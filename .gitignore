@@ -1,0 +1,13 @@
+# Local Pi runtime state
+.agent/
+.codegraph/
+.logs/
+.direnv/
+
+# Build outputs
+/agens
+/result
+/result-*
+
+# Reference repositories used for research, not vendored source
+/references/
