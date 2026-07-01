@@ -35,6 +35,7 @@ nix develop
 | Lint | `just lint` |
 | Test | `just test` |
 | Build | `just build` |
+| Config diagnostics | `just build && ./agens config doctor` |
 | Full gate | `just verify` |
 | Clean | `just clean` |
 
@@ -45,7 +46,8 @@ nix develop
 - Keep `cmd/agens` thin. It only adapts process exit behavior to `internal/app`.
 - Keep Cobra details in `internal/cli`; future domain logic must not depend on Cobra types.
 - Do not add `pkg/` until Agens has a real external Go API.
-- Do not add providers, Codex integration, TUI, packaging, or release automation as part of `AGN-1`.
+- Do not add providers, Codex integration, TUI, packaging, or release automation as part of foundation tasks unless their SDD scope explicitly includes them.
+- Keep hand-authored TOML config separate from future SQLite-backed runtime state.
 - Keep comments rare and focused on non-obvious why.
 - Never log or print secrets.
 

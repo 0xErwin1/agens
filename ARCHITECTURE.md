@@ -25,7 +25,7 @@ Rules:
 - `cmd/agens` contains no business logic.
 - `internal/cli` owns Cobra commands and help behavior.
 - Future domain packages must not import Cobra.
-- `internal/config` currently defines only the config-home contract. Deep config loading belongs to `AGN-2`.
+- `internal/config` owns TOML bootstrap config loading, project/global merge, environment expansion, and read-only diagnostics.
 - `internal/version` exposes build metadata and can later receive linker-provided values.
 
 ## Boundaries for future work
@@ -39,6 +39,10 @@ AGN-1 creates the foundation only. Later tasks may add:
 - TUI.
 
 Those features must enter through new SDD artifacts and should preserve the dependency direction above. Avoid adding broad abstractions before a concrete task needs them.
+
+## Config and state boundary
+
+TOML config files are for hand-authored bootstrap inputs only. Runtime state that Agens mutates — sessions, remembered permissions, model caches, discovered MCP state, and last-used values — belongs in a future SQLite-backed store, not in config files.
 
 ## Repository contracts
 

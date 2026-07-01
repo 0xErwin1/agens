@@ -45,7 +45,19 @@ Run the scaffolded CLI:
 ```sh
 just build
 ./agens --help
+./agens config doctor
 ```
+
+## Configuration
+
+Agens uses TOML files for hand-authored bootstrap configuration:
+
+- Global: `~/.config/agens/config.toml` or `$AGENS_CONFIG_HOME/config.toml`.
+- Project: `<project-root>/.agens/config.toml`, where project root is the nearest `.git` ancestor or the current directory outside git.
+
+Project config overrides global config. Missing files are valid and load defaults.
+
+Mutable runtime state does not belong in TOML config. Sessions, remembered permissions, model caches, discovered MCP state, and last-used values should be stored in SQLite by later tasks.
 
 ## TDD
 
