@@ -1,0 +1,42 @@
+package provider
+
+import (
+	"encoding/json"
+
+	"github.com/iperez/agens/internal/message"
+)
+
+// ChatRequest describes one streaming chat call. Messages carries the full
+// turn history including any system message (message.RoleSystem); where the
+// system content lands on the wire is each provider's encoding decision.
+type ChatRequest struct {
+	Model           string
+	Messages        []message.Message
+	Tools           []ToolSpec
+	MaxOutputTokens int
+	Temperature     *float64 // nil = provider default; distinguishes unset from 0
+}
+
+// ToolSpec declares a tool to the model. Execution and registration are
+// owned elsewhere (AGN-11); this is only the wire declaration shape.
+type ToolSpec struct {
+	Name        string
+	Description string
+	InputSchema json.RawMessage
+}
+
+// ModelInfo is intentionally minimal; AGN-7 (models.dev) extends it
+// additively. Never remove or repurpose fields.
+type ModelInfo struct {
+	ID              string
+	DisplayName     string
+	ContextWindow   int
+	MaxOutputTokens int
+	SupportsTools   bool
+}
+
+// Usage reports token consumption. Additive-only.
+type Usage struct {
+	InputTokens  int
+	OutputTokens int
+}
