@@ -10,6 +10,7 @@ import (
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
+	"github.com/iperez/agens/internal/permission"
 	"github.com/iperez/agens/internal/provider"
 	"github.com/iperez/agens/internal/provider/openai"
 	"github.com/iperez/agens/internal/tool"
@@ -60,10 +61,16 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	reg := tool.NewRegistry()
 
+	engine, err := permission.NewEngine(nil, permission.NewMemoryStore())
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+	gate := permission.NewGate(reg, engine, permission.DenyPrompter{})
+
 	loopOpts := []agentloop.Option{agentloop.WithModel(model)}
 	if systemPrompt != "" {
 		loopOpts = append(loopOpts, agentloop.WithSystemPrompt(systemPrompt))
 	}
 
-	return agentloop.New(p, reg, loopOpts...), nil
+	return agentloop.New(p, gate, loopOpts...), nil
 }

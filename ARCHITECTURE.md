@@ -11,6 +11,7 @@ internal/cli   Cobra command tree and CLI adapter behavior
 internal/config minimal configuration path contract
 internal/message typed, provider-neutral conversation history model (leaf, no internal deps)
 internal/provider provider-neutral contracts for auth, chat streaming, and factory wiring (leaf, Cobra-free, depends only on internal/message)
+internal/permission rule engine (Allow|Ask|Deny) and Gate decorator gating tool calls before dispatch; depends on internal/message, internal/provider, and github.com/bmatcuk/doublestar/v4; must not import internal/agentloop — the Gate satisfies agentloop.ToolRunner structurally, asserted only from a test file
 internal/version build/version metadata
 ```
 
@@ -22,6 +23,10 @@ cmd/agens -> internal/app -> internal/cli
                          -> internal/version
 
 internal/provider -> internal/message
+
+internal/permission -> internal/message, internal/provider
+
+internal/agent -> internal/permission
 
 (future) internal/agentloop, internal/tui, internal/persistence -> internal/message
 ```
