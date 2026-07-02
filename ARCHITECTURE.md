@@ -10,6 +10,7 @@ internal/app   application bootstrap and execution seam
 internal/cli   Cobra command tree and CLI adapter behavior
 internal/config minimal configuration path contract
 internal/message typed, provider-neutral conversation history model (leaf, no internal deps)
+internal/provider provider-neutral contracts for auth, chat streaming, and factory wiring (leaf, Cobra-free, depends only on internal/message)
 internal/version build/version metadata
 ```
 
@@ -20,7 +21,9 @@ cmd/agens -> internal/app -> internal/cli
                          -> internal/config
                          -> internal/version
 
-(future) internal/provider, internal/agentloop, internal/tui, internal/persistence -> internal/message
+internal/provider -> internal/message
+
+(future) internal/agentloop, internal/tui, internal/persistence -> internal/message
 ```
 
 Rules:
