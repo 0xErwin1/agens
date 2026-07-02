@@ -5,8 +5,6 @@ package openai
 import "encoding/json"
 
 // wireRequest is the chat-completions request body.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireRequest struct {
 	Model               string             `json:"model"`
 	Messages            []wireMessage      `json:"messages"`
@@ -22,8 +20,6 @@ type wireRequest struct {
 // Content is a pointer so an explicit empty string ("") can be distinguished
 // from an absent field: a tool-result message must emit content:"" while an
 // assistant message carrying only tool_calls must omit content entirely.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireMessage struct {
 	Role       string         `json:"role"`
 	Content    *string        `json:"content,omitempty"`
@@ -32,16 +28,12 @@ type wireMessage struct {
 }
 
 // wireTool describes one callable function offered to the model.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireTool struct {
 	Type     string       `json:"type"`
 	Function wireFunction `json:"function"`
 }
 
 // wireFunction is the function schema carried by wireTool.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireFunction struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
@@ -49,8 +41,6 @@ type wireFunction struct {
 }
 
 // wireToolCall is a fully-formed tool call in an assistant request message.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireToolCall struct {
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
@@ -65,8 +55,6 @@ type wireCallFunction struct {
 }
 
 // wireStreamOptions requests that a final usage-only chunk be sent.
-//
-//nolint:unused // consumed by the request encoder, added in a later slice
 type wireStreamOptions struct {
 	IncludeUsage bool `json:"include_usage"`
 }
@@ -108,8 +96,6 @@ type wireUsage struct {
 }
 
 // wireErrorEnvelope is the body of a non-2xx chat-completions response.
-//
-//nolint:unused // consumed by the error parser, added in a later slice
 type wireErrorEnvelope struct {
 	Error struct {
 		Message string `json:"message"`
