@@ -9,6 +9,7 @@ cmd/agens      process entrypoint only
 internal/app   application bootstrap and execution seam
 internal/cli   Cobra command tree and CLI adapter behavior
 internal/config minimal configuration path contract
+internal/message typed, provider-neutral conversation history model (leaf, no internal deps)
 internal/version build/version metadata
 ```
 
@@ -18,6 +19,8 @@ internal/version build/version metadata
 cmd/agens -> internal/app -> internal/cli
                          -> internal/config
                          -> internal/version
+
+(future) internal/provider, internal/agentloop, internal/tui, internal/persistence -> internal/message
 ```
 
 Rules:
@@ -26,6 +29,7 @@ Rules:
 - `internal/cli` owns Cobra commands and help behavior.
 - Future domain packages must not import Cobra.
 - `internal/config` owns TOML bootstrap config loading, project/global merge, environment expansion, and read-only diagnostics.
+- `internal/message` is a leaf package: it depends on nothing internal (stdlib + `google/uuid` only) and defines `Message`, `Role`, and the closed `Part` union (`TextPart`, `ToolUsePart`, `ToolResultPart`) with their JSON codec. Future providers (mapping wire formats to/from this model), the agent loop, the TUI, and persistence will all depend on `internal/message`; it must never depend on any of them.
 - `internal/version` exposes build metadata and can later receive linker-provided values.
 
 ## Boundaries for future work
