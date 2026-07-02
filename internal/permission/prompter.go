@@ -42,3 +42,17 @@ func (DenyPrompter) Prompt(ctx context.Context, call message.ToolUsePart) (Answe
 }
 
 var _ Prompter = DenyPrompter{}
+
+// AllowPrompter answers AnswerAllowOnce to every prompt without blocking.
+// It always allows the call for that single invocation and never returns
+// AnswerAllowAlways, so a Gate never persists a rule on its behalf. It
+// exists for callers that have already accepted unattended execution (for
+// example a --dangerously-allow-all flag), not as a general-purpose
+// default.
+type AllowPrompter struct{}
+
+func (AllowPrompter) Prompt(ctx context.Context, call message.ToolUsePart) (Answer, error) {
+	return AnswerAllowOnce, nil
+}
+
+var _ Prompter = AllowPrompter{}

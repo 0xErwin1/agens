@@ -11,6 +11,7 @@ import (
 	"github.com/iperez/agens/internal/agent"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
+	"github.com/iperez/agens/internal/permission"
 	"github.com/iperez/agens/internal/provider"
 )
 
@@ -239,6 +240,50 @@ func TestChatCommand_BuilderErrorPropagatesWithoutLeakingKey(t *testing.T) {
 	}
 	if strings.Contains(out.String()+errOut.String(), secret) {
 		t.Fatal("command output must never contain a raw api key value")
+	}
+}
+
+func TestChatCommand_DangerouslyAllowAllFlagSelectsAllowPrompter(t *testing.T) {
+	fakeProvider := &chatFakeProvider{steps: textDeltaSteps("ok")}
+	var received agent.Options
+	build := func(opts agent.Options) (*agentloop.Loop, error) {
+		received = opts
+		return agentloop.New(fakeProvider, nil, agentloop.WithModel("gpt-test")), nil
+	}
+
+	cmd := newChatCommandWithBuilder(build)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"--dangerously-allow-all", "hi"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+
+	if _, ok := received.Prompter.(permission.AllowPrompter); !ok {
+		t.Fatalf("Options.Prompter = %T, want permission.AllowPrompter when --dangerously-allow-all is set", received.Prompter)
+	}
+}
+
+func TestChatCommand_DefaultPrompterIsNotAllowPrompter(t *testing.T) {
+	fakeProvider := &chatFakeProvider{steps: textDeltaSteps("ok")}
+	var received agent.Options
+	build := func(opts agent.Options) (*agentloop.Loop, error) {
+		received = opts
+		return agentloop.New(fakeProvider, nil, agentloop.WithModel("gpt-test")), nil
+	}
+
+	cmd := newChatCommandWithBuilder(build)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"hi"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+
+	if _, ok := received.Prompter.(permission.AllowPrompter); ok {
+		t.Fatal("Options.Prompter = permission.AllowPrompter, want it unset without --dangerously-allow-all")
 	}
 }
 

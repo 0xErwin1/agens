@@ -31,6 +31,7 @@ func newChatCommand() *cobra.Command {
 
 func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 	var opts agent.Options
+	var allowAll bool
 
 	cmd := &cobra.Command{
 		Use:   "chat [prompt]",
@@ -45,6 +46,8 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
+
+			opts.Prompter = selectPrompter(allowAll)
 
 			loop, err := build(opts)
 			if err != nil {
@@ -78,6 +81,7 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 
 	cmd.Flags().StringVar(&opts.Model, "model", "", "override the configured model")
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
+	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
 
 	return cmd
 }
@@ -114,6 +118,10 @@ func defaultBuildLoop(opts agent.Options) (*agentloop.Loop, error) {
 	creds, err := auth.Load(filepath.Join(config.HomeDir(), "auth.json"))
 	if err != nil {
 		return nil, fmt.Errorf("chat: %w", err)
+	}
+
+	if opts.ProjectRoot == "" {
+		opts.ProjectRoot = loaded.ProjectRoot
 	}
 
 	loop, err := agent.BuildLoop(loaded.Config, creds, opts)

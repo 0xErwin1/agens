@@ -1,11 +1,17 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
+	"github.com/iperez/agens/internal/message"
+	"github.com/iperez/agens/internal/permission"
 )
 
 func validConfig() config.Config {
@@ -21,8 +27,16 @@ func validCreds() auth.File {
 	}
 }
 
+// validOptions returns an Options with a fresh, isolated ProjectRoot so
+// every BuildLoop/buildGate call in this file opens a real confinement
+// root instead of falling back to the test binary's working directory.
+func validOptions(t *testing.T) Options {
+	t.Helper()
+	return Options{ProjectRoot: t.TempDir()}
+}
+
 func TestBuildLoop_Success(t *testing.T) {
-	loop, err := BuildLoop(validConfig(), validCreds(), Options{})
+	loop, err := BuildLoop(validConfig(), validCreds(), validOptions(t))
 	if err != nil {
 		t.Fatalf("BuildLoop() error = %v, want nil", err)
 	}
@@ -48,7 +62,9 @@ func TestBuildLoop_ModelPrecedence(t *testing.T) {
 			cfg := validConfig()
 			cfg.Provider.Model = tt.cfgModel
 
-			loop, err := BuildLoop(cfg, validCreds(), Options{Model: tt.optsModel})
+			opts := validOptions(t)
+			opts.Model = tt.optsModel
+			loop, err := BuildLoop(cfg, validCreds(), opts)
 
 			if tt.wantErr {
 				if err == nil {
@@ -85,7 +101,9 @@ func TestBuildLoop_SystemPromptPrecedence(t *testing.T) {
 			cfg := validConfig()
 			cfg.Agent.SystemPrompt = tt.cfgSys
 
-			loop, err := BuildLoop(cfg, validCreds(), Options{SystemPrompt: tt.optsSys})
+			opts := validOptions(t)
+			opts.SystemPrompt = tt.optsSys
+			loop, err := BuildLoop(cfg, validCreds(), opts)
 			if err != nil {
 				t.Fatalf("BuildLoop() error = %v, want nil", err)
 			}
@@ -99,7 +117,7 @@ func TestBuildLoop_SystemPromptPrecedence(t *testing.T) {
 func TestBuildLoop_MissingAPIKeyErrors(t *testing.T) {
 	creds := auth.File{}
 
-	_, err := BuildLoop(validConfig(), creds, Options{})
+	_, err := BuildLoop(validConfig(), creds, validOptions(t))
 	if err == nil {
 		t.Fatal("BuildLoop() error = nil, want an error for missing credentials")
 	}
@@ -113,7 +131,7 @@ func TestBuildLoop_EmptyAPIKeyErrors(t *testing.T) {
 		defaultProviderID: {APIKey: ""},
 	}
 
-	_, err := BuildLoop(validConfig(), creds, Options{})
+	_, err := BuildLoop(validConfig(), creds, validOptions(t))
 	if err == nil {
 		t.Fatal("BuildLoop() error = nil, want an error for an empty api_key")
 	}
@@ -128,11 +146,152 @@ func TestBuildLoop_ErrorsNeverLeakAPIKeyValue(t *testing.T) {
 		"other-provider": {APIKey: secret},
 	}
 
-	_, err := BuildLoop(validConfig(), creds, Options{})
+	_, err := BuildLoop(validConfig(), creds, validOptions(t))
 	if err == nil {
 		t.Fatal("BuildLoop() error = nil, want an error since openai-api has no credentials")
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("BuildLoop() error = %q, must never contain a raw api_key value", err.Error())
+	}
+}
+
+// fakePrompter records every call it is asked to resolve and always
+// answers with the configured answer/err pair, mirroring the scripted
+// fakes used across the permission package's own tests.
+type fakePrompter struct {
+	answer permission.Answer
+	err    error
+	calls  []message.ToolUsePart
+}
+
+func (f *fakePrompter) Prompt(_ context.Context, call message.ToolUsePart) (permission.Answer, error) {
+	f.calls = append(f.calls, call)
+	return f.answer, f.err
+}
+
+func TestBuildGate_RegistersReadWriteEditWithSchemas(t *testing.T) {
+	gate, err := buildGate(validOptions(t))
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	specs := gate.Specs()
+	byName := make(map[string]bool, len(specs))
+	for _, s := range specs {
+		if len(s.InputSchema) == 0 {
+			t.Fatalf("tool %q has an empty InputSchema, want a non-nil JSON Schema", s.Name)
+		}
+		byName[s.Name] = true
+	}
+
+	for _, want := range []string{"read", "write", "edit"} {
+		if !byName[want] {
+			t.Fatalf("gate.Specs() = %+v, want it to include tool %q", specs, want)
+		}
+	}
+}
+
+func TestBuildGate_ReadIsAllowedWithoutPrompting(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	fp := &fakePrompter{answer: permission.AnswerDenyOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "read", Input: json.RawMessage(`{"path":"a.txt"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(read) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(read) result = %+v, want IsError == false", result)
+	}
+	if len(fp.calls) != 0 {
+		t.Fatalf("prompter was consulted %d time(s) for a read call, want 0 (read is pre-seeded Allow)", len(fp.calls))
+	}
+}
+
+func TestBuildGate_WriteAskConsultsPrompter_AllowOnceExecutes(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerAllowOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "write", Input: json.RawMessage(`{"path":"b.txt","content":"hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(write) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(write) result = %+v, want IsError == false for an allow-once answer", result)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s) for a write call, want exactly 1", len(fp.calls))
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "b.txt"))
+	if err != nil {
+		t.Fatalf("read back written file: %v", err)
+	}
+	if string(data) != "hi" {
+		t.Fatalf("written file content = %q, want %q", string(data), "hi")
+	}
+}
+
+func TestBuildGate_WriteAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerDenyOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "write", Input: json.RawMessage(`{"path":"c.txt","content":"hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(write) error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("gate.Run(write) result = %+v, want IsError == true for a deny-once answer", result)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s) for a write call, want exactly 1", len(fp.calls))
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "c.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("Stat(c.txt) error = %v, want a not-exist error since the write must not have executed", statErr)
+	}
+}
+
+func TestBuildGate_NilPrompterDefaultsToDenyPrompter(t *testing.T) {
+	dir := t.TempDir()
+	gate, err := buildGate(Options{ProjectRoot: dir})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "write", Input: json.RawMessage(`{"path":"d.txt","content":"hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(write) error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("gate.Run(write) result = %+v, want IsError == true when Options.Prompter is nil", result)
+	}
+}
+
+func TestBuildGate_EmptyProjectRootFallsBackToWorkingDir(t *testing.T) {
+	gate, err := buildGate(Options{})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+	if gate == nil {
+		t.Fatal("buildGate() gate = nil, want non-nil")
 	}
 }
