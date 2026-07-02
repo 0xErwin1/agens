@@ -18,13 +18,26 @@ const (
 )
 
 type Config struct {
-	Options Options `toml:"options"`
+	Options  Options  `toml:"options"`
+	Provider Provider `toml:"provider"`
+	Agent    Agent    `toml:"agent"`
 }
 
 type Options struct {
 	Debug   bool   `toml:"debug"`
 	DataDir string `toml:"data_dir"`
 }
+
+type Provider struct {
+	Model   string `toml:"model"`
+	BaseURL string `toml:"base_url"`
+}
+
+type Agent struct {
+	SystemPrompt string `toml:"system_prompt"`
+}
+
+const defaultSystemPrompt = "You are Agens, a helpful coding assistant."
 
 type Source struct {
 	Path  string
@@ -46,7 +59,9 @@ type LoadOptions struct {
 }
 
 type configPatch struct {
-	Options *optionsPatch `toml:"options"`
+	Options  *optionsPatch  `toml:"options"`
+	Provider *providerPatch `toml:"provider"`
+	Agent    *agentPatch    `toml:"agent"`
 }
 
 type optionsPatch struct {
@@ -54,11 +69,26 @@ type optionsPatch struct {
 	DataDir *string `toml:"data_dir"`
 }
 
+type providerPatch struct {
+	Model   *string `toml:"model"`
+	BaseURL *string `toml:"base_url"`
+}
+
+type agentPatch struct {
+	SystemPrompt *string `toml:"system_prompt"`
+}
+
 func DefaultConfig() Config {
 	return Config{
 		Options: Options{
 			Debug:   false,
 			DataDir: filepath.Join(defaultDataHome(), AppName),
+		},
+		Provider: Provider{
+			Model: "gpt-4.1",
+		},
+		Agent: Agent{
+			SystemPrompt: defaultSystemPrompt,
 		},
 	}
 }
