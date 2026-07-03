@@ -184,7 +184,7 @@ func TestBuildGate_RegistersReadWriteEditWithSchemas(t *testing.T) {
 		byName[s.Name] = true
 	}
 
-	for _, want := range []string{"read", "write", "edit"} {
+	for _, want := range []string{"read", "write", "edit", "bash"} {
 		if !byName[want] {
 			t.Fatalf("gate.Specs() = %+v, want it to include tool %q", specs, want)
 		}
@@ -283,6 +283,27 @@ func TestBuildGate_NilPrompterDefaultsToDenyPrompter(t *testing.T) {
 	}
 	if !result.IsError {
 		t.Fatalf("gate.Run(write) result = %+v, want IsError == true when Options.Prompter is nil", result)
+	}
+}
+
+func TestBuildGate_BashAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerDenyOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(bash) error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("gate.Run(bash) result = %+v, want IsError == true for a deny-once answer", result)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s) for a bash call, want exactly 1 (bash must resolve to Ask, no seeded rule)", len(fp.calls))
 	}
 }
 

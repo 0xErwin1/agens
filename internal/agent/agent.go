@@ -15,6 +15,7 @@ import (
 	"github.com/iperez/agens/internal/provider"
 	"github.com/iperez/agens/internal/provider/openai"
 	"github.com/iperez/agens/internal/tool"
+	"github.com/iperez/agens/internal/tool/bash"
 	"github.com/iperez/agens/internal/tool/fs"
 )
 
@@ -84,9 +85,9 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 }
 
 // buildGate resolves opts into a *permission.Gate wrapping the read, write,
-// and edit tools confined to opts.ProjectRoot (or os.Getwd() when empty).
-// read is pre-seeded to Allow so it never prompts; write and edit fall
-// through to DecisionAsk by default, resolved by opts.Prompter (or
+// edit, and bash tools confined to opts.ProjectRoot (or os.Getwd() when
+// empty). read is pre-seeded to Allow so it never prompts; write, edit, and
+// bash fall through to DecisionAsk by default, resolved by opts.Prompter (or
 // permission.DenyPrompter{} when opts.Prompter is nil).
 func buildGate(opts Options) (*permission.Gate, error) {
 	rootDir := opts.ProjectRoot
@@ -107,6 +108,7 @@ func buildGate(opts Options) (*permission.Gate, error) {
 	reg.Register(fs.NewRead(dir))
 	reg.Register(fs.NewWrite(dir))
 	reg.Register(fs.NewEdit(dir))
+	reg.Register(bash.New(rootDir))
 
 	rules := []permission.Rule{{Decision: permission.DecisionAllow, Name: "read"}}
 	engine, err := permission.NewEngine(rules, permission.NewMemoryStore())

@@ -10,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -95,16 +97,44 @@ func (b *Bash) Execute(ctx context.Context, input json.RawMessage) (tool.Result,
 
 	runErr := cmd.Run()
 
+	if ctx.Err() != nil {
+		return tool.Result{}, ctx.Err()
+	}
+	if cmdCtx.Err() == context.DeadlineExceeded {
+		return tool.Result{
+			IsError: true,
+			Text:    out.Text() + fmt.Sprintf("\nbash: command timed out after %s (process group killed)", d),
+		}, nil
+	}
 	return mapRunResult(runErr, cmd, out), nil
 }
 
 // newCommand builds the exec.Cmd for command, rooted at b.projectRoot with
 // out wired as both stdout and stderr.
+//
+// Setpgid makes bash the leader of its own process group (pgid == pid), so
+// cmd.Cancel can SIGKILL the whole group via the negative pid instead of
+// only the direct bash child. Without this, a backgrounded grandchild (e.g.
+// "sleep 30 &") would survive a timeout or turn cancellation as an orphan:
+// the default Cancel only kills cmd.Process. ESRCH means the group is
+// already gone, which Cancel reports as os.ErrProcessDone rather than an
+// error. cmd.WaitDelay bounds how long Wait will wait for a lingering
+// descendant that still holds the output pipe open after bash itself has
+// exited.
 func (b *Bash) newCommand(cmdCtx context.Context, command string, out *cappedBuffer) *exec.Cmd {
 	cmd := exec.CommandContext(cmdCtx, "bash", "-c", command)
 	cmd.Dir = b.projectRoot
 	cmd.Stdout = out
 	cmd.Stderr = out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = b.waitDelay
 	return cmd
 }
 
@@ -116,6 +146,14 @@ func mapRunResult(runErr error, cmd *exec.Cmd, out *cappedBuffer) tool.Result {
 			text = "(no output; exit status 0)"
 		}
 		return tool.Result{Text: text}
+	}
+
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		code := cmd.ProcessState.ExitCode()
+		return tool.Result{
+			IsError: code != 0,
+			Text:    out.Text() + "\n(output may be incomplete: a background process kept the output stream open)",
+		}
 	}
 
 	var exitErr *exec.ExitError
