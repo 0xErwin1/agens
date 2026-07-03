@@ -32,11 +32,12 @@ func newTTYPrompter(in io.Reader, out io.Writer) *ttyPrompter {
 
 var _ permission.Prompter = (*ttyPrompter)(nil)
 
-// promptPathInput is the best-effort shape used to extract a display path
-// from a tool call's input; a call with no "path" field, or input that does
-// not unmarshal into this shape at all, falls back to the raw input.
-type promptPathInput struct {
+// promptArgumentInput is the best-effort shape used to extract a display
+// argument from a tool call's input: Path wins when non-empty, then URL,
+// otherwise the caller falls back to the raw input.
+type promptArgumentInput struct {
 	Path string `json:"path"`
+	URL  string `json:"url"`
 }
 
 // Prompt writes call's tool name and a best-effort argument to p.out, then
@@ -77,12 +78,18 @@ func (p *ttyPrompter) Prompt(ctx context.Context, call message.ToolUsePart) (per
 }
 
 // promptArgument returns the best-effort display argument for input: the
-// "path" field when input unmarshals into promptPathInput with a non-empty
-// Path, otherwise input verbatim.
+// "path" field when input unmarshals into promptArgumentInput with a
+// non-empty Path, else the "url" field when non-empty, otherwise input
+// verbatim.
 func promptArgument(input json.RawMessage) string {
-	var p promptPathInput
-	if err := json.Unmarshal(input, &p); err == nil && p.Path != "" {
-		return p.Path
+	var p promptArgumentInput
+	if err := json.Unmarshal(input, &p); err == nil {
+		if p.Path != "" {
+			return p.Path
+		}
+		if p.URL != "" {
+			return p.URL
+		}
 	}
 	return string(input)
 }

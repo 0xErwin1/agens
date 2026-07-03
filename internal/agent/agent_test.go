@@ -184,7 +184,7 @@ func TestBuildGate_RegistersReadWriteEditWithSchemas(t *testing.T) {
 		byName[s.Name] = true
 	}
 
-	for _, want := range []string{"read", "write", "edit", "bash", "grep", "glob"} {
+	for _, want := range []string{"read", "write", "edit", "bash", "grep", "glob", "webfetch"} {
 		if !byName[want] {
 			t.Fatalf("gate.Specs() = %+v, want it to include tool %q", specs, want)
 		}
@@ -345,6 +345,27 @@ func TestBuildGate_BashAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
 	}
 	if len(fp.calls) != 1 {
 		t.Fatalf("prompter was consulted %d time(s) for a bash call, want exactly 1 (bash must resolve to Ask, no seeded rule)", len(fp.calls))
+	}
+}
+
+func TestBuildGate_WebfetchAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerDenyOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "webfetch", Input: json.RawMessage(`{"url":"http://169.254.169.254/"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(webfetch) error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("gate.Run(webfetch) result = %+v, want IsError == true for a deny-once answer", result)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s) for a webfetch call, want exactly 1 (webfetch must resolve to Ask, no seeded rule)", len(fp.calls))
 	}
 }
 

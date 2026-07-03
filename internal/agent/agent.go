@@ -18,6 +18,7 @@ import (
 	"github.com/iperez/agens/internal/tool/bash"
 	"github.com/iperez/agens/internal/tool/fs"
 	"github.com/iperez/agens/internal/tool/search"
+	"github.com/iperez/agens/internal/tool/webfetch"
 )
 
 // defaultProviderID is the only provider currently wired: it must match
@@ -86,11 +87,11 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 }
 
 // buildGate resolves opts into a *permission.Gate wrapping the read, write,
-// edit, bash, grep, and glob tools confined to opts.ProjectRoot (or
-// os.Getwd() when empty). read, grep, and glob are pre-seeded to Allow so
-// they never prompt; write, edit, and bash fall through to DecisionAsk by
-// default, resolved by opts.Prompter (or permission.DenyPrompter{} when
-// opts.Prompter is nil).
+// edit, bash, grep, glob, and webfetch tools confined to opts.ProjectRoot
+// (or os.Getwd() when empty). read, grep, and glob are pre-seeded to Allow
+// so they never prompt; write, edit, bash, and webfetch fall through to
+// DecisionAsk by default, resolved by opts.Prompter (or
+// permission.DenyPrompter{} when opts.Prompter is nil).
 func buildGate(opts Options) (*permission.Gate, error) {
 	rootDir := opts.ProjectRoot
 	if rootDir == "" {
@@ -113,6 +114,7 @@ func buildGate(opts Options) (*permission.Gate, error) {
 	reg.Register(bash.New(rootDir))
 	reg.Register(search.NewGrep(dir.FS()))
 	reg.Register(search.NewGlob(dir.FS()))
+	reg.Register(webfetch.New())
 
 	rules := []permission.Rule{
 		{Decision: permission.DecisionAllow, Name: "read"},

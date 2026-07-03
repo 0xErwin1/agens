@@ -110,6 +110,42 @@ func TestTTYPrompter_OutputIncludesToolNameAndPath(t *testing.T) {
 	}
 }
 
+func TestTTYPrompter_OutputShowsURLWhenNoPath(t *testing.T) {
+	out := new(bytes.Buffer)
+	p := newTTYPrompter(strings.NewReader("n\n"), out)
+
+	call := message.ToolUsePart{Name: "webfetch", Input: []byte(`{"url":"https://example.com/x"}`)}
+	if _, err := p.Prompt(context.Background(), call); err != nil {
+		t.Fatalf("Prompt() error = %v, want nil", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "https://example.com/x") {
+		t.Fatalf("prompt output = %q, want it to mention the bare URL %q", got, "https://example.com/x")
+	}
+	if strings.Contains(got, `"url"`) {
+		t.Fatalf("prompt output = %q, want the bare URL, not raw JSON", got)
+	}
+}
+
+func TestTTYPrompter_OutputPrefersPathOverURL(t *testing.T) {
+	out := new(bytes.Buffer)
+	p := newTTYPrompter(strings.NewReader("n\n"), out)
+
+	call := message.ToolUsePart{Name: "webfetch", Input: []byte(`{"path":"a","url":"b"}`)}
+	if _, err := p.Prompt(context.Background(), call); err != nil {
+		t.Fatalf("Prompt() error = %v, want nil", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "webfetch a —") {
+		t.Fatalf("prompt output = %q, want it to show the path %q when both path and url are set", got, "a")
+	}
+	if strings.Contains(got, "\"b\"") {
+		t.Fatalf("prompt output = %q, want path to win over url", got)
+	}
+}
+
 func TestTTYPrompter_OutputFallsBackToRawInputWhenNoPath(t *testing.T) {
 	out := new(bytes.Buffer)
 	p := newTTYPrompter(strings.NewReader("n\n"), out)

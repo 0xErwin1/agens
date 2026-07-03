@@ -18,6 +18,7 @@ internal/tool    uniform Tool contract and Registry the agent loop dispatches ag
 internal/tool/fs read/write/edit Tool implementations confined to a worktree via os.Root; Cobra-free, depends only on internal/tool, jsonschema-go, and the standard library
 internal/tool/bash bash Tool implementation (bash -c from the project root); turn-ctx-aware per-command timeout with turn-cancellation differentiation, process-group kill (no orphaned grandchildren), capped combined stdout/stderr output; Cobra-free, not sandboxed
 internal/tool/search grep and glob Tool implementations, worktree-confined via the same os.Root FS as internal/tool/fs (consumed through its FS() accessor); Cobra-free, depends only on internal/tool, doublestar, jsonschema-go, and the standard library
+internal/tool/webfetch webfetch Tool implementation: single HTTP GET per call, HTML responses converted to readable text (raw passthrough otherwise), response capped at 100 KiB, 30s default timeout; dial-time SSRF guard blocks link-local and cloud-metadata addresses on every connection attempt, including redirect hops; Ask-default (no seeded permission rule); Cobra-free
 internal/agentloop drives one synchronous agent turn loop: streams a provider response, assembles it into a message.Message, and dispatches requested tool calls
 internal/agent composition root that wires a config.Config and an auth.File into a ready-to-run *agentloop.Loop (provider, tool registry, permission Gate); no network calls of its own
 internal/version build/version metadata
@@ -37,12 +38,13 @@ internal/tool -> internal/message, internal/provider, jsonschema-go
 internal/tool/fs -> internal/tool, jsonschema-go, stdlib (no Cobra, no internal/agentloop, no internal/agent, no internal/cli, no internal/message)
 internal/tool/bash -> internal/tool, jsonschema-go, stdlib os/exec + syscall (no Cobra, no internal/agentloop, no internal/agent, no internal/cli, no internal/message)
 internal/tool/search -> internal/tool, doublestar, jsonschema-go, stdlib io/fs + regexp (no Cobra, no internal/agentloop, no internal/agent, no internal/cli, no internal/tool/fs)
+internal/tool/webfetch -> internal/tool, golang.org/x/net/html, jsonschema-go, stdlib net/http + net (no Cobra, no internal/agentloop, no internal/agent, no internal/cli)
 
 internal/permission -> internal/message, internal/provider
 
 internal/agentloop -> internal/message, internal/provider
 
-internal/agent -> internal/agentloop, internal/auth, internal/config, internal/permission, internal/provider, internal/provider/openai, internal/tool, internal/tool/fs, internal/tool/bash, internal/tool/search
+internal/agent -> internal/agentloop, internal/auth, internal/config, internal/permission, internal/provider, internal/provider/openai, internal/tool, internal/tool/fs, internal/tool/bash, internal/tool/search, internal/tool/webfetch
 
 internal/cli -> internal/agent, internal/agentloop, internal/auth, internal/config, internal/message, internal/permission
              -> (ttyPrompter implements internal/permission.Prompter; it owns terminal I/O and never leaks into internal/agent or internal/tool/fs)
