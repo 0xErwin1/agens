@@ -2,6 +2,7 @@ package fs
 
 import (
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -190,6 +191,45 @@ func TestDirRel_WriteEscapes(t *testing.T) {
 			t.Fatalf("os.Stat(escaped.txt outside root) error = %v, want IsNotExist (must remain untouched)", err)
 		}
 	})
+}
+
+// TestDirFS confirms FS() returns an fs.FS confined identically to d.rel:
+// reads inside the root succeed, and an escaping symlink is rejected.
+func TestDirFS(t *testing.T) {
+	root := t.TempDir()
+	outsideDir := t.TempDir()
+
+	writeFileT(t, filepath.Join(root, "inside.txt"), "inside content")
+
+	outsideFile := filepath.Join(outsideDir, "outside.txt")
+	writeFileT(t, outsideFile, "external content")
+
+	symlink := filepath.Join(root, "link-to-outside")
+	if err := os.Symlink(outsideFile, symlink); err != nil {
+		t.Fatalf("os.Symlink error = %v", err)
+	}
+
+	d, err := Open(root)
+	if err != nil {
+		t.Fatalf("Open(%q) error = %v", root, err)
+	}
+
+	fsys := d.FS()
+	if fsys == nil {
+		t.Fatalf("FS() = nil, want a usable fs.FS")
+	}
+
+	got, err := fs.ReadFile(fsys, "inside.txt")
+	if err != nil {
+		t.Fatalf("fs.ReadFile(inside.txt) error = %v", err)
+	}
+	if string(got) != "inside content" {
+		t.Fatalf("fs.ReadFile(inside.txt) = %q, want %q", got, "inside content")
+	}
+
+	if _, err := fs.ReadFile(fsys, "link-to-outside"); err == nil {
+		t.Fatalf("fs.ReadFile(link-to-outside) error = nil, want an error (escape must be rejected)")
+	}
 }
 
 func writeFileT(t *testing.T, path, content string) {
