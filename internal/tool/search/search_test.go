@@ -133,6 +133,48 @@ func TestErrCapReached(t *testing.T) {
 	}
 }
 
+func TestFinishWalk(t *testing.T) {
+	t.Run("no items and no cap reports no matches", func(t *testing.T) {
+		out := newCapped(5, 1<<20, "matches")
+
+		got := finishWalk(out, nil)
+		if got.IsError {
+			t.Fatalf("IsError = true, want false")
+		}
+		if got.Text != "no matches" {
+			t.Fatalf("Text = %q, want %q", got.Text, "no matches")
+		}
+	})
+
+	t.Run("items accumulated reports accumulated text", func(t *testing.T) {
+		out := newCapped(5, 1<<20, "matches")
+		out.add("a")
+		out.add("b")
+
+		got := finishWalk(out, nil)
+		if got.Text != "a\nb" {
+			t.Fatalf("Text = %q, want %q", got.Text, "a\nb")
+		}
+	})
+
+	t.Run("first item alone trips the byte cap reports the notice, not no matches", func(t *testing.T) {
+		out := newCapped(1000, 5, "matches")
+
+		if out.add("this line alone exceeds the byte cap") {
+			t.Fatalf("add() = true, want false (line alone overflows maxBytes)")
+		}
+
+		got := finishWalk(out, errCapReached)
+		if got.Text == "no matches" {
+			t.Fatalf("Text = %q, want the truncation notice, not \"no matches\"", got.Text)
+		}
+		const notice = "\n[output truncated after 100 KiB]"
+		if !strings.HasSuffix(got.Text, notice) {
+			t.Fatalf("Text = %q, want suffix %q", got.Text, notice)
+		}
+	})
+}
+
 func TestValidateRel(t *testing.T) {
 	tests := []struct {
 		name    string

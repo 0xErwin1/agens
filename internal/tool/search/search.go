@@ -13,11 +13,22 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/iperez/agens/internal/tool"
 )
 
 const (
 	maxItems       = 1000
 	maxOutputBytes = 100 << 10
+
+	// maxFileBytes bounds the size of a file grep will read into memory; a
+	// larger file is silently skipped rather than searched.
+	maxFileBytes = 10 << 20
+
+	// binarySniffLen is the number of leading bytes grep inspects for a NUL
+	// byte to heuristically classify a file as binary and skip it, mirroring
+	// git's own binary-detection heuristic.
+	binarySniffLen = 8192
 )
 
 // errCapReached is returned by a walk callback to stop the underlying walk
@@ -85,6 +96,20 @@ func (c *capped) text() string {
 // empty reports whether no items were ever accepted.
 func (c *capped) empty() bool {
 	return c.items == 0
+}
+
+// finishWalk maps the outcome of a completed accumulation walk to a
+// tool.Result. walkErr must already be known to be a non-failure: nil, or
+// errCapReached because a cap was hit. A walk that accepted no items and
+// never hit a cap reports "no matches"; one that trips a cap on its very
+// first, oversized item still reports the truncation notice rather than
+// falling through to "no matches", since out.text() carries that notice even
+// when out is otherwise empty.
+func finishWalk(out *capped, walkErr error) tool.Result {
+	if out.empty() && !errors.Is(walkErr, errCapReached) {
+		return tool.Result{Text: "no matches"}
+	}
+	return tool.Result{Text: out.text()}
 }
 
 // validateRel rejects an explicit path/glob/pattern input that would escape
