@@ -184,7 +184,7 @@ func TestBuildGate_RegistersReadWriteEditWithSchemas(t *testing.T) {
 		byName[s.Name] = true
 	}
 
-	for _, want := range []string{"read", "write", "edit", "bash"} {
+	for _, want := range []string{"read", "write", "edit", "bash", "grep", "glob"} {
 		if !byName[want] {
 			t.Fatalf("gate.Specs() = %+v, want it to include tool %q", specs, want)
 		}
@@ -213,6 +213,47 @@ func TestBuildGate_ReadIsAllowedWithoutPrompting(t *testing.T) {
 	}
 	if len(fp.calls) != 0 {
 		t.Fatalf("prompter was consulted %d time(s) for a read call, want 0 (read is pre-seeded Allow)", len(fp.calls))
+	}
+}
+
+// failOnCallPrompter fails the test immediately if Prompt is invoked. It
+// proves a call resolved to Allow without ever consulting the Prompter.
+type failOnCallPrompter struct {
+	t *testing.T
+}
+
+func (f failOnCallPrompter) Prompt(_ context.Context, call message.ToolUsePart) (permission.Answer, error) {
+	f.t.Fatalf("Prompter.Prompt was called for tool %q, want it to resolve Allow without prompting", call.Name)
+	return permission.AnswerDenyOnce, nil
+}
+
+func TestBuildGate_GrepAndGlobAreAllowedWithoutPrompting(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n\nconst needle = 1\n"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: failOnCallPrompter{t: t}})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	grepCall := message.ToolUsePart{ID: "tu_1", Name: "grep", Input: json.RawMessage(`{"pattern":"needle"}`)}
+	result, err := gate.Run(context.Background(), grepCall)
+	if err != nil {
+		t.Fatalf("gate.Run(grep) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(grep) result = %+v, want IsError == false", result)
+	}
+
+	globCall := message.ToolUsePart{ID: "tu_2", Name: "glob", Input: json.RawMessage(`{"pattern":"*.go"}`)}
+	result, err = gate.Run(context.Background(), globCall)
+	if err != nil {
+		t.Fatalf("gate.Run(glob) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(glob) result = %+v, want IsError == false", result)
 	}
 }
 

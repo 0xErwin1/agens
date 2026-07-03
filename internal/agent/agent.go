@@ -17,6 +17,7 @@ import (
 	"github.com/iperez/agens/internal/tool"
 	"github.com/iperez/agens/internal/tool/bash"
 	"github.com/iperez/agens/internal/tool/fs"
+	"github.com/iperez/agens/internal/tool/search"
 )
 
 // defaultProviderID is the only provider currently wired: it must match
@@ -85,10 +86,11 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 }
 
 // buildGate resolves opts into a *permission.Gate wrapping the read, write,
-// edit, and bash tools confined to opts.ProjectRoot (or os.Getwd() when
-// empty). read is pre-seeded to Allow so it never prompts; write, edit, and
-// bash fall through to DecisionAsk by default, resolved by opts.Prompter (or
-// permission.DenyPrompter{} when opts.Prompter is nil).
+// edit, bash, grep, and glob tools confined to opts.ProjectRoot (or
+// os.Getwd() when empty). read, grep, and glob are pre-seeded to Allow so
+// they never prompt; write, edit, and bash fall through to DecisionAsk by
+// default, resolved by opts.Prompter (or permission.DenyPrompter{} when
+// opts.Prompter is nil).
 func buildGate(opts Options) (*permission.Gate, error) {
 	rootDir := opts.ProjectRoot
 	if rootDir == "" {
@@ -109,8 +111,14 @@ func buildGate(opts Options) (*permission.Gate, error) {
 	reg.Register(fs.NewWrite(dir))
 	reg.Register(fs.NewEdit(dir))
 	reg.Register(bash.New(rootDir))
+	reg.Register(search.NewGrep(dir.FS()))
+	reg.Register(search.NewGlob(dir.FS()))
 
-	rules := []permission.Rule{{Decision: permission.DecisionAllow, Name: "read"}}
+	rules := []permission.Rule{
+		{Decision: permission.DecisionAllow, Name: "read"},
+		{Decision: permission.DecisionAllow, Name: "grep"},
+		{Decision: permission.DecisionAllow, Name: "glob"},
+	}
 	engine, err := permission.NewEngine(rules, permission.NewMemoryStore())
 	if err != nil {
 		return nil, fmt.Errorf("agent: %w", err)
