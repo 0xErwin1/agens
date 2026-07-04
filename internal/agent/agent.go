@@ -161,6 +161,31 @@ func BuildProvider(cfg config.Config, creds auth.File, opts Options) (provider.P
 	return buildProvider(providerID, cfg, creds, model)
 }
 
+// ResolveModel returns the effective model name BuildLoop would run for cfg,
+// creds, and opts, applying the same precedence — opts.Model, then
+// cfg.Provider.Model, then the selected provider's built-in default — without
+// building the loop or performing any I/O. It lets a surface display the real
+// model name (e.g. the TUI status bar) instead of a placeholder.
+func ResolveModel(cfg config.Config, creds auth.File, opts Options) (string, error) {
+	providerID, err := selectProviderID(cfg, creds)
+	if err != nil {
+		return "", err
+	}
+
+	model := opts.Model
+	if model == "" {
+		model = cfg.Provider.Model
+	}
+	if model == "" {
+		model = defaultModelFor(providerID)
+	}
+	if model == "" {
+		return "", errors.New("agent: no model configured")
+	}
+
+	return model, nil
+}
+
 // selectProviderID resolves which provider id BuildLoop should construct.
 // An explicit cfg.Provider.Type always wins and must name a known provider.
 // Otherwise the id is inferred from creds: a well-formed ChatGPT OAuth entry

@@ -10,13 +10,9 @@ import (
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
+	"github.com/iperez/agens/internal/permission"
 	"github.com/iperez/agens/internal/tui"
 )
-
-// defaultModelLabel is the status-line label used when no model can be
-// resolved from flags or config, standing in for the provider's built-in
-// default without asserting a specific name.
-const defaultModelLabel = "default"
 
 // tuiLoopBuilder resolves an agent.Options into a ready-to-run
 // *agentloop.Loop plus the model name to show in the status line. It is the
@@ -43,14 +39,25 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 		Long:  "Start the interactive terminal UI: a full-screen conversation view with a prompt input, streaming responses, and tool activity.",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			opts.Prompter = selectPrompter(allowAll)
+			// The TUI owns the terminal, so it cannot use the tty-reading
+			// prompter the chat command does: an interactive decision is
+			// routed through the Bubble Tea event loop as a modal instead.
+			// --dangerously-allow-all keeps its non-interactive AllowPrompter
+			// and installs no modal.
+			var prompter *tui.Prompter
+			if allowAll {
+				opts.Prompter = permission.AllowPrompter{}
+			} else {
+				prompter = tui.NewPrompter()
+				opts.Prompter = prompter
+			}
 
 			loop, modelName, err := build(opts)
 			if err != nil {
 				return err
 			}
 
-			return run(tui.New(loop, modelName))
+			return run(tui.New(loop, modelName, prompter))
 		},
 	}
 
@@ -79,12 +86,9 @@ func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, string, error) {
 		opts.ProjectRoot = loaded.ProjectRoot
 	}
 
-	modelName := opts.Model
-	if modelName == "" {
-		modelName = loaded.Config.Provider.Model
-	}
-	if modelName == "" {
-		modelName = defaultModelLabel
+	modelName, err := agent.ResolveModel(loaded.Config, creds, opts)
+	if err != nil {
+		return nil, "", fmt.Errorf("tui: %w", err)
 	}
 
 	loop, err := agent.BuildLoop(loaded.Config, creds, opts)

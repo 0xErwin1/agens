@@ -43,25 +43,40 @@ type Model struct {
 	events  <-chan tea.Msg
 	cancel  context.CancelFunc
 
+	// prompter routes tool-permission decisions into this event loop; it is
+	// nil when the caller pre-approved every call (--dangerously-allow-all),
+	// in which case no modal is ever shown. pending holds the request whose
+	// modal is currently on screen, or nil when none is.
+	prompter *Prompter
+	pending  *PermissionRequest
+
 	width, height int
 }
 
 var _ tea.Model = (*Model)(nil)
 
-// New constructs the root model for the given loop and display model name.
-func New(loop LoopRunner, modelName string) *Model {
+// New constructs the root model for the given loop and display model name. A
+// non-nil prompter installs the interactive permission modal; pass nil when
+// permission decisions are resolved without prompting.
+func New(loop LoopRunner, modelName string, prompter *Prompter) *Model {
 	return &Model{
 		input:     NewInput(),
 		status:    NewStatus(modelName),
 		messages:  NewMessages(),
 		loop:      loop,
 		modelName: modelName,
+		prompter:  prompter,
 	}
 }
 
-// Init focuses the input and returns its blink command.
+// Init focuses the input and, when an interactive prompter is installed,
+// starts listening for permission requests.
 func (m *Model) Init() tea.Cmd {
-	return m.input.Focus()
+	cmds := []tea.Cmd{m.input.Focus()}
+	if m.prompter != nil {
+		cmds = append(cmds, waitForPermission(m.prompter.Requests()))
+	}
+	return tea.Batch(cmds...)
 }
 
 // Update runs in two phases: it first dispatches on the message kind (layout,
@@ -78,7 +93,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.layout()
 
+	case PermissionRequestMsg:
+		req := msg.Request
+		m.pending = &req
+		m.layout()
+
 	case tea.KeyMsg:
+		if m.pending != nil {
+			swallow = true
+			cmds = append(cmds, m.handleModalKey(msg))
+			break
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			swallow = true
@@ -109,19 +134,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View stacks the conversation, status bar, and input vertically.
+// View stacks the conversation and status bar, then either the prompt input
+// or, while a tool awaits approval, the permission modal in its place.
 func (m *Model) View() string {
+	bottom := m.input.View()
+	if m.pending != nil {
+		bottom = renderPermission(m.pending.Call, m.width)
+	}
+
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.messages.View(),
 		m.status.View(),
-		m.input.View(),
+		bottom,
 	)
 }
 
-// layout distributes the current window size across the children: fixed
-// heights for the input and status bars, the remainder for the messages view.
+// layout distributes the current window size across the children: the status
+// bar is a fixed row, the bottom area is the input (or, while a permission
+// modal is shown, its taller footprint), and the messages view takes the
+// remainder.
 func (m *Model) layout() {
-	msgHeight := m.height - inputHeight - statusHeight
+	bottomHeight := inputHeight
+	if m.pending != nil {
+		bottomHeight = modalHeight
+	}
+
+	msgHeight := m.height - bottomHeight - statusHeight
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
@@ -129,6 +167,32 @@ func (m *Model) layout() {
 	m.messages.SetSize(m.width, msgHeight)
 	m.status.SetSize(m.width, statusHeight)
 	m.input.SetSize(m.width, inputHeight)
+}
+
+// handleModalKey resolves the on-screen permission modal from a keypress.
+// Ctrl+C cancels the whole turn (the loop goroutine's ctx cancellation
+// unblocks the prompter on its own); a bound answer key is sent back to the
+// waiting Prompt; unbound keys are ignored so the modal stays up. Either way
+// the messages view is restored to full height and the listener re-armed for
+// the next request.
+func (m *Model) handleModalKey(msg tea.KeyMsg) tea.Cmd {
+	if msg.Type == tea.KeyCtrlC {
+		m.abort()
+		m.pending = nil
+		m.layout()
+		return waitForPermission(m.prompter.Requests())
+	}
+
+	answer, ok := answerForModalKey(msg)
+	if !ok {
+		return nil
+	}
+
+	m.pending.Reply <- answer // buffered channel; never blocks
+	m.pending = nil
+	m.layout()
+
+	return waitForPermission(m.prompter.Requests())
 }
 
 // submit consumes the current input as a new user turn: it records the user
