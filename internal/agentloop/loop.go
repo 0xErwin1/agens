@@ -55,6 +55,12 @@ func WithModel(model string) Option {
 	}
 }
 
+// SetModel changes the model identifier sent on subsequent
+// provider.ChatRequests. Run reads the current value at the start of each
+// call, so it is safe to switch models between turns (for example from the
+// TUI's model selector). It does not affect a turn already in flight.
+func (l *Loop) SetModel(model string) { l.model = model }
+
 // WithMaxIterations overrides the default iteration limit. It panics if n is
 // less than 1, since a Loop that can never run a single iteration is a
 // programmer error, not a runtime condition.

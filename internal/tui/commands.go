@@ -20,8 +20,9 @@ type CommandContext interface {
 	NewConversation()
 	// Notify appends a muted, system-level note to the conversation.
 	Notify(text string)
-	// CurrentModel returns the active model's display name.
-	CurrentModel() string
+	// OpenModelSelector opens the interactive model selector, returning the
+	// command that fetches the catalog (or nil when unavailable).
+	OpenModelSelector() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
 }
@@ -118,23 +119,22 @@ func (r *CommandRegistry) Help() string {
 // self-contained closure over CommandContext; there is no central switch.
 func defaultCommands() *CommandRegistry {
 	return NewCommandRegistry(
-		Command{Name: "/new", Desc: "empezar un chat nuevo", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/new", Desc: "start a new chat", Run: func(ctx CommandContext) tea.Cmd {
 			ctx.NewConversation()
 			return nil
 		}},
-		Command{Name: "/clear", Desc: "limpiar la conversación", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/clear", Desc: "clear the conversation", Run: func(ctx CommandContext) tea.Cmd {
 			ctx.NewConversation()
 			return nil
 		}},
-		Command{Name: "/model", Desc: "mostrar el modelo actual", Run: func(ctx CommandContext) tea.Cmd {
-			ctx.Notify("modelo actual: " + ctx.CurrentModel())
-			return nil
+		Command{Name: "/model", Desc: "choose the model", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenModelSelector()
 		}},
-		Command{Name: "/help", Desc: "ver comandos y atajos", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/help", Desc: "show commands and shortcuts", Run: func(ctx CommandContext) tea.Cmd {
 			ctx.Notify(ctx.CommandHelp())
 			return nil
 		}},
-		Command{Name: "/quit", Desc: "salir de agens", Run: func(CommandContext) tea.Cmd {
+		Command{Name: "/quit", Desc: "quit agens", Run: func(CommandContext) tea.Cmd {
 			return tea.Quit
 		}},
 	)
@@ -143,11 +143,11 @@ func defaultCommands() *CommandRegistry {
 // keyBindingsHelp is the static key-binding section appended to /help.
 func keyBindingsHelp() string {
 	return strings.Join([]string{
-		"atajos:",
-		"  enter        enviar",
-		"  ctrl+c       cancelar turno / salir",
-		"  pgup / pgdn  scroll de la conversación",
-		"  esc          cerrar palette / rechazar permiso",
+		"shortcuts:",
+		"  enter        send",
+		"  ctrl+c       cancel turn / quit",
+		"  pgup / pgdn  scroll the conversation",
+		"  esc          close palette / deny permission",
 	}, "\n")
 }
 

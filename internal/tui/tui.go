@@ -11,6 +11,7 @@ import (
 
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
+	"github.com/iperez/agens/internal/provider"
 )
 
 // Layout dimensions. The input and status bars have fixed heights; the
@@ -60,6 +61,15 @@ type Model struct {
 	paletteItems []Command
 	paletteIdx   int
 
+	// lister fetches the model catalog for the selector; nil disables it. The
+	// remaining fields hold the selector's state while it is open.
+	lister          ModelLister
+	modelPickerOpen bool
+	modelItems      []provider.ModelInfo
+	modelIdx        int
+	modelLoading    bool
+	modelErr        error
+
 	width, height int
 }
 
@@ -70,8 +80,9 @@ var (
 
 // New constructs the root model for the given loop and display model name. A
 // non-nil prompter installs the interactive permission modal; pass nil when
-// permission decisions are resolved without prompting.
-func New(loop LoopRunner, modelName string, prompter *Prompter) *Model {
+// permission decisions are resolved without prompting. A non-nil lister
+// enables the /model selector; pass nil to disable it.
+func New(loop LoopRunner, modelName string, prompter *Prompter, lister ModelLister) *Model {
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	sp.Style = lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
 
@@ -84,6 +95,7 @@ func New(loop LoopRunner, modelName string, prompter *Prompter) *Model {
 		modelName: modelName,
 		prompter:  prompter,
 		commands:  defaultCommands(),
+		lister:    lister,
 	}
 }
 
@@ -133,6 +145,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.handleModalKey(msg))
 			break
 		}
+		if m.modelPickerOpen {
+			swallow = true
+			m.handleModelPickerKey(msg)
+			break
+		}
 		if m.showPalette {
 			if cmd, consumed := m.handlePaletteKey(msg); consumed {
 				swallow = true
@@ -152,6 +169,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			swallow = true
 			cmds = append(cmds, m.onEnter())
 		}
+
+	case modelsLoadedMsg:
+		m.modelLoading = false
+		m.modelErr = msg.err
+		m.modelItems = msg.models
+		m.modelIdx = indexOfModel(msg.models, m.modelName)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -199,6 +222,9 @@ func (m *Model) View() string {
 	switch {
 	case m.pending != nil:
 		return overlayAbove(base, renderPermission(m.pending.Call, m.width), inputRow)
+	case m.modelPickerOpen:
+		overlay := renderModelSelector(m.modelItems, m.modelIdx, m.modelLoading, m.modelErr, m.modelName, m.width)
+		return overlayAbove(base, overlay, inputRow)
 	case m.showPalette:
 		return overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.width), inputRow)
 	default:
@@ -300,7 +326,7 @@ func (m *Model) onEnter() tea.Cmd {
 
 		m.input.Reset()
 		m.closePalette()
-		m.messages.AddInfo("comando desconocido: " + value)
+		m.messages.AddInfo("unknown command: " + value)
 		m.layout()
 		return nil
 	}
@@ -386,13 +412,85 @@ func (m *Model) NewConversation() {
 // Notify implements CommandContext: it appends a system note to the view.
 func (m *Model) Notify(text string) { m.messages.AddInfo(text) }
 
-// CurrentModel implements CommandContext.
-func (m *Model) CurrentModel() string { return m.modelName }
+// OpenModelSelector implements CommandContext: it opens the model selector and
+// starts fetching the catalog, or reports that no lister is wired.
+func (m *Model) OpenModelSelector() tea.Cmd {
+	if m.lister == nil {
+		m.messages.AddInfo("model selector unavailable")
+		return nil
+	}
+
+	m.modelPickerOpen = true
+	m.modelLoading = true
+	m.modelErr = nil
+	m.modelItems = nil
+	m.modelIdx = 0
+
+	return loadModelsCmd(m.lister)
+}
+
+// handleModelPickerKey handles a keypress while the model selector is open:
+// Up/Down and Tab/Shift+Tab cycle the selection (wrapping), Enter switches to
+// the highlighted model, and Esc closes without changing anything. Keys are
+// ignored while the catalog is still loading or empty.
+func (m *Model) handleModelPickerKey(msg tea.KeyMsg) {
+	if msg.Type == tea.KeyEsc {
+		m.closeModelPicker()
+		return
+	}
+
+	n := len(m.modelItems)
+	if n == 0 {
+		return
+	}
+
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.modelIdx = (m.modelIdx - 1 + n) % n
+
+	case tea.KeyDown, tea.KeyTab:
+		m.modelIdx = (m.modelIdx + 1) % n
+
+	case tea.KeyEnter:
+		m.selectModel(m.modelItems[m.modelIdx])
+	}
+}
+
+// selectModel switches the active model on the loop and status bar, closes the
+// selector, and notes the change in the conversation.
+func (m *Model) selectModel(info provider.ModelInfo) {
+	m.loop.SetModel(info.ID)
+	m.modelName = info.ID
+	m.status.SetModel(info.ID)
+
+	m.closeModelPicker()
+	m.messages.AddInfo("switched model to " + info.ID)
+}
+
+// closeModelPicker hides the selector and clears its state.
+func (m *Model) closeModelPicker() {
+	m.modelPickerOpen = false
+	m.modelLoading = false
+	m.modelErr = nil
+	m.modelItems = nil
+	m.modelIdx = 0
+}
+
+// indexOfModel returns the index of the model whose ID equals current, or 0
+// when there is no match, so the selector opens on the active model.
+func indexOfModel(models []provider.ModelInfo, current string) int {
+	for i, info := range models {
+		if info.ID == current {
+			return i
+		}
+	}
+	return 0
+}
 
 // CommandHelp implements CommandContext: the command list from the registry
 // followed by the static key-binding section.
 func (m *Model) CommandHelp() string {
-	return "comandos:\n" + m.commands.Help() + "\n\n" + keyBindingsHelp()
+	return "commands:\n" + m.commands.Help() + "\n\n" + keyBindingsHelp()
 }
 
 // closePalette hides the palette and resets its selection.

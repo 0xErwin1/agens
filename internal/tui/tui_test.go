@@ -22,7 +22,7 @@ func sendMsg(m *Model, msg tea.Msg) tea.Cmd {
 }
 
 func sized(loop LoopRunner, modelName string) *Model {
-	m := New(loop, modelName, nil)
+	m := New(loop, modelName, nil, nil)
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return m
 }

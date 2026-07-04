@@ -124,14 +124,14 @@ func TestModel_ClearCommandResetsConversation(t *testing.T) {
 	}
 }
 
-func TestModel_ModelCommandReportsCurrentModel(t *testing.T) {
-	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+func TestModel_ModelCommandWithoutListerReportsUnavailable(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // sized() wires no lister
 
 	typeString(m, "/model")
 	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
 
-	if !strings.Contains(stripANSI(m.View()), "modelo actual: gpt-5.5") {
-		t.Fatalf("View() = %q, want /model to report the current model", stripANSI(m.View()))
+	if !strings.Contains(stripANSI(m.View()), "unavailable") {
+		t.Fatalf("View() = %q, want /model to report the selector is unavailable without a lister", stripANSI(m.View()))
 	}
 }
 
@@ -144,7 +144,7 @@ func TestModel_UnknownCommandReportsError(t *testing.T) {
 	}
 	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
 
-	if !strings.Contains(stripANSI(m.View()), "comando desconocido") {
+	if !strings.Contains(stripANSI(m.View()), "unknown command") {
 		t.Fatalf("View() = %q, want an unknown-command note", stripANSI(m.View()))
 	}
 }

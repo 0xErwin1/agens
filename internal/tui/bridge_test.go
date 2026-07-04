@@ -21,9 +21,12 @@ type scriptedLoopRunner struct {
 	err     error
 
 	receivedHistory []message.Message
+	model           string
 }
 
 var _ LoopRunner = (*scriptedLoopRunner)(nil)
+
+func (r *scriptedLoopRunner) SetModel(id string) { r.model = id }
 
 func (r *scriptedLoopRunner) Run(_ context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error) {
 	r.receivedHistory = history

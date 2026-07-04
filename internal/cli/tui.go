@@ -15,10 +15,11 @@ import (
 )
 
 // tuiLoopBuilder resolves an agent.Options into a ready-to-run
-// *agentloop.Loop plus the model name to show in the status line. It is the
-// dependency-injection seam that lets tests exercise the command against a
-// fake provider without touching config, auth, or the network.
-type tuiLoopBuilder func(opts agent.Options) (*agentloop.Loop, string, error)
+// *agentloop.Loop, a model lister for the /model selector, and the model name
+// to show in the status line. It is the dependency-injection seam that lets
+// tests exercise the command against a fake provider without touching config,
+// auth, or the network.
+type tuiLoopBuilder func(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error)
 
 // tuiRunner starts the interactive program for the given root model. It is a
 // second seam, distinct from the builder, so tests can verify the command
@@ -52,12 +53,12 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 				opts.Prompter = prompter
 			}
 
-			loop, modelName, err := build(opts)
+			loop, lister, modelName, err := build(opts)
 			if err != nil {
 				return err
 			}
 
-			return run(tui.New(loop, modelName, prompter))
+			return run(tui.New(loop, modelName, prompter, lister))
 		},
 	}
 
@@ -69,17 +70,17 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 }
 
 // defaultBuildTUI is the production tuiLoopBuilder: it loads config and
-// credentials from disk, resolves the display model name, and delegates to
-// agent.BuildLoop (mirrors chat.go's defaultBuildLoop).
-func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, string, error) {
+// credentials from disk, resolves the display model name, and builds both the
+// agent loop and the provider that backs the /model selector's listing.
+func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
 	loaded, err := config.Load()
 	if err != nil {
-		return nil, "", fmt.Errorf("tui: load config: %w", err)
+		return nil, nil, "", fmt.Errorf("tui: load config: %w", err)
 	}
 
 	creds, err := auth.Load(auth.DefaultPath())
 	if err != nil {
-		return nil, "", fmt.Errorf("tui: %w", err)
+		return nil, nil, "", fmt.Errorf("tui: %w", err)
 	}
 
 	if opts.ProjectRoot == "" {
@@ -88,15 +89,20 @@ func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, string, error) {
 
 	modelName, err := agent.ResolveModel(loaded.Config, creds, opts)
 	if err != nil {
-		return nil, "", fmt.Errorf("tui: %w", err)
+		return nil, nil, "", fmt.Errorf("tui: %w", err)
 	}
 
 	loop, err := agent.BuildLoop(loaded.Config, creds, opts)
 	if err != nil {
-		return nil, "", fmt.Errorf("tui: %w", err)
+		return nil, nil, "", fmt.Errorf("tui: %w", err)
 	}
 
-	return loop, modelName, nil
+	lister, err := agent.BuildProvider(loaded.Config, creds, opts)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("tui: %w", err)
+	}
+
+	return loop, lister, modelName, nil
 }
 
 // defaultRunTUI starts the Bubble Tea program on the alternate screen. Bubble

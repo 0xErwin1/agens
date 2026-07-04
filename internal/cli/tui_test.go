@@ -11,6 +11,7 @@ import (
 	"github.com/iperez/agens/internal/agent"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/permission"
+	"github.com/iperez/agens/internal/tui"
 )
 
 // stubTUILoop builds a throwaway loop from a fake provider so the builder seam
@@ -22,9 +23,9 @@ func stubTUILoop() *agentloop.Loop {
 
 func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 	var received agent.Options
-	build := func(opts agent.Options) (*agentloop.Loop, string, error) {
+	build := func(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
 		received = opts
-		return stubTUILoop(), "gpt-test", nil
+		return stubTUILoop(), nil, "gpt-test", nil
 	}
 
 	var ranModel tea.Model
@@ -55,9 +56,9 @@ func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 
 func TestTUICommand_DangerouslyAllowAllSelectsAllowPrompter(t *testing.T) {
 	var received agent.Options
-	build := func(opts agent.Options) (*agentloop.Loop, string, error) {
+	build := func(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
 		received = opts
-		return stubTUILoop(), "gpt-test", nil
+		return stubTUILoop(), nil, "gpt-test", nil
 	}
 	run := func(tea.Model) error { return nil }
 
@@ -77,9 +78,9 @@ func TestTUICommand_DangerouslyAllowAllSelectsAllowPrompter(t *testing.T) {
 
 func TestTUICommand_DefaultPrompterIsNotAllowPrompter(t *testing.T) {
 	var received agent.Options
-	build := func(opts agent.Options) (*agentloop.Loop, string, error) {
+	build := func(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
 		received = opts
-		return stubTUILoop(), "gpt-test", nil
+		return stubTUILoop(), nil, "gpt-test", nil
 	}
 	run := func(tea.Model) error { return nil }
 
@@ -98,8 +99,8 @@ func TestTUICommand_DefaultPrompterIsNotAllowPrompter(t *testing.T) {
 }
 
 func TestTUICommand_BuilderErrorPropagatesAndSkipsRun(t *testing.T) {
-	build := func(agent.Options) (*agentloop.Loop, string, error) {
-		return nil, "", errors.New("tui: no credentials found")
+	build := func(agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
+		return nil, nil, "", errors.New("tui: no credentials found")
 	}
 
 	ran := false

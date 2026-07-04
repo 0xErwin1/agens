@@ -39,6 +39,9 @@ var _ Component = (*Status)(nil)
 // "error: <msg>").
 func (s *Status) SetState(state string) { s.state = state }
 
+// SetModel replaces the model segment, used when the model is switched live.
+func (s *Status) SetModel(model string) { s.model = model }
+
 // SetSpinner sets the animated spinner frame shown before the state segment
 // while a turn is in flight. An empty frame hides it.
 func (s *Status) SetSpinner(frame string) { s.spinner = frame }
