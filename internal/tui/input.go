@@ -10,25 +10,32 @@ import (
 // inputPlaceholder is shown in the prompt area before the user types.
 const inputPlaceholder = "Ask agens…"
 
-// Input is the prompt component: a thin wrapper over a bubbles textarea that
-// exposes only the operations the root model needs. The root intercepts Enter
-// for submit, so the textarea itself never has to treat Enter as a newline.
+// inputBorderRows and inputBorderCols are the rows/columns the surrounding
+// rounded border and its horizontal padding consume, subtracted when sizing
+// the inner textarea so the framed input fits its allotted space.
+const (
+	inputBorderRows = 2 // top and bottom border
+	inputBorderCols = 4 // left/right border (2) + horizontal padding (2)
+)
+
+// Input is the prompt component: a bubbles textarea wrapped in a rounded
+// border so the prompt reads as a clearly delimited box. The root intercepts
+// Enter for submit, so the textarea itself never has to treat Enter as a
+// newline.
 type Input struct {
-	ta textarea.Model
+	ta    textarea.Model
+	width int
 }
 
 // NewInput constructs a focused, single-purpose prompt input with the agens
 // placeholder. It is focused on construction so the caller can immediately
-// return the blink command from the model's Init. The textarea's built-in
-// left prompt bar is recolored to the accent so it reads as opencode's input.
+// return the blink command from the model's Init. The textarea's own prompt
+// bar is disabled; the surrounding border provides the framing instead.
 func NewInput() *Input {
 	ta := textarea.New()
 	ta.Placeholder = inputPlaceholder
 	ta.ShowLineNumbers = false
-
-	bar := lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
-	ta.FocusedStyle.Prompt = bar
-	ta.BlurredStyle.Prompt = bar
+	ta.Prompt = ""
 
 	// Word-wise navigation on Ctrl+arrows, in addition to the textarea's
 	// default Alt+arrows, matching common terminal editors.
@@ -75,14 +82,34 @@ func (i *Input) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return i, cmd
 }
 
-// View renders the prompt input. The accent-colored left bar is the
-// textarea's own prompt, so no extra framing is added here.
-func (i *Input) View() string { return i.ta.View() }
+// View renders the prompt input inside a rounded, accent-colored border that
+// spans the full width, so the prompt is clearly delimited.
+func (i *Input) View() string {
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(CurrentTheme().Accent()).
+		Padding(0, 1)
+	if i.width > inputBorderRows {
+		box = box.Width(i.width - inputBorderRows) // border adds the remaining columns
+	}
 
-// SetSize sizes the textarea to the given width and height. The textarea
-// reserves room for its own prompt bar internally, so the full width is passed
-// through.
+	return box.Render(i.ta.View())
+}
+
+// SetSize sizes the inner textarea to fit within the border and padding of the
+// framed input.
 func (i *Input) SetSize(width, height int) {
-	i.ta.SetWidth(width)
-	i.ta.SetHeight(height)
+	i.width = width
+
+	innerWidth := width - inputBorderCols
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	innerHeight := height - inputBorderRows
+	if innerHeight < 1 {
+		innerHeight = 1
+	}
+
+	i.ta.SetWidth(innerWidth)
+	i.ta.SetHeight(innerHeight)
 }
