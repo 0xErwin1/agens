@@ -17,6 +17,7 @@ func NewRootCommand() *cobra.Command {
 	}
 
 	cmd.Version = version.Info()
+	cmd.AddCommand(newAuthCommand())
 	cmd.AddCommand(newConfigCommand())
 	cmd.AddCommand(newChatCommand())
 	return cmd
