@@ -7,11 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/permission"
+	"github.com/iperez/agens/internal/provider/chatgpt"
+	"github.com/iperez/agens/internal/provider/openai"
 )
 
 func validConfig() config.Config {
@@ -24,6 +27,21 @@ func validConfig() config.Config {
 func validCreds() auth.File {
 	return auth.File{
 		defaultProviderID: {APIKey: "sk-test-key"},
+	}
+}
+
+// chatgptCreds returns an auth.File with a well-formed ChatGPT OAuth entry:
+// a non-expired access token plus a refresh token, which is what
+// selectProviderID requires to infer the chatgpt provider.
+func chatgptCreds() auth.File {
+	expiresAt := time.Now().Add(time.Hour)
+	return auth.File{
+		chatgptProviderID: {
+			AccessToken:  "access-token",
+			RefreshToken: "refresh-token",
+			AccountID:    "acct_123",
+			ExpiresAt:    &expiresAt,
+		},
 	}
 }
 
@@ -54,7 +72,7 @@ func TestBuildLoop_ModelPrecedence(t *testing.T) {
 	}{
 		{name: "opts overrides cfg", optsModel: "opt-model", cfgModel: "cfg-model", wantErr: false},
 		{name: "falls back to cfg when opts empty", optsModel: "", cfgModel: "cfg-model", wantErr: false},
-		{name: "errors when both empty", optsModel: "", cfgModel: "", wantErr: true},
+		{name: "falls back to provider default when both empty", optsModel: "", cfgModel: "", wantErr: false},
 	}
 
 	for _, tt := range tests {
@@ -121,8 +139,8 @@ func TestBuildLoop_MissingAPIKeyErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("BuildLoop() error = nil, want an error for missing credentials")
 	}
-	if !strings.Contains(err.Error(), defaultProviderID) {
-		t.Fatalf("BuildLoop() error = %q, want it to name provider %q", err.Error(), defaultProviderID)
+	if !strings.Contains(err.Error(), "no credentials found") {
+		t.Fatalf("BuildLoop() error = %q, want it to mention %q", err.Error(), "no credentials found")
 	}
 }
 
@@ -135,8 +153,8 @@ func TestBuildLoop_EmptyAPIKeyErrors(t *testing.T) {
 	if err == nil {
 		t.Fatal("BuildLoop() error = nil, want an error for an empty api_key")
 	}
-	if !strings.Contains(err.Error(), defaultProviderID) {
-		t.Fatalf("BuildLoop() error = %q, want it to name provider %q", err.Error(), defaultProviderID)
+	if !strings.Contains(err.Error(), "no credentials found") {
+		t.Fatalf("BuildLoop() error = %q, want it to mention %q", err.Error(), "no credentials found")
 	}
 }
 
@@ -152,6 +170,176 @@ func TestBuildLoop_ErrorsNeverLeakAPIKeyValue(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("BuildLoop() error = %q, must never contain a raw api_key value", err.Error())
+	}
+}
+
+func TestBuildLoop_APIKeyOnlyCreds_FallsBackToOpenAIDefaultModel(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Model = ""
+
+	opts := validOptions(t)
+	loop, err := BuildLoop(cfg, validCreds(), opts)
+	if err != nil {
+		t.Fatalf("BuildLoop() error = %v, want nil", err)
+	}
+	if loop == nil {
+		t.Fatal("BuildLoop() loop = nil, want non-nil")
+	}
+}
+
+func TestBuildLoop_ChatGPTOnlyCreds_Success(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Model = ""
+
+	loop, err := BuildLoop(cfg, chatgptCreds(), validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildLoop() error = %v, want nil", err)
+	}
+	if loop == nil {
+		t.Fatal("BuildLoop() loop = nil, want non-nil")
+	}
+}
+
+func TestBuildLoop_ExplicitTypeOverridesInference(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Type = chatgptProviderID
+	cfg.Provider.Model = ""
+
+	// validCreds() only has an "openai-api" entry: without the explicit
+	// Type override this would infer "openai-api" and fail to find a
+	// ChatGPT entry to build with, proving Type actually took effect.
+	creds := chatgptCreds()
+
+	loop, err := BuildLoop(cfg, creds, validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildLoop() error = %v, want nil", err)
+	}
+	if loop == nil {
+		t.Fatal("BuildLoop() loop = nil, want non-nil")
+	}
+}
+
+func TestBuildLoop_BothEntriesPresent_ChatGPTWinsTiebreak(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Model = ""
+
+	creds := validCreds()
+	for k, v := range chatgptCreds() {
+		creds[k] = v
+	}
+
+	loop, err := BuildLoop(cfg, creds, validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildLoop() error = %v, want nil", err)
+	}
+	if loop == nil {
+		t.Fatal("BuildLoop() loop = nil, want non-nil")
+	}
+}
+
+func TestBuildLoop_UnknownProviderTypeErrors(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Type = "some-other-provider"
+
+	_, err := BuildLoop(cfg, validCreds(), validOptions(t))
+	if err == nil {
+		t.Fatal("BuildLoop() error = nil, want an error for an unknown provider type")
+	}
+	if !strings.Contains(err.Error(), "unknown provider type") {
+		t.Fatalf("BuildLoop() error = %q, want it to mention %q", err.Error(), "unknown provider type")
+	}
+	if !strings.Contains(err.Error(), "some-other-provider") {
+		t.Fatalf("BuildLoop() error = %q, want it to name the unknown type", err.Error())
+	}
+}
+
+func TestSelectProviderID(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfgType string
+		creds   auth.File
+		want    string
+		wantErr string
+	}{
+		{name: "explicit type wins", cfgType: chatgptProviderID, creds: validCreds(), want: chatgptProviderID},
+		{name: "infers api-key from creds", creds: validCreds(), want: defaultProviderID},
+		{name: "infers chatgpt from creds", creds: chatgptCreds(), want: chatgptProviderID},
+		{name: "no credentials errors", creds: auth.File{}, wantErr: "no credentials found"},
+		{name: "unknown explicit type errors", cfgType: "bogus", creds: validCreds(), wantErr: "unknown provider type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Provider.Type = tt.cfgType
+
+			got, err := selectProviderID(cfg, tt.creds)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("selectProviderID() error = %v, want it to contain %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("selectProviderID() error = %v, want nil", err)
+			}
+			if got != tt.want {
+				t.Fatalf("selectProviderID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSelectProviderID_PartialChatGPTCredsNeverSelectsChatGPT locks the
+// invariant that selectProviderID only infers chatgptProviderID when BOTH
+// AccessToken and RefreshToken are present: a half-populated entry (e.g. an
+// access token that survived a failed refresh, or a refresh token before the
+// first exchange) must never win the tiebreak over a usable api-key entry,
+// and must never be reported as a usable credential on its own.
+func TestSelectProviderID_PartialChatGPTCredsNeverSelectsChatGPT(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry auth.Entry
+	}{
+		{name: "access token only", entry: auth.Entry{AccessToken: "access-token"}},
+		{name: "refresh token only", entry: auth.Entry{RefreshToken: "refresh-token"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name+"/falls back to api-key when present", func(t *testing.T) {
+			creds := auth.File{
+				chatgptProviderID: tt.entry,
+				defaultProviderID: {APIKey: "sk-test-key"},
+			}
+
+			got, err := selectProviderID(validConfig(), creds)
+			if err != nil {
+				t.Fatalf("selectProviderID() error = %v, want nil", err)
+			}
+			if got != defaultProviderID {
+				t.Fatalf("selectProviderID() = %q, want %q (a partial chatgpt entry must never win the tiebreak)", got, defaultProviderID)
+			}
+		})
+
+		t.Run(tt.name+"/errors when no api-key entry exists", func(t *testing.T) {
+			creds := auth.File{
+				chatgptProviderID: tt.entry,
+			}
+
+			_, err := selectProviderID(validConfig(), creds)
+			if err == nil || !strings.Contains(err.Error(), "no credentials found") {
+				t.Fatalf("selectProviderID() error = %v, want it to contain %q", err, "no credentials found")
+			}
+		})
+	}
+}
+
+func TestDefaultModelFor(t *testing.T) {
+	if got := defaultModelFor(defaultProviderID); got != openai.DefaultModel {
+		t.Fatalf("defaultModelFor(%q) = %q, want %q", defaultProviderID, got, openai.DefaultModel)
+	}
+	if got := defaultModelFor(chatgptProviderID); got != chatgpt.DefaultModel {
+		t.Fatalf("defaultModelFor(%q) = %q, want %q", chatgptProviderID, got, chatgpt.DefaultModel)
 	}
 }
 
@@ -366,6 +554,60 @@ func TestBuildGate_WebfetchAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
 	}
 	if len(fp.calls) != 1 {
 		t.Fatalf("prompter was consulted %d time(s) for a webfetch call, want exactly 1 (webfetch must resolve to Ask, no seeded rule)", len(fp.calls))
+	}
+}
+
+// TestPersistChatGPTEntry_PreservesOtherProviderEntries proves persistChatGPTEntry's
+// load-modify-save round trip never drops a sibling provider's entry: a
+// live token refresh for openai-chatgpt must not silently erase an
+// already-configured openai-api credential in the same file.
+func TestPersistChatGPTEntry_PreservesOtherProviderEntries(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENS_CONFIG_HOME", dir)
+
+	seed := auth.File{
+		defaultProviderID: {APIKey: "sk-existing-key"},
+	}
+	if err := auth.Save(auth.DefaultPath(), seed); err != nil {
+		t.Fatalf("seed auth.Save() error = %v, want nil", err)
+	}
+
+	refreshed := auth.Entry{AccessToken: "new-access", RefreshToken: "new-refresh"}
+	if err := persistChatGPTEntry(refreshed); err != nil {
+		t.Fatalf("persistChatGPTEntry() error = %v, want nil", err)
+	}
+
+	got, err := auth.Load(auth.DefaultPath())
+	if err != nil {
+		t.Fatalf("auth.Load() error = %v, want nil", err)
+	}
+	if got[defaultProviderID].APIKey != "sk-existing-key" {
+		t.Fatalf("got[%q].APIKey = %q, want the pre-existing entry preserved", defaultProviderID, got[defaultProviderID].APIKey)
+	}
+	if got[chatgptProviderID] != refreshed {
+		t.Fatalf("got[%q] = %+v, want %+v", chatgptProviderID, got[chatgptProviderID], refreshed)
+	}
+}
+
+// TestPersistChatGPTEntry_WritesEvenWhenNoExistingFile proves a missing (or
+// unreadable) credentials file never blocks persisting a refreshed token:
+// persistChatGPTEntry falls back to an empty auth.File and still writes the
+// refreshed entry, instead of losing it.
+func TestPersistChatGPTEntry_WritesEvenWhenNoExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENS_CONFIG_HOME", dir)
+
+	refreshed := auth.Entry{AccessToken: "new-access", RefreshToken: "new-refresh"}
+	if err := persistChatGPTEntry(refreshed); err != nil {
+		t.Fatalf("persistChatGPTEntry() error = %v, want nil", err)
+	}
+
+	got, err := auth.Load(auth.DefaultPath())
+	if err != nil {
+		t.Fatalf("auth.Load() error = %v, want nil", err)
+	}
+	if got[chatgptProviderID] != refreshed {
+		t.Fatalf("got[%q] = %+v, want %+v", chatgptProviderID, got[chatgptProviderID], refreshed)
 	}
 }
 

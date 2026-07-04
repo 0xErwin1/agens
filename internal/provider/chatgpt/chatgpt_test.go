@@ -1,4 +1,4 @@
-package openai
+package chatgpt
 
 import (
 	"context"
@@ -16,16 +16,10 @@ import (
 
 var _ provider.Provider = (*Provider)(nil)
 
-func TestDefaultModelConstant(t *testing.T) {
-	if DefaultModel != "gpt-4.1" {
-		t.Fatalf("DefaultModel = %q, want %q", DefaultModel, "gpt-4.1")
-	}
-}
-
 func newTestProvider(t *testing.T, baseURL string, auth provider.Authenticator) provider.Provider {
 	t.Helper()
 
-	p, err := New(provider.Config{BaseURL: baseURL, Model: "gpt-4o"}, auth)
+	p, err := New(provider.Config{BaseURL: baseURL, Model: "gpt-5-codex"}, auth)
 	if err != nil {
 		t.Fatalf("New() error = %v, want nil", err)
 	}
@@ -40,12 +34,7 @@ func TestNewRejectsNilAuthenticator(t *testing.T) {
 }
 
 func TestNewDefaultsBaseURL(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-
-	p, err := New(provider.Config{}, auth)
+	p, err := New(provider.Config{}, &stubAuthenticator{validReturn: true})
 	if err != nil {
 		t.Fatalf("New() error = %v, want nil", err)
 	}
@@ -54,18 +43,13 @@ func TestNewDefaultsBaseURL(t *testing.T) {
 	if !ok {
 		t.Fatalf("New() returned %T, want *Provider", p)
 	}
-	if impl.baseURL != "https://api.openai.com/v1" {
-		t.Fatalf("baseURL = %q, want %q", impl.baseURL, "https://api.openai.com/v1")
+	if impl.baseURL != "https://chatgpt.com/backend-api/codex" {
+		t.Fatalf("baseURL = %q, want %q", impl.baseURL, "https://chatgpt.com/backend-api/codex")
 	}
 }
 
 func TestNewTrimsTrailingSlashFromBaseURL(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-
-	p, err := New(provider.Config{BaseURL: "https://example.com/v1/"}, auth)
+	p, err := New(provider.Config{BaseURL: "https://example.com/codex/"}, &stubAuthenticator{validReturn: true})
 	if err != nil {
 		t.Fatalf("New() error = %v, want nil", err)
 	}
@@ -74,29 +58,36 @@ func TestNewTrimsTrailingSlashFromBaseURL(t *testing.T) {
 	if !ok {
 		t.Fatalf("New() returned %T, want *Provider", p)
 	}
-	if impl.baseURL != "https://example.com/v1" {
-		t.Fatalf("baseURL = %q, want %q", impl.baseURL, "https://example.com/v1")
+	if impl.baseURL != "https://example.com/codex" {
+		t.Fatalf("baseURL = %q, want %q", impl.baseURL, "https://example.com/codex")
+	}
+}
+
+func TestNewAssignsSessionIDOncePerProvider(t *testing.T) {
+	p, err := New(provider.Config{}, &stubAuthenticator{validReturn: true})
+	if err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
+	}
+
+	impl, ok := p.(*Provider)
+	if !ok {
+		t.Fatalf("New() returned %T, want *Provider", p)
+	}
+	if impl.sessionID == "" {
+		t.Fatal("sessionID = \"\", want a non-empty value assigned by New")
 	}
 }
 
 func TestProviderID(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p := newTestProvider(t, "", auth)
+	p := newTestProvider(t, "", &stubAuthenticator{validReturn: true})
 
-	if got := p.ID(); got != "openai-api" {
-		t.Fatalf("ID() = %q, want %q", got, "openai-api")
+	if got := p.ID(); got != "openai-chatgpt" {
+		t.Fatalf("ID() = %q, want %q", got, "openai-chatgpt")
 	}
 }
 
-func TestProviderModelsReturnsStaticCatalog(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p := newTestProvider(t, "", auth)
+func TestProviderModelsReturnsCatalogContainingDefaultModel(t *testing.T) {
+	p := newTestProvider(t, "", &stubAuthenticator{validReturn: true})
 
 	models, err := p.Models(context.Background())
 	if err != nil {
@@ -106,54 +97,21 @@ func TestProviderModelsReturnsStaticCatalog(t *testing.T) {
 		t.Fatal("Models() returned empty slice, want non-empty")
 	}
 
-	wantIDs := map[string]bool{
-		"gpt-4.1":      false,
-		"gpt-4.1-mini": false,
-		"gpt-4o":       false,
-		"o4-mini":      false,
-	}
+	found := false
 	for _, m := range models {
-		if m.ID == "" {
-			t.Fatalf("Models() contains entry with empty ID: %+v", m)
-		}
-		if _, known := wantIDs[m.ID]; known {
-			wantIDs[m.ID] = true
-		}
-		if !m.SupportsTools {
-			t.Fatalf("Models() entry %q SupportsTools = false, want true", m.ID)
+		if m.ID == DefaultModel {
+			found = true
 		}
 	}
-	for id, found := range wantIDs {
-		if !found {
-			t.Fatalf("Models() missing expected entry %q", id)
-		}
-	}
-}
-
-func TestProviderModelsReturnsIndependentCopy(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p := newTestProvider(t, "", auth)
-
-	first, err := p.Models(context.Background())
-	if err != nil {
-		t.Fatalf("Models() error = %v, want nil", err)
-	}
-	first[0].ID = "mutated"
-
-	second, err := p.Models(context.Background())
-	if err != nil {
-		t.Fatalf("Models() error = %v, want nil", err)
-	}
-	if second[0].ID == "mutated" {
-		t.Fatal("Models() shares backing array across calls, want independent copies")
+	if !found {
+		t.Fatalf("Models() = %+v, want an entry with ID %q", models, DefaultModel)
 	}
 }
 
 // stubAuthenticator records whether Valid/Refresh/Decorate were invoked, and
-// lets tests force Valid to report false to exercise the D8 Refresh path.
+// lets tests force Valid to report false to exercise the lazy Refresh path.
+// Decorate sets both a Bearer token and a ChatGPT-Account-ID header, mirroring
+// the two credential pieces a real ChatGPT-backed authenticator attaches.
 type stubAuthenticator struct {
 	validReturn bool
 	refreshErr  error
@@ -164,6 +122,7 @@ type stubAuthenticator struct {
 func (s *stubAuthenticator) Decorate(_ context.Context, req *http.Request) error {
 	s.decorated = true
 	req.Header.Set("Authorization", "Bearer stub-token")
+	req.Header.Set("ChatGPT-Account-ID", "acct_stub")
 	return nil
 }
 
@@ -185,32 +144,29 @@ func chatRequestFixture() provider.ChatRequest {
 }
 
 func TestStreamSendsExpectedRequestShape(t *testing.T) {
-	var gotMethod, gotPath, gotContentType, gotAccept, gotAuth string
-	var gotBody map[string]any
+	var gotMethod, gotPath, gotContentType, gotAccept, gotOriginator, gotUserAgent, gotSessionID, gotBeta, gotAuth, gotAccountID string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod = r.Method
 		gotPath = r.URL.Path
 		gotContentType = r.Header.Get("Content-Type")
 		gotAccept = r.Header.Get("Accept")
+		gotOriginator = r.Header.Get("originator")
+		gotUserAgent = r.Header.Get("User-Agent")
+		gotSessionID = r.Header.Get("session-id")
+		gotBeta = r.Header.Get("OpenAI-Beta")
 		gotAuth = r.Header.Get("Authorization")
-
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read request body: %v", err)
-		}
-		if err := json.Unmarshal(body, &gotBody); err != nil {
-			t.Fatalf("unmarshal request body: %v", err)
-		}
+		gotAccountID = r.Header.Get("ChatGPT-Account-ID")
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte(sseScript(`data: {"type":"response.completed","response":{}}`)))
 	}))
 	defer server.Close()
 
 	auth := &stubAuthenticator{validReturn: true}
 	p := newTestProvider(t, server.URL, auth)
+	impl := p.(*Provider)
 
 	reader, err := p.Stream(context.Background(), chatRequestFixture())
 	if err != nil {
@@ -221,8 +177,8 @@ func TestStreamSendsExpectedRequestShape(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Fatalf("method = %q, want %q", gotMethod, http.MethodPost)
 	}
-	if gotPath != "/chat/completions" {
-		t.Fatalf("path = %q, want %q", gotPath, "/chat/completions")
+	if gotPath != "/responses" {
+		t.Fatalf("path = %q, want %q", gotPath, "/responses")
 	}
 	if gotContentType != "application/json" {
 		t.Fatalf("Content-Type = %q, want %q", gotContentType, "application/json")
@@ -230,8 +186,23 @@ func TestStreamSendsExpectedRequestShape(t *testing.T) {
 	if gotAccept != "text/event-stream" {
 		t.Fatalf("Accept = %q, want %q", gotAccept, "text/event-stream")
 	}
+	if gotOriginator != "codex_cli_rs" {
+		t.Fatalf("originator = %q, want %q", gotOriginator, "codex_cli_rs")
+	}
+	if gotUserAgent == "" {
+		t.Fatal("User-Agent header is empty, want a codex-style value")
+	}
+	if gotSessionID != impl.sessionID {
+		t.Fatalf("session-id = %q, want the provider's sessionID %q", gotSessionID, impl.sessionID)
+	}
+	if gotBeta != "" {
+		t.Fatalf("OpenAI-Beta header = %q, want it absent", gotBeta)
+	}
 	if gotAuth != "Bearer stub-token" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer stub-token")
+	}
+	if gotAccountID != "acct_stub" {
+		t.Fatalf("ChatGPT-Account-ID = %q, want %q", gotAccountID, "acct_stub")
 	}
 	if !auth.decorated {
 		t.Fatal("Decorate() was not called")
@@ -239,16 +210,13 @@ func TestStreamSendsExpectedRequestShape(t *testing.T) {
 	if auth.refreshed {
 		t.Fatal("Refresh() was called even though Valid() returned true")
 	}
-	if stream, _ := gotBody["stream"].(bool); !stream {
-		t.Fatalf("request body stream = %v, want true", gotBody["stream"])
-	}
 }
 
 func TestStreamRefreshesExpiredCredentialBeforeDecorate(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte(sseScript(`data: {"type":"response.completed","response":{}}`)))
 	}))
 	defer server.Close()
 
@@ -270,11 +238,10 @@ func TestStreamRefreshesExpiredCredentialBeforeDecorate(t *testing.T) {
 }
 
 func TestStreamDrainsCannedSSEScriptThroughStreamReader(t *testing.T) {
-	script := "" +
-		"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
-		"data: [DONE]\n\n"
+	script := sseScript(
+		`data: {"type":"response.output_text.delta","delta":"Hi"}`,
+		`data: {"type":"response.completed","response":{}}`,
+	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -319,7 +286,7 @@ func TestStreamNon2xxReturnsResponseErrorAndNoStreamReader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"message":"bad key","type":"auth","code":"invalid_api_key"}}`))
+		_, _ = w.Write([]byte(`{"error":{"message":"bad token","code":"invalid_token"}}`))
 	}))
 	defer server.Close()
 
@@ -341,8 +308,8 @@ func TestStreamNon2xxReturnsResponseErrorAndNoStreamReader(t *testing.T) {
 	if respErr.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("ResponseError.StatusCode = %d, want %d", respErr.StatusCode, http.StatusUnauthorized)
 	}
-	if respErr.Message != "bad key" || respErr.Type != "auth" || respErr.Code != "invalid_api_key" {
-		t.Fatalf("ResponseError = %+v, want Message=%q Type=%q Code=%q", respErr, "bad key", "auth", "invalid_api_key")
+	if respErr.Message != "bad token" || respErr.Code != "invalid_token" {
+		t.Fatalf("ResponseError = %+v, want Message=%q Code=%q", respErr, "bad token", "invalid_token")
 	}
 }
 
@@ -357,15 +324,15 @@ func TestStreamUsesRequestModelOverProviderDefault(t *testing.T) {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte(sseScript(`data: {"type":"response.completed","response":{}}`)))
 	}))
 	defer server.Close()
 
 	auth := &stubAuthenticator{validReturn: true}
-	p := newTestProvider(t, server.URL, auth) // provider default model gpt-4o
+	p := newTestProvider(t, server.URL, auth) // provider default model gpt-5-codex
 
 	req := chatRequestFixture()
-	req.Model = "gpt-4.1"
+	req.Model = "gpt-5-codex-mini"
 
 	reader, err := p.Stream(context.Background(), req)
 	if err != nil {
@@ -373,12 +340,12 @@ func TestStreamUsesRequestModelOverProviderDefault(t *testing.T) {
 	}
 	defer func() { _ = reader.Close() }()
 
-	if gotModel != "gpt-4.1" {
-		t.Fatalf("model sent = %q, want %q", gotModel, "gpt-4.1")
+	if gotModel != "gpt-5-codex-mini" {
+		t.Fatalf("model sent = %q, want %q", gotModel, "gpt-5-codex-mini")
 	}
 }
 
-func TestStreamFallsBackToProviderDefaultModel(t *testing.T) {
+func TestStreamFallsBackToProviderConfigModel(t *testing.T) {
 	var gotModel string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -389,12 +356,12 @@ func TestStreamFallsBackToProviderDefaultModel(t *testing.T) {
 
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte(sseScript(`data: {"type":"response.completed","response":{}}`)))
 	}))
 	defer server.Close()
 
 	auth := &stubAuthenticator{validReturn: true}
-	p := newTestProvider(t, server.URL, auth) // provider default model gpt-4o
+	p := newTestProvider(t, server.URL, auth) // provider config model gpt-5-codex
 
 	reader, err := p.Stream(context.Background(), chatRequestFixture())
 	if err != nil {
@@ -402,36 +369,39 @@ func TestStreamFallsBackToProviderDefaultModel(t *testing.T) {
 	}
 	defer func() { _ = reader.Close() }()
 
-	if gotModel != "gpt-4o" {
-		t.Fatalf("model sent = %q, want %q", gotModel, "gpt-4o")
+	if gotModel != "gpt-5-codex" {
+		t.Fatalf("model sent = %q, want %q", gotModel, "gpt-5-codex")
 	}
 }
 
-func TestStreamErrorsBeforeNetworkWhenNoModelResolved(t *testing.T) {
-	called := false
+func TestStreamFallsBackToDefaultModelWhenNothingConfigured(t *testing.T) {
+	var gotModel string
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
+		var body map[string]any
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		gotModel, _ = body["model"].(string)
+
+		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sseScript(`data: {"type":"response.completed","response":{}}`)))
 	}))
 	defer server.Close()
 
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p, err := New(provider.Config{BaseURL: server.URL}, auth) // no default model
+	auth := &stubAuthenticator{validReturn: true}
+	p, err := New(provider.Config{BaseURL: server.URL}, auth) // no config model
 	if err != nil {
 		t.Fatalf("New() error = %v, want nil", err)
 	}
 
-	reader, err := p.Stream(context.Background(), chatRequestFixture()) // req.Model also empty
-	if err == nil {
-		t.Fatal("Stream() error = nil, want non-nil")
+	reader, err := p.Stream(context.Background(), chatRequestFixture())
+	if err != nil {
+		t.Fatalf("Stream() error = %v, want nil", err)
 	}
-	if reader != nil {
-		t.Fatalf("Stream() reader = %+v, want nil", reader)
-	}
-	if called {
-		t.Fatal("Stream() reached the network despite unresolved model")
+	defer func() { _ = reader.Close() }()
+
+	if gotModel != DefaultModel {
+		t.Fatalf("model sent = %q, want %q", gotModel, DefaultModel)
 	}
 }

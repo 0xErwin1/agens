@@ -33,10 +33,18 @@ func TestDefaultConfigProviderAndAgent(t *testing.T) {
 		check func(t *testing.T, cfg Config)
 	}{
 		{
-			name: "provider model default",
+			name: "provider model default is empty (providers supply their own default)",
 			check: func(t *testing.T, cfg Config) {
-				if cfg.Provider.Model != "gpt-4.1" {
-					t.Fatalf("Provider.Model = %q, want %q", cfg.Provider.Model, "gpt-4.1")
+				if cfg.Provider.Model != "" {
+					t.Fatalf("Provider.Model = %q, want empty", cfg.Provider.Model)
+				}
+			},
+		},
+		{
+			name: "provider type default is empty (inferred from credentials)",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Provider.Type != "" {
+					t.Fatalf("Provider.Type = %q, want empty", cfg.Provider.Type)
 				}
 			},
 		},

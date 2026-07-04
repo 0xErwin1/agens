@@ -123,6 +123,22 @@ func TestLoadParsesProviderAndAgentSections(t *testing.T) {
 	}
 }
 
+func TestLoadParsesProviderType(t *testing.T) {
+	home := t.TempDir()
+	toml := "[provider]\ntype = \"openai-chatgpt\"\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: t.TempDir(), Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if loaded.Config.Provider.Type != "openai-chatgpt" {
+		t.Fatalf("Provider.Type = %q, want %q", loaded.Config.Provider.Type, "openai-chatgpt")
+	}
+}
+
 func TestLoadWithoutProviderOrAgentSectionsKeepsDefaults(t *testing.T) {
 	home := t.TempDir()
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[options]\ndebug = true\n"), 0o644); err != nil {

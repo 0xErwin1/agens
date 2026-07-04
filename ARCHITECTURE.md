@@ -10,9 +10,11 @@ internal/app   application bootstrap and execution seam
 internal/cli   Cobra command tree, CLI adapter behavior, and the interactive ttyPrompter (permission UI adapter)
 internal/config minimal configuration path contract
 internal/auth  on-disk provider credential storage (api_key/access_token entries), no network calls
+internal/auth/chatgpt ChatGPT OAuth login flow and token authenticator: PKCE browser login, JWT account-id parsing, and refresh_token-based renewal that persists back through internal/auth; no Cobra
 internal/message typed, provider-neutral conversation history model (leaf, no internal deps)
 internal/provider provider-neutral contracts for auth, chat streaming, and factory wiring (leaf, Cobra-free, depends only on internal/message)
 internal/provider/openai provider.Provider implementation for OpenAI's chat-completions API, API-key authenticated
+internal/provider/chatgpt provider.Provider implementation for OpenAI's Responses API ("/responses"), ChatGPT-OAuth authenticated, SSE streaming; no Cobra, no internal/auth
 internal/permission rule engine (Allow|Ask|Deny) and Gate decorator gating tool calls before dispatch; depends on internal/message, internal/provider, and github.com/bmatcuk/doublestar/v4; must not import internal/agentloop — the Gate satisfies agentloop.ToolRunner structurally, asserted only from a test file
 internal/tool    uniform Tool contract and Registry the agent loop dispatches against; Cobra-free, depends on internal/message, internal/provider, jsonschema-go
 internal/tool/fs read/write/edit Tool implementations confined to a worktree via os.Root; Cobra-free, depends only on internal/tool, jsonschema-go, and the standard library
@@ -33,6 +35,10 @@ cmd/agens -> internal/app -> internal/cli
 
 internal/provider -> internal/message
 internal/provider/openai -> internal/provider, internal/message
+internal/provider/chatgpt -> internal/provider, internal/message, google/uuid, stdlib (Responses-API SSE provider; no Cobra, no internal/auth)
+
+internal/auth -> internal/config
+internal/auth/chatgpt -> internal/auth, internal/provider, stdlib (OAuth login + token authenticator; no Cobra)
 
 internal/tool -> internal/message, internal/provider, jsonschema-go
 internal/tool/fs -> internal/tool, jsonschema-go, stdlib (no Cobra, no internal/agentloop, no internal/agent, no internal/cli, no internal/message)
@@ -44,9 +50,9 @@ internal/permission -> internal/message, internal/provider
 
 internal/agentloop -> internal/message, internal/provider
 
-internal/agent -> internal/agentloop, internal/auth, internal/config, internal/permission, internal/provider, internal/provider/openai, internal/tool, internal/tool/fs, internal/tool/bash, internal/tool/search, internal/tool/webfetch
+internal/agent -> internal/agentloop, internal/auth, internal/auth/chatgpt, internal/config, internal/permission, internal/provider, internal/provider/openai, internal/provider/chatgpt, internal/tool, internal/tool/fs, internal/tool/bash, internal/tool/search, internal/tool/webfetch
 
-internal/cli -> internal/agent, internal/agentloop, internal/auth, internal/config, internal/message, internal/permission
+internal/cli -> internal/agent, internal/agentloop, internal/auth, internal/config, internal/message, internal/permission, golang.org/x/term
              -> (ttyPrompter implements internal/permission.Prompter; it owns terminal I/O and never leaks into internal/agent or internal/tool/fs)
 
 (future) internal/tui, internal/persistence -> internal/message

@@ -22,6 +22,9 @@ func applyProviderPatch(cfg *Config, patch *providerPatch) {
 	if patch == nil {
 		return
 	}
+	if patch.Type != nil {
+		cfg.Provider.Type = *patch.Type
+	}
 	if patch.Model != nil {
 		cfg.Provider.Model = *patch.Model
 	}

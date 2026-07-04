@@ -29,6 +29,7 @@ type Options struct {
 }
 
 type Provider struct {
+	Type    string `toml:"type"`
 	Model   string `toml:"model"`
 	BaseURL string `toml:"base_url"`
 }
@@ -70,6 +71,7 @@ type optionsPatch struct {
 }
 
 type providerPatch struct {
+	Type    *string `toml:"type"`
 	Model   *string `toml:"model"`
 	BaseURL *string `toml:"base_url"`
 }
@@ -84,9 +86,7 @@ func DefaultConfig() Config {
 			Debug:   false,
 			DataDir: filepath.Join(defaultDataHome(), AppName),
 		},
-		Provider: Provider{
-			Model: "gpt-4.1",
-		},
+		Provider: Provider{},
 		Agent: Agent{
 			SystemPrompt: defaultSystemPrompt,
 		},

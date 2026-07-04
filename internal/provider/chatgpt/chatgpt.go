@@ -1,4 +1,4 @@
-package openai
+package chatgpt
 
 import (
 	"bytes"
@@ -8,42 +8,48 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/iperez/agens/internal/provider"
 )
 
 const (
-	defaultBaseURL = "https://api.openai.com/v1"
+	defaultBaseURL = "https://chatgpt.com/backend-api/codex"
 
-	// DefaultModel is the model id used when a caller (for example the
-	// agent loop's model precedence) needs a provider default without
-	// constructing a Provider first.
-	DefaultModel = "gpt-4.1"
+	// DefaultModel is the model id used when neither the request nor the
+	// provider's Config specifies one. The ChatGPT product surface rotates
+	// this id over time; Config.Model overrides it whenever a specific
+	// model is required.
+	DefaultModel = "gpt-5-codex"
+
+	// codexCLIVersion is the version segment reported in the User-Agent
+	// header. It has no functional meaning within agens and is not tied to
+	// any agens release; it exists only to shape the header string.
+	codexCLIVersion = "0.1.0"
 
 	// maxErrorBodyBytes bounds how much of a non-2xx response body Stream
 	// reads before handing it to parseResponseError.
 	maxErrorBodyBytes = 32 * 1024
 )
 
-// staticModels is the provisional model catalog. AGN-7 replaces it with a
-// models.dev-backed lookup; until then, context/output limits and
-// SupportsTools are hand-maintained best-effort values.
+// staticModels is the provisional model catalog for the ChatGPT-backed
+// Responses API surface. AGN-7 replaces it with a models.dev-backed lookup.
 var staticModels = []provider.ModelInfo{
-	{ID: "gpt-4.1", DisplayName: "GPT-4.1", ContextWindow: 1_000_000, MaxOutputTokens: 32_768, SupportsTools: true},
-	{ID: "gpt-4.1-mini", DisplayName: "GPT-4.1 mini", ContextWindow: 1_000_000, MaxOutputTokens: 32_768, SupportsTools: true},
-	{ID: "gpt-4o", DisplayName: "GPT-4o", ContextWindow: 128_000, MaxOutputTokens: 16_384, SupportsTools: true},
-	{ID: "o4-mini", DisplayName: "o4-mini", ContextWindow: 200_000, MaxOutputTokens: 100_000, SupportsTools: true},
+	{ID: DefaultModel, DisplayName: "GPT-5 Codex", ContextWindow: 400_000, MaxOutputTokens: 128_000, SupportsTools: true},
 }
 
-// Provider implements provider.Provider against OpenAI's chat-completions
-// API, authenticated with the given provider.Authenticator.
+// Provider implements provider.Provider against OpenAI's Responses API
+// ("/responses"), authenticated with the given provider.Authenticator.
 type Provider struct {
 	baseURL    string
 	model      string
 	httpClient *http.Client
 	auth       provider.Authenticator
+	sessionID  string
 }
 
 var _ provider.Provider = (*Provider)(nil)
@@ -57,7 +63,7 @@ var _ provider.Provider = (*Provider)(nil)
 // the caller's responsibility via ctx.
 func New(cfg provider.Config, auth provider.Authenticator) (provider.Provider, error) {
 	if auth == nil {
-		return nil, errors.New("openai: authenticator must not be nil")
+		return nil, errors.New("chatgpt: authenticator must not be nil")
 	}
 
 	baseURL := cfg.BaseURL
@@ -71,12 +77,13 @@ func New(cfg provider.Config, auth provider.Authenticator) (provider.Provider, e
 		model:      cfg.Model,
 		httpClient: &http.Client{Timeout: cfg.HTTPTimeout},
 		auth:       auth,
+		sessionID:  uuid.NewString(),
 	}, nil
 }
 
 // ID implements provider.Provider.
 func (p *Provider) ID() string {
-	return "openai-api"
+	return "openai-chatgpt"
 }
 
 // Models implements provider.Provider, returning a copy of the static
@@ -87,6 +94,14 @@ func (p *Provider) Models(_ context.Context) ([]provider.ModelInfo, error) {
 	return models, nil
 }
 
+// userAgent builds the User-Agent header value sent with every /responses
+// request. This exact string, along with the session-id header set in
+// Stream, is a best-effort match of the codex CLI's own client fingerprint
+// and may need adjustment if the backend starts treating it differently.
+func userAgent() string {
+	return fmt.Sprintf("codex_cli_rs/%s (%s %s)", codexCLIVersion, runtime.GOOS, runtime.GOARCH)
+}
+
 // Stream implements provider.Provider.
 func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest) (provider.StreamReader, error) {
 	model := req.Model
@@ -94,49 +109,52 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest) (provid
 		model = p.model
 	}
 	if model == "" {
-		return nil, errors.New("openai: no model resolved: request.Model and provider default are both empty")
+		model = DefaultModel
 	}
 	req.Model = model
 
 	wire, err := encodeRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("openai: encode request: %w", err)
+		return nil, fmt.Errorf("chatgpt: encode request: %w", err)
 	}
 
 	body, err := json.Marshal(wire)
 	if err != nil {
-		return nil, fmt.Errorf("openai: marshal request: %w", err)
+		return nil, fmt.Errorf("chatgpt: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/responses", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("openai: build request: %w", err)
+		return nil, fmt.Errorf("chatgpt: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("originator", "codex_cli_rs")
+	httpReq.Header.Set("User-Agent", userAgent())
+	httpReq.Header.Set("session-id", p.sessionID)
 
 	if !p.auth.Valid(time.Now()) {
 		if err := p.auth.Refresh(ctx); err != nil {
-			return nil, fmt.Errorf("openai: refresh credential: %w", err)
+			return nil, fmt.Errorf("chatgpt: refresh credential: %w", err)
 		}
 	}
 	if err := p.auth.Decorate(ctx, httpReq); err != nil {
-		return nil, fmt.Errorf("openai: decorate request: %w", err)
+		return nil, fmt.Errorf("chatgpt: decorate request: %w", err)
 	}
 
 	resp, err := p.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("openai: send request: %w", err)
+		return nil, fmt.Errorf("chatgpt: send request: %w", err)
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
 		_ = resp.Body.Close()
 		if readErr != nil {
-			return nil, fmt.Errorf("openai: read error response body: %w", readErr)
+			return nil, fmt.Errorf("chatgpt: read error response body: %w", readErr)
 		}
 		return nil, parseResponseError(resp.StatusCode, errBody)
 	}
 
-	return newStream(resp.Body), nil
+	return newResponsesStream(resp.Body), nil
 }
