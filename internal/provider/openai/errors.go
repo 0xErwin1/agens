@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 )
 
 // maxErrorSnippet bounds the raw body echoed into ResponseError.Message when
@@ -19,6 +20,12 @@ type ResponseError struct {
 
 func (e *ResponseError) Error() string {
 	return fmt.Sprintf("openai: HTTP %d: %s (%s)", e.StatusCode, e.Message, e.Code)
+}
+
+// IsAuthError reports whether this response failed because of authentication:
+// an HTTP 401 (invalid or missing key) or 403 (key not permitted).
+func (e *ResponseError) IsAuthError() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 }
 
 // parseResponseError parses body as an OpenAI error envelope. If body is not

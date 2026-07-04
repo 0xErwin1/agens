@@ -103,6 +103,12 @@ func (e *tokenError) Error() string {
 	return fmt.Sprintf("chatgpt: token exchange failed: HTTP %d: %s", e.statusCode, e.reason)
 }
 
+// IsAuthError classifies every token-exchange failure as an authentication
+// error: a failed authorization-code exchange or refresh means the stored
+// credential is unusable and the user must sign in again, regardless of the
+// specific status code (an expired refresh token commonly returns 400).
+func (e *tokenError) IsAuthError() bool { return true }
+
 // exchangeCode performs the authorization_code exchange against
 // tokenEndpoint and maps the response into an auth.Entry. now supplies the
 // current time so Entry.ExpiresAt is deterministic in tests.

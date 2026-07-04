@@ -5,6 +5,24 @@ import (
 	"testing"
 )
 
+func TestResponseError_IsAuthError(t *testing.T) {
+	cases := []struct {
+		status int
+		want   bool
+	}{
+		{401, true},
+		{403, true},
+		{500, false},
+		{429, false},
+	}
+	for _, c := range cases {
+		err := &ResponseError{StatusCode: c.status}
+		if got := err.IsAuthError(); got != c.want {
+			t.Fatalf("ResponseError{StatusCode:%d}.IsAuthError() = %v, want %v", c.status, got, c.want)
+		}
+	}
+}
+
 func TestParseResponseError_ValidEnvelope(t *testing.T) {
 	body := []byte(`{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}`)
 

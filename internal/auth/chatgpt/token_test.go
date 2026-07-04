@@ -13,6 +13,17 @@ import (
 	"time"
 )
 
+func TestTokenError_IsAuthError(t *testing.T) {
+	// Any token-exchange failure, regardless of status, means the credential
+	// is unusable and the user must sign in again.
+	for _, status := range []int{400, 401, 500} {
+		err := &tokenError{statusCode: status, reason: "non-2xx"}
+		if !err.IsAuthError() {
+			t.Fatalf("tokenError{statusCode:%d}.IsAuthError() = false, want true", status)
+		}
+	}
+}
+
 func fakeIDToken(t *testing.T, accountID string) string {
 	t.Helper()
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))

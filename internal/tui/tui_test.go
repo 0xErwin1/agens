@@ -271,6 +271,37 @@ func TestModel_TurnDoneWithErrorShowsErrorBlock(t *testing.T) {
 	}
 }
 
+func TestModel_TurnDoneWithAuthErrorShowsReloginHint(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	sendMsg(m, TurnDoneMsg{Err: authErrorString("chatgpt: HTTP 401: invalid credentials")})
+
+	view := stripANSI(m.messages.View())
+	if !strings.Contains(view, "invalid credentials") {
+		t.Fatalf("View() = %q, want the raw auth error still shown", view)
+	}
+	if !strings.Contains(view, "agens auth login") {
+		t.Fatalf("View() = %q, want the actionable re-login hint for an auth failure", view)
+	}
+}
+
+func TestModel_TurnDoneWithNonAuthErrorHasNoReloginHint(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	sendMsg(m, TurnDoneMsg{Err: errorString("provider exploded")})
+
+	view := stripANSI(m.messages.View())
+	if strings.Contains(view, "agens auth login") {
+		t.Fatalf("View() = %q, want no re-login hint for a non-auth error", view)
+	}
+}
+
 func TestModel_TurnDoneCanceledIsNotTreatedAsError(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
@@ -393,3 +424,10 @@ func TestModel_CtrlCWhileRunningDoesNotQuit(t *testing.T) {
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
+
+// authErrorString is an errorString classified as an authentication failure,
+// satisfying provider.AuthError so the model surfaces the re-login hint.
+type authErrorString string
+
+func (e authErrorString) Error() string     { return string(e) }
+func (e authErrorString) IsAuthError() bool { return true }

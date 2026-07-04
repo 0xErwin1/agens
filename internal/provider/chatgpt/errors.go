@@ -6,6 +6,7 @@ package chatgpt
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 )
 
 // maxErrorSnippet bounds the raw body echoed into ResponseError.Message when
@@ -29,6 +30,14 @@ func (e *ResponseError) Error() string {
 		return fmt.Sprintf("chatgpt: response failed: %s (%s)", e.Message, e.Code)
 	}
 	return fmt.Sprintf("chatgpt: HTTP %d: %s (%s)", e.StatusCode, e.Message, e.Code)
+}
+
+// IsAuthError reports whether this response failed because of authentication:
+// an HTTP 401 or 403. A "response.failed" envelope (StatusCode == 0) is a
+// model/response failure, not a credential problem, so it is never classified
+// as auth.
+func (e *ResponseError) IsAuthError() bool {
+	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
 }
 
 // wireErrorEnvelope is the body of a non-2xx /responses response. The backend

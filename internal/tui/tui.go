@@ -1036,6 +1036,10 @@ func (m *Model) addToolCalls(msg *message.Message) {
 // handleDone finalizes a completed turn: it clears the running state, adopts
 // the grown history, and reflects success or failure in the status bar. A
 // canceled turn is treated as a clean stop rather than an error.
+// authErrorHint is the actionable note shown below an authentication failure,
+// pointing the user at the command that restores their credentials.
+const authErrorHint = "Your credentials are missing or expired. Run `agens auth login` to sign in again."
+
 func (m *Model) handleDone(msg TurnDoneMsg) {
 	m.running = false
 	if m.cancel != nil {
@@ -1051,6 +1055,9 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 
 	if msg.Err != nil && !errors.Is(msg.Err, context.Canceled) {
 		m.messages.SetError(msg.Err.Error())
+		if provider.IsAuthError(msg.Err) {
+			m.messages.AddInfo(authErrorHint)
+		}
 		m.status.SetState(stateError)
 		return
 	}
