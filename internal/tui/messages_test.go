@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -60,45 +61,67 @@ func TestMessages_FinishAssistantKeepsTextAcrossFollowingBlocks(t *testing.T) {
 	}
 }
 
-func TestMessages_AddToolCallRendersArrowAndName(t *testing.T) {
+func TestMessages_ToolCallHeaderShowsCaretNameAndDetail(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
-	m.AddToolCall("bash", "ls -la")
+	m.AddToolCall("t1", "bash", "ls -la")
 
 	view := stripANSI(m.View())
-	if !strings.Contains(view, "→ bash") {
-		t.Fatalf("View() = %q, want the tool-call marker %q", view, "→ bash")
+	if !strings.Contains(view, "▸ bash") {
+		t.Fatalf("View() = %q, want the collapsed tool caret and name %q", view, "▸ bash")
 	}
 	if !strings.Contains(view, "ls -la") {
 		t.Fatalf("View() = %q, want the executed command detail %q", view, "ls -la")
 	}
 }
 
-func TestMessages_AddToolResultRendersContent(t *testing.T) {
+func TestMessages_ToolResultFoldedByDefaultAndExpandsOnToggle(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
-	m.AddToolResult("file contents here", false)
+	m.AddToolCall("t1", "bash", "ls")
+	m.CompleteToolCall("t1", "file contents here", false, 1200*time.Millisecond)
 
-	view := m.View()
+	// Folded by default: the header shows the duration but not the result body.
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "1.2s") {
+		t.Fatalf("View() = %q, want the tool duration in the header", view)
+	}
+	if strings.Contains(view, "file contents here") {
+		t.Fatalf("View() = %q, want the result folded away by default", view)
+	}
+
+	m.ToggleTools()
+
+	view = stripANSI(m.View())
+	if !strings.Contains(view, "▾ bash") {
+		t.Fatalf("View() = %q, want the expanded caret after toggling", view)
+	}
 	if !strings.Contains(view, "file contents here") {
-		t.Fatalf("View() = %q, want the tool-result content", view)
+		t.Fatalf("View() = %q, want the result body shown when expanded", view)
 	}
 }
 
-func TestMessages_AddToolResultMarksErrors(t *testing.T) {
+func TestMessages_ToolErrorMarksHeaderAndShowsBodyWhenExpanded(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
-	m.AddToolResult("permission denied", true)
+	m.AddToolCall("t1", "bash", "rm x")
+	m.CompleteToolCall("t1", "permission denied", true, 500*time.Millisecond)
 
-	view := m.View()
-	if !strings.Contains(view, "permission denied") {
-		t.Fatalf("View() = %q, want the tool-result content", view)
+	// The failure marker shows on the header even while folded.
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "failed") {
+		t.Fatalf("View() = %q, want a failure marker on a failed tool header", view)
 	}
-	if !strings.Contains(strings.ToLower(view), "error") {
-		t.Fatalf("View() = %q, want an error marker for a failed tool result", view)
+	if strings.Contains(view, "permission denied") {
+		t.Fatalf("View() = %q, want the error body folded by default", view)
+	}
+
+	m.ToggleTools()
+	if !strings.Contains(stripANSI(m.View()), "permission denied") {
+		t.Fatalf("View() = %q, want the error body when expanded", stripANSI(m.View()))
 	}
 }
 
@@ -148,7 +171,7 @@ func TestMessages_StreamingAssistantRendersMarkdownLive(t *testing.T) {
 	}
 }
 
-func TestMessages_AddToolResultTruncatesLongOutput(t *testing.T) {
+func TestMessages_ToolResultTruncatesLongOutputWhenExpanded(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
@@ -158,7 +181,9 @@ func TestMessages_AddToolResultTruncatesLongOutput(t *testing.T) {
 	}
 	b.WriteString("UNIQUE_TAIL_MARKER")
 
-	m.AddToolResult(b.String(), false)
+	m.AddToolCall("t1", "bash", "cat big")
+	m.CompleteToolCall("t1", b.String(), false, time.Second)
+	m.ToggleTools()
 
 	view := stripANSI(m.View())
 	if !strings.Contains(view, truncationMarker) {
@@ -166,20 +191,5 @@ func TestMessages_AddToolResultTruncatesLongOutput(t *testing.T) {
 	}
 	if strings.Contains(view, "UNIQUE_TAIL_MARKER") {
 		t.Fatalf("stripped View() = %q, must not contain the tail past the truncation limit", view)
-	}
-}
-
-func TestMessages_AddToolResultErrorContentPresent(t *testing.T) {
-	m := NewMessages()
-	m.SetSize(80, 20)
-
-	m.AddToolResult("disk is full", true)
-
-	view := stripANSI(m.View())
-	if !strings.Contains(view, "disk is full") {
-		t.Fatalf("stripped View() = %q, want the error result content", view)
-	}
-	if !strings.Contains(strings.ToLower(view), "error") {
-		t.Fatalf("stripped View() = %q, want an error marker for a failed tool result", view)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -25,8 +26,6 @@ var ayuStyleJSON []byte
 // off by a colored left bar (like opencode) rather than a text label; tool and
 // error lines keep a short glyph/word so they read even without color.
 const (
-	labelToolCall    = "→ "
-	labelToolError   = "error: "
 	labelErrorBlock  = "error: "
 	labelThinking    = "Thinking"
 	blockSeparator   = "\n\n"
@@ -53,9 +52,7 @@ type blockKind int
 const (
 	blockUser blockKind = iota
 	blockAssistant
-	blockToolCall
-	blockToolResult
-	blockToolError
+	blockTool
 	blockError
 	blockSystem
 	blockReasoning
@@ -63,12 +60,24 @@ const (
 
 // block is a finalized conversation entry kept in its raw form so it can be
 // re-rendered (and, for assistant markdown, re-wrapped) whenever the width
-// changes. detail carries a secondary, muted string (currently the tool
-// call's argument, e.g. the shell command) shown after the primary text.
+// changes. detail carries a secondary, muted string (the tool call's argument,
+// e.g. the shell command) shown after the primary text.
+//
+// A blockTool pairs a tool call with its result: text is the tool name, detail
+// the argument, result the (raw) output. toolID links the call to the result
+// that completes it; done marks that the result has arrived; isError flags a
+// failed result; dur is the execution time (zero when unknown, e.g. resumed
+// from history).
 type block struct {
 	kind   blockKind
 	text   string
 	detail string
+
+	toolID  string
+	result  string
+	isError bool
+	done    bool
+	dur     time.Duration
 }
 
 // Messages is the scrollable conversation view. Finalized turns are kept as
@@ -83,7 +92,10 @@ type Messages struct {
 	streamingActive bool
 	reasoning       string
 	reasoningActive bool
-	width, height   int
+	// toolsExpanded controls whether tool blocks show their result body; folded
+	// by default, toggled for all tools at once via ToggleTools (Ctrl+O).
+	toolsExpanded bool
+	width, height int
 
 	// renderer is width-bound: a glamour.TermRenderer wraps to a fixed width,
 	// so it is rebuilt whenever the width changes rather than per render.
@@ -160,22 +172,36 @@ func (m *Messages) FinishAssistant() {
 	m.rebuild()
 }
 
-// AddToolCall adds a block marking that a tool invocation has started. detail
-// is a short description of what the tool acts on (the shell command, a path),
-// shown muted after the tool name; it may be empty.
-func (m *Messages) AddToolCall(name, detail string) {
-	m.blocks = append(m.blocks, block{kind: blockToolCall, text: name, detail: detail})
+// AddToolCall adds a collapsible tool block for a started invocation. id links
+// it to the result that later completes it; detail is a short description of
+// what the tool acts on (the shell command, a path), shown muted after the tool
+// name and may be empty. The block starts pending (no result, no duration).
+func (m *Messages) AddToolCall(id, name, detail string) {
+	m.blocks = append(m.blocks, block{kind: blockTool, toolID: id, text: name, detail: detail})
 	m.rebuild()
 }
 
-// AddToolResult adds a block carrying a tool's result. isError selects the
-// error styling so a failed result is visually distinct.
-func (m *Messages) AddToolResult(text string, isError bool) {
-	kind := blockToolResult
-	if isError {
-		kind = blockToolError
+// CompleteToolCall fills the pending tool block matching id with its result,
+// error status, and execution duration. It is a no-op when no matching pending
+// block exists (e.g. a duplicate or unknown result).
+func (m *Messages) CompleteToolCall(id, result string, isError bool, dur time.Duration) {
+	for i := range m.blocks {
+		b := &m.blocks[i]
+		if b.kind == blockTool && b.toolID == id && !b.done {
+			b.result = result
+			b.isError = isError
+			b.dur = dur
+			b.done = true
+			m.rebuild()
+			return
+		}
 	}
-	m.blocks = append(m.blocks, block{kind: kind, text: text})
+}
+
+// ToggleTools flips whether tool blocks show their result body, for every tool
+// at once. It backs the Ctrl+O collapse/expand shortcut.
+func (m *Messages) ToggleTools() {
+	m.toolsExpanded = !m.toolsExpanded
 	m.rebuild()
 }
 
@@ -193,15 +219,18 @@ func (m *Messages) AddInfo(text string) {
 }
 
 // SetHistory replaces the conversation with blocks reconstructed from a saved
-// message history, used when resuming a session. The mapping mirrors how the
-// live stream builds blocks: user text and tool results under the user role,
-// assistant text and tool calls under the assistant role.
+// message history, used when resuming a session. User and assistant text map to
+// their turn blocks; a tool call and its later result are paired by tool-use id
+// into one collapsible tool block. Durations are unknown when resuming, so they
+// are left zero (hidden).
 func (m *Messages) SetHistory(history []message.Message) {
 	m.blocks = nil
 	m.streaming = ""
 	m.streamingActive = false
 	m.reasoning = ""
 	m.reasoningActive = false
+
+	toolIndex := map[string]int{}
 
 	for _, msg := range history {
 		for _, part := range msg.Parts {
@@ -214,14 +243,15 @@ func (m *Messages) SetHistory(history []message.Message) {
 				m.blocks = append(m.blocks, block{kind: kind, text: p.Text})
 
 			case message.ToolUsePart:
-				m.blocks = append(m.blocks, block{kind: blockToolCall, text: p.Name, detail: permissionDetail(p.Input)})
+				toolIndex[p.ID] = len(m.blocks)
+				m.blocks = append(m.blocks, block{kind: blockTool, toolID: p.ID, text: p.Name, detail: permissionDetail(p.Input)})
 
 			case message.ToolResultPart:
-				kind := blockToolResult
-				if p.IsError {
-					kind = blockToolError
+				if i, ok := toolIndex[p.ToolUseID]; ok {
+					m.blocks[i].result = toolResultText(p)
+					m.blocks[i].isError = p.IsError
+					m.blocks[i].done = true
 				}
-				m.blocks = append(m.blocks, block{kind: kind, text: toolResultText(p)})
 			}
 		}
 	}
@@ -363,22 +393,8 @@ func (m *Messages) renderBlock(b block) string {
 	case blockAssistant:
 		return m.renderMarkdown(b.text)
 
-	case blockToolCall:
-		head := lipgloss.NewStyle().Foreground(theme.Tool()).Bold(true).Render(labelToolCall + b.text)
-		if b.detail != "" {
-			head += "  " + lipgloss.NewStyle().Foreground(theme.Muted()).Render(b.detail)
-		}
-		width := m.width - contentGutter
-		if width < 1 {
-			width = 1
-		}
-		return lipgloss.NewStyle().MarginLeft(contentGutter).Width(width).Render(head)
-
-	case blockToolResult:
-		return m.gutteredBlock(theme.Muted(), indentLines(truncateToolResult(b.text)), false)
-
-	case blockToolError:
-		return m.gutteredBlock(theme.Error(), indentLines(labelToolError+truncateToolResult(b.text)), false)
+	case blockTool:
+		return m.renderTool(b)
 
 	case blockError:
 		return m.gutteredBlock(theme.Error(), labelErrorBlock+b.text, true)
@@ -392,6 +408,48 @@ func (m *Messages) renderBlock(b block) string {
 	default:
 		return b.text
 	}
+}
+
+// renderTool renders a collapsible tool block: a header line with a disclosure
+// caret, the tool name and argument, its duration and (on failure) a status
+// marker; the result body follows only when tools are expanded and the result
+// has arrived.
+func (m *Messages) renderTool(b block) string {
+	theme := CurrentTheme()
+
+	caret := "▸ "
+	if m.toolsExpanded && b.done {
+		caret = "▾ "
+	}
+
+	head := lipgloss.NewStyle().Foreground(theme.Tool()).Bold(true).Render(caret + b.text)
+	muted := lipgloss.NewStyle().Foreground(theme.Muted())
+	if b.detail != "" {
+		head += "  " + muted.Render(b.detail)
+	}
+	if b.done && b.dur > 0 {
+		head += "  " + muted.Render("· "+formatDuration(b.dur))
+	}
+	if b.isError {
+		head += "  " + lipgloss.NewStyle().Foreground(theme.Error()).Render("· failed")
+	}
+
+	width := m.width - contentGutter
+	if width < 1 {
+		width = 1
+	}
+	header := lipgloss.NewStyle().MarginLeft(contentGutter).Width(width).Render(head)
+
+	if !m.toolsExpanded || !b.done || b.result == "" {
+		return header
+	}
+
+	color := theme.Muted()
+	if b.isError {
+		color = theme.Error()
+	}
+	body := m.gutteredBlock(color, indentLines(truncateToolResult(b.result)), false)
+	return header + "\n" + body
 }
 
 // renderUser renders a user turn as a block set off by a colored left bar,

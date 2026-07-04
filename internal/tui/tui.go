@@ -69,6 +69,9 @@ type Model struct {
 	// per-turn duration shown in the footer.
 	now       func() time.Time
 	turnStart time.Time
+	// toolClock marks when the current tool began executing, advanced after each
+	// tool result so consecutive tools each get their own execution duration.
+	toolClock time.Time
 	// quitArmed is set after a Ctrl+C that neither canceled a turn nor cleared
 	// the input, so a second Ctrl+C quits; any other key disarms it.
 	quitArmed bool
@@ -321,6 +324,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if quit := m.handleCtrlC(); quit {
 				return m, tea.Quit
 			}
+		case tea.KeyCtrlO:
+			swallow = true
+			m.messages.ToggleTools()
 		case tea.KeyEnter:
 			swallow = true
 			cmds = append(cmds, m.onEnter())
@@ -1128,12 +1134,18 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.status.SetState(stateRunning + msg.Event.ToolCall.Name)
 
 	case agentloop.LoopToolResult:
-		m.messages.AddToolResult(toolResultText(msg.Event.ToolResult), msg.Event.ToolResult.IsError)
+		result := msg.Event.ToolResult
+		dur := m.now().Sub(m.toolClock)
+		m.toolClock = m.now()
+		m.messages.CompleteToolCall(result.ToolUseID, toolResultText(result), result.IsError, dur)
 
 	case agentloop.LoopMessageDone:
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
 		m.addToolCalls(msg.Event.Message)
+		// Tools execute after the message is finalized; start the per-tool clock
+		// here so the first result's duration is measured from this point.
+		m.toolClock = m.now()
 
 	case agentloop.LoopUsage:
 		// Usage is not surfaced in this batch.
@@ -1151,7 +1163,7 @@ func (m *Model) addToolCalls(msg *message.Message) {
 	}
 	for _, part := range msg.Parts {
 		if call, ok := part.(message.ToolUsePart); ok {
-			m.messages.AddToolCall(call.Name, permissionDetail(call.Input))
+			m.messages.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
 		}
 	}
 }

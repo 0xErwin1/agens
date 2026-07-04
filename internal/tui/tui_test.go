@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -223,11 +224,46 @@ func TestModel_ToolCallEventUpdatesStatusAndView(t *testing.T) {
 	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &done}})
 
 	view := stripANSI(m.View())
-	if !strings.Contains(view, "→ read") {
+	if !strings.Contains(view, "▸ read") {
 		t.Fatalf("View() = %q, want a tool-call block for read", view)
 	}
 	if !strings.Contains(view, "internal/foo.go") {
 		t.Fatalf("View() = %q, want the read path shown as the tool detail", view)
+	}
+}
+
+func TestModel_ToolResultCompletesBlockWithDuration(t *testing.T) {
+	start := time.Unix(5000, 0)
+	m := New(Deps{
+		Loop:  &scriptedLoopRunner{},
+		Model: "gpt-5.5",
+		Now:   fakeClock(start, start, start.Add(1200*time.Millisecond)),
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	done := message.NewMessage(message.RoleAssistant, message.ToolUsePart{
+		ID: "t1", Name: "bash", Input: json.RawMessage(`{"command":"ls"}`),
+	})
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &done}}) // toolClock = start
+
+	result := message.ToolResultPart{ToolUseID: "t1", Content: message.Parts{message.TextPart{Text: "a.go b.go"}}}
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopToolResult, ToolResult: result}}) // now = start+1.2s
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "1.2s") {
+		t.Fatalf("View() = %q, want the tool block completed with its 1.2s duration", view)
+	}
+	// Folded by default: the result body is hidden until Ctrl+O.
+	if strings.Contains(view, "a.go b.go") {
+		t.Fatalf("View() = %q, want the tool result folded by default", view)
+	}
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlO})
+	if !strings.Contains(stripANSI(m.View()), "a.go b.go") {
+		t.Fatalf("View() = %q, want the result shown after Ctrl+O expands tools", stripANSI(m.View()))
 	}
 }
 
