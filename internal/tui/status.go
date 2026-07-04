@@ -21,11 +21,12 @@ const statusHints = "enter send · ctrl+c quit"
 // colored through the active theme: the app name in the accent, the model
 // muted, and the state colored by whether it reports an error.
 type Status struct {
-	model   string
-	state   string
-	effort  string
-	spinner string
-	width   int
+	model    string
+	state    string
+	effort   string
+	spinner  string
+	duration string
+	width    int
 }
 
 // NewStatus constructs a Status for the given model, starting in the ready
@@ -49,6 +50,10 @@ func (s *Status) SetEffort(effort string) { s.effort = effort }
 // SetSpinner sets the animated spinner frame shown before the state segment
 // while a turn is in flight. An empty frame hides it.
 func (s *Status) SetSpinner(frame string) { s.spinner = frame }
+
+// SetDuration sets the last turn's elapsed-time segment shown after the state;
+// empty hides it. It is cleared when a new turn starts and set when one ends.
+func (s *Status) SetDuration(d string) { s.duration = d }
 
 // Init implements tea.Model; the status bar has no startup command.
 func (s *Status) Init() tea.Cmd { return nil }
@@ -75,6 +80,9 @@ func (s *Status) View() string {
 		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.effort)
 	}
 	left += statusSeparator + state
+	if s.duration != "" {
+		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.duration)
+	}
 	right := lipgloss.NewStyle().Foreground(theme.Muted()).Render(statusHints) + " "
 
 	line := s.justify(left, right)

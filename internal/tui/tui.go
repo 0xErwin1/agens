@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
@@ -63,6 +64,11 @@ type Model struct {
 	// workLabel describes what the running turn is doing (thinking/writing/
 	// running a tool), shown by the inline activity indicator above the input.
 	workLabel string
+	// now supplies the current time (injectable for tests); turnStart marks when
+	// the in-flight turn began, driving the live elapsed counter and the final
+	// per-turn duration shown in the footer.
+	now       func() time.Time
+	turnStart time.Time
 	// quitArmed is set after a Ctrl+C that neither canceled a turn nor cleared
 	// the input, so a second Ctrl+C quits; any other key disarms it.
 	quitArmed bool
@@ -173,6 +179,9 @@ type Deps struct {
 	// opens the session picker on startup instead. They back the --resume flag.
 	ResumeID     string
 	OpenSessions bool
+	// Now supplies the current time; defaults to time.Now when nil. Tests inject
+	// a controlled clock to assert turn timing deterministically.
+	Now func() time.Time
 }
 
 // New constructs the root model from its dependencies.
@@ -187,6 +196,11 @@ func New(deps Deps) *Model {
 			counter++
 			return fmt.Sprintf("session-%d", counter)
 		}
+	}
+
+	now := deps.Now
+	if now == nil {
+		now = time.Now
 	}
 
 	return &Model{
@@ -208,6 +222,7 @@ func New(deps Deps) *Model {
 		project:             deps.Project,
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
+		now:                 now,
 	}
 }
 
@@ -552,10 +567,31 @@ func frameView(s string, leftPad, topPad int) string {
 }
 
 // workingLine renders the inline activity indicator: the animated spinner
-// followed by what the turn is currently doing, aligned to the shared gutter.
+// followed by what the turn is currently doing and the elapsed time since it
+// began, aligned to the shared gutter. The elapsed segment updates on every
+// spinner tick.
 func (m *Model) workingLine() string {
-	label := lipgloss.NewStyle().Foreground(CurrentTheme().Muted()).Render(m.workLabel)
-	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(m.spinner.View() + " " + label)
+	muted := lipgloss.NewStyle().Foreground(CurrentTheme().Muted())
+
+	text := m.workLabel
+	if !m.turnStart.IsZero() {
+		text += " " + formatDuration(m.now().Sub(m.turnStart))
+	}
+
+	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(m.spinner.View() + " " + muted.Render(text))
+}
+
+// formatDuration renders a turn's elapsed time compactly: one decimal below ten
+// seconds, whole seconds below a minute, and m:ss above it.
+func formatDuration(d time.Duration) string {
+	switch {
+	case d < 10*time.Second:
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	default:
+		return fmt.Sprintf("%dm%02ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
 }
 
 // overlayAbove composites overlay onto base so that overlay's last line lands
@@ -646,8 +682,10 @@ func (m *Model) submit() tea.Cmd {
 		m.messages.AddInfo("could not read referenced file(s): " + strings.Join(failed, ", "))
 	}
 	m.status.SetState(stateThinking)
+	m.status.SetDuration("")
 	m.workLabel = stateThinking
 	m.running = true
+	m.turnStart = m.now()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
@@ -1133,6 +1171,10 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 	}
 	m.events = nil
 	m.status.SetSpinner("")
+
+	if !m.turnStart.IsZero() {
+		m.status.SetDuration(formatDuration(m.now().Sub(m.turnStart)))
+	}
 
 	if msg.History != nil {
 		m.history = msg.History
