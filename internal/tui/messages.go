@@ -459,6 +459,10 @@ func (m *Messages) renderTool(b block) string {
 		return header
 	}
 
+	if !b.isError && isDiffResult(b.result) {
+		return header + "\n" + m.renderDiffBody(b.result)
+	}
+
 	color := theme.Muted()
 	if b.isError {
 		color = theme.Error()

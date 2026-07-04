@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -95,6 +96,30 @@ func TestWrite_Execute(t *testing.T) {
 	t.Run("missing content creates no file", func(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(root, "nocontent.txt")); !os.IsNotExist(err) {
 			t.Fatalf("os.Stat(nocontent.txt) error = %v, want IsNotExist (a missing content field must not create/truncate a file)", err)
+		}
+	})
+
+	t.Run("new file result is an all-additions diff", func(t *testing.T) {
+		res, err := w.Execute(context.Background(), json.RawMessage(`{"path":"fresh.txt","content":"line one\nline two\n"}`))
+		if err != nil || res.IsError {
+			t.Fatalf("Execute() = (%+v, %v), want a successful result", res, err)
+		}
+		if !strings.Contains(res.Text, "+++ b/fresh.txt") {
+			t.Fatalf("result = %q, want a unified diff header for the new file", res.Text)
+		}
+		if !strings.Contains(res.Text, "+line one") || !strings.Contains(res.Text, "+line two") {
+			t.Fatalf("result = %q, want the new content as additions", res.Text)
+		}
+	})
+
+	t.Run("overwrite result diffs old against new", func(t *testing.T) {
+		writeFileT(t, filepath.Join(root, "change.txt"), "keep\ndrop me\nkeep\n")
+		res, err := w.Execute(context.Background(), json.RawMessage(`{"path":"change.txt","content":"keep\nadd me\nkeep\n"}`))
+		if err != nil || res.IsError {
+			t.Fatalf("Execute() = (%+v, %v), want a successful result", res, err)
+		}
+		if !strings.Contains(res.Text, "-drop me") || !strings.Contains(res.Text, "+add me") {
+			t.Fatalf("result = %q, want the changed line shown as a removal and an addition", res.Text)
 		}
 	})
 

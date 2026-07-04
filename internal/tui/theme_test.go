@@ -68,10 +68,12 @@ func TestSetThemeCurrentThemeRoundTrip(t *testing.T) {
 // swap the active theme without touching any rendering component.
 type stubTheme struct{}
 
-func (stubTheme) Accent() lipgloss.Color    { return "1" }
-func (stubTheme) User() lipgloss.Color      { return "2" }
-func (stubTheme) Assistant() lipgloss.Color { return "3" }
-func (stubTheme) Tool() lipgloss.Color      { return "4" }
-func (stubTheme) Muted() lipgloss.Color     { return "5" }
-func (stubTheme) Error() lipgloss.Color     { return "6" }
-func (stubTheme) Surface() lipgloss.Color   { return "7" }
+func (stubTheme) Accent() lipgloss.Color       { return "1" }
+func (stubTheme) User() lipgloss.Color         { return "2" }
+func (stubTheme) Assistant() lipgloss.Color    { return "3" }
+func (stubTheme) Tool() lipgloss.Color         { return "4" }
+func (stubTheme) Muted() lipgloss.Color        { return "5" }
+func (stubTheme) Error() lipgloss.Color        { return "6" }
+func (stubTheme) Surface() lipgloss.Color      { return "7" }
+func (stubTheme) DiffAddBg() lipgloss.Color    { return "8" }
+func (stubTheme) DiffRemoveBg() lipgloss.Color { return "9" }

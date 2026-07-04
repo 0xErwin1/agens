@@ -67,6 +67,14 @@ func (w *Write) Execute(_ context.Context, input json.RawMessage) (tool.Result, 
 		return tool.Result{IsError: true, Text: err.Error()}, nil
 	}
 
+	// Read the current content before overwriting so the result can show the
+	// change as a diff. A missing (or unreadable) file is treated as empty, so
+	// a brand-new file renders as all additions.
+	before := ""
+	if data, err := w.dir.root.ReadFile(relPath); err == nil {
+		before = string(data)
+	}
+
 	if parent := filepath.Dir(relPath); parent != "." {
 		if err := w.dir.root.MkdirAll(parent, 0o755); err != nil {
 			return tool.Result{IsError: true, Text: err.Error()}, nil
@@ -77,5 +85,5 @@ func (w *Write) Execute(_ context.Context, input json.RawMessage) (tool.Result, 
 		return tool.Result{IsError: true, Text: err.Error()}, nil
 	}
 
-	return tool.Result{Text: fmt.Sprintf("wrote %d bytes to %s", len(*in.Content), in.Path)}, nil
+	return tool.Result{Text: renderDiff(in.Path, before, *in.Content)}, nil
 }

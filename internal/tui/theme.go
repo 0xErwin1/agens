@@ -14,6 +14,9 @@ type Theme interface {
 	Muted() lipgloss.Color     // dim/secondary (tool results, hints)
 	Error() lipgloss.Color     // errors
 	Surface() lipgloss.Color   // solid panel fill (input box), never transparent
+
+	DiffAddBg() lipgloss.Color    // subtle row tint behind added diff lines
+	DiffRemoveBg() lipgloss.Color // subtle row tint behind removed diff lines
 }
 
 // DefaultTheme is a dark palette used when no other theme has been installed.
@@ -29,6 +32,9 @@ func (DefaultTheme) Muted() lipgloss.Color     { return lipgloss.Color("#7A7A7A"
 func (DefaultTheme) Error() lipgloss.Color     { return lipgloss.Color("#FF6B6B") }
 func (DefaultTheme) Surface() lipgloss.Color   { return lipgloss.Color("#1A1B26") }
 
+func (DefaultTheme) DiffAddBg() lipgloss.Color    { return lipgloss.Color("#12261A") }
+func (DefaultTheme) DiffRemoveBg() lipgloss.Color { return lipgloss.Color("#2A1618") }
+
 // AyuTheme is the ayu dark palette: a warm gold accent over a near-black
 // background, with the signature blue entities and olive green. Colors follow
 // the canonical ayu dark syntax roles so the TUI reads like an ayu editor.
@@ -43,6 +49,9 @@ func (AyuTheme) Tool() lipgloss.Color      { return lipgloss.Color("#59C2FF") } 
 func (AyuTheme) Muted() lipgloss.Color     { return lipgloss.Color("#565B66") } // comment
 func (AyuTheme) Error() lipgloss.Color     { return lipgloss.Color("#F07178") } // markup red
 func (AyuTheme) Surface() lipgloss.Color   { return lipgloss.Color("#11151C") } // raised panel
+
+func (AyuTheme) DiffAddBg() lipgloss.Color    { return lipgloss.Color("#162116") } // ayu tool success bg
+func (AyuTheme) DiffRemoveBg() lipgloss.Color { return lipgloss.Color("#26181B") } // ayu tool error bg
 
 // currentTheme is the active theme every component renders against. The TUI
 // runs on a single goroutine (the Bubble Tea update loop), so no mutex guards
