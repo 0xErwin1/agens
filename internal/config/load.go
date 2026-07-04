@@ -34,11 +34,13 @@ type Provider struct {
 	BaseURL string `toml:"base_url"`
 }
 
+// Agent holds user-configurable overrides for the agent loop. SystemPrompt
+// is a user override for the base system prompt; when empty, the base
+// prompt is chosen automatically by the internal/prompt package from the
+// resolved model.
 type Agent struct {
 	SystemPrompt string `toml:"system_prompt"`
 }
-
-const defaultSystemPrompt = "You are Agens, a helpful coding assistant."
 
 type Source struct {
 	Path  string
@@ -87,9 +89,7 @@ func DefaultConfig() Config {
 			DataDir: filepath.Join(defaultDataHome(), AppName),
 		},
 		Provider: Provider{},
-		Agent: Agent{
-			SystemPrompt: defaultSystemPrompt,
-		},
+		Agent:    Agent{},
 	}
 }
 

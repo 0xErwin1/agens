@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"time"
 
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	chatgptauth "github.com/iperez/agens/internal/auth/chatgpt"
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/permission"
+	"github.com/iperez/agens/internal/prompt"
 	"github.com/iperez/agens/internal/provider"
 	chatgptprovider "github.com/iperez/agens/internal/provider/chatgpt"
 	"github.com/iperez/agens/internal/provider/openai"
@@ -47,9 +51,9 @@ type Options struct {
 }
 
 // BuildLoop resolves cfg, creds, and opts into a ready-to-run
-// *agentloop.Loop. It performs no network I/O: only the provider
-// constructors and agentloop.New are called, both of which are pure
-// construction.
+// *agentloop.Loop. It performs no network I/O; it reads local config,
+// credentials, and instruction files and constructs the provider and loop,
+// both of which are pure construction.
 //
 // The provider to wire is resolved by selectProviderID: an explicit
 // cfg.Provider.Type wins, otherwise it is inferred from which credentials
@@ -72,9 +76,9 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, errors.New("agent: no model configured")
 	}
 
-	systemPrompt := opts.SystemPrompt
-	if systemPrompt == "" {
-		systemPrompt = cfg.Agent.SystemPrompt
+	systemPrompt, err := buildSystemPrompt(cfg, opts, model)
+	if err != nil {
+		return nil, err
 	}
 
 	p, err := buildProvider(providerID, cfg, creds, model)
@@ -87,12 +91,44 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, err
 	}
 
-	loopOpts := []agentloop.Option{agentloop.WithModel(model)}
-	if systemPrompt != "" {
-		loopOpts = append(loopOpts, agentloop.WithSystemPrompt(systemPrompt))
-	}
+	loopOpts := []agentloop.Option{agentloop.WithModel(model), agentloop.WithSystemPrompt(systemPrompt)}
 
 	return agentloop.New(p, gate, loopOpts...), nil
+}
+
+// buildSystemPrompt assembles the full system prompt for the resolved
+// model: opts.SystemPrompt (falling back to cfg.Agent.SystemPrompt) is
+// used as the base-prompt override when non-empty, otherwise the base
+// prompt is chosen by prompt.Select(model); the runtime environment block
+// and any discovered AGENTS.md/CLAUDE.md instructions are always appended.
+func buildSystemPrompt(cfg config.Config, opts Options, model string) (string, error) {
+	override := opts.SystemPrompt
+	if override == "" {
+		override = cfg.Agent.SystemPrompt
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("agent: %w", err)
+	}
+
+	projectRoot := opts.ProjectRoot
+	if projectRoot == "" {
+		projectRoot = config.ProjectRoot(cwd)
+	}
+	_, statErr := os.Stat(filepath.Join(projectRoot, ".git"))
+	isGitRepo := statErr == nil
+
+	return prompt.Build(prompt.Options{
+		Model:       model,
+		Override:    override,
+		WorkingDir:  cwd,
+		ProjectRoot: projectRoot,
+		ConfigHome:  config.HomeDir(),
+		IsGitRepo:   isGitRepo,
+		Platform:    runtime.GOOS,
+		Now:         time.Now(),
+	}), nil
 }
 
 // selectProviderID resolves which provider id BuildLoop should construct.

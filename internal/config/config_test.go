@@ -49,10 +49,10 @@ func TestDefaultConfigProviderAndAgent(t *testing.T) {
 			},
 		},
 		{
-			name: "agent system prompt default not empty",
+			name: "agent system prompt default is empty (base prompt comes from internal/prompt)",
 			check: func(t *testing.T, cfg Config) {
-				if cfg.Agent.SystemPrompt == "" {
-					t.Fatal("Agent.SystemPrompt = \"\", want non-empty default")
+				if cfg.Agent.SystemPrompt != "" {
+					t.Fatalf("Agent.SystemPrompt = %q, want empty", cfg.Agent.SystemPrompt)
 				}
 			},
 		},

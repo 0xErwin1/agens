@@ -132,6 +132,70 @@ func TestBuildLoop_SystemPromptPrecedence(t *testing.T) {
 	}
 }
 
+// TestBuildSystemPrompt_OverridePrecedence proves buildSystemPrompt resolves
+// opts.SystemPrompt over cfg.Agent.SystemPrompt, and that the assembled
+// prompt always contains the environment block regardless of which base
+// prompt (or none) was supplied.
+func TestBuildSystemPrompt_OverridePrecedence(t *testing.T) {
+	tests := []struct {
+		name        string
+		optsSys     string
+		cfgSys      string
+		wantContain string
+	}{
+		{name: "opts overrides cfg", optsSys: "opts prompt", cfgSys: "cfg prompt", wantContain: "opts prompt"},
+		{name: "falls back to cfg when opts empty", optsSys: "", cfgSys: "cfg prompt", wantContain: "cfg prompt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AGENS_CONFIG_HOME", t.TempDir())
+
+			cfg := validConfig()
+			cfg.Agent.SystemPrompt = tt.cfgSys
+
+			opts := validOptions(t)
+			opts.SystemPrompt = tt.optsSys
+
+			got, err := buildSystemPrompt(cfg, opts, "gpt-4.1")
+			if err != nil {
+				t.Fatalf("buildSystemPrompt() error = %v, want nil", err)
+			}
+			if !strings.Contains(got, tt.wantContain) {
+				t.Fatalf("buildSystemPrompt() = %q, want it to contain override %q", got, tt.wantContain)
+			}
+			if !strings.Contains(got, "You are powered by the model named gpt-4.1.") {
+				t.Fatalf("buildSystemPrompt() = %q, want it to contain the environment model marker", got)
+			}
+		})
+	}
+}
+
+// TestBuildSystemPrompt_NoOverrideUsesModelSelectedBase proves that with no
+// override at all, buildSystemPrompt still returns a non-empty prompt
+// containing the environment block, sourced from prompt.Select(model)
+// instead of a hardcoded persona string.
+func TestBuildSystemPrompt_NoOverrideUsesModelSelectedBase(t *testing.T) {
+	t.Setenv("AGENS_CONFIG_HOME", t.TempDir())
+
+	cfg := validConfig()
+	cfg.Agent.SystemPrompt = ""
+
+	opts := validOptions(t)
+	opts.SystemPrompt = ""
+
+	got, err := buildSystemPrompt(cfg, opts, "gpt-4.1")
+	if err != nil {
+		t.Fatalf("buildSystemPrompt() error = %v, want nil", err)
+	}
+	if got == "" {
+		t.Fatal("buildSystemPrompt() = \"\", want a non-empty assembled prompt")
+	}
+	if !strings.Contains(got, "You are powered by the model named gpt-4.1.") {
+		t.Fatalf("buildSystemPrompt() = %q, want it to contain the environment model marker", got)
+	}
+}
+
 func TestBuildLoop_MissingAPIKeyErrors(t *testing.T) {
 	creds := auth.File{}
 
