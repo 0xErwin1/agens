@@ -1,6 +1,8 @@
 package tui
 
 import (
+	_ "embed"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -10,6 +12,14 @@ import (
 
 	"github.com/iperez/agens/internal/message"
 )
+
+// ayuStyleJSON is the glamour style config that renders assistant markdown —
+// including code-block syntax highlighting — with the ayu dark palette, so code
+// fences match the rest of the TUI's ayu theme instead of glamour's default
+// dark chroma colors.
+//
+//go:embed ayu.json
+var ayuStyleJSON []byte
 
 // Visible markers layered on top of the theme colors. The user turn is set
 // off by a colored left bar (like opencode) rather than a text label; tool and
@@ -257,13 +267,14 @@ func (m *Messages) buildRenderer() {
 		wrap = 1
 	}
 
-	// A fixed dark style is used instead of glamour.WithAutoStyle(): auto
-	// resolves the style by querying the terminal's background color (OSC 11)
-	// at render time, and because Bubble Tea already owns the tty in raw mode,
-	// that query's response leaks into the input as stray text. A fixed style
-	// never queries the terminal.
+	// A fixed embedded ayu style is used instead of glamour.WithAutoStyle():
+	// auto resolves the style by querying the terminal's background color
+	// (OSC 11) at render time, and because Bubble Tea already owns the tty in
+	// raw mode, that query's response leaks into the input as stray text. A
+	// fixed style never queries the terminal.
 	r, err := glamour.NewTermRenderer(
-		glamour.WithStandardStyle("dark"),
+		glamour.WithStylesFromJSONBytes(ayuStyleJSON),
+		glamour.WithChromaFormatter(codeChromaFormatter()),
 		glamour.WithWordWrap(wrap),
 	)
 	if err != nil {
@@ -271,6 +282,21 @@ func (m *Messages) buildRenderer() {
 		return
 	}
 	m.renderer = r
+}
+
+// codeChromaFormatter picks the chroma formatter for code-block highlighting.
+// glamour's default ("terminal256") quantizes the ayu palette to the 256-color
+// cube; when the terminal advertises truecolor via COLORTERM it uses
+// "terminal16m" so the exact ayu hex colors render. COLORTERM is read from the
+// environment only — never by querying the terminal — so it cannot reintroduce
+// the OSC escape leak that WithAutoStyle caused.
+func codeChromaFormatter() string {
+	switch strings.ToLower(os.Getenv("COLORTERM")) {
+	case "truecolor", "24bit":
+		return "terminal16m"
+	default:
+		return "terminal256"
+	}
 }
 
 // rebuild renders every finalized block plus the live streaming block (if any)
