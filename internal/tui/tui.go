@@ -38,6 +38,7 @@ const (
 // State labels shown in the status bar.
 const (
 	stateThinking = "thinking…"
+	stateWriting  = "writing…"
 	stateRunning  = "running "
 	stateReady    = "ready"
 	stateError    = "error"
@@ -57,8 +58,11 @@ type Model struct {
 	history   []message.Message
 
 	running bool
-	events  <-chan tea.Msg
-	cancel  context.CancelFunc
+	// workLabel describes what the running turn is doing (thinking/writing/
+	// running a tool), shown by the inline activity indicator above the input.
+	workLabel string
+	events    <-chan tea.Msg
+	cancel    context.CancelFunc
 
 	// prompter routes tool-permission decisions into this event loop; it is
 	// nil when the caller pre-approved every call (--dangerously-allow-all),
@@ -257,9 +261,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // than inserted into the layout, so the chat never resizes or scrolls when one
 // appears.
 func (m *Model) View() string {
+	// The gap row above the input doubles as the inline activity indicator
+	// while a turn runs, so "thinking/writing" is visible next to the
+	// conversation rather than only in the footer.
+	gap := ""
+	if m.running {
+		gap = m.workingLine()
+	}
+
 	base := lipgloss.JoinVertical(lipgloss.Left,
 		m.messages.View(),
-		"", // inputGap: blank row between the conversation and the input
+		gap,
 		m.input.View(),
 		m.status.View(),
 	)
@@ -299,6 +311,13 @@ func frameView(s string, leftPad, topPad int) string {
 	}
 
 	return strings.Join(out, "\n")
+}
+
+// workingLine renders the inline activity indicator: the animated spinner
+// followed by what the turn is currently doing, aligned to the shared gutter.
+func (m *Model) workingLine() string {
+	label := lipgloss.NewStyle().Foreground(CurrentTheme().Muted()).Render(m.workLabel)
+	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(m.spinner.View() + " " + label)
 }
 
 // overlayAbove composites overlay onto base so that overlay's last line lands
@@ -382,6 +401,7 @@ func (m *Model) submit() tea.Cmd {
 	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: text}))
 	m.messages.AppendUser(text)
 	m.status.SetState(stateThinking)
+	m.workLabel = stateThinking
 	m.running = true
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -653,13 +673,17 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.messages.StartAssistant()
 
 	case agentloop.LoopReasoningDelta:
+		m.workLabel = stateThinking
 		m.messages.AppendReasoningDelta(msg.Event.Text)
 
 	case agentloop.LoopTextDelta:
+		m.workLabel = stateWriting
+		m.status.SetState(stateWriting)
 		m.messages.FinishReasoning()
 		m.messages.AppendAssistantDelta(msg.Event.Text)
 
 	case agentloop.LoopToolCallStarted:
+		m.workLabel = stateRunning + msg.Event.ToolCall.Name
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
 		m.messages.AddToolCall(msg.Event.ToolCall.Name, permissionDetail(msg.Event.ToolCall.Input))

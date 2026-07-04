@@ -94,6 +94,26 @@ func TestModel_EffortSelectorEscKeepsDefault(t *testing.T) {
 	}
 }
 
+func TestModel_InlineActivityIndicator(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	m.running = true
+	m.workLabel = stateThinking
+	if !strings.Contains(stripANSI(m.View()), "thinking…") {
+		t.Fatal("inline activity indicator not shown while running")
+	}
+
+	streamEvent(m, agentloop.LoopTextDelta, "hello")
+	if m.workLabel != stateWriting {
+		t.Fatalf("workLabel = %q, want %q once the answer streams", m.workLabel, stateWriting)
+	}
+
+	m.handleDone(TurnDoneMsg{})
+	if strings.Contains(stripANSI(m.View()), stateWriting) {
+		t.Fatal("activity indicator still shown after the turn finished")
+	}
+}
+
 func TestIndexOfEffort(t *testing.T) {
 	// minimal, low, medium, high, xhigh → medium is index 2.
 	if got := indexOfEffort(testEffortLevels, ""); got != 2 {
