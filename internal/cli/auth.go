@@ -15,13 +15,22 @@ import (
 	"golang.org/x/term"
 
 	"github.com/iperez/agens/internal/auth"
+	"github.com/iperez/agens/internal/auth/chatgpt"
 )
 
 // loginFunc performs the ChatGPT OAuth device/browser login flow and
-// returns the resulting credentials entry. It is a local seam: the real
-// implementation lives in internal/auth/chatgpt, a package that does not
-// exist yet, so production wiring is completed once that package lands.
+// returns the resulting credentials entry. It is a local seam: production
+// code wires chatGPTLogin, which adapts the real internal/auth/chatgpt.Login
+// to this signature; tests inject scripted stand-ins so the command tree
+// can be exercised without a real OAuth flow.
 type loginFunc func(ctx context.Context, out io.Writer) (auth.Entry, error)
+
+// chatGPTLogin adapts chatgpt.Login to the loginFunc seam, running the real
+// ChatGPT PKCE browser login flow with production defaults for browser
+// opening and HTTP transport.
+func chatGPTLogin(ctx context.Context, out io.Writer) (auth.Entry, error) {
+	return chatgpt.Login(ctx, chatgpt.LoginOptions{Out: out})
+}
 
 // authDeps is the dependency-injection seam for the `auth` command tree,
 // mirroring loopBuilder in chat.go: production code wires real
@@ -35,8 +44,9 @@ type authDeps struct {
 	now        func() time.Time
 }
 
-// errChatGPTLoginNotWired is returned by the production login stand-in
-// until the real internal/auth/chatgpt.Login is wired in.
+// errChatGPTLoginNotWired is returned by notWiredLogin, the test-only login
+// stand-in for command paths (api-key, status, logout) that must never
+// invoke the ChatGPT OAuth flow.
 var errChatGPTLoginNotWired = errors.New("auth: chatgpt login not yet wired")
 
 func notWiredLogin(context.Context, io.Writer) (auth.Entry, error) {
@@ -44,12 +54,19 @@ func notWiredLogin(context.Context, io.Writer) (auth.Entry, error) {
 }
 
 func newAuthCommand() *cobra.Command {
-	return newAuthCommandWithDeps(authDeps{
-		login:      notWiredLogin,
+	return newAuthCommandWithDeps(defaultAuthDeps())
+}
+
+// defaultAuthDeps returns the production authDeps: the real ChatGPT OAuth
+// login flow, terminal-backed secret reading, and the default credentials
+// file path.
+func defaultAuthDeps() authDeps {
+	return authDeps{
+		login:      chatGPTLogin,
 		readSecret: readSecretFromTerminal,
 		authPath:   auth.DefaultPath,
 		now:        time.Now,
-	})
+	}
 }
 
 func newAuthCommandWithDeps(deps authDeps) *cobra.Command {
@@ -70,7 +87,8 @@ func newAuthCommandWithDeps(deps authDeps) *cobra.Command {
 
 // newAuthLoginCommand builds `auth login`, whose bare form runs the ChatGPT
 // OAuth flow via deps.login and persists the resulting entry under the
-// "chatgpt" provider id, preserving every other provider already on disk.
+// "openai-chatgpt" provider id, preserving every other provider already on
+// disk.
 func newAuthLoginCommand(deps authDeps) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "login",
@@ -82,7 +100,7 @@ func newAuthLoginCommand(deps authDeps) *cobra.Command {
 				return fmt.Errorf("auth login: %w", err)
 			}
 
-			if err := saveProviderEntry(deps.authPath(), "chatgpt", entry); err != nil {
+			if err := saveProviderEntry(deps.authPath(), "openai-chatgpt", entry); err != nil {
 				return fmt.Errorf("auth login: %w", err)
 			}
 

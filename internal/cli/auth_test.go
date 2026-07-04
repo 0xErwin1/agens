@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,28 @@ func TestAuthCommand_BareLoginInvokesInjectedLogin(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("bare `auth login` did not invoke the injected login func")
+	}
+
+	file, err := auth.Load(path)
+	if err != nil {
+		t.Fatalf("auth.Load() error = %v", err)
+	}
+	if file["openai-chatgpt"].AccessToken != "at-x" {
+		t.Fatalf("bare `auth login` did not persist the entry under %q, got file = %+v", "openai-chatgpt", file)
+	}
+}
+
+// TestDefaultAuthDeps_WiresRealChatGPTLogin verifies the production command
+// tree wires chatGPTLogin (the real internal/auth/chatgpt.Login adapter)
+// rather than the notWiredLogin stand-in, without invoking it — invoking it
+// would open a real browser and hit the real network.
+func TestDefaultAuthDeps_WiresRealChatGPTLogin(t *testing.T) {
+	deps := defaultAuthDeps()
+
+	got := reflect.ValueOf(deps.login).Pointer()
+	want := reflect.ValueOf(chatGPTLogin).Pointer()
+	if got != want {
+		t.Fatal("defaultAuthDeps().login is not wired to chatGPTLogin")
 	}
 }
 
