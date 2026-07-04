@@ -21,10 +21,12 @@ const (
 	defaultBaseURL = "https://chatgpt.com/backend-api/codex"
 
 	// DefaultModel is the model id used when neither the request nor the
-	// provider's Config specifies one. The ChatGPT product surface rotates
-	// this id over time; Config.Model overrides it whenever a specific
-	// model is required.
-	DefaultModel = "gpt-5-codex"
+	// provider's Config specifies one. The ChatGPT-subscription backend only
+	// serves a rotating subset of ids (e.g. gpt-5.5, gpt-5.4) and rejects
+	// others with a 400; Config.Model or the --model flag overrides this
+	// whenever the current default is no longer served. A runtime models
+	// lookup (AGN-7) will eventually replace this hardcoded default.
+	DefaultModel = "gpt-5.5"
 
 	// codexCLIVersion is the version segment reported in the User-Agent
 	// header. It has no functional meaning within agens and is not tied to
@@ -39,7 +41,7 @@ const (
 // staticModels is the provisional model catalog for the ChatGPT-backed
 // Responses API surface. AGN-7 replaces it with a models.dev-backed lookup.
 var staticModels = []provider.ModelInfo{
-	{ID: DefaultModel, DisplayName: "GPT-5 Codex", ContextWindow: 400_000, MaxOutputTokens: 128_000, SupportsTools: true},
+	{ID: DefaultModel, DisplayName: "GPT-5.5", ContextWindow: 400_000, MaxOutputTokens: 128_000, SupportsTools: true},
 }
 
 // Provider implements provider.Provider against OpenAI's Responses API

@@ -31,25 +31,35 @@ func (e *ResponseError) Error() string {
 	return fmt.Sprintf("chatgpt: HTTP %d: %s (%s)", e.StatusCode, e.Message, e.Code)
 }
 
-// wireErrorEnvelope is the body of a non-2xx /responses response.
+// wireErrorEnvelope is the body of a non-2xx /responses response. The backend
+// uses two shapes: a nested {"error":{code,message}} object and a flat
+// {"detail":"..."} string; both are decoded so either surfaces a message.
 type wireErrorEnvelope struct {
 	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+	Detail string `json:"detail"`
 }
 
-// parseResponseError parses body as a /responses error envelope. If body is
-// not valid JSON, Message falls back to a truncated raw snippet of body
-// instead. It never returns nil, so callers can always attach the result via
-// errors.As.
+// parseResponseError parses body as a /responses error envelope, preferring
+// error.message, then the flat detail field. If body is not valid JSON, or is
+// JSON that carries none of those fields, Message falls back to a truncated
+// raw snippet of body so the caller never sees an empty reason. It never
+// returns nil, so callers can always attach the result via errors.As.
 func parseResponseError(statusCode int, body []byte) error {
 	var envelope wireErrorEnvelope
 	if err := json.Unmarshal(body, &envelope); err == nil {
-		return &ResponseError{
-			StatusCode: statusCode,
-			Code:       envelope.Error.Code,
-			Message:    envelope.Error.Message,
+		message := envelope.Error.Message
+		if message == "" {
+			message = envelope.Detail
+		}
+		if message != "" || envelope.Error.Code != "" {
+			return &ResponseError{
+				StatusCode: statusCode,
+				Code:       envelope.Error.Code,
+				Message:    message,
+			}
 		}
 	}
 

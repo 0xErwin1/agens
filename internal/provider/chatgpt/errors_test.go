@@ -116,6 +116,30 @@ func TestResponseError_ErrorFormat_NonZeroStatusCodeStillUsesHTTPPrefix(t *testi
 	}
 }
 
+func TestParseResponseError_FlatDetailBody(t *testing.T) {
+	body := []byte(`{"detail":"The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account."}`)
+
+	err := parseResponseError(400, body)
+
+	var responseErr *ResponseError
+	if !asResponseError(err, &responseErr) {
+		t.Fatalf("parseResponseError() = %v (%T), want a *ResponseError", err, err)
+	}
+	if !strings.Contains(responseErr.Message, "not supported") {
+		t.Fatalf("Message = %q, want it to surface the flat detail field", responseErr.Message)
+	}
+}
+
+func TestParseResponseError_UnrecognizedJSONFallsBackToSnippet(t *testing.T) {
+	body := []byte(`{"unexpected":"shape"}`)
+
+	err := parseResponseError(400, body)
+
+	if !strings.Contains(err.Error(), "unexpected") {
+		t.Fatalf("Error() = %q, want the raw snippet when no known error field is present", err.Error())
+	}
+}
+
 // asResponseError is a small local errors.As helper so the test package
 // does not need to import "errors" solely for this one assertion.
 func asResponseError(err error, target **ResponseError) bool {
