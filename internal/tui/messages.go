@@ -277,6 +277,10 @@ func (m *Messages) buildRenderer() {
 // and pushes the joined content into the viewport, keeping the newest content
 // in view.
 func (m *Messages) rebuild() {
+	// Auto-follow only when already at the bottom, so the user can scroll up
+	// to read while the agent keeps streaming without being snapped back.
+	follow := m.vp.AtBottom()
+
 	parts := make([]string, 0, len(m.blocks)+2)
 	for _, b := range m.blocks {
 		parts = append(parts, m.renderBlock(b))
@@ -289,7 +293,9 @@ func (m *Messages) rebuild() {
 	}
 
 	m.vp.SetContent(strings.Join(parts, blockSeparator))
-	m.vp.GotoBottom()
+	if follow {
+		m.vp.GotoBottom()
+	}
 }
 
 // renderReasoning renders the model's thinking as a dim, italic block under a

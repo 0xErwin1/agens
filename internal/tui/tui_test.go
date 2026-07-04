@@ -87,6 +87,26 @@ func TestModel_CentersContentWithPadding(t *testing.T) {
 	}
 }
 
+func TestModel_ScrollStaysPutWhileStreaming(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+	for i := 0; i < 40; i++ {
+		m.messages.AppendUser("a conversation line")
+	}
+
+	// Scroll up, then simulate the agent appending more content.
+	sendKey(m, tea.KeyMsg{Type: tea.KeyPgUp})
+	offsetBefore := m.messages.vp.YOffset
+
+	m.messages.AppendUser("another line while the user is reading up")
+
+	if m.messages.vp.AtBottom() {
+		t.Fatal("appending content snapped the view to the bottom while scrolled up")
+	}
+	if m.messages.vp.YOffset != offsetBefore {
+		t.Fatalf("scroll offset moved from %d to %d on append, want it to stay", offsetBefore, m.messages.vp.YOffset)
+	}
+}
+
 func TestModel_PageUpScrollsConversation(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
@@ -294,15 +314,58 @@ func TestModel_EnterWhileRunningDoesNotStartConcurrentTurn(t *testing.T) {
 	}
 }
 
-func TestModel_CtrlCIdleQuits(t *testing.T) {
+func TestModel_CtrlCIdleDoubleQuits(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
+	// First Ctrl+C only arms the quit prompt.
+	if cmd := sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlC}); cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatal("a single ctrl+c while idle quit, want it to arm a confirmation first")
+		}
+	}
+	if !m.quitArmed {
+		t.Fatal("first ctrl+c did not arm the quit prompt")
+	}
+	if !strings.Contains(stripANSI(m.View()), "press ctrl+c again to quit") {
+		t.Fatalf("View() = %q, want the quit hint", stripANSI(m.View()))
+	}
+
+	// Second consecutive Ctrl+C quits.
 	cmd := sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlC})
 	if cmd == nil {
-		t.Fatal("ctrl+c while idle returned nil cmd, want tea.Quit")
+		t.Fatal("second ctrl+c returned nil cmd, want tea.Quit")
 	}
 	if _, ok := cmd().(tea.QuitMsg); !ok {
-		t.Fatal("ctrl+c while idle did not return a quit command")
+		t.Fatal("second consecutive ctrl+c did not quit")
+	}
+}
+
+func TestModel_CtrlCDisarmedByOtherKey(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlC}) // arm
+	sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	if m.quitArmed {
+		t.Fatal("typing a key did not disarm the quit prompt")
+	}
+}
+
+func TestModel_CtrlCClearsInput(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	typeString(m, "some draft")
+	cmd := sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlC})
+
+	if m.input.Value() != "" {
+		t.Fatalf("input = %q, want ctrl+c to clear it", m.input.Value())
+	}
+	if cmd != nil {
+		if _, ok := cmd().(tea.QuitMsg); ok {
+			t.Fatal("ctrl+c cleared the input but also quit, want only the clear")
+		}
+	}
+	if m.quitArmed {
+		t.Fatal("clearing the input should not arm quit")
 	}
 }
 

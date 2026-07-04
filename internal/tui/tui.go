@@ -63,6 +63,9 @@ type Model struct {
 	// workLabel describes what the running turn is doing (thinking/writing/
 	// running a tool), shown by the inline activity indicator above the input.
 	workLabel string
+	// quitArmed is set after a Ctrl+C that neither canceled a turn nor cleared
+	// the input, so a second Ctrl+C quits; any other key disarms it.
+	quitArmed bool
 	events    <-chan tea.Msg
 	cancel    context.CancelFunc
 
@@ -226,6 +229,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 
 	case tea.KeyMsg:
+		// Any key other than Ctrl+C disarms the double-Ctrl+C-to-quit prompt.
+		if msg.Type != tea.KeyCtrlC {
+			m.quitArmed = false
+		}
 		if isScrollKey(msg) {
 			swallow = true
 			_, cmd := m.messages.Update(msg)
@@ -268,9 +275,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			swallow = true
-			if m.running {
-				m.abort()
-			} else {
+			if quit := m.handleCtrlC(); quit {
 				return m, tea.Quit
 			}
 		case tea.KeyEnter:
@@ -446,8 +451,13 @@ func (m *Model) View() string {
 	// while a turn runs, so "thinking/writing" is visible next to the
 	// conversation rather than only in the footer.
 	gap := ""
-	if m.running {
+	switch {
+	case m.running:
 		gap = m.workingLine()
+	case m.quitArmed:
+		gap = lipgloss.NewStyle().MarginLeft(contentGutter).
+			Foreground(CurrentTheme().Muted()).
+			Render("press ctrl+c again to quit")
 	}
 
 	base := lipgloss.JoinVertical(lipgloss.Left,
@@ -936,6 +946,27 @@ func (m *Model) closePalette() {
 	m.showPalette = false
 	m.paletteItems = nil
 	m.paletteIdx = 0
+}
+
+// handleCtrlC resolves a Ctrl+C press and reports whether the program should
+// quit. While a turn runs it cancels the turn; with text in the input it
+// clears the input; otherwise the first press arms a quit prompt and a second
+// consecutive press quits.
+func (m *Model) handleCtrlC() (quit bool) {
+	switch {
+	case m.running:
+		m.abort()
+		m.quitArmed = false
+	case m.input.Value() != "":
+		m.input.Reset()
+		m.refreshCompletions()
+		m.quitArmed = false
+	case m.quitArmed:
+		return true
+	default:
+		m.quitArmed = true
+	}
+	return false
 }
 
 // abort cancels the in-flight turn without quitting the program. The turn's
