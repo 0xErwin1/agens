@@ -132,6 +132,115 @@ func TestModel_SessionPickerResumesConversation(t *testing.T) {
 	}
 }
 
+func TestModel_SavesSessionWithProject(t *testing.T) {
+	store := &fakeSessionStore{}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Sessions: store, Project: "/home/me/projA"})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	m.history = []message.Message{message.NewMessage(message.RoleUser, message.TextPart{Text: "q"})}
+	m.handleDone(TurnDoneMsg{History: m.history})
+
+	if len(store.saved) != 1 {
+		t.Fatalf("saved %d sessions, want 1", len(store.saved))
+	}
+	if store.saved[0].Project != "/home/me/projA" {
+		t.Fatalf("saved project = %q, want the current project root", store.saved[0].Project)
+	}
+}
+
+func TestModel_SessionPickerFiltersByProjectAndTogglesAll(t *testing.T) {
+	sessions := []session.Session{
+		{ID: "a", Title: "this-project chat", Project: "/home/me/projA"},
+		{ID: "b", Title: "other-project chat", Project: "/home/me/projB"},
+		{ID: "c", Title: "legacy chat"}, // no project
+	}
+	store := &fakeSessionStore{list: sessions}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Sessions: store, Project: "/home/me/projA"})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	cmd := m.OpenSessionPicker()
+	m.Update(cmd()) // deliver the full list
+
+	// Default scope: only the current project's session is listed.
+	if len(m.sessionItems) != 1 || m.sessionItems[0].ID != "a" {
+		t.Fatalf("default picker items = %v, want only the current project's session", m.sessionItems)
+	}
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "this-project chat") || strings.Contains(view, "other-project chat") {
+		t.Fatalf("View() = %q, want only this project's conversation by default", view)
+	}
+
+	// Ctrl+A widens to every project.
+	sendKey(m, tea.KeyMsg{Type: tea.KeyCtrlA})
+
+	if len(m.sessionItems) != 3 {
+		t.Fatalf("after ctrl+a, picker items = %d, want all 3 across projects", len(m.sessionItems))
+	}
+	view = stripANSI(m.View())
+	if !strings.Contains(view, "other-project chat") || !strings.Contains(view, "projB") {
+		t.Fatalf("View() = %q, want all-projects view tagging each session's project", view)
+	}
+}
+
+func TestModel_ResumeIDOnStartupLoadsSession(t *testing.T) {
+	past := session.Session{
+		ID:       "old",
+		Title:    "past chat",
+		Messages: []message.Message{message.NewMessage(message.RoleUser, message.TextPart{Text: "earlier question"})},
+	}
+	store := &fakeSessionStore{loadByID: map[string]session.Session{"old": past}}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Sessions: store, ResumeID: "old"})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// Init wires the resume command; run the batch and deliver its messages.
+	for _, msg := range runCmd(m.Init()) {
+		m.Update(msg)
+	}
+
+	if m.sessionID != "old" {
+		t.Fatalf("sessionID = %q, want the resumed session %q", m.sessionID, "old")
+	}
+	if len(m.history) != 1 {
+		t.Fatalf("history has %d messages, want the resumed 1", len(m.history))
+	}
+	if !strings.Contains(stripANSI(m.View()), "earlier question") {
+		t.Fatalf("View() = %q, want the resumed conversation rendered", stripANSI(m.View()))
+	}
+}
+
+func TestModel_OpenSessionsOnStartupOpensPicker(t *testing.T) {
+	store := &fakeSessionStore{list: []session.Session{{ID: "a", Title: "a chat"}}}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Sessions: store, OpenSessions: true})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	m.Init()
+
+	if !m.sessionPickerOpen {
+		t.Fatal("session picker did not open on startup with OpenSessions set")
+	}
+}
+
+// runCmd executes a tea.Cmd, flattening a batch into the messages its children
+// produce so a startup batch can be delivered back into Update.
+func runCmd(cmd tea.Cmd) []tea.Msg {
+	if cmd == nil {
+		return nil
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return []tea.Msg{msg}
+	}
+	var msgs []tea.Msg
+	for _, c := range batch {
+		if c == nil {
+			continue
+		}
+		msgs = append(msgs, c())
+	}
+	return msgs
+}
+
 func TestModel_SessionsUnavailableWithoutStore(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // no store
 

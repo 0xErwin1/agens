@@ -18,8 +18,8 @@ func newRootCommand(build tuiLoopBuilder, run tuiRunner) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agens",
 		Short: "Agens is a coding agent CLI",
-		Long:  "Agens is a coding agent CLI. Run it with no arguments to open the interactive terminal UI.",
-		Args:  cobra.NoArgs,
+		Long:  "Agens is a coding agent CLI. Run it with no arguments to open the interactive terminal UI, or pass a session id to resume that conversation.",
+		Args:  cobra.MaximumNArgs(1),
 	}
 
 	cmd.Version = version.Info()

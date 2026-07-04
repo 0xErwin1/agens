@@ -27,6 +27,7 @@ type tuiSession struct {
 	effortLevels []string
 	sessions     tui.SessionStore
 	files        tui.FileSource
+	project      string
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -46,8 +47,9 @@ type tuiRunner func(model tea.Model) error
 func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 	var opts agent.Options
 	var allowAll bool
+	var resume bool
 
-	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+	cmd.RunE = func(_ *cobra.Command, args []string) error {
 		// The TUI owns the terminal, so it cannot use the tty-reading
 		// prompter the chat command does: an interactive decision is
 		// routed through the Bubble Tea event loop as a modal instead.
@@ -66,6 +68,8 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			return err
 		}
 
+		resumeID, openSessions := resolveResume(resume, args)
+
 		return run(tui.New(tui.Deps{
 			Loop:         sess.loop,
 			Model:        sess.model,
@@ -76,12 +80,27 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Sessions:     sess.sessions,
 			NewSessionID: uuid.NewString,
 			Files:        sess.files,
+			Project:      sess.project,
+			ResumeID:     resumeID,
+			OpenSessions: openSessions,
 		}))
 	}
 
 	cmd.Flags().StringVar(&opts.Model, "model", "", "override the configured model")
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
+	cmd.Flags().BoolVar(&resume, "resume", false, "resume a saved conversation: pass a session id to open it, or omit the id to pick from the list")
+}
+
+// resolveResume maps the --resume flag and an optional positional session id to
+// the TUI's startup behavior: a non-empty id resumes that session directly; a
+// bare --resume opens the session picker; neither starts a fresh conversation.
+// A positional id implies resume even without the flag.
+func resolveResume(resume bool, args []string) (resumeID string, openSessions bool) {
+	if len(args) > 0 && args[0] != "" {
+		return args[0], false
+	}
+	return "", resume
 }
 
 // defaultBuildTUI is the production tuiLoopBuilder: it loads config and
@@ -141,6 +160,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		effortLevels: prov.EffortLevels(),
 		sessions:     session.NewStore(session.DefaultDir()),
 		files:        files,
+		project:      opts.ProjectRoot,
 	}, nil
 }
 

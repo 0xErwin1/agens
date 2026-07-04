@@ -127,6 +127,30 @@ func TestTUICommand_BuilderErrorPropagatesAndSkipsRun(t *testing.T) {
 	}
 }
 
+func TestResolveResume(t *testing.T) {
+	cases := []struct {
+		name       string
+		resume     bool
+		args       []string
+		wantID     string
+		wantIsList bool
+	}{
+		{"bare agens starts fresh", false, nil, "", false},
+		{"--resume with no id opens the list", true, nil, "", true},
+		{"--resume with an id opens that session", true, []string{"abc"}, "abc", false},
+		{"a positional id implies resume", false, []string{"abc"}, "abc", false},
+		{"an empty positional falls back to the flag", true, []string{""}, "", true},
+	}
+
+	for _, c := range cases {
+		id, openList := resolveResume(c.resume, c.args)
+		if id != c.wantID || openList != c.wantIsList {
+			t.Fatalf("%s: resolveResume(%v, %v) = (%q, %v), want (%q, %v)",
+				c.name, c.resume, c.args, id, openList, c.wantID, c.wantIsList)
+		}
+	}
+}
+
 func TestRootCommand_BareInvocationRunsTUI(t *testing.T) {
 	built := false
 	build := func(agent.Options) (tuiSession, error) {

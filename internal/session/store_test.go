@@ -12,8 +12,9 @@ func TestStore_SaveListLoadRoundTrip(t *testing.T) {
 	store := NewStore(t.TempDir())
 
 	sess := Session{
-		ID:    "abc",
-		Title: "first chat",
+		ID:      "abc",
+		Title:   "first chat",
+		Project: "/home/me/projA",
 		Messages: []message.Message{
 			message.NewMessage(message.RoleUser, message.TextPart{Text: "hola"}),
 			message.NewMessage(message.RoleAssistant, message.TextPart{Text: "buenas"}),
@@ -29,6 +30,9 @@ func TestStore_SaveListLoadRoundTrip(t *testing.T) {
 	}
 	if loaded.Title != "first chat" || len(loaded.Messages) != 2 {
 		t.Fatalf("loaded = %+v, want title and 2 messages preserved", loaded)
+	}
+	if loaded.Project != "/home/me/projA" {
+		t.Fatalf("loaded project = %q, want it preserved across save/load", loaded.Project)
 	}
 	if loaded.Updated.IsZero() {
 		t.Fatal("Save did not stamp Updated")

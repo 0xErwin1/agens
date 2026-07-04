@@ -105,11 +105,21 @@ type Model struct {
 	// sessions persists and lists conversations (nil disables history);
 	// sessionID is the current conversation, minted by newSessionID. The
 	// remaining fields hold the session picker's state while it is open.
+	// project is the absolute project root the current conversation belongs to;
+	// saved sessions are stamped with it and the picker filters to it by
+	// default. resumeID and openSessionsOnStart drive the startup behavior of
+	// the --resume flag.
+	project             string
+	resumeID            string
+	openSessionsOnStart bool
+
 	sessions          SessionStore
 	sessionID         string
 	newSessionID      func() string
 	sessionPickerOpen bool
 	sessionItems      []session.Session
+	sessionAll        []session.Session
+	sessionShowAll    bool
 	sessionIdx        int
 	sessionLoading    bool
 	sessionErr        error
@@ -156,6 +166,13 @@ type Deps struct {
 	// nil (tests). Production passes a uuid generator.
 	NewSessionID func() string
 	Files        FileSource
+	// Project is the absolute project root the conversation belongs to; saved
+	// sessions are stamped with it and the picker scopes to it by default.
+	Project string
+	// ResumeID, when non-empty, resumes that session on startup. OpenSessions
+	// opens the session picker on startup instead. They back the --resume flag.
+	ResumeID     string
+	OpenSessions bool
 }
 
 // New constructs the root model from its dependencies.
@@ -173,21 +190,24 @@ func New(deps Deps) *Model {
 	}
 
 	return &Model{
-		input:        NewInput(),
-		status:       NewStatus(deps.Model),
-		messages:     NewMessages(),
-		spinner:      sp,
-		loop:         deps.Loop,
-		modelName:    deps.Model,
-		prompter:     deps.Prompter,
-		commands:     defaultCommands(),
-		lister:       deps.Models,
-		systemPrompt: deps.SystemPrompt,
-		effortLevels: deps.EffortLevels,
-		sessions:     deps.Sessions,
-		newSessionID: newID,
-		sessionID:    newID(),
-		files:        deps.Files,
+		input:               NewInput(),
+		status:              NewStatus(deps.Model),
+		messages:            NewMessages(),
+		spinner:             sp,
+		loop:                deps.Loop,
+		modelName:           deps.Model,
+		prompter:            deps.Prompter,
+		commands:            defaultCommands(),
+		lister:              deps.Models,
+		systemPrompt:        deps.SystemPrompt,
+		effortLevels:        deps.EffortLevels,
+		sessions:            deps.Sessions,
+		newSessionID:        newID,
+		sessionID:           newID(),
+		files:               deps.Files,
+		project:             deps.Project,
+		resumeID:            deps.ResumeID,
+		openSessionsOnStart: deps.OpenSessions,
 	}
 }
 
@@ -200,6 +220,14 @@ func (m *Model) Init() tea.Cmd {
 	}
 	if m.files != nil {
 		cmds = append(cmds, loadFilesCmd(m.files))
+	}
+	if m.sessions != nil {
+		switch {
+		case m.resumeID != "":
+			cmds = append(cmds, resumeSessionCmd(m.sessions, m.resumeID))
+		case m.openSessionsOnStart:
+			cmds = append(cmds, m.OpenSessionPicker())
+		}
 	}
 	return tea.Batch(cmds...)
 }
@@ -292,8 +320,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sessionsLoadedMsg:
 		m.sessionLoading = false
 		m.sessionErr = msg.err
-		m.sessionItems = msg.sessions
-		m.sessionIdx = 0
+		m.sessionAll = msg.sessions
+		m.applySessionFilter()
+
+	case sessionResumeMsg:
+		if msg.err != nil {
+			m.messages.AddInfo("could not resume session: " + humanizeError(msg.err.Error()))
+		} else {
+			m.applyResumedSession(msg.sess)
+		}
 
 	case filesLoadedMsg:
 		m.filesLoaded = true
@@ -486,7 +521,7 @@ func (m *Model) View() string {
 	case m.effortPickerOpen:
 		base = overlayAbove(base, renderEffortSelector(m.effortLevels, m.effortIdx, m.effort, m.contentWidth), inputRow)
 	case m.sessionPickerOpen:
-		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.contentWidth)
+		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.sessionShowAll, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
 	case m.filePickerOpen:
 		overlay := renderFileSelector(m.fileItems, m.fileIdx, !m.filesLoaded, m.contentWidth)
@@ -734,6 +769,7 @@ func (m *Model) saveSession() {
 	err := m.sessions.Save(session.Session{
 		ID:       m.sessionID,
 		Title:    sessionTitle(m.history),
+		Project:  m.project,
 		Messages: m.history,
 	})
 	if err != nil {
@@ -760,11 +796,21 @@ func (m *Model) OpenSessionPicker() tea.Cmd {
 
 // handleSessionPickerKey handles a keypress while the session picker is open:
 // Up/Down and Tab/Shift+Tab cycle the selection (wrapping), Enter resumes the
-// highlighted conversation, and Esc closes. Keys are ignored while loading or
-// when the list is empty.
+// highlighted conversation, Ctrl+A toggles between this project and all
+// projects, and Esc closes. Keys are ignored while loading or when the list is
+// empty.
 func (m *Model) handleSessionPickerKey(msg tea.KeyMsg) {
 	if msg.Type == tea.KeyEsc {
 		m.closeSessionPicker()
+		return
+	}
+
+	// Ctrl+A toggles between this project and every project. It is handled
+	// before the empty-list guard so an empty this-project view can still be
+	// widened to all projects.
+	if msg.Type == tea.KeyCtrlA {
+		m.sessionShowAll = !m.sessionShowAll
+		m.applySessionFilter()
 		return
 	}
 
@@ -785,22 +831,49 @@ func (m *Model) handleSessionPickerKey(msg tea.KeyMsg) {
 	}
 }
 
-// resumeSession loads the chosen conversation into the current view, adopting
-// its history and id so subsequent turns append to it.
+// resumeSession loads the chosen conversation from the picker into the current
+// view and closes the picker.
 func (m *Model) resumeSession(meta session.Session) {
 	sess, err := m.sessions.Load(meta.ID)
 	if err != nil {
 		m.closeSessionPicker()
-		m.messages.AddInfo("could not load session: " + err.Error())
+		m.messages.AddInfo("could not load session: " + humanizeError(err.Error()))
 		return
 	}
 
+	m.applyResumedSession(sess)
+	m.closeSessionPicker()
+}
+
+// applyResumedSession adopts a loaded conversation's history and id so
+// subsequent turns append to it. It is shared by the picker and the startup
+// --resume path.
+func (m *Model) applyResumedSession(sess session.Session) {
 	m.history = sess.Messages
 	m.sessionID = sess.ID
+	if sess.Project != "" {
+		m.project = sess.Project
+	}
 	m.messages.SetHistory(sess.Messages)
-
-	m.closeSessionPicker()
 	m.layout()
+}
+
+// applySessionFilter recomputes the visible session list from the full loaded
+// set: scoped to the current project, or every session when show-all is active
+// or no project is known. The selection resets to the top.
+func (m *Model) applySessionFilter() {
+	if m.sessionShowAll || m.project == "" {
+		m.sessionItems = m.sessionAll
+	} else {
+		filtered := make([]session.Session, 0, len(m.sessionAll))
+		for _, s := range m.sessionAll {
+			if s.Project == m.project {
+				filtered = append(filtered, s)
+			}
+		}
+		m.sessionItems = filtered
+	}
+	m.sessionIdx = 0
 }
 
 // closeSessionPicker hides the picker and clears its state.
@@ -809,6 +882,8 @@ func (m *Model) closeSessionPicker() {
 	m.sessionLoading = false
 	m.sessionErr = nil
 	m.sessionItems = nil
+	m.sessionAll = nil
+	m.sessionShowAll = false
 	m.sessionIdx = 0
 }
 

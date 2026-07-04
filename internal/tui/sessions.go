@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"path/filepath"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -40,6 +41,21 @@ func loadSessionsCmd(store SessionStore) tea.Cmd {
 	}
 }
 
+// sessionResumeMsg delivers the result of loading a single session by id (the
+// startup --resume path) into the Update loop.
+type sessionResumeMsg struct {
+	sess session.Session
+	err  error
+}
+
+// resumeSessionCmd loads one session by id off the UI goroutine.
+func resumeSessionCmd(store SessionStore, id string) tea.Cmd {
+	return func() tea.Msg {
+		sess, err := store.Load(id)
+		return sessionResumeMsg{sess: sess, err: err}
+	}
+}
+
 // sessionTitle derives a short title for a conversation from its first user
 // message, falling back to a placeholder for an empty history.
 func sessionTitle(history []message.Message) string {
@@ -73,7 +89,7 @@ func truncateTitle(s string) string {
 // renderSessionSelector draws the session picker overlay: a loading or error
 // line, an empty note, or the sessions with the selection highlighted and the
 // visible window following it.
-func renderSessionSelector(sessions []session.Session, selected int, loading bool, loadErr error, width int) string {
+func renderSessionSelector(sessions []session.Session, selected int, loading bool, loadErr error, showAll bool, width int) string {
 	theme := CurrentTheme()
 
 	inner := width - 4
@@ -85,8 +101,13 @@ func renderSessionSelector(sessions []session.Session, selected int, loading boo
 		return lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(s)
 	}
 
-	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Resume a conversation"))
-	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("↑/↓ · tab · enter resume · esc cancel"))
+	scope := "this project"
+	if showAll {
+		scope = "all projects"
+	}
+	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Resume a conversation") +
+		lipgloss.NewStyle().Foreground(theme.Muted()).Render("  ("+scope+")"))
+	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("↑/↓ · enter resume · ctrl+a all/this · esc cancel"))
 
 	var body []string
 	switch {
@@ -97,7 +118,7 @@ func renderSessionSelector(sessions []session.Session, selected int, loading boo
 	case len(sessions) == 0:
 		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("no saved conversations"))}
 	default:
-		body = sessionRows(sessions, selected, theme, inner)
+		body = sessionRows(sessions, selected, showAll, theme, inner)
 	}
 
 	content := append([]string{title}, body...)
@@ -114,8 +135,10 @@ func renderSessionSelector(sessions []session.Session, selected int, loading boo
 	return box.Render(strings.Join(content, "\n"))
 }
 
-// sessionRows renders the visible window of session rows.
-func sessionRows(sessions []session.Session, selected int, theme Theme, inner int) []string {
+// sessionRows renders the visible window of session rows. When showAll is set
+// each row is tagged with its project's base name so cross-project results are
+// distinguishable.
+func sessionRows(sessions []session.Session, selected int, showAll bool, theme Theme, inner int) []string {
 	start := windowStart(selected, len(sessions), maxSessionRows)
 	end := start + maxSessionRows
 	if end > len(sessions) {
@@ -134,9 +157,24 @@ func sessionRows(sessions []session.Session, selected int, theme Theme, inner in
 		}
 
 		title := lipgloss.NewStyle().Foreground(titleColor).Render(sess.Title)
-		when := lipgloss.NewStyle().Foreground(theme.Muted()).Render("  " + sess.Updated.Format(sessionTimeFormat))
+
+		meta := "  " + sess.Updated.Format(sessionTimeFormat)
+		if showAll {
+			meta = "  " + sessionProjectLabel(sess.Project) + meta
+		}
+		when := lipgloss.NewStyle().Foreground(theme.Muted()).Render(meta)
 
 		rows = append(rows, lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(marker+title+when))
 	}
 	return rows
+}
+
+// sessionProjectLabel is the short project tag shown in the all-projects view:
+// the base name of the project root, or a placeholder for sessions saved
+// without a project.
+func sessionProjectLabel(project string) string {
+	if project == "" {
+		return "[no project]"
+	}
+	return "[" + filepath.Base(project) + "]"
 }
