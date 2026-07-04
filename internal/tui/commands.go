@@ -25,6 +25,9 @@ type CommandContext interface {
 	OpenModelSelector() tea.Cmd
 	// OpenEffortSelector opens the reasoning-effort selector.
 	OpenEffortSelector() tea.Cmd
+	// OpenSessionPicker opens the saved-conversation picker, returning the
+	// command that lists them (or nil when unavailable).
+	OpenSessionPicker() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
 }
@@ -134,6 +137,9 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/effort", Desc: "set the reasoning effort", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenEffortSelector()
+		}},
+		Command{Name: "/sessions", Desc: "resume a saved conversation", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenSessionPicker()
 		}},
 		Command{Name: "/help", Desc: "show commands and shortcuts", Run: func(ctx CommandContext) tea.Cmd {
 			ctx.Notify(ctx.CommandHelp())

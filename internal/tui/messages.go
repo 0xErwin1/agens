@@ -7,6 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/iperez/agens/internal/message"
 )
 
 // Visible markers layered on top of the theme colors. The user turn is set
@@ -177,6 +179,43 @@ func (m *Messages) SetError(msg string) {
 // the conversation.
 func (m *Messages) AddInfo(text string) {
 	m.blocks = append(m.blocks, block{kind: blockSystem, text: text})
+	m.rebuild()
+}
+
+// SetHistory replaces the conversation with blocks reconstructed from a saved
+// message history, used when resuming a session. The mapping mirrors how the
+// live stream builds blocks: user text and tool results under the user role,
+// assistant text and tool calls under the assistant role.
+func (m *Messages) SetHistory(history []message.Message) {
+	m.blocks = nil
+	m.streaming = ""
+	m.streamingActive = false
+	m.reasoning = ""
+	m.reasoningActive = false
+
+	for _, msg := range history {
+		for _, part := range msg.Parts {
+			switch p := part.(type) {
+			case message.TextPart:
+				kind := blockAssistant
+				if msg.Role == message.RoleUser {
+					kind = blockUser
+				}
+				m.blocks = append(m.blocks, block{kind: kind, text: p.Text})
+
+			case message.ToolUsePart:
+				m.blocks = append(m.blocks, block{kind: blockToolCall, text: p.Name, detail: permissionDetail(p.Input)})
+
+			case message.ToolResultPart:
+				kind := blockToolResult
+				if p.IsError {
+					kind = blockToolError
+				}
+				m.blocks = append(m.blocks, block{kind: kind, text: toolResultText(p)})
+			}
+		}
+	}
+
 	m.rebuild()
 }
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -12,6 +13,7 @@ import (
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/provider"
+	"github.com/iperez/agens/internal/session"
 )
 
 // Layout dimensions. The input and status bars have fixed heights; the
@@ -97,6 +99,18 @@ type Model struct {
 	effortPickerOpen bool
 	effortIdx        int
 
+	// sessions persists and lists conversations (nil disables history);
+	// sessionID is the current conversation, minted by newSessionID. The
+	// remaining fields hold the session picker's state while it is open.
+	sessions          SessionStore
+	sessionID         string
+	newSessionID      func() string
+	sessionPickerOpen bool
+	sessionItems      []session.Session
+	sessionIdx        int
+	sessionLoading    bool
+	sessionErr        error
+
 	width, height int
 	// contentWidth is the width of the centered content column and leftPad the
 	// left offset that centers it; both are derived from width in layout.
@@ -124,12 +138,25 @@ type Deps struct {
 	Models       ModelLister
 	SystemPrompt SystemPromptFunc
 	EffortLevels []string
+	Sessions     SessionStore
+	// NewSessionID mints a fresh conversation id; defaults to a counter when
+	// nil (tests). Production passes a uuid generator.
+	NewSessionID func() string
 }
 
 // New constructs the root model from its dependencies.
 func New(deps Deps) *Model {
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	sp.Style = lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
+
+	newID := deps.NewSessionID
+	if newID == nil {
+		counter := 0
+		newID = func() string {
+			counter++
+			return fmt.Sprintf("session-%d", counter)
+		}
+	}
 
 	return &Model{
 		input:        NewInput(),
@@ -143,6 +170,9 @@ func New(deps Deps) *Model {
 		lister:       deps.Models,
 		systemPrompt: deps.SystemPrompt,
 		effortLevels: deps.EffortLevels,
+		sessions:     deps.Sessions,
+		newSessionID: newID,
+		sessionID:    newID(),
 	}
 }
 
@@ -202,6 +232,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleEffortPickerKey(msg)
 			break
 		}
+		if m.sessionPickerOpen {
+			swallow = true
+			m.handleSessionPickerKey(msg)
+			break
+		}
 		if m.showPalette {
 			if cmd, consumed := m.handlePaletteKey(msg); consumed {
 				swallow = true
@@ -227,6 +262,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelErr = msg.err
 		m.modelItems = msg.models
 		m.modelIdx = indexOfModel(msg.models, m.modelName)
+
+	case sessionsLoadedMsg:
+		m.sessionLoading = false
+		m.sessionErr = msg.err
+		m.sessionItems = msg.sessions
+		m.sessionIdx = 0
 
 	case spinner.TickMsg:
 		// Ignore ticks that arrive after the turn ended; otherwise a stray
@@ -291,6 +332,9 @@ func (m *Model) View() string {
 		base = overlayAbove(base, overlay, inputRow)
 	case m.effortPickerOpen:
 		base = overlayAbove(base, renderEffortSelector(m.effortLevels, m.effortIdx, m.effort, m.contentWidth), inputRow)
+	case m.sessionPickerOpen:
+		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.contentWidth)
+		base = overlayAbove(base, overlay, inputRow)
 	case m.showPalette:
 		base = overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.contentWidth), inputRow)
 	}
@@ -506,11 +550,103 @@ func (m *Model) runCommand(cmd Command) tea.Cmd {
 	return result
 }
 
-// NewConversation implements CommandContext: it discards the history and
-// resets the conversation view.
+// NewConversation implements CommandContext: it discards the history, resets
+// the conversation view, and starts a fresh session so the next turns are
+// saved separately from the previous conversation.
 func (m *Model) NewConversation() {
 	m.history = nil
 	m.messages = NewMessages()
+	m.sessionID = m.newSessionID()
+	m.layout()
+}
+
+// saveSession persists the current conversation. It is a no-op when there is
+// no store or no history, and surfaces a write failure as a note rather than
+// interrupting the turn.
+func (m *Model) saveSession() {
+	if m.sessions == nil || len(m.history) == 0 {
+		return
+	}
+
+	err := m.sessions.Save(session.Session{
+		ID:       m.sessionID,
+		Title:    sessionTitle(m.history),
+		Messages: m.history,
+	})
+	if err != nil {
+		m.messages.AddInfo("could not save session: " + err.Error())
+	}
+}
+
+// OpenSessionPicker implements CommandContext: it opens the session picker and
+// starts listing saved conversations, or reports that history is unavailable.
+func (m *Model) OpenSessionPicker() tea.Cmd {
+	if m.sessions == nil {
+		m.messages.AddInfo("session history not available")
+		return nil
+	}
+
+	m.sessionPickerOpen = true
+	m.sessionLoading = true
+	m.sessionErr = nil
+	m.sessionItems = nil
+	m.sessionIdx = 0
+
+	return loadSessionsCmd(m.sessions)
+}
+
+// handleSessionPickerKey handles a keypress while the session picker is open:
+// Up/Down and Tab/Shift+Tab cycle the selection (wrapping), Enter resumes the
+// highlighted conversation, and Esc closes. Keys are ignored while loading or
+// when the list is empty.
+func (m *Model) handleSessionPickerKey(msg tea.KeyMsg) {
+	if msg.Type == tea.KeyEsc {
+		m.closeSessionPicker()
+		return
+	}
+
+	n := len(m.sessionItems)
+	if n == 0 {
+		return
+	}
+
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.sessionIdx = (m.sessionIdx - 1 + n) % n
+
+	case tea.KeyDown, tea.KeyTab:
+		m.sessionIdx = (m.sessionIdx + 1) % n
+
+	case tea.KeyEnter:
+		m.resumeSession(m.sessionItems[m.sessionIdx])
+	}
+}
+
+// resumeSession loads the chosen conversation into the current view, adopting
+// its history and id so subsequent turns append to it.
+func (m *Model) resumeSession(meta session.Session) {
+	sess, err := m.sessions.Load(meta.ID)
+	if err != nil {
+		m.closeSessionPicker()
+		m.messages.AddInfo("could not load session: " + err.Error())
+		return
+	}
+
+	m.history = sess.Messages
+	m.sessionID = sess.ID
+	m.messages.SetHistory(sess.Messages)
+
+	m.closeSessionPicker()
+	m.layout()
+}
+
+// closeSessionPicker hides the picker and clears its state.
+func (m *Model) closeSessionPicker() {
+	m.sessionPickerOpen = false
+	m.sessionLoading = false
+	m.sessionErr = nil
+	m.sessionItems = nil
+	m.sessionIdx = 0
 }
 
 // Notify implements CommandContext: it appends a system note to the view.
@@ -729,6 +865,7 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 	}
 
 	m.status.SetState(stateReady)
+	m.saveSession()
 }
 
 // isScrollKey reports whether msg is a key that scrolls the conversation view

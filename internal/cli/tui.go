@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/iperez/agens/internal/agent"
@@ -11,6 +12,7 @@ import (
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/permission"
+	"github.com/iperez/agens/internal/session"
 	"github.com/iperez/agens/internal/tui"
 )
 
@@ -23,6 +25,7 @@ type tuiSession struct {
 	prompt       tui.SystemPromptFunc
 	model        string
 	effortLevels []string
+	sessions     tui.SessionStore
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -62,18 +65,20 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 				opts.Prompter = prompter
 			}
 
-			session, err := build(opts)
+			sess, err := build(opts)
 			if err != nil {
 				return err
 			}
 
 			return run(tui.New(tui.Deps{
-				Loop:         session.loop,
-				Model:        session.model,
+				Loop:         sess.loop,
+				Model:        sess.model,
 				Prompter:     prompter,
-				Models:       session.lister,
-				SystemPrompt: session.prompt,
-				EffortLevels: session.effortLevels,
+				Models:       sess.lister,
+				SystemPrompt: sess.prompt,
+				EffortLevels: sess.effortLevels,
+				Sessions:     sess.sessions,
+				NewSessionID: uuid.NewString,
 			}))
 		},
 	}
@@ -133,6 +138,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		prompt:       prompt,
 		model:        modelName,
 		effortLevels: prov.EffortLevels(),
+		sessions:     session.NewStore(session.DefaultDir()),
 	}, nil
 }
 
