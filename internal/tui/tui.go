@@ -52,6 +52,13 @@ type Model struct {
 	prompter *Prompter
 	pending  *PermissionRequest
 
+	// showPalette is set while the input holds a slash command; paletteItems
+	// are the commands currently matching it and paletteIdx the highlighted
+	// one.
+	showPalette  bool
+	paletteItems []command
+	paletteIdx   int
+
 	width, height int
 }
 
@@ -121,6 +128,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.handleModalKey(msg))
 			break
 		}
+		if m.showPalette {
+			if cmd, consumed := m.handlePaletteKey(msg); consumed {
+				swallow = true
+				cmds = append(cmds, cmd)
+				break
+			}
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			swallow = true
@@ -131,9 +145,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case tea.KeyEnter:
 			swallow = true
-			if !m.running && strings.TrimSpace(m.input.Value()) != "" {
-				cmds = append(cmds, m.submit())
-			}
+			cmds = append(cmds, m.onEnter())
 		}
 
 	case spinner.TickMsg:
@@ -154,6 +166,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if !swallow {
 		_, cmd := m.input.Update(msg)
 		cmds = append(cmds, cmd)
+
+		if _, ok := msg.(tea.KeyMsg); ok {
+			m.refreshPalette()
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -169,11 +185,19 @@ func (m *Model) View() string {
 		bottom = renderPermission(m.pending.Call, m.width)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left,
-		m.messages.View(),
-		bottom,
-		m.status.View(),
-	)
+	parts := []string{m.messages.View()}
+	if m.paletteVisible() {
+		parts = append(parts, renderPalette(m.paletteItems, m.paletteIdx, m.width))
+	}
+	parts = append(parts, bottom, m.status.View())
+
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// paletteVisible reports whether the command palette should be drawn: only
+// when it is active and no permission modal has taken over the bottom area.
+func (m *Model) paletteVisible() bool {
+	return m.showPalette && m.pending == nil
 }
 
 // layout distributes the current window size across the children: the status
@@ -186,7 +210,12 @@ func (m *Model) layout() {
 		bottomHeight = modalHeight
 	}
 
-	msgHeight := m.height - bottomHeight - statusHeight
+	pal := 0
+	if m.paletteVisible() {
+		pal = paletteHeight(len(m.paletteItems))
+	}
+
+	msgHeight := m.height - bottomHeight - statusHeight - pal
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
@@ -239,6 +268,122 @@ func (m *Model) submit() tea.Cmd {
 	m.events = runTurn(ctx, m.loop, m.history)
 
 	return tea.Batch(waitFor(m.events), m.spinner.Tick)
+}
+
+// onEnter handles the Enter key when the palette has not already consumed it:
+// a slash command is run (unknown ones report an error note), an empty or
+// in-flight input is ignored, and anything else is submitted as a chat turn.
+func (m *Model) onEnter() tea.Cmd {
+	value := strings.TrimSpace(m.input.Value())
+	if value == "" || m.running {
+		return nil
+	}
+
+	if strings.HasPrefix(value, "/") {
+		if c, ok := lookupCommand(value); ok {
+			return m.runCommand(c.name)
+		}
+
+		m.input.Reset()
+		m.closePalette()
+		m.messages.AddInfo("comando desconocido: " + value)
+		m.layout()
+		return nil
+	}
+
+	return m.submit()
+}
+
+// refreshPalette recomputes the command palette from the current input after a
+// keystroke: it is shown only while idle and while the input holds a slash
+// command. It relayouts when visibility changes so the messages view shrinks
+// or grows to make room.
+func (m *Model) refreshPalette() {
+	previous := m.showPalette
+
+	if m.running {
+		m.paletteItems = nil
+	} else {
+		m.paletteItems = matchCommands(m.input.Value())
+	}
+
+	m.showPalette = len(m.paletteItems) > 0
+	if m.paletteIdx >= len(m.paletteItems) {
+		m.paletteIdx = 0
+	}
+
+	if previous != m.showPalette {
+		m.layout()
+	}
+}
+
+// handlePaletteKey handles a keypress while the palette is open. It reports
+// whether it consumed the key: navigation, completion (Tab), dismissal (Esc),
+// and running the selection (Enter) are consumed; anything else falls through
+// so ordinary typing still edits the input and re-filters the palette.
+func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	switch msg.Type {
+	case tea.KeyUp:
+		if m.paletteIdx > 0 {
+			m.paletteIdx--
+		}
+		return nil, true
+
+	case tea.KeyDown:
+		if m.paletteIdx < len(m.paletteItems)-1 {
+			m.paletteIdx++
+		}
+		return nil, true
+
+	case tea.KeyTab:
+		m.input.SetValue(m.paletteItems[m.paletteIdx].name + " ")
+		m.refreshPalette()
+		return nil, true
+
+	case tea.KeyEsc:
+		m.input.Reset()
+		m.closePalette()
+		m.layout()
+		return nil, true
+
+	case tea.KeyEnter:
+		return m.runCommand(m.paletteItems[m.paletteIdx].name), true
+
+	default:
+		return nil, false
+	}
+}
+
+// runCommand executes the named slash command, clearing the input and palette
+// first. /quit returns tea.Quit; the rest mutate the conversation in place.
+func (m *Model) runCommand(name string) tea.Cmd {
+	m.input.Reset()
+	m.closePalette()
+
+	switch name {
+	case "/new", "/clear":
+		m.history = nil
+		m.messages = NewMessages()
+
+	case "/model":
+		m.messages.AddInfo("modelo actual: " + m.modelName)
+
+	case "/help":
+		m.messages.AddInfo(helpText())
+
+	case "/quit":
+		return tea.Quit
+	}
+
+	m.layout()
+	return nil
+}
+
+// closePalette hides the palette and resets its selection.
+func (m *Model) closePalette() {
+	m.showPalette = false
+	m.paletteItems = nil
+	m.paletteIdx = 0
 }
 
 // abort cancels the in-flight turn without quitting the program. The turn's

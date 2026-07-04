@@ -44,6 +44,7 @@ const (
 	blockToolResult
 	blockToolError
 	blockError
+	blockSystem
 )
 
 // block is a finalized conversation entry kept in its raw form so it can be
@@ -141,6 +142,13 @@ func (m *Messages) AddToolResult(text string, isError bool) {
 // SetError adds an error block describing a turn-level failure.
 func (m *Messages) SetError(msg string) {
 	m.blocks = append(m.blocks, block{kind: blockError, text: msg})
+	m.rebuild()
+}
+
+// AddInfo adds a muted, system-level note (e.g. a slash command's output) to
+// the conversation.
+func (m *Messages) AddInfo(text string) {
+	m.blocks = append(m.blocks, block{kind: blockSystem, text: text})
 	m.rebuild()
 }
 
@@ -254,6 +262,9 @@ func (m *Messages) renderBlock(b block) string {
 
 	case blockError:
 		return m.gutteredBlock(theme.Error(), labelErrorBlock+b.text, true)
+
+	case blockSystem:
+		return m.gutteredBlock(theme.Muted(), b.text, false)
 
 	default:
 		return b.text

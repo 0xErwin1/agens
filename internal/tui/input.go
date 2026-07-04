@@ -42,6 +42,13 @@ func (i *Input) Value() string { return i.ta.Value() }
 // Reset clears the entered text, returning the input to its empty state.
 func (i *Input) Reset() { i.ta.Reset() }
 
+// SetValue replaces the entered text and moves the cursor to the end, used by
+// the command palette to complete a highlighted command into the input.
+func (i *Input) SetValue(s string) {
+	i.ta.SetValue(s)
+	i.ta.CursorEnd()
+}
+
 // Focus focuses the input and returns the textarea's blink command.
 func (i *Input) Focus() tea.Cmd { return i.ta.Focus() }
 
