@@ -111,6 +111,16 @@ type Model struct {
 	sessionLoading    bool
 	sessionErr        error
 
+	// files provides the project files for @-references (nil disables them);
+	// fileCache is the list loaded once at startup. The picker fields hold the
+	// @-picker's state while it is open.
+	files          FileSource
+	fileCache      []string
+	filesLoaded    bool
+	filePickerOpen bool
+	fileItems      []string
+	fileIdx        int
+
 	width, height int
 	// contentWidth is the width of the centered content column and leftPad the
 	// left offset that centers it; both are derived from width in layout.
@@ -142,6 +152,7 @@ type Deps struct {
 	// NewSessionID mints a fresh conversation id; defaults to a counter when
 	// nil (tests). Production passes a uuid generator.
 	NewSessionID func() string
+	Files        FileSource
 }
 
 // New constructs the root model from its dependencies.
@@ -173,6 +184,7 @@ func New(deps Deps) *Model {
 		sessions:     deps.Sessions,
 		newSessionID: newID,
 		sessionID:    newID(),
+		files:        deps.Files,
 	}
 }
 
@@ -182,6 +194,9 @@ func (m *Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.input.Focus()}
 	if m.prompter != nil {
 		cmds = append(cmds, waitForPermission(m.prompter.Requests()))
+	}
+	if m.files != nil {
+		cmds = append(cmds, loadFilesCmd(m.files))
 	}
 	return tea.Batch(cmds...)
 }
@@ -237,6 +252,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleSessionPickerKey(msg)
 			break
 		}
+		if m.filePickerOpen {
+			if m.handleFilePickerKey(msg) {
+				swallow = true
+				break
+			}
+		}
 		if m.showPalette {
 			if cmd, consumed := m.handlePaletteKey(msg); consumed {
 				swallow = true
@@ -269,6 +290,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.sessionItems = msg.sessions
 		m.sessionIdx = 0
 
+	case filesLoadedMsg:
+		m.filesLoaded = true
+		m.fileCache = msg.files
+
 	case spinner.TickMsg:
 		// Ignore ticks that arrive after the turn ended; otherwise a stray
 		// tick repaints the spinner next to "ready" with no further ticks to
@@ -292,11 +317,123 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, cmd)
 
 		if _, ok := msg.(tea.KeyMsg); ok {
-			m.refreshPalette()
+			m.refreshCompletions()
 		}
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// refreshCompletions recomputes the input-driven overlays after a keystroke.
+// An in-progress @-reference takes precedence over the slash palette; the two
+// never show at once.
+func (m *Model) refreshCompletions() {
+	if m.refreshFilePicker() {
+		m.showPalette = false
+		return
+	}
+	m.filePickerOpen = false
+	m.refreshPalette()
+}
+
+// refreshFilePicker opens or updates the @-reference picker from the current
+// input, returning whether it is active. It is inactive when no file source is
+// wired, a turn is running, or the input has no in-progress @-reference.
+func (m *Model) refreshFilePicker() bool {
+	token, _, ok := atToken(m.input.Value())
+	if m.files == nil || m.running || !ok {
+		m.filePickerOpen = false
+		return false
+	}
+
+	m.filePickerOpen = true
+	m.fileItems = filterFiles(m.fileCache, token)
+	if m.fileIdx >= len(m.fileItems) {
+		m.fileIdx = 0
+	}
+	return true
+}
+
+// handleFilePickerKey handles a keypress while the @-picker is open. It reports
+// whether it consumed the key: navigation, insertion (Enter), and dismissal
+// (Esc) are consumed; anything else falls through so typing keeps filtering.
+func (m *Model) handleFilePickerKey(msg tea.KeyMsg) bool {
+	n := len(m.fileItems)
+
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		if n > 0 {
+			m.fileIdx = (m.fileIdx - 1 + n) % n
+		}
+		return true
+
+	case tea.KeyDown, tea.KeyTab:
+		if n > 0 {
+			m.fileIdx = (m.fileIdx + 1) % n
+		}
+		return true
+
+	case tea.KeyEsc:
+		m.filePickerOpen = false
+		return true
+
+	case tea.KeyEnter:
+		if n > 0 {
+			m.insertFileRef(m.fileItems[m.fileIdx])
+		}
+		return true
+
+	default:
+		return false
+	}
+}
+
+// insertFileRef replaces the in-progress @-reference in the input with the
+// chosen path followed by a space, which ends the reference and closes the
+// picker.
+func (m *Model) insertFileRef(path string) {
+	value := m.input.Value()
+	_, start, ok := atToken(value)
+	if !ok {
+		return
+	}
+
+	m.input.SetValue(value[:start] + "@" + path + " ")
+	m.filePickerOpen = false
+}
+
+// expandFileRefs appends the contents of every @-referenced project file to
+// text, so the model sees them. Unknown references and unreadable files are
+// left as-is; each file is capped at maxFileRefBytes.
+func (m *Model) expandFileRefs(text string) string {
+	if m.files == nil {
+		return text
+	}
+
+	known := make(map[string]struct{}, len(m.fileCache))
+	for _, f := range m.fileCache {
+		known[f] = struct{}{}
+	}
+
+	refs := extractFileRefs(text, known)
+	if len(refs) == 0 {
+		return text
+	}
+
+	var b strings.Builder
+	b.WriteString(text)
+	for _, path := range refs {
+		content, err := m.files.Read(path)
+		if err != nil {
+			continue
+		}
+		if len(content) > maxFileRefBytes {
+			content = content[:maxFileRefBytes] + "\n… (truncated)"
+		}
+		b.WriteString("\n\n--- " + path + " ---\n")
+		b.WriteString(content)
+	}
+	return b.String()
 }
 
 // View composes the fixed frame — conversation, prompt input, footer — and
@@ -334,6 +471,9 @@ func (m *Model) View() string {
 		base = overlayAbove(base, renderEffortSelector(m.effortLevels, m.effortIdx, m.effort, m.contentWidth), inputRow)
 	case m.sessionPickerOpen:
 		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.contentWidth)
+		base = overlayAbove(base, overlay, inputRow)
+	case m.filePickerOpen:
+		overlay := renderFileSelector(m.fileItems, m.fileIdx, !m.filesLoaded, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
 	case m.showPalette:
 		base = overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.contentWidth), inputRow)
@@ -444,8 +584,11 @@ func (m *Model) handleModalKey(msg tea.KeyMsg) tea.Cmd {
 func (m *Model) submit() tea.Cmd {
 	text := m.input.Value()
 	m.input.Reset()
+	m.filePickerOpen = false
 
-	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: text}))
+	// The model receives the message with @-referenced files inlined; the
+	// conversation shows the original text the user typed.
+	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: m.expandFileRefs(text)}))
 	m.messages.AppendUser(text)
 	m.status.SetState(stateThinking)
 	m.workLabel = stateThinking

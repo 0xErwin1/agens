@@ -26,6 +26,7 @@ type tuiSession struct {
 	model        string
 	effortLevels []string
 	sessions     tui.SessionStore
+	files        tui.FileSource
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -79,6 +80,7 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 				EffortLevels: sess.effortLevels,
 				Sessions:     sess.sessions,
 				NewSessionID: uuid.NewString,
+				Files:        sess.files,
 			}))
 		},
 	}
@@ -132,6 +134,13 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return sp, true
 	}
 
+	// @-references are best-effort: a project root that cannot be opened as a
+	// confinement root simply disables them rather than failing the TUI.
+	var files tui.FileSource
+	if src, err := newProjectFileSource(opts.ProjectRoot); err == nil {
+		files = src
+	}
+
 	return tuiSession{
 		loop:         loop,
 		lister:       prov,
@@ -139,6 +148,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		model:        modelName,
 		effortLevels: prov.EffortLevels(),
 		sessions:     session.NewStore(session.DefaultDir()),
+		files:        files,
 	}, nil
 }
 
