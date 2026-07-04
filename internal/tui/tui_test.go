@@ -50,6 +50,23 @@ func TestModel_SpinnerTicksOnlyWhileRunning(t *testing.T) {
 	}
 }
 
+func TestModel_PageUpScrollsConversation(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	for i := 0; i < 40; i++ {
+		m.messages.AppendUser("a conversation line")
+	}
+	if !m.messages.vp.AtBottom() {
+		t.Fatal("precondition failed: viewport should sit at the bottom after appends")
+	}
+
+	sendMsg(m, tea.KeyMsg{Type: tea.KeyPgUp})
+
+	if m.messages.vp.AtBottom() {
+		t.Fatal("PgUp did not scroll the conversation up; scroll is not wired to the messages view")
+	}
+}
+
 func TestModel_WindowSizeSizesChildrenAndRenders(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

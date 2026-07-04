@@ -104,7 +104,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pending = &req
 		m.layout()
 
+	case tea.MouseMsg:
+		swallow = true
+		_, cmd := m.messages.Update(msg)
+		cmds = append(cmds, cmd)
+
 	case tea.KeyMsg:
+		if isScrollKey(msg) {
+			swallow = true
+			_, cmd := m.messages.Update(msg)
+			cmds = append(cmds, cmd)
+			break
+		}
 		if m.pending != nil {
 			swallow = true
 			cmds = append(cmds, m.handleModalKey(msg))
@@ -251,7 +262,7 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 
 	case agentloop.LoopToolCallStarted:
 		m.messages.FinishAssistant()
-		m.messages.AddToolCall(msg.Event.ToolCall.Name)
+		m.messages.AddToolCall(msg.Event.ToolCall.Name, permissionDetail(msg.Event.ToolCall.Input))
 		m.status.SetState(stateRunning + msg.Event.ToolCall.Name)
 
 	case agentloop.LoopToolResult:
@@ -290,6 +301,19 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 	}
 
 	m.status.SetState(stateReady)
+}
+
+// isScrollKey reports whether msg is a key that scrolls the conversation view
+// rather than editing the prompt. Only page keys are claimed so ordinary
+// arrows and text still reach the input; the mouse wheel scrolls too, handled
+// separately as a MouseMsg.
+func isScrollKey(msg tea.KeyMsg) bool {
+	switch msg.Type {
+	case tea.KeyPgUp, tea.KeyPgDown:
+		return true
+	default:
+		return false
+	}
 }
 
 // toolResultText flattens a tool result's parts into a single string by

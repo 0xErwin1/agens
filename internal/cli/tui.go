@@ -103,7 +103,11 @@ func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, string, error) {
 // Tea owns the terminal for the program's lifetime, so nothing else writes to
 // stdout while it runs.
 func defaultRunTUI(model tea.Model) error {
-	if _, err := tea.NewProgram(model, tea.WithAltScreen()).Run(); err != nil {
+	// Mouse cell motion is enabled so the conversation view scrolls with the
+	// wheel. It captures mouse events, so native click-drag selection is
+	// replaced by the terminal's shift-drag (or equivalent) to copy text.
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := program.Run(); err != nil {
 		return fmt.Errorf("tui: %w", err)
 	}
 	return nil

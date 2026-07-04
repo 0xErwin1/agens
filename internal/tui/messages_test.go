@@ -64,11 +64,14 @@ func TestMessages_AddToolCallRendersArrowAndName(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
-	m.AddToolCall("read")
+	m.AddToolCall("bash", "ls -la")
 
-	view := m.View()
-	if !strings.Contains(view, "→ read") {
-		t.Fatalf("View() = %q, want the tool-call marker %q", view, "→ read")
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "→ bash") {
+		t.Fatalf("View() = %q, want the tool-call marker %q", view, "→ bash")
+	}
+	if !strings.Contains(view, "ls -la") {
+		t.Fatalf("View() = %q, want the executed command detail %q", view, "ls -la")
 	}
 }
 

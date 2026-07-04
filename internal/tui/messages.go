@@ -48,10 +48,12 @@ const (
 
 // block is a finalized conversation entry kept in its raw form so it can be
 // re-rendered (and, for assistant markdown, re-wrapped) whenever the width
-// changes.
+// changes. detail carries a secondary, muted string (currently the tool
+// call's argument, e.g. the shell command) shown after the primary text.
 type block struct {
-	kind blockKind
-	text string
+	kind   blockKind
+	text   string
+	detail string
 }
 
 // Messages is the scrollable conversation view. Finalized turns are kept as
@@ -117,9 +119,11 @@ func (m *Messages) FinishAssistant() {
 	m.rebuild()
 }
 
-// AddToolCall adds a block marking that a tool invocation has started.
-func (m *Messages) AddToolCall(name string) {
-	m.blocks = append(m.blocks, block{kind: blockToolCall, text: name})
+// AddToolCall adds a block marking that a tool invocation has started. detail
+// is a short description of what the tool acts on (the shell command, a path),
+// shown muted after the tool name; it may be empty.
+func (m *Messages) AddToolCall(name, detail string) {
+	m.blocks = append(m.blocks, block{kind: blockToolCall, text: name, detail: detail})
 	m.rebuild()
 }
 
@@ -232,7 +236,15 @@ func (m *Messages) renderBlock(b block) string {
 		return m.renderMarkdown(b.text)
 
 	case blockToolCall:
-		return m.gutteredBlock(theme.Tool(), labelToolCall+b.text, true)
+		head := lipgloss.NewStyle().Foreground(theme.Tool()).Bold(true).Render(labelToolCall + b.text)
+		if b.detail != "" {
+			head += "  " + lipgloss.NewStyle().Foreground(theme.Muted()).Render(b.detail)
+		}
+		width := m.width - contentGutter
+		if width < 1 {
+			width = 1
+		}
+		return lipgloss.NewStyle().MarginLeft(contentGutter).Width(width).Render(head)
 
 	case blockToolResult:
 		return m.gutteredBlock(theme.Muted(), indentLines(truncateToolResult(b.text)), false)
