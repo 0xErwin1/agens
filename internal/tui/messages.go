@@ -16,6 +16,7 @@ const (
 	labelToolCall    = "→ "
 	labelToolError   = "error: "
 	labelErrorBlock  = "error: "
+	labelThinking    = "Thinking"
 	blockSeparator   = "\n\n"
 	toolResultIndent = "  "
 
@@ -45,6 +46,7 @@ const (
 	blockToolError
 	blockError
 	blockSystem
+	blockReasoning
 )
 
 // block is a finalized conversation entry kept in its raw form so it can be
@@ -67,6 +69,8 @@ type Messages struct {
 	blocks          []block
 	streaming       string
 	streamingActive bool
+	reasoning       string
+	reasoningActive bool
 	width, height   int
 
 	// renderer is width-bound: a glamour.TermRenderer wraps to a fixed width,
@@ -100,6 +104,30 @@ func (m *Messages) StartAssistant() {
 func (m *Messages) AppendAssistantDelta(text string) {
 	m.streamingActive = true
 	m.streaming += text
+	m.rebuild()
+}
+
+// AppendReasoningDelta appends text to the in-progress reasoning ("thinking")
+// stream, shown live above the answer.
+func (m *Messages) AppendReasoningDelta(text string) {
+	m.reasoningActive = true
+	m.reasoning += text
+	m.rebuild()
+}
+
+// FinishReasoning commits the in-progress reasoning to a finalized block. It is
+// a no-op when there is no active, non-empty reasoning, so callers may invoke
+// it defensively when the answer or a tool call begins.
+func (m *Messages) FinishReasoning() {
+	if !m.reasoningActive || m.reasoning == "" {
+		m.reasoningActive = false
+		m.reasoning = ""
+		return
+	}
+
+	m.blocks = append(m.blocks, block{kind: blockReasoning, text: m.reasoning})
+	m.reasoning = ""
+	m.reasoningActive = false
 	m.rebuild()
 }
 
@@ -210,9 +238,12 @@ func (m *Messages) buildRenderer() {
 // and pushes the joined content into the viewport, keeping the newest content
 // in view.
 func (m *Messages) rebuild() {
-	parts := make([]string, 0, len(m.blocks)+1)
+	parts := make([]string, 0, len(m.blocks)+2)
 	for _, b := range m.blocks {
 		parts = append(parts, m.renderBlock(b))
+	}
+	if m.reasoningActive {
+		parts = append(parts, m.renderReasoning(m.reasoning))
 	}
 	if m.streamingActive {
 		parts = append(parts, m.renderStreaming())
@@ -220,6 +251,24 @@ func (m *Messages) rebuild() {
 
 	m.vp.SetContent(strings.Join(parts, blockSeparator))
 	m.vp.GotoBottom()
+}
+
+// renderReasoning renders the model's thinking as a dim, italic block under a
+// "Thinking" label, aligned to the shared gutter. It is used both for the live
+// stream and for a finalized reasoning block.
+func (m *Messages) renderReasoning(text string) string {
+	theme := CurrentTheme()
+
+	width := m.width - contentGutter
+	if width < 1 {
+		width = 1
+	}
+
+	dim := lipgloss.NewStyle().Foreground(theme.Muted()).Italic(true)
+	label := dim.Bold(true).Render(labelThinking)
+	body := dim.Width(width).Render(text)
+
+	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(label + "\n" + body)
 }
 
 // renderStreaming renders the in-progress assistant text as plain, gutter-
@@ -265,6 +314,9 @@ func (m *Messages) renderBlock(b block) string {
 
 	case blockSystem:
 		return m.gutteredBlock(theme.Muted(), b.text, false)
+
+	case blockReasoning:
+		return m.renderReasoning(b.text)
 
 	default:
 		return b.text

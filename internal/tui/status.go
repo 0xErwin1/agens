@@ -23,6 +23,7 @@ const statusHints = "enter send · ctrl+c quit"
 type Status struct {
 	model   string
 	state   string
+	effort  string
 	spinner string
 	width   int
 }
@@ -41,6 +42,9 @@ func (s *Status) SetState(state string) { s.state = state }
 
 // SetModel replaces the model segment, used when the model is switched live.
 func (s *Status) SetModel(model string) { s.model = model }
+
+// SetEffort sets the reasoning-effort segment; empty hides it.
+func (s *Status) SetEffort(effort string) { s.effort = effort }
 
 // SetSpinner sets the animated spinner frame shown before the state segment
 // while a turn is in flight. An empty frame hides it.
@@ -66,7 +70,11 @@ func (s *Status) View() string {
 		state = lipgloss.NewStyle().Foreground(theme.Accent()).Render(s.spinner) + " " + state
 	}
 
-	left := " " + name + statusSeparator + model + statusSeparator + state
+	left := " " + name + statusSeparator + model
+	if s.effort != "" {
+		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.effort)
+	}
+	left += statusSeparator + state
 	right := lipgloss.NewStyle().Foreground(theme.Muted()).Render(statusHints) + " "
 
 	line := s.justify(left, right)

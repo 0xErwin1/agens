@@ -23,6 +23,8 @@ type CommandContext interface {
 	// OpenModelSelector opens the interactive model selector, returning the
 	// command that fetches the catalog (or nil when unavailable).
 	OpenModelSelector() tea.Cmd
+	// OpenEffortSelector opens the reasoning-effort selector.
+	OpenEffortSelector() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
 }
@@ -129,6 +131,9 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/model", Desc: "choose the model", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenModelSelector()
+		}},
+		Command{Name: "/effort", Desc: "set the reasoning effort", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenEffortSelector()
 		}},
 		Command{Name: "/help", Desc: "show commands and shortcuts", Run: func(ctx CommandContext) tea.Cmd {
 			ctx.Notify(ctx.CommandHelp())

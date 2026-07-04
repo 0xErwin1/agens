@@ -85,6 +85,12 @@ type Model struct {
 	modelLoading    bool
 	modelErr        error
 
+	// effort is the current reasoning effort ("" = model default); the picker
+	// fields hold the effort selector's state while it is open.
+	effort           string
+	effortPickerOpen bool
+	effortIdx        int
+
 	width, height int
 	// contentWidth is the width of the centered content column and leftPad the
 	// left offset that centers it; both are derived from width in layout.
@@ -183,6 +189,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleModelPickerKey(msg)
 			break
 		}
+		if m.effortPickerOpen {
+			swallow = true
+			m.handleEffortPickerKey(msg)
+			break
+		}
 		if m.showPalette {
 			if cmd, consumed := m.handlePaletteKey(msg); consumed {
 				swallow = true
@@ -259,6 +270,8 @@ func (m *Model) View() string {
 	case m.modelPickerOpen:
 		overlay := renderModelSelector(m.modelItems, m.modelIdx, m.modelLoading, m.modelErr, m.modelName, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
+	case m.effortPickerOpen:
+		base = overlayAbove(base, renderEffortSelector(m.effortIdx, m.effort, m.contentWidth), inputRow)
 	case m.showPalette:
 		base = overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.contentWidth), inputRow)
 	}
@@ -549,6 +562,46 @@ func (m *Model) closeModelPicker() {
 	m.modelIdx = 0
 }
 
+// OpenEffortSelector implements CommandContext: it opens the reasoning-effort
+// selector positioned on the current effort.
+func (m *Model) OpenEffortSelector() tea.Cmd {
+	m.effortPickerOpen = true
+	m.effortIdx = indexOfEffort(m.effort)
+	return nil
+}
+
+// handleEffortPickerKey handles a keypress while the effort selector is open:
+// Up/Down and Tab/Shift+Tab cycle (wrapping), Enter applies the effort, and
+// Esc closes without changing it.
+func (m *Model) handleEffortPickerKey(msg tea.KeyMsg) {
+	n := len(effortOptions)
+
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.effortIdx = (m.effortIdx - 1 + n) % n
+
+	case tea.KeyDown, tea.KeyTab:
+		m.effortIdx = (m.effortIdx + 1) % n
+
+	case tea.KeyEsc:
+		m.effortPickerOpen = false
+
+	case tea.KeyEnter:
+		m.selectEffort(effortOptions[m.effortIdx])
+	}
+}
+
+// selectEffort applies the chosen effort to the loop and status bar and closes
+// the selector.
+func (m *Model) selectEffort(effort string) {
+	m.effort = effort
+	m.loop.SetEffort(effort)
+	m.status.SetEffort(effort)
+
+	m.effortPickerOpen = false
+	m.messages.AddInfo("reasoning effort set to " + effort)
+}
+
 // indexOfModel returns the index of the model whose ID equals current, or 0
 // when there is no match, so the selector opens on the active model.
 func indexOfModel(models []provider.ModelInfo, current string) int {
@@ -589,10 +642,15 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 	case agentloop.LoopIterationStart:
 		m.messages.StartAssistant()
 
+	case agentloop.LoopReasoningDelta:
+		m.messages.AppendReasoningDelta(msg.Event.Text)
+
 	case agentloop.LoopTextDelta:
+		m.messages.FinishReasoning()
 		m.messages.AppendAssistantDelta(msg.Event.Text)
 
 	case agentloop.LoopToolCallStarted:
+		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
 		m.messages.AddToolCall(msg.Event.ToolCall.Name, permissionDetail(msg.Event.ToolCall.Input))
 		m.status.SetState(stateRunning + msg.Event.ToolCall.Name)
@@ -601,6 +659,7 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.messages.AddToolResult(toolResultText(msg.Event.ToolResult), msg.Event.ToolResult.IsError)
 
 	case agentloop.LoopMessageDone:
+		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
 
 	case agentloop.LoopUsage:

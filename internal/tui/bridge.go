@@ -37,6 +37,8 @@ type LoopRunner interface {
 	SetModel(id string)
 	// SetSystemPrompt replaces the system prompt for subsequent turns.
 	SetSystemPrompt(prompt string)
+	// SetEffort changes the reasoning effort for subsequent turns.
+	SetEffort(effort string)
 }
 
 // runTurn starts loop.Run on a goroutine and returns a channel that

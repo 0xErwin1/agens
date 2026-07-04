@@ -23,12 +23,14 @@ type scriptedLoopRunner struct {
 	receivedHistory []message.Message
 	model           string
 	systemPrompt    string
+	effort          string
 }
 
 var _ LoopRunner = (*scriptedLoopRunner)(nil)
 
 func (r *scriptedLoopRunner) SetModel(id string)            { r.model = id }
 func (r *scriptedLoopRunner) SetSystemPrompt(prompt string) { r.systemPrompt = prompt }
+func (r *scriptedLoopRunner) SetEffort(effort string)       { r.effort = effort }
 
 func (r *scriptedLoopRunner) Run(_ context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error) {
 	r.receivedHistory = history
