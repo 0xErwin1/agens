@@ -127,7 +127,7 @@ func TestPermissionDetail(t *testing.T) {
 
 func modalModel(t *testing.T) (*Model, PermissionRequest) {
 	t.Helper()
-	m := New(&scriptedLoopRunner{}, "gpt-5.5", NewPrompter(), nil)
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Prompter: NewPrompter()})
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	req := PermissionRequest{

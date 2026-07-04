@@ -14,12 +14,20 @@ import (
 	"github.com/iperez/agens/internal/tui"
 )
 
-// tuiLoopBuilder resolves an agent.Options into a ready-to-run
-// *agentloop.Loop, a model lister for the /model selector, and the model name
-// to show in the status line. It is the dependency-injection seam that lets
-// tests exercise the command against a fake provider without touching config,
-// auth, or the network.
-type tuiLoopBuilder func(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error)
+// tuiSession is everything the TUI needs from the build step: the agent loop,
+// the model lister for the /model selector, the system-prompt rebuilder used
+// on a live model switch, and the model name for the status line.
+type tuiSession struct {
+	loop   *agentloop.Loop
+	lister tui.ModelLister
+	prompt tui.SystemPromptFunc
+	model  string
+}
+
+// tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
+// dependency-injection seam that lets tests exercise the command against a
+// fake provider without touching config, auth, or the network.
+type tuiLoopBuilder func(opts agent.Options) (tuiSession, error)
 
 // tuiRunner starts the interactive program for the given root model. It is a
 // second seam, distinct from the builder, so tests can verify the command
@@ -53,12 +61,18 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 				opts.Prompter = prompter
 			}
 
-			loop, lister, modelName, err := build(opts)
+			session, err := build(opts)
 			if err != nil {
 				return err
 			}
 
-			return run(tui.New(loop, modelName, prompter, lister))
+			return run(tui.New(tui.Deps{
+				Loop:         session.loop,
+				Model:        session.model,
+				Prompter:     prompter,
+				Models:       session.lister,
+				SystemPrompt: session.prompt,
+			}))
 		},
 	}
 
@@ -70,17 +84,18 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 }
 
 // defaultBuildTUI is the production tuiLoopBuilder: it loads config and
-// credentials from disk, resolves the display model name, and builds both the
-// agent loop and the provider that backs the /model selector's listing.
-func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, tui.ModelLister, string, error) {
+// credentials from disk, resolves the display model name, and builds the agent
+// loop, the provider that backs the /model selector's listing, and the
+// system-prompt rebuilder used when the model is switched live.
+func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	loaded, err := config.Load()
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("tui: load config: %w", err)
+		return tuiSession{}, fmt.Errorf("tui: load config: %w", err)
 	}
 
 	creds, err := auth.Load(auth.DefaultPath())
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("tui: %w", err)
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
 	if opts.ProjectRoot == "" {
@@ -89,20 +104,28 @@ func defaultBuildTUI(opts agent.Options) (*agentloop.Loop, tui.ModelLister, stri
 
 	modelName, err := agent.ResolveModel(loaded.Config, creds, opts)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("tui: %w", err)
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
 	loop, err := agent.BuildLoop(loaded.Config, creds, opts)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("tui: %w", err)
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
 	lister, err := agent.BuildProvider(loaded.Config, creds, opts)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("tui: %w", err)
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
-	return loop, lister, modelName, nil
+	prompt := func(model string) (string, bool) {
+		sp, err := agent.BuildSystemPrompt(loaded.Config, opts, model)
+		if err != nil {
+			return "", false
+		}
+		return sp, true
+	}
+
+	return tuiSession{loop: loop, lister: lister, prompt: prompt, model: modelName}, nil
 }
 
 // defaultRunTUI starts the Bubble Tea program on the alternate screen. Bubble

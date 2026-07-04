@@ -35,6 +35,8 @@ type LoopRunner interface {
 	Run(ctx context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error)
 	// SetModel switches the model used for subsequent turns.
 	SetModel(id string)
+	// SetSystemPrompt replaces the system prompt for subsequent turns.
+	SetSystemPrompt(prompt string)
 }
 
 // runTurn starts loop.Run on a goroutine and returns a channel that

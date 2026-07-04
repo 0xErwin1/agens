@@ -22,7 +22,12 @@ func (f fakeLister) Models(context.Context) ([]provider.ModelInfo, error) {
 }
 
 func sizedWithLister(lister ModelLister) *Model {
-	m := New(&scriptedLoopRunner{}, "gpt-5.5", nil, lister)
+	m := New(Deps{
+		Loop:         &scriptedLoopRunner{},
+		Model:        "gpt-5.5",
+		Models:       lister,
+		SystemPrompt: func(id string) (string, bool) { return "You are powered by the model named " + id, true },
+	})
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return m
 }
@@ -74,8 +79,12 @@ func TestModel_ModelSelectorLoadsAndSwitches(t *testing.T) {
 	if m.modelName != "gpt-5.4" {
 		t.Fatalf("modelName = %q, want it switched to gpt-5.4", m.modelName)
 	}
-	if runner, ok := m.loop.(*scriptedLoopRunner); !ok || runner.model != "gpt-5.4" {
+	runner, ok := m.loop.(*scriptedLoopRunner)
+	if !ok || runner.model != "gpt-5.4" {
 		t.Fatal("SetModel was not propagated to the loop")
+	}
+	if !strings.Contains(runner.systemPrompt, "gpt-5.4") {
+		t.Fatalf("system prompt = %q, want it rebuilt for the new model gpt-5.4", runner.systemPrompt)
 	}
 	if !strings.Contains(stripANSI(m.status.View()), "gpt-5.4") {
 		t.Fatal("status bar was not updated to the new model")

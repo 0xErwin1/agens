@@ -68,6 +68,7 @@ type Model struct {
 	// lister fetches the model catalog for the selector; nil disables it. The
 	// remaining fields hold the selector's state while it is open.
 	lister          ModelLister
+	systemPrompt    SystemPromptFunc
 	modelPickerOpen bool
 	modelItems      []provider.ModelInfo
 	modelIdx        int
@@ -82,24 +83,39 @@ var (
 	_ CommandContext = (*Model)(nil)
 )
 
-// New constructs the root model for the given loop and display model name. A
-// non-nil prompter installs the interactive permission modal; pass nil when
-// permission decisions are resolved without prompting. A non-nil lister
-// enables the /model selector; pass nil to disable it.
-func New(loop LoopRunner, modelName string, prompter *Prompter, lister ModelLister) *Model {
+// SystemPromptFunc rebuilds the system prompt for a model id so the model's
+// self-identity stays correct after a live switch. ok is false when a prompt
+// could not be built, in which case the current prompt is left unchanged.
+type SystemPromptFunc func(model string) (string, bool)
+
+// Deps are the dependencies of the root model. Loop and Model are required;
+// the rest are optional: a nil Prompter resolves permissions without a modal,
+// a nil Models disables the /model selector, and a nil SystemPrompt leaves the
+// system prompt untouched on a model switch.
+type Deps struct {
+	Loop         LoopRunner
+	Model        string
+	Prompter     *Prompter
+	Models       ModelLister
+	SystemPrompt SystemPromptFunc
+}
+
+// New constructs the root model from its dependencies.
+func New(deps Deps) *Model {
 	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
 	sp.Style = lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
 
 	return &Model{
-		input:     NewInput(),
-		status:    NewStatus(modelName),
-		messages:  NewMessages(),
-		spinner:   sp,
-		loop:      loop,
-		modelName: modelName,
-		prompter:  prompter,
-		commands:  defaultCommands(),
-		lister:    lister,
+		input:        NewInput(),
+		status:       NewStatus(deps.Model),
+		messages:     NewMessages(),
+		spinner:      sp,
+		loop:         deps.Loop,
+		modelName:    deps.Model,
+		prompter:     deps.Prompter,
+		commands:     defaultCommands(),
+		lister:       deps.Models,
+		systemPrompt: deps.SystemPrompt,
 	}
 }
 
@@ -465,6 +481,15 @@ func (m *Model) handleModelPickerKey(msg tea.KeyMsg) {
 // selector, and notes the change in the conversation.
 func (m *Model) selectModel(info provider.ModelInfo) {
 	m.loop.SetModel(info.ID)
+
+	// Rebuild the system prompt so its model-identity block matches the new
+	// model; otherwise the assistant keeps reporting the previous one.
+	if m.systemPrompt != nil {
+		if prompt, ok := m.systemPrompt(info.ID); ok {
+			m.loop.SetSystemPrompt(prompt)
+		}
+	}
+
 	m.modelName = info.ID
 	m.status.SetModel(info.ID)
 

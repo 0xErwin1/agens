@@ -61,6 +61,14 @@ func WithModel(model string) Option {
 // TUI's model selector). It does not affect a turn already in flight.
 func (l *Loop) SetModel(model string) { l.model = model }
 
+// SetSystemPrompt replaces the system prompt prepended to subsequent
+// provider.ChatRequests. It is used alongside SetModel when switching models
+// live, so the prompt's model-identity block matches the new model.
+func (l *Loop) SetSystemPrompt(prompt string) {
+	msg := message.NewMessage(message.RoleSystem, message.TextPart{Text: prompt})
+	l.systemMsg = &msg
+}
+
 // WithMaxIterations overrides the default iteration limit. It panics if n is
 // less than 1, since a Loop that can never run a single iteration is a
 // programmer error, not a runtime condition.

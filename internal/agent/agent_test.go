@@ -157,15 +157,15 @@ func TestBuildSystemPrompt_OverridePrecedence(t *testing.T) {
 			opts := validOptions(t)
 			opts.SystemPrompt = tt.optsSys
 
-			got, err := buildSystemPrompt(cfg, opts, "gpt-4.1")
+			got, err := BuildSystemPrompt(cfg, opts, "gpt-4.1")
 			if err != nil {
-				t.Fatalf("buildSystemPrompt() error = %v, want nil", err)
+				t.Fatalf("BuildSystemPrompt() error = %v, want nil", err)
 			}
 			if !strings.Contains(got, tt.wantContain) {
-				t.Fatalf("buildSystemPrompt() = %q, want it to contain override %q", got, tt.wantContain)
+				t.Fatalf("BuildSystemPrompt() = %q, want it to contain override %q", got, tt.wantContain)
 			}
 			if !strings.Contains(got, "You are powered by the model named gpt-4.1.") {
-				t.Fatalf("buildSystemPrompt() = %q, want it to contain the environment model marker", got)
+				t.Fatalf("BuildSystemPrompt() = %q, want it to contain the environment model marker", got)
 			}
 		})
 	}
@@ -184,15 +184,15 @@ func TestBuildSystemPrompt_NoOverrideUsesModelSelectedBase(t *testing.T) {
 	opts := validOptions(t)
 	opts.SystemPrompt = ""
 
-	got, err := buildSystemPrompt(cfg, opts, "gpt-4.1")
+	got, err := BuildSystemPrompt(cfg, opts, "gpt-4.1")
 	if err != nil {
-		t.Fatalf("buildSystemPrompt() error = %v, want nil", err)
+		t.Fatalf("BuildSystemPrompt() error = %v, want nil", err)
 	}
 	if got == "" {
-		t.Fatal("buildSystemPrompt() = \"\", want a non-empty assembled prompt")
+		t.Fatal("BuildSystemPrompt() = \"\", want a non-empty assembled prompt")
 	}
 	if !strings.Contains(got, "You are powered by the model named gpt-4.1.") {
-		t.Fatalf("buildSystemPrompt() = %q, want it to contain the environment model marker", got)
+		t.Fatalf("BuildSystemPrompt() = %q, want it to contain the environment model marker", got)
 	}
 }
 

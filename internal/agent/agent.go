@@ -76,7 +76,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, errors.New("agent: no model configured")
 	}
 
-	systemPrompt, err := buildSystemPrompt(cfg, opts, model)
+	systemPrompt, err := BuildSystemPrompt(cfg, opts, model)
 	if err != nil {
 		return nil, err
 	}
@@ -96,12 +96,14 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	return agentloop.New(p, gate, loopOpts...), nil
 }
 
-// buildSystemPrompt assembles the full system prompt for the resolved
+// BuildSystemPrompt assembles the full system prompt for the resolved
 // model: opts.SystemPrompt (falling back to cfg.Agent.SystemPrompt) is
 // used as the base-prompt override when non-empty, otherwise the base
 // prompt is chosen by prompt.Select(model); the runtime environment block
 // and any discovered AGENTS.md/CLAUDE.md instructions are always appended.
-func buildSystemPrompt(cfg config.Config, opts Options, model string) (string, error) {
+// It is exported so a live model switch can rebuild the prompt (whose
+// environment block names the model) for the newly selected model.
+func BuildSystemPrompt(cfg config.Config, opts Options, model string) (string, error) {
 	override := opts.SystemPrompt
 	if override == "" {
 		override = cfg.Agent.SystemPrompt
