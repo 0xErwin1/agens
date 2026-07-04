@@ -172,19 +172,6 @@ func padRight(s string, width int) string {
 	return s + strings.Repeat(" ", width-len(s))
 }
 
-// paletteHeight is the number of terminal rows the palette occupies for n
-// matched commands, including its border. It is zero when there is nothing to
-// show, so the layout reserves no space.
-func paletteHeight(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	if n > maxPaletteItems {
-		n = maxPaletteItems
-	}
-	return n + 2 // rounded border top and bottom
-}
-
 // renderPalette draws the command palette: one row per matched command, the
 // selected row marked and highlighted, inside a bordered box sized to width.
 func renderPalette(items []Command, selected, width int) string {

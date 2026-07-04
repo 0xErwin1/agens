@@ -12,15 +12,10 @@ import (
 	"github.com/iperez/agens/internal/permission"
 )
 
-// Modal geometry. The permission modal replaces the input area while it is
-// shown; modalHeight is reserved by the layout so the messages view shrinks
-// by exactly the modal's height rather than the input's, keeping the whole
-// frame within the terminal. Every content line is rendered on a single row
-// (Inline + MaxWidth), so the rendered height is deterministic.
-const (
-	modalContentRows = 4
-	modalHeight      = modalContentRows + 2 // + rounded border (top and bottom)
-)
+// Modal geometry. The permission modal floats above the input as an overlay;
+// every content line is rendered on a single row (Inline + MaxWidth), so its
+// rendered height is deterministic (modalContentRows + the rounded border).
+const modalContentRows = 4
 
 // PermissionRequest is one pending tool-permission decision handed from the
 // agent loop's goroutine to the Bubble Tea event loop. Reply is a buffered

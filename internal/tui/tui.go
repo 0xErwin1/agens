@@ -180,47 +180,56 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View stacks the conversation, then the prompt input (or, while a tool awaits
-// approval, the permission modal in its place), then the footer at the very
-// bottom — matching opencode's bottom-anchored input with a status/hints line
-// beneath it.
+// View composes the fixed frame — conversation, prompt input, footer — and
+// then floats any active overlay (permission modal or command palette) just
+// above the input. Overlays are composited on top of the conversation rather
+// than inserted into the layout, so the chat never resizes or scrolls when one
+// appears.
 func (m *Model) View() string {
-	bottom := m.input.View()
-	if m.pending != nil {
-		bottom = renderPermission(m.pending.Call, m.width)
-	}
+	base := lipgloss.JoinVertical(lipgloss.Left,
+		m.messages.View(),
+		m.input.View(),
+		m.status.View(),
+	)
 
-	parts := []string{m.messages.View()}
-	if m.paletteVisible() {
-		parts = append(parts, renderPalette(m.paletteItems, m.paletteIdx, m.width))
-	}
-	parts = append(parts, bottom, m.status.View())
+	// The input begins immediately after the conversation view; overlays end
+	// on the row just above it.
+	inputRow := m.messages.height
 
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	switch {
+	case m.pending != nil:
+		return overlayAbove(base, renderPermission(m.pending.Call, m.width), inputRow)
+	case m.showPalette:
+		return overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.width), inputRow)
+	default:
+		return base
+	}
 }
 
-// paletteVisible reports whether the command palette should be drawn: only
-// when it is active and no permission modal has taken over the bottom area.
-func (m *Model) paletteVisible() bool {
-	return m.showPalette && m.pending == nil
+// overlayAbove composites overlay onto base so that overlay's last line lands
+// on the row just above inputRow, leaving the rest of base (and its line count)
+// unchanged. Overlay lines that would fall outside base are dropped.
+func overlayAbove(base, overlay string, inputRow int) string {
+	baseLines := strings.Split(base, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+
+	top := inputRow - len(overlayLines)
+	for i, line := range overlayLines {
+		row := top + i
+		if row < 0 || row >= len(baseLines) {
+			continue
+		}
+		baseLines[row] = line
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
-// layout distributes the current window size across the children: the status
-// bar is a fixed row, the bottom area is the input (or, while a permission
-// modal is shown, its taller footprint), and the messages view takes the
-// remainder.
+// layout gives the conversation view all the vertical space left by the fixed
+// input and footer rows. Overlays float on top of it (see View) and never
+// reduce this height.
 func (m *Model) layout() {
-	bottomHeight := inputHeight
-	if m.pending != nil {
-		bottomHeight = modalHeight
-	}
-
-	pal := 0
-	if m.paletteVisible() {
-		pal = paletteHeight(len(m.paletteItems))
-	}
-
-	msgHeight := m.height - bottomHeight - statusHeight - pal
+	msgHeight := m.height - inputHeight - statusHeight
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
