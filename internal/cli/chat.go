@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -115,7 +114,7 @@ func defaultBuildLoop(opts agent.Options) (*agentloop.Loop, error) {
 		return nil, fmt.Errorf("chat: load config: %w", err)
 	}
 
-	creds, err := auth.Load(filepath.Join(config.HomeDir(), "auth.json"))
+	creds, err := auth.Load(auth.DefaultPath())
 	if err != nil {
 		return nil, fmt.Errorf("chat: %w", err)
 	}
