@@ -27,6 +27,29 @@ func sized(loop LoopRunner, modelName string) *Model {
 	return m
 }
 
+func TestModel_SpinnerTicksOnlyWhileRunning(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	m.running = true
+	cmd := sendMsg(m, m.spinner.Tick())
+	if cmd == nil {
+		t.Fatal("spinner tick while running returned no continuation command, want the animation to keep going")
+	}
+	if m.status.spinner == "" {
+		t.Fatal("status spinner frame is empty while running, want an animated frame")
+	}
+
+	m.running = false
+	if cmd := sendMsg(m, m.spinner.Tick()); cmd != nil {
+		t.Fatal("spinner kept ticking after the turn ended, want it to stop")
+	}
+
+	m.handleDone(TurnDoneMsg{})
+	if m.status.spinner != "" {
+		t.Fatalf("status spinner = %q after the turn finished, want it cleared", m.status.spinner)
+	}
+}
+
 func TestModel_WindowSizeSizesChildrenAndRenders(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

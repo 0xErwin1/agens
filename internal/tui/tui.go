@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -34,6 +35,7 @@ type Model struct {
 	input    *Input
 	status   *Status
 	messages *Messages
+	spinner  spinner.Model
 
 	loop      LoopRunner
 	modelName string
@@ -59,10 +61,14 @@ var _ tea.Model = (*Model)(nil)
 // non-nil prompter installs the interactive permission modal; pass nil when
 // permission decisions are resolved without prompting.
 func New(loop LoopRunner, modelName string, prompter *Prompter) *Model {
+	sp := spinner.New(spinner.WithSpinner(spinner.MiniDot))
+	sp.Style = lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
+
 	return &Model{
 		input:     NewInput(),
 		status:    NewStatus(modelName),
 		messages:  NewMessages(),
+		spinner:   sp,
 		loop:      loop,
 		modelName: modelName,
 		prompter:  prompter,
@@ -117,6 +123,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.running && strings.TrimSpace(m.input.Value()) != "" {
 				cmds = append(cmds, m.submit())
 			}
+		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		m.status.SetSpinner(m.spinner.View())
+		if m.running {
+			cmds = append(cmds, cmd)
 		}
 
 	case StreamMsg:
@@ -211,7 +225,7 @@ func (m *Model) submit() tea.Cmd {
 	m.cancel = cancel
 	m.events = runTurn(ctx, m.loop, m.history)
 
-	return waitFor(m.events)
+	return tea.Batch(waitFor(m.events), m.spinner.Tick)
 }
 
 // abort cancels the in-flight turn without quitting the program. The turn's
@@ -261,6 +275,7 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 		m.cancel = nil
 	}
 	m.events = nil
+	m.status.SetSpinner("")
 
 	if msg.History != nil {
 		m.history = msg.History

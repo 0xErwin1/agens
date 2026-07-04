@@ -18,9 +18,10 @@ const statusSeparator = " · "
 // colored through the active theme: the app name in the accent, the model
 // muted, and the state colored by whether it reports an error.
 type Status struct {
-	model string
-	state string
-	width int
+	model   string
+	state   string
+	spinner string
+	width   int
 }
 
 // NewStatus constructs a Status for the given model, starting in the ready
@@ -34,6 +35,10 @@ var _ Component = (*Status)(nil)
 // SetState replaces the state segment (e.g. "thinking…", "running read",
 // "error: <msg>").
 func (s *Status) SetState(state string) { s.state = state }
+
+// SetSpinner sets the animated spinner frame shown before the state segment
+// while a turn is in flight. An empty frame hides it.
+func (s *Status) SetSpinner(frame string) { s.spinner = frame }
 
 // Init implements tea.Model; the status bar has no startup command.
 func (s *Status) Init() tea.Cmd { return nil }
@@ -50,6 +55,9 @@ func (s *Status) View() string {
 	name := lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("agens")
 	model := lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.model)
 	state := lipgloss.NewStyle().Foreground(s.stateColor(theme)).Render(s.state)
+	if s.spinner != "" {
+		state = lipgloss.NewStyle().Foreground(theme.Accent()).Render(s.spinner) + " " + state
+	}
 
 	line := name + statusSeparator + model + statusSeparator + state
 
