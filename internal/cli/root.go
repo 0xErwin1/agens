@@ -21,5 +21,6 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newConfigCommand())
 	cmd.AddCommand(newChatCommand())
 	cmd.AddCommand(newModelsCommand())
+	cmd.AddCommand(newTUICommand())
 	return cmd
 }

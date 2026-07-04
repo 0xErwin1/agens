@@ -1,0 +1,76 @@
+package tui
+
+import (
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// statusReady is the initial state shown before any turn runs.
+const statusReady = "ready"
+
+// statusSeparator joins the status segments (app name, model, state).
+const statusSeparator = " · "
+
+// Status is the single-line status bar rendering the app name, active model,
+// and current state, e.g. "agens · gpt-5.5 · thinking…". Each segment is
+// colored through the active theme: the app name in the accent, the model
+// muted, and the state colored by whether it reports an error.
+type Status struct {
+	model string
+	state string
+	width int
+}
+
+// NewStatus constructs a Status for the given model, starting in the ready
+// state.
+func NewStatus(model string) *Status {
+	return &Status{model: model, state: statusReady}
+}
+
+var _ Component = (*Status)(nil)
+
+// SetState replaces the state segment (e.g. "thinking…", "running read",
+// "error: <msg>").
+func (s *Status) SetState(state string) { s.state = state }
+
+// Init implements tea.Model; the status bar has no startup command.
+func (s *Status) Init() tea.Cmd { return nil }
+
+// Update implements tea.Model. The status bar is driven entirely through
+// SetState, so it ignores incoming messages.
+func (s *Status) Update(tea.Msg) (tea.Model, tea.Cmd) { return s, nil }
+
+// View renders the themed status line, kept to a single row and truncated or
+// padded to the stored width.
+func (s *Status) View() string {
+	theme := CurrentTheme()
+
+	name := lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("agens")
+	model := lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.model)
+	state := lipgloss.NewStyle().Foreground(s.stateColor(theme)).Render(s.state)
+
+	line := name + statusSeparator + model + statusSeparator + state
+
+	// Inline + MaxWidth keep the bar to one ANSI-aware row; Width pads the
+	// remainder so the accent line fills the terminal.
+	style := lipgloss.NewStyle().Inline(true)
+	if s.width > 0 {
+		style = style.MaxWidth(s.width).Width(s.width)
+	}
+
+	return style.Render(line)
+}
+
+// stateColor selects the error color when the state reports a failure and the
+// accent color otherwise.
+func (s *Status) stateColor(theme Theme) lipgloss.Color {
+	if strings.HasPrefix(s.state, "error") {
+		return theme.Error()
+	}
+	return theme.Accent()
+}
+
+// SetSize stores the available width; the height is fixed at one line.
+func (s *Status) SetSize(width, _ int) { s.width = width }
