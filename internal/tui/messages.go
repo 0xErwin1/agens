@@ -63,9 +63,9 @@ type block struct {
 
 // Messages is the scrollable conversation view. Finalized turns are kept as
 // raw blocks and styled on every rebuild; the in-progress assistant response is
-// accumulated separately and rendered live (plain, never markdown) until
-// FinishAssistant commits it. After every mutation the viewport content is
-// rebuilt and scrolled to the bottom.
+// accumulated separately and rendered live as markdown until FinishAssistant
+// commits it. After every mutation the viewport content is rebuilt and, when
+// already at the bottom, scrolled to follow the newest content.
 type Messages struct {
 	vp              viewport.Model
 	blocks          []block
@@ -316,12 +316,12 @@ func (m *Messages) renderReasoning(text string) string {
 	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(label + "\n" + body)
 }
 
-// renderStreaming renders the in-progress assistant text as plain, gutter-
-// aligned text. Markdown is intentionally NOT applied here: token deltas arrive
-// rapidly and running glamour on every delta would be wasteful, so markdown is
-// deferred to FinishAssistant.
+// renderStreaming renders the in-progress assistant text as live markdown,
+// using the same renderer as a finalized block so the layout does not shift
+// when the response commits. It falls back to the raw text if the renderer is
+// unavailable, matching renderMarkdown.
 func (m *Messages) renderStreaming() string {
-	return m.gutteredBlock(CurrentTheme().Assistant(), m.streaming, false)
+	return m.renderMarkdown(m.streaming)
 }
 
 // renderBlock styles one finalized block according to its kind and the active

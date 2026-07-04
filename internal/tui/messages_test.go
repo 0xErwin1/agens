@@ -131,16 +131,20 @@ func TestMessages_FinalizedAssistantRendersMarkdownContent(t *testing.T) {
 	}
 }
 
-func TestMessages_StreamingAssistantShowsRawDeltaNotMarkdown(t *testing.T) {
+func TestMessages_StreamingAssistantRendersMarkdownLive(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
 	m.StartAssistant()
-	m.AppendAssistantDelta("# raw heading")
+	m.AppendAssistantDelta("some **bold** text")
 
 	view := stripANSI(m.View())
-	if !strings.Contains(view, "# raw heading") {
-		t.Fatalf("stripped View() = %q, want the raw, unprocessed delta %q while streaming", view, "# raw heading")
+	if !strings.Contains(view, "bold") {
+		t.Fatalf("stripped View() = %q, want the emphasized word rendered live", view)
+	}
+	// Live markdown consumes the emphasis markers; raw text would keep them.
+	if strings.Contains(view, "**bold**") {
+		t.Fatalf("stripped View() = %q, want markdown applied to the streaming text, not raw markers", view)
 	}
 }
 

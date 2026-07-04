@@ -26,6 +26,32 @@ func TestDefaultTheme_EveryRoleReturnsANonEmptyColor(t *testing.T) {
 	}
 }
 
+func TestAyuTheme_EveryRoleReturnsANonEmptyColor(t *testing.T) {
+	theme := AyuTheme{}
+
+	roles := map[string]lipgloss.Color{
+		"Accent":    theme.Accent(),
+		"User":      theme.User(),
+		"Assistant": theme.Assistant(),
+		"Tool":      theme.Tool(),
+		"Muted":     theme.Muted(),
+		"Error":     theme.Error(),
+		"Surface":   theme.Surface(),
+	}
+
+	for role, color := range roles {
+		if string(color) == "" {
+			t.Fatalf("AyuTheme.%s() = empty, want a non-empty color", role)
+		}
+	}
+}
+
+func TestDefaultActiveThemeIsAyu(t *testing.T) {
+	if _, ok := CurrentTheme().(AyuTheme); !ok {
+		t.Fatalf("CurrentTheme() = %T, want AyuTheme as the default active theme", CurrentTheme())
+	}
+}
+
 func TestSetThemeCurrentThemeRoundTrip(t *testing.T) {
 	original := CurrentTheme()
 	t.Cleanup(func() { SetTheme(original) })

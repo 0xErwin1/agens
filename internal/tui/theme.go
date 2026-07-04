@@ -29,10 +29,25 @@ func (DefaultTheme) Muted() lipgloss.Color     { return lipgloss.Color("#7A7A7A"
 func (DefaultTheme) Error() lipgloss.Color     { return lipgloss.Color("#FF6B6B") }
 func (DefaultTheme) Surface() lipgloss.Color   { return lipgloss.Color("#1A1B26") }
 
+// AyuTheme is the ayu dark palette: a warm gold accent over a near-black
+// background, with the signature blue entities and olive green. Colors follow
+// the canonical ayu dark syntax roles so the TUI reads like an ayu editor.
+type AyuTheme struct{}
+
+var _ Theme = AyuTheme{}
+
+func (AyuTheme) Accent() lipgloss.Color    { return lipgloss.Color("#E6B450") } // gold
+func (AyuTheme) User() lipgloss.Color      { return lipgloss.Color("#AAD94C") } // string green
+func (AyuTheme) Assistant() lipgloss.Color { return lipgloss.Color("#BFBDB6") } // foreground
+func (AyuTheme) Tool() lipgloss.Color      { return lipgloss.Color("#59C2FF") } // entity blue
+func (AyuTheme) Muted() lipgloss.Color     { return lipgloss.Color("#565B66") } // comment
+func (AyuTheme) Error() lipgloss.Color     { return lipgloss.Color("#F07178") } // markup red
+func (AyuTheme) Surface() lipgloss.Color   { return lipgloss.Color("#11151C") } // raised panel
+
 // currentTheme is the active theme every component renders against. The TUI
 // runs on a single goroutine (the Bubble Tea update loop), so no mutex guards
 // this — SetTheme must not be called concurrently with rendering.
-var currentTheme Theme = DefaultTheme{}
+var currentTheme Theme = AyuTheme{}
 
 // CurrentTheme returns the active theme; components call this rather than
 // referencing colors directly.

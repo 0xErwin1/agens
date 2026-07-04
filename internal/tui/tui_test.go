@@ -194,7 +194,9 @@ func TestModel_StreamTextDeltaAppearsInView(t *testing.T) {
 	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopIterationStart, Iteration: 1}})
 	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopTextDelta, Iteration: 1, Text: "streamed answer"}})
 
-	if view := m.View(); !strings.Contains(view, "streamed answer") {
+	// Live markdown splits words into separate style spans, so strip ANSI
+	// before matching the contiguous phrase.
+	if view := stripANSI(m.View()); !strings.Contains(view, "streamed answer") {
 		t.Fatalf("View() = %q, want the streamed assistant text", view)
 	}
 }
