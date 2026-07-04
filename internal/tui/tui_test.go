@@ -50,6 +50,15 @@ func TestModel_SpinnerTicksOnlyWhileRunning(t *testing.T) {
 	}
 }
 
+func TestModel_ReservesGapBetweenChatAndInput(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // sized at 80x24
+
+	want := 24 - inputHeight - statusHeight - inputGap
+	if m.messages.height != want {
+		t.Fatalf("messages height = %d, want %d (a blank row reserved before the input)", m.messages.height, want)
+	}
+}
+
 func TestModel_PageUpScrollsConversation(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

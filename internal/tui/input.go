@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -28,6 +29,11 @@ func NewInput() *Input {
 	bar := lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
 	ta.FocusedStyle.Prompt = bar
 	ta.BlurredStyle.Prompt = bar
+
+	// Word-wise navigation on Ctrl+arrows, in addition to the textarea's
+	// default Alt+arrows, matching common terminal editors.
+	ta.KeyMap.WordForward = key.NewBinding(key.WithKeys("ctrl+right", "alt+right", "alt+f"))
+	ta.KeyMap.WordBackward = key.NewBinding(key.WithKeys("ctrl+left", "alt+left", "alt+b"))
 
 	ta.Focus()
 

@@ -11,6 +11,30 @@ func typeRunes(in *Input, s string) {
 	in.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)})
 }
 
+func hasKey(keys []string, want string) bool {
+	for _, k := range keys {
+		if k == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestInput_CtrlArrowsNavigateWords(t *testing.T) {
+	i := NewInput()
+
+	if !hasKey(i.ta.KeyMap.WordForward.Keys(), "ctrl+right") {
+		t.Fatalf("WordForward keys = %v, want ctrl+right bound", i.ta.KeyMap.WordForward.Keys())
+	}
+	if !hasKey(i.ta.KeyMap.WordBackward.Keys(), "ctrl+left") {
+		t.Fatalf("WordBackward keys = %v, want ctrl+left bound", i.ta.KeyMap.WordBackward.Keys())
+	}
+	// The textarea's default alt+arrows must still work.
+	if !hasKey(i.ta.KeyMap.WordForward.Keys(), "alt+right") {
+		t.Fatalf("WordForward keys = %v, want alt+right kept", i.ta.KeyMap.WordForward.Keys())
+	}
+}
+
 func TestInput_ValueReflectsTypedText(t *testing.T) {
 	in := NewInput()
 	in.SetSize(40, 3)

@@ -19,6 +19,10 @@ import (
 const (
 	inputHeight  = 3
 	statusHeight = 1
+
+	// inputGap is a blank row between the conversation and the input, so the
+	// last message does not sit flush against the prompt.
+	inputGap = 1
 )
 
 // State labels shown in the status bar.
@@ -211,13 +215,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) View() string {
 	base := lipgloss.JoinVertical(lipgloss.Left,
 		m.messages.View(),
+		"", // inputGap: blank row between the conversation and the input
 		m.input.View(),
 		m.status.View(),
 	)
 
-	// The input begins immediately after the conversation view; overlays end
-	// on the row just above it.
-	inputRow := m.messages.height
+	// The input begins after the conversation view and the gap row; overlays
+	// end on the row just above it.
+	inputRow := m.messages.height + inputGap
 
 	switch {
 	case m.pending != nil:
@@ -255,7 +260,7 @@ func overlayAbove(base, overlay string, inputRow int) string {
 // input and footer rows. Overlays float on top of it (see View) and never
 // reduce this height.
 func (m *Model) layout() {
-	msgHeight := m.height - inputHeight - statusHeight
+	msgHeight := m.height - inputHeight - statusHeight - inputGap
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
