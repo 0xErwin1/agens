@@ -103,6 +103,20 @@ func TestModel_PageUpScrollsConversation(t *testing.T) {
 	}
 }
 
+func TestModel_StrayTickAfterDoneDoesNotRestoreSpinner(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	m.running = true
+	sendMsg(m, m.spinner.Tick()) // spinner set while running
+	m.handleDone(TurnDoneMsg{})  // clears spinner, running = false
+
+	sendMsg(m, m.spinner.Tick()) // a stray tick arriving after the turn ended
+
+	if m.status.spinner != "" {
+		t.Fatalf("status spinner = %q after a stray tick, want it to stay cleared", m.status.spinner)
+	}
+}
+
 func TestModel_WindowSizeSizesChildrenAndRenders(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

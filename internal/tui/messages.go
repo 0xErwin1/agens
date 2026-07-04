@@ -340,6 +340,7 @@ func (m *Messages) renderUser(text string) string {
 		BorderForeground(theme.User()).
 		Foreground(theme.Assistant()).
 		PaddingLeft(1).
+		MarginTop(1).
 		Width(width).
 		Render(text)
 }

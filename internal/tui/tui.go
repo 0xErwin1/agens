@@ -17,7 +17,7 @@ import (
 // Layout dimensions. The input and status bars have fixed heights; the
 // conversation view takes the remaining vertical space.
 const (
-	inputHeight  = 3
+	inputHeight  = 5
 	statusHeight = 1
 
 	// inputGap is a blank row between the conversation and the input, so the
@@ -229,10 +229,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelIdx = indexOfModel(msg.models, m.modelName)
 
 	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.spinner, cmd = m.spinner.Update(msg)
-		m.status.SetSpinner(m.spinner.View())
+		// Ignore ticks that arrive after the turn ended; otherwise a stray
+		// tick repaints the spinner next to "ready" with no further ticks to
+		// clear it, leaving the loader stuck.
 		if m.running {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			m.status.SetSpinner(m.spinner.View())
 			cmds = append(cmds, cmd)
 		}
 
