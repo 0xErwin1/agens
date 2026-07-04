@@ -23,8 +23,10 @@ const (
 // Enter for submit, so the textarea itself never has to treat Enter as a
 // newline.
 type Input struct {
-	ta    textarea.Model
-	width int
+	ta          textarea.Model
+	width       int
+	innerWidth  int
+	innerHeight int
 }
 
 // NewInput constructs a focused, single-purpose prompt input with the agens
@@ -93,37 +95,56 @@ func (i *Input) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return i, cmd
 }
 
-// View renders the prompt input inside a rounded, accent-colored border that
-// spans the full width, so the prompt is clearly delimited.
+// View renders the prompt input inside a rounded, accent-colored border with a
+// solid surface fill.
+//
+// The empty state is rendered from a self-drawn placeholder rather than the
+// textarea's own: bubbles' placeholder path leaves lines short and pads them
+// with unpainted spaces its own Base cannot recolor, which shows through as a
+// patchy fill. With text, the textarea pads each line with the surface color
+// itself, so its view is used directly.
 func (i *Input) View() string {
 	theme := CurrentTheme()
-	box := lipgloss.NewStyle().
+
+	content := i.ta.View()
+	if i.ta.Value() == "" {
+		content = lipgloss.NewStyle().
+			Foreground(theme.Muted()).
+			Background(theme.Surface()).
+			Width(i.innerWidth).
+			Render(inputPlaceholder)
+	}
+
+	inner := lipgloss.Place(
+		i.innerWidth, i.innerHeight,
+		lipgloss.Left, lipgloss.Top,
+		content,
+		lipgloss.WithWhitespaceBackground(theme.Surface()),
+	)
+
+	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent()).
 		BorderBackground(theme.Surface()).
 		Background(theme.Surface()).
-		Padding(0, 1)
-	if i.width > inputBorderRows {
-		box = box.Width(i.width - inputBorderRows) // border adds the remaining columns
-	}
-
-	return box.Render(i.ta.View())
+		Padding(0, 1).
+		Render(inner)
 }
 
 // SetSize sizes the inner textarea to fit within the border and padding of the
-// framed input.
+// framed input, and records the inner region for the surface fill.
 func (i *Input) SetSize(width, height int) {
 	i.width = width
 
-	innerWidth := width - inputBorderCols
-	if innerWidth < 1 {
-		innerWidth = 1
+	i.innerWidth = width - inputBorderCols
+	if i.innerWidth < 1 {
+		i.innerWidth = 1
 	}
-	innerHeight := height - inputBorderRows
-	if innerHeight < 1 {
-		innerHeight = 1
+	i.innerHeight = height - inputBorderRows
+	if i.innerHeight < 1 {
+		i.innerHeight = 1
 	}
 
-	i.ta.SetWidth(innerWidth)
-	i.ta.SetHeight(innerHeight)
+	i.ta.SetWidth(i.innerWidth)
+	i.ta.SetHeight(i.innerHeight)
 }
