@@ -52,17 +52,21 @@ type Model struct {
 	prompter *Prompter
 	pending  *PermissionRequest
 
-	// showPalette is set while the input holds a slash command; paletteItems
-	// are the commands currently matching it and paletteIdx the highlighted
-	// one.
+	// commands is the slash-command registry the palette draws from. showPalette
+	// is set while the input holds a slash command; paletteItems are the
+	// commands currently matching it and paletteIdx the highlighted one.
+	commands     *CommandRegistry
 	showPalette  bool
-	paletteItems []command
+	paletteItems []Command
 	paletteIdx   int
 
 	width, height int
 }
 
-var _ tea.Model = (*Model)(nil)
+var (
+	_ tea.Model      = (*Model)(nil)
+	_ CommandContext = (*Model)(nil)
+)
 
 // New constructs the root model for the given loop and display model name. A
 // non-nil prompter installs the interactive permission modal; pass nil when
@@ -79,6 +83,7 @@ func New(loop LoopRunner, modelName string, prompter *Prompter) *Model {
 		loop:      loop,
 		modelName: modelName,
 		prompter:  prompter,
+		commands:  defaultCommands(),
 	}
 }
 
@@ -280,8 +285,8 @@ func (m *Model) onEnter() tea.Cmd {
 	}
 
 	if strings.HasPrefix(value, "/") {
-		if c, ok := lookupCommand(value); ok {
-			return m.runCommand(c.name)
+		if c, ok := m.commands.Lookup(value); ok {
+			return m.runCommand(c)
 		}
 
 		m.input.Reset()
@@ -304,7 +309,7 @@ func (m *Model) refreshPalette() {
 	if m.running {
 		m.paletteItems = nil
 	} else {
-		m.paletteItems = matchCommands(m.input.Value())
+		m.paletteItems = m.commands.Match(m.input.Value())
 	}
 
 	m.showPalette = len(m.paletteItems) > 0
@@ -318,26 +323,20 @@ func (m *Model) refreshPalette() {
 }
 
 // handlePaletteKey handles a keypress while the palette is open. It reports
-// whether it consumed the key: navigation, completion (Tab), dismissal (Esc),
-// and running the selection (Enter) are consumed; anything else falls through
-// so ordinary typing still edits the input and re-filters the palette.
+// whether it consumed the key: cycling the selection (Up/Down, Tab/Shift+Tab),
+// dismissal (Esc), and running the selection (Enter) are consumed; anything
+// else falls through so ordinary typing still edits the input and re-filters
+// the palette. Navigation wraps around the ends.
 func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	n := len(m.paletteItems)
+
 	switch msg.Type {
-	case tea.KeyUp:
-		if m.paletteIdx > 0 {
-			m.paletteIdx--
-		}
+	case tea.KeyUp, tea.KeyShiftTab:
+		m.paletteIdx = (m.paletteIdx - 1 + n) % n
 		return nil, true
 
-	case tea.KeyDown:
-		if m.paletteIdx < len(m.paletteItems)-1 {
-			m.paletteIdx++
-		}
-		return nil, true
-
-	case tea.KeyTab:
-		m.input.SetValue(m.paletteItems[m.paletteIdx].name + " ")
-		m.refreshPalette()
+	case tea.KeyDown, tea.KeyTab:
+		m.paletteIdx = (m.paletteIdx + 1) % n
 		return nil, true
 
 	case tea.KeyEsc:
@@ -347,36 +346,44 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		return nil, true
 
 	case tea.KeyEnter:
-		return m.runCommand(m.paletteItems[m.paletteIdx].name), true
+		return m.runCommand(m.paletteItems[m.paletteIdx]), true
 
 	default:
 		return nil, false
 	}
 }
 
-// runCommand executes the named slash command, clearing the input and palette
-// first. /quit returns tea.Quit; the rest mutate the conversation in place.
-func (m *Model) runCommand(name string) tea.Cmd {
+// runCommand executes cmd against the model as its CommandContext, clearing the
+// input and palette first and relayouting after (a command may replace the
+// conversation view). The returned tea.Cmd, if any, is the command's own (for
+// example tea.Quit).
+func (m *Model) runCommand(cmd Command) tea.Cmd {
 	m.input.Reset()
 	m.closePalette()
 
-	switch name {
-	case "/new", "/clear":
-		m.history = nil
-		m.messages = NewMessages()
-
-	case "/model":
-		m.messages.AddInfo("modelo actual: " + m.modelName)
-
-	case "/help":
-		m.messages.AddInfo(helpText())
-
-	case "/quit":
-		return tea.Quit
-	}
+	result := cmd.Run(m)
 
 	m.layout()
-	return nil
+	return result
+}
+
+// NewConversation implements CommandContext: it discards the history and
+// resets the conversation view.
+func (m *Model) NewConversation() {
+	m.history = nil
+	m.messages = NewMessages()
+}
+
+// Notify implements CommandContext: it appends a system note to the view.
+func (m *Model) Notify(text string) { m.messages.AddInfo(text) }
+
+// CurrentModel implements CommandContext.
+func (m *Model) CurrentModel() string { return m.modelName }
+
+// CommandHelp implements CommandContext: the command list from the registry
+// followed by the static key-binding section.
+func (m *Model) CommandHelp() string {
+	return "comandos:\n" + m.commands.Help() + "\n\n" + keyBindingsHelp()
 }
 
 // closePalette hides the palette and resets its selection.

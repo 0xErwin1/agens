@@ -15,27 +15,49 @@ func typeString(m *Model, s string) {
 	}
 }
 
-func TestMatchCommands(t *testing.T) {
-	if got := matchCommands("/"); len(got) != len(commands) {
-		t.Fatalf("matchCommands(%q) matched %d, want all %d", "/", len(got), len(commands))
+func TestRegistryMatch(t *testing.T) {
+	r := defaultCommands()
+
+	if got := r.Match("/"); len(got) != len(r.All()) {
+		t.Fatalf("Match(%q) matched %d, want all %d", "/", len(got), len(r.All()))
 	}
-	if got := matchCommands("/m"); len(got) != 1 || got[0].name != "/model" {
-		t.Fatalf("matchCommands(%q) = %v, want just /model", "/m", got)
+	if got := r.Match("/m"); len(got) != 1 || got[0].Name != "/model" {
+		t.Fatalf("Match(%q) = %v, want just /model", "/m", got)
 	}
-	if got := matchCommands("hola"); got != nil {
-		t.Fatalf("matchCommands(%q) = %v, want nil for non-command input", "hola", got)
+	if got := r.Match("hola"); got != nil {
+		t.Fatalf("Match(%q) = %v, want nil for non-command input", "hola", got)
 	}
-	if got := matchCommands("/model gpt-5.5"); len(got) != 1 || got[0].name != "/model" {
-		t.Fatalf("matchCommands with an argument = %v, want the command matched on its token", got)
+	if got := r.Match("/model gpt-5.5"); len(got) != 1 || got[0].Name != "/model" {
+		t.Fatalf("Match with an argument = %v, want the command matched on its token", got)
 	}
 }
 
-func TestLookupCommand(t *testing.T) {
-	if c, ok := lookupCommand("/help"); !ok || c.name != "/help" {
-		t.Fatalf("lookupCommand(/help) = (%v, %v), want /help", c, ok)
+func TestRegistryLookup(t *testing.T) {
+	r := defaultCommands()
+
+	if c, ok := r.Lookup("/help"); !ok || c.Name != "/help" {
+		t.Fatalf("Lookup(/help) = (%v, %v), want /help", c, ok)
 	}
-	if _, ok := lookupCommand("/nope"); ok {
-		t.Fatal("lookupCommand(/nope) matched, want no match")
+	if _, ok := r.Lookup("/nope"); ok {
+		t.Fatal("Lookup(/nope) matched, want no match")
+	}
+}
+
+func TestRegistryRegisterIsExtensible(t *testing.T) {
+	r := NewCommandRegistry()
+	ran := false
+	r.Register(Command{Name: "/ping", Desc: "test", Run: func(CommandContext) tea.Cmd {
+		ran = true
+		return nil
+	}})
+
+	c, ok := r.Lookup("/ping")
+	if !ok {
+		t.Fatal("registered command not found by Lookup")
+	}
+	c.Run(nil)
+	if !ran {
+		t.Fatal("registered command's handler did not run")
 	}
 }
 
@@ -47,22 +69,42 @@ func TestModel_SlashShowsPalette(t *testing.T) {
 	if !m.showPalette {
 		t.Fatal("typing '/' did not open the command palette")
 	}
-	if len(m.paletteItems) != len(commands) {
-		t.Fatalf("palette shows %d items, want all %d", len(m.paletteItems), len(commands))
+	if len(m.paletteItems) != len(m.commands.All()) {
+		t.Fatalf("palette shows %d items, want all %d", len(m.paletteItems), len(m.commands.All()))
 	}
 	if !strings.Contains(m.View(), "/model") {
 		t.Fatalf("View() = %q, want the palette to list commands", m.View())
 	}
 }
 
-func TestModel_TabCompletesCommand(t *testing.T) {
+func TestModel_TabAndShiftTabCyclePalette(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+	typeString(m, "/")
 
-	typeString(m, "/h")
+	if m.paletteIdx != 0 {
+		t.Fatalf("initial selection = %d, want 0", m.paletteIdx)
+	}
+
 	sendKey(m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.paletteIdx != 1 {
+		t.Fatalf("selection after Tab = %d, want 1", m.paletteIdx)
+	}
 
-	if got := m.input.Value(); got != "/help " {
-		t.Fatalf("input after Tab = %q, want %q", got, "/help ")
+	sendKey(m, tea.KeyMsg{Type: tea.KeyShiftTab})
+	if m.paletteIdx != 0 {
+		t.Fatalf("selection after Shift+Tab = %d, want 0", m.paletteIdx)
+	}
+
+	// Shift+Tab from the top wraps to the last item.
+	sendKey(m, tea.KeyMsg{Type: tea.KeyShiftTab})
+	if want := len(m.paletteItems) - 1; m.paletteIdx != want {
+		t.Fatalf("selection after wrap = %d, want %d", m.paletteIdx, want)
+	}
+
+	// Tab from the bottom wraps back to the top.
+	sendKey(m, tea.KeyMsg{Type: tea.KeyTab})
+	if m.paletteIdx != 0 {
+		t.Fatalf("selection after wrap forward = %d, want 0", m.paletteIdx)
 	}
 }
 

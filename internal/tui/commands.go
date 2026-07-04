@@ -3,6 +3,7 @@ package tui
 import (
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -10,21 +11,144 @@ import (
 // never grows taller than the space the layout reserves for it.
 const maxPaletteItems = 6
 
-// command is one slash command the palette can complete and run.
-type command struct {
-	name string
-	desc string
+// CommandContext is the narrow surface a command acts on. Commands depend on
+// this interface rather than on *Model, so a command never reaches into the
+// model's internals and the two stay decoupled: adding a command is writing a
+// closure against these few operations.
+type CommandContext interface {
+	// NewConversation discards the current history and clears the view.
+	NewConversation()
+	// Notify appends a muted, system-level note to the conversation.
+	Notify(text string)
+	// CurrentModel returns the active model's display name.
+	CurrentModel() string
+	// CommandHelp returns the help text listing commands and key bindings.
+	CommandHelp() string
 }
 
-// commands is the built-in slash-command set, in display order. Kept in a
-// dedicated file (mirroring the reference's internal/commands package) so new
-// commands are added here rather than threaded through the model.
-var commands = []command{
-	{"/new", "empezar un chat nuevo"},
-	{"/clear", "limpiar la conversación"},
-	{"/model", "mostrar el modelo actual"},
-	{"/help", "ver comandos y atajos"},
-	{"/quit", "salir de agens"},
+// CommandFunc runs a command against a context and optionally returns a
+// tea.Cmd (for example tea.Quit). It must not block.
+type CommandFunc func(ctx CommandContext) tea.Cmd
+
+// Command is one slash command: how it is named and described in the palette,
+// and what it does when run.
+type Command struct {
+	Name string
+	Desc string
+	Run  CommandFunc
+}
+
+// CommandRegistry holds the available slash commands, ordered for display and
+// indexed by name for lookup. Register makes the set extensible at runtime
+// (e.g. future skills) without editing the model.
+type CommandRegistry struct {
+	ordered []Command
+	byName  map[string]Command
+}
+
+// NewCommandRegistry builds a registry from cmds, preserving their order.
+func NewCommandRegistry(cmds ...Command) *CommandRegistry {
+	r := &CommandRegistry{byName: make(map[string]Command, len(cmds))}
+	for _, c := range cmds {
+		r.Register(c)
+	}
+	return r
+}
+
+// Register adds or replaces a command by name, keeping display order stable:
+// a new name is appended, an existing one is updated in place.
+func (r *CommandRegistry) Register(c Command) {
+	if _, exists := r.byName[c.Name]; !exists {
+		r.ordered = append(r.ordered, c)
+	} else {
+		for i := range r.ordered {
+			if r.ordered[i].Name == c.Name {
+				r.ordered[i] = c
+				break
+			}
+		}
+	}
+	r.byName[c.Name] = c
+}
+
+// All returns the commands in display order.
+func (r *CommandRegistry) All() []Command { return r.ordered }
+
+// Match returns the commands whose name starts with input's command token. A
+// bare "/" matches all; non-command input matches none.
+func (r *CommandRegistry) Match(input string) []Command {
+	token := commandToken(input)
+	if token == "" {
+		return nil
+	}
+
+	out := make([]Command, 0, len(r.ordered))
+	for _, c := range r.ordered {
+		if strings.HasPrefix(c.Name, token) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Lookup returns the command exactly named by input's token.
+func (r *CommandRegistry) Lookup(input string) (Command, bool) {
+	c, ok := r.byName[commandToken(input)]
+	return c, ok
+}
+
+// Help renders the command list, one "  /name  desc" line per command in
+// display order. Callers append their own key-binding section.
+func (r *CommandRegistry) Help() string {
+	width := 0
+	for _, c := range r.ordered {
+		if len(c.Name) > width {
+			width = len(c.Name)
+		}
+	}
+
+	lines := make([]string, 0, len(r.ordered))
+	for _, c := range r.ordered {
+		lines = append(lines, "  "+padRight(c.Name, width)+"  "+c.Desc)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// defaultCommands is the built-in slash-command set. Each command is a
+// self-contained closure over CommandContext; there is no central switch.
+func defaultCommands() *CommandRegistry {
+	return NewCommandRegistry(
+		Command{Name: "/new", Desc: "empezar un chat nuevo", Run: func(ctx CommandContext) tea.Cmd {
+			ctx.NewConversation()
+			return nil
+		}},
+		Command{Name: "/clear", Desc: "limpiar la conversación", Run: func(ctx CommandContext) tea.Cmd {
+			ctx.NewConversation()
+			return nil
+		}},
+		Command{Name: "/model", Desc: "mostrar el modelo actual", Run: func(ctx CommandContext) tea.Cmd {
+			ctx.Notify("modelo actual: " + ctx.CurrentModel())
+			return nil
+		}},
+		Command{Name: "/help", Desc: "ver comandos y atajos", Run: func(ctx CommandContext) tea.Cmd {
+			ctx.Notify(ctx.CommandHelp())
+			return nil
+		}},
+		Command{Name: "/quit", Desc: "salir de agens", Run: func(CommandContext) tea.Cmd {
+			return tea.Quit
+		}},
+	)
+}
+
+// keyBindingsHelp is the static key-binding section appended to /help.
+func keyBindingsHelp() string {
+	return strings.Join([]string{
+		"atajos:",
+		"  enter        enviar",
+		"  ctrl+c       cancelar turno / salir",
+		"  pgup / pgdn  scroll de la conversación",
+		"  esc          cerrar palette / rechazar permiso",
+	}, "\n")
 }
 
 // commandToken extracts the leading "/word" token from input, ignoring any
@@ -40,33 +164,12 @@ func commandToken(input string) string {
 	return token
 }
 
-// matchCommands returns the commands whose name starts with the input's
-// command token. A bare "/" matches all commands; a non-command input matches
-// none.
-func matchCommands(input string) []command {
-	token := commandToken(input)
-	if token == "" {
-		return nil
+// padRight pads s with spaces to at least width columns.
+func padRight(s string, width int) string {
+	if len(s) >= width {
+		return s
 	}
-
-	out := make([]command, 0, len(commands))
-	for _, c := range commands {
-		if strings.HasPrefix(c.name, token) {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// lookupCommand returns the command exactly named by input's token.
-func lookupCommand(input string) (command, bool) {
-	token := commandToken(input)
-	for _, c := range commands {
-		if c.name == token {
-			return c, true
-		}
-	}
-	return command{}, false
+	return s + strings.Repeat(" ", width-len(s))
 }
 
 // paletteHeight is the number of terminal rows the palette occupies for n
@@ -82,27 +185,9 @@ func paletteHeight(n int) int {
 	return n + 2 // rounded border top and bottom
 }
 
-// helpText is the body shown by /help: the command list and the key bindings.
-func helpText() string {
-	return strings.Join([]string{
-		"comandos:",
-		"  /new     empezar un chat nuevo",
-		"  /clear   limpiar la conversación",
-		"  /model   mostrar el modelo actual",
-		"  /help    esta ayuda",
-		"  /quit    salir",
-		"",
-		"atajos:",
-		"  enter        enviar",
-		"  ctrl+c       cancelar turno / salir",
-		"  pgup / pgdn  scroll de la conversación",
-		"  esc          cerrar palette / rechazar permiso",
-	}, "\n")
-}
-
 // renderPalette draws the command palette: one row per matched command, the
 // selected row marked and highlighted, inside a bordered box sized to width.
-func renderPalette(items []command, selected, width int) string {
+func renderPalette(items []Command, selected, width int) string {
 	theme := CurrentTheme()
 
 	if len(items) > maxPaletteItems {
@@ -123,8 +208,8 @@ func renderPalette(items []command, selected, width int) string {
 			nameColor = theme.User()
 		}
 
-		name := lipgloss.NewStyle().Foreground(nameColor).Bold(true).Width(10).Render(c.name)
-		desc := lipgloss.NewStyle().Foreground(theme.Muted()).Render(c.desc)
+		name := lipgloss.NewStyle().Foreground(nameColor).Bold(true).Width(10).Render(c.Name)
+		desc := lipgloss.NewStyle().Foreground(theme.Muted()).Render(c.Desc)
 
 		rows = append(rows, lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(marker+name+desc))
 	}
