@@ -20,5 +20,6 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newAuthCommand())
 	cmd.AddCommand(newConfigCommand())
 	cmd.AddCommand(newChatCommand())
+	cmd.AddCommand(newModelsCommand())
 	return cmd
 }

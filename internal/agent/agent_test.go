@@ -301,6 +301,45 @@ func TestBuildLoop_BothEntriesPresent_ChatGPTWinsTiebreak(t *testing.T) {
 	}
 }
 
+func TestBuildProvider_APIKeyOnlyCreds_Success(t *testing.T) {
+	p, err := BuildProvider(validConfig(), validCreds(), validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildProvider() error = %v, want nil", err)
+	}
+	if p == nil {
+		t.Fatal("BuildProvider() provider = nil, want non-nil")
+	}
+	if p.ID() != defaultProviderID {
+		t.Fatalf("BuildProvider().ID() = %q, want %q", p.ID(), defaultProviderID)
+	}
+}
+
+func TestBuildProvider_ChatGPTOnlyCreds_Success(t *testing.T) {
+	cfg := validConfig()
+	cfg.Provider.Model = ""
+
+	p, err := BuildProvider(cfg, chatgptCreds(), validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildProvider() error = %v, want nil", err)
+	}
+	if p == nil {
+		t.Fatal("BuildProvider() provider = nil, want non-nil")
+	}
+	if p.ID() != chatgptProviderID {
+		t.Fatalf("BuildProvider().ID() = %q, want %q", p.ID(), chatgptProviderID)
+	}
+}
+
+func TestBuildProvider_MissingCredsErrors(t *testing.T) {
+	_, err := BuildProvider(validConfig(), auth.File{}, validOptions(t))
+	if err == nil {
+		t.Fatal("BuildProvider() error = nil, want an error for missing credentials")
+	}
+	if !strings.Contains(err.Error(), "no credentials found") {
+		t.Fatalf("BuildProvider() error = %q, want it to mention %q", err.Error(), "no credentials found")
+	}
+}
+
 func TestBuildLoop_UnknownProviderTypeErrors(t *testing.T) {
 	cfg := validConfig()
 	cfg.Provider.Type = "some-other-provider"

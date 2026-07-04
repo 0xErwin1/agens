@@ -131,6 +131,36 @@ func buildSystemPrompt(cfg config.Config, opts Options, model string) (string, e
 	}), nil
 }
 
+// BuildProvider resolves cfg + creds + opts into the selected
+// provider.Provider (api-key or chatgpt-oauth), without constructing the
+// agent loop or tool gate. It is used by commands that only need to talk to
+// the provider directly, such as listing models.
+//
+// Provider selection and model resolution mirror BuildLoop exactly: the
+// model is resolved through opts.Model, cfg.Provider.Model, and finally
+// defaultModelFor(providerID), and passed into the provider config even
+// though Models does not use it, so construction never diverges from
+// BuildLoop's.
+func BuildProvider(cfg config.Config, creds auth.File, opts Options) (provider.Provider, error) {
+	providerID, err := selectProviderID(cfg, creds)
+	if err != nil {
+		return nil, err
+	}
+
+	model := opts.Model
+	if model == "" {
+		model = cfg.Provider.Model
+	}
+	if model == "" {
+		model = defaultModelFor(providerID)
+	}
+	if model == "" {
+		return nil, errors.New("agent: no model configured")
+	}
+
+	return buildProvider(providerID, cfg, creds, model)
+}
+
 // selectProviderID resolves which provider id BuildLoop should construct.
 // An explicit cfg.Provider.Type always wins and must name a known provider.
 // Otherwise the id is inferred from creds: a well-formed ChatGPT OAuth entry

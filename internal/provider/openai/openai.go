@@ -27,14 +27,21 @@ const (
 	maxErrorBodyBytes = 32 * 1024
 )
 
-// staticModels is the provisional model catalog. AGN-7 replaces it with a
-// models.dev-backed lookup; until then, context/output limits and
-// SupportsTools are hand-maintained best-effort values.
-var staticModels = []provider.ModelInfo{
-	{ID: "gpt-4.1", DisplayName: "GPT-4.1", ContextWindow: 1_000_000, MaxOutputTokens: 32_768, SupportsTools: true},
-	{ID: "gpt-4.1-mini", DisplayName: "GPT-4.1 mini", ContextWindow: 1_000_000, MaxOutputTokens: 32_768, SupportsTools: true},
-	{ID: "gpt-4o", DisplayName: "GPT-4o", ContextWindow: 128_000, MaxOutputTokens: 16_384, SupportsTools: true},
-	{ID: "o4-mini", DisplayName: "o4-mini", ContextWindow: 200_000, MaxOutputTokens: 100_000, SupportsTools: true},
+// chatModelIDPrefixes are the "/models" id prefixes Models keeps. The
+// endpoint returns every model OpenAI hosts — embeddings, whisper, tts,
+// image, and moderation models included — with no way to filter server-side,
+// so the chat-capable subset is selected by id prefix instead.
+var chatModelIDPrefixes = []string{"gpt-", "chatgpt", "o1", "o3", "o4"}
+
+// isChatModel reports whether id names a chat-capable model, based on
+// chatModelIDPrefixes.
+func isChatModel(id string) bool {
+	for _, prefix := range chatModelIDPrefixes {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // Provider implements provider.Provider against OpenAI's chat-completions
@@ -79,11 +86,58 @@ func (p *Provider) ID() string {
 	return "openai-api"
 }
 
-// Models implements provider.Provider, returning a copy of the static
-// catalog so callers cannot mutate Provider's internal state.
-func (p *Provider) Models(_ context.Context) ([]provider.ModelInfo, error) {
-	models := make([]provider.ModelInfo, len(staticModels))
-	copy(models, staticModels)
+// Models implements provider.Provider, fetching the current model catalog
+// from OpenAI's "/models" endpoint at call time rather than returning a
+// hardcoded list. The endpoint reports only an id per model — no context
+// window or pricing — so ContextWindow and MaxOutputTokens are left at zero,
+// and results are filtered to the chat-capable subset (see
+// chatModelIDPrefixes).
+func (p *Provider) Models(ctx context.Context) ([]provider.ModelInfo, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("openai: build models request: %w", err)
+	}
+	httpReq.Header.Set("Accept", "application/json")
+
+	if !p.auth.Valid(time.Now()) {
+		if err := p.auth.Refresh(ctx); err != nil {
+			return nil, fmt.Errorf("openai: refresh credential: %w", err)
+		}
+	}
+	if err := p.auth.Decorate(ctx, httpReq); err != nil {
+		return nil, fmt.Errorf("openai: decorate request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("openai: fetch models: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if readErr != nil {
+			return nil, fmt.Errorf("openai: read error response body: %w", readErr)
+		}
+		return nil, parseResponseError(resp.StatusCode, errBody)
+	}
+
+	var wire wireModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
+		return nil, fmt.Errorf("openai: decode models response: %w", err)
+	}
+
+	models := make([]provider.ModelInfo, 0, len(wire.Data))
+	for _, m := range wire.Data {
+		if !isChatModel(m.ID) {
+			continue
+		}
+		models = append(models, provider.ModelInfo{
+			ID:            m.ID,
+			DisplayName:   m.ID,
+			SupportsTools: true,
+		})
+	}
 	return models, nil
 }
 

@@ -103,3 +103,15 @@ type wireErrorEnvelope struct {
 		Code    string `json:"code"`
 	} `json:"error"`
 }
+
+// wireModelsResponse is the /models response body.
+type wireModelsResponse struct {
+	Data []wireModel `json:"data"`
+}
+
+// wireModel is one entry of a /models response's "data" array. It carries
+// only the id field Models maps into provider.ModelInfo; the endpoint also
+// returns object, created, and owned_by, which are intentionally ignored.
+type wireModel struct {
+	ID string `json:"id"`
+}

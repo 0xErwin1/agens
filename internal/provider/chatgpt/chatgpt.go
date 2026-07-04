@@ -29,23 +29,18 @@ const (
 	DefaultModel = "gpt-5.5"
 
 	// codexCLIVersion is the version segment reported in the User-Agent
-	// header. It has no functional meaning within agens and is not tied to
-	// any agens release; it exists only to shape the header string.
-	codexCLIVersion = "0.1.0"
+	// header and sent as the /models client_version query parameter. It has
+	// no functional meaning within agens and is not tied to any agens
+	// release. The backend's /models endpoint gates its response on this
+	// value: a stale version (e.g. the previous "0.1.0") makes /models
+	// return an empty list, so this must be bumped periodically to match a
+	// recent codex CLI release.
+	codexCLIVersion = "0.142.2"
 
 	// maxErrorBodyBytes bounds how much of a non-2xx response body Stream
 	// reads before handing it to parseResponseError.
 	maxErrorBodyBytes = 32 * 1024
 )
-
-// staticModels is the provisional model catalog for the ChatGPT-backed
-// Responses API surface. AGN-7 replaces it with a models.dev-backed lookup.
-var staticModels = []provider.ModelInfo{
-	{ID: "gpt-5.5", DisplayName: "GPT-5.5", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
-	{ID: "gpt-5.4", DisplayName: "GPT-5.4", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
-	{ID: "gpt-5.4-mini", DisplayName: "GPT-5.4 mini", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
-	{ID: "gpt-5.3-codex-spark", DisplayName: "GPT-5.3 Codex Spark", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
-}
 
 // Provider implements provider.Provider against OpenAI's Responses API
 // ("/responses"), authenticated with the given provider.Authenticator.
@@ -91,11 +86,64 @@ func (p *Provider) ID() string {
 	return "openai-chatgpt"
 }
 
-// Models implements provider.Provider, returning a copy of the static
-// catalog so callers cannot mutate Provider's internal state.
-func (p *Provider) Models(_ context.Context) ([]provider.ModelInfo, error) {
-	models := make([]provider.ModelInfo, len(staticModels))
-	copy(models, staticModels)
+// Models implements provider.Provider, fetching the current model catalog
+// from the backend's "/models" endpoint at call time rather than returning a
+// hardcoded list. Only entries with visibility "list" are returned; hidden
+// or other visibilities are filtered out.
+func (p *Provider) Models(ctx context.Context) ([]provider.ModelInfo, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/models", nil)
+	if err != nil {
+		return nil, fmt.Errorf("chatgpt: build models request: %w", err)
+	}
+
+	query := httpReq.URL.Query()
+	query.Set("client_version", codexCLIVersion)
+	httpReq.URL.RawQuery = query.Encode()
+
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("originator", "codex_cli_rs")
+	httpReq.Header.Set("User-Agent", userAgent())
+
+	if !p.auth.Valid(time.Now()) {
+		if err := p.auth.Refresh(ctx); err != nil {
+			return nil, fmt.Errorf("chatgpt: refresh credential: %w", err)
+		}
+	}
+	if err := p.auth.Decorate(ctx, httpReq); err != nil {
+		return nil, fmt.Errorf("chatgpt: decorate request: %w", err)
+	}
+
+	resp, err := p.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("chatgpt: fetch models: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+		if readErr != nil {
+			return nil, fmt.Errorf("chatgpt: read error response body: %w", readErr)
+		}
+		return nil, parseResponseError(resp.StatusCode, errBody)
+	}
+
+	var wire wireModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
+		return nil, fmt.Errorf("chatgpt: decode models response: %w", err)
+	}
+
+	models := make([]provider.ModelInfo, 0, len(wire.Models))
+	for _, m := range wire.Models {
+		if m.Visibility != "list" {
+			continue
+		}
+		models = append(models, provider.ModelInfo{
+			ID:            m.Slug,
+			DisplayName:   m.DisplayName,
+			ContextWindow: m.ContextWindow,
+			SupportsTools: true,
+		})
+	}
 	return models, nil
 }
 

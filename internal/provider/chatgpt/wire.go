@@ -71,6 +71,21 @@ type wireTool struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
+// wireModelsResponse is the /models response body.
+type wireModelsResponse struct {
+	Models []wireModel `json:"models"`
+}
+
+// wireModel is one entry of a /models response's "models" array. It carries
+// only the fields Models maps into provider.ModelInfo; the backend sends
+// many other fields that are intentionally ignored.
+type wireModel struct {
+	Slug          string `json:"slug"`
+	DisplayName   string `json:"display_name"`
+	ContextWindow int    `json:"context_window"`
+	Visibility    string `json:"visibility"`
+}
+
 // wireStreamEvent is one decoded /responses SSE event. Dispatch is driven
 // entirely by Type; unlike chat-completions' "event:" line, the Responses
 // API repeats its event kind inside the JSON body, and that is the value

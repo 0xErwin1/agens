@@ -86,8 +86,18 @@ func TestProviderID(t *testing.T) {
 	}
 }
 
-func TestProviderModelsReturnsCatalogContainingDefaultModel(t *testing.T) {
-	p := newTestProvider(t, "", &stubAuthenticator{validReturn: true})
+func TestProviderModelsFetchesFromModelsEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Fatalf("path = %q, want %q", r.URL.Path, "/models")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"models":[{"slug":"` + DefaultModel + `","display_name":"GPT-5.5","context_window":272000,"visibility":"list"}]}`))
+	}))
+	defer server.Close()
+
+	p := newTestProvider(t, server.URL, &stubAuthenticator{validReturn: true})
 
 	models, err := p.Models(context.Background())
 	if err != nil {

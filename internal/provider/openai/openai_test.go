@@ -91,67 +91,6 @@ func TestProviderID(t *testing.T) {
 	}
 }
 
-func TestProviderModelsReturnsStaticCatalog(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p := newTestProvider(t, "", auth)
-
-	models, err := p.Models(context.Background())
-	if err != nil {
-		t.Fatalf("Models() error = %v, want nil", err)
-	}
-	if len(models) == 0 {
-		t.Fatal("Models() returned empty slice, want non-empty")
-	}
-
-	wantIDs := map[string]bool{
-		"gpt-4.1":      false,
-		"gpt-4.1-mini": false,
-		"gpt-4o":       false,
-		"o4-mini":      false,
-	}
-	for _, m := range models {
-		if m.ID == "" {
-			t.Fatalf("Models() contains entry with empty ID: %+v", m)
-		}
-		if _, known := wantIDs[m.ID]; known {
-			wantIDs[m.ID] = true
-		}
-		if !m.SupportsTools {
-			t.Fatalf("Models() entry %q SupportsTools = false, want true", m.ID)
-		}
-	}
-	for id, found := range wantIDs {
-		if !found {
-			t.Fatalf("Models() missing expected entry %q", id)
-		}
-	}
-}
-
-func TestProviderModelsReturnsIndependentCopy(t *testing.T) {
-	auth, err := NewAPIKeyAuthenticator("sk-test")
-	if err != nil {
-		t.Fatalf("NewAPIKeyAuthenticator() error = %v", err)
-	}
-	p := newTestProvider(t, "", auth)
-
-	first, err := p.Models(context.Background())
-	if err != nil {
-		t.Fatalf("Models() error = %v, want nil", err)
-	}
-	first[0].ID = "mutated"
-
-	second, err := p.Models(context.Background())
-	if err != nil {
-		t.Fatalf("Models() error = %v, want nil", err)
-	}
-	if second[0].ID == "mutated" {
-		t.Fatal("Models() shares backing array across calls, want independent copies")
-	}
-}
-
 // stubAuthenticator records whether Valid/Refresh/Decorate were invoked, and
 // lets tests force Valid to report false to exercise the D8 Refresh path.
 type stubAuthenticator struct {
