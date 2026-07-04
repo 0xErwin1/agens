@@ -965,10 +965,12 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.messages.AppendAssistantDelta(msg.Event.Text)
 
 	case agentloop.LoopToolCallStarted:
+		// The tool call's arguments are not known yet (they stream after the
+		// start), so the call block itself is added at LoopMessageDone, where
+		// the assembled input yields its detail. Here we only reflect activity.
 		m.workLabel = stateRunning + msg.Event.ToolCall.Name
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
-		m.messages.AddToolCall(msg.Event.ToolCall.Name, permissionDetail(msg.Event.ToolCall.Input))
 		m.status.SetState(stateRunning + msg.Event.ToolCall.Name)
 
 	case agentloop.LoopToolResult:
@@ -977,12 +979,27 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 	case agentloop.LoopMessageDone:
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
+		m.addToolCalls(msg.Event.Message)
 
 	case agentloop.LoopUsage:
 		// Usage is not surfaced in this batch.
 	}
 
 	return waitFor(m.events)
+}
+
+// addToolCalls appends a tool-call block for each tool invocation in the
+// finalized assistant message, showing the tool name and a detail extracted
+// from its now-assembled arguments (the shell command, the file path).
+func (m *Model) addToolCalls(msg *message.Message) {
+	if msg == nil {
+		return
+	}
+	for _, part := range msg.Parts {
+		if call, ok := part.(message.ToolUsePart); ok {
+			m.messages.AddToolCall(call.Name, permissionDetail(call.Input))
+		}
+	}
 }
 
 // handleDone finalizes a completed turn: it clears the running state, adopts

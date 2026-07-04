@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -188,13 +189,23 @@ func TestModel_ToolCallEventUpdatesStatusAndView(t *testing.T) {
 		Kind:     agentloop.LoopToolCallStarted,
 		ToolCall: message.ToolUsePart{ID: "t1", Name: "read"},
 	}})
+	if !strings.Contains(m.View(), "running read") {
+		t.Fatalf("View() = %q, want the status to show the running tool", m.View())
+	}
 
-	view := m.View()
+	// The call block, with its argument detail, appears once the message with
+	// the assembled input is finalized.
+	done := message.NewMessage(message.RoleAssistant, message.ToolUsePart{
+		ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"internal/foo.go"}`),
+	})
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &done}})
+
+	view := stripANSI(m.View())
 	if !strings.Contains(view, "→ read") {
 		t.Fatalf("View() = %q, want a tool-call block for read", view)
 	}
-	if !strings.Contains(view, "running read") {
-		t.Fatalf("View() = %q, want the status to show the running tool", view)
+	if !strings.Contains(view, "internal/foo.go") {
+		t.Fatalf("View() = %q, want the read path shown as the tool detail", view)
 	}
 }
 
