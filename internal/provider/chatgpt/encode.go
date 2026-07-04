@@ -26,6 +26,9 @@ func encodeRequest(req provider.ChatRequest) (wireRequest, error) {
 		Store:             false,
 		Stream:            true,
 		Include:           []string{},
+		// Always request a reasoning summary so the "thinking" can be shown;
+		// Effort is included only when the caller set one.
+		Reasoning: &wireReasoning{Effort: req.Effort, Summary: "auto"},
 	}
 
 	var instructionParts []string

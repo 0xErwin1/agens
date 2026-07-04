@@ -33,6 +33,15 @@ type wireRequest struct {
 	Store             bool            `json:"store"`
 	Stream            bool            `json:"stream"`
 	Include           []string        `json:"include"`
+	Reasoning         *wireReasoning  `json:"reasoning,omitempty"`
+}
+
+// wireReasoning configures reasoning for reasoning-capable models. Summary
+// "auto" makes the backend stream a reasoning summary (surfaced as the
+// "thinking" output); Effort selects the reasoning budget when set.
+type wireReasoning struct {
+	Effort  string `json:"effort,omitempty"`
+	Summary string `json:"summary,omitempty"`
 }
 
 // wireInputItem is one entry of a /responses request's "input" array (a

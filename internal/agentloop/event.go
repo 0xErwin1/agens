@@ -18,6 +18,7 @@ type LoopEventKind int
 const (
 	LoopIterationStart LoopEventKind = iota
 	LoopTextDelta
+	LoopReasoningDelta
 	LoopToolCallStarted
 	LoopToolResult
 	LoopUsage
@@ -32,6 +33,7 @@ const (
 //
 //	LoopIterationStart:  Iteration
 //	LoopTextDelta:       Iteration, Text
+//	LoopReasoningDelta:  Iteration, Text (the model's streamed reasoning summary)
 //	LoopToolCallStarted: Iteration, ToolCall (ID+Name only; Input not yet known)
 //	LoopToolResult:      Iteration, ToolResult
 //	LoopUsage:           Iteration, Usage

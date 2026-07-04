@@ -30,6 +30,7 @@ type Loop struct {
 	tools     ToolRunner
 	systemMsg *message.Message
 	model     string
+	effort    string
 	maxIter   int
 }
 
@@ -67,6 +68,17 @@ func (l *Loop) SetModel(model string) { l.model = model }
 func (l *Loop) SetSystemPrompt(prompt string) {
 	msg := message.NewMessage(message.RoleSystem, message.TextPart{Text: prompt})
 	l.systemMsg = &msg
+}
+
+// SetEffort changes the reasoning effort sent on subsequent
+// provider.ChatRequests. Empty restores the model's default.
+func (l *Loop) SetEffort(effort string) { l.effort = effort }
+
+// WithEffort sets the initial reasoning effort.
+func WithEffort(effort string) Option {
+	return func(l *Loop) {
+		l.effort = effort
+	}
 }
 
 // WithMaxIterations overrides the default iteration limit. It panics if n is
@@ -164,7 +176,7 @@ func (l *Loop) runIteration(ctx context.Context, history []message.Message, spec
 		msgs = append(msgs, history...)
 	}
 
-	req := provider.ChatRequest{Model: l.model, Messages: msgs, Tools: specs}
+	req := provider.ChatRequest{Model: l.model, Messages: msgs, Tools: specs, Effort: l.effort}
 
 	reader, err := l.provider.Stream(ctx, req)
 	if err != nil {

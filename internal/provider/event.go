@@ -5,6 +5,7 @@ type EventType int
 
 const (
 	EventTextDelta EventType = iota
+	EventReasoningDelta
 	EventToolCallStart
 	EventToolArgsDelta
 	EventToolCallEnd
@@ -17,6 +18,8 @@ func (t EventType) String() string {
 	switch t {
 	case EventTextDelta:
 		return "text_delta"
+	case EventReasoningDelta:
+		return "reasoning_delta"
 	case EventToolCallStart:
 		return "tool_call_start"
 	case EventToolArgsDelta:
@@ -40,7 +43,8 @@ func (t EventType) String() string {
 //
 // Field validity by Type:
 //
-//	EventTextDelta:     Text
+//	EventTextDelta:      Text
+//	EventReasoningDelta: Text
 //	EventToolCallStart: ToolCallID, ToolName
 //	EventToolArgsDelta: ToolCallID, ArgsDelta
 //	EventToolCallEnd:   ToolCallID (ToolName may be echoed, not guaranteed)

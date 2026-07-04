@@ -70,6 +70,11 @@ func (a *assembler) apply(ev provider.StreamEvent, iteration int, emit func(Loop
 		a.text.WriteString(ev.Text)
 		emit(LoopEvent{Kind: LoopTextDelta, Iteration: iteration, Text: ev.Text})
 
+	case provider.EventReasoningDelta:
+		// Reasoning is surfaced live but never folded into the finalized
+		// message: it is the model's ephemeral thinking, not its answer.
+		emit(LoopEvent{Kind: LoopReasoningDelta, Iteration: iteration, Text: ev.Text})
+
 	case provider.EventToolCallStart:
 		if _, exists := a.builders[ev.ToolCallID]; exists {
 			return fmt.Errorf("agentloop: duplicate tool call start for id %q", ev.ToolCallID)

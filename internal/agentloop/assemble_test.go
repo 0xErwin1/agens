@@ -120,6 +120,17 @@ func TestAssemble_Success(t *testing.T) {
 			wantEventKinds: []LoopEventKind{LoopToolCallStarted},
 		},
 		{
+			name: "reasoning delta is surfaced but not folded into the message",
+			steps: []streamStep{
+				{ev: provider.StreamEvent{Type: provider.EventReasoningDelta, Text: "let me think"}},
+				{ev: provider.StreamEvent{Type: provider.EventTextDelta, Text: "answer"}},
+				{ev: provider.StreamEvent{Type: provider.EventDone, StopReason: "stop"}},
+			},
+			wantText:       "answer",
+			wantStopReason: "stop",
+			wantEventKinds: []LoopEventKind{LoopReasoningDelta, LoopTextDelta},
+		},
+		{
 			name: "usage arriving after done is not lost",
 			steps: []streamStep{
 				{ev: provider.StreamEvent{Type: provider.EventTextDelta, Text: "hi"}},

@@ -144,6 +144,12 @@ func (s *responsesStream) decodeEvent(event wireStreamEvent) error {
 			Text: event.Delta,
 		})
 
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		s.queue = append(s.queue, provider.StreamEvent{
+			Type: provider.EventReasoningDelta,
+			Text: event.Delta,
+		})
+
 	case "response.output_item.added":
 		if event.Item != nil && event.Item.Type == responseItemTypeFunctionCall {
 			s.sawToolCall = true

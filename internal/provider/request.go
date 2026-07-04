@@ -15,6 +15,11 @@ type ChatRequest struct {
 	Tools           []ToolSpec
 	MaxOutputTokens int
 	Temperature     *float64 // nil = provider default; distinguishes unset from 0
+
+	// Effort is the reasoning effort for reasoning-capable models (for
+	// example "low", "medium", "high"). Empty means the model's default; a
+	// provider that does not support it ignores the field.
+	Effort string
 }
 
 // ToolSpec declares a tool to the model. Execution and registration are
