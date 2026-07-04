@@ -68,7 +68,7 @@ func renderModelSelector(items []provider.ModelInfo, selected int, loading bool,
 	case loading:
 		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("loading models…"))}
 	case loadErr != nil:
-		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Error()).Render("error: " + loadErr.Error()))}
+		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Error()).Render("error: " + humanizeError(loadErr.Error())))}
 	case len(items) == 0:
 		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("no models available"))}
 	default:

@@ -93,7 +93,7 @@ func renderSessionSelector(sessions []session.Session, selected int, loading boo
 	case loading:
 		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("loading sessions…"))}
 	case loadErr != nil:
-		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Error()).Render("error: " + loadErr.Error()))}
+		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Error()).Render("error: " + humanizeError(loadErr.Error())))}
 	case len(sessions) == 0:
 		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("no saved conversations"))}
 	default:

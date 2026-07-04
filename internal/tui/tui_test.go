@@ -271,6 +271,23 @@ func TestModel_TurnDoneWithErrorShowsErrorBlock(t *testing.T) {
 	}
 }
 
+func TestModel_TurnErrorDisplayStripsInternalPackagePrefixes(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hi")})
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	sendMsg(m, TurnDoneMsg{Err: errorString("agentloop: open stream: chatgpt: HTTP 503: overloaded")})
+
+	view := stripANSI(m.messages.View())
+	if !strings.Contains(view, "HTTP 503: overloaded") {
+		t.Fatalf("View() = %q, want the innermost error message kept", view)
+	}
+	if strings.Contains(view, "agentloop:") || strings.Contains(view, "chatgpt:") {
+		t.Fatalf("View() = %q, want the internal package prefixes stripped", view)
+	}
+}
+
 func TestModel_TurnDoneWithAuthErrorShowsReloginHint(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

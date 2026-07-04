@@ -1064,7 +1064,7 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 	}
 
 	if msg.Err != nil && !errors.Is(msg.Err, context.Canceled) {
-		m.messages.SetError(msg.Err.Error())
+		m.messages.SetError(humanizeError(msg.Err.Error()))
 		if provider.IsAuthError(msg.Err) {
 			m.messages.AddInfo(authErrorHint)
 		}
