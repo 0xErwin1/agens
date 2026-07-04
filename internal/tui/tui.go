@@ -148,8 +148,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-// View stacks the conversation and status bar, then either the prompt input
-// or, while a tool awaits approval, the permission modal in its place.
+// View stacks the conversation, then the prompt input (or, while a tool awaits
+// approval, the permission modal in its place), then the footer at the very
+// bottom — matching opencode's bottom-anchored input with a status/hints line
+// beneath it.
 func (m *Model) View() string {
 	bottom := m.input.View()
 	if m.pending != nil {
@@ -158,8 +160,8 @@ func (m *Model) View() string {
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		m.messages.View(),
-		m.status.View(),
 		bottom,
+		m.status.View(),
 	)
 }
 

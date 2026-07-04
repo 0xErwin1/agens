@@ -18,8 +18,8 @@ func TestMessages_AppendUserRendersPrefixedBlock(t *testing.T) {
 	m.AppendUser("what is 2+2?")
 
 	view := m.View()
-	if !strings.Contains(view, "You:") {
-		t.Fatalf("View() = %q, want the user prefix %q", view, "You:")
+	if !strings.Contains(view, "┃") {
+		t.Fatalf("View() = %q, want the user turn's left bar %q", view, "┃")
 	}
 	if !strings.Contains(view, "what is 2+2?") {
 		t.Fatalf("View() = %q, want the user text", view)
@@ -35,9 +35,6 @@ func TestMessages_StreamingAssistantVisibleBeforeFinish(t *testing.T) {
 	m.AppendAssistantDelta("lo")
 
 	view := m.View()
-	if !strings.Contains(view, "agens:") {
-		t.Fatalf("View() = %q, want the assistant prefix %q while streaming", view, "agens:")
-	}
 	if !strings.Contains(view, "hello") {
 		t.Fatalf("View() = %q, want the streamed assistant text %q", view, "hello")
 	}
@@ -52,7 +49,9 @@ func TestMessages_FinishAssistantKeepsTextAcrossFollowingBlocks(t *testing.T) {
 	m.FinishAssistant()
 	m.AppendUser("next question")
 
-	view := m.View()
+	// Assistant text is markdown, which colors each word as its own span, so
+	// strip ANSI before matching the contiguous phrase.
+	view := stripANSI(m.View())
 	if !strings.Contains(view, "answer text") {
 		t.Fatalf("View() = %q, want the finalized assistant text to persist", view)
 	}

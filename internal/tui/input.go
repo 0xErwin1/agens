@@ -3,6 +3,7 @@ package tui
 import (
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // inputPlaceholder is shown in the prompt area before the user types.
@@ -17,11 +18,17 @@ type Input struct {
 
 // NewInput constructs a focused, single-purpose prompt input with the agens
 // placeholder. It is focused on construction so the caller can immediately
-// return the blink command from the model's Init.
+// return the blink command from the model's Init. The textarea's built-in
+// left prompt bar is recolored to the accent so it reads as opencode's input.
 func NewInput() *Input {
 	ta := textarea.New()
 	ta.Placeholder = inputPlaceholder
 	ta.ShowLineNumbers = false
+
+	bar := lipgloss.NewStyle().Foreground(CurrentTheme().Accent())
+	ta.FocusedStyle.Prompt = bar
+	ta.BlurredStyle.Prompt = bar
+
 	ta.Focus()
 
 	return &Input{ta: ta}
@@ -55,10 +62,13 @@ func (i *Input) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return i, cmd
 }
 
-// View renders the prompt input.
+// View renders the prompt input. The accent-colored left bar is the
+// textarea's own prompt, so no extra framing is added here.
 func (i *Input) View() string { return i.ta.View() }
 
-// SetSize sizes the textarea to the given width and a short height.
+// SetSize sizes the textarea to the given width and height. The textarea
+// reserves room for its own prompt bar internally, so the full width is passed
+// through.
 func (i *Input) SetSize(width, height int) {
 	i.ta.SetWidth(width)
 	i.ta.SetHeight(height)

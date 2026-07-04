@@ -180,8 +180,7 @@ func renderPermission(call message.ToolUsePart, width int) string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(theme.Accent()).
 		Padding(0, 1).
-		Height(modalContentRows).
-		MaxHeight(modalContentRows)
+		Height(modalContentRows)
 	if width > 4 {
 		box = box.Width(width - 2)
 	}

@@ -13,6 +13,9 @@ const statusReady = "ready"
 // statusSeparator joins the status segments (app name, model, state).
 const statusSeparator = " · "
 
+// statusHints is the right-aligned keybind legend, mirroring opencode's footer.
+const statusHints = "enter send · ctrl+c quit"
+
 // Status is the single-line status bar rendering the app name, active model,
 // and current state, e.g. "agens · gpt-5.5 · thinking…". Each segment is
 // colored through the active theme: the app name in the accent, the model
@@ -47,8 +50,9 @@ func (s *Status) Init() tea.Cmd { return nil }
 // SetState, so it ignores incoming messages.
 func (s *Status) Update(tea.Msg) (tea.Model, tea.Cmd) { return s, nil }
 
-// View renders the themed status line, kept to a single row and truncated or
-// padded to the stored width.
+// View renders the themed footer: the app name, model, and state on the left,
+// and the keybind hints on the right, justified across the stored width and
+// inset by a one-column gutter to match the conversation.
 func (s *Status) View() string {
 	theme := CurrentTheme()
 
@@ -59,16 +63,33 @@ func (s *Status) View() string {
 		state = lipgloss.NewStyle().Foreground(theme.Accent()).Render(s.spinner) + " " + state
 	}
 
-	line := name + statusSeparator + model + statusSeparator + state
+	left := " " + name + statusSeparator + model + statusSeparator + state
+	right := lipgloss.NewStyle().Foreground(theme.Muted()).Render(statusHints) + " "
 
-	// Inline + MaxWidth keep the bar to one ANSI-aware row; Width pads the
-	// remainder so the accent line fills the terminal.
+	line := s.justify(left, right)
+
 	style := lipgloss.NewStyle().Inline(true)
 	if s.width > 0 {
-		style = style.MaxWidth(s.width).Width(s.width)
+		style = style.MaxWidth(s.width)
 	}
 
 	return style.Render(line)
+}
+
+// justify places left and right on one row separated by padding that fills the
+// stored width. When there is not enough room for both, the right hints are
+// dropped so the model/state on the left is never lost.
+func (s *Status) justify(left, right string) string {
+	if s.width <= 0 {
+		return left
+	}
+
+	gap := s.width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		return left
+	}
+
+	return left + strings.Repeat(" ", gap) + right
 }
 
 // stateColor selects the error color when the state reports a failure and the

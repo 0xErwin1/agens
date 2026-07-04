@@ -76,7 +76,7 @@ func TestModel_EnterSubmitsStartsTurnAndShowsUserBlock(t *testing.T) {
 	}
 
 	view := m.View()
-	if !strings.Contains(view, "You:") || !strings.Contains(view, "hi there") {
+	if !strings.Contains(view, "hi there") {
 		t.Fatalf("View() = %q, want a user block containing the prompt", view)
 	}
 	if !strings.Contains(view, "thinking") {

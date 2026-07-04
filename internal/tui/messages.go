@@ -9,17 +9,20 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Visible markers kept as text (not just color) so the conversation stays
-// legible on terminals without color and so a screen reader still conveys the
-// speaker/role. Color is layered on top via the active theme at render time.
+// Visible markers layered on top of the theme colors. The user turn is set
+// off by a colored left bar (like opencode) rather than a text label; tool and
+// error lines keep a short glyph/word so they read even without color.
 const (
-	labelUser        = "You:"
 	labelToolCall    = "→ "
 	labelToolError   = "error: "
 	labelErrorBlock  = "error: "
-	prefixAssistant  = "agens: "
 	blockSeparator   = "\n\n"
 	toolResultIndent = "  "
+
+	// contentGutter is the left indent applied to every non-user block so the
+	// conversation aligns with glamour's built-in document margin (2) instead
+	// of hugging the terminal edge.
+	contentGutter = 2
 )
 
 // Tool results can be arbitrarily large (a whole file, a long command dump).
@@ -170,9 +173,19 @@ func (m *Messages) buildRenderer() {
 		return
 	}
 
+	wrap := m.width - contentGutter
+	if wrap < 1 {
+		wrap = 1
+	}
+
+	// A fixed dark style is used instead of glamour.WithAutoStyle(): auto
+	// resolves the style by querying the terminal's background color (OSC 11)
+	// at render time, and because Bubble Tea already owns the tty in raw mode,
+	// that query's response leaks into the input as stray text. A fixed style
+	// never queries the terminal.
 	r, err := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(m.width),
+		glamour.WithStandardStyle("dark"),
+		glamour.WithWordWrap(wrap),
 	)
 	if err != nil {
 		m.renderer = nil
@@ -197,54 +210,81 @@ func (m *Messages) rebuild() {
 	m.vp.GotoBottom()
 }
 
-// renderStreaming renders the in-progress assistant text as plain, styled text.
-// Markdown is intentionally NOT applied here: token deltas arrive rapidly and
-// running glamour on every delta would be wasteful, so markdown is deferred to
-// FinishAssistant.
+// renderStreaming renders the in-progress assistant text as plain, gutter-
+// aligned text. Markdown is intentionally NOT applied here: token deltas arrive
+// rapidly and running glamour on every delta would be wasteful, so markdown is
+// deferred to FinishAssistant.
 func (m *Messages) renderStreaming() string {
-	body := m.styled(CurrentTheme().Assistant(), m.streaming)
-	return prefixAssistant + body
+	return m.gutteredBlock(CurrentTheme().Assistant(), m.streaming, false)
 }
 
 // renderBlock styles one finalized block according to its kind and the active
-// theme. Assistant blocks are rendered as markdown; the rest are plain text
-// with a role color.
+// theme. The user turn gets a colored left bar; assistant blocks are rendered
+// as markdown; tool and error lines are gutter-aligned colored text.
 func (m *Messages) renderBlock(b block) string {
 	theme := CurrentTheme()
 
 	switch b.kind {
 	case blockUser:
-		label := lipgloss.NewStyle().Foreground(theme.User()).Bold(true).Render(labelUser)
-		return label + " " + m.styled(theme.User(), b.text)
+		return m.renderUser(b.text)
 
 	case blockAssistant:
 		return m.renderMarkdown(b.text)
 
 	case blockToolCall:
-		return lipgloss.NewStyle().Foreground(theme.Tool()).Bold(true).Render(labelToolCall + b.text)
+		return m.gutteredBlock(theme.Tool(), labelToolCall+b.text, true)
 
 	case blockToolResult:
-		return m.styled(theme.Muted(), indentLines(truncateToolResult(b.text)))
+		return m.gutteredBlock(theme.Muted(), indentLines(truncateToolResult(b.text)), false)
 
 	case blockToolError:
-		return m.styled(theme.Error(), indentLines(labelToolError+truncateToolResult(b.text)))
+		return m.gutteredBlock(theme.Error(), indentLines(labelToolError+truncateToolResult(b.text)), false)
 
 	case blockError:
-		return lipgloss.NewStyle().Foreground(theme.Error()).Bold(true).Render(labelErrorBlock + b.text)
+		return m.gutteredBlock(theme.Error(), labelErrorBlock+b.text, true)
 
 	default:
 		return b.text
 	}
 }
 
-// styled applies a foreground color and, when a width is known, wraps the text
-// to that width so long non-markdown blocks do not overflow the viewport.
-func (m *Messages) styled(color lipgloss.Color, text string) string {
-	style := lipgloss.NewStyle().Foreground(color)
-	if m.width > 0 {
-		style = style.Width(m.width)
+// renderUser renders a user turn as a block set off by a colored left bar,
+// matching opencode's treatment. The bar sits at the far left and the text is
+// inset so it lines up with the gutter used by every other block.
+func (m *Messages) renderUser(text string) string {
+	theme := CurrentTheme()
+
+	width := m.width - 2 // left bar (1) + a column of right slack
+	if width < 1 {
+		width = 1
 	}
-	return style.Render(text)
+
+	return lipgloss.NewStyle().
+		BorderStyle(lipgloss.ThickBorder()).
+		BorderLeft(true).
+		BorderForeground(theme.User()).
+		Foreground(theme.Assistant()).
+		PaddingLeft(1).
+		Width(width).
+		Render(text)
+}
+
+// gutteredBlock renders text in color, wrapped to the content width and inset
+// by the shared left gutter so non-user blocks align with the assistant's
+// markdown margin. bold emphasizes headers such as the tool-call and
+// turn-error lines.
+func (m *Messages) gutteredBlock(color lipgloss.Color, text string, bold bool) string {
+	width := m.width - contentGutter
+	if width < 1 {
+		width = 1
+	}
+
+	return lipgloss.NewStyle().
+		Foreground(color).
+		Bold(bold).
+		Width(width).
+		MarginLeft(contentGutter).
+		Render(text)
 }
 
 // renderMarkdown renders assistant text as terminal markdown, falling back to
