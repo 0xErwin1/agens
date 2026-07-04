@@ -86,6 +86,12 @@ func (p *Provider) ID() string {
 	return "openai-api"
 }
 
+// EffortLevels implements provider.Provider: OpenAI's reasoning-effort values
+// in ascending order.
+func (p *Provider) EffortLevels() []string {
+	return []string{"minimal", "low", "medium", "high", "xhigh"}
+}
+
 // Models implements provider.Provider, fetching the current model catalog
 // from OpenAI's "/models" endpoint at call time rather than returning a
 // hardcoded list. The endpoint reports only an id per model — no context

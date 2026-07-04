@@ -38,8 +38,16 @@ func TestModel_ReasoningShowsThinkingThenAnswer(t *testing.T) {
 	}
 }
 
-func TestModel_EffortSelectorSetsEffortEverywhere(t *testing.T) {
+var testEffortLevels = []string{"minimal", "low", "medium", "high", "xhigh"}
+
+func sizedWithEffort() *Model {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+	m.effortLevels = testEffortLevels
+	return m
+}
+
+func TestModel_EffortSelectorSetsEffortEverywhere(t *testing.T) {
+	m := sizedWithEffort()
 
 	typeString(m, "/effort")
 	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // run /effort → open picker
@@ -47,8 +55,8 @@ func TestModel_EffortSelectorSetsEffortEverywhere(t *testing.T) {
 	if !m.effortPickerOpen {
 		t.Fatal("/effort did not open the effort selector")
 	}
-	if m.effortIdx != indexOfEffort("") {
-		t.Fatalf("selector opened on idx %d, want the default %d", m.effortIdx, indexOfEffort(""))
+	if m.effortIdx != indexOfEffort(testEffortLevels, "") {
+		t.Fatalf("selector opened on idx %d, want the default %d", m.effortIdx, indexOfEffort(testEffortLevels, ""))
 	}
 
 	// medium (default) → high
@@ -71,7 +79,7 @@ func TestModel_EffortSelectorSetsEffortEverywhere(t *testing.T) {
 }
 
 func TestModel_EffortSelectorEscKeepsDefault(t *testing.T) {
-	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+	m := sizedWithEffort()
 
 	typeString(m, "/effort")
 	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
@@ -87,10 +95,25 @@ func TestModel_EffortSelectorEscKeepsDefault(t *testing.T) {
 }
 
 func TestIndexOfEffort(t *testing.T) {
-	if got := indexOfEffort(""); got != 1 {
-		t.Fatalf("indexOfEffort(\"\") = %d, want 1 (medium default)", got)
+	// minimal, low, medium, high, xhigh → medium is index 2.
+	if got := indexOfEffort(testEffortLevels, ""); got != 2 {
+		t.Fatalf("indexOfEffort(\"\") = %d, want 2 (medium default)", got)
 	}
-	if got := indexOfEffort("high"); got != 2 {
-		t.Fatalf("indexOfEffort(high) = %d, want 2", got)
+	if got := indexOfEffort(testEffortLevels, "xhigh"); got != 4 {
+		t.Fatalf("indexOfEffort(xhigh) = %d, want 4", got)
+	}
+}
+
+func TestModel_EffortUnavailableWithoutLevels(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // no effort levels
+
+	typeString(m, "/effort")
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if m.effortPickerOpen {
+		t.Fatal("selector opened for a provider with no effort levels")
+	}
+	if !strings.Contains(stripANSI(m.View()), "not available") {
+		t.Fatalf("View() = %q, want an unavailable note", stripANSI(m.View()))
 	}
 }

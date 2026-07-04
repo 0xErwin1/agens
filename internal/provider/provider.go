@@ -45,6 +45,11 @@ type Provider interface {
 	// Models lists the models this provider can serve.
 	Models(ctx context.Context) ([]ModelInfo, error)
 
+	// EffortLevels lists the reasoning-effort values this provider accepts, in
+	// ascending order (empty when the provider has no reasoning effort). The
+	// set is provider-specific: OpenAI and Anthropic differ.
+	EffortLevels() []string
+
 	// Stream opens a streaming chat call for req. The returned StreamReader
 	// must be closed by the caller once consumption is done.
 	Stream(ctx context.Context, req ChatRequest) (StreamReader, error)

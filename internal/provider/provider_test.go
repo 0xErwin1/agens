@@ -84,6 +84,8 @@ func (f *fakeProvider) Models(_ context.Context) ([]ModelInfo, error) {
 	return f.models, nil
 }
 
+func (f *fakeProvider) EffortLevels() []string { return nil }
+
 func (f *fakeProvider) Stream(_ context.Context, _ ChatRequest) (StreamReader, error) {
 	if f.streamErr != nil {
 		return nil, f.streamErr

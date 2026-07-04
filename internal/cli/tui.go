@@ -18,10 +18,11 @@ import (
 // the model lister for the /model selector, the system-prompt rebuilder used
 // on a live model switch, and the model name for the status line.
 type tuiSession struct {
-	loop   *agentloop.Loop
-	lister tui.ModelLister
-	prompt tui.SystemPromptFunc
-	model  string
+	loop         *agentloop.Loop
+	lister       tui.ModelLister
+	prompt       tui.SystemPromptFunc
+	model        string
+	effortLevels []string
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -72,6 +73,7 @@ func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Comman
 				Prompter:     prompter,
 				Models:       session.lister,
 				SystemPrompt: session.prompt,
+				EffortLevels: session.effortLevels,
 			}))
 		},
 	}
@@ -112,7 +114,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
-	lister, err := agent.BuildProvider(loaded.Config, creds, opts)
+	prov, err := agent.BuildProvider(loaded.Config, creds, opts)
 	if err != nil {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
@@ -125,7 +127,13 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return sp, true
 	}
 
-	return tuiSession{loop: loop, lister: lister, prompt: prompt, model: modelName}, nil
+	return tuiSession{
+		loop:         loop,
+		lister:       prov,
+		prompt:       prompt,
+		model:        modelName,
+		effortLevels: prov.EffortLevels(),
+	}, nil
 }
 
 // defaultRunTUI starts the Bubble Tea program on the alternate screen. Bubble

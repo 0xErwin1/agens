@@ -85,9 +85,11 @@ type Model struct {
 	modelLoading    bool
 	modelErr        error
 
-	// effort is the current reasoning effort ("" = model default); the picker
-	// fields hold the effort selector's state while it is open.
+	// effort is the current reasoning effort ("" = provider default);
+	// effortLevels are the provider's supported values (empty disables the
+	// selector); the picker fields hold the selector state while open.
 	effort           string
+	effortLevels     []string
 	effortPickerOpen bool
 	effortIdx        int
 
@@ -117,6 +119,7 @@ type Deps struct {
 	Prompter     *Prompter
 	Models       ModelLister
 	SystemPrompt SystemPromptFunc
+	EffortLevels []string
 }
 
 // New constructs the root model from its dependencies.
@@ -135,6 +138,7 @@ func New(deps Deps) *Model {
 		commands:     defaultCommands(),
 		lister:       deps.Models,
 		systemPrompt: deps.SystemPrompt,
+		effortLevels: deps.EffortLevels,
 	}
 }
 
@@ -271,7 +275,7 @@ func (m *Model) View() string {
 		overlay := renderModelSelector(m.modelItems, m.modelIdx, m.modelLoading, m.modelErr, m.modelName, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
 	case m.effortPickerOpen:
-		base = overlayAbove(base, renderEffortSelector(m.effortIdx, m.effort, m.contentWidth), inputRow)
+		base = overlayAbove(base, renderEffortSelector(m.effortLevels, m.effortIdx, m.effort, m.contentWidth), inputRow)
 	case m.showPalette:
 		base = overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.contentWidth), inputRow)
 	}
@@ -563,10 +567,16 @@ func (m *Model) closeModelPicker() {
 }
 
 // OpenEffortSelector implements CommandContext: it opens the reasoning-effort
-// selector positioned on the current effort.
+// selector positioned on the current effort, or reports that the provider has
+// no reasoning effort to choose.
 func (m *Model) OpenEffortSelector() tea.Cmd {
+	if len(m.effortLevels) == 0 {
+		m.messages.AddInfo("reasoning effort not available for this provider")
+		return nil
+	}
+
 	m.effortPickerOpen = true
-	m.effortIdx = indexOfEffort(m.effort)
+	m.effortIdx = indexOfEffort(m.effortLevels, m.effort)
 	return nil
 }
 
@@ -574,7 +584,7 @@ func (m *Model) OpenEffortSelector() tea.Cmd {
 // Up/Down and Tab/Shift+Tab cycle (wrapping), Enter applies the effort, and
 // Esc closes without changing it.
 func (m *Model) handleEffortPickerKey(msg tea.KeyMsg) {
-	n := len(effortOptions)
+	n := len(m.effortLevels)
 
 	switch msg.Type {
 	case tea.KeyUp, tea.KeyShiftTab:
@@ -587,7 +597,7 @@ func (m *Model) handleEffortPickerKey(msg tea.KeyMsg) {
 		m.effortPickerOpen = false
 
 	case tea.KeyEnter:
-		m.selectEffort(effortOptions[m.effortIdx])
+		m.selectEffort(m.effortLevels[m.effortIdx])
 	}
 }
 

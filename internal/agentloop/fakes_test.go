@@ -68,6 +68,8 @@ func (p *fakeProvider) Models(ctx context.Context) ([]provider.ModelInfo, error)
 	return nil, nil
 }
 
+func (p *fakeProvider) EffortLevels() []string { return nil }
+
 func (p *fakeProvider) Stream(ctx context.Context, req provider.ChatRequest) (provider.StreamReader, error) {
 	p.lastRequest = req
 	return newScriptedStream(p.steps), nil

@@ -27,6 +27,8 @@ func (p *modelsFakeProvider) Models(context.Context) ([]provider.ModelInfo, erro
 	return p.models, p.modelsErr
 }
 
+func (p *modelsFakeProvider) EffortLevels() []string { return nil }
+
 func (p *modelsFakeProvider) Stream(context.Context, provider.ChatRequest) (provider.StreamReader, error) {
 	return nil, nil
 }

@@ -50,6 +50,8 @@ func (p *sequencingProvider) Models(context.Context) ([]provider.ModelInfo, erro
 	return nil, nil
 }
 
+func (p *sequencingProvider) EffortLevels() []string { return nil }
+
 func (p *sequencingProvider) Stream(_ context.Context, req provider.ChatRequest) (provider.StreamReader, error) {
 	p.requests = append(p.requests, req)
 
@@ -74,6 +76,8 @@ func (p *cancelingStreamProvider) ID() string { return "canceling-stream-provide
 func (p *cancelingStreamProvider) Models(context.Context) ([]provider.ModelInfo, error) {
 	return nil, nil
 }
+
+func (p *cancelingStreamProvider) EffortLevels() []string { return nil }
 
 func (p *cancelingStreamProvider) Stream(context.Context, provider.ChatRequest) (provider.StreamReader, error) {
 	return &cancelingStream{cancel: p.cancel}, nil

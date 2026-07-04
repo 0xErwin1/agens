@@ -62,6 +62,7 @@ var _ provider.Provider = (*chatFakeProvider)(nil)
 func (p *chatFakeProvider) ID() string { return "chat-fake-provider" }
 
 func (p *chatFakeProvider) Models(context.Context) ([]provider.ModelInfo, error) { return nil, nil }
+func (p *chatFakeProvider) EffortLevels() []string                               { return nil }
 
 func (p *chatFakeProvider) Stream(_ context.Context, req provider.ChatRequest) (provider.StreamReader, error) {
 	p.lastRequest = req

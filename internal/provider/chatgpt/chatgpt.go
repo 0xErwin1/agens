@@ -86,6 +86,12 @@ func (p *Provider) ID() string {
 	return "openai-chatgpt"
 }
 
+// EffortLevels implements provider.Provider: the reasoning-effort values the
+// OpenAI Responses backend accepts, in ascending order.
+func (p *Provider) EffortLevels() []string {
+	return []string{"minimal", "low", "medium", "high", "xhigh"}
+}
+
 // Models implements provider.Provider, fetching the current model catalog
 // from the backend's "/models" endpoint at call time rather than returning a
 // hardcoded list. Only entries with visibility "list" are returned; hidden

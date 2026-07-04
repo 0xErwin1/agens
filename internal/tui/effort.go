@@ -6,25 +6,26 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// effortOptions is the reasoning-effort choices the selector offers, in
-// ascending order. The empty default (model's own effort) is not listed;
-// choosing one always sets an explicit value.
-var effortOptions = []string{"low", "medium", "high"}
-
-// indexOfEffort returns the index of current in effortOptions, or 1 (medium)
-// when it is unset or unknown, so the selector opens on a sensible default.
-func indexOfEffort(current string) int {
-	for i, e := range effortOptions {
+// indexOfEffort returns the index of current in options, or the index of
+// "medium" (else the middle) when current is unset or unknown, so the selector
+// opens on a sensible default.
+func indexOfEffort(options []string, current string) int {
+	for i, e := range options {
 		if e == current {
 			return i
 		}
 	}
-	return 1
+	for i, e := range options {
+		if e == "medium" {
+			return i
+		}
+	}
+	return len(options) / 2
 }
 
 // renderEffortSelector draws the effort selector overlay: one row per option
 // with the current one marked and the selection highlighted.
-func renderEffortSelector(selected int, current string, width int) string {
+func renderEffortSelector(options []string, selected int, current string, width int) string {
 	theme := CurrentTheme()
 
 	inner := width - 4
@@ -38,8 +39,8 @@ func renderEffortSelector(selected int, current string, width int) string {
 
 	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Reasoning effort"))
 
-	rows := make([]string, 0, len(effortOptions))
-	for i, opt := range effortOptions {
+	rows := make([]string, 0, len(options))
+	for i, opt := range options {
 		marker := "  "
 		color := theme.Assistant()
 		if i == selected {
