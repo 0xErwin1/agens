@@ -322,7 +322,9 @@ func (m *Messages) renderMarkdown(text string) string {
 	if err != nil {
 		return text
 	}
-	return strings.TrimRight(out, "\n")
+	// glamour pads the block with a leading and trailing blank line; trim both
+	// so assistant turns sit tight against their neighbors.
+	return strings.Trim(out, "\n")
 }
 
 // truncateToolResult caps a tool result at a line and byte budget, appending a

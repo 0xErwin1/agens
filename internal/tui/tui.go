@@ -23,6 +23,16 @@ const (
 	// inputGap is a blank row between the conversation and the input, so the
 	// last message does not sit flush against the prompt.
 	inputGap = 1
+
+	// topPad is the blank space above the first row of content.
+	topPad = 1
+
+	// maxContentWidth caps the content column; on wider terminals the column
+	// is centered rather than stretched edge to edge, which reads as less
+	// sparse. minSidePad is the minimum horizontal breathing room on each side
+	// when the terminal is narrower than the cap.
+	maxContentWidth = 96
+	minSidePad      = 2
 )
 
 // State labels shown in the status bar.
@@ -76,6 +86,9 @@ type Model struct {
 	modelErr        error
 
 	width, height int
+	// contentWidth is the width of the centered content column and leftPad the
+	// left offset that centers it; both are derived from width in layout.
+	contentWidth, leftPad int
 }
 
 var (
@@ -242,15 +255,33 @@ func (m *Model) View() string {
 
 	switch {
 	case m.pending != nil:
-		return overlayAbove(base, renderPermission(m.pending.Call, m.width), inputRow)
+		base = overlayAbove(base, renderPermission(m.pending.Call, m.contentWidth), inputRow)
 	case m.modelPickerOpen:
-		overlay := renderModelSelector(m.modelItems, m.modelIdx, m.modelLoading, m.modelErr, m.modelName, m.width)
-		return overlayAbove(base, overlay, inputRow)
+		overlay := renderModelSelector(m.modelItems, m.modelIdx, m.modelLoading, m.modelErr, m.modelName, m.contentWidth)
+		base = overlayAbove(base, overlay, inputRow)
 	case m.showPalette:
-		return overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.width), inputRow)
-	default:
-		return base
+		base = overlayAbove(base, renderPalette(m.paletteItems, m.paletteIdx, m.contentWidth), inputRow)
 	}
+
+	return frameView(base, m.leftPad, topPad)
+}
+
+// frameView centers the composed view by prefixing every line with leftPad
+// spaces and adds topPad blank rows above it, giving the content top and side
+// breathing room without touching the components themselves.
+func frameView(s string, leftPad, topPad int) string {
+	pad := strings.Repeat(" ", leftPad)
+
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, topPad+len(lines))
+	for i := 0; i < topPad; i++ {
+		out = append(out, "")
+	}
+	for _, line := range lines {
+		out = append(out, pad+line)
+	}
+
+	return strings.Join(out, "\n")
 }
 
 // overlayAbove composites overlay onto base so that overlay's last line lands
@@ -276,14 +307,26 @@ func overlayAbove(base, overlay string, inputRow int) string {
 // input and footer rows. Overlays float on top of it (see View) and never
 // reduce this height.
 func (m *Model) layout() {
-	msgHeight := m.height - inputHeight - statusHeight - inputGap
+	m.contentWidth = m.width - 2*minSidePad
+	if m.contentWidth > maxContentWidth {
+		m.contentWidth = maxContentWidth
+	}
+	if m.contentWidth < 1 {
+		m.contentWidth = 1
+	}
+	m.leftPad = (m.width - m.contentWidth) / 2
+	if m.leftPad < 0 {
+		m.leftPad = 0
+	}
+
+	msgHeight := m.height - inputHeight - statusHeight - inputGap - topPad
 	if msgHeight < 0 {
 		msgHeight = 0
 	}
 
-	m.messages.SetSize(m.width, msgHeight)
-	m.status.SetSize(m.width, statusHeight)
-	m.input.SetSize(m.width, inputHeight)
+	m.messages.SetSize(m.contentWidth, msgHeight)
+	m.status.SetSize(m.contentWidth, statusHeight)
+	m.input.SetSize(m.contentWidth, inputHeight)
 }
 
 // handleModalKey resolves the on-screen permission modal from a keypress.

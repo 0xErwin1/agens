@@ -53,9 +53,36 @@ func TestModel_SpinnerTicksOnlyWhileRunning(t *testing.T) {
 func TestModel_ReservesGapBetweenChatAndInput(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // sized at 80x24
 
-	want := 24 - inputHeight - statusHeight - inputGap
+	want := 24 - inputHeight - statusHeight - inputGap - topPad
 	if m.messages.height != want {
-		t.Fatalf("messages height = %d, want %d (a blank row reserved before the input)", m.messages.height, want)
+		t.Fatalf("messages height = %d, want %d (blank rows reserved before the input and at the top)", m.messages.height, want)
+	}
+}
+
+func TestModel_CentersContentWithPadding(t *testing.T) {
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5"})
+	m.Update(tea.WindowSizeMsg{Width: 200, Height: 24})
+
+	if m.contentWidth != maxContentWidth {
+		t.Fatalf("contentWidth = %d, want it capped at %d on a wide terminal", m.contentWidth, maxContentWidth)
+	}
+	wantPad := (200 - maxContentWidth) / 2
+	if m.leftPad != wantPad {
+		t.Fatalf("leftPad = %d, want %d (centered)", m.leftPad, wantPad)
+	}
+
+	lines := strings.Split(m.View(), "\n")
+	if strings.TrimSpace(lines[0]) != "" {
+		t.Fatalf("first line = %q, want a blank top-padding row", lines[0])
+	}
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, strings.Repeat(" ", wantPad)) {
+			t.Fatalf("content line %q is not left-padded by %d spaces", line, wantPad)
+		}
+		break
 	}
 }
 
