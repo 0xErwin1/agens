@@ -92,10 +92,11 @@ type Messages struct {
 	streamingActive bool
 	reasoning       string
 	reasoningActive bool
-	// toolsExpanded controls whether tool blocks show their result body; folded
-	// by default, toggled for all tools at once via ToggleTools (Ctrl+O).
-	toolsExpanded bool
-	width, height int
+	// detailsExpanded controls whether collapsible blocks (tool output and
+	// finished "Thinking") show their body; folded by default, toggled for all
+	// of them at once via ToggleDetails (Ctrl+O).
+	detailsExpanded bool
+	width, height   int
 
 	// renderer is width-bound: a glamour.TermRenderer wraps to a fixed width,
 	// so it is rebuilt whenever the width changes rather than per render.
@@ -198,10 +199,11 @@ func (m *Messages) CompleteToolCall(id, result string, isError bool, dur time.Du
 	}
 }
 
-// ToggleTools flips whether tool blocks show their result body, for every tool
-// at once. It backs the Ctrl+O collapse/expand shortcut.
-func (m *Messages) ToggleTools() {
-	m.toolsExpanded = !m.toolsExpanded
+// ToggleDetails flips whether collapsible blocks (tool output and finished
+// "Thinking") show their body, for all of them at once. It backs the Ctrl+O
+// collapse/expand shortcut.
+func (m *Messages) ToggleDetails() {
+	m.detailsExpanded = !m.detailsExpanded
 	m.rebuild()
 }
 
@@ -342,7 +344,7 @@ func (m *Messages) rebuild() {
 		parts = append(parts, m.renderBlock(b))
 	}
 	if m.reasoningActive {
-		parts = append(parts, m.renderReasoning(m.reasoning))
+		parts = append(parts, m.renderReasoning(m.reasoning, true))
 	}
 	if m.streamingActive {
 		parts = append(parts, m.renderStreaming())
@@ -355,9 +357,10 @@ func (m *Messages) rebuild() {
 }
 
 // renderReasoning renders the model's thinking as a dim, italic block under a
-// "Thinking" label, aligned to the shared gutter. It is used both for the live
-// stream and for a finalized reasoning block.
-func (m *Messages) renderReasoning(text string) string {
+// "Thinking" label, aligned to the shared gutter. The live stream (live=true)
+// always shows the full text so the user can watch it think; a finished block
+// is collapsible, showing only the labeled header until details are expanded.
+func (m *Messages) renderReasoning(text string, live bool) string {
 	theme := CurrentTheme()
 
 	width := m.width - contentGutter
@@ -366,9 +369,21 @@ func (m *Messages) renderReasoning(text string) string {
 	}
 
 	dim := lipgloss.NewStyle().Foreground(theme.Muted()).Italic(true)
-	label := dim.Bold(true).Render(labelThinking)
-	body := dim.Width(width).Render(text)
 
+	caret := ""
+	if !live {
+		caret = "▸ "
+		if m.detailsExpanded {
+			caret = "▾ "
+		}
+	}
+	label := dim.Bold(true).Render(caret + labelThinking)
+
+	if !live && !m.detailsExpanded {
+		return lipgloss.NewStyle().MarginLeft(contentGutter).Render(label)
+	}
+
+	body := dim.Width(width).Render(text)
 	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(label + "\n" + body)
 }
 
@@ -403,7 +418,7 @@ func (m *Messages) renderBlock(b block) string {
 		return m.gutteredBlock(theme.Muted(), b.text, false)
 
 	case blockReasoning:
-		return m.renderReasoning(b.text)
+		return m.renderReasoning(b.text, false)
 
 	default:
 		return b.text
@@ -418,7 +433,7 @@ func (m *Messages) renderTool(b block) string {
 	theme := CurrentTheme()
 
 	caret := "▸ "
-	if m.toolsExpanded && b.done {
+	if m.detailsExpanded && b.done {
 		caret = "▾ "
 	}
 
@@ -440,7 +455,7 @@ func (m *Messages) renderTool(b block) string {
 	}
 	header := lipgloss.NewStyle().MarginLeft(contentGutter).Width(width).Render(head)
 
-	if !m.toolsExpanded || !b.done || b.result == "" {
+	if !m.detailsExpanded || !b.done || b.result == "" {
 		return header
 	}
 

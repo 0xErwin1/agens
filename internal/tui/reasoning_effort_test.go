@@ -32,9 +32,18 @@ func TestModel_ReasoningShowsThinkingThenAnswer(t *testing.T) {
 	if !strings.Contains(view, "the answer") {
 		t.Fatalf("View() = %q, want the answer once text streams", view)
 	}
-	// The reasoning is finalized (kept as a dim block), not discarded.
-	if !strings.Contains(view, "let me think about it") {
-		t.Fatalf("View() = %q, want the reasoning kept after the answer starts", view)
+	// The finished reasoning collapses to its "Thinking" header; the block is
+	// kept but its text is folded away until Ctrl+O expands it.
+	if !strings.Contains(view, "Thinking") {
+		t.Fatalf("View() = %q, want the collapsed Thinking header kept", view)
+	}
+	if strings.Contains(view, "let me think about it") {
+		t.Fatalf("View() = %q, want the finished reasoning folded by default", view)
+	}
+
+	m.messages.ToggleDetails()
+	if !strings.Contains(stripANSI(m.View()), "let me think about it") {
+		t.Fatalf("View() = %q, want the reasoning shown after expanding details", stripANSI(m.View()))
 	}
 }
 

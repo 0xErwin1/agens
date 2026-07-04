@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,15 @@ type Model struct {
 	// toolClock marks when the current tool began executing, advanced after each
 	// tool result so consecutive tools each get their own execution duration.
 	toolClock time.Time
+
+	// usage is the latest token accounting reported by the provider; hasUsage
+	// gates the footer segment until the first report. contextWindow is the
+	// current model's window (0 = unknown), used to show a context percentage.
+	// tokensDetailed toggles the compact/verbose token view (Ctrl+P).
+	usage          provider.Usage
+	hasUsage       bool
+	contextWindow  int
+	tokensDetailed bool
 	// quitArmed is set after a Ctrl+C that neither canceled a turn nor cleared
 	// the input, so a second Ctrl+C quits; any other key disarms it.
 	quitArmed bool
@@ -239,6 +249,12 @@ func (m *Model) Init() tea.Cmd {
 	if m.files != nil {
 		cmds = append(cmds, loadFilesCmd(m.files))
 	}
+	if m.lister != nil {
+		// Fetch the catalog in the background so the footer can show the current
+		// model's context percentage without waiting for the user to open the
+		// /model selector.
+		cmds = append(cmds, loadModelsCmd(m.lister))
+	}
 	if m.sessions != nil {
 		switch {
 		case m.resumeID != "":
@@ -326,7 +342,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case tea.KeyCtrlO:
 			swallow = true
-			m.messages.ToggleTools()
+			m.messages.ToggleDetails()
+		case tea.KeyCtrlP:
+			swallow = true
+			m.tokensDetailed = !m.tokensDetailed
+			m.status.SetTokens(m.tokenSummary())
 		case tea.KeyEnter:
 			swallow = true
 			cmds = append(cmds, m.onEnter())
@@ -337,6 +357,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelErr = msg.err
 		m.modelItems = msg.models
 		m.modelIdx = indexOfModel(msg.models, m.modelName)
+		m.contextWindow = contextWindowFor(msg.models, m.modelName)
+		m.status.SetTokens(m.tokenSummary())
 
 	case sessionsLoadedMsg:
 		m.sessionLoading = false
@@ -993,6 +1015,8 @@ func (m *Model) selectModel(info provider.ModelInfo) {
 
 	m.modelName = info.ID
 	m.status.SetModel(info.ID)
+	m.contextWindow = info.ContextWindow
+	m.status.SetTokens(m.tokenSummary())
 
 	m.closeModelPicker()
 	m.messages.AddInfo("switched model to " + info.ID)
@@ -1059,6 +1083,18 @@ func indexOfModel(models []provider.ModelInfo, current string) int {
 	for i, info := range models {
 		if info.ID == current {
 			return i
+		}
+	}
+	return 0
+}
+
+// contextWindowFor returns the context window of the model whose ID equals
+// current, or 0 when it is unknown (no match, or the provider does not report
+// one), in which case the footer omits the context percentage.
+func contextWindowFor(models []provider.ModelInfo, current string) int {
+	for _, info := range models {
+		if info.ID == current {
+			return info.ContextWindow
 		}
 	}
 	return 0
@@ -1148,10 +1184,64 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.toolClock = m.now()
 
 	case agentloop.LoopUsage:
-		// Usage is not surfaced in this batch.
+		if msg.Event.Usage != nil {
+			m.usage = *msg.Event.Usage
+			m.hasUsage = true
+			m.status.SetTokens(m.tokenSummary())
+		}
 	}
 
 	return waitFor(m.events)
+}
+
+// tokenSummary renders the footer's token/context segment from the latest usage
+// report: a compact total with a context percentage, or an input/output
+// breakdown when detailed view is toggled (Ctrl+P). It is empty until the first
+// usage report arrives.
+func (m *Model) tokenSummary() string {
+	if !m.hasUsage {
+		return ""
+	}
+
+	total := m.usage.InputTokens + m.usage.OutputTokens
+	pct := m.contextPct()
+
+	if m.tokensDetailed {
+		s := "in " + formatTokens(m.usage.InputTokens) + " · out " + formatTokens(m.usage.OutputTokens)
+		if pct != "" {
+			s += " · " + pct
+		}
+		return s
+	}
+
+	s := formatTokens(total)
+	if pct != "" {
+		s += " (" + pct + ")"
+	}
+	return s
+}
+
+// contextPct renders the share of the model's context window the conversation
+// occupies, or "" when the window is unknown.
+func (m *Model) contextPct() string {
+	if m.contextWindow <= 0 {
+		return ""
+	}
+	total := m.usage.InputTokens + m.usage.OutputTokens
+	return fmt.Sprintf("%d%%", total*100/m.contextWindow)
+}
+
+// formatTokens renders a token count compactly: bare below a thousand, K with
+// one decimal below a million, M above.
+func formatTokens(n int) string {
+	switch {
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 1_000_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
 }
 
 // addToolCalls appends a tool-call block for each tool invocation in the

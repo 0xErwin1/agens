@@ -157,7 +157,8 @@ func keyBindingsHelp() string {
 		"shortcuts:",
 		"  enter        send",
 		"  ctrl+c       cancel turn / quit",
-		"  ctrl+o       expand / collapse tool output",
+		"  ctrl+o       expand / collapse tool output & thinking",
+		"  ctrl+p       toggle detailed token usage",
 		"  pgup / pgdn  scroll the conversation",
 		"  esc          close palette / deny permission",
 	}, "\n")

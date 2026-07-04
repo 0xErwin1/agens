@@ -92,7 +92,7 @@ func TestMessages_ToolResultFoldedByDefaultAndExpandsOnToggle(t *testing.T) {
 		t.Fatalf("View() = %q, want the result folded away by default", view)
 	}
 
-	m.ToggleTools()
+	m.ToggleDetails()
 
 	view = stripANSI(m.View())
 	if !strings.Contains(view, "▾ bash") {
@@ -119,7 +119,7 @@ func TestMessages_ToolErrorMarksHeaderAndShowsBodyWhenExpanded(t *testing.T) {
 		t.Fatalf("View() = %q, want the error body folded by default", view)
 	}
 
-	m.ToggleTools()
+	m.ToggleDetails()
 	if !strings.Contains(stripANSI(m.View()), "permission denied") {
 		t.Fatalf("View() = %q, want the error body when expanded", stripANSI(m.View()))
 	}
@@ -183,7 +183,7 @@ func TestMessages_ToolResultTruncatesLongOutputWhenExpanded(t *testing.T) {
 
 	m.AddToolCall("t1", "bash", "cat big")
 	m.CompleteToolCall("t1", b.String(), false, time.Second)
-	m.ToggleTools()
+	m.ToggleDetails()
 
 	view := stripANSI(m.View())
 	if !strings.Contains(view, truncationMarker) {

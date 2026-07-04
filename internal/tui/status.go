@@ -26,6 +26,7 @@ type Status struct {
 	effort   string
 	spinner  string
 	duration string
+	tokens   string
 	width    int
 }
 
@@ -55,6 +56,10 @@ func (s *Status) SetSpinner(frame string) { s.spinner = frame }
 // empty hides it. It is cleared when a new turn starts and set when one ends.
 func (s *Status) SetDuration(d string) { s.duration = d }
 
+// SetTokens sets the token/context-usage segment shown before the right-aligned
+// hints; empty hides it.
+func (s *Status) SetTokens(t string) { s.tokens = t }
+
 // Init implements tea.Model; the status bar has no startup command.
 func (s *Status) Init() tea.Cmd { return nil }
 
@@ -83,7 +88,12 @@ func (s *Status) View() string {
 	if s.duration != "" {
 		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.duration)
 	}
-	right := lipgloss.NewStyle().Foreground(theme.Muted()).Render(statusHints) + " "
+
+	right := ""
+	if s.tokens != "" {
+		right += lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.tokens) + statusSeparator
+	}
+	right += lipgloss.NewStyle().Foreground(theme.Muted()).Render(statusHints) + " "
 
 	line := s.justify(left, right)
 
