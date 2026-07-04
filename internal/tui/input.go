@@ -37,6 +37,17 @@ func NewInput() *Input {
 	ta.ShowLineNumbers = false
 	ta.Prompt = ""
 
+	// Fill the textarea's own cells with the surface color so the box interior
+	// is never transparent (the terminal background must not show through).
+	surface := CurrentTheme().Surface()
+	for _, style := range []*textarea.Style{&ta.FocusedStyle, &ta.BlurredStyle} {
+		style.Base = style.Base.Background(surface)
+		style.Text = style.Text.Background(surface)
+		style.Placeholder = style.Placeholder.Background(surface)
+		style.CursorLine = style.CursorLine.Background(surface)
+		style.EndOfBuffer = style.EndOfBuffer.Background(surface)
+	}
+
 	// Word-wise navigation on Ctrl+arrows, in addition to the textarea's
 	// default Alt+arrows, matching common terminal editors.
 	ta.KeyMap.WordForward = key.NewBinding(key.WithKeys("ctrl+right", "alt+right", "alt+f"))
@@ -85,9 +96,12 @@ func (i *Input) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // View renders the prompt input inside a rounded, accent-colored border that
 // spans the full width, so the prompt is clearly delimited.
 func (i *Input) View() string {
+	theme := CurrentTheme()
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(CurrentTheme().Accent()).
+		BorderForeground(theme.Accent()).
+		BorderBackground(theme.Surface()).
+		Background(theme.Surface()).
 		Padding(0, 1)
 	if i.width > inputBorderRows {
 		box = box.Width(i.width - inputBorderRows) // border adds the remaining columns

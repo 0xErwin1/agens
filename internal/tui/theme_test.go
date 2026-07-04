@@ -16,6 +16,7 @@ func TestDefaultTheme_EveryRoleReturnsANonEmptyColor(t *testing.T) {
 		"Tool":      theme.Tool(),
 		"Muted":     theme.Muted(),
 		"Error":     theme.Error(),
+		"Surface":   theme.Surface(),
 	}
 
 	for role, color := range roles {
@@ -47,3 +48,4 @@ func (stubTheme) Assistant() lipgloss.Color { return "3" }
 func (stubTheme) Tool() lipgloss.Color      { return "4" }
 func (stubTheme) Muted() lipgloss.Color     { return "5" }
 func (stubTheme) Error() lipgloss.Color     { return "6" }
+func (stubTheme) Surface() lipgloss.Color   { return "7" }
