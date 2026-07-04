@@ -131,6 +131,54 @@ func TestModel_AtReferenceExpandsFileIntoHistory(t *testing.T) {
 	}
 }
 
+// erroringFileSource lists a file but fails every read, standing in for a file
+// that vanished or became unreadable after the startup index.
+type erroringFileSource struct {
+	files   []string
+	listErr error
+	readErr error
+}
+
+func (f erroringFileSource) List() ([]string, error) { return f.files, f.listErr }
+func (f erroringFileSource) Read(string) (string, error) {
+	return "", f.readErr
+}
+
+func TestModel_FileIndexErrorIsSurfaced(t *testing.T) {
+	src := erroringFileSource{listErr: errors.New("permission denied walking tree")}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Files: src})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	// Deliver the failed startup index result.
+	m.Update(filesLoadedMsg{err: src.listErr})
+
+	view := stripANSI(m.messages.View())
+	if !strings.Contains(view, "file references unavailable") {
+		t.Fatalf("View() = %q, want the swallowed index error surfaced to the user", view)
+	}
+	if !strings.Contains(view, "permission denied walking tree") {
+		t.Fatalf("View() = %q, want the underlying index error reason shown", view)
+	}
+}
+
+func TestModel_UnreadableReferencedFileIsReported(t *testing.T) {
+	src := erroringFileSource{files: []string{"cmd/main.go"}, readErr: errors.New("no such file")}
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", Files: src})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.Update(filesLoadedMsg{files: src.files})
+
+	typeString(m, "explain @cmd/main.go ")
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // submit
+
+	view := stripANSI(m.messages.View())
+	if !strings.Contains(view, "could not read referenced file") {
+		t.Fatalf("View() = %q, want the dropped @reference reported instead of silently skipped", view)
+	}
+	if !strings.Contains(view, "cmd/main.go") {
+		t.Fatalf("View() = %q, want the unreadable path named", view)
+	}
+}
+
 func userText(t *testing.T, msg message.Message) string {
 	t.Helper()
 	for _, p := range msg.Parts {

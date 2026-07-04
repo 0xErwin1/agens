@@ -298,6 +298,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case filesLoadedMsg:
 		m.filesLoaded = true
 		m.fileCache = msg.files
+		if msg.err != nil {
+			m.messages.AddInfo("file references unavailable: " + msg.err.Error())
+		}
 
 	case spinner.TickMsg:
 		// Ignore ticks that arrive after the turn ended; otherwise a stray
@@ -408,11 +411,13 @@ func (m *Model) insertFileRef(path string) {
 }
 
 // expandFileRefs appends the contents of every @-referenced project file to
-// text, so the model sees them. Unknown references and unreadable files are
-// left as-is; each file is capped at maxFileRefBytes.
-func (m *Model) expandFileRefs(text string) string {
+// text, so the model sees them. Unknown references are left as-is; each file is
+// capped at maxFileRefBytes. failed lists the known files whose read failed, so
+// the caller can tell the user their reference was dropped rather than dropping
+// it silently.
+func (m *Model) expandFileRefs(text string) (expanded string, failed []string) {
 	if m.files == nil {
-		return text
+		return text, nil
 	}
 
 	known := make(map[string]struct{}, len(m.fileCache))
@@ -422,7 +427,7 @@ func (m *Model) expandFileRefs(text string) string {
 
 	refs := extractFileRefs(text, known)
 	if len(refs) == 0 {
-		return text
+		return text, nil
 	}
 
 	var b strings.Builder
@@ -430,6 +435,7 @@ func (m *Model) expandFileRefs(text string) string {
 	for _, path := range refs {
 		content, err := m.files.Read(path)
 		if err != nil {
+			failed = append(failed, path)
 			continue
 		}
 		if len(content) > maxFileRefBytes {
@@ -438,7 +444,7 @@ func (m *Model) expandFileRefs(text string) string {
 		b.WriteString("\n\n--- " + path + " ---\n")
 		b.WriteString(content)
 	}
-	return b.String()
+	return b.String(), failed
 }
 
 // View composes the fixed frame — conversation, prompt input, footer — and
@@ -598,8 +604,12 @@ func (m *Model) submit() tea.Cmd {
 
 	// The model receives the message with @-referenced files inlined; the
 	// conversation shows the original text the user typed.
-	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: m.expandFileRefs(text)}))
+	expanded, failed := m.expandFileRefs(text)
+	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: expanded}))
 	m.messages.AppendUser(text)
+	if len(failed) > 0 {
+		m.messages.AddInfo("could not read referenced file(s): " + strings.Join(failed, ", "))
+	}
 	m.status.SetState(stateThinking)
 	m.workLabel = stateThinking
 	m.running = true
