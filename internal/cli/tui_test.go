@@ -33,7 +33,7 @@ func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 		return nil
 	}
 
-	cmd := newTUICommandWithBuilder(build, run)
+	cmd := newRootCommand(build, run)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs([]string{"--model", "gpt-custom", "--system", "custom prompt"})
@@ -61,7 +61,7 @@ func TestTUICommand_DangerouslyAllowAllSelectsAllowPrompter(t *testing.T) {
 	}
 	run := func(tea.Model) error { return nil }
 
-	cmd := newTUICommandWithBuilder(build, run)
+	cmd := newRootCommand(build, run)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs([]string{"--dangerously-allow-all"})
@@ -83,7 +83,7 @@ func TestTUICommand_DefaultPrompterIsNotAllowPrompter(t *testing.T) {
 	}
 	run := func(tea.Model) error { return nil }
 
-	cmd := newTUICommandWithBuilder(build, run)
+	cmd := newRootCommand(build, run)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs(nil)
@@ -108,7 +108,7 @@ func TestTUICommand_BuilderErrorPropagatesAndSkipsRun(t *testing.T) {
 		return nil
 	}
 
-	cmd := newTUICommandWithBuilder(build, run)
+	cmd := newRootCommand(build, run)
 	out := new(bytes.Buffer)
 	errOut := new(bytes.Buffer)
 	cmd.SetOut(out)
@@ -127,17 +127,51 @@ func TestTUICommand_BuilderErrorPropagatesAndSkipsRun(t *testing.T) {
 	}
 }
 
-func TestRootCommand_RegistersTUI(t *testing.T) {
+func TestRootCommand_BareInvocationRunsTUI(t *testing.T) {
+	built := false
+	build := func(agent.Options) (tuiSession, error) {
+		built = true
+		return tuiSession{loop: stubTUILoop(), model: "gpt-test"}, nil
+	}
+
+	var ranModel tea.Model
+	run := func(m tea.Model) error {
+		ranModel = m
+		return nil
+	}
+
+	cmd := newRootCommand(build, run)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs(nil) // bare `agens`, no subcommand
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+
+	if !built || ranModel == nil {
+		t.Fatalf("bare agens did not build+run the TUI (built=%v, ranModel=%v)", built, ranModel)
+	}
+}
+
+func TestRootCommand_KeepsSubcommandsAndDropsTUI(t *testing.T) {
 	root := NewRootCommand()
 
-	found := false
-	for _, c := range root.Commands() {
-		if c.Name() == "tui" {
-			found = true
-			break
+	has := func(name string) bool {
+		for _, c := range root.Commands() {
+			if c.Name() == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, name := range []string{"auth", "config", "chat", "models"} {
+		if !has(name) {
+			t.Fatalf("root command no longer registers the %q subcommand", name)
 		}
 	}
-	if !found {
-		t.Fatal("root command does not register a \"tui\" subcommand")
+	if has("tui") {
+		t.Fatal("root command still registers a \"tui\" subcommand, want it removed in favor of bare agens")
 	}
 }

@@ -39,57 +39,49 @@ type tuiLoopBuilder func(opts agent.Options) (tuiSession, error)
 // wiring without starting a Bubble Tea program (which requires a TTY).
 type tuiRunner func(model tea.Model) error
 
-func newTUICommand() *cobra.Command {
-	return newTUICommandWithBuilder(defaultBuildTUI, defaultRunTUI)
-}
-
-func newTUICommandWithBuilder(build tuiLoopBuilder, run tuiRunner) *cobra.Command {
+// configureRootTUI wires the interactive terminal UI onto cmd as its default
+// action: running agens with no subcommand builds the agent session and starts
+// the TUI. The build and run seams are injected so tests can exercise the
+// wiring without config, auth, a network, or a TTY.
+func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 	var opts agent.Options
 	var allowAll bool
 
-	cmd := &cobra.Command{
-		Use:   "tui",
-		Short: "Start the interactive terminal UI",
-		Long:  "Start the interactive terminal UI: a full-screen conversation view with a prompt input, streaming responses, and tool activity.",
-		Args:  cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			// The TUI owns the terminal, so it cannot use the tty-reading
-			// prompter the chat command does: an interactive decision is
-			// routed through the Bubble Tea event loop as a modal instead.
-			// --dangerously-allow-all keeps its non-interactive AllowPrompter
-			// and installs no modal.
-			var prompter *tui.Prompter
-			if allowAll {
-				opts.Prompter = permission.AllowPrompter{}
-			} else {
-				prompter = tui.NewPrompter()
-				opts.Prompter = prompter
-			}
+	cmd.RunE = func(_ *cobra.Command, _ []string) error {
+		// The TUI owns the terminal, so it cannot use the tty-reading
+		// prompter the chat command does: an interactive decision is
+		// routed through the Bubble Tea event loop as a modal instead.
+		// --dangerously-allow-all keeps its non-interactive AllowPrompter
+		// and installs no modal.
+		var prompter *tui.Prompter
+		if allowAll {
+			opts.Prompter = permission.AllowPrompter{}
+		} else {
+			prompter = tui.NewPrompter()
+			opts.Prompter = prompter
+		}
 
-			sess, err := build(opts)
-			if err != nil {
-				return err
-			}
+		sess, err := build(opts)
+		if err != nil {
+			return err
+		}
 
-			return run(tui.New(tui.Deps{
-				Loop:         sess.loop,
-				Model:        sess.model,
-				Prompter:     prompter,
-				Models:       sess.lister,
-				SystemPrompt: sess.prompt,
-				EffortLevels: sess.effortLevels,
-				Sessions:     sess.sessions,
-				NewSessionID: uuid.NewString,
-				Files:        sess.files,
-			}))
-		},
+		return run(tui.New(tui.Deps{
+			Loop:         sess.loop,
+			Model:        sess.model,
+			Prompter:     prompter,
+			Models:       sess.lister,
+			SystemPrompt: sess.prompt,
+			EffortLevels: sess.effortLevels,
+			Sessions:     sess.sessions,
+			NewSessionID: uuid.NewString,
+			Files:        sess.files,
+		}))
 	}
 
 	cmd.Flags().StringVar(&opts.Model, "model", "", "override the configured model")
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
-
-	return cmd
 }
 
 // defaultBuildTUI is the production tuiLoopBuilder: it loads config and

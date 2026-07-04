@@ -7,20 +7,28 @@ import (
 )
 
 func NewRootCommand() *cobra.Command {
+	return newRootCommand(defaultBuildTUI, defaultRunTUI)
+}
+
+// newRootCommand assembles the command tree with the TUI as the root's default
+// action, so bare `agens` opens the interactive UI while the subcommands remain
+// available. The build and run seams are threaded to the root's TUI action so
+// tests can drive it without config, auth, a network, or a TTY.
+func newRootCommand(build tuiLoopBuilder, run tuiRunner) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "agens",
 		Short: "Agens is a coding agent CLI",
-		Long:  "Agens is a coding agent CLI with a headless core and future TUI support.",
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			return cmd.Help()
-		},
+		Long:  "Agens is a coding agent CLI. Run it with no arguments to open the interactive terminal UI.",
+		Args:  cobra.NoArgs,
 	}
 
 	cmd.Version = version.Info()
+
+	configureRootTUI(cmd, build, run)
+
 	cmd.AddCommand(newAuthCommand())
 	cmd.AddCommand(newConfigCommand())
 	cmd.AddCommand(newChatCommand())
 	cmd.AddCommand(newModelsCommand())
-	cmd.AddCommand(newTUICommand())
 	return cmd
 }
