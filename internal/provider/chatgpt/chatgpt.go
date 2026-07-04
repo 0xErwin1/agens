@@ -41,7 +41,10 @@ const (
 // staticModels is the provisional model catalog for the ChatGPT-backed
 // Responses API surface. AGN-7 replaces it with a models.dev-backed lookup.
 var staticModels = []provider.ModelInfo{
-	{ID: DefaultModel, DisplayName: "GPT-5.5", ContextWindow: 400_000, MaxOutputTokens: 128_000, SupportsTools: true},
+	{ID: "gpt-5.5", DisplayName: "GPT-5.5", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
+	{ID: "gpt-5.4", DisplayName: "GPT-5.4", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
+	{ID: "gpt-5.4-mini", DisplayName: "GPT-5.4 mini", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
+	{ID: "gpt-5.3-codex-spark", DisplayName: "GPT-5.3 Codex Spark", ContextWindow: 272_000, MaxOutputTokens: 128_000, SupportsTools: true},
 }
 
 // Provider implements provider.Provider against OpenAI's Responses API
