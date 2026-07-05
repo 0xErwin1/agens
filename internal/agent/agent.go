@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/iperez/agens/internal/agentdef"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	chatgptauth "github.com/iperez/agens/internal/auth/chatgpt"
@@ -106,22 +107,42 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		loopOpts = append(loopOpts, agentloop.WithMaxIterations(maxIterations))
 	}
 
-	// A subagent runs the base toolset — with no task tool, so a delegation
-	// never recurses — through its own loop with an isolated conversation and a
-	// subagent-flavored system prompt. The task tool on the parent gate hands
-	// work to that subagent synchronously.
-	subGate, err := buildGate(opts)
+	// A subagent runs the base toolset — with no task tool, so a delegation never
+	// recurses — through its own loop with an isolated conversation, the system
+	// prompt of the chosen agent definition, and the model picked for the
+	// delegation. buildSub constructs that loop per delegation, since the model
+	// (and thus the prompt's environment block) varies by task.
+	defs, err := loadAgentDefs(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	subLoopOpts := make([]agentloop.Option, len(loopOpts), len(loopOpts)+1)
-	copy(subLoopOpts, loopOpts)
-	subLoopOpts = append(subLoopOpts, agentloop.WithSystemPrompt(subagentSystemPrompt(systemPrompt)))
+	buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
+		subGate, err := buildGate(opts)
+		if err != nil {
+			return nil, err
+		}
 
-	runner := newSubagentRunner(agentloop.New(p, subGate, subLoopOpts...), "subagent", model)
+		subPrompt, err := BuildSystemPrompt(cfg, withSystemPrompt(opts, def.Prompt), subModel)
+		if err != nil {
+			return nil, err
+		}
 
-	parentGate, err := buildParentGate(opts, runner)
+		subOpts := []agentloop.Option{
+			agentloop.WithModel(subModel),
+			agentloop.WithSystemPrompt(subagentSystemPrompt(subPrompt)),
+			agentloop.WithParallelToolCalls(cfg.Agent.ParallelToolCalls),
+		}
+		if maxIterations > 0 {
+			subOpts = append(subOpts, agentloop.WithMaxIterations(maxIterations))
+		}
+
+		return agentloop.New(p, subGate, subOpts...), nil
+	}
+
+	runner := newSubagentRunner(buildSub, defs, model)
+
+	parentGate, err := buildParentGate(opts, runner, defs)
 	if err != nil {
 		return nil, err
 	}
@@ -155,41 +176,61 @@ func subagentSystemPrompt(base string) string {
 // synchronous), but the counter is atomic so the id generation is race-free.
 var subagentSeq atomic.Int64
 
+// subLoopBuilder constructs a subagent loop for a resolved definition and model.
+// It returns the loopRunner interface (satisfied by *agentloop.Loop) so the
+// runner can be driven with a double in tests.
+type subLoopBuilder func(def agentdef.Definition, model string) (loopRunner, error)
+
 // subagentRunner runs a delegated task through a nested loop with an isolated
 // conversation, returning the subagent's final assistant text. It satisfies
-// task.Runner. name and model describe the subagent to the UI panel.
+// task.Runner. The definition and model are resolved per delegation from the
+// request; build then constructs the loop for that pair.
 type subagentRunner struct {
-	loop  loopRunner
-	name  string
-	model string
+	build       subLoopBuilder
+	defs        *agentdef.Set
+	parentModel string
 }
 
-func newSubagentRunner(loop loopRunner, name, model string) *subagentRunner {
-	return &subagentRunner{loop: loop, name: name, model: model}
+func newSubagentRunner(build subLoopBuilder, defs *agentdef.Set, parentModel string) *subagentRunner {
+	return &subagentRunner{build: build, defs: defs, parentModel: parentModel}
 }
 
-// Run seeds a fresh conversation with the task description and drives the
-// subagent loop to completion, returning the text of its final assistant turn.
-// The parent turn's ctx is threaded through, so canceling the parent cancels the
-// subagent too. When the parent loop installed an event sink (WithEventSink), the
-// subagent's lifecycle — start, each tool it invokes, and completion — is
-// streamed as LoopSubagent* events so the UI can show it running live.
-func (r *subagentRunner) Run(ctx context.Context, description string) (string, error) {
+// Run resolves the request to a definition and model, seeds a fresh conversation
+// with the task description, and drives the subagent loop to completion,
+// returning the text of its final assistant turn. The parent turn's ctx is
+// threaded through, so canceling the parent cancels the subagent too. When the
+// parent loop installed an event sink (WithEventSink), the subagent's lifecycle
+// — start, each tool it invokes, and completion — is streamed as LoopSubagent*
+// events so the UI can show it running live.
+func (r *subagentRunner) Run(ctx context.Context, req task.Request) (string, error) {
+	def, model := r.resolve(req)
+
 	parentEmit := agentloop.EventSink(ctx)
 	id := fmt.Sprintf("subagent-%d", subagentSeq.Add(1))
 
 	if parentEmit != nil {
 		parentEmit(agentloop.LoopEvent{
 			Kind:     agentloop.LoopSubagentStarted,
-			Subagent: agentloop.Subagent{ID: id, Name: r.name, Model: r.model, Prompt: description},
+			Subagent: agentloop.Subagent{ID: id, Name: def.Name, Model: model, Prompt: req.Description},
 		})
 	}
 
-	history := []message.Message{
-		message.NewMessage(message.RoleUser, message.TextPart{Text: description}),
+	loop, err := r.build(def, model)
+	if err != nil {
+		if parentEmit != nil {
+			parentEmit(agentloop.LoopEvent{
+				Kind:     agentloop.LoopSubagentFinished,
+				Subagent: agentloop.Subagent{ID: id, Failed: true},
+			})
+		}
+		return "", err
 	}
 
-	final, err := r.loop.Run(ctx, history, subagentActivitySink(parentEmit, id))
+	history := []message.Message{
+		message.NewMessage(message.RoleUser, message.TextPart{Text: req.Description}),
+	}
+
+	final, err := loop.Run(ctx, history, subagentActivitySink(parentEmit, id))
 
 	result := ""
 	if err == nil {
@@ -206,6 +247,31 @@ func (r *subagentRunner) Run(ctx context.Context, description string) (string, e
 		return "", err
 	}
 	return result, nil
+}
+
+// resolve picks the definition and model for a request: the named definition
+// (or the first subagent-capable one, or a bare fallback when none exist), and
+// the request's model, falling back to the definition's default model and then
+// the parent's model.
+func (r *subagentRunner) resolve(req task.Request) (agentdef.Definition, string) {
+	def, ok := r.defs.ByName(req.Agent)
+	if !ok {
+		if subs := r.defs.Subagents(); len(subs) > 0 {
+			def = subs[0]
+		} else {
+			def = agentdef.Definition{Name: "subagent", Mode: agentdef.ModeAll}
+		}
+	}
+
+	model := req.Model
+	if model == "" {
+		model = def.Model
+	}
+	if model == "" {
+		model = r.parentModel
+	}
+
+	return def, model
 }
 
 // subagentActivitySink forwards each of a subagent's own LoopEvents to parentEmit,
@@ -513,18 +579,62 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*p
 }
 
 // buildParentGate builds the main agent's gate: the base toolset plus the task
-// tool, which delegates to runner. task is pre-seeded to Allow so a delegation
+// tool, which delegates to runner and offers the subagent-capable definitions of
+// defs as its selectable agents. task is pre-seeded to Allow so a delegation
 // itself never prompts; the subagent's own side-effecting tool calls are still
 // gated by its own gate. Subagents are built with buildGate (no task), so a
 // delegation does not recurse.
-func buildParentGate(opts Options, runner task.Runner) (*permission.Gate, error) {
+func buildParentGate(opts Options, runner task.Runner, defs *agentdef.Set) (*permission.Gate, error) {
 	reg, rules, err := baseToolset(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	reg.Register(task.New(runner))
+	reg.Register(task.New(runner, subagentOptions(defs)))
 	rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "task"})
 
 	return assembleGate(reg, rules, opts)
+}
+
+// subagentOptions projects the subagent-capable definitions of defs into the
+// task.Agent options the task tool advertises and validates against.
+func subagentOptions(defs *agentdef.Set) []task.Agent {
+	subs := defs.Subagents()
+	out := make([]task.Agent, 0, len(subs))
+	for _, d := range subs {
+		out = append(out, task.Agent{Name: d.Name, Description: d.Description, Models: d.Models})
+	}
+	return out
+}
+
+// loadAgentDefs discovers the agent definitions available for opts: the built-in
+// generic agents overlaid by the files in the global agents directory and then
+// the project's .agens/agents directory. It never fails on a missing directory;
+// only a real read or parse error is returned.
+func loadAgentDefs(opts Options) (*agentdef.Set, error) {
+	projectRoot := opts.ProjectRoot
+	if projectRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("agent: %w", err)
+		}
+		projectRoot = config.ProjectRoot(wd)
+	}
+
+	globalDir := filepath.Join(config.HomeDir(), "agents")
+	projectDir := filepath.Join(projectRoot, ".agens", "agents")
+
+	set, err := agentdef.Load(globalDir, projectDir)
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+	return set, nil
+}
+
+// withSystemPrompt returns a copy of opts with SystemPrompt set to prompt, used
+// to build a subagent's prompt from its definition body while reusing the rest
+// of the parent's options.
+func withSystemPrompt(opts Options, prompt string) Options {
+	opts.SystemPrompt = prompt
+	return opts
 }

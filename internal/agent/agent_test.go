@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iperez/agens/internal/agentdef"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
@@ -19,7 +20,26 @@ import (
 	"github.com/iperez/agens/internal/provider"
 	"github.com/iperez/agens/internal/provider/chatgpt"
 	"github.com/iperez/agens/internal/provider/openai"
+	"github.com/iperez/agens/internal/tool/task"
 )
+
+// loadTestDefs returns the built-in agent definitions (build, plan) for wiring
+// the parent gate and subagent runner in tests without touching disk.
+func loadTestDefs(t *testing.T) *agentdef.Set {
+	t.Helper()
+	set, err := agentdef.Load("", "")
+	if err != nil {
+		t.Fatalf("agentdef.Load() error = %v", err)
+	}
+	return set
+}
+
+// fakeBuilder is a subLoopBuilder that ignores the resolved definition and model
+// and always returns fl, so the subagent runner's glue can be tested with a
+// scripted loop.
+func fakeBuilder(fl loopRunner) subLoopBuilder {
+	return func(agentdef.Definition, string) (loopRunner, error) { return fl, nil }
+}
 
 func validConfig() config.Config {
 	cfg := config.DefaultConfig()
@@ -835,8 +855,8 @@ type fakeSubRunner struct {
 	gotDesc string
 }
 
-func (f *fakeSubRunner) Run(_ context.Context, description string) (string, error) {
-	f.gotDesc = description
+func (f *fakeSubRunner) Run(_ context.Context, req task.Request) (string, error) {
+	f.gotDesc = req.Description
 	return f.out, nil
 }
 
@@ -871,7 +891,7 @@ func TestBuildGate_ExcludesTaskSoSubagentsDoNotRecurse(t *testing.T) {
 
 func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
 	runner := &fakeSubRunner{out: "subagent report"}
-	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner)
+	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner, loadTestDefs(t))
 	if err != nil {
 		t.Fatalf("buildParentGate() error = %v, want nil", err)
 	}
@@ -924,7 +944,7 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "here are the findings"}),
 	}}
 
-	out, err := newSubagentRunner(fl, "subagent", "gpt-x").Run(context.Background(), "investigate the bug")
+	out, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(context.Background(), task.Request{Description: "investigate the bug", Agent: "build"})
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -946,7 +966,7 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 func TestSubagentRunner_PropagatesLoopError(t *testing.T) {
 	fl := &fakeLoop{err: errors.New("stream failed")}
 
-	if _, err := newSubagentRunner(fl, "subagent", "gpt-x").Run(context.Background(), "do it"); err == nil {
+	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(context.Background(), task.Request{Description: "do it", Agent: "build"}); err == nil {
 		t.Fatal("Run() error = nil, want the loop error propagated")
 	}
 }
@@ -970,7 +990,8 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 	var got []agentloop.LoopEvent
 	ctx := agentloop.WithEventSink(context.Background(), func(ev agentloop.LoopEvent) { got = append(got, ev) })
 
-	if _, err := newSubagentRunner(fl, "explore", "gpt-5.5").Run(ctx, "look around"); err != nil {
+	req := task.Request{Description: "look around", Agent: "build", Model: "gpt-5.5"}
+	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(ctx, req); err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 
@@ -980,8 +1001,8 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 	if got[0].Kind != agentloop.LoopSubagentStarted {
 		t.Fatalf("first event kind = %v, want LoopSubagentStarted", got[0].Kind)
 	}
-	if got[0].Subagent.Name != "explore" || got[0].Subagent.Model != "gpt-5.5" {
-		t.Fatalf("started event = %+v, want the runner's name/model", got[0].Subagent)
+	if got[0].Subagent.Name != "build" || got[0].Subagent.Model != "gpt-5.5" {
+		t.Fatalf("started event = %+v, want the resolved agent name/model", got[0].Subagent)
 	}
 
 	last := got[len(got)-1]
@@ -1021,6 +1042,37 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 	}
 	if activity != 1 {
 		t.Fatalf("activity events = %d, want 1 (the forwarded message-done event)", activity)
+	}
+}
+
+func TestSubagentRunner_ResolvesModelPrecedence(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := "---\nmodel: def-model\nmodels:\n  - def-model\n  - req-model\n---\nwork\n"
+	if err := os.WriteFile(filepath.Join(dir, "worker.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write agent: %v", err)
+	}
+
+	defs, err := agentdef.Load("", dir)
+	if err != nil {
+		t.Fatalf("agentdef.Load() error = %v", err)
+	}
+
+	r := newSubagentRunner(nil, defs, "parent-model")
+
+	if _, model := r.resolve(task.Request{Agent: "worker", Model: "req-model"}); model != "req-model" {
+		t.Fatalf("resolve model = %q, want the request's model to win", model)
+	}
+	if _, model := r.resolve(task.Request{Agent: "worker"}); model != "def-model" {
+		t.Fatalf("resolve model = %q, want the definition's default model", model)
+	}
+	if _, model := r.resolve(task.Request{Agent: "build"}); model != "parent-model" {
+		t.Fatalf("resolve model = %q, want the parent model when neither request nor def sets one", model)
+	}
+	if def, _ := r.resolve(task.Request{Agent: "ghost"}); def.Name == "" {
+		t.Fatal("resolve of an unknown agent must fall back to a subagent-capable definition, not an empty one")
 	}
 }
 
