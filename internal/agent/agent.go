@@ -4,17 +4,20 @@
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	chatgptauth "github.com/iperez/agens/internal/auth/chatgpt"
 	"github.com/iperez/agens/internal/config"
+	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/permission"
 	"github.com/iperez/agens/internal/prompt"
 	"github.com/iperez/agens/internal/provider"
@@ -24,6 +27,7 @@ import (
 	"github.com/iperez/agens/internal/tool/bash"
 	"github.com/iperez/agens/internal/tool/fs"
 	"github.com/iperez/agens/internal/tool/search"
+	"github.com/iperez/agens/internal/tool/task"
 	"github.com/iperez/agens/internal/tool/webfetch"
 )
 
@@ -87,11 +91,6 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, err
 	}
 
-	gate, err := buildGate(opts)
-	if err != nil {
-		return nil, err
-	}
-
 	loopOpts := []agentloop.Option{
 		agentloop.WithModel(model),
 		agentloop.WithSystemPrompt(systemPrompt),
@@ -106,7 +105,67 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		loopOpts = append(loopOpts, agentloop.WithMaxIterations(maxIterations))
 	}
 
-	return agentloop.New(p, gate, loopOpts...), nil
+	// A subagent runs the base toolset — with no task tool, so a delegation
+	// never recurses — through its own loop with an isolated conversation. The
+	// task tool on the parent gate hands work to that subagent synchronously.
+	subGate, err := buildGate(opts)
+	if err != nil {
+		return nil, err
+	}
+	runner := newSubagentRunner(agentloop.New(p, subGate, loopOpts...))
+
+	parentGate, err := buildParentGate(opts, runner)
+	if err != nil {
+		return nil, err
+	}
+
+	return agentloop.New(p, parentGate, loopOpts...), nil
+}
+
+// subagentRunner runs a delegated task through a nested loop with an isolated
+// conversation, returning the subagent's final assistant text. It satisfies
+// task.Runner.
+type subagentRunner struct {
+	loop *agentloop.Loop
+}
+
+func newSubagentRunner(loop *agentloop.Loop) *subagentRunner {
+	return &subagentRunner{loop: loop}
+}
+
+// Run seeds a fresh conversation with the task description and drives the
+// subagent loop to completion, returning the text of its final assistant turn.
+// The parent turn's ctx is threaded through, so canceling the parent cancels the
+// subagent too.
+func (r *subagentRunner) Run(ctx context.Context, description string) (string, error) {
+	history := []message.Message{
+		message.NewMessage(message.RoleUser, message.TextPart{Text: description}),
+	}
+
+	final, err := r.loop.Run(ctx, history, nil)
+	if err != nil {
+		return "", err
+	}
+	return lastAssistantText(final), nil
+}
+
+// lastAssistantText returns the concatenated text of the most recent assistant
+// message in history, or "" when there is none.
+func lastAssistantText(history []message.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role != message.RoleAssistant {
+			continue
+		}
+
+		var b strings.Builder
+		for _, part := range history[i].Parts {
+			if text, ok := part.(message.TextPart); ok {
+				b.WriteString(text.Text)
+			}
+		}
+		return b.String()
+	}
+	return ""
 }
 
 // BuildSystemPrompt assembles the full system prompt for the resolved
@@ -316,18 +375,30 @@ func persistChatGPTEntry(entry auth.Entry) error {
 // DecisionAsk by default, resolved by opts.Prompter (or
 // permission.DenyPrompter{} when opts.Prompter is nil).
 func buildGate(opts Options) (*permission.Gate, error) {
+	reg, rules, err := baseToolset(opts)
+	if err != nil {
+		return nil, err
+	}
+	return assembleGate(reg, rules, opts)
+}
+
+// baseToolset builds the registry of tools shared by the main agent and its
+// subagents — read/write/edit, bash, grep/glob, and webfetch — confined to
+// opts.ProjectRoot (or the working directory when empty), together with the
+// permission rules that pre-seed the read-only tools to Allow.
+func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 	rootDir := opts.ProjectRoot
 	if rootDir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("agent: %w", err)
+			return nil, nil, fmt.Errorf("agent: %w", err)
 		}
 		rootDir = wd
 	}
 
 	dir, err := fs.Open(rootDir)
 	if err != nil {
-		return nil, fmt.Errorf("agent: %w", err)
+		return nil, nil, fmt.Errorf("agent: %w", err)
 	}
 
 	reg := tool.NewRegistry()
@@ -344,6 +415,12 @@ func buildGate(opts Options) (*permission.Gate, error) {
 		{Decision: permission.DecisionAllow, Name: "grep"},
 		{Decision: permission.DecisionAllow, Name: "glob"},
 	}
+	return reg, rules, nil
+}
+
+// assembleGate wraps reg and rules in a permission Gate that resolves Ask
+// decisions through opts.Prompter (or DenyPrompter when nil).
+func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*permission.Gate, error) {
 	engine, err := permission.NewEngine(rules, permission.NewMemoryStore())
 	if err != nil {
 		return nil, fmt.Errorf("agent: %w", err)
@@ -355,4 +432,21 @@ func buildGate(opts Options) (*permission.Gate, error) {
 	}
 
 	return permission.NewGate(reg, engine, prompter), nil
+}
+
+// buildParentGate builds the main agent's gate: the base toolset plus the task
+// tool, which delegates to runner. task is pre-seeded to Allow so a delegation
+// itself never prompts; the subagent's own side-effecting tool calls are still
+// gated by its own gate. Subagents are built with buildGate (no task), so a
+// delegation does not recurse.
+func buildParentGate(opts Options, runner task.Runner) (*permission.Gate, error) {
+	reg, rules, err := baseToolset(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	reg.Register(task.New(runner))
+	rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "task"})
+
+	return assembleGate(reg, rules, opts)
 }

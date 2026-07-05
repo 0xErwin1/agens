@@ -14,6 +14,7 @@ import (
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/permission"
+	"github.com/iperez/agens/internal/provider"
 	"github.com/iperez/agens/internal/provider/chatgpt"
 	"github.com/iperez/agens/internal/provider/openai"
 )
@@ -821,5 +822,90 @@ func TestBuildGate_EmptyProjectRootFallsBackToWorkingDir(t *testing.T) {
 	}
 	if gate == nil {
 		t.Fatal("buildGate() gate = nil, want non-nil")
+	}
+}
+
+// fakeSubRunner is a scripted task.Runner recording the description it was asked
+// to run and returning a canned result, so the parent gate's task wiring can be
+// exercised without a provider or a nested loop.
+type fakeSubRunner struct {
+	out     string
+	gotDesc string
+}
+
+func (f *fakeSubRunner) Run(_ context.Context, description string) (string, error) {
+	f.gotDesc = description
+	return f.out, nil
+}
+
+func resultText(r message.ToolResultPart) string {
+	var b strings.Builder
+	for _, part := range r.Content {
+		if text, ok := part.(message.TextPart); ok {
+			b.WriteString(text.Text)
+		}
+	}
+	return b.String()
+}
+
+func specNames(t *testing.T, gate interface{ Specs() []provider.ToolSpec }) map[string]bool {
+	t.Helper()
+	names := map[string]bool{}
+	for _, s := range gate.Specs() {
+		names[s.Name] = true
+	}
+	return names
+}
+
+func TestBuildGate_ExcludesTaskSoSubagentsDoNotRecurse(t *testing.T) {
+	gate, err := buildGate(validOptions(t))
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+	if specNames(t, gate)["task"] {
+		t.Fatal("buildGate() includes task, want it absent so a subagent cannot delegate recursively")
+	}
+}
+
+func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
+	runner := &fakeSubRunner{out: "subagent report"}
+	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner)
+	if err != nil {
+		t.Fatalf("buildParentGate() error = %v, want nil", err)
+	}
+
+	if !specNames(t, gate)["task"] {
+		t.Fatal("buildParentGate() specs missing task, want it registered")
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "task", Input: json.RawMessage(`{"description":"go do X"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(task) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(task) result = %+v, want a successful delegation (task pre-seeded Allow)", result)
+	}
+	if got := resultText(result); got != "subagent report" {
+		t.Fatalf("gate.Run(task) text = %q, want the subagent's report", got)
+	}
+	if runner.gotDesc != "go do X" {
+		t.Fatalf("runner got description %q, want %q", runner.gotDesc, "go do X")
+	}
+}
+
+func TestLastAssistantText(t *testing.T) {
+	history := []message.Message{
+		message.NewMessage(message.RoleUser, message.TextPart{Text: "do it"}),
+		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "thinking out loud"}),
+		message.NewMessage(message.RoleUser, message.TextPart{Text: "a tool result"}),
+		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "final answer"}),
+	}
+
+	if got := lastAssistantText(history); got != "final answer" {
+		t.Fatalf("lastAssistantText() = %q, want the most recent assistant text", got)
+	}
+	if got := lastAssistantText(nil); got != "" {
+		t.Fatalf("lastAssistantText(nil) = %q, want empty", got)
 	}
 }
