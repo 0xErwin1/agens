@@ -68,6 +68,10 @@ type Model struct {
 	// queued holds plain messages typed while a turn was running; each is sent
 	// automatically, in order, one per successful turn completion.
 	queued []string
+	// mouseEnabled tracks whether mouse reporting is on. It starts on (the wheel
+	// scrolls the conversation) and is toggled off via /select so the terminal's
+	// native click-drag text selection works, then back on.
+	mouseEnabled bool
 	// now supplies the current time (injectable for tests); turnStart marks when
 	// the in-flight turn began, driving the live elapsed counter and the final
 	// per-turn duration shown in the footer.
@@ -257,6 +261,7 @@ func New(deps Deps) *Model {
 		now:                 now,
 		collapseThinking:    deps.CollapseThinking,
 		truncateToolOutput:  deps.TruncateToolOutput,
+		mouseEnabled:        true,
 	}
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
 	return m
@@ -1043,6 +1048,19 @@ func (m *Model) closeSessionPicker() {
 
 // Notify implements CommandContext: it appends a system note to the view.
 func (m *Model) Notify(text string) { m.messages.AddInfo(text) }
+
+// ToggleMouse implements CommandContext: it flips mouse reporting. Turning it off
+// hands click-drag back to the terminal so the user can select and copy text
+// (losing wheel scroll until re-enabled); turning it on restores wheel scroll.
+func (m *Model) ToggleMouse() tea.Cmd {
+	m.mouseEnabled = !m.mouseEnabled
+	if m.mouseEnabled {
+		m.messages.AddInfo("mouse on: the wheel scrolls the conversation again")
+		return tea.EnableMouseCellMotion
+	}
+	m.messages.AddInfo("mouse off: drag to select and copy text; run /select again to restore scrolling")
+	return tea.DisableMouse
+}
 
 // OpenModelSelector implements CommandContext: it opens the model selector and
 // starts fetching the catalog, or reports that no lister is wired.
