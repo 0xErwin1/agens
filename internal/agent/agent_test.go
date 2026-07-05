@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/message"
@@ -892,6 +894,63 @@ func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
 	if runner.gotDesc != "go do X" {
 		t.Fatalf("runner got description %q, want %q", runner.gotDesc, "go do X")
 	}
+}
+
+// fakeLoop is a loopRunner double: it records the history it was driven with and
+// returns a canned grown history / error, so the subagent runner's glue can be
+// tested without a provider.
+type fakeLoop struct {
+	gotHistory []message.Message
+	ret        []message.Message
+	err        error
+}
+
+func (f *fakeLoop) Run(_ context.Context, history []message.Message, _ func(agentloop.LoopEvent)) ([]message.Message, error) {
+	f.gotHistory = history
+	return f.ret, f.err
+}
+
+func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
+	fl := &fakeLoop{ret: []message.Message{
+		message.NewMessage(message.RoleUser, message.TextPart{Text: "investigate the bug"}),
+		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "here are the findings"}),
+	}}
+
+	out, err := newSubagentRunner(fl).Run(context.Background(), "investigate the bug")
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if out != "here are the findings" {
+		t.Fatalf("Run() = %q, want the subagent's final assistant text", out)
+	}
+
+	if len(fl.gotHistory) != 1 {
+		t.Fatalf("subagent seeded with %d messages, want exactly 1 (the task description)", len(fl.gotHistory))
+	}
+	if fl.gotHistory[0].Role != message.RoleUser {
+		t.Fatalf("subagent's seed message role = %v, want user", fl.gotHistory[0].Role)
+	}
+	if got := resultTextOf(fl.gotHistory[0]); got != "investigate the bug" {
+		t.Fatalf("subagent seeded with %q, want the task description", got)
+	}
+}
+
+func TestSubagentRunner_PropagatesLoopError(t *testing.T) {
+	fl := &fakeLoop{err: errors.New("stream failed")}
+
+	if _, err := newSubagentRunner(fl).Run(context.Background(), "do it"); err == nil {
+		t.Fatal("Run() error = nil, want the loop error propagated")
+	}
+}
+
+func resultTextOf(m message.Message) string {
+	var b strings.Builder
+	for _, part := range m.Parts {
+		if text, ok := part.(message.TextPart); ok {
+			b.WriteString(text.Text)
+		}
+	}
+	return b.String()
 }
 
 func TestLastAssistantText(t *testing.T) {

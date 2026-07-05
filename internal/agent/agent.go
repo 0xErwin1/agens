@@ -122,14 +122,20 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	return agentloop.New(p, parentGate, loopOpts...), nil
 }
 
+// loopRunner is the subset of *agentloop.Loop the subagent runner drives,
+// narrowed to an interface so the runner can be tested without a provider.
+type loopRunner interface {
+	Run(ctx context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error)
+}
+
 // subagentRunner runs a delegated task through a nested loop with an isolated
 // conversation, returning the subagent's final assistant text. It satisfies
 // task.Runner.
 type subagentRunner struct {
-	loop *agentloop.Loop
+	loop loopRunner
 }
 
-func newSubagentRunner(loop *agentloop.Loop) *subagentRunner {
+func newSubagentRunner(loop loopRunner) *subagentRunner {
 	return &subagentRunner{loop: loop}
 }
 
