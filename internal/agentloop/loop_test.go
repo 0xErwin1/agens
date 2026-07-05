@@ -428,6 +428,30 @@ func TestRun_SinkReceivesExpectedEventKinds(t *testing.T) {
 	}
 }
 
+func TestRun_DefaultsParallelToolCallsOnRequests(t *testing.T) {
+	p := &fakeProvider{steps: textOnlySteps("hi")}
+	loop := New(p, nil, WithModel("gpt-test"))
+
+	if _, err := loop.Run(context.Background(), nil, nil); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if !p.lastRequest.ParallelToolCalls {
+		t.Fatalf("ChatRequest.ParallelToolCalls = false, want true by default")
+	}
+}
+
+func TestRun_WithParallelToolCallsFalseDisablesRequestFlag(t *testing.T) {
+	p := &fakeProvider{steps: textOnlySteps("hi")}
+	loop := New(p, nil, WithModel("gpt-test"), WithParallelToolCalls(false))
+
+	if _, err := loop.Run(context.Background(), nil, nil); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if p.lastRequest.ParallelToolCalls {
+		t.Fatalf("ChatRequest.ParallelToolCalls = true, want false")
+	}
+}
+
 func TestRun_ToolsSpecsCalledExactlyOncePerRun(t *testing.T) {
 	call := message.ToolUsePart{ID: "call_1", Name: "loop_tool"}
 	p := &fakeProvider{steps: toolCallSteps(call)}

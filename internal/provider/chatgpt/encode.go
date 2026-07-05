@@ -22,7 +22,7 @@ func encodeRequest(req provider.ChatRequest) (wireRequest, error) {
 		Model:             req.Model,
 		Input:             []wireInputItem{},
 		ToolChoice:        toolChoiceAuto,
-		ParallelToolCalls: false,
+		ParallelToolCalls: req.ParallelToolCalls,
 		Store:             false,
 		Stream:            true,
 		Include:           []string{},

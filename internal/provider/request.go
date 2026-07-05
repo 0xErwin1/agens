@@ -16,6 +16,10 @@ type ChatRequest struct {
 	MaxOutputTokens int
 	Temperature     *float64 // nil = provider default; distinguishes unset from 0
 
+	// ParallelToolCalls asks providers that support same-turn tool calls to
+	// let the model emit multiple independent tool calls in one assistant turn.
+	ParallelToolCalls bool
+
 	// Effort is the reasoning effort for reasoning-capable models (for
 	// example "low", "medium", "high"). Empty means the model's default; a
 	// provider that does not support it ignores the field.

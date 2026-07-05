@@ -105,7 +105,7 @@ func TestLoadExpandsDataDir(t *testing.T) {
 
 func TestLoadParsesProviderAndAgentSections(t *testing.T) {
 	home := t.TempDir()
-	toml := "[provider]\nmodel = \"gpt-4o\"\nbase_url = \"https://example.test\"\n\n[agent]\nsystem_prompt = \"X\"\nmax_iterations = 17\n"
+	toml := "[provider]\nmodel = \"gpt-4o\"\nbase_url = \"https://example.test\"\n\n[agent]\nsystem_prompt = \"X\"\nmax_iterations = 17\nparallel_tool_calls = false\n"
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(toml), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -125,6 +125,9 @@ func TestLoadParsesProviderAndAgentSections(t *testing.T) {
 	}
 	if loaded.Config.Agent.MaxIterations != 17 {
 		t.Fatalf("Agent.MaxIterations = %d, want 17", loaded.Config.Agent.MaxIterations)
+	}
+	if loaded.Config.Agent.ParallelToolCalls {
+		t.Fatalf("Agent.ParallelToolCalls = true, want false")
 	}
 }
 

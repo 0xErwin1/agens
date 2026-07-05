@@ -92,7 +92,11 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, err
 	}
 
-	loopOpts := []agentloop.Option{agentloop.WithModel(model), agentloop.WithSystemPrompt(systemPrompt)}
+	loopOpts := []agentloop.Option{
+		agentloop.WithModel(model),
+		agentloop.WithSystemPrompt(systemPrompt),
+		agentloop.WithParallelToolCalls(cfg.Agent.ParallelToolCalls),
+	}
 
 	maxIterations, err := resolveMaxIterations(cfg, opts)
 	if err != nil {

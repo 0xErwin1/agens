@@ -64,6 +64,14 @@ func TestDefaultConfigProviderAndAgent(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "agent parallel tool calls default is enabled",
+			check: func(t *testing.T, cfg Config) {
+				if !cfg.Agent.ParallelToolCalls {
+					t.Fatalf("Agent.ParallelToolCalls = false, want true")
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -82,5 +90,16 @@ func TestApplyPatch_AgentMaxIterations(t *testing.T) {
 
 	if cfg.Agent.MaxIterations != 17 {
 		t.Fatalf("Agent.MaxIterations = %d, want 17", cfg.Agent.MaxIterations)
+	}
+}
+
+func TestApplyPatch_AgentParallelToolCalls(t *testing.T) {
+	cfg := DefaultConfig()
+	value := false
+
+	applyPatch(&cfg, configPatch{Agent: &agentPatch{ParallelToolCalls: &value}})
+
+	if cfg.Agent.ParallelToolCalls {
+		t.Fatalf("Agent.ParallelToolCalls = true, want false")
 	}
 }

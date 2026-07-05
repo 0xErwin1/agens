@@ -26,12 +26,13 @@ const defaultMaxIterations = 60
 // tool calls, repeating until the model produces a turn with no tool calls
 // or the iteration limit is reached.
 type Loop struct {
-	provider  provider.Provider
-	tools     ToolRunner
-	systemMsg *message.Message
-	model     string
-	effort    string
-	maxIter   int
+	provider          provider.Provider
+	tools             ToolRunner
+	systemMsg         *message.Message
+	model             string
+	effort            string
+	maxIter           int
+	parallelToolCalls bool
 }
 
 // Option configures a Loop constructed by New.
@@ -81,6 +82,12 @@ func WithEffort(effort string) Option {
 	}
 }
 
+func WithParallelToolCalls(enabled bool) Option {
+	return func(l *Loop) {
+		l.parallelToolCalls = enabled
+	}
+}
+
 // WithMaxIterations overrides the default iteration limit. It panics if n is
 // less than 1, since a Loop that can never run a single iteration is a
 // programmer error, not a runtime condition.
@@ -102,9 +109,10 @@ func New(p provider.Provider, tools ToolRunner, opts ...Option) *Loop {
 	}
 
 	l := &Loop{
-		provider: p,
-		tools:    tools,
-		maxIter:  defaultMaxIterations,
+		provider:          p,
+		tools:             tools,
+		maxIter:           defaultMaxIterations,
+		parallelToolCalls: true,
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -176,7 +184,7 @@ func (l *Loop) runIteration(ctx context.Context, history []message.Message, spec
 		msgs = append(msgs, history...)
 	}
 
-	req := provider.ChatRequest{Model: l.model, Messages: msgs, Tools: specs, Effort: l.effort}
+	req := provider.ChatRequest{Model: l.model, Messages: msgs, Tools: specs, Effort: l.effort, ParallelToolCalls: l.parallelToolCalls}
 
 	reader, err := l.provider.Stream(ctx, req)
 	if err != nil {

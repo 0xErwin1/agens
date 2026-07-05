@@ -52,64 +52,113 @@ func (g *Gate) Specs() []provider.ToolSpec {
 // returns a denied ToolResultPart with a nil Go error, mirroring
 // Registry.Run's unknown-tool path: a denial is a tool-level failure the
 // model can see, not a Go error that aborts the turn. Ask is resolved by
-// runAsk.
+// the configured Prompter.
 func (g *Gate) Run(ctx context.Context, call message.ToolUsePart) (message.ToolResultPart, error) {
-	if err := ctx.Err(); err != nil {
+	allowed, err := g.authorize(ctx, call)
+	if err != nil {
 		return message.ToolResultPart{}, err
+	}
+	if !allowed {
+		return deniedResult(call), nil
+	}
+	return g.inner.Run(ctx, call)
+}
+
+func (g *Gate) RunBatch(ctx context.Context, calls []message.ToolUsePart, onResult func(message.ToolResultPart)) ([]message.ToolResultPart, error) {
+	preflight := make([]bool, len(calls))
+	for i, call := range calls {
+		allowed, err := g.authorize(ctx, call)
+		if err != nil {
+			return nil, err
+		}
+		preflight[i] = allowed
+	}
+
+	results := make([]message.ToolResultPart, 0, len(calls))
+	for i, call := range calls {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		var result message.ToolResultPart
+		if !preflight[i] {
+			result = deniedResult(call)
+		} else {
+			var err error
+			result, err = g.inner.Run(ctx, call)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				result = toolErrorResult(call, err)
+			}
+			result.ToolUseID = call.ID
+		}
+
+		results = append(results, result)
+		if onResult != nil {
+			onResult(result)
+		}
+	}
+	return results, nil
+}
+
+func (g *Gate) authorize(ctx context.Context, call message.ToolUsePart) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 
 	decision, err := g.engine.Evaluate(ctx, call)
 	if err != nil {
-		return message.ToolResultPart{}, err
+		return false, err
 	}
 
 	switch decision {
 	case DecisionAllow:
-		return g.inner.Run(ctx, call)
+		return true, nil
 	case DecisionDeny:
-		return deniedResult(call), nil
+		return false, nil
 	default:
-		return g.runAsk(ctx, call)
+		return g.resolveAsk(ctx, call)
 	}
 }
 
-// runAsk consults the Prompter for a Decision that resolved to Ask.
-// allow-once/allow-always execute the call; deny-once and any unrecognized
-// Answer deny it. The "always" answers additionally remember a name-only
-// Rule before acting, so a later matching call resolves without prompting
-// again. A Prompter error or an AnswerCancel answer returns a real error
-// and never remembers a rule; if ctx was also canceled, ctx's error takes
-// priority over the Prompter's own error.
-func (g *Gate) runAsk(ctx context.Context, call message.ToolUsePart) (message.ToolResultPart, error) {
+// resolveAsk consults the Prompter for a Decision that resolved to Ask.
+// The "always" answers additionally remember a name-only Rule before acting,
+// so a later matching call resolves without prompting again. A Prompter error
+// or an AnswerCancel answer returns a real error and never remembers a rule;
+// if ctx was also canceled, ctx's error takes priority over the Prompter's own
+// error.
+func (g *Gate) resolveAsk(ctx context.Context, call message.ToolUsePart) (bool, error) {
 	answer, err := g.prompter.Prompt(ctx, call)
 	if err != nil {
 		if ctx.Err() != nil {
-			return message.ToolResultPart{}, ctx.Err()
+			return false, ctx.Err()
 		}
-		return message.ToolResultPart{}, err
+		return false, err
 	}
 
 	switch answer {
 	case AnswerAllowOnce:
-		return g.inner.Run(ctx, call)
+		return true, nil
 
 	case AnswerAllowAlways:
 		if err := g.engine.Remember(ctx, Rule{Decision: DecisionAllow, Name: call.Name}); err != nil {
-			return message.ToolResultPart{}, err
+			return false, err
 		}
-		return g.inner.Run(ctx, call)
+		return true, nil
 
 	case AnswerDenyAlways:
 		if err := g.engine.Remember(ctx, Rule{Decision: DecisionDeny, Name: call.Name}); err != nil {
-			return message.ToolResultPart{}, err
+			return false, err
 		}
-		return deniedResult(call), nil
+		return false, nil
 
 	case AnswerCancel:
-		return message.ToolResultPart{}, ErrCanceled
+		return false, ErrCanceled
 
 	default:
-		return deniedResult(call), nil
+		return false, nil
 	}
 }
 
@@ -123,6 +172,14 @@ func deniedResult(call message.ToolUsePart) message.ToolResultPart {
 			Text: fmt.Sprintf("permission denied: tool %q was not executed", call.Name),
 		}},
 		IsError: true,
+	}
+}
+
+func toolErrorResult(call message.ToolUsePart, err error) message.ToolResultPart {
+	return message.ToolResultPart{
+		ToolUseID: call.ID,
+		Content:   message.Parts{message.TextPart{Text: err.Error()}},
+		IsError:   true,
 	}
 }
 

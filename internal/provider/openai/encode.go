@@ -17,6 +17,7 @@ func encodeRequest(req provider.ChatRequest) (wireRequest, error) {
 		Model:               req.Model,
 		Stream:              true,
 		StreamOptions:       &wireStreamOptions{IncludeUsage: true},
+		ParallelToolCalls:   req.ParallelToolCalls,
 		MaxCompletionTokens: req.MaxOutputTokens,
 		Temperature:         req.Temperature,
 	}

@@ -11,6 +11,7 @@ type wireRequest struct {
 	Tools               []wireTool         `json:"tools,omitempty"`
 	Stream              bool               `json:"stream"`
 	StreamOptions       *wireStreamOptions `json:"stream_options,omitempty"`
+	ParallelToolCalls   bool               `json:"parallel_tool_calls"`
 	MaxCompletionTokens int                `json:"max_completion_tokens,omitempty"`
 	Temperature         *float64           `json:"temperature,omitempty"`
 }

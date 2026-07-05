@@ -39,8 +39,9 @@ type Provider struct {
 // prompt is chosen automatically by the internal/prompt package from the
 // resolved model.
 type Agent struct {
-	SystemPrompt  string `toml:"system_prompt"`
-	MaxIterations int    `toml:"max_iterations"`
+	SystemPrompt      string `toml:"system_prompt"`
+	MaxIterations     int    `toml:"max_iterations"`
+	ParallelToolCalls bool   `toml:"parallel_tool_calls"`
 }
 
 type Source struct {
@@ -80,8 +81,9 @@ type providerPatch struct {
 }
 
 type agentPatch struct {
-	SystemPrompt  *string `toml:"system_prompt"`
-	MaxIterations *int    `toml:"max_iterations"`
+	SystemPrompt      *string `toml:"system_prompt"`
+	MaxIterations     *int    `toml:"max_iterations"`
+	ParallelToolCalls *bool   `toml:"parallel_tool_calls"`
 }
 
 func DefaultConfig() Config {
@@ -91,7 +93,9 @@ func DefaultConfig() Config {
 			DataDir: filepath.Join(defaultDataHome(), AppName),
 		},
 		Provider: Provider{},
-		Agent:    Agent{},
+		Agent: Agent{
+			ParallelToolCalls: true,
+		},
 	}
 }
 

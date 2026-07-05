@@ -138,6 +138,9 @@ system_prompt = ""
 # Maximum model/tool loop iterations for one prompt. Must be >= 1.
 # CLI --max-iterations overrides this value; unset uses the internal default.
 max_iterations = 60
+# Allow providers to emit independent tool calls in the same assistant turn.
+# Set false as a rollback knob if grouped tool calls cause provider issues.
+parallel_tool_calls = true
 ```
 
 Validate the loaded config with:

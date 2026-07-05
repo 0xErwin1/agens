@@ -45,6 +45,9 @@ func applyAgentPatch(cfg *Config, patch *agentPatch) {
 	if patch.MaxIterations != nil {
 		cfg.Agent.MaxIterations = *patch.MaxIterations
 	}
+	if patch.ParallelToolCalls != nil {
+		cfg.Agent.ParallelToolCalls = *patch.ParallelToolCalls
+	}
 }
 
 func expandPatch(patch *configPatch, env map[string]string) error {

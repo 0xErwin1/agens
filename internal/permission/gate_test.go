@@ -51,6 +51,157 @@ func (f *fakePrompter) Prompt(ctx context.Context, call message.ToolUsePart) (An
 
 var _ Prompter = (*fakePrompter)(nil)
 
+type recordingRunner struct {
+	order   *[]string
+	calls   []message.ToolUsePart
+	results map[string]message.ToolResultPart
+}
+
+func (r *recordingRunner) Specs() []provider.ToolSpec { return nil }
+
+func (r *recordingRunner) Run(_ context.Context, call message.ToolUsePart) (message.ToolResultPart, error) {
+	if r.order != nil {
+		*r.order = append(*r.order, "run:"+call.ID)
+	}
+	r.calls = append(r.calls, call)
+	if result, ok := r.results[call.ID]; ok {
+		return result, nil
+	}
+	return message.ToolResultPart{Content: message.Parts{message.TextPart{Text: "ok " + call.ID}}}, nil
+}
+
+type sequencePrompter struct {
+	order   *[]string
+	answers []Answer
+	calls   []message.ToolUsePart
+}
+
+func (p *sequencePrompter) Prompt(_ context.Context, call message.ToolUsePart) (Answer, error) {
+	if p.order != nil {
+		*p.order = append(*p.order, "prompt:"+call.ID)
+	}
+	p.calls = append(p.calls, call)
+	if len(p.answers) == 0 {
+		return AnswerDenyOnce, nil
+	}
+	answer := p.answers[0]
+	p.answers = p.answers[1:]
+	return answer, nil
+}
+
+func TestGateRunBatch_PreflightsEveryCallBeforeExecution(t *testing.T) {
+	var order []string
+	inner := &recordingRunner{order: &order, results: map[string]message.ToolResultPart{}}
+	prompter := &sequencePrompter{order: &order, answers: []Answer{AnswerAllowOnce, AnswerAllowOnce}}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	calls := []message.ToolUsePart{{ID: "a", Name: "write"}, {ID: "b", Name: "bash"}}
+	var emitted []string
+	results, err := gate.RunBatch(context.Background(), calls, func(result message.ToolResultPart) {
+		emitted = append(emitted, result.ToolUseID)
+	})
+	if err != nil {
+		t.Fatalf("RunBatch() error = %v, want nil", err)
+	}
+
+	wantOrder := []string{"prompt:a", "prompt:b", "run:a", "run:b"}
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("order = %v, want %v", order, wantOrder)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %+v, want 2", results)
+	}
+	if gotIDs := []string{results[0].ToolUseID, results[1].ToolUseID}; !reflect.DeepEqual(gotIDs, []string{"a", "b"}) {
+		t.Fatalf("result ToolUseIDs = %v, want [a b]", gotIDs)
+	}
+	if !reflect.DeepEqual(emitted, []string{"a", "b"}) {
+		t.Fatalf("onResult ToolUseIDs = %v, want [a b]", emitted)
+	}
+}
+
+func TestGateRunBatch_DeniedCallContinuesLaterAllowedCalls(t *testing.T) {
+	inner := &recordingRunner{results: map[string]message.ToolResultPart{}}
+	prompter := &sequencePrompter{answers: []Answer{AnswerAllowOnce, AnswerDenyOnce, AnswerAllowOnce}}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	calls := []message.ToolUsePart{{ID: "a", Name: "write"}, {ID: "b", Name: "edit"}, {ID: "c", Name: "bash"}}
+	results, err := gate.RunBatch(context.Background(), calls, nil)
+	if err != nil {
+		t.Fatalf("RunBatch() error = %v, want nil", err)
+	}
+
+	if len(results) != 3 || results[0].IsError || !results[1].IsError || results[2].IsError {
+		t.Fatalf("results = %+v, want allowed, denied, allowed", results)
+	}
+	if gotIDs := []string{results[0].ToolUseID, results[1].ToolUseID, results[2].ToolUseID}; !reflect.DeepEqual(gotIDs, []string{"a", "b", "c"}) {
+		t.Fatalf("result ToolUseIDs = %v, want [a b c]", gotIDs)
+	}
+	gotRuns := []string{}
+	for _, call := range inner.calls {
+		gotRuns = append(gotRuns, call.ID)
+	}
+	if !reflect.DeepEqual(gotRuns, []string{"a", "c"}) {
+		t.Fatalf("inner runs = %v, want [a c]", gotRuns)
+	}
+}
+
+func TestGateRunBatch_RememberedAllowAndDenyAffectLaterSameBatchCalls(t *testing.T) {
+	inner := &recordingRunner{results: map[string]message.ToolResultPart{}}
+	prompter := &sequencePrompter{answers: []Answer{AnswerAllowAlways, AnswerDenyAlways}}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	calls := []message.ToolUsePart{
+		{ID: "allow_1", Name: "write"},
+		{ID: "allow_2", Name: "write"},
+		{ID: "deny_1", Name: "bash"},
+		{ID: "deny_2", Name: "bash"},
+	}
+	results, err := gate.RunBatch(context.Background(), calls, nil)
+	if err != nil {
+		t.Fatalf("RunBatch() error = %v, want nil", err)
+	}
+
+	if len(prompter.calls) != 2 {
+		t.Fatalf("prompts = %+v, want only first write and first bash prompted", prompter.calls)
+	}
+	if len(inner.calls) != 2 || inner.calls[0].ID != "allow_1" || inner.calls[1].ID != "allow_2" {
+		t.Fatalf("inner calls = %+v, want both write calls only", inner.calls)
+	}
+	if !results[2].IsError || !results[3].IsError {
+		t.Fatalf("deny results = %+v, want both bash calls denied", results[2:])
+	}
+}
+
+func TestGateRunBatch_CancelAbortsBeforeExecution(t *testing.T) {
+	inner := &recordingRunner{results: map[string]message.ToolResultPart{}}
+	prompter := &sequencePrompter{answers: []Answer{AnswerAllowOnce, AnswerCancel}}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	_, err = gate.RunBatch(context.Background(), []message.ToolUsePart{{ID: "a", Name: "write"}, {ID: "b", Name: "bash"}}, nil)
+	if !errors.Is(err, ErrCanceled) {
+		t.Fatalf("RunBatch() error = %v, want ErrCanceled", err)
+	}
+	if len(inner.calls) != 0 {
+		t.Fatalf("inner calls = %+v, want none before preflight completes", inner.calls)
+	}
+}
+
 func TestGate_CtxAlreadyCancelled(t *testing.T) {
 	inner := &fakeRunner{}
 	prompter := &fakePrompter{}

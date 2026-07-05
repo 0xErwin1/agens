@@ -273,6 +273,28 @@ func TestEncodeRequest_ToolsFlatShape(t *testing.T) {
 	}
 }
 
+func TestEncodeRequest_ParallelToolCallsReflectsRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		flag bool
+	}{
+		{name: "enabled", flag: true},
+		{name: "disabled", flag: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire, err := encodeRequest(provider.ChatRequest{Model: "gpt-5", ParallelToolCalls: tc.flag})
+			if err != nil {
+				t.Fatalf("encodeRequest() error = %v", err)
+			}
+
+			got := marshalToMap(t, wire)
+			if got["parallel_tool_calls"] != tc.flag {
+				t.Fatalf("parallel_tool_calls = %v, want %v", got["parallel_tool_calls"], tc.flag)
+			}
+		})
+	}
+}
+
 func TestEncodeRequest_TemperatureAndMaxOutputTokensNeverLeakOntoWire(t *testing.T) {
 	temp := 0.7
 	req := provider.ChatRequest{

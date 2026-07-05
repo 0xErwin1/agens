@@ -67,6 +67,19 @@ func loopMaxIterations(t *testing.T, loop any) int {
 	return int(field.Int())
 }
 
+func loopParallelToolCalls(t *testing.T, loop any) bool {
+	t.Helper()
+	value := reflect.ValueOf(loop)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		t.Fatalf("loop = %T, want non-nil pointer", loop)
+	}
+	field := value.Elem().FieldByName("parallelToolCalls")
+	if !field.IsValid() {
+		t.Fatal("loop.parallelToolCalls field not found")
+	}
+	return field.Bool()
+}
+
 func TestBuildLoop_Success(t *testing.T) {
 	loop, err := BuildLoop(validConfig(), validCreds(), validOptions(t))
 	if err != nil {
@@ -143,6 +156,19 @@ func TestBuildLoop_SystemPromptPrecedence(t *testing.T) {
 				t.Fatal("BuildLoop() loop = nil, want non-nil")
 			}
 		})
+	}
+}
+
+func TestBuildLoop_ParallelToolCallsComesFromConfig(t *testing.T) {
+	cfg := validConfig()
+	cfg.Agent.ParallelToolCalls = false
+
+	loop, err := BuildLoop(cfg, validCreds(), validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildLoop() error = %v, want nil", err)
+	}
+	if loopParallelToolCalls(t, loop) {
+		t.Fatalf("loop parallelToolCalls = true, want false from config rollback knob")
 	}
 }
 

@@ -80,6 +80,19 @@ func TestBuildJoinsPartsWithBlankLines(t *testing.T) {
 	}
 }
 
+func TestSelectedPromptsMentionSameTurnIndependentToolsAndPerToolApproval(t *testing.T) {
+	for _, model := range []string{"gpt-5", "gpt-5-codex"} {
+		t.Run(model, func(t *testing.T) {
+			got := Select(model)
+			for _, want := range []string{"same assistant turn", "Each sensitive tool call is resolved through its own permission decision", "always"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("Select(%q) missing %q in prompt:\n%s", model, want, got)
+				}
+			}
+		})
+	}
+}
+
 func TestJoinNonEmptyDropsEmptyPartsAndReturnsEmptyWhenAllPartsAreEmpty(t *testing.T) {
 	if got := joinNonEmpty([]string{"", "", ""}); got != "" {
 		t.Fatalf("joinNonEmpty(all empty) = %q, want empty string", got)
