@@ -65,6 +65,9 @@ type Model struct {
 	// workLabel describes what the running turn is doing (thinking/writing/
 	// running a tool), shown by the inline activity indicator above the input.
 	workLabel string
+	// queued holds plain messages typed while a turn was running; each is sent
+	// automatically, in order, one per successful turn completion.
+	queued []string
 	// now supplies the current time (injectable for tests); turnStart marks when
 	// the in-flight turn began, driving the live elapsed counter and the final
 	// per-turn duration shown in the footer.
@@ -425,7 +428,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.handleStream(msg))
 
 	case TurnDoneMsg:
-		m.handleDone(msg)
+		cmds = append(cmds, m.handleDone(msg))
 
 	case subagentDemoMsg:
 		cmds = append(cmds, m.advanceSubagentDemo(msg))
@@ -640,6 +643,9 @@ func (m *Model) workingLine() string {
 	if !m.turnStart.IsZero() {
 		text += " " + formatDuration(m.now().Sub(m.turnStart))
 	}
+	if n := len(m.queued); n > 0 {
+		text += fmt.Sprintf(" · %d en cola", n)
+	}
 
 	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(m.spinner.View() + " " + muted.Render(text))
 }
@@ -735,7 +741,13 @@ func (m *Model) submit() tea.Cmd {
 	text := m.input.Value()
 	m.input.Reset()
 	m.filePickerOpen = false
+	return m.submitText(text)
+}
 
+// submitText records text as a new user turn, shows it, marks the model busy,
+// and starts the turn goroutine. It backs both a live submission (submit) and
+// the automatic sending of a queued message when the previous turn finishes.
+func (m *Model) submitText(text string) tea.Cmd {
 	// The model receives the message with @-referenced files inlined; the
 	// conversation shows the original text the user typed.
 	expanded, failed := m.expandFileRefs(text)
@@ -757,16 +769,47 @@ func (m *Model) submit() tea.Cmd {
 	return tea.Batch(waitFor(m.events), m.spinner.Tick)
 }
 
+// enqueueMessage stores the current input as a pending message to be sent when
+// the running turn finishes, then clears the input. It backs typing ahead while
+// the agent is busy.
+func (m *Model) enqueueMessage() {
+	text := m.input.Value()
+	m.queued = append(m.queued, text)
+	m.input.Reset()
+	m.filePickerOpen = false
+	m.closePalette()
+	m.messages.AddInfo(fmt.Sprintf("queued (%d): %s", len(m.queued), truncateTitle(strings.TrimSpace(text))))
+	m.layout()
+}
+
+// drainQueued sends the next pending message, if any, as a fresh turn. It is
+// called after a turn completes successfully so queued follow-ups flow one per
+// completed turn.
+func (m *Model) drainQueued() tea.Cmd {
+	if len(m.queued) == 0 {
+		return nil
+	}
+	next := m.queued[0]
+	m.queued = m.queued[1:]
+	return m.submitText(next)
+}
+
 // onEnter handles the Enter key when the palette has not already consumed it:
 // a slash command is run (unknown ones report an error note), an empty or
 // in-flight input is ignored, and anything else is submitted as a chat turn.
 func (m *Model) onEnter() tea.Cmd {
 	value := strings.TrimSpace(m.input.Value())
-	if value == "" || m.running {
+	if value == "" {
 		return nil
 	}
 
 	if strings.HasPrefix(value, "/") {
+		// Running commands mid-turn is a separate concern; while a turn runs a
+		// slash command is ignored rather than executed.
+		if m.running {
+			return nil
+		}
+
 		if c, ok := m.commands.Lookup(value); ok {
 			return m.runCommand(c)
 		}
@@ -775,6 +818,13 @@ func (m *Model) onEnter() tea.Cmd {
 		m.closePalette()
 		m.messages.AddInfo("unknown command: " + value)
 		m.layout()
+		return nil
+	}
+
+	// A plain message typed while a turn is running is queued and sent when the
+	// turn finishes, so the user can line up follow-ups without waiting.
+	if m.running {
+		m.enqueueMessage()
 		return nil
 	}
 
@@ -1312,7 +1362,7 @@ func (m *Model) addToolCalls(msg *message.Message) {
 // pointing the user at the command that restores their credentials.
 const authErrorHint = "Your credentials are missing or expired. Run `agens auth login` to sign in again."
 
-func (m *Model) handleDone(msg TurnDoneMsg) {
+func (m *Model) handleDone(msg TurnDoneMsg) tea.Cmd {
 	m.running = false
 	if m.cancel != nil {
 		m.cancel()
@@ -1329,17 +1379,32 @@ func (m *Model) handleDone(msg TurnDoneMsg) {
 		m.history = msg.History
 	}
 
-	if msg.Err != nil && !errors.Is(msg.Err, context.Canceled) {
+	// A canceled turn is a deliberate stop: end cleanly and drop any queued
+	// follow-ups the user typed ahead, since they meant to halt.
+	if msg.Err != nil && errors.Is(msg.Err, context.Canceled) {
+		m.queued = nil
+		m.status.SetState(stateReady)
+		m.saveSession()
+		return nil
+	}
+
+	if msg.Err != nil {
 		m.messages.SetError(humanizeError(msg.Err.Error()))
 		if provider.IsAuthError(msg.Err) {
 			m.messages.AddInfo(authErrorHint)
 		}
 		m.status.SetState(stateError)
-		return
+		// Queued messages are kept but not auto-sent into a failing turn; the
+		// next successful completion drains them.
+		if n := len(m.queued); n > 0 {
+			m.messages.AddInfo(fmt.Sprintf("%d queued message(s) still pending", n))
+		}
+		return nil
 	}
 
 	m.status.SetState(stateReady)
 	m.saveSession()
+	return m.drainQueued()
 }
 
 // isScrollKey reports whether msg is a key that scrolls the conversation view
