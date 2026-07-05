@@ -70,6 +70,13 @@ func renderSubagentFocus(s *subagentState, siblings []*subagentState, index, wid
 		}
 	}
 
+	if s.status != subagentRunning && s.result != "" {
+		top = append(top, "", focusLine(muted.Bold(true).Render("Result"), width))
+		for _, ln := range strings.Split(s.result, "\n") {
+			top = append(top, focusLine(muted.Render(ln), width))
+		}
+	}
+
 	footer := focusLine(muted.Render(subagentFocusCrumbs(s, siblings, index)), width)
 
 	return assembleFocus(top, footer, height)

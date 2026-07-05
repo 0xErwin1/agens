@@ -147,7 +147,7 @@ func renderSubagentTree(rows []subagentRow, selected, width int) string {
 
 	var body []string
 	if len(rows) == 0 {
-		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("no subagents yet — try /subagents-demo"))}
+		body = []string{oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("no active subagents"))}
 	} else {
 		body = subagentTreeRows(rows, selected, theme, inner)
 	}

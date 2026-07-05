@@ -434,9 +434,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TurnDoneMsg:
 		cmds = append(cmds, m.handleDone(msg))
-
-	case subagentDemoMsg:
-		cmds = append(cmds, m.advanceSubagentDemo(msg))
 	}
 
 	if !swallow {
@@ -1287,6 +1284,24 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		batch := msg.Event.ToolBatch
 		m.messages.CompleteLatestToolBatch(batch.Total, batch.Completed, batch.Failed)
 
+	case agentloop.LoopSubagentStarted:
+		s := msg.Event.Subagent
+		m.messages.StartSubagent(s.ID, s.ParentID, s.Name, s.Model, "")
+
+	case agentloop.LoopSubagentActivity:
+		s := msg.Event.Subagent
+		if s.Activity != "" {
+			m.messages.AddSubagentActivity(s.ID, s.Activity)
+		}
+		if s.Tokens > 0 {
+			m.messages.UpdateSubagentProgress(s.ID, s.Tokens, 0)
+		}
+
+	case agentloop.LoopSubagentFinished:
+		s := msg.Event.Subagent
+		m.messages.SetSubagentResult(s.ID, s.Result)
+		m.messages.CompleteSubagent(s.ID, s.Failed, 0)
+
 	case agentloop.LoopMessageDone:
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
@@ -1363,7 +1378,9 @@ func (m *Model) addToolCalls(msg *message.Message) {
 	if msg == nil {
 		return
 	}
-	calls := toolUsesInMessage(*msg)
+	// A task delegation is shown live by the subagent panel (driven by the
+	// LoopSubagent* events), so it is not also rendered as a tool block.
+	calls := filterOutTask(toolUsesInMessage(*msg))
 	if len(calls) == 0 {
 		return
 	}
@@ -1373,6 +1390,18 @@ func (m *Model) addToolCalls(msg *message.Message) {
 	}
 	call := calls[0]
 	m.messages.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
+}
+
+// filterOutTask drops task tool calls, whose delegation is represented by the
+// subagent panel rather than a tool block.
+func filterOutTask(calls []message.ToolUsePart) []message.ToolUsePart {
+	out := make([]message.ToolUsePart, 0, len(calls))
+	for _, c := range calls {
+		if c.Name != "task" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // handleDone finalizes a completed turn: it clears the running state, adopts

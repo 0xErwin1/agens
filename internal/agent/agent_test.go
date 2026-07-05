@@ -903,10 +903,18 @@ type fakeLoop struct {
 	gotHistory []message.Message
 	ret        []message.Message
 	err        error
+	emits      []agentloop.LoopEvent
 }
 
-func (f *fakeLoop) Run(_ context.Context, history []message.Message, _ func(agentloop.LoopEvent)) ([]message.Message, error) {
+func (f *fakeLoop) Run(_ context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error) {
 	f.gotHistory = history
+	// Replay the subagent's own scripted events into the sink so the runner's
+	// translation to LoopSubagent* events can be observed.
+	if sink != nil {
+		for _, ev := range f.emits {
+			sink(ev)
+		}
+	}
 	return f.ret, f.err
 }
 
@@ -916,7 +924,7 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "here are the findings"}),
 	}}
 
-	out, err := newSubagentRunner(fl).Run(context.Background(), "investigate the bug")
+	out, err := newSubagentRunner(fl, "subagent", "gpt-x").Run(context.Background(), "investigate the bug")
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -938,8 +946,64 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 func TestSubagentRunner_PropagatesLoopError(t *testing.T) {
 	fl := &fakeLoop{err: errors.New("stream failed")}
 
-	if _, err := newSubagentRunner(fl).Run(context.Background(), "do it"); err == nil {
+	if _, err := newSubagentRunner(fl, "subagent", "gpt-x").Run(context.Background(), "do it"); err == nil {
 		t.Fatal("Run() error = nil, want the loop error propagated")
+	}
+}
+
+func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
+	fl := &fakeLoop{
+		ret: []message.Message{
+			message.NewMessage(message.RoleAssistant, message.TextPart{Text: "final report"}),
+		},
+		emits: []agentloop.LoopEvent{
+			{Kind: agentloop.LoopToolCallStarted, ToolCall: message.ToolUsePart{Name: "read"}},
+			{Kind: agentloop.LoopToolCallStarted, ToolCall: message.ToolUsePart{Name: "bash"}},
+		},
+	}
+
+	var got []agentloop.LoopEvent
+	ctx := agentloop.WithEventSink(context.Background(), func(ev agentloop.LoopEvent) { got = append(got, ev) })
+
+	if _, err := newSubagentRunner(fl, "explore", "gpt-5.5").Run(ctx, "look around"); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if len(got) == 0 {
+		t.Fatal("no events reached the parent sink, want the subagent lifecycle streamed")
+	}
+	if got[0].Kind != agentloop.LoopSubagentStarted {
+		t.Fatalf("first event kind = %v, want LoopSubagentStarted", got[0].Kind)
+	}
+	if got[0].Subagent.Name != "explore" || got[0].Subagent.Model != "gpt-5.5" {
+		t.Fatalf("started event = %+v, want the runner's name/model", got[0].Subagent)
+	}
+
+	last := got[len(got)-1]
+	if last.Kind != agentloop.LoopSubagentFinished {
+		t.Fatalf("last event kind = %v, want LoopSubagentFinished", last.Kind)
+	}
+	if last.Subagent.Failed {
+		t.Fatalf("finished event Failed = true, want a clean completion")
+	}
+	if last.Subagent.Result != "final report" {
+		t.Fatalf("finished event Result = %q, want the subagent's report", last.Subagent.Result)
+	}
+
+	// Every started/finished pair shares one id, and the two tool calls became
+	// activity events.
+	id := got[0].Subagent.ID
+	activity := 0
+	for _, ev := range got {
+		if ev.Subagent.ID != id {
+			t.Fatalf("event %+v uses a different subagent id, want all %q", ev, id)
+		}
+		if ev.Kind == agentloop.LoopSubagentActivity && ev.Subagent.Activity != "" {
+			activity++
+		}
+	}
+	if activity != 2 {
+		t.Fatalf("activity events = %d, want 2 (one per tool the subagent invoked)", activity)
 	}
 }
 

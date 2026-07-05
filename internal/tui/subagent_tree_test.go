@@ -72,13 +72,13 @@ func TestSubagentTree_ShowsRunningCountAndRows(t *testing.T) {
 	}
 }
 
-func TestSubagentTree_EmptyStateGuidesToDemo(t *testing.T) {
+func TestSubagentTree_EmptyState(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
 
 	view := stripANSI(renderSubagentTree(m.orderedSubagents(), 0, 60))
-	if !strings.Contains(view, "no subagents yet") {
-		t.Fatalf("tree = %q, want the empty-state hint", view)
+	if !strings.Contains(view, "no active subagents") {
+		t.Fatalf("tree = %q, want the empty-state note", view)
 	}
 }
 

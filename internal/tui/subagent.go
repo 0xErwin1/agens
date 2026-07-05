@@ -45,6 +45,7 @@ type subagentState struct {
 	tokens   int
 	dur      time.Duration
 	activity []string
+	result   string
 }
 
 // findSubagent returns the live state of the subagent with the given id, or nil
@@ -116,6 +117,17 @@ func (m *Messages) UpdateSubagentProgress(id string, tokens int, dur time.Durati
 	m.rebuild()
 }
 
+// SetSubagentResult records a subagent's final report so its panel can show it
+// once finished. It is a no-op for an unknown id.
+func (m *Messages) SetSubagentResult(id, result string) {
+	sub := m.findSubagent(id)
+	if sub == nil {
+		return
+	}
+	sub.result = result
+	m.rebuild()
+}
+
 // CompleteSubagent marks a subagent finished, recording its final status and
 // elapsed time. A nonzero dur overrides the last live figure. It is a no-op for
 // an unknown id.
@@ -171,6 +183,16 @@ func (s *subagentState) visibleActivity(expanded bool) []string {
 	return nil
 }
 
+// visibleResult returns the subagent's final report lines when it has finished
+// and its panel is expanded, otherwise nil (a running or collapsed panel does
+// not show the report).
+func (s *subagentState) visibleResult(expanded bool) []string {
+	if s.result == "" || s.status == subagentRunning || !expanded {
+		return nil
+	}
+	return strings.Split(s.result, "\n")
+}
+
 // renderSubagent renders a delegated subagent as a collapsible panel: a header
 // with a disclosure caret, the subagent glyph and name in the accent color, and
 // a muted metadata line; below it the activity lines chosen by visibleActivity.
@@ -203,15 +225,18 @@ func (m *Messages) renderSubagent(s *subagentState) string {
 
 	header := lipgloss.NewStyle().MarginLeft(indent).Width(width).Render(head)
 
-	lines := s.visibleActivity(m.detailsExpanded)
-	if len(lines) == 0 {
+	activity := s.visibleActivity(m.detailsExpanded)
+	result := s.visibleResult(m.detailsExpanded)
+	if len(activity) == 0 && len(result) == 0 {
 		return header
 	}
 
-	prefixed := make([]string, len(lines))
-	for i, ln := range lines {
-		prefixed[i] = subagentActivityPrefix + ln
+	body := make([]string, 0, len(activity)+len(result))
+	for _, ln := range activity {
+		body = append(body, subagentActivityPrefix+ln)
 	}
-	body := lipgloss.NewStyle().Foreground(theme.Muted()).MarginLeft(indent).Width(width).Render(strings.Join(prefixed, "\n"))
-	return header + "\n" + body
+	body = append(body, result...)
+
+	rendered := lipgloss.NewStyle().Foreground(theme.Muted()).MarginLeft(indent).Width(width).Render(strings.Join(body, "\n"))
+	return header + "\n" + rendered
 }

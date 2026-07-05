@@ -33,9 +33,6 @@ type CommandContext interface {
 	// ToggleMouse flips mouse reporting so the user can select/copy text from the
 	// conversation (mouse off) or scroll with the wheel (mouse on).
 	ToggleMouse() tea.Cmd
-	// PlaySubagentDemo plays a mocked subagent delegation in the conversation so
-	// the subagent panel and tree can be seen before real subagents are wired in.
-	PlaySubagentDemo() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
 }
@@ -172,9 +169,6 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSubagentTree()
-		}},
-		Command{Name: "/subagents-demo", Desc: "play a mocked subagent delegation", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
-			return ctx.PlaySubagentDemo()
 		}},
 		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.ToggleMouse()

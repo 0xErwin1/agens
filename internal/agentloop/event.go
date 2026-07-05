@@ -23,9 +23,29 @@ const (
 	LoopToolResult
 	LoopToolBatchStarted
 	LoopToolBatchFinished
+	LoopSubagentStarted
+	LoopSubagentActivity
+	LoopSubagentFinished
 	LoopUsage
 	LoopMessageDone
 )
+
+// Subagent reports the lifecycle of a delegated subagent so a surface (the TUI's
+// subagent panel) can show it running live. ID correlates the events of one
+// delegation; ParentID nests it under another subagent (empty for a top-level
+// delegation). Name and Model describe it. Activity is a single progress line
+// (a tool the subagent invoked); Tokens is its running token total; Result is
+// its final report; Failed marks a failed completion.
+type Subagent struct {
+	ID       string
+	ParentID string
+	Name     string
+	Model    string
+	Activity string
+	Tokens   int
+	Result   string
+	Failed   bool
+}
 
 // ToolBatch reports aggregate progress for a same-turn group of tool calls.
 // Completed counts materialized child results. Failed counts child error
@@ -51,6 +71,9 @@ type ToolBatch struct {
 //	LoopToolResult:      Iteration, ToolResult
 //	LoopToolBatchStarted: Iteration, ToolBatch
 //	LoopToolBatchFinished: Iteration, ToolBatch
+//	LoopSubagentStarted:  Subagent (ID, ParentID, Name, Model)
+//	LoopSubagentActivity: Subagent (ID, and Activity or Tokens)
+//	LoopSubagentFinished: Subagent (ID, Result, Failed)
 //	LoopUsage:           Iteration, Usage
 //	LoopMessageDone:     Iteration, Message
 //
@@ -62,6 +85,7 @@ type LoopEvent struct {
 	ToolCall   message.ToolUsePart
 	ToolResult message.ToolResultPart
 	ToolBatch  ToolBatch
+	Subagent   Subagent
 	Usage      *provider.Usage
 	Message    *message.Message
 }

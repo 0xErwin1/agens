@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/iperez/agens/internal/agentloop"
@@ -112,7 +113,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	if err != nil {
 		return nil, err
 	}
-	runner := newSubagentRunner(agentloop.New(p, subGate, loopOpts...))
+	runner := newSubagentRunner(agentloop.New(p, subGate, loopOpts...), "subagent", model)
 
 	parentGate, err := buildParentGate(opts, runner)
 	if err != nil {
@@ -128,31 +129,90 @@ type loopRunner interface {
 	Run(ctx context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error)
 }
 
+// subagentSeq mints unique ids for subagent runs so a surface can correlate a
+// delegation's lifecycle events. Subagents run one at a time (v1 is
+// synchronous), but the counter is atomic so the id generation is race-free.
+var subagentSeq atomic.Int64
+
 // subagentRunner runs a delegated task through a nested loop with an isolated
 // conversation, returning the subagent's final assistant text. It satisfies
-// task.Runner.
+// task.Runner. name and model describe the subagent to the UI panel.
 type subagentRunner struct {
-	loop loopRunner
+	loop  loopRunner
+	name  string
+	model string
 }
 
-func newSubagentRunner(loop loopRunner) *subagentRunner {
-	return &subagentRunner{loop: loop}
+func newSubagentRunner(loop loopRunner, name, model string) *subagentRunner {
+	return &subagentRunner{loop: loop, name: name, model: model}
 }
 
 // Run seeds a fresh conversation with the task description and drives the
 // subagent loop to completion, returning the text of its final assistant turn.
 // The parent turn's ctx is threaded through, so canceling the parent cancels the
-// subagent too.
+// subagent too. When the parent loop installed an event sink (WithEventSink), the
+// subagent's lifecycle — start, each tool it invokes, and completion — is
+// streamed as LoopSubagent* events so the UI can show it running live.
 func (r *subagentRunner) Run(ctx context.Context, description string) (string, error) {
+	parentEmit := agentloop.EventSink(ctx)
+	id := fmt.Sprintf("subagent-%d", subagentSeq.Add(1))
+
+	if parentEmit != nil {
+		parentEmit(agentloop.LoopEvent{
+			Kind:     agentloop.LoopSubagentStarted,
+			Subagent: agentloop.Subagent{ID: id, Name: r.name, Model: r.model},
+		})
+	}
+
 	history := []message.Message{
 		message.NewMessage(message.RoleUser, message.TextPart{Text: description}),
 	}
 
-	final, err := r.loop.Run(ctx, history, nil)
+	final, err := r.loop.Run(ctx, history, subagentActivitySink(parentEmit, id))
+
+	result := ""
+	if err == nil {
+		result = lastAssistantText(final)
+	}
+	if parentEmit != nil {
+		parentEmit(agentloop.LoopEvent{
+			Kind:     agentloop.LoopSubagentFinished,
+			Subagent: agentloop.Subagent{ID: id, Result: result, Failed: err != nil},
+		})
+	}
+
 	if err != nil {
 		return "", err
 	}
-	return lastAssistantText(final), nil
+	return result, nil
+}
+
+// subagentActivitySink translates a subagent's own LoopEvents into the subagent
+// panel's activity stream on parentEmit: each tool the subagent invokes becomes
+// an activity line, and its usage becomes a running token total. It returns nil
+// when there is no parent sink, so an unobserved subagent runs without overhead.
+func subagentActivitySink(parentEmit func(agentloop.LoopEvent), id string) func(agentloop.LoopEvent) {
+	if parentEmit == nil {
+		return nil
+	}
+
+	return func(ev agentloop.LoopEvent) {
+		switch ev.Kind {
+		case agentloop.LoopToolCallStarted:
+			parentEmit(agentloop.LoopEvent{
+				Kind:     agentloop.LoopSubagentActivity,
+				Subagent: agentloop.Subagent{ID: id, Activity: ev.ToolCall.Name},
+			})
+
+		case agentloop.LoopUsage:
+			if ev.Usage != nil {
+				parentEmit(agentloop.LoopEvent{
+					Kind:     agentloop.LoopSubagentActivity,
+					Subagent: agentloop.Subagent{ID: id, Tokens: ev.Usage.InputTokens + ev.Usage.OutputTokens},
+				})
+			}
+		}
+	}
 }
 
 // lastAssistantText returns the concatenated text of the most recent assistant

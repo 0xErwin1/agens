@@ -140,6 +140,11 @@ func (l *Loop) Run(ctx context.Context, history []message.Message, sink func(Loo
 		}
 	}
 
+	// Install the sink so a tool reached through this loop — a subagent's task
+	// tool — can emit into the same event stream despite tool.Execute carrying
+	// no sink of its own.
+	ctx = WithEventSink(ctx, emit)
+
 	var specs []provider.ToolSpec
 	if l.tools != nil {
 		specs = l.tools.Specs()
