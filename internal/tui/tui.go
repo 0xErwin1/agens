@@ -82,6 +82,10 @@ type Model struct {
 	hasUsage       bool
 	contextWindow  int
 	tokensDetailed bool
+	// collapseThinking and truncateToolOutput mirror the UI config so the message
+	// view's display options can be reapplied after NewConversation rebuilds it.
+	collapseThinking   bool
+	truncateToolOutput bool
 	// quitArmed is set after a Ctrl+C that neither canceled a turn nor cleared
 	// the input, so a second Ctrl+C quits; any other key disarms it.
 	quitArmed bool
@@ -202,6 +206,11 @@ type Deps struct {
 	// Now supplies the current time; defaults to time.Now when nil. Tests inject
 	// a controlled clock to assert turn timing deterministically.
 	Now func() time.Time
+	// CollapseThinking folds a finished reasoning block to its header;
+	// TruncateToolOutput caps an expanded tool result. Both default to false
+	// (shown in full) and come from the user's UI config.
+	CollapseThinking   bool
+	TruncateToolOutput bool
 }
 
 // New constructs the root model from its dependencies.
@@ -223,7 +232,7 @@ func New(deps Deps) *Model {
 		now = time.Now
 	}
 
-	return &Model{
+	m := &Model{
 		input:               NewInput(),
 		status:              NewStatus(deps.Model),
 		messages:            NewMessages(),
@@ -243,7 +252,11 @@ func New(deps Deps) *Model {
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
 		now:                 now,
+		collapseThinking:    deps.CollapseThinking,
+		truncateToolOutput:  deps.TruncateToolOutput,
 	}
+	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
+	return m
 }
 
 // Init focuses the input and, when an interactive prompter is installed,
@@ -842,6 +855,7 @@ func (m *Model) runCommand(cmd Command) tea.Cmd {
 func (m *Model) NewConversation() {
 	m.history = nil
 	m.messages = NewMessages()
+	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
 	m.sessionID = m.newSessionID()
 	m.subagentFocusID = ""
 	m.subagentTreeOpen = false

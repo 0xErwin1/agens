@@ -6,6 +6,19 @@ func applyPatch(cfg *Config, patch configPatch) {
 	applyOptionsPatch(cfg, patch.Options)
 	applyProviderPatch(cfg, patch.Provider)
 	applyAgentPatch(cfg, patch.Agent)
+	applyUIPatch(cfg, patch.UI)
+}
+
+func applyUIPatch(cfg *Config, patch *uiPatch) {
+	if patch == nil {
+		return
+	}
+	if patch.CollapseThinking != nil {
+		cfg.UI.CollapseThinking = *patch.CollapseThinking
+	}
+	if patch.TruncateToolOutput != nil {
+		cfg.UI.TruncateToolOutput = *patch.TruncateToolOutput
+	}
 }
 
 func applyOptionsPatch(cfg *Config, patch *optionsPatch) {

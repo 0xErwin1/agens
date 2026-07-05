@@ -29,6 +29,9 @@ type tuiSession struct {
 	sessions     tui.SessionStore
 	files        tui.FileSource
 	project      string
+
+	collapseThinking   bool
+	truncateToolOutput bool
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -76,18 +79,20 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 		resumeID, openSessions := resolveResume(resume, args)
 
 		return run(tui.New(tui.Deps{
-			Loop:         sess.loop,
-			Model:        sess.model,
-			Prompter:     prompter,
-			Models:       sess.lister,
-			SystemPrompt: sess.prompt,
-			EffortLevels: sess.effortLevels,
-			Sessions:     sess.sessions,
-			NewSessionID: uuid.NewString,
-			Files:        sess.files,
-			Project:      sess.project,
-			ResumeID:     resumeID,
-			OpenSessions: openSessions,
+			Loop:               sess.loop,
+			Model:              sess.model,
+			Prompter:           prompter,
+			Models:             sess.lister,
+			SystemPrompt:       sess.prompt,
+			EffortLevels:       sess.effortLevels,
+			Sessions:           sess.sessions,
+			NewSessionID:       uuid.NewString,
+			Files:              sess.files,
+			Project:            sess.project,
+			ResumeID:           resumeID,
+			OpenSessions:       openSessions,
+			CollapseThinking:   sess.collapseThinking,
+			TruncateToolOutput: sess.truncateToolOutput,
 		}))
 	}
 
@@ -159,14 +164,16 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	}
 
 	return tuiSession{
-		loop:         loop,
-		lister:       prov,
-		prompt:       prompt,
-		model:        modelName,
-		effortLevels: prov.EffortLevels(),
-		sessions:     session.NewStore(session.DefaultDir()),
-		files:        files,
-		project:      opts.ProjectRoot,
+		loop:               loop,
+		lister:             prov,
+		prompt:             prompt,
+		model:              modelName,
+		effortLevels:       prov.EffortLevels(),
+		sessions:           session.NewStore(session.DefaultDir()),
+		files:              files,
+		project:            opts.ProjectRoot,
+		collapseThinking:   loaded.Config.UI.CollapseThinking,
+		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,
 	}, nil
 }
 

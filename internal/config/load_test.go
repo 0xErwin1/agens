@@ -64,6 +64,31 @@ func TestLoadProjectOverridesGlobal(t *testing.T) {
 	}
 }
 
+func TestLoadUISectionDefaultsFalseAndOverrides(t *testing.T) {
+	home := t.TempDir()
+
+	def, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: t.TempDir(), Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if def.Config.UI.CollapseThinking || def.Config.UI.TruncateToolOutput {
+		t.Fatalf("UI defaults = %+v, want both false (shown in full)", def.Config.UI)
+	}
+
+	cfg := "[ui]\ncollapse_thinking = true\ntruncate_tool_output = true\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: t.TempDir(), Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if !loaded.Config.UI.CollapseThinking || !loaded.Config.UI.TruncateToolOutput {
+		t.Fatalf("UI = %+v, want both true after override", loaded.Config.UI)
+	}
+}
+
 func TestLoadRejectsMalformedTOML(t *testing.T) {
 	home := t.TempDir()
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[options\n"), 0o644); err != nil {

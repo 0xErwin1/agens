@@ -32,13 +32,29 @@ func TestModel_ReasoningShowsThinkingThenAnswer(t *testing.T) {
 	if !strings.Contains(view, "the answer") {
 		t.Fatalf("View() = %q, want the answer once text streams", view)
 	}
-	// The finished reasoning collapses to its "Thinking" header; the block is
-	// kept but its text is folded away until Ctrl+O expands it.
+	// By default a finished reasoning block is not collapsed: its text stays
+	// visible under the "Thinking" header rather than being folded away.
+	if !strings.Contains(view, "Thinking") {
+		t.Fatalf("View() = %q, want the Thinking header kept", view)
+	}
+	if !strings.Contains(view, "let me think about it") {
+		t.Fatalf("View() = %q, want the finished reasoning shown in full by default", view)
+	}
+}
+
+func TestModel_ReasoningCollapsesWhenConfigured(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
+	m.messages.SetDisplayOptions(true, false) // collapse_thinking = true
+
+	streamEvent(m, agentloop.LoopReasoningDelta, "let me think about it")
+	streamEvent(m, agentloop.LoopTextDelta, "the answer")
+
+	view := stripANSI(m.View())
 	if !strings.Contains(view, "Thinking") {
 		t.Fatalf("View() = %q, want the collapsed Thinking header kept", view)
 	}
 	if strings.Contains(view, "let me think about it") {
-		t.Fatalf("View() = %q, want the finished reasoning folded by default", view)
+		t.Fatalf("View() = %q, want the finished reasoning folded when collapse is configured", view)
 	}
 
 	m.messages.ToggleDetails()

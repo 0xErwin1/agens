@@ -107,7 +107,13 @@ type Messages struct {
 	// finished "Thinking") show their body; folded by default, toggled for all
 	// of them at once via ToggleDetails (Ctrl+O).
 	detailsExpanded bool
-	width, height   int
+	// collapseThinking folds a finished reasoning block to its header; when false
+	// (default) finished thinking is shown in full. truncateToolOutput caps an
+	// expanded tool result to a line/byte budget; when false (default) the full
+	// result is shown. Both come from the user's UI config.
+	collapseThinking   bool
+	truncateToolOutput bool
+	width, height      int
 
 	// renderer is width-bound: a glamour.TermRenderer wraps to a fixed width,
 	// so it is rebuilt whenever the width changes rather than per render.
@@ -313,6 +319,14 @@ func (m *Messages) ToggleDetails() {
 	m.rebuild()
 }
 
+// SetDisplayOptions configures how much of a finished reasoning block and an
+// expanded tool result are shown, from the user's UI config, and re-renders.
+func (m *Messages) SetDisplayOptions(collapseThinking, truncateToolOutput bool) {
+	m.collapseThinking = collapseThinking
+	m.truncateToolOutput = truncateToolOutput
+	m.rebuild()
+}
+
 // SetError adds an error block describing a turn-level failure.
 func (m *Messages) SetError(msg string) {
 	m.blocks = append(m.blocks, block{kind: blockError, text: msg})
@@ -484,8 +498,13 @@ func (m *Messages) renderReasoning(text string, live bool) string {
 
 	dim := lipgloss.NewStyle().Foreground(theme.Muted()).Italic(true)
 
+	// A finished block collapses to a caret + header (expandable with Ctrl+O)
+	// only when the user opted into collapsing; otherwise, like the live stream,
+	// it is always shown in full.
+	collapsible := !live && m.collapseThinking
+
 	caret := ""
-	if !live {
+	if collapsible {
 		caret = "▸ "
 		if m.detailsExpanded {
 			caret = "▾ "
@@ -493,7 +512,7 @@ func (m *Messages) renderReasoning(text string, live bool) string {
 	}
 	label := dim.Bold(true).Render(caret + labelThinking)
 
-	if !live && !m.detailsExpanded {
+	if collapsible && !m.detailsExpanded {
 		return lipgloss.NewStyle().MarginLeft(contentGutter).Render(label)
 	}
 
@@ -637,7 +656,11 @@ func (m *Messages) renderTool(b block) string {
 	if b.isError {
 		color = theme.Error()
 	}
-	body := m.gutteredBlock(color, indentLines(truncateToolResult(b.result)), false)
+	result := b.result
+	if m.truncateToolOutput {
+		result = truncateToolResult(result)
+	}
+	body := m.gutteredBlock(color, indentLines(result), false)
 	return header + "\n" + body
 }
 

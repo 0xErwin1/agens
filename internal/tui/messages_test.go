@@ -174,9 +174,10 @@ func TestMessages_StreamingAssistantRendersMarkdownLive(t *testing.T) {
 	}
 }
 
-func TestMessages_ToolResultTruncatesLongOutputWhenExpanded(t *testing.T) {
+func TestMessages_ToolResultTruncatesLongOutputWhenConfigured(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(80, 20)
+	m.SetDisplayOptions(false, true) // truncate_tool_output = true
 
 	var b strings.Builder
 	for i := 0; i < toolResultMaxLines+50; i++ {
@@ -190,10 +191,33 @@ func TestMessages_ToolResultTruncatesLongOutputWhenExpanded(t *testing.T) {
 
 	view := stripANSI(m.View())
 	if !strings.Contains(view, truncationMarker) {
-		t.Fatalf("stripped View() = %q, want the truncation marker %q for a long result", view, truncationMarker)
+		t.Fatalf("stripped View() = %q, want the truncation marker %q when truncation is configured", view, truncationMarker)
 	}
 	if strings.Contains(view, "UNIQUE_TAIL_MARKER") {
 		t.Fatalf("stripped View() = %q, must not contain the tail past the truncation limit", view)
+	}
+}
+
+func TestMessages_ToolResultShownInFullWhenExpandedByDefault(t *testing.T) {
+	m := NewMessages()
+	m.SetSize(80, 200) // tall enough that the full result fits the viewport
+
+	var b strings.Builder
+	for i := 0; i < toolResultMaxLines+50; i++ {
+		b.WriteString("line\n")
+	}
+	b.WriteString("UNIQUE_TAIL_MARKER")
+
+	m.AddToolCall("t1", "bash", "cat big")
+	m.CompleteToolCall("t1", b.String(), false, time.Second)
+	m.ToggleDetails()
+
+	view := stripANSI(m.View())
+	if strings.Contains(view, truncationMarker) {
+		t.Fatalf("stripped View() = %q, want no truncation marker by default (expanded output shown in full)", view)
+	}
+	if !strings.Contains(view, "UNIQUE_TAIL_MARKER") {
+		t.Fatalf("stripped View() = %q, want the full result including its tail when expanded by default", view)
 	}
 }
 

@@ -21,6 +21,16 @@ type Config struct {
 	Options  Options  `toml:"options"`
 	Provider Provider `toml:"provider"`
 	Agent    Agent    `toml:"agent"`
+	UI       UI       `toml:"ui"`
+}
+
+// UI holds display preferences for the interactive terminal UI. Both default to
+// false: a finished reasoning block is shown in full (not folded to its header)
+// and an expanded tool result is shown in full (not capped). Enabling either
+// restores the compact, folded/truncated behavior.
+type UI struct {
+	CollapseThinking   bool `toml:"collapse_thinking"`
+	TruncateToolOutput bool `toml:"truncate_tool_output"`
 }
 
 type Options struct {
@@ -67,6 +77,12 @@ type configPatch struct {
 	Options  *optionsPatch  `toml:"options"`
 	Provider *providerPatch `toml:"provider"`
 	Agent    *agentPatch    `toml:"agent"`
+	UI       *uiPatch       `toml:"ui"`
+}
+
+type uiPatch struct {
+	CollapseThinking   *bool `toml:"collapse_thinking"`
+	TruncateToolOutput *bool `toml:"truncate_tool_output"`
 }
 
 type optionsPatch struct {
