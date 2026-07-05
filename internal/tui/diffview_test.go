@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -27,6 +28,31 @@ func TestParseHunkNewStart(t *testing.T) {
 		if got := parseHunkNewStart(header); got != want {
 			t.Fatalf("parseHunkNewStart(%q) = %d, want %d", header, got, want)
 		}
+	}
+}
+
+func TestMessages_ExpandedDiffIsShownInFull(t *testing.T) {
+	m := NewMessages()
+	m.SetSize(80, 20)
+
+	var b strings.Builder
+	b.WriteString("--- a/big.txt\n+++ b/big.txt\n@@ -0,0 +1,40 @@\n")
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&b, "+line %d\n", i)
+	}
+
+	body := stripANSI(m.renderDiffBody(b.String()))
+
+	if strings.Contains(body, truncationMarker) {
+		t.Fatalf("diff body = %q, want no truncation marker (the full diff shows on expand)", body)
+	}
+	for _, n := range []int{1, 20, 40} {
+		if !strings.Contains(body, fmt.Sprintf("line %d", n)) {
+			t.Fatalf("diff body missing 'line %d', want every changed line rendered", n)
+		}
+	}
+	if got := strings.Count(body, "line "); got != 40 {
+		t.Fatalf("diff body rendered %d changed lines, want all 40", got)
 	}
 }
 

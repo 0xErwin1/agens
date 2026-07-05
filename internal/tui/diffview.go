@@ -16,9 +16,11 @@ func isDiffResult(s string) bool {
 }
 
 // renderDiffBody renders a unified diff as a friendly, GitHub-style view: the
-// git file and hunk headers are dropped, each changed line is tinted (green
-// additions, red deletions) and gutter-numbered by its line in the new file,
-// and the whole thing is capped to the tool-result line budget.
+// git file and hunk headers are dropped, and each changed line is tinted (green
+// additions, red deletions) and gutter-numbered by its line in the new file.
+// The body is only rendered when its tool block is expanded, and it is shown in
+// full — a long diff is scrolled by the conversation viewport rather than
+// truncated, so the whole change can be reviewed.
 func (m *Messages) renderDiffBody(diff string) string {
 	theme := CurrentTheme()
 
@@ -27,9 +29,8 @@ func (m *Messages) renderDiffBody(diff string) string {
 		width = 1
 	}
 
-	rows := make([]string, 0, toolResultMaxLines+1)
+	rows := make([]string, 0)
 	newLine := 0
-	truncated := false
 
 	for _, ln := range strings.Split(diff, "\n") {
 		if strings.HasPrefix(ln, "--- ") || strings.HasPrefix(ln, "+++ ") {
@@ -38,11 +39,6 @@ func (m *Messages) renderDiffBody(diff string) string {
 		if strings.HasPrefix(ln, "@@") {
 			newLine = parseHunkNewStart(ln)
 			continue
-		}
-
-		if len(rows) >= toolResultMaxLines {
-			truncated = true
-			break
 		}
 
 		switch {
@@ -55,10 +51,6 @@ func (m *Messages) renderDiffBody(diff string) string {
 			rows = append(rows, diffRow(theme, newLine, ' ', ln[1:], width))
 			newLine++
 		}
-	}
-
-	if truncated {
-		rows = append(rows, lipgloss.NewStyle().Foreground(theme.Muted()).Render(truncationMarker))
 	}
 
 	return lipgloss.NewStyle().MarginLeft(contentGutter).Render(strings.Join(rows, "\n"))
