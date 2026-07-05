@@ -66,6 +66,18 @@ type subagentState struct {
 	result string
 }
 
+// RunningSubagents reports how many delegated subagents are still executing, so a
+// surface can persistently show that work is happening off the main thread.
+func (m *Messages) RunningSubagents() int {
+	n := 0
+	for i := range m.blocks {
+		if b := &m.blocks[i]; b.kind == blockSubagent && b.sub != nil && b.sub.status == subagentRunning {
+			n++
+		}
+	}
+	return n
+}
+
 // findSubagent returns the live state of the subagent with the given id, or nil
 // when no such panel exists.
 func (m *Messages) findSubagent(id string) *subagentState {

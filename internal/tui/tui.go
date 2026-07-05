@@ -645,6 +645,9 @@ func (m *Model) workingLine() string {
 	if !m.turnStart.IsZero() {
 		text += " " + formatDuration(m.now().Sub(m.turnStart))
 	}
+	if n := m.messages.RunningSubagents(); n > 0 {
+		text += fmt.Sprintf(" · %d subagent(s) · /subagents", n)
+	}
 	if n := len(m.queued); n > 0 {
 		text += fmt.Sprintf(" · %d en cola", n)
 	}
