@@ -119,9 +119,11 @@ func subagentFocusCrumbs(s *subagentState, siblings []*subagentState, index int)
 	return strings.Join(parts, " · ")
 }
 
-// handleSubagentFocusKey handles a keypress while a subagent is entered: Esc steps
-// back to the list, Left/Right move between siblings, and Up/Down scroll the
-// subagent's conversation.
+// handleSubagentFocusKey handles a keypress while a subagent is entered. The
+// subagent's conversation behaves like the main thread — Ctrl+O expands its tool
+// output and thinking, Up/Down (and PgUp/PgDn, the wheel) scroll it — with the
+// focus-only additions Esc (step back to the list) and Left/Right (move between
+// siblings).
 func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.Type {
 	case tea.KeyEsc:
@@ -135,6 +137,9 @@ func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) tea.Cmd {
 
 	case tea.KeyRight, tea.KeyTab:
 		m.focusSibling(1)
+
+	case tea.KeyCtrlO:
+		m.activeMessages().ToggleDetails()
 
 	case tea.KeyUp, tea.KeyDown:
 		if s := m.focusedSubagent(); s != nil && s.convo != nil {

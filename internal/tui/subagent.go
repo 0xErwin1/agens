@@ -232,12 +232,17 @@ func (m *Messages) clock() time.Time {
 	return m.now()
 }
 
-// subagentExpired reports whether a finished subagent has lingered past
-// subagentListLinger and should drop off the active-subagent tree. A running
-// subagent never expires.
+// subagentExpired reports whether a finished subagent should drop off the
+// active-subagent tree. A running subagent never expires; a live one that
+// finished lingers subagentListLinger before expiring; one reconstructed from a
+// resumed session (finished with no timestamp) is already expired, so past
+// delegations do not clutter the active list — their inline panels remain.
 func (m *Messages) subagentExpired(s *subagentState) bool {
-	if s.status == subagentRunning || s.finishedAt.IsZero() {
+	if s.status == subagentRunning {
 		return false
+	}
+	if s.finishedAt.IsZero() {
+		return true
 	}
 	return m.clock().Sub(s.finishedAt) >= subagentListLinger
 }
@@ -308,7 +313,10 @@ func subagentToolLine(t subagentTool) string {
 func (s *subagentState) panelBody(expanded bool) []string {
 	var body []string
 
-	if s.prompt != "" {
+	// The task prompt is shown while the subagent runs (so you can see what it is
+	// doing) and whenever the panel is expanded; a finished, collapsed panel is
+	// just its "done" header.
+	if s.prompt != "" && (expanded || s.status == subagentRunning) {
 		prompt := s.prompt
 		if !expanded {
 			prompt = truncateRunes(firstLine(prompt), subagentPromptMaxRunes)

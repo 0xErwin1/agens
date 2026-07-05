@@ -2,6 +2,7 @@ package tui
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -427,6 +428,12 @@ func (m *Messages) SetHistory(history []message.Message) {
 				m.blocks = append(m.blocks, block{kind: kind, text: p.Text})
 
 			case message.ToolUsePart:
+				// A lone task delegation is rebuilt as its subagent panel (as it
+				// showed live), not a raw task tool block.
+				if p.Name == "task" && len(toolUses) == 1 {
+					m.StartSubagent(p.ID, "", "subagent", "", taskDescription(p.Input))
+					continue
+				}
 				if len(toolUses) > 1 {
 					if !batchInserted {
 						m.addToolUseBlocks(toolUses, toolIndex)
@@ -437,6 +444,20 @@ func (m *Messages) SetHistory(history []message.Message) {
 				m.addToolUseBlocks([]message.ToolUsePart{p}, toolIndex)
 
 			case message.ToolResultPart:
+				if sub := m.findSubagent(p.ToolUseID); sub != nil {
+					// A resumed subagent's report becomes its panel result and, so
+					// entering it is not empty, its conversation. It stays finished
+					// with no timestamp so it does not rejoin the active list.
+					sub.result = toolResultText(p)
+					sub.status = subagentDone
+					if p.IsError {
+						sub.status = subagentFailed
+					}
+					if sub.convo != nil && sub.result != "" {
+						sub.convo.blocks = append(sub.convo.blocks, block{kind: blockAssistant, text: sub.result})
+					}
+					continue
+				}
 				if i, ok := toolIndex[p.ToolUseID]; ok {
 					m.blocks[i].result = toolResultText(p)
 					m.blocks[i].isError = p.IsError
@@ -447,6 +468,19 @@ func (m *Messages) SetHistory(history []message.Message) {
 	}
 
 	m.rebuild()
+}
+
+// taskDescription extracts the delegated task's description from a task tool
+// call's input, used to label a subagent panel reconstructed on resume. It
+// returns "" when the input cannot be parsed.
+func taskDescription(input json.RawMessage) string {
+	var in struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil {
+		return ""
+	}
+	return in.Description
 }
 
 // Init implements tea.Model; the view has no startup command.
