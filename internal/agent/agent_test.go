@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,6 +52,19 @@ func chatgptCreds() auth.File {
 func validOptions(t *testing.T) Options {
 	t.Helper()
 	return Options{ProjectRoot: t.TempDir()}
+}
+
+func loopMaxIterations(t *testing.T, loop any) int {
+	t.Helper()
+	value := reflect.ValueOf(loop)
+	if value.Kind() != reflect.Pointer || value.IsNil() {
+		t.Fatalf("loop = %T, want non-nil pointer", loop)
+	}
+	field := value.Elem().FieldByName("maxIter")
+	if !field.IsValid() {
+		t.Fatal("loop.maxIter field not found")
+	}
+	return int(field.Int())
 }
 
 func TestBuildLoop_Success(t *testing.T) {
@@ -127,6 +141,66 @@ func TestBuildLoop_SystemPromptPrecedence(t *testing.T) {
 			}
 			if loop == nil {
 				t.Fatal("BuildLoop() loop = nil, want non-nil")
+			}
+		})
+	}
+}
+
+func TestBuildLoop_MaxIterationsPrecedence(t *testing.T) {
+	tests := []struct {
+		name    string
+		optsMax int
+		cfgMax  int
+		want    int
+	}{
+		{name: "opts overrides cfg", optsMax: 7, cfgMax: 9, want: 7},
+		{name: "falls back to cfg when opts unset", optsMax: 0, cfgMax: 9, want: 9},
+		{name: "falls back to loop default when both unset", optsMax: 0, cfgMax: 0, want: 60},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Agent.MaxIterations = tt.cfgMax
+
+			opts := validOptions(t)
+			opts.MaxIterations = tt.optsMax
+
+			loop, err := BuildLoop(cfg, validCreds(), opts)
+			if err != nil {
+				t.Fatalf("BuildLoop() error = %v, want nil", err)
+			}
+			if got := loopMaxIterations(t, loop); got != tt.want {
+				t.Fatalf("loop maxIter = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuildLoop_NegativeMaxIterationsError(t *testing.T) {
+	tests := []struct {
+		name    string
+		optsMax int
+		cfgMax  int
+	}{
+		{name: "opts negative", optsMax: -1, cfgMax: 9},
+		{name: "cfg negative", optsMax: 0, cfgMax: -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.Agent.MaxIterations = tt.cfgMax
+
+			opts := validOptions(t)
+			opts.MaxIterations = tt.optsMax
+
+			_, err := BuildLoop(cfg, validCreds(), opts)
+			if err == nil {
+				t.Fatal("BuildLoop() error = nil, want an error for max iterations < 0")
+			}
+			if !strings.Contains(err.Error(), "max iterations") {
+				t.Fatalf("BuildLoop() error = %q, want it to mention max iterations", err.Error())
 			}
 		})
 	}

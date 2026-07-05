@@ -226,7 +226,7 @@ func TestRun_ErrMaxIterationsWithPartialHistory(t *testing.T) {
 	}
 }
 
-func TestRun_DefaultMaxIterationsIsTwenty(t *testing.T) {
+func TestRun_DefaultMaxIterationsIsSixty(t *testing.T) {
 	call := message.ToolUsePart{ID: "call_1", Name: "loop_tool"}
 	p := &fakeProvider{steps: toolCallSteps(call)}
 	tools := &fakeToolRunner{responses: map[string]message.ToolResultPart{
@@ -238,8 +238,8 @@ func TestRun_DefaultMaxIterationsIsTwenty(t *testing.T) {
 	if !errors.Is(err, ErrMaxIterations) {
 		t.Fatalf("Run() error = %v, want ErrMaxIterations", err)
 	}
-	if len(got) != 40 {
-		t.Fatalf("history length = %d, want 40 (default max iterations = 20, 2 messages per iteration)", len(got))
+	if len(got) != 120 {
+		t.Fatalf("history length = %d, want 120 (default max iterations = 60, 2 messages per iteration)", len(got))
 	}
 }
 

@@ -37,8 +37,9 @@ const (
 // Options carries the per-invocation overrides a caller (typically the
 // chat command's flags) supplies on top of a loaded config.Config.
 type Options struct {
-	Model        string
-	SystemPrompt string
+	Model         string
+	SystemPrompt  string
+	MaxIterations int
 
 	// ProjectRoot confines the read/write/edit tools' filesystem access. An
 	// empty value falls back to os.Getwd().
@@ -93,6 +94,14 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	loopOpts := []agentloop.Option{agentloop.WithModel(model), agentloop.WithSystemPrompt(systemPrompt)}
 
+	maxIterations, err := resolveMaxIterations(cfg, opts)
+	if err != nil {
+		return nil, err
+	}
+	if maxIterations > 0 {
+		loopOpts = append(loopOpts, agentloop.WithMaxIterations(maxIterations))
+	}
+
 	return agentloop.New(p, gate, loopOpts...), nil
 }
 
@@ -143,6 +152,22 @@ func BuildSystemPrompt(cfg config.Config, opts Options, model string) (string, e
 // defaultModelFor(providerID), and passed into the provider config even
 // though Models does not use it, so construction never diverges from
 // BuildLoop's.
+func resolveMaxIterations(cfg config.Config, opts Options) (int, error) {
+	if opts.MaxIterations < 0 {
+		return 0, errors.New("agent: max iterations must be >= 1")
+	}
+	if opts.MaxIterations > 0 {
+		return opts.MaxIterations, nil
+	}
+	if cfg.Agent.MaxIterations < 0 {
+		return 0, errors.New("agent: max iterations must be >= 1")
+	}
+	if cfg.Agent.MaxIterations > 0 {
+		return cfg.Agent.MaxIterations, nil
+	}
+	return 0, nil
+}
+
 func BuildProvider(cfg config.Config, creds auth.File, opts Options) (provider.Provider, error) {
 	providerID, err := selectProviderID(cfg, creds)
 	if err != nil {

@@ -36,7 +36,7 @@ func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 	cmd := newRootCommand(build, run)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
-	cmd.SetArgs([]string{"--model", "gpt-custom", "--system", "custom prompt"})
+	cmd.SetArgs([]string{"--model", "gpt-custom", "--system", "custom prompt", "--max-iterations", "17"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
@@ -48,8 +48,43 @@ func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 	if received.SystemPrompt != "custom prompt" {
 		t.Fatalf("Options.SystemPrompt = %q, want %q", received.SystemPrompt, "custom prompt")
 	}
+	if received.MaxIterations != 17 {
+		t.Fatalf("Options.MaxIterations = %d, want 17", received.MaxIterations)
+	}
 	if ranModel == nil {
 		t.Fatal("run seam was not called with a model, want the constructed TUI model")
+	}
+}
+
+func TestTUICommand_RejectsInvalidMaxIterationsFlag(t *testing.T) {
+	for _, args := range [][]string{
+		{"--max-iterations=0"},
+		{"--max-iterations=-1"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			builderCalled := false
+			build := func(agent.Options) (tuiSession, error) {
+				builderCalled = true
+				return tuiSession{loop: stubTUILoop(), model: "gpt-test"}, nil
+			}
+			run := func(tea.Model) error { return nil }
+
+			cmd := newRootCommand(build, run)
+			cmd.SetOut(new(bytes.Buffer))
+			cmd.SetErr(new(bytes.Buffer))
+			cmd.SetArgs(args)
+
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatal("Execute() error = nil, want invalid max iterations error")
+			}
+			if !strings.Contains(err.Error(), "--max-iterations") {
+				t.Fatalf("Execute() error = %q, want it to mention --max-iterations", err.Error())
+			}
+			if builderCalled {
+				t.Fatal("builder was called, want validation to reject before building the loop")
+			}
+		})
 	}
 }
 

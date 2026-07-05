@@ -39,7 +39,8 @@ type Provider struct {
 // prompt is chosen automatically by the internal/prompt package from the
 // resolved model.
 type Agent struct {
-	SystemPrompt string `toml:"system_prompt"`
+	SystemPrompt  string `toml:"system_prompt"`
+	MaxIterations int    `toml:"max_iterations"`
 }
 
 type Source struct {
@@ -79,7 +80,8 @@ type providerPatch struct {
 }
 
 type agentPatch struct {
-	SystemPrompt *string `toml:"system_prompt"`
+	SystemPrompt  *string `toml:"system_prompt"`
+	MaxIterations *int    `toml:"max_iterations"`
 }
 
 func DefaultConfig() Config {
@@ -171,6 +173,9 @@ func (l *Loaded) applyFile(path string, scope Scope, env map[string]string) erro
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
 	if err := expandPatch(&patch, env); err != nil {
+		return fmt.Errorf("%s config %s: %w", scope, path, err)
+	}
+	if err := validatePatch(patch); err != nil {
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
 	applyPatch(&l.Config, patch)

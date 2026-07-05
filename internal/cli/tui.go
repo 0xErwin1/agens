@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -49,7 +50,11 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 	var allowAll bool
 	var resume bool
 
-	cmd.RunE = func(_ *cobra.Command, args []string) error {
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("max-iterations") && opts.MaxIterations < 1 {
+			return errors.New("tui: --max-iterations must be >= 1")
+		}
+
 		// The TUI owns the terminal, so it cannot use the tty-reading
 		// prompter the chat command does: an interactive decision is
 		// routed through the Bubble Tea event loop as a modal instead.
@@ -88,6 +93,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 
 	cmd.Flags().StringVar(&opts.Model, "model", "", "override the configured model")
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
+	cmd.Flags().IntVar(&opts.MaxIterations, "max-iterations", 0, "override the configured agent loop iteration limit")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "resume a saved conversation: pass a session id to open it, or omit the id to pick from the list")
 }

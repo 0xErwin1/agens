@@ -56,6 +56,14 @@ func TestDefaultConfigProviderAndAgent(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "agent max iterations default is unset",
+			check: func(t *testing.T, cfg Config) {
+				if cfg.Agent.MaxIterations != 0 {
+					t.Fatalf("Agent.MaxIterations = %d, want 0", cfg.Agent.MaxIterations)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -63,5 +71,16 @@ func TestDefaultConfigProviderAndAgent(t *testing.T) {
 			cfg := DefaultConfig()
 			tt.check(t, cfg)
 		})
+	}
+}
+
+func TestApplyPatch_AgentMaxIterations(t *testing.T) {
+	cfg := DefaultConfig()
+	value := 17
+
+	applyPatch(&cfg, configPatch{Agent: &agentPatch{MaxIterations: &value}})
+
+	if cfg.Agent.MaxIterations != 17 {
+		t.Fatalf("Agent.MaxIterations = %d, want 17", cfg.Agent.MaxIterations)
 	}
 }

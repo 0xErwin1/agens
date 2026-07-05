@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -103,7 +105,7 @@ func TestLoadExpandsDataDir(t *testing.T) {
 
 func TestLoadParsesProviderAndAgentSections(t *testing.T) {
 	home := t.TempDir()
-	toml := "[provider]\nmodel = \"gpt-4o\"\nbase_url = \"https://example.test\"\n\n[agent]\nsystem_prompt = \"X\"\n"
+	toml := "[provider]\nmodel = \"gpt-4o\"\nbase_url = \"https://example.test\"\n\n[agent]\nsystem_prompt = \"X\"\nmax_iterations = 17\n"
 	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(toml), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +122,9 @@ func TestLoadParsesProviderAndAgentSections(t *testing.T) {
 	}
 	if loaded.Config.Agent.SystemPrompt != "X" {
 		t.Fatalf("Agent.SystemPrompt = %q, want %q", loaded.Config.Agent.SystemPrompt, "X")
+	}
+	if loaded.Config.Agent.MaxIterations != 17 {
+		t.Fatalf("Agent.MaxIterations = %d, want 17", loaded.Config.Agent.MaxIterations)
 	}
 }
 
@@ -184,6 +189,32 @@ func TestLoadProjectOverridesGlobalProviderModel(t *testing.T) {
 	}
 }
 
+func TestLoadProjectOverridesGlobalAgentMaxIterations(t *testing.T) {
+	home := t.TempDir()
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectConfigDir := filepath.Join(repo, ".agens")
+	if err := os.Mkdir(projectConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[agent]\nmax_iterations = 11\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectConfigDir, "config.toml"), []byte("[agent]\nmax_iterations = 13\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: filepath.Join(repo, "nested"), Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+	if loaded.Config.Agent.MaxIterations != 13 {
+		t.Fatalf("Agent.MaxIterations = %d, want 13", loaded.Config.Agent.MaxIterations)
+	}
+}
+
 func TestLoadExpandsBaseURLOnlyNotSystemPrompt(t *testing.T) {
 	home := t.TempDir()
 	toml := "[provider]\nbase_url = \"$AGENS_URL\"\n\n[agent]\nsystem_prompt = \"budget is $AGENS_URL literal\"\n"
@@ -201,5 +232,30 @@ func TestLoadExpandsBaseURLOnlyNotSystemPrompt(t *testing.T) {
 	want := "budget is $AGENS_URL literal"
 	if loaded.Config.Agent.SystemPrompt != want {
 		t.Fatalf("Agent.SystemPrompt = %q, want literal %q", loaded.Config.Agent.SystemPrompt, want)
+	}
+}
+
+func TestLoadRejectsAgentMaxIterationsLessThanOne(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value int
+	}{
+		{name: "zero", value: 0},
+		{name: "negative", value: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(fmt.Sprintf("[agent]\nmax_iterations = %d\n", tc.value)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: t.TempDir(), Env: map[string]string{}})
+			if err == nil {
+				t.Fatalf("LoadFrom() error = nil, want an error for max_iterations = %d", tc.value)
+			}
+			if !strings.Contains(err.Error(), "max_iterations") {
+				t.Fatalf("LoadFrom() error = %q, want it to mention max_iterations", err.Error())
+			}
+		})
 	}
 }

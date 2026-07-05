@@ -18,7 +18,7 @@ var ErrMaxIterations = errors.New("agentloop: max iterations reached")
 var errModelRequired = errors.New("agentloop: a model is required, configure one with WithModel")
 
 // defaultMaxIterations is used when WithMaxIterations is not supplied.
-const defaultMaxIterations = 20
+const defaultMaxIterations = 60
 
 // Loop drives one synchronous agent turn loop: per iteration it builds a
 // provider.ChatRequest from the configured system prompt and the current

@@ -57,6 +57,15 @@ Agens uses TOML files for hand-authored bootstrap configuration:
 
 Project config overrides global config. Missing files are valid and load defaults.
 
+Example:
+
+```toml
+[agent]
+# Maximum model/tool loop iterations for one prompt. Must be >= 1.
+# CLI `--max-iterations` overrides this value; unset uses the internal default of 60.
+max_iterations = 60
+```
+
 Mutable runtime state does not belong in TOML config. Sessions, remembered permissions, model caches, discovered MCP state, and last-used values should be stored in SQLite by later tasks.
 
 ## TDD

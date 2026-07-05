@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 func applyPatch(cfg *Config, patch configPatch) {
 	applyOptionsPatch(cfg, patch.Options)
 	applyProviderPatch(cfg, patch.Provider)
@@ -40,6 +42,9 @@ func applyAgentPatch(cfg *Config, patch *agentPatch) {
 	if patch.SystemPrompt != nil {
 		cfg.Agent.SystemPrompt = *patch.SystemPrompt
 	}
+	if patch.MaxIterations != nil {
+		cfg.Agent.MaxIterations = *patch.MaxIterations
+	}
 }
 
 func expandPatch(patch *configPatch, env map[string]string) error {
@@ -47,6 +52,13 @@ func expandPatch(patch *configPatch, env map[string]string) error {
 		return err
 	}
 	return expandProviderPatch(patch.Provider, env)
+}
+
+func validatePatch(patch configPatch) error {
+	if patch.Agent != nil && patch.Agent.MaxIterations != nil && *patch.Agent.MaxIterations < 1 {
+		return fmt.Errorf("agent.max_iterations must be >= 1")
+	}
+	return nil
 }
 
 func expandOptionsPatch(patch *optionsPatch, env map[string]string) error {

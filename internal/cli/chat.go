@@ -42,6 +42,9 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if cmd.Flags().Changed("max-iterations") && opts.MaxIterations < 1 {
+				return errors.New("chat: --max-iterations must be >= 1")
+			}
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -80,6 +83,7 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 
 	cmd.Flags().StringVar(&opts.Model, "model", "", "override the configured model")
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
+	cmd.Flags().IntVar(&opts.MaxIterations, "max-iterations", 0, "override the configured agent loop iteration limit")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
 
 	return cmd
