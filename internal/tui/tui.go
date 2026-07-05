@@ -144,9 +144,11 @@ type Model struct {
 	sessionErr        error
 
 	// subagentTreeOpen shows the active-subagent tree overlay; subagentIdx is the
-	// highlighted row within the flattened tree.
+	// highlighted row within the flattened tree. subagentFocusID, when non-empty,
+	// replaces the conversation with that subagent's live focus view.
 	subagentTreeOpen bool
 	subagentIdx      int
+	subagentFocusID  string
 
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
@@ -329,6 +331,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.subagentTreeOpen {
 			swallow = true
 			m.handleSubagentTreeKey(msg)
+			break
+		}
+		if m.subagentFocusID != "" && msg.Type != tea.KeyCtrlC {
+			swallow = true
+			m.handleSubagentFocusKey(msg)
 			break
 		}
 		if m.filePickerOpen {
@@ -558,7 +565,7 @@ func (m *Model) View() string {
 	}
 
 	base := lipgloss.JoinVertical(lipgloss.Left,
-		m.messages.View(),
+		m.conversationView(),
 		gap,
 		m.input.View(),
 		m.status.View(),
@@ -836,6 +843,8 @@ func (m *Model) NewConversation() {
 	m.history = nil
 	m.messages = NewMessages()
 	m.sessionID = m.newSessionID()
+	m.subagentFocusID = ""
+	m.subagentTreeOpen = false
 	m.layout()
 }
 

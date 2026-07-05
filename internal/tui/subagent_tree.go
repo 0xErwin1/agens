@@ -42,6 +42,13 @@ func (m *Model) handleSubagentTreeKey(msg tea.KeyMsg) {
 
 	case tea.KeyDown, tea.KeyTab:
 		m.subagentIdx = (m.subagentIdx + 1) % n
+
+	case tea.KeyEnter:
+		rows := m.messages.orderedSubagents()
+		if m.subagentIdx < len(rows) {
+			m.subagentFocusID = rows[m.subagentIdx].state.id
+			m.subagentTreeOpen = false
+		}
 	}
 }
 
@@ -136,7 +143,7 @@ func renderSubagentTree(rows []subagentRow, selected, width int) string {
 
 	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Subagents") +
 		lipgloss.NewStyle().Foreground(theme.Muted()).Render(fmt.Sprintf("  (%d active)", countRunningSubagents(rows))))
-	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("↑/↓ navigate · esc close"))
+	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render("↑/↓ navigate · enter open · esc close"))
 
 	var body []string
 	if len(rows) == 0 {
