@@ -16,14 +16,14 @@ func subagentEvent(kind agentloop.LoopEventKind, sub agentloop.Subagent) StreamM
 func TestModel_SubagentEventsDriveTheLivePanel(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
-	sendMsg(m, subagentEvent(agentloop.LoopSubagentStarted, agentloop.Subagent{ID: "s1", Name: "explore", Model: "gpt-5.5"}))
-	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", Activity: "read"}))
+	sendMsg(m, subagentEvent(agentloop.LoopSubagentStarted, agentloop.Subagent{ID: "s1", Name: "explore", Model: "gpt-5.5", Prompt: "look into X"}))
+	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", ToolCall: message.ToolUsePart{ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)}}))
 	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", Tokens: 1200}))
 
-	// While running, the panel shows the subagent's name, model, token total and
-	// its latest activity.
+	// While running, the panel shows the subagent's name, model, token total, its
+	// task and its latest tool with the argument.
 	running := stripANSI(m.View())
-	for _, want := range []string{"explore", "gpt-5.5", "1.2K tok", "read"} {
+	for _, want := range []string{"explore", "gpt-5.5", "1.2K tok", "look into X", "read a.go"} {
 		if !strings.Contains(running, want) {
 			t.Fatalf("running panel = %q, want it to contain %q", running, want)
 		}

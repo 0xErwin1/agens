@@ -12,15 +12,15 @@ func TestSubagentFocus_ShowsHeaderActivityAndBreadcrumb(t *testing.T) {
 	m := NewMessages()
 	m.SetSize(72, 16)
 
-	m.StartSubagent("a", "", "explore", "gpt-5.5", "high")
-	m.AddSubagentActivity("a", "reading files")
-	m.AddSubagentActivity("a", "summarizing")
+	m.StartSubagent("a", "", "explore", "gpt-5.5", "investigate X")
+	m.AddSubagentTool("a", "t1", "read", "a.go")
+	m.AddSubagentTool("a", "t2", "grep", "needle")
 	m.UpdateSubagentProgress("a", 1500, 900*time.Millisecond)
 
 	siblings, idx := m.subagentSiblings("a")
 	view := stripANSI(renderSubagentFocus(m.findSubagent("a"), siblings, idx, m.width, m.height))
 
-	for _, want := range []string{"explore", "gpt-5.5", "high", "Activity", "reading files", "summarizing", "esc back"} {
+	for _, want := range []string{"explore", "gpt-5.5", "Task", "investigate X", "Activity", "read a.go", "grep needle", "esc back"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("focus view = %q, want it to contain %q", view, want)
 		}

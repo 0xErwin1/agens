@@ -952,13 +952,18 @@ func TestSubagentRunner_PropagatesLoopError(t *testing.T) {
 }
 
 func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
+	// The subagent's finalized assistant message carries two tool calls; the sink
+	// turns each into a subagent activity event.
+	toolMsg := message.NewMessage(message.RoleAssistant,
+		message.ToolUsePart{ID: "t1", Name: "read"},
+		message.ToolUsePart{ID: "t2", Name: "bash"},
+	)
 	fl := &fakeLoop{
 		ret: []message.Message{
 			message.NewMessage(message.RoleAssistant, message.TextPart{Text: "final report"}),
 		},
 		emits: []agentloop.LoopEvent{
-			{Kind: agentloop.LoopToolCallStarted, ToolCall: message.ToolUsePart{Name: "read"}},
-			{Kind: agentloop.LoopToolCallStarted, ToolCall: message.ToolUsePart{Name: "bash"}},
+			{Kind: agentloop.LoopMessageDone, Message: &toolMsg},
 		},
 	}
 
@@ -998,7 +1003,7 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 		if ev.Subagent.ID != id {
 			t.Fatalf("event %+v uses a different subagent id, want all %q", ev, id)
 		}
-		if ev.Kind == agentloop.LoopSubagentActivity && ev.Subagent.Activity != "" {
+		if ev.Kind == agentloop.LoopSubagentActivity && ev.Subagent.ToolCall.Name != "" {
 			activity++
 		}
 	}

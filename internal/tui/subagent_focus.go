@@ -60,13 +60,25 @@ func renderSubagentFocus(s *subagentState, siblings []*subagentState, index, wid
 	if meta := s.metaLine(); meta != "" {
 		top = append(top, focusLine(muted.Render(meta), width))
 	}
-	top = append(top, "", focusLine(muted.Bold(true).Render("Activity"), width))
 
-	if len(s.activity) == 0 {
+	if s.prompt != "" {
+		top = append(top, "", focusLine(muted.Bold(true).Render("Task"), width))
+		for _, ln := range strings.Split(s.prompt, "\n") {
+			top = append(top, focusLine(muted.Render(ln), width))
+		}
+	}
+
+	top = append(top, "", focusLine(muted.Bold(true).Render("Activity"), width))
+	if len(s.tools) == 0 {
 		top = append(top, focusLine(muted.Italic(true).Render("(waiting…)"), width))
 	} else {
-		for _, ln := range s.activity {
-			top = append(top, focusLine(muted.Render(subagentActivityPrefix+ln), width))
+		for _, t := range s.tools {
+			top = append(top, focusLine(muted.Render(subagentToolLine(t)), width))
+			if t.done && t.result != "" {
+				for _, ln := range reduceLines(t.result, subagentToolResultMaxLines) {
+					top = append(top, focusLine(muted.Render("  "+ln), width))
+				}
+			}
 		}
 	}
 

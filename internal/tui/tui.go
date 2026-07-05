@@ -1286,14 +1286,16 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 
 	case agentloop.LoopSubagentStarted:
 		s := msg.Event.Subagent
-		m.messages.StartSubagent(s.ID, s.ParentID, s.Name, s.Model, "")
+		m.messages.StartSubagent(s.ID, s.ParentID, s.Name, s.Model, s.Prompt)
 
 	case agentloop.LoopSubagentActivity:
 		s := msg.Event.Subagent
-		if s.Activity != "" {
-			m.messages.AddSubagentActivity(s.ID, s.Activity)
-		}
-		if s.Tokens > 0 {
+		switch {
+		case s.ToolCall.Name != "":
+			m.messages.AddSubagentTool(s.ID, s.ToolCall.ID, s.ToolCall.Name, permissionDetail(s.ToolCall.Input))
+		case s.ToolResult.ToolUseID != "":
+			m.messages.CompleteSubagentTool(s.ID, s.ToolResult.ToolUseID, toolResultText(s.ToolResult), s.ToolResult.IsError)
+		case s.Tokens > 0:
 			m.messages.UpdateSubagentProgress(s.ID, s.Tokens, 0)
 		}
 

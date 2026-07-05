@@ -201,8 +201,8 @@ func subagentTreeRows(rows []subagentRow, selected int, theme Theme, inner int) 
 
 		// A running subagent shows its current step beneath the row so the roster
 		// answers "what is it doing" at a glance, aligned under the name.
-		if s.status == subagentRunning && len(s.activity) > 0 {
-			detail := "  " + indent + "  " + subagentActivityPrefix + s.activity[len(s.activity)-1]
+		if s.status == subagentRunning && len(s.tools) > 0 {
+			detail := "  " + indent + "  " + subagentToolLine(s.tools[len(s.tools)-1])
 			rendered += "\n" + lipgloss.NewStyle().Foreground(theme.Muted()).Inline(true).MaxWidth(inner).Render(detail)
 		}
 
