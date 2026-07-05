@@ -809,21 +809,27 @@ func (m *Model) onEnter() tea.Cmd {
 	}
 
 	if strings.HasPrefix(value, "/") {
-		// Running commands mid-turn is a separate concern; while a turn runs a
-		// slash command is ignored rather than executed.
-		if m.running {
+		c, ok := m.commands.Lookup(value)
+		if !ok {
+			m.input.Reset()
+			m.closePalette()
+			m.messages.AddInfo("unknown command: " + value)
+			m.layout()
 			return nil
 		}
 
-		if c, ok := m.commands.Lookup(value); ok {
-			return m.runCommand(c)
+		// A command that would mutate the in-flight turn or the loop's live
+		// settings is refused while a turn runs; safe ones (help, select, the
+		// subagent overlays, quit) run immediately.
+		if m.running && !c.SafeWhileRunning {
+			m.input.Reset()
+			m.closePalette()
+			m.messages.AddInfo(c.Name + " is not available while a turn is running")
+			m.layout()
+			return nil
 		}
 
-		m.input.Reset()
-		m.closePalette()
-		m.messages.AddInfo("unknown command: " + value)
-		m.layout()
-		return nil
+		return m.runCommand(c)
 	}
 
 	// A plain message typed while a turn is running is queued and sent when the
@@ -843,11 +849,7 @@ func (m *Model) onEnter() tea.Cmd {
 func (m *Model) refreshPalette() {
 	previous := m.showPalette
 
-	if m.running {
-		m.paletteItems = nil
-	} else {
-		m.paletteItems = m.commands.Match(m.input.Value())
-	}
+	m.paletteItems = m.commands.MatchRunnable(m.input.Value(), m.running)
 
 	m.showPalette = len(m.paletteItems) > 0
 	if m.paletteIdx >= len(m.paletteItems) {

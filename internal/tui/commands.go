@@ -45,11 +45,14 @@ type CommandContext interface {
 type CommandFunc func(ctx CommandContext) tea.Cmd
 
 // Command is one slash command: how it is named and described in the palette,
-// and what it does when run.
+// and what it does when run. SafeWhileRunning marks a command that neither
+// mutates the in-flight turn nor the agent loop's live settings, so it may run
+// while a turn is executing; the rest are offered only when idle.
 type Command struct {
-	Name string
-	Desc string
-	Run  CommandFunc
+	Name             string
+	Desc             string
+	Run              CommandFunc
+	SafeWhileRunning bool
 }
 
 // CommandRegistry holds the available slash commands, ordered for display and
@@ -105,6 +108,24 @@ func (r *CommandRegistry) Match(input string) []Command {
 	return out
 }
 
+// MatchRunnable is Match narrowed to the commands offered in the current state:
+// while a turn is running only SafeWhileRunning commands are shown, so the
+// palette never suggests a command that cannot run mid-turn.
+func (r *CommandRegistry) MatchRunnable(input string, running bool) []Command {
+	matched := r.Match(input)
+	if !running {
+		return matched
+	}
+
+	out := make([]Command, 0, len(matched))
+	for _, c := range matched {
+		if c.SafeWhileRunning {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // Lookup returns the command exactly named by input's token.
 func (r *CommandRegistry) Lookup(input string) (Command, bool) {
 	c, ok := r.byName[commandToken(input)]
@@ -149,20 +170,20 @@ func defaultCommands() *CommandRegistry {
 		Command{Name: "/sessions", Desc: "resume a saved conversation", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSessionPicker()
 		}},
-		Command{Name: "/subagents", Desc: "list active subagents", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSubagentTree()
 		}},
-		Command{Name: "/subagents-demo", Desc: "play a mocked subagent delegation", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/subagents-demo", Desc: "play a mocked subagent delegation", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.PlaySubagentDemo()
 		}},
-		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.ToggleMouse()
 		}},
-		Command{Name: "/help", Desc: "show commands and shortcuts", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/help", Desc: "show commands and shortcuts", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			ctx.Notify(ctx.CommandHelp())
 			return nil
 		}},
-		Command{Name: "/quit", Desc: "quit agens", Run: func(CommandContext) tea.Cmd {
+		Command{Name: "/quit", Desc: "quit agens", SafeWhileRunning: true, Run: func(CommandContext) tea.Cmd {
 			return tea.Quit
 		}},
 	)
