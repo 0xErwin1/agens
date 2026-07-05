@@ -115,7 +115,7 @@ func subagentStatusMark(theme Theme, status subagentStatus) (string, lipgloss.Co
 	case subagentFailed:
 		return "✗", theme.Error()
 	default:
-		return "•", theme.Accent()
+		return "●", theme.Accent()
 	}
 }
 
@@ -190,8 +190,16 @@ func subagentTreeRows(rows []subagentRow, selected int, theme Theme, inner int) 
 		if meta := s.metaLine(); meta != "" {
 			line += "  " + lipgloss.NewStyle().Foreground(theme.Muted()).Render(meta)
 		}
+		rendered := lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(line)
 
-		out = append(out, lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(line))
+		// A running subagent shows its current step beneath the row so the roster
+		// answers "what is it doing" at a glance, aligned under the name.
+		if s.status == subagentRunning && len(s.activity) > 0 {
+			detail := "  " + indent + "  " + subagentActivityPrefix + s.activity[len(s.activity)-1]
+			rendered += "\n" + lipgloss.NewStyle().Foreground(theme.Muted()).Inline(true).MaxWidth(inner).Render(detail)
+		}
+
+		out = append(out, rendered)
 	}
 	return out
 }

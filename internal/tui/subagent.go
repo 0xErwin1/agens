@@ -15,6 +15,10 @@ const subagentGlyph = "◆"
 // so a long-running subagent's step history cannot grow the panel without bound.
 const subagentActivityMax = 6
 
+// subagentActivityPrefix marks a subagent's activity/step lines, echoing the
+// child-line connector opencode uses in its task blocks.
+const subagentActivityPrefix = "↳ "
+
 // subagentStatus tracks a delegated subagent's lifecycle for its inline panel.
 type subagentStatus int
 
@@ -204,7 +208,10 @@ func (m *Messages) renderSubagent(s *subagentState) string {
 		return header
 	}
 
-	bodyText := toolResultIndent + strings.Join(lines, "\n"+toolResultIndent)
-	body := lipgloss.NewStyle().Foreground(theme.Muted()).MarginLeft(indent).Width(width).Render(bodyText)
+	prefixed := make([]string, len(lines))
+	for i, ln := range lines {
+		prefixed[i] = subagentActivityPrefix + ln
+	}
+	body := lipgloss.NewStyle().Foreground(theme.Muted()).MarginLeft(indent).Width(width).Render(strings.Join(prefixed, "\n"))
 	return header + "\n" + body
 }
