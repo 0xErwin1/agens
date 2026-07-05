@@ -10,22 +10,31 @@ import (
 
 	"github.com/iperez/agens/internal/agentdef"
 	"github.com/iperez/agens/internal/provider"
+	"github.com/iperez/agens/internal/tool/task"
 )
 
-// agentsModel builds a model wired with the built-in agents, a two-model
-// catalog, and projectRoot as the destination for saved definition files.
+// agentsModel builds a model wired with the built-in agents, a live catalog
+// seeded from them, a two-model provider catalog, and projectRoot as the
+// destination for saved definition files.
 func agentsModel(t *testing.T, projectRoot string) *Model {
 	t.Helper()
 	defs, err := agentdef.Load("", "")
 	if err != nil {
 		t.Fatalf("agentdef.Load() error = %v", err)
 	}
+
+	seed := make([]task.Agent, 0)
+	for _, d := range defs.Subagents() {
+		seed = append(seed, task.Agent{Name: d.Name, Description: d.Description, Models: d.Models})
+	}
+
 	m := New(Deps{
-		Loop:    &scriptedLoopRunner{},
-		Model:   "gpt-5.5",
-		Models:  fakeLister{models: []provider.ModelInfo{{ID: "gpt-5.5"}, {ID: "gpt-4.1"}}},
-		Agents:  defs,
-		Project: projectRoot,
+		Loop:      &scriptedLoopRunner{},
+		Model:     "gpt-5.5",
+		Models:    fakeLister{models: []provider.ModelInfo{{ID: "gpt-5.5"}, {ID: "gpt-4.1"}}},
+		Agents:    defs,
+		Subagents: task.NewCatalog(seed),
+		Project:   projectRoot,
 	})
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return m
@@ -81,6 +90,15 @@ func TestModel_AgentsMenuTogglesAndSavesModels(t *testing.T) {
 	def, _ := m.agents.ByName("build")
 	if len(def.Models) != 1 || def.Models[0] != "gpt-5.5" {
 		t.Fatalf("in-memory build.Models = %v, want [gpt-5.5]", def.Models)
+	}
+
+	// The live catalog the running loop reads reflects the edit immediately.
+	for _, a := range m.subagents.Agents() {
+		if a.Name == "build" {
+			if len(a.Models) != 1 || a.Models[0] != "gpt-5.5" {
+				t.Fatalf("live catalog build.Models = %v, want [gpt-5.5] applied this session", a.Models)
+			}
+		}
 	}
 }
 

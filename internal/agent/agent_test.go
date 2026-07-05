@@ -891,7 +891,8 @@ func TestBuildGate_ExcludesTaskSoSubagentsDoNotRecurse(t *testing.T) {
 
 func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
 	runner := &fakeSubRunner{out: "subagent report"}
-	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner, loadTestDefs(t))
+	catalog := task.NewCatalog(subagentOptions(loadTestDefs(t)))
+	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner, catalog)
 	if err != nil {
 		t.Fatalf("buildParentGate() error = %v, want nil", err)
 	}

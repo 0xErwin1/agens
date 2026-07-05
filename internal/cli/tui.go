@@ -15,6 +15,7 @@ import (
 	"github.com/iperez/agens/internal/config"
 	"github.com/iperez/agens/internal/permission"
 	"github.com/iperez/agens/internal/session"
+	"github.com/iperez/agens/internal/tool/task"
 	"github.com/iperez/agens/internal/tui"
 )
 
@@ -31,6 +32,7 @@ type tuiSession struct {
 	files        tui.FileSource
 	project      string
 	agents       *agentdef.Set
+	subagents    *task.Catalog
 
 	collapseThinking   bool
 	truncateToolOutput bool
@@ -92,6 +94,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Files:              sess.files,
 			Project:            sess.project,
 			Agents:             sess.agents,
+			Subagents:          sess.subagents,
 			ResumeID:           resumeID,
 			OpenSessions:       openSessions,
 			CollapseThinking:   sess.collapseThinking,
@@ -135,6 +138,12 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	if opts.ProjectRoot == "" {
 		opts.ProjectRoot = loaded.ProjectRoot
 	}
+
+	// A shared subagent catalog lets the agents menu change what a delegation may
+	// pick in the current session: BuildLoop seeds it and the task tool reads it,
+	// while the TUI holds the same instance and edits it.
+	catalog := task.NewCatalog(nil)
+	opts.Subagents = catalog
 
 	modelName, err := agent.ResolveModel(loaded.Config, creds, opts)
 	if err != nil {
@@ -181,6 +190,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		files:              files,
 		project:            opts.ProjectRoot,
 		agents:             defs,
+		subagents:          catalog,
 		collapseThinking:   loaded.Config.UI.CollapseThinking,
 		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,
 	}, nil

@@ -3,7 +3,8 @@
 // returns its final report to the caller. The subagent is executed through an
 // injected Runner, so this package depends on neither the agent loop nor a
 // provider. The set of selectable subagents — and, per subagent, the models it
-// may run on — is supplied to New, keeping this package free of any dependency
+// may run on — is supplied as a mutable Catalog, so a surface can update what a
+// delegation may pick mid-session, keeping this package free of any dependency
 // on the agent-definition source.
 package task
 
@@ -44,29 +45,33 @@ type Agent struct {
 }
 
 // Tool is the "task" tool. It hands a Request to a subagent through its Runner
-// and returns whatever the subagent reports back. The agents slice is
-// advertised to the model as the selectable subagents and used to validate the
-// requested agent and model before a delegation runs.
+// and returns whatever the subagent reports back. The selectable subagents come
+// from catalog, read on each schema build and each execution so an edit to the
+// shared catalog takes effect on the next turn.
 type Tool struct {
-	runner Runner
-	agents []Agent
-	byName map[string]Agent
+	runner  Runner
+	catalog *Catalog
 }
 
-// New returns a task Tool backed by runner and offering agents as the
-// selectable subagents. It panics if runner is nil, since a task tool that
-// cannot run a subagent is a wiring bug the composition root must fail fast on.
-func New(runner Runner, agents []Agent) *Tool {
+// New returns a task Tool backed by runner and offering the subagents of
+// catalog. A nil catalog offers no selectable subagents (the tool takes only a
+// description). It panics if runner is nil, since a task tool that cannot run a
+// subagent is a wiring bug the composition root must fail fast on.
+func New(runner Runner, catalog *Catalog) *Tool {
 	if runner == nil {
 		panic("task: New called with a nil Runner")
 	}
 
-	byName := make(map[string]Agent, len(agents))
-	for _, a := range agents {
-		byName[a.Name] = a
-	}
+	return &Tool{runner: runner, catalog: catalog}
+}
 
-	return &Tool{runner: runner, agents: agents, byName: byName}
+// agents returns the current selectable subagents, or nil when no catalog is
+// wired.
+func (t *Tool) agents() []Agent {
+	if t.catalog == nil {
+		return nil
+	}
+	return t.catalog.Agents()
 }
 
 func (t *Tool) Name() string { return "task" }
@@ -77,7 +82,7 @@ func (t *Tool) Description() string {
 		"separable pieces of work (deep research, a focused change) out of the main " +
 		"conversation's context. The subagent runs to completion before you continue."
 
-	if len(t.agents) == 0 {
+	if len(t.agents()) == 0 {
 		return base
 	}
 
@@ -93,11 +98,11 @@ func (t *Tool) Schema() *jsonschema.Schema {
 		},
 	}
 
-	if len(t.agents) > 0 {
+	if agents := t.agents(); len(agents) > 0 {
 		props["agent"] = &jsonschema.Schema{
 			Type:        "string",
-			Enum:        agentEnum(t.agents),
-			Description: agentParamDescription(t.agents),
+			Enum:        agentEnum(agents),
+			Description: agentParamDescription(agents),
 		}
 		props["model"] = &jsonschema.Schema{
 			Type: "string",
@@ -194,18 +199,25 @@ func (t *Tool) Execute(ctx context.Context, input json.RawMessage) (tool.Result,
 // allowed for the chosen agent.
 func (t *Tool) resolveRequest(in taskInput) (Request, string) {
 	req := Request(in)
-	if len(t.agents) == 0 {
+
+	agents := t.agents()
+	if len(agents) == 0 {
 		return req, ""
+	}
+
+	byName := make(map[string]Agent, len(agents))
+	for _, a := range agents {
+		byName[a.Name] = a
 	}
 
 	name := in.Agent
 	if name == "" {
-		name = t.agents[0].Name
+		name = agents[0].Name
 	}
 
-	agent, ok := t.byName[name]
+	agent, ok := byName[name]
 	if !ok {
-		return Request{}, fmt.Sprintf("task: unknown agent %q; available agents: %s", in.Agent, t.agentNames())
+		return Request{}, fmt.Sprintf("task: unknown agent %q; available agents: %s", in.Agent, agentNames(agents))
 	}
 	req.Agent = name
 
@@ -216,9 +228,9 @@ func (t *Tool) resolveRequest(in taskInput) (Request, string) {
 	return req, ""
 }
 
-func (t *Tool) agentNames() string {
-	names := make([]string, 0, len(t.agents))
-	for _, a := range t.agents {
+func agentNames(agents []Agent) string {
+	names := make([]string, 0, len(agents))
+	for _, a := range agents {
 		names = append(names, a.Name)
 	}
 	return strings.Join(names, ", ")

@@ -152,8 +152,16 @@ func (m *Model) saveAgentModels() {
 	def.Source = path
 	m.agents.Upsert(def)
 
+	// Update the live catalog so the running loop's task tool honors the new set
+	// on the next turn, not only in a fresh session.
+	applied := m.subagents != nil && m.subagents.SetModels(def.Name, models)
+
 	m.closeAgentMenu()
-	m.messages.AddInfo(fmt.Sprintf("saved %s models — applies to new sessions (/new)", def.Name))
+	if applied {
+		m.messages.AddInfo(fmt.Sprintf("saved %s models — in effect now", def.Name))
+	} else {
+		m.messages.AddInfo(fmt.Sprintf("saved %s models — applies to new sessions (/new)", def.Name))
+	}
 }
 
 // closeAgentMenu hides the menu and clears both levels' state.

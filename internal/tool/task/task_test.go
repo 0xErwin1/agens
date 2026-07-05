@@ -156,7 +156,7 @@ func testAgents() []Agent {
 }
 
 func TestTask_SchemaAdvertisesAgentAndModelWhenOffered(t *testing.T) {
-	schema := New(&fakeRunner{}, testAgents()).Schema()
+	schema := New(&fakeRunner{}, NewCatalog(testAgents())).Schema()
 
 	data, err := json.Marshal(schema)
 	if err != nil {
@@ -185,7 +185,7 @@ func TestTask_SchemaAdvertisesAgentAndModelWhenOffered(t *testing.T) {
 
 func TestTask_ExecuteRoutesAgentAndModel(t *testing.T) {
 	runner := &fakeRunner{out: "ok"}
-	tl := New(runner, testAgents())
+	tl := New(runner, NewCatalog(testAgents()))
 
 	_, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"do it","agent":"plan","model":"gpt-4.1"}`))
 	if err != nil {
@@ -198,7 +198,7 @@ func TestTask_ExecuteRoutesAgentAndModel(t *testing.T) {
 
 func TestTask_ExecuteDefaultsAgentToFirstWhenOmitted(t *testing.T) {
 	runner := &fakeRunner{out: "ok"}
-	tl := New(runner, testAgents())
+	tl := New(runner, NewCatalog(testAgents()))
 
 	if _, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"do it"}`)); err != nil {
 		t.Fatalf("Execute() error = %v, want nil", err)
@@ -210,7 +210,7 @@ func TestTask_ExecuteDefaultsAgentToFirstWhenOmitted(t *testing.T) {
 
 func TestTask_ExecuteUnknownAgentIsToolError(t *testing.T) {
 	runner := &fakeRunner{out: "should not run"}
-	tl := New(runner, testAgents())
+	tl := New(runner, NewCatalog(testAgents()))
 
 	result, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"do it","agent":"ghost"}`))
 	if err != nil {
@@ -226,7 +226,7 @@ func TestTask_ExecuteUnknownAgentIsToolError(t *testing.T) {
 
 func TestTask_ExecuteModelNotAllowedIsToolError(t *testing.T) {
 	runner := &fakeRunner{out: "should not run"}
-	tl := New(runner, testAgents())
+	tl := New(runner, NewCatalog(testAgents()))
 
 	result, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"do it","agent":"plan","model":"gpt-5-codex"}`))
 	if err != nil {
@@ -237,6 +237,35 @@ func TestTask_ExecuteModelNotAllowedIsToolError(t *testing.T) {
 	}
 	if runner.callCount != 0 {
 		t.Fatalf("runner ran %d time(s) for a disallowed model, want 0", runner.callCount)
+	}
+}
+
+func TestTask_CatalogEditTakesEffectOnNextCall(t *testing.T) {
+	runner := &fakeRunner{out: "ok"}
+	catalog := NewCatalog(testAgents())
+	tl := New(runner, catalog)
+
+	// "build" starts unrestricted, so any model is accepted.
+	if _, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"x","agent":"build","model":"gpt-5-codex"}`)); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if runner.gotReq.Model != "gpt-5-codex" {
+		t.Fatalf("first call model = %q, want it accepted while build is unrestricted", runner.gotReq.Model)
+	}
+
+	// Restrict build to a different model; the same delegation is now rejected.
+	catalog.SetModels("build", []string{"gpt-5.5"})
+
+	runner.callCount = 0
+	result, err := tl.Execute(context.Background(), json.RawMessage(`{"description":"x","agent":"build","model":"gpt-5-codex"}`))
+	if err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("Execute() result = %+v, want IsError once the catalog restricts build", result)
+	}
+	if runner.callCount != 0 {
+		t.Fatalf("runner ran %d time(s) after the model was disallowed live, want 0", runner.callCount)
 	}
 }
 

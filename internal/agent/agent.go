@@ -55,6 +55,13 @@ type Options struct {
 	// by a static Allow/Deny rule (write and edit, by default). A nil
 	// Prompter falls back to permission.DenyPrompter{}, denying every Ask.
 	Prompter permission.Prompter
+
+	// Subagents, when non-nil, is the shared catalog of selectable subagents the
+	// task tool reads. BuildLoop populates it from the discovered definitions, so
+	// a surface holding the same catalog (the TUI's agents menu) can change the
+	// models a delegation may pick and have it take effect on the next turn. A nil
+	// value makes BuildLoop use a private catalog, fixed for the session.
+	Subagents *task.Catalog
 }
 
 // BuildLoop resolves cfg, creds, and opts into a ready-to-run
@@ -142,7 +149,16 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	runner := newSubagentRunner(buildSub, defs, model)
 
-	parentGate, err := buildParentGate(opts, runner, defs)
+	// The task tool reads its selectable subagents from a shared catalog: an
+	// opts-provided one (so a surface can edit it live) or a private one. Either
+	// way it is (re)seeded from the discovered definitions.
+	catalog := opts.Subagents
+	if catalog == nil {
+		catalog = task.NewCatalog(nil)
+	}
+	catalog.Replace(subagentOptions(defs))
+
+	parentGate, err := buildParentGate(opts, runner, catalog)
 	if err != nil {
 		return nil, err
 	}
@@ -579,18 +595,18 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*p
 }
 
 // buildParentGate builds the main agent's gate: the base toolset plus the task
-// tool, which delegates to runner and offers the subagent-capable definitions of
-// defs as its selectable agents. task is pre-seeded to Allow so a delegation
-// itself never prompts; the subagent's own side-effecting tool calls are still
-// gated by its own gate. Subagents are built with buildGate (no task), so a
-// delegation does not recurse.
-func buildParentGate(opts Options, runner task.Runner, defs *agentdef.Set) (*permission.Gate, error) {
+// tool, which delegates to runner and offers the subagents of catalog as its
+// selectable agents. task is pre-seeded to Allow so a delegation itself never
+// prompts; the subagent's own side-effecting tool calls are still gated by its
+// own gate. Subagents are built with buildGate (no task), so a delegation does
+// not recurse.
+func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog) (*permission.Gate, error) {
 	reg, rules, err := baseToolset(opts)
 	if err != nil {
 		return nil, err
 	}
 
-	reg.Register(task.New(runner, subagentOptions(defs)))
+	reg.Register(task.New(runner, catalog))
 	rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "task"})
 
 	return assembleGate(reg, rules, opts)

@@ -17,6 +17,7 @@ import (
 	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/provider"
 	"github.com/iperez/agens/internal/session"
+	"github.com/iperez/agens/internal/tool/task"
 )
 
 // Layout dimensions. The input and status bars have fixed heights; the
@@ -167,6 +168,7 @@ type Model struct {
 	// selects an agent in the list, and once agentMenuEditing names an entered
 	// agent, agentModelRows/agentModelIdx drive its per-agent model editor.
 	agents           *agentdef.Set
+	subagents        *task.Catalog
 	agentMenuOpen    bool
 	agentIdx         int
 	agentMenuEditing string
@@ -221,6 +223,10 @@ type Deps struct {
 	// Agents are the agent definitions the /agents menu presents and edits; nil
 	// disables the menu.
 	Agents *agentdef.Set
+	// Subagents is the live catalog the running loop's task tool reads; when set,
+	// an /agents edit updates it so it takes effect this session, not only the
+	// next one.
+	Subagents *task.Catalog
 	// ResumeID, when non-empty, resumes that session on startup. OpenSessions
 	// opens the session picker on startup instead. They back the --resume flag.
 	ResumeID     string
@@ -272,6 +278,7 @@ func New(deps Deps) *Model {
 		files:               deps.Files,
 		project:             deps.Project,
 		agents:              deps.Agents,
+		subagents:           deps.Subagents,
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
 		now:                 now,
