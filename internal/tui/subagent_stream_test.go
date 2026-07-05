@@ -7,6 +7,7 @@ import (
 
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
+	"github.com/iperez/agens/internal/provider"
 )
 
 func subagentEvent(kind agentloop.LoopEventKind, sub agentloop.Subagent) StreamMsg {
@@ -16,9 +17,12 @@ func subagentEvent(kind agentloop.LoopEventKind, sub agentloop.Subagent) StreamM
 func TestModel_SubagentEventsDriveTheLivePanel(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
+	toolMsg := message.NewMessage(message.RoleAssistant, message.ToolUsePart{ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)})
+	usage := &provider.Usage{InputTokens: 800, OutputTokens: 400}
+
 	sendMsg(m, subagentEvent(agentloop.LoopSubagentStarted, agentloop.Subagent{ID: "s1", Name: "explore", Model: "gpt-5.5", Prompt: "look into X"}))
-	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", ToolCall: message.ToolUsePart{ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)}}))
-	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", Tokens: 1200}))
+	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", Event: &agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &toolMsg}}))
+	sendMsg(m, subagentEvent(agentloop.LoopSubagentActivity, agentloop.Subagent{ID: "s1", Event: &agentloop.LoopEvent{Kind: agentloop.LoopUsage, Usage: usage}}))
 
 	// While running, the panel shows the subagent's name, model, token total, its
 	// task and its latest tool with the argument.

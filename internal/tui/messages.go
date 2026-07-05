@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
 )
 
@@ -335,6 +336,55 @@ func (m *Messages) SetDisplayOptions(collapseThinking, truncateToolOutput bool) 
 	m.collapseThinking = collapseThinking
 	m.truncateToolOutput = truncateToolOutput
 	m.rebuild()
+}
+
+// ApplyStream applies one loop stream event to the conversation the same way the
+// main thread does, so a subagent's own conversation renders identically. It
+// covers only the view-level effects (assistant text, reasoning, tool blocks and
+// their results); token and timing accounting stay with the root model.
+func (m *Messages) ApplyStream(ev agentloop.LoopEvent) {
+	switch ev.Kind {
+	case agentloop.LoopIterationStart:
+		m.StartAssistant()
+
+	case agentloop.LoopReasoningDelta:
+		m.AppendReasoningDelta(ev.Text)
+
+	case agentloop.LoopTextDelta:
+		m.FinishReasoning()
+		m.AppendAssistantDelta(ev.Text)
+
+	case agentloop.LoopToolResult:
+		m.CompleteToolCall(ev.ToolResult.ToolUseID, toolResultText(ev.ToolResult), ev.ToolResult.IsError, 0)
+
+	case agentloop.LoopToolBatchFinished:
+		b := ev.ToolBatch
+		m.CompleteLatestToolBatch(b.Total, b.Completed, b.Failed)
+
+	case agentloop.LoopMessageDone:
+		m.FinishReasoning()
+		m.FinishAssistant()
+		if ev.Message != nil {
+			m.addToolCallsFromMessage(*ev.Message)
+		}
+	}
+}
+
+// addToolCallsFromMessage appends the finalized tool invocations in msg as tool
+// blocks (a batch header plus child rows when there are several). It mirrors the
+// root model's addToolCalls without its task filtering, since a subagent never
+// has the task tool.
+func (m *Messages) addToolCallsFromMessage(msg message.Message) {
+	calls := toolUsesInMessage(msg)
+	if len(calls) == 0 {
+		return
+	}
+	if len(calls) > 1 {
+		m.AddToolBatch(calls)
+		return
+	}
+	call := calls[0]
+	m.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
 }
 
 // SetError adds an error block describing a turn-level failure.

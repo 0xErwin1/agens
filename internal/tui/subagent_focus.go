@@ -31,23 +31,41 @@ func (m *Messages) subagentSiblings(id string) (siblings []*subagentState, index
 }
 
 // focusLine insets a single rendered line by the shared gutter and clamps it to
-// width, matching the alignment of the conversation it replaces.
+// width, matching the alignment of the conversation.
 func focusLine(s string, width int) string {
 	return lipgloss.NewStyle().Inline(true).MaxWidth(width).Render(strings.Repeat(" ", contentGutter) + s)
 }
 
-// renderSubagentFocus renders the full-height focus view for one subagent: a
-// header (status glyph, name, metadata), its activity log as a live stream, and
-// a breadcrumb footer pinned to the bottom row for navigating back and between
-// siblings. It always returns exactly height lines so the surrounding input and
-// footer stay put when focus replaces the conversation.
-func renderSubagentFocus(s *subagentState, siblings []*subagentState, index, width, height int) string {
+// focusedSubagent returns the subagent currently entered (focused), or nil when
+// none is or it is no longer present.
+func (m *Model) focusedSubagent() *subagentState {
+	if m.subagentFocusID == "" {
+		return nil
+	}
+	return m.messages.findSubagent(m.subagentFocusID)
+}
+
+// activeMessages is the conversation the scroll and expand keys act on: the
+// entered subagent's own conversation when one is focused, otherwise the main
+// thread.
+func (m *Model) activeMessages() *Messages {
+	if s := m.focusedSubagent(); s != nil && s.convo != nil {
+		return s.convo
+	}
+	return m.messages
+}
+
+// subagentFocusView renders entering a subagent: a compact header with its glyph,
+// name, metadata and task, then the subagent's own conversation — rendered
+// exactly like the main thread and scrollable — and a breadcrumb footer. It fills
+// the screen (the input is hidden while focused). Sizing the subagent's viewport
+// here keeps it bound to the current terminal size.
+func (m *Model) subagentFocusView(s *subagentState) string {
 	theme := CurrentTheme()
+
+	width := m.contentWidth
 	if width < 1 {
 		width = 1
-	}
-	if height < 1 {
-		height = 1
 	}
 
 	muted := lipgloss.NewStyle().Foreground(theme.Muted())
@@ -55,99 +73,56 @@ func renderSubagentFocus(s *subagentState, siblings []*subagentState, index, wid
 	glyph, glyphColor := subagentStatusMark(theme, s.status)
 	title := lipgloss.NewStyle().Foreground(glyphColor).Render(glyph) + " " +
 		lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render(subagentGlyph+" "+s.name)
-
-	top := []string{focusLine(title, width)}
 	if meta := s.metaLine(); meta != "" {
-		top = append(top, focusLine(muted.Render(meta), width))
+		title += "  " + muted.Render(meta)
+	}
+	switch s.status {
+	case subagentFailed:
+		title += "  " + lipgloss.NewStyle().Foreground(theme.Error()).Render("· failed")
+	case subagentDone:
+		title += "  " + muted.Render("· done")
 	}
 
+	header := []string{focusLine(title, width)}
 	if s.prompt != "" {
-		top = append(top, "", focusLine(muted.Bold(true).Render("Task"), width))
-		for _, ln := range strings.Split(s.prompt, "\n") {
-			top = append(top, focusLine(muted.Render(ln), width))
-		}
+		header = append(header, focusLine(muted.Render("task: "+truncateRunes(firstLine(s.prompt), width)), width))
 	}
+	header = append(header, "")
 
-	top = append(top, "", focusLine(muted.Bold(true).Render("Activity"), width))
-	if len(s.tools) == 0 {
-		top = append(top, focusLine(muted.Italic(true).Render("(waiting…)"), width))
-	} else {
-		for _, t := range s.tools {
-			top = append(top, focusLine(muted.Render(subagentToolLine(t)), width))
-			if t.done && t.result != "" {
-				for _, ln := range reduceLines(t.result, subagentToolResultMaxLines) {
-					top = append(top, focusLine(muted.Render("  "+ln), width))
-				}
-			}
-		}
-	}
-
-	if s.status != subagentRunning && s.result != "" {
-		top = append(top, "", focusLine(muted.Bold(true).Render("Result"), width))
-		for _, ln := range strings.Split(s.result, "\n") {
-			top = append(top, focusLine(muted.Render(ln), width))
-		}
-	}
-
+	siblings, index := m.messages.subagentSiblings(s.id)
 	footer := focusLine(muted.Render(subagentFocusCrumbs(s, siblings, index)), width)
 
-	return assembleFocus(top, footer, height)
+	convoHeight := m.height - topPad - len(header) - 1
+	if convoHeight < 1 {
+		convoHeight = 1
+	}
+	if s.convo != nil {
+		s.convo.SetSize(width, convoHeight)
+	}
+
+	lines := make([]string, 0, len(header)+convoHeight+1)
+	lines = append(lines, header...)
+	if s.convo != nil {
+		lines = append(lines, s.convo.View())
+	}
+	lines = append(lines, footer)
+	return strings.Join(lines, "\n")
 }
 
-// subagentFocusCrumbs builds the breadcrumb hint: how to leave the view, the
-// position among siblings and how to move between them, and how to jump to the
-// parent when nested.
+// subagentFocusCrumbs builds the breadcrumb hint: how to scroll and leave the
+// view, the position among siblings and how to move between them.
 func subagentFocusCrumbs(s *subagentState, siblings []*subagentState, index int) string {
-	parts := []string{"esc back"}
+	parts := []string{"↑/↓ scroll", "esc back"}
 	if len(siblings) > 1 {
 		parts = append(parts, fmt.Sprintf("(%d/%d)", index+1, len(siblings)), "←/→ prev/next")
-	}
-	if s.parentID != "" {
-		parts = append(parts, "↑ parent")
 	}
 	return strings.Join(parts, " · ")
 }
 
-// assembleFocus stacks the top lines and the footer into exactly height rows,
-// padding the gap between them and, if the top overflows, truncating it (real
-// transcript scrolling arrives with real subagents).
-func assembleFocus(top []string, footer string, height int) string {
-	lines := make([]string, 0, height)
-	lines = append(lines, top...)
-
-	if len(lines) > height-1 {
-		lines = lines[:height-1]
-	}
-	for len(lines) < height-1 {
-		lines = append(lines, "")
-	}
-	lines = append(lines, footer)
-
-	return strings.Join(lines, "\n")
-}
-
-// conversationView returns what fills the conversation area: the focused
-// subagent's live view when one is focused (and still present), otherwise the
-// normal message list. Reading the subagent's state here keeps the focus view
-// updating in real time as the delegation progresses.
-func (m *Model) conversationView() string {
-	if m.subagentFocusID == "" {
-		return m.messages.View()
-	}
-
-	s := m.messages.findSubagent(m.subagentFocusID)
-	if s == nil {
-		return m.messages.View()
-	}
-
-	siblings, index := m.messages.subagentSiblings(m.subagentFocusID)
-	return renderSubagentFocus(s, siblings, index, m.messages.width, m.messages.height)
-}
-
-// handleSubagentFocusKey handles a keypress while a subagent is focused: Esc
-// leaves the view, Left/Right (or Tab/Shift+Tab) move between siblings, and Up
-// jumps to the parent when nested.
-func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) {
+// handleSubagentFocusKey handles a keypress while a subagent is entered: Esc steps
+// back to the list, Left/Right move between siblings, and Up/Down scroll the
+// subagent's conversation.
+func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) tea.Cmd {
 	switch msg.Type {
 	case tea.KeyEsc:
 		// Step back out to the subagent list rather than all the way to the chat,
@@ -161,11 +136,13 @@ func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) {
 	case tea.KeyRight, tea.KeyTab:
 		m.focusSibling(1)
 
-	case tea.KeyUp:
-		if s := m.messages.findSubagent(m.subagentFocusID); s != nil && s.parentID != "" {
-			m.subagentFocusID = s.parentID
+	case tea.KeyUp, tea.KeyDown:
+		if s := m.focusedSubagent(); s != nil && s.convo != nil {
+			_, cmd := s.convo.Update(msg)
+			return cmd
 		}
 	}
+	return nil
 }
 
 // focusSibling moves focus to the previous or next sibling of the focused

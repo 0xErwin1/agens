@@ -995,20 +995,32 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 		t.Fatalf("finished event Result = %q, want the subagent's report", last.Subagent.Result)
 	}
 
-	// Every started/finished pair shares one id, and the two tool calls became
-	// activity events.
+	// Every event shares one subagent id, and the subagent's own message-done
+	// event is forwarded verbatim as an activity event carrying its two tool calls.
 	id := got[0].Subagent.ID
 	activity := 0
 	for _, ev := range got {
 		if ev.Subagent.ID != id {
 			t.Fatalf("event %+v uses a different subagent id, want all %q", ev, id)
 		}
-		if ev.Kind == agentloop.LoopSubagentActivity && ev.Subagent.ToolCall.Name != "" {
+		if ev.Kind == agentloop.LoopSubagentActivity && ev.Subagent.Event != nil {
 			activity++
+			if ev.Subagent.Event.Kind != agentloop.LoopMessageDone {
+				t.Fatalf("forwarded activity event kind = %v, want the subagent's LoopMessageDone verbatim", ev.Subagent.Event.Kind)
+			}
+			calls := 0
+			for _, part := range ev.Subagent.Event.Message.Parts {
+				if _, ok := part.(message.ToolUsePart); ok {
+					calls++
+				}
+			}
+			if calls != 2 {
+				t.Fatalf("forwarded message carries %d tool calls, want 2", calls)
+			}
 		}
 	}
-	if activity != 2 {
-		t.Fatalf("activity events = %d, want 2 (one per tool the subagent invoked)", activity)
+	if activity != 1 {
+		t.Fatalf("activity events = %d, want 1 (the forwarded message-done event)", activity)
 	}
 }
 

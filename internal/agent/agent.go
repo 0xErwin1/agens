@@ -208,47 +208,22 @@ func (r *subagentRunner) Run(ctx context.Context, description string) (string, e
 	return result, nil
 }
 
-// subagentActivitySink translates a subagent's own LoopEvents into the subagent
-// panel's activity stream on parentEmit: each tool the subagent invokes (with its
-// argument) and each tool result becomes an activity event, and its usage becomes
-// a running token total. It returns nil when there is no parent sink, so an
-// unobserved subagent runs without overhead.
+// subagentActivitySink forwards each of a subagent's own LoopEvents to parentEmit,
+// wrapped as a LoopSubagentActivity tagged with the subagent id and carrying the
+// event verbatim, so a surface can both drive a compact panel and render the
+// subagent's full conversation like the main thread. It returns nil when there is
+// no parent sink, so an unobserved subagent runs without overhead.
 func subagentActivitySink(parentEmit func(agentloop.LoopEvent), id string) func(agentloop.LoopEvent) {
 	if parentEmit == nil {
 		return nil
 	}
 
 	return func(ev agentloop.LoopEvent) {
-		switch ev.Kind {
-		case agentloop.LoopMessageDone:
-			// The finalized assistant message carries each tool call with its
-			// assembled input, so the panel can show what the subagent is acting on.
-			if ev.Message == nil {
-				return
-			}
-			for _, part := range ev.Message.Parts {
-				if call, ok := part.(message.ToolUsePart); ok {
-					parentEmit(agentloop.LoopEvent{
-						Kind:     agentloop.LoopSubagentActivity,
-						Subagent: agentloop.Subagent{ID: id, ToolCall: call},
-					})
-				}
-			}
-
-		case agentloop.LoopToolResult:
-			parentEmit(agentloop.LoopEvent{
-				Kind:     agentloop.LoopSubagentActivity,
-				Subagent: agentloop.Subagent{ID: id, ToolResult: ev.ToolResult},
-			})
-
-		case agentloop.LoopUsage:
-			if ev.Usage != nil {
-				parentEmit(agentloop.LoopEvent{
-					Kind:     agentloop.LoopSubagentActivity,
-					Subagent: agentloop.Subagent{ID: id, Tokens: ev.Usage.InputTokens + ev.Usage.OutputTokens},
-				})
-			}
-		}
+		forwarded := ev
+		parentEmit(agentloop.LoopEvent{
+			Kind:     agentloop.LoopSubagentActivity,
+			Subagent: agentloop.Subagent{ID: id, Event: &forwarded},
+		})
 	}
 }
 

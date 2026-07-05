@@ -1,40 +1,47 @@
 package tui
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/iperez/agens/internal/agentloop"
+	"github.com/iperez/agens/internal/message"
 )
 
-func TestSubagentFocus_ShowsHeaderActivityAndBreadcrumb(t *testing.T) {
-	m := NewMessages()
-	m.SetSize(72, 16)
+func TestSubagentFocus_ShowsHeaderAndSubagentConversation(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 
-	m.StartSubagent("a", "", "explore", "gpt-5.5", "investigate X")
-	m.AddSubagentTool("a", "t1", "read", "a.go")
-	m.AddSubagentTool("a", "t2", "grep", "needle")
-	m.UpdateSubagentProgress("a", 1500, 900*time.Millisecond)
+	m.messages.StartSubagent("a", "", "explore", "gpt-5.5", "investigate the parser")
+	// Feed the subagent's own conversation a tool call so its chat has content.
+	toolMsg := message.NewMessage(message.RoleAssistant, message.ToolUsePart{
+		ID:    "t1",
+		Name:  "read",
+		Input: json.RawMessage(`{"path":"parser.go"}`),
+	})
+	m.messages.ApplySubagentStream("a", agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &toolMsg})
 
-	siblings, idx := m.subagentSiblings("a")
-	view := stripANSI(renderSubagentFocus(m.findSubagent("a"), siblings, idx, m.width, m.height))
+	m.subagentFocusID = "a"
+	view := stripANSI(m.View())
 
-	for _, want := range []string{"explore", "gpt-5.5", "Task", "investigate X", "Activity", "read a.go", "grep needle", "esc back"} {
+	// The header names the subagent and its task; the body is its own conversation
+	// (a real tool block, not a muted summary); the footer is the breadcrumb.
+	for _, want := range []string{"explore", "gpt-5.5", "investigate the parser", "read", "parser.go", "esc back"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("focus view = %q, want it to contain %q", view, want)
 		}
 	}
 }
 
-func TestSubagentFocus_HeightIsExact(t *testing.T) {
-	m := NewMessages()
-	m.SetSize(72, 16)
-	m.StartSubagent("a", "", "explore", "gpt-5.5", "")
+func TestSubagentFocus_FillsTheScreenHeight(t *testing.T) {
+	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // sized at 80x24
+	m.messages.StartSubagent("a", "", "explore", "gpt-5.5", "task")
+	m.subagentFocusID = "a"
 
-	got := renderSubagentFocus(m.findSubagent("a"), []*subagentState{m.findSubagent("a")}, 0, 72, 16)
-	if lines := strings.Count(got, "\n") + 1; lines != 16 {
-		t.Fatalf("focus view height = %d lines, want exactly 16 so the input/footer stay put", lines)
+	if lines := strings.Count(m.View(), "\n") + 1; lines != m.height {
+		t.Fatalf("focus view height = %d lines, want the full screen height %d", lines, m.height)
 	}
 }
 

@@ -316,7 +316,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		swallow = true
-		_, cmd := m.messages.Update(msg)
+		_, cmd := m.activeMessages().Update(msg)
 		cmds = append(cmds, cmd)
 
 	case tea.KeyMsg:
@@ -326,7 +326,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if isScrollKey(msg) {
 			swallow = true
-			_, cmd := m.messages.Update(msg)
+			_, cmd := m.activeMessages().Update(msg)
 			cmds = append(cmds, cmd)
 			break
 		}
@@ -357,7 +357,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.subagentFocusID != "" && msg.Type != tea.KeyCtrlC {
 			swallow = true
-			m.handleSubagentFocusKey(msg)
+			cmds = append(cmds, m.handleSubagentFocusKey(msg))
 			break
 		}
 		if m.filePickerOpen {
@@ -384,7 +384,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.OpenSubagentTree())
 		case tea.KeyCtrlO:
 			swallow = true
-			m.messages.ToggleDetails()
+			m.activeMessages().ToggleDetails()
 		case tea.KeyCtrlP:
 			swallow = true
 			m.tokensDetailed = !m.tokensDetailed
@@ -577,6 +577,12 @@ func (m *Model) expandFileRefs(text string) (expanded string, failed []string) {
 // than inserted into the layout, so the chat never resizes or scrolls when one
 // appears.
 func (m *Model) View() string {
+	// Entering a subagent takes over the whole frame: its conversation renders
+	// like the main thread (scrollable) under a small header, with no input.
+	if s := m.focusedSubagent(); s != nil {
+		return frameView(m.subagentFocusView(s), m.leftPad, topPad)
+	}
+
 	// The gap row above the input doubles as the inline activity indicator
 	// while a turn runs, so "thinking/writing" is visible next to the
 	// conversation rather than only in the footer.
@@ -591,7 +597,7 @@ func (m *Model) View() string {
 	}
 
 	base := lipgloss.JoinVertical(lipgloss.Left,
-		m.conversationView(),
+		m.messages.View(),
 		gap,
 		m.input.View(),
 		m.status.View(),
@@ -1303,15 +1309,7 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.messages.StartSubagent(s.ID, s.ParentID, s.Name, s.Model, s.Prompt)
 
 	case agentloop.LoopSubagentActivity:
-		s := msg.Event.Subagent
-		switch {
-		case s.ToolCall.Name != "":
-			m.messages.AddSubagentTool(s.ID, s.ToolCall.ID, s.ToolCall.Name, permissionDetail(s.ToolCall.Input))
-		case s.ToolResult.ToolUseID != "":
-			m.messages.CompleteSubagentTool(s.ID, s.ToolResult.ToolUseID, toolResultText(s.ToolResult), s.ToolResult.IsError)
-		case s.Tokens > 0:
-			m.messages.UpdateSubagentProgress(s.ID, s.Tokens, 0)
-		}
+		m.handleSubagentActivity(msg.Event.Subagent)
 
 	case agentloop.LoopSubagentFinished:
 		s := msg.Event.Subagent
@@ -1338,6 +1336,39 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 	}
 
 	return tea.Batch(waitFor(m.events), followup)
+}
+
+// handleSubagentActivity applies one forwarded subagent event: it feeds the
+// subagent's own conversation view (so entering it renders like the main thread)
+// and updates the compact inline panel — its tool summary and running token
+// total.
+func (m *Model) handleSubagentActivity(s agentloop.Subagent) {
+	if s.Event == nil {
+		return
+	}
+	ev := *s.Event
+
+	m.messages.ApplySubagentStream(s.ID, ev)
+
+	switch ev.Kind {
+	case agentloop.LoopMessageDone:
+		if ev.Message == nil {
+			return
+		}
+		for _, part := range ev.Message.Parts {
+			if call, ok := part.(message.ToolUsePart); ok {
+				m.messages.AddSubagentTool(s.ID, call.ID, call.Name, permissionDetail(call.Input))
+			}
+		}
+
+	case agentloop.LoopToolResult:
+		m.messages.CompleteSubagentTool(s.ID, ev.ToolResult.ToolUseID, toolResultText(ev.ToolResult), ev.ToolResult.IsError)
+
+	case agentloop.LoopUsage:
+		if ev.Usage != nil {
+			m.messages.UpdateSubagentProgress(s.ID, ev.Usage.InputTokens+ev.Usage.OutputTokens, 0)
+		}
+	}
 }
 
 // subagentExpiryMsg fires after a finished subagent's linger window so the

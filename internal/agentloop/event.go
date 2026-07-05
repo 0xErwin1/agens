@@ -48,6 +48,11 @@ type Subagent struct {
 	ToolResult message.ToolResultPart
 	Tokens     int
 
+	// Event carries the subagent's own stream event verbatim on a
+	// LoopSubagentActivity, so a surface can render the subagent's conversation
+	// exactly like the main thread. Nil on the start/finished events.
+	Event *LoopEvent
+
 	Result string
 	Failed bool
 }

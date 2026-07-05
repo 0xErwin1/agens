@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/iperez/agens/internal/agentloop"
 )
 
 // subagentGlyph marks a delegated subagent panel, distinguishing it from a plain
@@ -69,6 +71,11 @@ type subagentState struct {
 	tools      []subagentTool
 	result     string
 	finishedAt time.Time
+
+	// convo is the subagent's own conversation, rendered exactly like the main
+	// thread when the subagent is entered (focused). It is fed the subagent's
+	// full stream via ApplyStream.
+	convo *Messages
 }
 
 // RunningSubagents reports how many delegated subagents are still executing, so a
@@ -105,6 +112,12 @@ func (m *Messages) StartSubagent(id, parentID, name, model, prompt string) {
 		}
 	}
 
+	// The subagent gets its own conversation view, sharing the parent's display
+	// options and clock, so entering it renders identically to the main thread.
+	convo := NewMessages()
+	convo.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
+	convo.SetClock(m.now)
+
 	m.blocks = append(m.blocks, block{kind: blockSubagent, sub: &subagentState{
 		id:       id,
 		parentID: parentID,
@@ -113,8 +126,20 @@ func (m *Messages) StartSubagent(id, parentID, name, model, prompt string) {
 		model:    model,
 		prompt:   prompt,
 		status:   subagentRunning,
+		convo:    convo,
 	}})
 	m.rebuild()
+}
+
+// ApplySubagentStream feeds one of a subagent's own stream events into its
+// conversation view, so a focused subagent renders like the main thread. It is a
+// no-op for an unknown id.
+func (m *Messages) ApplySubagentStream(id string, ev agentloop.LoopEvent) {
+	sub := m.findSubagent(id)
+	if sub == nil || sub.convo == nil {
+		return
+	}
+	sub.convo.ApplyStream(ev)
 }
 
 // AddSubagentTool records a tool call a subagent started, shown with its name and
