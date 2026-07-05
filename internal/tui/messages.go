@@ -2,6 +2,7 @@ package tui
 
 import (
 	_ "embed"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -53,6 +54,7 @@ const (
 	blockUser blockKind = iota
 	blockAssistant
 	blockTool
+	blockToolBatch
 	blockError
 	blockSystem
 	blockReasoning
@@ -73,11 +75,15 @@ type block struct {
 	text   string
 	detail string
 
-	toolID  string
-	result  string
-	isError bool
-	done    bool
-	dur     time.Duration
+	toolID         string
+	batchID        string
+	batchTotal     int
+	batchCompleted int
+	batchFailed    int
+	result         string
+	isError        bool
+	done           bool
+	dur            time.Duration
 }
 
 // Messages is the scrollable conversation view. Finalized turns are kept as
@@ -182,6 +188,34 @@ func (m *Messages) AddToolCall(id, name, detail string) {
 	m.rebuild()
 }
 
+// AddToolBatch adds one aggregate batch header followed by individually
+// collapsible child tool rows. Each child keeps the same result pairing and
+// expansion behavior as a standalone tool call.
+func (m *Messages) AddToolBatch(calls []message.ToolUsePart) {
+	if len(calls) == 0 {
+		return
+	}
+	if len(calls) == 1 {
+		call := calls[0]
+		m.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
+		return
+	}
+
+	batchID := toolBatchID(len(m.blocks), calls)
+	m.blocks = append(m.blocks, block{kind: blockToolBatch, batchID: batchID, batchTotal: len(calls)})
+	for _, call := range calls {
+		m.blocks = append(m.blocks, block{
+			kind:       blockTool,
+			toolID:     call.ID,
+			batchID:    batchID,
+			batchTotal: len(calls),
+			text:       call.Name,
+			detail:     permissionDetail(call.Input),
+		})
+	}
+	m.rebuild()
+}
+
 // CompleteToolCall fills the pending tool block matching id with its result,
 // error status, and execution duration. It is a no-op when no matching pending
 // block exists (e.g. a duplicate or unknown result).
@@ -197,6 +231,73 @@ func (m *Messages) CompleteToolCall(id, result string, isError bool, dur time.Du
 			return
 		}
 	}
+}
+
+// CompleteLatestToolBatch marks the newest unfinished batch header terminal.
+// The backend batch IDs are execution-oriented while the TUI batch IDs are
+// derived from finalized tool calls, so completion is matched by recency.
+func (m *Messages) CompleteLatestToolBatch(total, completed, failed int) {
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		b := &m.blocks[i]
+		if b.kind != blockToolBatch || b.done {
+			continue
+		}
+		if total > 0 {
+			b.batchTotal = total
+		}
+		b.batchCompleted = completed
+		b.batchFailed = failed
+		b.isError = failed > 0
+		b.done = true
+		m.rebuild()
+		return
+	}
+}
+
+func toolUsesInMessage(msg message.Message) []message.ToolUsePart {
+	calls := make([]message.ToolUsePart, 0)
+	if msg.Role != message.RoleAssistant {
+		return calls
+	}
+	for _, part := range msg.Parts {
+		if call, ok := part.(message.ToolUsePart); ok {
+			calls = append(calls, call)
+		}
+	}
+	return calls
+}
+
+func toolBatchID(blockIndex int, calls []message.ToolUsePart) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("batch:%d:%s", blockIndex, calls[0].ID)
+}
+
+func (m *Messages) addToolUseBlocks(calls []message.ToolUsePart, toolIndex map[string]int) {
+	if len(calls) == 0 {
+		return
+	}
+	if len(calls) > 1 {
+		batchID := toolBatchID(len(m.blocks), calls)
+		m.blocks = append(m.blocks, block{kind: blockToolBatch, batchID: batchID, batchTotal: len(calls)})
+		for _, call := range calls {
+			toolIndex[call.ID] = len(m.blocks)
+			m.blocks = append(m.blocks, block{
+				kind:       blockTool,
+				toolID:     call.ID,
+				batchID:    batchID,
+				batchTotal: len(calls),
+				text:       call.Name,
+				detail:     permissionDetail(call.Input),
+			})
+		}
+		return
+	}
+
+	call := calls[0]
+	toolIndex[call.ID] = len(m.blocks)
+	m.blocks = append(m.blocks, block{kind: blockTool, toolID: call.ID, text: call.Name, detail: permissionDetail(call.Input)})
 }
 
 // ToggleDetails flips whether collapsible blocks (tool output and finished
@@ -235,6 +336,8 @@ func (m *Messages) SetHistory(history []message.Message) {
 	toolIndex := map[string]int{}
 
 	for _, msg := range history {
+		toolUses := toolUsesInMessage(msg)
+		batchInserted := false
 		for _, part := range msg.Parts {
 			switch p := part.(type) {
 			case message.TextPart:
@@ -245,8 +348,14 @@ func (m *Messages) SetHistory(history []message.Message) {
 				m.blocks = append(m.blocks, block{kind: kind, text: p.Text})
 
 			case message.ToolUsePart:
-				toolIndex[p.ID] = len(m.blocks)
-				m.blocks = append(m.blocks, block{kind: blockTool, toolID: p.ID, text: p.Name, detail: permissionDetail(p.Input)})
+				if len(toolUses) > 1 {
+					if !batchInserted {
+						m.addToolUseBlocks(toolUses, toolIndex)
+						batchInserted = true
+					}
+					continue
+				}
+				m.addToolUseBlocks([]message.ToolUsePart{p}, toolIndex)
 
 			case message.ToolResultPart:
 				if i, ok := toolIndex[p.ToolUseID]; ok {
@@ -411,6 +520,9 @@ func (m *Messages) renderBlock(b block) string {
 	case blockTool:
 		return m.renderTool(b)
 
+	case blockToolBatch:
+		return m.renderToolBatch(b)
+
 	case blockError:
 		return m.gutteredBlock(theme.Error(), labelErrorBlock+b.text, true)
 
@@ -423,6 +535,56 @@ func (m *Messages) renderBlock(b block) string {
 	default:
 		return b.text
 	}
+}
+
+// renderToolBatch renders the aggregate header for a same-turn group of tool
+// calls. The header summarizes child completion state only; the child rows
+// below remain the interactive units for inspecting individual tool details.
+func (m *Messages) renderToolBatch(b block) string {
+	theme := CurrentTheme()
+
+	completed := 0
+	failed := 0
+	for _, child := range m.blocks {
+		if child.kind != blockTool || child.batchID != b.batchID {
+			continue
+		}
+		if child.done {
+			completed++
+		}
+		if child.isError {
+			failed++
+		}
+	}
+	if b.batchCompleted > completed {
+		completed = b.batchCompleted
+	}
+	if b.batchFailed > failed {
+		failed = b.batchFailed
+	}
+
+	total := b.batchTotal
+	if total == 0 {
+		total = completed
+	}
+
+	state := fmt.Sprintf("Batch %d/%d running", completed, total)
+	if b.done || (total > 0 && completed >= total) {
+		if failed == 0 && completed >= total {
+			state = fmt.Sprintf("Batch %d/%d succeeded", completed, total)
+		} else {
+			if failed == 0 {
+				failed = 1
+			}
+			state = fmt.Sprintf("Batch %d/%d completed · %d failed", completed, total, failed)
+		}
+	}
+
+	color := theme.Tool()
+	if failed > 0 {
+		color = theme.Error()
+	}
+	return m.gutteredBlock(color, "▦ "+state, true)
 }
 
 // renderTool renders a collapsible tool block: a header line with a disclosure

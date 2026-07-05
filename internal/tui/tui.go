@@ -1175,6 +1175,10 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		m.toolClock = m.now()
 		m.messages.CompleteToolCall(result.ToolUseID, toolResultText(result), result.IsError, dur)
 
+	case agentloop.LoopToolBatchFinished:
+		batch := msg.Event.ToolBatch
+		m.messages.CompleteLatestToolBatch(batch.Total, batch.Completed, batch.Failed)
+
 	case agentloop.LoopMessageDone:
 		m.messages.FinishReasoning()
 		m.messages.FinishAssistant()
@@ -1244,18 +1248,23 @@ func formatTokens(n int) string {
 	}
 }
 
-// addToolCalls appends a tool-call block for each tool invocation in the
-// finalized assistant message, showing the tool name and a detail extracted
-// from its now-assembled arguments (the shell command, the file path).
+// addToolCalls appends finalized tool invocations from the assistant message.
+// Multiple calls from the same message render as one batch header followed by
+// the same individually expandable child tool rows used for standalone calls.
 func (m *Model) addToolCalls(msg *message.Message) {
 	if msg == nil {
 		return
 	}
-	for _, part := range msg.Parts {
-		if call, ok := part.(message.ToolUsePart); ok {
-			m.messages.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
-		}
+	calls := toolUsesInMessage(*msg)
+	if len(calls) == 0 {
+		return
 	}
+	if len(calls) > 1 {
+		m.messages.AddToolBatch(calls)
+		return
+	}
+	call := calls[0]
+	m.messages.AddToolCall(call.ID, call.Name, permissionDetail(call.Input))
 }
 
 // handleDone finalizes a completed turn: it clears the running state, adopts

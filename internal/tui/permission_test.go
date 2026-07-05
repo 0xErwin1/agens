@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -142,11 +143,39 @@ func TestModel_PermissionRequestShowsModal(t *testing.T) {
 	m, _ := modalModel(t)
 
 	view := m.View()
-	if !strings.Contains(view, "Permission required") {
+	if !strings.Contains(view, "Approve this tool call?") {
 		t.Fatalf("View() = %q, want it to show the permission modal", view)
 	}
 	if !strings.Contains(view, "bash") {
 		t.Fatalf("View() = %q, want it to name the requested tool", view)
+	}
+}
+
+func TestRenderPermissionFramesDecisionAsSingleToolCall(t *testing.T) {
+	view := stripANSI(renderPermission(toolCall("bash", `{"command":"rm -rf tmp"}`), 80))
+
+	for _, want := range []string{"Approve this tool call?", "bash", "rm -rf tmp", "y allow", "a always allow", "n deny", "d always deny", "esc skip"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("renderPermission() = %q, want %q", view, want)
+		}
+	}
+	for _, banned := range []string{"batch", "all tools", "whole batch", "bulk", "deny-all"} {
+		if strings.Contains(strings.ToLower(view), banned) {
+			t.Fatalf("renderPermission() = %q, must not imply bulk approval with %q", view, banned)
+		}
+	}
+}
+
+func TestRenderPermissionKeepsDecisionHintsVisibleOnNarrowWidths(t *testing.T) {
+	for _, width := range []int{40, 28} {
+		t.Run(fmt.Sprintf("width-%d", width), func(t *testing.T) {
+			view := stripANSI(renderPermission(toolCall("bash", `{"command":"rm -rf tmp"}`), width))
+			for _, want := range []string{"y/n", "a/d", "esc"} {
+				if !strings.Contains(view, want) {
+					t.Fatalf("renderPermission(width=%d) = %q, want compact hint %q", width, view, want)
+				}
+			}
+		})
 	}
 }
 
@@ -167,7 +196,7 @@ func TestModel_ModalAllowSendsAnswerAndClears(t *testing.T) {
 	if m.pending != nil {
 		t.Fatal("modal is still pending after an answer, want it cleared")
 	}
-	if strings.Contains(m.View(), "Permission required") {
+	if strings.Contains(m.View(), "Approve this tool call?") {
 		t.Fatal("View() still shows the modal after answering")
 	}
 }

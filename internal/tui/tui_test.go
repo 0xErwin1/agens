@@ -267,6 +267,75 @@ func TestModel_ToolResultCompletesBlockWithDuration(t *testing.T) {
 	}
 }
 
+func TestModel_MessageDoneGroupsMultipleToolCalls(t *testing.T) {
+	start := time.Unix(5000, 0)
+	m := New(Deps{
+		Loop:  &scriptedLoopRunner{},
+		Model: "gpt-5.5",
+		Now:   fakeClock(start, start, start.Add(100*time.Millisecond), start.Add(250*time.Millisecond)),
+	})
+	m.Update(tea.WindowSizeMsg{Width: 90, Height: 24})
+
+	done := message.NewMessage(message.RoleAssistant,
+		message.ToolUsePart{ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)},
+		message.ToolUsePart{ID: "t2", Name: "bash", Input: json.RawMessage(`{"command":"go test ./internal/tui"}`)},
+	)
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &done}})
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Batch 0/2 running") {
+		t.Fatalf("View() = %q, want one running batch header for multiple same-message calls", view)
+	}
+	if strings.Count(view, "Batch") != 1 {
+		t.Fatalf("View() = %q, want exactly one batch header", view)
+	}
+	for _, want := range []string{"▸ read", "a.go", "▸ bash", "go test ./internal/tui"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("View() = %q, want child tool row content %q", view, want)
+		}
+	}
+
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopToolBatchStarted, ToolBatch: agentloop.ToolBatch{ID: "iteration-1-tools", Total: 2}}})
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopToolResult, ToolResult: message.ToolResultPart{ToolUseID: "t1", Content: message.Parts{message.TextPart{Text: "a"}}}}})
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopToolResult, ToolResult: message.ToolResultPart{ToolUseID: "t2", Content: message.Parts{message.TextPart{Text: "ok"}}}}})
+
+	view = stripANSI(m.View())
+	if !strings.Contains(view, "Batch 2/2 succeeded") {
+		t.Fatalf("View() = %q, want completed batch summary after child results", view)
+	}
+	if strings.Count(view, "▸ read") != 1 || strings.Count(view, "▸ bash") != 1 {
+		t.Fatalf("View() = %q, want child rows to remain visible without duplicate rows", view)
+	}
+}
+
+func TestModel_BatchFinishedMarksIncompleteBatchTerminal(t *testing.T) {
+	start := time.Unix(6000, 0)
+	m := New(Deps{
+		Loop:  &scriptedLoopRunner{},
+		Model: "gpt-5.5",
+		Now:   fakeClock(start),
+	})
+	m.Update(tea.WindowSizeMsg{Width: 90, Height: 24})
+
+	done := message.NewMessage(message.RoleAssistant,
+		message.ToolUsePart{ID: "t1", Name: "read", Input: json.RawMessage(`{"path":"a.go"}`)},
+		message.ToolUsePart{ID: "t2", Name: "bash", Input: json.RawMessage(`{"command":"go test ./internal/tui"}`)},
+	)
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{Kind: agentloop.LoopMessageDone, Message: &done}})
+	sendMsg(m, StreamMsg{Event: agentloop.LoopEvent{
+		Kind:      agentloop.LoopToolBatchFinished,
+		ToolBatch: agentloop.ToolBatch{Total: 2, Completed: 0, Failed: 1},
+	}})
+
+	view := stripANSI(m.View())
+	if !strings.Contains(view, "Batch 0/2 completed · 1 failed") {
+		t.Fatalf("View() = %q, want incomplete batch marked terminal after batch finish", view)
+	}
+	if strings.Contains(view, "Batch 0/2 running") {
+		t.Fatalf("View() = %q, want batch finish to clear running state", view)
+	}
+}
+
 func TestModel_TurnDoneStopsRunningAndAdoptsHistory(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5")
 

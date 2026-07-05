@@ -158,7 +158,7 @@ func renderPermission(call message.ToolUsePart, width int) string {
 		return lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(s)
 	}
 
-	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Permission required"))
+	title := oneLine(lipgloss.NewStyle().Foreground(theme.Accent()).Bold(true).Render("Approve this tool call?"))
 
 	action := lipgloss.NewStyle().Foreground(theme.Tool()).Render("→ " + call.Name)
 	if detail := permissionDetail(call.Input); detail != "" {
@@ -166,8 +166,14 @@ func renderPermission(call message.ToolUsePart, width int) string {
 	}
 	action = oneLine(action)
 
-	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render(
-		"y allow · a always · n deny · d deny-all · esc skip"))
+	hintText := "y allow · a always allow · n deny · d always deny · esc skip"
+	if inner < len(hintText) {
+		hintText = "y/n once · a/d always · esc"
+	}
+	if inner < len(hintText) {
+		hintText = "y/n · a/d · esc"
+	}
+	hint := oneLine(lipgloss.NewStyle().Foreground(theme.Muted()).Render(hintText))
 
 	content := strings.Join([]string{title, action, "", hint}, "\n")
 
