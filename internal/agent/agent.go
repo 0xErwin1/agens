@@ -107,13 +107,19 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	}
 
 	// A subagent runs the base toolset — with no task tool, so a delegation
-	// never recurses — through its own loop with an isolated conversation. The
-	// task tool on the parent gate hands work to that subagent synchronously.
+	// never recurses — through its own loop with an isolated conversation and a
+	// subagent-flavored system prompt. The task tool on the parent gate hands
+	// work to that subagent synchronously.
 	subGate, err := buildGate(opts)
 	if err != nil {
 		return nil, err
 	}
-	runner := newSubagentRunner(agentloop.New(p, subGate, loopOpts...), "subagent", model)
+
+	subLoopOpts := make([]agentloop.Option, len(loopOpts), len(loopOpts)+1)
+	copy(subLoopOpts, loopOpts)
+	subLoopOpts = append(subLoopOpts, agentloop.WithSystemPrompt(subagentSystemPrompt(systemPrompt)))
+
+	runner := newSubagentRunner(agentloop.New(p, subGate, subLoopOpts...), "subagent", model)
 
 	parentGate, err := buildParentGate(opts, runner)
 	if err != nil {
@@ -127,6 +133,21 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 // narrowed to an interface so the runner can be tested without a provider.
 type loopRunner interface {
 	Run(ctx context.Context, history []message.Message, sink func(agentloop.LoopEvent)) ([]message.Message, error)
+}
+
+// subagentSystemPrompt derives a subagent's system prompt from the main prompt,
+// appending an instruction that it works autonomously on a single delegated task
+// and returns a concise final report, since it cannot delegate further. This is
+// a v1 stand-in until agent-defs (a dedicated subagent definition) lands.
+func subagentSystemPrompt(base string) string {
+	const instruction = "You are running as a subagent handling one delegated task with your own " +
+		"isolated context. Work autonomously to complete it, then return a single, concise " +
+		"final report of what you did and what you found. You cannot delegate to further subagents."
+
+	if base == "" {
+		return instruction
+	}
+	return base + "\n\n" + instruction
 }
 
 // subagentSeq mints unique ids for subagent runs so a surface can correlate a

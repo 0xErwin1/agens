@@ -1017,6 +1017,20 @@ func resultTextOf(m message.Message) string {
 	return b.String()
 }
 
+func TestSubagentSystemPrompt_AppendsInstructionToBase(t *testing.T) {
+	got := subagentSystemPrompt("BASE PROMPT")
+	if !strings.HasPrefix(got, "BASE PROMPT") {
+		t.Fatalf("subagentSystemPrompt() = %q, want it to keep the base prompt", got)
+	}
+	if !strings.Contains(got, "subagent") || !strings.Contains(got, "cannot delegate") {
+		t.Fatalf("subagentSystemPrompt() = %q, want the subagent instruction appended", got)
+	}
+
+	if got := subagentSystemPrompt(""); !strings.Contains(got, "subagent") {
+		t.Fatalf("subagentSystemPrompt(\"\") = %q, want the bare instruction", got)
+	}
+}
+
 func TestLastAssistantText(t *testing.T) {
 	history := []message.Message{
 		message.NewMessage(message.RoleUser, message.TextPart{Text: "do it"}),
