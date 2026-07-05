@@ -143,6 +143,11 @@ type Model struct {
 	sessionLoading    bool
 	sessionErr        error
 
+	// subagentTreeOpen shows the active-subagent tree overlay; subagentIdx is the
+	// highlighted row within the flattened tree.
+	subagentTreeOpen bool
+	subagentIdx      int
+
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
 	// @-picker's state while it is open.
@@ -319,6 +324,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.sessionPickerOpen {
 			swallow = true
 			m.handleSessionPickerKey(msg)
+			break
+		}
+		if m.subagentTreeOpen {
+			swallow = true
+			m.handleSubagentTreeKey(msg)
 			break
 		}
 		if m.filePickerOpen {
@@ -569,6 +579,8 @@ func (m *Model) View() string {
 	case m.sessionPickerOpen:
 		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.sessionShowAll, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
+	case m.subagentTreeOpen:
+		base = overlayAbove(base, renderSubagentTree(m.messages.orderedSubagents(), m.subagentIdx, m.contentWidth), inputRow)
 	case m.filePickerOpen:
 		overlay := renderFileSelector(m.fileItems, m.fileIdx, !m.filesLoaded, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)

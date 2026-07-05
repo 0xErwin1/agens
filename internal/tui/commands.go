@@ -28,8 +28,10 @@ type CommandContext interface {
 	// OpenSessionPicker opens the saved-conversation picker, returning the
 	// command that lists them (or nil when unavailable).
 	OpenSessionPicker() tea.Cmd
+	// OpenSubagentTree opens the active-subagent tree overlay.
+	OpenSubagentTree() tea.Cmd
 	// PlaySubagentDemo plays a mocked subagent delegation in the conversation so
-	// the subagent panel can be seen before real subagents are wired in.
+	// the subagent panel and tree can be seen before real subagents are wired in.
 	PlaySubagentDemo() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
@@ -144,7 +146,10 @@ func defaultCommands() *CommandRegistry {
 		Command{Name: "/sessions", Desc: "resume a saved conversation", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSessionPicker()
 		}},
-		Command{Name: "/subagents", Desc: "show delegated subagents (demo)", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/subagents", Desc: "list active subagents", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenSubagentTree()
+		}},
+		Command{Name: "/subagents-demo", Desc: "play a mocked subagent delegation", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.PlaySubagentDemo()
 		}},
 		Command{Name: "/help", Desc: "show commands and shortcuts", Run: func(ctx CommandContext) tea.Cmd {
