@@ -150,7 +150,10 @@ func (m *Model) conversationView() string {
 func (m *Model) handleSubagentFocusKey(msg tea.KeyMsg) {
 	switch msg.Type {
 	case tea.KeyEsc:
+		// Step back out to the subagent list rather than all the way to the chat,
+		// preserving the tree selection so a second Esc leaves the list.
 		m.subagentFocusID = ""
+		m.subagentTreeOpen = true
 
 	case tea.KeyLeft, tea.KeyShiftTab:
 		m.focusSibling(-1)

@@ -189,6 +189,7 @@ func keyBindingsHelp() string {
 		"shortcuts:",
 		"  enter        send",
 		"  ctrl+c       cancel turn / quit",
+		"  ctrl+↑       subagents: list (↑/↓ · enter open · esc back)",
 		"  ctrl+o       expand / collapse tool output & thinking",
 		"  ctrl+p       toggle detailed token usage",
 		"  pgup / pgdn  scroll the conversation",

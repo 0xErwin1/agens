@@ -28,7 +28,7 @@ func (m *Model) handleSubagentTreeKey(msg tea.KeyMsg) {
 		return
 	}
 
-	n := len(m.messages.orderedSubagents())
+	n := len(m.messages.treeSubagents())
 	if n == 0 {
 		return
 	}
@@ -44,7 +44,7 @@ func (m *Model) handleSubagentTreeKey(msg tea.KeyMsg) {
 		m.subagentIdx = (m.subagentIdx + 1) % n
 
 	case tea.KeyEnter:
-		rows := m.messages.orderedSubagents()
+		rows := m.messages.treeSubagents()
 		if m.subagentIdx < len(rows) {
 			m.subagentFocusID = rows[m.subagentIdx].state.id
 			m.subagentTreeOpen = false

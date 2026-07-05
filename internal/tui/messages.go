@@ -113,7 +113,11 @@ type Messages struct {
 	// result is shown. Both come from the user's UI config.
 	collapseThinking   bool
 	truncateToolOutput bool
-	width, height      int
+	// now supplies the current time for time-based UI (a finished subagent
+	// lingering in the tree); nil falls back to time.Now. The root model injects
+	// its own clock so tests are deterministic.
+	now           func() time.Time
+	width, height int
 
 	// renderer is width-bound: a glamour.TermRenderer wraps to a fixed width,
 	// so it is rebuilt whenever the width changes rather than per render.
@@ -123,7 +127,13 @@ type Messages struct {
 // NewMessages constructs an empty conversation view. Its viewport is sized
 // later via SetSize.
 func NewMessages() *Messages {
-	return &Messages{vp: viewport.New(0, 0)}
+	return &Messages{vp: viewport.New(0, 0), now: time.Now}
+}
+
+// SetClock injects the clock used for time-based UI (subagent list expiry). A nil
+// value restores time.Now.
+func (m *Messages) SetClock(now func() time.Time) {
+	m.now = now
 }
 
 var _ Component = (*Messages)(nil)

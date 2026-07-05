@@ -24,6 +24,10 @@ const subagentToolResultMaxLines = 6
 // single readable line; the full prompt shows when the panel is expanded.
 const subagentPromptMaxRunes = 100
 
+// subagentListLinger is how long a finished subagent stays in the active-subagent
+// tree before it drops off; its inline conversation panel remains as the record.
+const subagentListLinger = 30 * time.Second
+
 // subagentStatus tracks a delegated subagent's lifecycle for its inline panel.
 type subagentStatus int
 
@@ -59,11 +63,12 @@ type subagentState struct {
 	model  string
 	prompt string
 
-	status subagentStatus
-	tokens int
-	dur    time.Duration
-	tools  []subagentTool
-	result string
+	status     subagentStatus
+	tokens     int
+	dur        time.Duration
+	tools      []subagentTool
+	result     string
+	finishedAt time.Time
 }
 
 // RunningSubagents reports how many delegated subagents are still executing, so a
@@ -189,7 +194,42 @@ func (m *Messages) CompleteSubagent(id string, isError bool, dur time.Duration) 
 	if dur > 0 {
 		sub.dur = dur
 	}
+	sub.finishedAt = m.clock()
 	m.rebuild()
+}
+
+// clock returns the current time from the injected clock, defaulting to time.Now
+// when none was set (tests may inject a controlled clock via SetClock).
+func (m *Messages) clock() time.Time {
+	if m.now == nil {
+		return time.Now()
+	}
+	return m.now()
+}
+
+// subagentExpired reports whether a finished subagent has lingered past
+// subagentListLinger and should drop off the active-subagent tree. A running
+// subagent never expires.
+func (m *Messages) subagentExpired(s *subagentState) bool {
+	if s.status == subagentRunning || s.finishedAt.IsZero() {
+		return false
+	}
+	return m.clock().Sub(s.finishedAt) >= subagentListLinger
+}
+
+// treeSubagents is orderedSubagents narrowed to what the active-subagent tree
+// shows: every running subagent plus finished ones still within their linger
+// window. Expired finished subagents drop off the list (their inline panels
+// stay).
+func (m *Messages) treeSubagents() []subagentRow {
+	rows := m.orderedSubagents()
+	out := make([]subagentRow, 0, len(rows))
+	for _, r := range rows {
+		if !m.subagentExpired(r.state) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // metaLine renders the muted header detail: model, token count, and elapsed

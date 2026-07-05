@@ -264,6 +264,7 @@ func New(deps Deps) *Model {
 		mouseEnabled:        true,
 	}
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
+	m.messages.SetClock(m.now)
 	return m
 }
 
@@ -378,6 +379,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if quit := m.handleCtrlC(); quit {
 				return m, tea.Quit
 			}
+		case tea.KeyCtrlUp:
+			swallow = true
+			cmds = append(cmds, m.OpenSubagentTree())
 		case tea.KeyCtrlO:
 			swallow = true
 			m.messages.ToggleDetails()
@@ -434,6 +438,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TurnDoneMsg:
 		cmds = append(cmds, m.handleDone(msg))
+
+	case subagentExpiryMsg:
+		// Reaching Update re-renders the view, which drops any finished subagent
+		// whose linger window has elapsed from the active-subagent tree.
 	}
 
 	if !swallow {
@@ -605,7 +613,7 @@ func (m *Model) View() string {
 		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.sessionShowAll, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
 	case m.subagentTreeOpen:
-		base = overlayAbove(base, renderSubagentTree(m.messages.orderedSubagents(), m.subagentIdx, m.contentWidth), inputRow)
+		base = overlayAbove(base, renderSubagentTree(m.messages.treeSubagents(), m.subagentIdx, m.contentWidth), inputRow)
 	case m.filePickerOpen:
 		overlay := renderFileSelector(m.fileItems, m.fileIdx, !m.filesLoaded, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
@@ -913,6 +921,7 @@ func (m *Model) NewConversation() {
 	m.history = nil
 	m.messages = NewMessages()
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
+	m.messages.SetClock(m.now)
 	m.sessionID = m.newSessionID()
 	m.subagentFocusID = ""
 	m.subagentTreeOpen = false
@@ -1254,6 +1263,8 @@ func (m *Model) abort() {
 // handleStream applies one turn event to the components and returns the
 // command that continues listening for the rest of the turn.
 func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
+	var followup tea.Cmd
+
 	switch msg.Event.Kind {
 	case agentloop.LoopIterationStart:
 		m.messages.StartAssistant()
@@ -1306,6 +1317,9 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		s := msg.Event.Subagent
 		m.messages.SetSubagentResult(s.ID, s.Result)
 		m.messages.CompleteSubagent(s.ID, s.Failed, 0)
+		// Re-render once the finished subagent's linger window elapses so it drops
+		// off the active-subagent tree.
+		followup = subagentExpiryCmd()
 
 	case agentloop.LoopMessageDone:
 		m.messages.FinishReasoning()
@@ -1323,7 +1337,16 @@ func (m *Model) handleStream(msg StreamMsg) tea.Cmd {
 		}
 	}
 
-	return waitFor(m.events)
+	return tea.Batch(waitFor(m.events), followup)
+}
+
+// subagentExpiryMsg fires after a finished subagent's linger window so the
+// active-subagent tree re-renders and drops it.
+type subagentExpiryMsg struct{}
+
+// subagentExpiryCmd schedules a subagentExpiryMsg after the linger window.
+func subagentExpiryCmd() tea.Cmd {
+	return tea.Tick(subagentListLinger, func(time.Time) tea.Msg { return subagentExpiryMsg{} })
 }
 
 // tokenSummary renders the footer's token/context segment from the latest usage
