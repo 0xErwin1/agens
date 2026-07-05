@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/iperez/agens/internal/agentdef"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/message"
 	"github.com/iperez/agens/internal/provider"
@@ -161,6 +162,17 @@ type Model struct {
 	subagentIdx      int
 	subagentFocusID  string
 
+	// agents holds the agent definitions the /agents menu presents and edits (nil
+	// disables the menu). The menu is two-level: agentMenuOpen gates it, agentIdx
+	// selects an agent in the list, and once agentMenuEditing names an entered
+	// agent, agentModelRows/agentModelIdx drive its per-agent model editor.
+	agents           *agentdef.Set
+	agentMenuOpen    bool
+	agentIdx         int
+	agentMenuEditing string
+	agentModelRows   []agentModelRow
+	agentModelIdx    int
+
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
 	// @-picker's state while it is open.
@@ -206,6 +218,9 @@ type Deps struct {
 	// Project is the absolute project root the conversation belongs to; saved
 	// sessions are stamped with it and the picker scopes to it by default.
 	Project string
+	// Agents are the agent definitions the /agents menu presents and edits; nil
+	// disables the menu.
+	Agents *agentdef.Set
 	// ResumeID, when non-empty, resumes that session on startup. OpenSessions
 	// opens the session picker on startup instead. They back the --resume flag.
 	ResumeID     string
@@ -256,6 +271,7 @@ func New(deps Deps) *Model {
 		sessionID:           newID(),
 		files:               deps.Files,
 		project:             deps.Project,
+		agents:              deps.Agents,
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
 		now:                 now,
@@ -348,6 +364,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.sessionPickerOpen {
 			swallow = true
 			m.handleSessionPickerKey(msg)
+			break
+		}
+		if m.agentMenuOpen {
+			swallow = true
+			m.handleAgentMenuKey(msg)
 			break
 		}
 		if m.subagentTreeOpen {
@@ -618,6 +639,8 @@ func (m *Model) View() string {
 	case m.sessionPickerOpen:
 		overlay := renderSessionSelector(m.sessionItems, m.sessionIdx, m.sessionLoading, m.sessionErr, m.sessionShowAll, m.contentWidth)
 		base = overlayAbove(base, overlay, inputRow)
+	case m.agentMenuOpen:
+		base = overlayAbove(base, m.agentMenuView(), inputRow)
 	case m.subagentTreeOpen:
 		base = overlayAbove(base, renderSubagentTree(m.messages.treeSubagents(), m.subagentIdx, m.contentWidth), inputRow)
 	case m.filePickerOpen:

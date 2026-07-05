@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/iperez/agens/internal/agent"
+	"github.com/iperez/agens/internal/agentdef"
 	"github.com/iperez/agens/internal/agentloop"
 	"github.com/iperez/agens/internal/auth"
 	"github.com/iperez/agens/internal/config"
@@ -29,6 +30,7 @@ type tuiSession struct {
 	sessions     tui.SessionStore
 	files        tui.FileSource
 	project      string
+	agents       *agentdef.Set
 
 	collapseThinking   bool
 	truncateToolOutput bool
@@ -89,6 +91,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			NewSessionID:       uuid.NewString,
 			Files:              sess.files,
 			Project:            sess.project,
+			Agents:             sess.agents,
 			ResumeID:           resumeID,
 			OpenSessions:       openSessions,
 			CollapseThinking:   sess.collapseThinking,
@@ -148,6 +151,11 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
+	defs, err := agent.LoadAgentDefs(opts)
+	if err != nil {
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
+	}
+
 	prompt := func(model string) (string, bool) {
 		sp, err := agent.BuildSystemPrompt(loaded.Config, opts, model)
 		if err != nil {
@@ -172,6 +180,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		sessions:           session.NewStore(session.DefaultDir()),
 		files:              files,
 		project:            opts.ProjectRoot,
+		agents:             defs,
 		collapseThinking:   loaded.Config.UI.CollapseThinking,
 		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,
 	}, nil

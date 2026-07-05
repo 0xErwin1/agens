@@ -14,10 +14,10 @@ import (
 // block. Unknown keys are ignored so a file can carry fields a newer version
 // understands without failing to parse here.
 type frontmatter struct {
-	Description string   `yaml:"description"`
-	Mode        string   `yaml:"mode"`
-	Model       string   `yaml:"model"`
-	Models      []string `yaml:"models"`
+	Description string   `yaml:"description,omitempty"`
+	Mode        string   `yaml:"mode,omitempty"`
+	Model       string   `yaml:"model,omitempty"`
+	Models      []string `yaml:"models,omitempty"`
 }
 
 // Parse turns a definition file's raw bytes into a Definition. name is the file

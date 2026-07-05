@@ -85,6 +85,11 @@ func (s *Set) put(d Definition) {
 	s.defs = append(s.defs, d)
 }
 
+// Upsert adds def or, when a definition of the same name already exists,
+// replaces it in place, preserving its position. It lets a surface reflect an
+// edited definition in the set it presents without reloading from disk.
+func (s *Set) Upsert(d Definition) { s.put(d) }
+
 // All returns a copy of every definition in insertion order.
 func (s *Set) All() []Definition {
 	out := make([]Definition, len(s.defs))

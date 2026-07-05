@@ -198,6 +198,65 @@ func TestSet_SubagentsExcludesPrimaryOnly(t *testing.T) {
 	}
 }
 
+func TestSaveModels_MaterializesBuiltinIntoProjectDir(t *testing.T) {
+	projectDir := t.TempDir()
+
+	build, _ := Load("", "")
+	def, _ := build.ByName("build")
+
+	path, err := SaveModels(projectDir, def, []string{"gpt-5.5", " gpt-5.5 ", "gpt-4.1"})
+	if err != nil {
+		t.Fatalf("SaveModels() error = %v, want nil", err)
+	}
+	if filepath.Dir(path) != projectDir {
+		t.Fatalf("wrote to %s, want it inside the project dir %s", path, projectDir)
+	}
+
+	// The written file parses back with the deduped models and the body intact.
+	reloaded, err := Load("", projectDir)
+	if err != nil {
+		t.Fatalf("reload error = %v", err)
+	}
+	got, ok := reloaded.ByName("build")
+	if !ok {
+		t.Fatal("saved build agent not found on reload")
+	}
+	if !reflect.DeepEqual(got.Models, []string{"gpt-5.5", "gpt-4.1"}) {
+		t.Fatalf("reloaded Models = %v, want the deduped set", got.Models)
+	}
+	if got.Prompt != def.Prompt {
+		t.Fatalf("reloaded prompt lost; got %q want %q", got.Prompt, def.Prompt)
+	}
+	if got.Source == sourceBuiltin {
+		t.Fatal("reloaded build should be file-backed, want the project file to shadow the built-in")
+	}
+}
+
+func TestSaveModels_RewritesFileBackedDefinitionInPlace(t *testing.T) {
+	dir := t.TempDir()
+	writeAgent(t, dir, "worker.md", "---\ndescription: does work\nmodels:\n  - gpt-4.1\n---\nthe worker prompt\n")
+
+	set, _ := Load("", dir)
+	def, _ := set.ByName("worker")
+
+	path, err := SaveModels(dir, def, []string{"gpt-5.5"})
+	if err != nil {
+		t.Fatalf("SaveModels() error = %v, want nil", err)
+	}
+	if path != def.Source {
+		t.Fatalf("wrote to %s, want the definition's own file %s", path, def.Source)
+	}
+
+	reloaded, _ := Load("", dir)
+	got, _ := reloaded.ByName("worker")
+	if !reflect.DeepEqual(got.Models, []string{"gpt-5.5"}) {
+		t.Fatalf("reloaded Models = %v, want [gpt-5.5]", got.Models)
+	}
+	if got.Description != "does work" || got.Prompt != "the worker prompt" {
+		t.Fatalf("rewrite lost fields: description=%q prompt=%q", got.Description, got.Prompt)
+	}
+}
+
 func writeAgent(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {

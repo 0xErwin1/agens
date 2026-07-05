@@ -112,7 +112,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	// prompt of the chosen agent definition, and the model picked for the
 	// delegation. buildSub constructs that loop per delegation, since the model
 	// (and thus the prompt's environment block) varies by task.
-	defs, err := loadAgentDefs(opts)
+	defs, err := LoadAgentDefs(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -607,11 +607,13 @@ func subagentOptions(defs *agentdef.Set) []task.Agent {
 	return out
 }
 
-// loadAgentDefs discovers the agent definitions available for opts: the built-in
+// LoadAgentDefs discovers the agent definitions available for opts: the built-in
 // generic agents overlaid by the files in the global agents directory and then
 // the project's .agens/agents directory. It never fails on a missing directory;
-// only a real read or parse error is returned.
-func loadAgentDefs(opts Options) (*agentdef.Set, error) {
+// only a real read or parse error is returned. It is exported so a surface (the
+// TUI's agents menu) can present and edit the same definitions the loop resolves
+// delegations against.
+func LoadAgentDefs(opts Options) (*agentdef.Set, error) {
 	projectRoot := opts.ProjectRoot
 	if projectRoot == "" {
 		wd, err := os.Getwd()

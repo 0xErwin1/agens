@@ -30,6 +30,9 @@ type CommandContext interface {
 	OpenSessionPicker() tea.Cmd
 	// OpenSubagentTree opens the active-subagent tree overlay.
 	OpenSubagentTree() tea.Cmd
+	// OpenAgentMenu opens the agents menu, where each subagent's available models
+	// are defined.
+	OpenAgentMenu() tea.Cmd
 	// ToggleMouse flips mouse reporting so the user can select/copy text from the
 	// conversation (mouse off) or scroll with the wheel (mouse on).
 	ToggleMouse() tea.Cmd
@@ -169,6 +172,9 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSubagentTree()
+		}},
+		Command{Name: "/agents", Desc: "define each subagent's available models", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenAgentMenu()
 		}},
 		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.ToggleMouse()
