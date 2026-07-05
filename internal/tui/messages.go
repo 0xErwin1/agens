@@ -55,6 +55,7 @@ const (
 	blockAssistant
 	blockTool
 	blockToolBatch
+	blockSubagent
 	blockError
 	blockSystem
 	blockReasoning
@@ -84,6 +85,10 @@ type block struct {
 	isError        bool
 	done           bool
 	dur            time.Duration
+
+	// sub holds the live state of a delegated subagent when kind is
+	// blockSubagent; it is nil for every other block kind.
+	sub *subagentState
 }
 
 // Messages is the scrollable conversation view. Finalized turns are kept as
@@ -522,6 +527,9 @@ func (m *Messages) renderBlock(b block) string {
 
 	case blockToolBatch:
 		return m.renderToolBatch(b)
+
+	case blockSubagent:
+		return m.renderSubagent(b.sub)
 
 	case blockError:
 		return m.gutteredBlock(theme.Error(), labelErrorBlock+b.text, true)

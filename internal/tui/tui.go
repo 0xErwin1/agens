@@ -396,6 +396,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case TurnDoneMsg:
 		m.handleDone(msg)
+
+	case subagentDemoMsg:
+		cmds = append(cmds, m.advanceSubagentDemo(msg))
 	}
 
 	if !swallow {
