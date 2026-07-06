@@ -33,6 +33,9 @@ type CommandContext interface {
 	// OpenAgentMenu opens the agents menu, where each subagent's available models
 	// are defined.
 	OpenAgentMenu() tea.Cmd
+	// OpenAgentPicker opens the primary-agent picker used to switch the active
+	// agent.
+	OpenAgentPicker() tea.Cmd
 	// ToggleMouse flips mouse reporting so the user can select/copy text from the
 	// conversation (mouse off) or scroll with the wheel (mouse on).
 	ToggleMouse() tea.Cmd
@@ -173,6 +176,9 @@ func defaultCommands() *CommandRegistry {
 		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenSubagentTree()
 		}},
+		Command{Name: "/agent", Desc: "switch the active agent (or press tab)", Run: func(ctx CommandContext) tea.Cmd {
+			return ctx.OpenAgentPicker()
+		}},
 		Command{Name: "/agents", Desc: "define each subagent's available models", Run: func(ctx CommandContext) tea.Cmd {
 			return ctx.OpenAgentMenu()
 		}},
@@ -194,6 +200,7 @@ func keyBindingsHelp() string {
 	return strings.Join([]string{
 		"shortcuts:",
 		"  enter        send",
+		"  tab          rotate the active agent",
 		"  ctrl+c       cancel turn / quit",
 		"  ctrl+↑       subagents: list (↑/↓ · enter open · esc back)",
 		"  ctrl+o       expand / collapse tool output & thinking",

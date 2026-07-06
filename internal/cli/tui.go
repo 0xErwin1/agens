@@ -26,6 +26,7 @@ type tuiSession struct {
 	loop         *agentloop.Loop
 	lister       tui.ModelLister
 	prompt       tui.SystemPromptFunc
+	agentPrompt  tui.AgentPromptFunc
 	model        string
 	effortLevels []string
 	sessions     tui.SessionStore
@@ -88,6 +89,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Prompter:           prompter,
 			Models:             sess.lister,
 			SystemPrompt:       sess.prompt,
+			AgentPrompt:        sess.agentPrompt,
 			EffortLevels:       sess.effortLevels,
 			Sessions:           sess.sessions,
 			NewSessionID:       uuid.NewString,
@@ -173,6 +175,21 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return sp, true
 	}
 
+	// agentPrompt rebuilds the prompt with a primary agent's persona as the base
+	// override; an empty persona leaves opts untouched, reproducing the default
+	// prompt above (so a --system flag still applies to the default agent).
+	agentPrompt := func(persona, model string) (string, bool) {
+		o := opts
+		if persona != "" {
+			o.SystemPrompt = persona
+		}
+		sp, err := agent.BuildSystemPrompt(loaded.Config, o, model)
+		if err != nil {
+			return "", false
+		}
+		return sp, true
+	}
+
 	// @-references are best-effort: a project root that cannot be opened as a
 	// confinement root simply disables them rather than failing the TUI.
 	var files tui.FileSource
@@ -184,6 +201,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		loop:               loop,
 		lister:             prov,
 		prompt:             prompt,
+		agentPrompt:        agentPrompt,
 		model:              modelName,
 		effortLevels:       prov.EffortLevels(),
 		sessions:           session.NewStore(session.DefaultDir()),

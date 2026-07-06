@@ -175,6 +175,17 @@ type Model struct {
 	agentModelRows   []agentModelRow
 	agentModelIdx    int
 
+	// activeAgent is the primary agent driving the main thread ("" or "default" =
+	// the model's base persona); agentPrompt rebuilds the system prompt with an
+	// agent's persona for a model; pendingAgentNote is a synthetic switch note
+	// prepended to the next message so the model notices a mid-conversation
+	// change. The picker fields hold the /agent overlay state.
+	activeAgent      string
+	agentPrompt      AgentPromptFunc
+	pendingAgentNote string
+	agentPickerOpen  bool
+	agentPickerIdx   int
+
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
 	// @-picker's state while it is open.
@@ -201,6 +212,12 @@ var (
 // could not be built, in which case the current prompt is left unchanged.
 type SystemPromptFunc func(model string) (string, bool)
 
+// AgentPromptFunc rebuilds the full system prompt for a persona override (an
+// agent definition's body, empty for the default) and a model id, so switching
+// the primary agent or the model keeps the prompt and its model-identity block
+// consistent. ok is false when a prompt could not be built.
+type AgentPromptFunc func(persona, model string) (string, bool)
+
 // Deps are the dependencies of the root model. Loop and Model are required;
 // the rest are optional: a nil Prompter resolves permissions without a modal,
 // a nil Models disables the /model selector, and a nil SystemPrompt leaves the
@@ -211,6 +228,10 @@ type Deps struct {
 	Prompter     *Prompter
 	Models       ModelLister
 	SystemPrompt SystemPromptFunc
+	// AgentPrompt rebuilds the system prompt with a primary agent's persona for a
+	// model; nil falls back to SystemPrompt (default persona only), disabling
+	// agent-aware rebuilds.
+	AgentPrompt  AgentPromptFunc
 	EffortLevels []string
 	Sessions     SessionStore
 	// NewSessionID mints a fresh conversation id; defaults to a counter when
@@ -271,6 +292,7 @@ func New(deps Deps) *Model {
 		commands:            defaultCommands(),
 		lister:              deps.Models,
 		systemPrompt:        deps.SystemPrompt,
+		agentPrompt:         deps.AgentPrompt,
 		effortLevels:        deps.EffortLevels,
 		sessions:            deps.Sessions,
 		newSessionID:        newID,
@@ -378,6 +400,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.handleAgentMenuKey(msg)
 			break
 		}
+		if m.agentPickerOpen {
+			swallow = true
+			m.handleAgentPickerKey(msg)
+			break
+		}
 		if m.subagentTreeOpen {
 			swallow = true
 			m.handleSubagentTreeKey(msg)
@@ -410,6 +437,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlUp:
 			swallow = true
 			cmds = append(cmds, m.OpenSubagentTree())
+		case tea.KeyTab:
+			// Rotating mid-turn would swap the system prompt under the running turn,
+			// so it is offered only while idle, like /agent and /model.
+			swallow = true
+			if !m.running {
+				m.cycleAgent(1)
+			}
+		case tea.KeyShiftTab:
+			swallow = true
+			if !m.running {
+				m.cycleAgent(-1)
+			}
 		case tea.KeyCtrlO:
 			swallow = true
 			m.activeMessages().ToggleDetails()
@@ -648,6 +687,8 @@ func (m *Model) View() string {
 		base = overlayAbove(base, overlay, inputRow)
 	case m.agentMenuOpen:
 		base = overlayAbove(base, m.agentMenuView(), inputRow)
+	case m.agentPickerOpen:
+		base = overlayAbove(base, renderAgentPicker(m.agentEntries(), m.agentPickerIdx, m.activeAgentName(), m.contentWidth), inputRow)
 	case m.subagentTreeOpen:
 		base = overlayAbove(base, renderSubagentTree(m.messages.treeSubagents(), m.subagentIdx, m.contentWidth), inputRow)
 	case m.filePickerOpen:
@@ -797,9 +838,14 @@ func (m *Model) submit() tea.Cmd {
 // and starts the turn goroutine. It backs both a live submission (submit) and
 // the automatic sending of a queued message when the previous turn finishes.
 func (m *Model) submitText(text string) tea.Cmd {
-	// The model receives the message with @-referenced files inlined; the
-	// conversation shows the original text the user typed.
+	// The model receives the message with @-referenced files inlined and, after an
+	// agent switch, a synthetic switch note prepended; the conversation shows the
+	// original text the user typed.
 	expanded, failed := m.expandFileRefs(text)
+	if m.pendingAgentNote != "" {
+		expanded = m.pendingAgentNote + expanded
+		m.pendingAgentNote = ""
+	}
 	m.history = append(m.history, message.NewMessage(message.RoleUser, message.TextPart{Text: expanded}))
 	m.messages.AppendUser(text)
 	if len(failed) > 0 {
@@ -961,6 +1007,9 @@ func (m *Model) NewConversation() {
 	m.sessionID = m.newSessionID()
 	m.subagentFocusID = ""
 	m.subagentTreeOpen = false
+	// The active agent carries over to the new conversation, but a queued switch
+	// note does not: a fresh conversation already starts under that agent's prompt.
+	m.pendingAgentNote = ""
 	m.layout()
 }
 
@@ -976,6 +1025,7 @@ func (m *Model) saveSession() {
 		ID:       m.sessionID,
 		Title:    sessionTitle(m.history),
 		Project:  m.project,
+		Agent:    m.activeAgent,
 		Messages: m.history,
 	})
 	if err != nil {
@@ -1060,6 +1110,13 @@ func (m *Model) applyResumedSession(sess session.Session) {
 	if sess.Project != "" {
 		m.project = sess.Project
 	}
+
+	// Restore the primary agent the session was saved under, rebuilding the loop's
+	// prompt so it resumes under that agent's persona.
+	m.activeAgent = sess.Agent
+	m.rebuildSystemPrompt(m.modelName)
+	m.status.SetAgent(statusAgentLabel(m.activeAgentName()))
+
 	m.messages.SetHistory(sess.Messages)
 	m.layout()
 }
@@ -1158,13 +1215,10 @@ func (m *Model) handleModelPickerKey(msg tea.KeyMsg) {
 func (m *Model) selectModel(info provider.ModelInfo) {
 	m.loop.SetModel(info.ID)
 
-	// Rebuild the system prompt so its model-identity block matches the new
-	// model; otherwise the assistant keeps reporting the previous one.
-	if m.systemPrompt != nil {
-		if prompt, ok := m.systemPrompt(info.ID); ok {
-			m.loop.SetSystemPrompt(prompt)
-		}
-	}
+	// Rebuild the system prompt so its model-identity block matches the new model
+	// (and keeps the active agent's persona); otherwise the assistant keeps
+	// reporting the previous model or loses the agent.
+	m.rebuildSystemPrompt(info.ID)
 
 	m.modelName = info.ID
 	m.status.SetModel(info.ID)

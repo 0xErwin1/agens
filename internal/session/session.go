@@ -16,6 +16,7 @@ type Session struct {
 	ID       string            `json:"id"`
 	Title    string            `json:"title"`
 	Project  string            `json:"project,omitempty"`
+	Agent    string            `json:"agent,omitempty"`
 	Updated  time.Time         `json:"updated"`
 	Messages []message.Message `json:"messages"`
 }

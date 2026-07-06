@@ -22,6 +22,7 @@ const statusHints = "enter send · ctrl+c quit"
 // muted, and the state colored by whether it reports an error.
 type Status struct {
 	model    string
+	agent    string
 	state    string
 	effort   string
 	spinner  string
@@ -44,6 +45,10 @@ func (s *Status) SetState(state string) { s.state = state }
 
 // SetModel replaces the model segment, used when the model is switched live.
 func (s *Status) SetModel(model string) { s.model = model }
+
+// SetAgent sets the active-agent segment shown after the model; empty (or the
+// default agent) hides it, since the default persona is the baseline.
+func (s *Status) SetAgent(agent string) { s.agent = agent }
 
 // SetEffort sets the reasoning-effort segment; empty hides it.
 func (s *Status) SetEffort(effort string) { s.effort = effort }
@@ -81,6 +86,9 @@ func (s *Status) View() string {
 	}
 
 	left := " " + name + statusSeparator + model
+	if s.agent != "" {
+		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Accent()).Render("@"+s.agent)
+	}
 	if s.effort != "" {
 		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.effort)
 	}

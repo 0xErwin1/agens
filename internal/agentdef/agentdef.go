@@ -118,6 +118,18 @@ func (s *Set) Subagents() []Definition {
 	return out
 }
 
+// Primary returns the definitions that may run as the primary (main-thread)
+// agent, in insertion order.
+func (s *Set) Primary() []Definition {
+	out := make([]Definition, 0, len(s.defs))
+	for _, d := range s.defs {
+		if d.IsPrimary() {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // Builtins returns the generic, domain-agnostic definitions that ship with the
 // binary: a hands-on "build" agent and a read-only "plan" agent. They apply in
 // both contexts (ModeAll) and place no model restriction, so a delegation can
