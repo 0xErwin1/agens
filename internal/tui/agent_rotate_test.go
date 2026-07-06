@@ -138,6 +138,45 @@ func TestModel_ModelSwitchKeepsActiveAgentPersona(t *testing.T) {
 	}
 }
 
+func TestModel_ResumeClearsPendingSwitchNote(t *testing.T) {
+	m, _ := rotateModel(t)
+
+	sendKey(m, tea.KeyMsg{Type: tea.KeyTab}) // → build, queues a switch note
+	if m.pendingAgentNote == "" {
+		t.Fatal("precondition: expected a queued switch note after a tab")
+	}
+
+	m.applyResumedSession(session.Session{
+		ID:       "s",
+		Agent:    "plan",
+		Messages: []message.Message{message.NewMessage(message.RoleUser, message.TextPart{Text: "hi"})},
+	})
+
+	if m.pendingAgentNote != "" {
+		t.Fatal("resume did not drop the queued switch note; it would leak into the resumed conversation")
+	}
+}
+
+func TestModel_ResumeUnknownAgentFallsBackToDefault(t *testing.T) {
+	m, _ := rotateModel(t)
+
+	m.applyResumedSession(session.Session{
+		ID:       "s",
+		Agent:    "ghost",
+		Messages: []message.Message{message.NewMessage(message.RoleUser, message.TextPart{Text: "hi"})},
+	})
+
+	if m.activeAgentName() != defaultAgentName {
+		t.Fatalf("resumed agent = %q, want a fallback to default for a missing agent", m.activeAgentName())
+	}
+	if m.status.agent != "" {
+		t.Fatalf("status agent = %q, want it hidden after the default fallback", m.status.agent)
+	}
+	if !strings.Contains(stripANSI(m.messages.View()), "no longer exists") {
+		t.Fatal("want a note explaining the saved agent no longer exists")
+	}
+}
+
 func TestModel_ResumeRestoresActiveAgent(t *testing.T) {
 	m, loop := rotateModel(t)
 

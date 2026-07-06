@@ -128,6 +128,25 @@ func TestModel_AgentsMenuEscNavigatesLevels(t *testing.T) {
 	}
 }
 
+func TestModel_AgentsMenuEditorFillsInWhenModelsLoadLate(t *testing.T) {
+	m := agentsModel(t, t.TempDir())
+
+	// Enter the editor before the model catalog has been delivered (modelItems
+	// empty): an unrestricted agent yields no rows.
+	m.OpenAgentMenu()
+	sendKey(m, tea.KeyMsg{Type: tea.KeyEnter}) // enter build
+	if len(m.agentModelRows) != 0 {
+		t.Fatalf("precondition: want empty rows before the catalog loads, got %d", len(m.agentModelRows))
+	}
+
+	// The async catalog arrives; the open editor fills in rather than sticking on
+	// "no models available".
+	m.Update(modelsLoadedMsg{models: []provider.ModelInfo{{ID: "gpt-5.5"}, {ID: "gpt-4.1"}}})
+	if len(m.agentModelRows) != 2 {
+		t.Fatalf("editor rows = %d after the catalog loaded, want them filled in", len(m.agentModelRows))
+	}
+}
+
 func TestModel_AgentsMenuUnavailableWithoutAgents(t *testing.T) {
 	m := sized(&scriptedLoopRunner{}, "gpt-5.5") // no Agents wired
 

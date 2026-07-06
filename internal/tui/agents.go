@@ -94,6 +94,26 @@ func (m *Model) enterAgentModels(def agentdef.Definition) {
 	m.agentModelIdx = 0
 }
 
+// refreshAgentModelEditor rebuilds the open model editor's rows from the current
+// catalog. It is called when the model catalog finishes loading, so an editor
+// entered before the fetch returned (empty rows) fills in rather than staying
+// stuck on "no models available".
+func (m *Model) refreshAgentModelEditor() {
+	if !m.agentMenuOpen || m.agentMenuEditing == "" || m.agents == nil {
+		return
+	}
+
+	def, ok := m.agents.ByName(m.agentMenuEditing)
+	if !ok {
+		return
+	}
+
+	m.agentModelRows = buildAgentModelRows(m.modelItems, def.Models)
+	if m.agentModelIdx >= len(m.agentModelRows) {
+		m.agentModelIdx = 0
+	}
+}
+
 // handleAgentModelsKey handles the per-agent model editor: Up/Down cycle, Space
 // toggles the highlighted model, Enter saves the selection to the agent's
 // definition file, and Esc returns to the agent list without saving.

@@ -945,7 +945,7 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 		message.NewMessage(message.RoleAssistant, message.TextPart{Text: "here are the findings"}),
 	}}
 
-	out, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(context.Background(), task.Request{Description: "investigate the bug", Agent: "build"})
+	out, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), nil, "gpt-x").Run(context.Background(), task.Request{Description: "investigate the bug", Agent: "build"})
 	if err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
@@ -967,7 +967,7 @@ func TestSubagentRunner_SeedsDescriptionAndReturnsFinalText(t *testing.T) {
 func TestSubagentRunner_PropagatesLoopError(t *testing.T) {
 	fl := &fakeLoop{err: errors.New("stream failed")}
 
-	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(context.Background(), task.Request{Description: "do it", Agent: "build"}); err == nil {
+	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), nil, "gpt-x").Run(context.Background(), task.Request{Description: "do it", Agent: "build"}); err == nil {
 		t.Fatal("Run() error = nil, want the loop error propagated")
 	}
 }
@@ -992,7 +992,7 @@ func TestSubagentRunner_StreamsLifecycleToParentSink(t *testing.T) {
 	ctx := agentloop.WithEventSink(context.Background(), func(ev agentloop.LoopEvent) { got = append(got, ev) })
 
 	req := task.Request{Description: "look around", Agent: "build", Model: "gpt-5.5"}
-	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), "gpt-x").Run(ctx, req); err != nil {
+	if _, err := newSubagentRunner(fakeBuilder(fl), loadTestDefs(t), nil, "gpt-x").Run(ctx, req); err != nil {
 		t.Fatalf("Run() error = %v, want nil", err)
 	}
 
@@ -1061,7 +1061,7 @@ func TestSubagentRunner_ResolvesModelPrecedence(t *testing.T) {
 		t.Fatalf("agentdef.Load() error = %v", err)
 	}
 
-	r := newSubagentRunner(nil, defs, "parent-model")
+	r := newSubagentRunner(nil, defs, nil, "parent-model")
 
 	if _, model := r.resolve(task.Request{Agent: "worker", Model: "req-model"}); model != "req-model" {
 		t.Fatalf("resolve model = %q, want the request's model to win", model)
@@ -1074,6 +1074,29 @@ func TestSubagentRunner_ResolvesModelPrecedence(t *testing.T) {
 	}
 	if def, _ := r.resolve(task.Request{Agent: "ghost"}); def.Name == "" {
 		t.Fatal("resolve of an unknown agent must fall back to a subagent-capable definition, not an empty one")
+	}
+}
+
+// TestSubagentRunner_ResolveClampsToCatalogAllowList proves that an omitted or
+// parent-inherited model is clamped to the agent's allowed set, closing the
+// bypass where the task tool only validates an explicitly requested model.
+func TestSubagentRunner_ResolveClampsToCatalogAllowList(t *testing.T) {
+	defs := loadTestDefs(t) // build (unrestricted), plan
+	catalog := task.NewCatalog([]task.Agent{
+		{Name: "build", Models: []string{"gpt-4.1"}}, // restricted live
+		{Name: "plan"}, // unrestricted
+	})
+	r := newSubagentRunner(nil, defs, catalog, "gpt-5.5")
+
+	// Model omitted for a restricted agent → clamped to its first allowed model,
+	// not the disallowed parent model.
+	if _, model := r.resolve(task.Request{Agent: "build"}); model != "gpt-4.1" {
+		t.Fatalf("resolve model = %q, want it clamped to the agent's allowed gpt-4.1, not the parent gpt-5.5", model)
+	}
+
+	// An unrestricted agent still inherits the parent model.
+	if _, model := r.resolve(task.Request{Agent: "plan"}); model != "gpt-5.5" {
+		t.Fatalf("resolve model = %q, want the parent model for an unrestricted agent", model)
 	}
 }
 

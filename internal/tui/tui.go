@@ -468,6 +468,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelIdx = indexOfModel(msg.models, m.modelName)
 		m.contextWindow = contextWindowFor(msg.models, m.modelName)
 		m.status.SetTokens(m.tokenSummary())
+		m.refreshAgentModelEditor()
 
 	case sessionsLoadedMsg:
 		m.sessionLoading = false
@@ -1111,13 +1112,30 @@ func (m *Model) applyResumedSession(sess session.Session) {
 		m.project = sess.Project
 	}
 
+	// A resume is not a mid-conversation switch, so any queued agent-switch note is
+	// dropped rather than leaking into the resumed conversation.
+	m.pendingAgentNote = ""
+
 	// Restore the primary agent the session was saved under, rebuilding the loop's
-	// prompt so it resumes under that agent's persona.
+	// prompt so it resumes under that agent's persona. If the saved agent no longer
+	// exists (its definition was removed, or is no longer primary-capable), fall
+	// back to the default so the status bar never advertises an agent that is not
+	// actually driving the prompt.
 	m.activeAgent = sess.Agent
+	staleAgent := ""
+	if sess.Agent != "" && sess.Agent != defaultAgentName && !m.hasAgent(sess.Agent) {
+		staleAgent = sess.Agent
+		m.activeAgent = ""
+	}
 	m.rebuildSystemPrompt(m.modelName)
 	m.status.SetAgent(statusAgentLabel(m.activeAgentName()))
 
+	// SetHistory rebuilds the view from the resumed history, so a note about a
+	// missing agent is added after it, not before, or it would be discarded.
 	m.messages.SetHistory(sess.Messages)
+	if staleAgent != "" {
+		m.messages.AddInfo("saved agent " + staleAgent + " no longer exists; using the default")
+	}
 	m.layout()
 }
 

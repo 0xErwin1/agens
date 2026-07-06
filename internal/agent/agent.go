@@ -124,12 +124,16 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, err
 	}
 
-	buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
-		subGate, err := buildGate(opts)
-		if err != nil {
-			return nil, err
-		}
+	// The subagent gate (base toolset, no task) depends on neither the delegated
+	// agent nor the model, so it is built once and shared across delegations,
+	// which run one at a time. Building it per delegation would leak an os.Root
+	// file descriptor each time, since the confinement root has no Close.
+	subGate, err := buildGate(opts)
+	if err != nil {
+		return nil, err
+	}
 
+	buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
 		subPrompt, err := BuildSystemPrompt(cfg, withSystemPrompt(opts, def.Prompt), subModel)
 		if err != nil {
 			return nil, err
@@ -147,8 +151,6 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return agentloop.New(p, subGate, subOpts...), nil
 	}
 
-	runner := newSubagentRunner(buildSub, defs, model)
-
 	// The task tool reads its selectable subagents from a shared catalog: an
 	// opts-provided one (so a surface can edit it live) or a private one. Either
 	// way it is (re)seeded from the discovered definitions.
@@ -157,6 +159,8 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		catalog = task.NewCatalog(nil)
 	}
 	catalog.Replace(subagentOptions(defs))
+
+	runner := newSubagentRunner(buildSub, defs, catalog, model)
 
 	parentGate, err := buildParentGate(opts, runner, catalog)
 	if err != nil {
@@ -204,11 +208,12 @@ type subLoopBuilder func(def agentdef.Definition, model string) (loopRunner, err
 type subagentRunner struct {
 	build       subLoopBuilder
 	defs        *agentdef.Set
+	catalog     *task.Catalog
 	parentModel string
 }
 
-func newSubagentRunner(build subLoopBuilder, defs *agentdef.Set, parentModel string) *subagentRunner {
-	return &subagentRunner{build: build, defs: defs, parentModel: parentModel}
+func newSubagentRunner(build subLoopBuilder, defs *agentdef.Set, catalog *task.Catalog, parentModel string) *subagentRunner {
+	return &subagentRunner{build: build, defs: defs, catalog: catalog, parentModel: parentModel}
 }
 
 // Run resolves the request to a definition and model, seeds a fresh conversation
@@ -287,7 +292,38 @@ func (r *subagentRunner) resolve(req task.Request) (agentdef.Definition, string)
 		model = r.parentModel
 	}
 
+	// Enforce the agent's allow-list on the resolved model, so an omitted or
+	// parent-inherited model never runs the agent on a model it disallows — the
+	// task tool only validates an explicitly requested model. The allowed set is
+	// read from the live catalog, matching the tool's own validation source.
+	if allowed := r.allowedModels(def.Name); len(allowed) > 0 && !containsString(allowed, model) {
+		model = allowed[0]
+	}
+
 	return def, model
+}
+
+// allowedModels returns the models the named agent may run on, from the live
+// catalog (nil when there is no catalog or no such agent, meaning unrestricted).
+func (r *subagentRunner) allowedModels(name string) []string {
+	if r.catalog == nil {
+		return nil
+	}
+	for _, a := range r.catalog.Agents() {
+		if a.Name == name {
+			return a.Models
+		}
+	}
+	return nil
+}
+
+func containsString(items []string, want string) bool {
+	for _, s := range items {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // subagentActivitySink forwards each of a subagent's own LoopEvents to parentEmit,

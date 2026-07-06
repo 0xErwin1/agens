@@ -257,6 +257,34 @@ func TestSaveModels_RewritesFileBackedDefinitionInPlace(t *testing.T) {
 	}
 }
 
+func TestSaveModels_MaterializesGlobalDefIntoProjectNotInPlace(t *testing.T) {
+	globalDir := t.TempDir()
+	projectDir := t.TempDir()
+	writeAgent(t, globalDir, "shared.md", "---\ndescription: global shared\n---\nshared body\n")
+
+	set, _ := Load(globalDir, "")
+	def, _ := set.ByName("shared")
+	if !strings.HasPrefix(def.Source, globalDir) {
+		t.Fatalf("def.Source = %q, want it under the global dir", def.Source)
+	}
+
+	path, err := SaveModels(projectDir, def, []string{"gpt-5.5"})
+	if err != nil {
+		t.Fatalf("SaveModels() error = %v, want nil", err)
+	}
+	if filepath.Dir(path) != projectDir {
+		t.Fatalf("wrote to %s, want it materialized into the project dir, not the global file", path)
+	}
+
+	globalData, err := os.ReadFile(filepath.Join(globalDir, "shared.md"))
+	if err != nil {
+		t.Fatalf("read global file: %v", err)
+	}
+	if strings.Contains(string(globalData), "gpt-5.5") {
+		t.Fatalf("global file was mutated = %q, want it left untouched by a project-scoped edit", string(globalData))
+	}
+}
+
 func writeAgent(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {

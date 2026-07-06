@@ -42,6 +42,17 @@ func (m *Model) activeAgentName() string {
 	return m.activeAgent
 }
 
+// hasAgent reports whether name is one of the rotation entries (the default or a
+// primary-capable definition).
+func (m *Model) hasAgent(name string) bool {
+	for _, e := range m.agentEntries() {
+		if e.name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // currentPersona returns the persona (system-prompt body) of the active agent,
 // or "" for the default.
 func (m *Model) currentPersona() string {
