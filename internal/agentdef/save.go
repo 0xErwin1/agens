@@ -110,7 +110,7 @@ func writeFileAtomic(path string, data []byte) error {
 // frontmatter fields are omitted, so a definition with no restrictions produces
 // a minimal file.
 func marshal(def Definition) ([]byte, error) {
-	fm := frontmatter{
+	fm := defFrontmatter{
 		Description: def.Description,
 		Model:       def.Model,
 		Models:      def.Models,

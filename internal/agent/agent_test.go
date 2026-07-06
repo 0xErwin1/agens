@@ -316,6 +316,67 @@ func TestBuildSystemPrompt_NoOverrideUsesModelSelectedBase(t *testing.T) {
 	}
 }
 
+// writeProjectSkill writes a valid SKILL.md under projectRoot/.agens/skills/<name>.
+func writeProjectSkill(t *testing.T, projectRoot, name, description string) {
+	t.Helper()
+	dir := filepath.Join(projectRoot, ".agens", "skills", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir skill dir: %v", err)
+	}
+	content := "---\nname: " + name + "\ndescription: " + description + "\n---\nthe skill body\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+}
+
+func TestBuildSystemPrompt_IncludesSkillsWhenSet(t *testing.T) {
+	t.Setenv("AGENS_CONFIG_HOME", t.TempDir())
+
+	opts := validOptions(t)
+	writeProjectSkill(t, opts.ProjectRoot, "git-commit", "make conventional commits")
+
+	skills, _, err := LoadSkills(opts)
+	if err != nil {
+		t.Fatalf("LoadSkills() error = %v, want nil", err)
+	}
+	opts.Skills = skills
+
+	got, err := BuildSystemPrompt(validConfig(), opts, "gpt-4.1")
+	if err != nil {
+		t.Fatalf("BuildSystemPrompt() error = %v, want nil", err)
+	}
+	if !strings.Contains(got, "Available skills") || !strings.Contains(got, "git-commit") {
+		t.Fatalf("BuildSystemPrompt() = %q, want the level-1 skills block", got)
+	}
+}
+
+func TestLoadSkills_DiscoversProjectSkillsAndWarnsOnMalformed(t *testing.T) {
+	t.Setenv("AGENS_CONFIG_HOME", t.TempDir())
+
+	opts := validOptions(t)
+	writeProjectSkill(t, opts.ProjectRoot, "good", "a good skill")
+
+	// A malformed skill (no name) must be skipped with a warning, not fail the load.
+	badDir := filepath.Join(opts.ProjectRoot, ".agens", "skills", "bad")
+	if err := os.MkdirAll(badDir, 0o755); err != nil {
+		t.Fatalf("mkdir bad skill: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(badDir, "SKILL.md"), []byte("---\ndescription: no name\n---\nbody\n"), 0o644); err != nil {
+		t.Fatalf("write bad SKILL.md: %v", err)
+	}
+
+	set, warnings, err := LoadSkills(opts)
+	if err != nil {
+		t.Fatalf("LoadSkills() error = %v, want nil", err)
+	}
+	if _, ok := set.ByName("good"); !ok {
+		t.Fatal("the valid skill was not discovered")
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "bad") {
+		t.Fatalf("warnings = %v, want one naming the malformed skill", warnings)
+	}
+}
+
 func TestBuildLoop_MissingAPIKeyErrors(t *testing.T) {
 	creds := auth.File{}
 
@@ -889,13 +950,16 @@ func TestBuildGate_ExcludesTaskSoSubagentsDoNotRecurse(t *testing.T) {
 func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
 	runner := &fakeSubRunner{out: "subagent report"}
 	catalog := task.NewCatalog(subagentOptions(loadTestDefs(t)))
-	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner, catalog)
+	gate, err := buildParentGate(Options{ProjectRoot: t.TempDir(), Prompter: failOnCallPrompter{t: t}}, runner, catalog, nil)
 	if err != nil {
 		t.Fatalf("buildParentGate() error = %v, want nil", err)
 	}
 
 	if !specNames(t, gate)["task"] {
 		t.Fatal("buildParentGate() specs missing task, want it registered")
+	}
+	if specNames(t, gate)["skill"] {
+		t.Fatal("buildParentGate() registered skill with no skills, want it absent")
 	}
 
 	call := message.ToolUsePart{ID: "tu_1", Name: "task", Input: json.RawMessage(`{"description":"go do X"}`)}
@@ -911,6 +975,40 @@ func TestBuildParentGate_RegistersTaskAllowedWithoutPrompting(t *testing.T) {
 	}
 	if runner.gotDesc != "go do X" {
 		t.Fatalf("runner got description %q, want %q", runner.gotDesc, "go do X")
+	}
+}
+
+func TestBuildParentGate_RegistersSkillAllowedWhenSkillsPresent(t *testing.T) {
+	projectRoot := t.TempDir()
+	writeProjectSkill(t, projectRoot, "git-commit", "make conventional commits")
+
+	skills, _, err := LoadSkills(Options{ProjectRoot: projectRoot})
+	if err != nil {
+		t.Fatalf("LoadSkills() error = %v, want nil", err)
+	}
+
+	runner := &fakeSubRunner{out: "report"}
+	catalog := task.NewCatalog(subagentOptions(loadTestDefs(t)))
+	gate, err := buildParentGate(Options{ProjectRoot: projectRoot, Prompter: failOnCallPrompter{t: t}}, runner, catalog, skills)
+	if err != nil {
+		t.Fatalf("buildParentGate() error = %v, want nil", err)
+	}
+
+	if !specNames(t, gate)["skill"] {
+		t.Fatal("buildParentGate() specs missing skill, want it registered when skills exist")
+	}
+
+	// skill is pre-seeded to Allow, so it runs without the failOnCallPrompter firing.
+	call := message.ToolUsePart{ID: "tu_1", Name: "skill", Input: json.RawMessage(`{"name":"git-commit"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run(skill) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run(skill) result = %+v, want the skill loaded without prompting", result)
+	}
+	if !strings.Contains(resultText(result), "the skill body") {
+		t.Fatalf("gate.Run(skill) text = %q, want the SKILL.md body", resultText(result))
 	}
 }
 

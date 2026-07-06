@@ -14,6 +14,11 @@ type Options struct {
 	IsGitRepo   bool
 	Platform    string
 	Now         time.Time
+
+	// Skills carries the level-1 disclosure (name + description) of each
+	// discovered skill. When non-empty it is appended as a final section so the
+	// model knows which skills it can load; when empty no section is added.
+	Skills []SkillInfo
 }
 
 // Build assembles the full system prompt: the base persona (Override if
@@ -35,9 +40,10 @@ func Build(o Options) string {
 		Now:         o.Now,
 	})
 
-	parts := make([]string, 0, 2+len(projectInstructionFilenames))
+	parts := make([]string, 0, 3+len(projectInstructionFilenames))
 	parts = append(parts, base, env)
 	parts = append(parts, Instructions(o.ConfigHome, o.WorkingDir, o.ProjectRoot)...)
+	parts = append(parts, skillsSection(o.Skills))
 
 	return joinNonEmpty(parts)
 }

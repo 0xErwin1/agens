@@ -25,6 +25,7 @@ import (
 	"github.com/iperez/agens/internal/provider"
 	chatgptprovider "github.com/iperez/agens/internal/provider/chatgpt"
 	"github.com/iperez/agens/internal/provider/openai"
+	"github.com/iperez/agens/internal/skill"
 	"github.com/iperez/agens/internal/tool"
 	"github.com/iperez/agens/internal/tool/bash"
 	"github.com/iperez/agens/internal/tool/fs"
@@ -62,6 +63,12 @@ type Options struct {
 	// models a delegation may pick and have it take effect on the next turn. A nil
 	// value makes BuildLoop use a private catalog, fixed for the session.
 	Subagents *task.Catalog
+
+	// Skills, when non-nil, is the discovered skill set the parent agent's
+	// system prompt advertises (level 1) and the skill tool reads (levels 2-3).
+	// A surface loads it once and passes it here so a live prompt rebuild keeps
+	// the same skills; a nil value makes BuildLoop discover them itself.
+	Skills *skill.Set
 }
 
 // BuildLoop resolves cfg, creds, and opts into a ready-to-run
@@ -90,7 +97,20 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, errors.New("agent: no model configured")
 	}
 
-	systemPrompt, err := BuildSystemPrompt(cfg, opts, model)
+	// Skills are a parent-only surface: their level-1 block goes into the parent
+	// prompt and the skill tool into the parent gate. Subagents run the base
+	// toolset with no skill tool, so their prompts (built from opts below) must
+	// not carry the skills block — opts keeps Skills nil for them, and only the
+	// parent prompt is built from an opts copy that has them.
+	skills := opts.Skills
+	if skills == nil {
+		skills, _, err = LoadSkills(opts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	systemPrompt, err := BuildSystemPrompt(cfg, withSkills(opts, skills), model)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +157,12 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	}
 
 	buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
-		subPrompt, err := BuildSystemPrompt(cfg, withSystemPrompt(opts, def.Prompt), subModel)
+		// A subagent has no skill tool, so its prompt must not advertise skills;
+		// withSystemPrompt carries the parent's opts, which may hold a skill set.
+		subPromptOpts := withSystemPrompt(opts, def.Prompt)
+		subPromptOpts.Skills = nil
+
+		subPrompt, err := BuildSystemPrompt(cfg, subPromptOpts, subModel)
 		if err != nil {
 			return nil, err
 		}
@@ -165,7 +190,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	runner := newSubagentRunner(buildSub, defs, catalog, model)
 
-	parentGate, err := buildParentGate(opts, runner, catalog)
+	parentGate, err := buildParentGate(opts, runner, catalog, skills)
 	if err != nil {
 		return nil, err
 	}
@@ -401,7 +426,31 @@ func BuildSystemPrompt(cfg config.Config, opts Options, model string) (string, e
 		IsGitRepo:   isGitRepo,
 		Platform:    runtime.GOOS,
 		Now:         time.Now(),
+		Skills:      skillInfos(opts.Skills),
 	}), nil
+}
+
+// skillInfos projects a skill set into the level-1 prompt disclosure — each
+// skill's name and description. A nil set yields no infos, so the prompt's
+// skills section is dropped entirely.
+func skillInfos(set *skill.Set) []prompt.SkillInfo {
+	if set == nil {
+		return nil
+	}
+	skills := set.All()
+	infos := make([]prompt.SkillInfo, 0, len(skills))
+	for _, s := range skills {
+		infos = append(infos, prompt.SkillInfo{Name: s.Name, Description: s.Description})
+	}
+	return infos
+}
+
+// withSkills returns a copy of opts with Skills set, used to build the parent
+// agent's prompt with the discovered skills while leaving the caller's opts
+// (and thus the subagent prompts built from it) skill-free.
+func withSkills(opts Options, skills *skill.Set) Options {
+	opts.Skills = skills
+	return opts
 }
 
 // BuildProvider resolves cfg + creds + opts into the selected
@@ -635,11 +684,13 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*p
 
 // buildParentGate builds the main agent's gate: the base toolset plus the task
 // tool, which delegates to runner and offers the subagents of catalog as its
-// selectable agents. task is pre-seeded to Allow so a delegation itself never
-// prompts; the subagent's own side-effecting tool calls are still gated by its
-// own gate. Subagents are built with buildGate (no task), so a delegation does
-// not recurse.
-func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog) (*permission.Gate, error) {
+// selectable agents, plus the skill tool when skills is non-empty. task and
+// skill are pre-seeded to Allow so neither prompts; a delegation's own
+// side-effecting tool calls are still gated by the subagent's gate, and the
+// skill tool is read-only and confined to each skill's directory. Subagents are
+// built with buildGate (no task, no skill), so a delegation does not recurse and
+// cannot load skills.
+func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog, skills *skill.Set) (*permission.Gate, error) {
 	reg, rules, err := baseToolset(opts)
 	if err != nil {
 		return nil, err
@@ -647,6 +698,11 @@ func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog) (*
 
 	reg.Register(task.New(runner, catalog))
 	rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "task"})
+
+	if skills != nil && skills.Len() > 0 {
+		reg.Register(skill.NewTool(skills))
+		rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "skill"})
+	}
 
 	return assembleGate(reg, rules, opts)
 }
@@ -684,6 +740,37 @@ func LoadAgentDefs(opts Options) (*agentdef.Set, []string, error) {
 	projectDir := filepath.Join(projectRoot, ".agens", "agents")
 
 	set, issues := agentdef.Load(globalDir, projectDir)
+
+	warnings := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		warnings = append(warnings, issue.Error())
+	}
+
+	return set, warnings, nil
+}
+
+// LoadSkills discovers the Agent Skills available for opts: the skill
+// directories under the global skills directory overlaid by the project's
+// .agens/skills directory, a project skill shadowing a global one of the same
+// name. A malformed or unreadable skill is skipped and returned as a
+// human-readable warning rather than failing, so one bad skill never blocks
+// startup; the error return is reserved for a failure to resolve the project
+// root. It is exported so a surface can load the set once and pass it into
+// Options.Skills, keeping a live prompt rebuild on the same skills.
+func LoadSkills(opts Options) (*skill.Set, []string, error) {
+	projectRoot := opts.ProjectRoot
+	if projectRoot == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, nil, fmt.Errorf("agent: %w", err)
+		}
+		projectRoot = config.ProjectRoot(wd)
+	}
+
+	globalDir := filepath.Join(config.HomeDir(), "skills")
+	projectDir := filepath.Join(projectRoot, ".agens", "skills")
+
+	set, issues := skill.Load(globalDir, projectDir)
 
 	warnings := make([]string, 0, len(issues))
 	for _, issue := range issues {

@@ -149,6 +149,15 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	catalog := task.NewCatalog(nil)
 	opts.Subagents = catalog
 
+	// Skills are discovered once and pinned onto opts so BuildLoop and the
+	// prompt-rebuild closures below share the same set: a live model or agent
+	// switch rebuilds the prompt with the same skills advertised.
+	skills, skillWarnings, err := agent.LoadSkills(opts)
+	if err != nil {
+		return tuiSession{}, fmt.Errorf("tui: %w", err)
+	}
+	opts.Skills = skills
+
 	modelName, err := agent.ResolveModel(loaded.Config, creds, opts)
 	if err != nil {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
@@ -168,6 +177,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	if err != nil {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
+	agentWarnings = append(agentWarnings, skillWarnings...)
 
 	prompt := func(model string) (string, bool) {
 		sp, err := agent.BuildSystemPrompt(loaded.Config, opts, model)

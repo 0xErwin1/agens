@@ -1,19 +1,18 @@
 package agentdef
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"io"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/iperez/agens/internal/frontmatter"
 )
 
-// frontmatter mirrors the recognized YAML keys of a definition's frontmatter
+// defFrontmatter mirrors the recognized YAML keys of a definition's frontmatter
 // block. Unknown keys are ignored so a file can carry fields a newer version
 // understands without failing to parse here.
-type frontmatter struct {
+type defFrontmatter struct {
 	Description string   `yaml:"description,omitempty"`
 	Mode        string   `yaml:"mode,omitempty"`
 	Model       string   `yaml:"model,omitempty"`
@@ -25,7 +24,7 @@ type frontmatter struct {
 // `---` YAML frontmatter block is optional: when absent, the whole file is the
 // prompt and every field takes its default (ModeAll, no model restriction).
 func Parse(name, source string, data []byte) (Definition, error) {
-	front, body := splitFrontmatter(data)
+	front, body := frontmatter.Split(data)
 
 	def := Definition{
 		Name:   name,
@@ -38,7 +37,7 @@ func Parse(name, source string, data []byte) (Definition, error) {
 		return def, nil
 	}
 
-	var fm frontmatter
+	var fm defFrontmatter
 	if err := yaml.Unmarshal(front, &fm); err != nil {
 		return Definition{}, fmt.Errorf("invalid frontmatter: %w", err)
 	}
@@ -68,34 +67,5 @@ func parseMode(s string) (Mode, error) {
 		return ModeSubagent, nil
 	default:
 		return "", fmt.Errorf("invalid mode %q (want primary, subagent, or all)", s)
-	}
-}
-
-// splitFrontmatter separates a leading `---`-delimited YAML block from the
-// markdown body. It returns (nil, data) when the file does not open with a
-// `---` line or the block is never closed, so a plain markdown file is treated
-// as a body with no frontmatter rather than an error.
-func splitFrontmatter(data []byte) (front, body []byte) {
-	reader := bufio.NewReader(bytes.NewReader(data))
-
-	first, err := reader.ReadString('\n')
-	if strings.TrimRight(first, "\r\n") != "---" {
-		return nil, data
-	}
-	if err != nil {
-		return nil, data
-	}
-
-	var collected bytes.Buffer
-	for {
-		line, err := reader.ReadString('\n')
-		if strings.TrimRight(line, "\r\n") == "---" {
-			rest, _ := io.ReadAll(reader)
-			return collected.Bytes(), rest
-		}
-		collected.WriteString(line)
-		if err != nil {
-			return nil, data
-		}
 	}
 }
