@@ -128,9 +128,9 @@ func TestDefinition_ModeHelpers(t *testing.T) {
 }
 
 func TestLoad_BuiltinsPresentWithoutFiles(t *testing.T) {
-	set, err := Load("", "")
-	if err != nil {
-		t.Fatalf("Load() error = %v, want nil", err)
+	set, warnings := Load("", "")
+	if len(warnings) != 0 {
+		t.Fatalf("Load() warnings = %v, want none", warnings)
 	}
 	for _, name := range []string{"build", "plan"} {
 		if _, ok := set.ByName(name); !ok {
@@ -140,9 +140,9 @@ func TestLoad_BuiltinsPresentWithoutFiles(t *testing.T) {
 }
 
 func TestLoad_MissingDirectoriesAreNotAnError(t *testing.T) {
-	set, err := Load(filepath.Join(t.TempDir(), "nope"), filepath.Join(t.TempDir(), "nada"))
-	if err != nil {
-		t.Fatalf("Load() error = %v, want nil for missing directories", err)
+	set, warnings := Load(filepath.Join(t.TempDir(), "nope"), filepath.Join(t.TempDir(), "nada"))
+	if len(warnings) != 0 {
+		t.Fatalf("Load() warnings = %v, want none for missing directories", warnings)
 	}
 	if len(set.All()) != len(Builtins()) {
 		t.Fatalf("Load() = %d defs, want just the built-ins", len(set.All()))
@@ -157,9 +157,9 @@ func TestLoad_ProjectOverridesGlobalAndBuiltin(t *testing.T) {
 	writeAgent(t, globalDir, "shared.md", "---\ndescription: from global\n---\nglobal shared\n")
 	writeAgent(t, projectDir, "shared.md", "---\ndescription: from project\n---\nproject shared\n")
 
-	set, err := Load(globalDir, projectDir)
-	if err != nil {
-		t.Fatalf("Load() error = %v, want nil", err)
+	set, warnings := Load(globalDir, projectDir)
+	if len(warnings) != 0 {
+		t.Fatalf("Load() warnings = %v, want none", warnings)
 	}
 
 	build, _ := set.ByName("build")
@@ -173,12 +173,30 @@ func TestLoad_ProjectOverridesGlobalAndBuiltin(t *testing.T) {
 	}
 }
 
-func TestLoad_MalformedFileFailsFast(t *testing.T) {
+func TestLoad_MalformedFileIsSkippedWithWarning(t *testing.T) {
 	dir := t.TempDir()
 	writeAgent(t, dir, "broken.md", "---\nmode: nonsense\n---\nbody\n")
+	writeAgent(t, dir, "good.md", "---\ndescription: fine\n---\nok body\n")
 
-	if _, err := Load(dir, ""); err == nil {
-		t.Fatal("Load() error = nil, want a malformed agent file to fail fast")
+	set, warnings := Load(dir, "")
+
+	// The bad file is reported but does not fail the load.
+	if len(warnings) != 1 {
+		t.Fatalf("Load() warnings = %v, want exactly one for the malformed file", warnings)
+	}
+	if !strings.Contains(warnings[0].Error(), "broken.md") {
+		t.Fatalf("warning = %q, want it to name the skipped file", warnings[0].Error())
+	}
+
+	// The valid file and the built-ins still load — one bad file never hides them.
+	if _, ok := set.ByName("good"); !ok {
+		t.Fatal("the valid agent was dropped alongside the malformed one")
+	}
+	if _, ok := set.ByName("build"); !ok {
+		t.Fatal("the built-ins were dropped because of one malformed file")
+	}
+	if _, ok := set.ByName("broken"); ok {
+		t.Fatal("the malformed agent must not be registered")
 	}
 }
 
@@ -186,10 +204,7 @@ func TestSet_SubagentsExcludesPrimaryOnly(t *testing.T) {
 	dir := t.TempDir()
 	writeAgent(t, dir, "boss.md", "---\nmode: primary\n---\nboss\n")
 
-	set, err := Load("", dir)
-	if err != nil {
-		t.Fatalf("Load() error = %v, want nil", err)
-	}
+	set, _ := Load("", dir)
 
 	for _, d := range set.Subagents() {
 		if d.Name == "boss" {
@@ -213,10 +228,7 @@ func TestSaveModels_MaterializesBuiltinIntoProjectDir(t *testing.T) {
 	}
 
 	// The written file parses back with the deduped models and the body intact.
-	reloaded, err := Load("", projectDir)
-	if err != nil {
-		t.Fatalf("reload error = %v", err)
-	}
+	reloaded, _ := Load("", projectDir)
 	got, ok := reloaded.ByName("build")
 	if !ok {
 		t.Fatal("saved build agent not found on reload")

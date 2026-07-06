@@ -51,6 +51,14 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 
 			opts.Prompter = selectPrompter(allowAll)
 
+			// Surface any skipped agent-definition files to stderr so a malformed
+			// file is visible rather than silently dropped; it never blocks the turn.
+			if _, warnings, derr := agent.LoadAgentDefs(opts); derr == nil {
+				for _, w := range warnings {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: "+w)
+				}
+			}
+
 			loop, err := build(opts)
 			if err != nil {
 				return err

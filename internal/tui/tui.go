@@ -244,6 +244,10 @@ type Deps struct {
 	// Agents are the agent definitions the /agents menu presents and edits; nil
 	// disables the menu.
 	Agents *agentdef.Set
+	// AgentWarnings are human-readable notes about agent definition files that
+	// were skipped (malformed or unreadable); they are shown once at startup so a
+	// skipped file is visible rather than silently dropped.
+	AgentWarnings []string
 	// Subagents is the live catalog the running loop's task tool reads; when set,
 	// an /agents edit updates it so it takes effect this session, not only the
 	// next one.
@@ -310,6 +314,13 @@ func New(deps Deps) *Model {
 	}
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
 	m.messages.SetClock(m.now)
+
+	// Surface any skipped agent-definition files once, as startup notes, so a
+	// malformed file the loader stepped over is visible rather than silent.
+	for _, w := range deps.AgentWarnings {
+		m.messages.AddInfo(w)
+	}
+
 	return m
 }
 

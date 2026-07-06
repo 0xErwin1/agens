@@ -119,7 +119,10 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	// prompt of the chosen agent definition, and the model picked for the
 	// delegation. buildSub constructs that loop per delegation, since the model
 	// (and thus the prompt's environment block) varies by task.
-	defs, err := LoadAgentDefs(opts)
+	// Definition-file warnings are surfaced by the interactive/headless entry
+	// points that load defs directly (the TUI and the chat command); BuildLoop
+	// only needs the resolved set.
+	defs, _, err := LoadAgentDefs(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -661,16 +664,18 @@ func subagentOptions(defs *agentdef.Set) []task.Agent {
 
 // LoadAgentDefs discovers the agent definitions available for opts: the built-in
 // generic agents overlaid by the files in the global agents directory and then
-// the project's .agens/agents directory. It never fails on a missing directory;
-// only a real read or parse error is returned. It is exported so a surface (the
-// TUI's agents menu) can present and edit the same definitions the loop resolves
-// delegations against.
-func LoadAgentDefs(opts Options) (*agentdef.Set, error) {
+// the project's .agens/agents directory. A malformed or unreadable definition
+// file is skipped and returned as a human-readable warning rather than failing,
+// so one bad file never blocks startup; the error return is reserved for a
+// failure to resolve the project root. It is exported so a surface (the TUI's
+// agents menu) can present and edit the same definitions the loop resolves
+// delegations against, and surface the same warnings.
+func LoadAgentDefs(opts Options) (*agentdef.Set, []string, error) {
 	projectRoot := opts.ProjectRoot
 	if projectRoot == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("agent: %w", err)
+			return nil, nil, fmt.Errorf("agent: %w", err)
 		}
 		projectRoot = config.ProjectRoot(wd)
 	}
@@ -678,11 +683,14 @@ func LoadAgentDefs(opts Options) (*agentdef.Set, error) {
 	globalDir := filepath.Join(config.HomeDir(), "agents")
 	projectDir := filepath.Join(projectRoot, ".agens", "agents")
 
-	set, err := agentdef.Load(globalDir, projectDir)
-	if err != nil {
-		return nil, fmt.Errorf("agent: %w", err)
+	set, issues := agentdef.Load(globalDir, projectDir)
+
+	warnings := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		warnings = append(warnings, issue.Error())
 	}
-	return set, nil
+
+	return set, warnings, nil
 }
 
 // withSystemPrompt returns a copy of opts with SystemPrompt set to prompt, used

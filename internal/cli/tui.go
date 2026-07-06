@@ -23,17 +23,18 @@ import (
 // the model lister for the /model selector, the system-prompt rebuilder used
 // on a live model switch, and the model name for the status line.
 type tuiSession struct {
-	loop         *agentloop.Loop
-	lister       tui.ModelLister
-	prompt       tui.SystemPromptFunc
-	agentPrompt  tui.AgentPromptFunc
-	model        string
-	effortLevels []string
-	sessions     tui.SessionStore
-	files        tui.FileSource
-	project      string
-	agents       *agentdef.Set
-	subagents    *task.Catalog
+	loop          *agentloop.Loop
+	lister        tui.ModelLister
+	prompt        tui.SystemPromptFunc
+	agentPrompt   tui.AgentPromptFunc
+	model         string
+	effortLevels  []string
+	sessions      tui.SessionStore
+	files         tui.FileSource
+	project       string
+	agents        *agentdef.Set
+	agentWarnings []string
+	subagents     *task.Catalog
 
 	collapseThinking   bool
 	truncateToolOutput bool
@@ -96,6 +97,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Files:              sess.files,
 			Project:            sess.project,
 			Agents:             sess.agents,
+			AgentWarnings:      sess.agentWarnings,
 			Subagents:          sess.subagents,
 			ResumeID:           resumeID,
 			OpenSessions:       openSessions,
@@ -162,7 +164,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
 
-	defs, err := agent.LoadAgentDefs(opts)
+	defs, agentWarnings, err := agent.LoadAgentDefs(opts)
 	if err != nil {
 		return tuiSession{}, fmt.Errorf("tui: %w", err)
 	}
@@ -208,6 +210,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		files:              files,
 		project:            opts.ProjectRoot,
 		agents:             defs,
+		agentWarnings:      agentWarnings,
 		subagents:          catalog,
 		collapseThinking:   loaded.Config.UI.CollapseThinking,
 		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,

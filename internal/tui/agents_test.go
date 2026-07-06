@@ -18,10 +18,7 @@ import (
 // destination for saved definition files.
 func agentsModel(t *testing.T, projectRoot string) *Model {
 	t.Helper()
-	defs, err := agentdef.Load("", "")
-	if err != nil {
-		t.Fatalf("agentdef.Load() error = %v", err)
-	}
+	defs, _ := agentdef.Load("", "")
 
 	seed := make([]task.Agent, 0)
 	for _, d := range defs.Subagents() {
@@ -144,6 +141,20 @@ func TestModel_AgentsMenuEditorFillsInWhenModelsLoadLate(t *testing.T) {
 	m.Update(modelsLoadedMsg{models: []provider.ModelInfo{{ID: "gpt-5.5"}, {ID: "gpt-4.1"}}})
 	if len(m.agentModelRows) != 2 {
 		t.Fatalf("editor rows = %d after the catalog loaded, want them filled in", len(m.agentModelRows))
+	}
+}
+
+func TestModel_AgentWarningsSurfacedAtStartup(t *testing.T) {
+	m := New(Deps{
+		Loop:          &scriptedLoopRunner{},
+		Model:         "gpt-5.5",
+		AgentWarnings: []string{"agentdef: skipped broken.md: invalid mode \"nonsense\""},
+	})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	view := stripANSI(m.messages.View())
+	if !strings.Contains(view, "broken.md") {
+		t.Fatalf("startup view = %q, want the skipped-agent warning shown", view)
 	}
 }
 

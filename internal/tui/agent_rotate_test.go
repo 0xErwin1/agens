@@ -17,10 +17,7 @@ import (
 // was called with, so a test can assert which persona reached the loop.
 func rotateModel(t *testing.T) (*Model, *scriptedLoopRunner) {
 	t.Helper()
-	defs, err := agentdef.Load("", "")
-	if err != nil {
-		t.Fatalf("agentdef.Load() error = %v", err)
-	}
+	defs, _ := agentdef.Load("", "")
 	loop := &scriptedLoopRunner{}
 	m := New(Deps{
 		Loop:   loop,
