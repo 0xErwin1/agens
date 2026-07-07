@@ -6,10 +6,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
-	"github.com/iperez/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/session"
 )
 
 // rotateModel builds a model wired with the built-in primary agents (default,

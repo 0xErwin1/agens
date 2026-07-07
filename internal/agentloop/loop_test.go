@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // textOnlySteps scripts a stream that emits a single text delta followed by

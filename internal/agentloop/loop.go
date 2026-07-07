@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // ErrMaxIterations is returned by Run when the configured iteration limit is

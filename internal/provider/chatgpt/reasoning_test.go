@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 func TestEncodeRequest_Reasoning(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // fallbackInputSchema is the InputSchema cached for a Tool whose Schema()

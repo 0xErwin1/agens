@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/agentloop"
 )
 
 // subagentGlyph marks a delegated subagent panel, distinguishing it from a plain

@@ -14,8 +14,8 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	"github.com/iperez/agens/internal/auth"
-	"github.com/iperez/agens/internal/auth/chatgpt"
+	"github.com/0xErwin1/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/auth/chatgpt"
 )
 
 // loginFunc performs the ChatGPT OAuth device/browser login flow and

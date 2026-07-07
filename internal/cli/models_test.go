@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/agent"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/agent"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // modelsFakeProvider is a minimal provider.Provider for models command

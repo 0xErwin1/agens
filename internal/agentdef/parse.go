@@ -6,7 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/iperez/agens/internal/frontmatter"
+	"github.com/0xErwin1/agens/internal/frontmatter"
 )
 
 // defFrontmatter mirrors the recognized YAML keys of a definition's frontmatter

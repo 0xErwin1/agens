@@ -4,8 +4,8 @@ import (
 	"errors"
 	iofs "io/fs"
 
-	agentfs "github.com/iperez/agens/internal/tool/fs"
-	"github.com/iperez/agens/internal/tui"
+	agentfs "github.com/0xErwin1/agens/internal/tool/fs"
+	"github.com/0xErwin1/agens/internal/tui"
 )
 
 // maxProjectFiles bounds how many files the @-reference index holds, so a huge

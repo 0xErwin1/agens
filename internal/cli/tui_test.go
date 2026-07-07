@@ -8,9 +8,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agent"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/agent"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/permission"
 )
 
 // stubTUILoop builds a throwaway loop from a fake provider so the builder seam

@@ -8,15 +8,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
-	"github.com/iperez/agens/internal/agent"
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/auth"
-	"github.com/iperez/agens/internal/config"
-	"github.com/iperez/agens/internal/permission"
-	"github.com/iperez/agens/internal/session"
-	"github.com/iperez/agens/internal/tool/task"
-	"github.com/iperez/agens/internal/tui"
+	"github.com/0xErwin1/agens/internal/agent"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/tool/task"
+	"github.com/0xErwin1/agens/internal/tui"
 )
 
 // tuiSession is everything the TUI needs from the build step: the agent loop,

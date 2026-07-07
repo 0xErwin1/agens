@@ -3,7 +3,7 @@ package cli
 import (
 	"github.com/spf13/cobra"
 
-	"github.com/iperez/agens/internal/version"
+	"github.com/0xErwin1/agens/internal/version"
 )
 
 func NewRootCommand() *cobra.Command {

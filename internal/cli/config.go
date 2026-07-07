@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/iperez/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/config"
 )
 
 func newConfigCommand() *cobra.Command {

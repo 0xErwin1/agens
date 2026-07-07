@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/iperez/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/auth"
 )
 
 // OAuth endpoint and client configuration for the ChatGPT PKCE login flow,

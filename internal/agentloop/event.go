@@ -8,8 +8,8 @@
 package agentloop
 
 import (
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // LoopEventKind discriminates which LoopEvent fields are meaningful.

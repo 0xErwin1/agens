@@ -1,6 +1,6 @@
 package app
 
-import "github.com/iperez/agens/internal/cli"
+import "github.com/0xErwin1/agens/internal/cli"
 
 func Run(args []string) error {
 	cmd := cli.NewRootCommand()

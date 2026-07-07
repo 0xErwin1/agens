@@ -5,7 +5,7 @@ package session
 import (
 	"time"
 
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 // Session is one saved conversation. Project is the absolute project root the

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // toolChoiceAuto is the only tool_choice value this wire ever sends: the

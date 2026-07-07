@@ -8,7 +8,7 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 // stripANSI removes terminal escape sequences so assertions can match the plain

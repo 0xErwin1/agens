@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 func newFramer(script string) *sseFramer {

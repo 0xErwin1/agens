@@ -11,16 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/auth"
-	"github.com/iperez/agens/internal/config"
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/permission"
-	"github.com/iperez/agens/internal/provider"
-	"github.com/iperez/agens/internal/provider/chatgpt"
-	"github.com/iperez/agens/internal/provider/openai"
-	"github.com/iperez/agens/internal/tool/task"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider/chatgpt"
+	"github.com/0xErwin1/agens/internal/provider/openai"
+	"github.com/0xErwin1/agens/internal/tool/task"
 )
 
 // loadTestDefs returns the built-in agent definitions (build, plan) for wiring

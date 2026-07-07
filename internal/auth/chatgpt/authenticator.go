@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/iperez/agens/internal/auth"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 var _ provider.Authenticator = (*Authenticator)(nil)

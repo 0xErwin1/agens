@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/agent"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/permission"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/agent"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // chatStreamStep is one scripted Recv() outcome, mirroring

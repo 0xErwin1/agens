@@ -8,7 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // fakeLister is a ModelLister double returning a fixed catalog or error.

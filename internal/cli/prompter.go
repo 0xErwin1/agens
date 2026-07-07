@@ -10,8 +10,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
 )
 
 // ttyPrompter asks a human for a permission decision by writing a prompt to

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iperez/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/auth"
 )
 
 func TestAuthCommand_BareLoginInvokesInjectedLogin(t *testing.T) {

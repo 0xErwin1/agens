@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 // var _ agentloop.ToolRunner = (*Registry)(nil) is the only place internal/tool

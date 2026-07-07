@@ -8,8 +8,8 @@ import (
 	"io"
 	"strings"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // toolCallBuilder accumulates one in-flight tool call's fragmented

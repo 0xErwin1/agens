@@ -8,7 +8,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // maxModelRows caps how many model rows the selector shows at once; a longer

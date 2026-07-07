@@ -8,9 +8,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/provider"
-	"github.com/iperez/agens/internal/tool/task"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/tool/task"
 )
 
 // agentsModel builds a model wired with the built-in agents, a live catalog

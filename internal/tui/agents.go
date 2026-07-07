@@ -8,8 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // maxAgentRows and maxAgentModelRows cap how many rows each level of the agents

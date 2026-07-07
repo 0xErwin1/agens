@@ -9,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 func sendKey(m *Model, k tea.KeyMsg) tea.Cmd {

@@ -1,8 +1,8 @@
 package permission_test
 
 import (
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/permission"
 )
 
 // var _ agentloop.ToolRunner = (*permission.Gate)(nil) is the only place in

@@ -6,8 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // Reuses fakeLister and scriptedLoopRunner from the package's other tests.

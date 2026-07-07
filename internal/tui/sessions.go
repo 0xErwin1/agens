@@ -7,8 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/session"
 )
 
 // maxSessionRows caps how many session rows the picker shows at once; a longer

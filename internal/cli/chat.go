@@ -11,11 +11,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/iperez/agens/internal/agent"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/auth"
-	"github.com/iperez/agens/internal/config"
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/agent"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 // loopBuilder resolves an agent.Options into a ready-to-run

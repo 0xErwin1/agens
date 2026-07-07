@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
 )
 
 func TestTTYPrompter_KeyMap(t *testing.T) {

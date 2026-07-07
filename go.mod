@@ -1,4 +1,4 @@
-module github.com/iperez/agens
+module github.com/0xErwin1/agens
 
 go 1.25.0
 

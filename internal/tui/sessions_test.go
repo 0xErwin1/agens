@@ -7,8 +7,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/session"
 )
 
 // fakeSessionStore is a SessionStore double backed by an in-memory map.

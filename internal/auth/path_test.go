@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/iperez/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/config"
 )
 
 func TestDefaultPathUsesExplicitConfigHome(t *testing.T) {

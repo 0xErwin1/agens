@@ -6,7 +6,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/iperez/agens/internal/frontmatter"
+	"github.com/0xErwin1/agens/internal/frontmatter"
 )
 
 // The Anthropic Agent Skill contract caps the two required frontmatter fields.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // Runner mirrors agentloop.ToolRunner so Gate can decorate an inner tool

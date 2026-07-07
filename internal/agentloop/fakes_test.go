@@ -4,8 +4,8 @@ import (
 	"context"
 	"io"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // streamStep is one scripted Recv() outcome: either an event or an error,

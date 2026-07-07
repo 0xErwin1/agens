@@ -8,8 +8,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
 )
 
 // Modal geometry. The permission modal floats above the input as an overlay;

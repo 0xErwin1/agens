@@ -13,8 +13,8 @@ import (
 	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/message"
 )
 
 // ayuStyleJSON is the glamour style config that renders assistant markdown —

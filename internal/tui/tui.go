@@ -12,12 +12,12 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/iperez/agens/internal/agentdef"
-	"github.com/iperez/agens/internal/agentloop"
-	"github.com/iperez/agens/internal/message"
-	"github.com/iperez/agens/internal/provider"
-	"github.com/iperez/agens/internal/session"
-	"github.com/iperez/agens/internal/tool/task"
+	"github.com/0xErwin1/agens/internal/agentdef"
+	"github.com/0xErwin1/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/tool/task"
 )
 
 // Layout dimensions. The input and status bars have fixed heights; the

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // sseScript joins each already-formatted "data: {...}" JSON line into one

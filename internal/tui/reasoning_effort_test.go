@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/iperez/agens/internal/agentloop"
+	"github.com/0xErwin1/agens/internal/agentloop"
 )
 
 func streamEvent(m *Model, kind agentloop.LoopEventKind, text string) {

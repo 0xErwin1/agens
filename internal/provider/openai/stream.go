@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/iperez/agens/internal/provider"
+	"github.com/0xErwin1/agens/internal/provider"
 )
 
 // sseFramer decodes an OpenAI chat-completions Server-Sent Events body one

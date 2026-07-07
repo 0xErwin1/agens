@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iperez/agens/internal/tool"
+	"github.com/0xErwin1/agens/internal/tool"
 )
 
 func TestNew(t *testing.T) {

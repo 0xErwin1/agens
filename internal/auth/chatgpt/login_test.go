@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iperez/agens/internal/auth"
+	"github.com/0xErwin1/agens/internal/auth"
 )
 
 // fakeTokenServer returns an httptest.Server that answers the token
