@@ -1,5 +1,4 @@
-// Package session persists agent conversations to disk so they can be listed
-// and resumed. Each session is one JSON file holding its message history.
+// Package session defines saved conversation data that can be listed and resumed.
 package session
 
 import (

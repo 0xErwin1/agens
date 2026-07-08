@@ -22,7 +22,7 @@ Agens is a Go CLI coding agent with an interactive terminal UI, one-shot chat mo
 - Session persistence and resume in the TUI.
 - Nix-first developer environment and `just` workflows.
 
-Still intentionally out of scope: MCP, skills, sub-agents, packaging/release automation, and a SQLite runtime store.
+Still intentionally out of scope: packaging/release automation and editor protocol integrations.
 
 ## Quick start
 
@@ -153,13 +153,13 @@ Validate the loaded config with:
 
 Credentials are stored in `auth.json` under the same config home used for `config.toml`. The file stores provider entries keyed by provider id (`openai-api`, `openai-chatgpt`). CLI status output redacts secrets.
 
-Sessions are currently stored as JSON files under:
+Sessions are stored in a SQLite database under:
 
 ```text
-${XDG_DATA_HOME:-~/.local/share}/agens/sessions
+${XDG_DATA_HOME:-~/.local/share}/agens/sessions.db
 ```
 
-Mutable runtime state should not be added to TOML config. Future persistent state should move to the planned runtime store.
+Mutable runtime state belongs in the runtime store, not in TOML config.
 
 ## Development
 
