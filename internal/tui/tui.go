@@ -14,6 +14,7 @@ import (
 
 	"github.com/0xErwin1/agens/internal/agentdef"
 	"github.com/0xErwin1/agens/internal/agentloop"
+	usercommand "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/message"
 	"github.com/0xErwin1/agens/internal/provider"
 	"github.com/0xErwin1/agens/internal/session"
@@ -244,10 +245,11 @@ type Deps struct {
 	// Agents are the agent definitions the /agents menu presents and edits; nil
 	// disables the menu.
 	Agents *agentdef.Set
-	// AgentWarnings are human-readable notes about agent definition files that
-	// were skipped (malformed or unreadable); they are shown once at startup so a
-	// skipped file is visible rather than silently dropped.
+	// AgentWarnings are human-readable notes about startup files that were skipped
+	// (malformed or unreadable); they are shown once so skipped files are visible.
 	AgentWarnings []string
+	// UserCommands are markdown-backed slash commands registered after built-ins.
+	UserCommands *usercommand.Set
 	// Subagents is the live catalog the running loop's task tool reads; when set,
 	// an /agents edit updates it so it takes effect this session, not only the
 	// next one.
@@ -314,6 +316,7 @@ func New(deps Deps) *Model {
 	}
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
 	m.messages.SetClock(m.now)
+	registerUserCommands(m.commands, deps.UserCommands)
 
 	// Surface any skipped agent-definition files once, as startup notes, so a
 	// malformed file the loader stepped over is visible rather than silent.
@@ -849,6 +852,10 @@ func (m *Model) submit() tea.Cmd {
 // submitText records text as a new user turn, shows it, marks the model busy,
 // and starts the turn goroutine. It backs both a live submission (submit) and
 // the automatic sending of a queued message when the previous turn finishes.
+func (m *Model) SubmitUserPrompt(text string) tea.Cmd {
+	return m.submitText(text)
+}
+
 func (m *Model) submitText(text string) tea.Cmd {
 	// The model receives the message with @-referenced files inlined and, after an
 	// agent switch, a synthetic switch note prepended; the conversation shows the
@@ -999,10 +1006,11 @@ func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 // conversation view). The returned tea.Cmd, if any, is the command's own (for
 // example tea.Quit).
 func (m *Model) runCommand(cmd Command) tea.Cmd {
+	input := m.input.Value()
 	m.input.Reset()
 	m.closePalette()
 
-	result := cmd.Run(m)
+	result := cmd.Run(m, input)
 
 	m.layout()
 	return result

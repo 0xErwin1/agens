@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/google/uuid"
@@ -12,6 +13,7 @@ import (
 	"github.com/0xErwin1/agens/internal/agentdef"
 	"github.com/0xErwin1/agens/internal/agentloop"
 	"github.com/0xErwin1/agens/internal/auth"
+	usercommand "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/config"
 	"github.com/0xErwin1/agens/internal/permission"
 	"github.com/0xErwin1/agens/internal/session"
@@ -34,6 +36,7 @@ type tuiSession struct {
 	project       string
 	agents        *agentdef.Set
 	agentWarnings []string
+	userCommands  *usercommand.Set
 	subagents     *task.Catalog
 
 	collapseThinking   bool
@@ -98,6 +101,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Project:            sess.project,
 			Agents:             sess.agents,
 			AgentWarnings:      sess.agentWarnings,
+			UserCommands:       sess.userCommands,
 			Subagents:          sess.subagents,
 			ResumeID:           resumeID,
 			OpenSessions:       openSessions,
@@ -179,6 +183,14 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	}
 	agentWarnings = append(agentWarnings, skillWarnings...)
 
+	commands, commandIssues := usercommand.Load(
+		filepath.Join(config.HomeDir(), "commands"),
+		filepath.Join(opts.ProjectRoot, ".agens", "commands"),
+	)
+	for _, issue := range commandIssues {
+		agentWarnings = append(agentWarnings, issue.Error())
+	}
+
 	prompt := func(model string) (string, bool) {
 		sp, err := agent.BuildSystemPrompt(loaded.Config, opts, model)
 		if err != nil {
@@ -221,6 +233,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		project:            opts.ProjectRoot,
 		agents:             defs,
 		agentWarnings:      agentWarnings,
+		userCommands:       commands,
 		subagents:          catalog,
 		collapseThinking:   loaded.Config.UI.CollapseThinking,
 		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,
