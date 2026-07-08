@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -18,10 +19,28 @@ const (
 )
 
 type Config struct {
-	Options  Options  `toml:"options"`
-	Provider Provider `toml:"provider"`
-	Agent    Agent    `toml:"agent"`
-	UI       UI       `toml:"ui"`
+	Options  Options              `toml:"options"`
+	Provider Provider             `toml:"provider"`
+	Agent    Agent                `toml:"agent"`
+	UI       UI                   `toml:"ui"`
+	MCP      map[string]MCPServer `toml:"mcp"`
+}
+
+const (
+	MCPTransportStdio = "stdio"
+	MCPTransportHTTP  = "http"
+	MCPTransportSSE   = "sse"
+)
+
+type MCPServer struct {
+	Transport  string            `toml:"transport"`
+	Command    string            `toml:"command"`
+	Args       []string          `toml:"args"`
+	Env        map[string]string `toml:"env"`
+	CWD        string            `toml:"cwd"`
+	URL        string            `toml:"url"`
+	Headers    map[string]string `toml:"headers"`
+	MaxRetries int               `toml:"max_retries"`
 }
 
 // UI holds display preferences for the interactive terminal UI. Both default to
@@ -74,15 +93,27 @@ type LoadOptions struct {
 }
 
 type configPatch struct {
-	Options  *optionsPatch  `toml:"options"`
-	Provider *providerPatch `toml:"provider"`
-	Agent    *agentPatch    `toml:"agent"`
-	UI       *uiPatch       `toml:"ui"`
+	Options  *optionsPatch             `toml:"options"`
+	Provider *providerPatch            `toml:"provider"`
+	Agent    *agentPatch               `toml:"agent"`
+	UI       *uiPatch                  `toml:"ui"`
+	MCP      map[string]mcpServerPatch `toml:"mcp"`
 }
 
 type uiPatch struct {
 	CollapseThinking   *bool `toml:"collapse_thinking"`
 	TruncateToolOutput *bool `toml:"truncate_tool_output"`
+}
+
+type mcpServerPatch struct {
+	Transport  *string           `toml:"transport"`
+	Command    *string           `toml:"command"`
+	Args       []string          `toml:"args"`
+	Env        map[string]string `toml:"env"`
+	CWD        *string           `toml:"cwd"`
+	URL        *string           `toml:"url"`
+	Headers    map[string]string `toml:"headers"`
+	MaxRetries *int              `toml:"max_retries"`
 }
 
 type optionsPatch struct {
@@ -112,6 +143,7 @@ func DefaultConfig() Config {
 		Agent: Agent{
 			ParallelToolCalls: true,
 		},
+		MCP: map[string]MCPServer{},
 	}
 }
 
@@ -192,6 +224,9 @@ func (l *Loaded) applyFile(path string, scope Scope, env map[string]string) erro
 	if err != nil {
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
+	if scope == ScopeProject && len(patch.MCP) > 0 {
+		return fmt.Errorf("project config %s: MCP servers must be configured in global config", path)
+	}
 	if err := expandPatch(&patch, env); err != nil {
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
@@ -199,11 +234,17 @@ func (l *Loaded) applyFile(path string, scope Scope, env map[string]string) erro
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
 	applyPatch(&l.Config, patch)
+	if err := validateConfig(l.Config); err != nil {
+		return fmt.Errorf("%s config %s: %w", scope, path, err)
+	}
 	l.Sources = append(l.Sources, Source{Path: path, Scope: scope})
 	return nil
 }
 
 func decodePatch(data []byte) (configPatch, error) {
+	if err := checkDuplicateMCPTables(data); err != nil {
+		return configPatch{}, err
+	}
 	var patch configPatch
 	decoder := toml.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -211,6 +252,22 @@ func decodePatch(data []byte) (configPatch, error) {
 		return configPatch{}, fmt.Errorf("invalid TOML: %w", err)
 	}
 	return patch, nil
+}
+
+func checkDuplicateMCPTables(data []byte) error {
+	seen := map[string]struct{}{}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "[mcp.") || !strings.HasSuffix(line, "]") || strings.HasPrefix(line, "[[") {
+			continue
+		}
+		name := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "[mcp."), "]"))
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("duplicate MCP server %s", "mcp."+name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
 }
 
 func environMap() map[string]string {

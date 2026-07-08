@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/0xErwin1/agens/internal/provider"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // fakeTool is a Tool double. Name, Description and Schema are plain fields

@@ -33,3 +33,30 @@ func TestExpandEnvMissingVariableFails(t *testing.T) {
 		t.Fatal("ExpandEnv() error = nil, want error")
 	}
 }
+
+func TestExpandEnvDoesNotRunCommandsByDefault(t *testing.T) {
+	got, err := ExpandEnv("$(printf should-not-run)", map[string]string{})
+	if err != nil {
+		t.Fatalf("ExpandEnv() error = %v", err)
+	}
+	if got != "$(printf should-not-run)" {
+		t.Fatalf("ExpandEnv() = %q, want literal command expression", got)
+	}
+}
+
+func TestExpandCommandSubstitutionHasNoStdin(t *testing.T) {
+	got, err := ExpandEnvWithCommands("$(read value || printf no-stdin)", map[string]string{})
+	if err != nil {
+		t.Fatalf("ExpandEnvWithCommands() error = %v", err)
+	}
+	if got != "no-stdin" {
+		t.Fatalf("ExpandEnvWithCommands() = %q, want no-stdin", got)
+	}
+}
+
+func TestExpandCommandSubstitutionCapsOutput(t *testing.T) {
+	_, err := ExpandEnvWithCommands("$(head -c 70000 /dev/zero | tr '\\0' x)", map[string]string{})
+	if err == nil {
+		t.Fatal("ExpandEnvWithCommands() error = nil, want output cap error")
+	}
+}

@@ -15,12 +15,15 @@ import (
 	"github.com/0xErwin1/agens/internal/agentloop"
 	"github.com/0xErwin1/agens/internal/auth"
 	"github.com/0xErwin1/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/mcpclient"
 	"github.com/0xErwin1/agens/internal/message"
 	"github.com/0xErwin1/agens/internal/permission"
 	"github.com/0xErwin1/agens/internal/provider"
 	"github.com/0xErwin1/agens/internal/provider/chatgpt"
 	"github.com/0xErwin1/agens/internal/provider/openai"
+	agenttool "github.com/0xErwin1/agens/internal/tool"
 	"github.com/0xErwin1/agens/internal/tool/task"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // loadTestDefs returns the built-in agent definitions (build, plan) for wiring
@@ -838,6 +841,176 @@ func TestBuildGate_WebfetchAskConsultsPrompter_DenyOnceDenies(t *testing.T) {
 	}
 	if len(fp.calls) != 1 {
 		t.Fatalf("prompter was consulted %d time(s) for a webfetch call, want exactly 1 (webfetch must resolve to Ask, no seeded rule)", len(fp.calls))
+	}
+}
+
+type fakeMCPDiscoverer struct {
+	tools       []agenttool.Tool
+	diagnostics []mcpclient.Diagnostic
+	ctx         context.Context
+}
+
+func (f *fakeMCPDiscoverer) Discover(ctx context.Context) ([]agenttool.Tool, []mcpclient.Diagnostic) {
+	f.ctx = ctx
+	return f.tools, f.diagnostics
+}
+
+type fakeMCPTool struct {
+	name        string
+	description string
+	result      agenttool.Result
+	err         error
+	calls       int
+}
+
+func (f *fakeMCPTool) Name() string        { return f.name }
+func (f *fakeMCPTool) Description() string { return f.description }
+func (f *fakeMCPTool) Schema() *jsonschema.Schema {
+	return nil
+}
+func (f *fakeMCPTool) Execute(context.Context, json.RawMessage) (agenttool.Result, error) {
+	f.calls++
+	return f.result, f.err
+}
+
+func TestBuildGate_RegistersDiscoveredMCPTools(t *testing.T) {
+	searchTool := &fakeMCPTool{name: "docs_search", description: "Search docs", result: agenttool.Result{Text: "found docs"}}
+	fetchTool := &fakeMCPTool{name: "docs_fetch", description: "Fetch docs", result: agenttool.Result{Text: "fetched docs"}}
+	gate, err := buildGate(Options{
+		ProjectRoot:   t.TempDir(),
+		Prompter:      &fakePrompter{answer: permission.AnswerAllowOnce},
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{searchTool, fetchTool}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	names := specNames(t, gate)
+	if !names["docs_search"] || !names["docs_fetch"] {
+		t.Fatalf("gate specs names = %#v, want docs_search and docs_fetch", names)
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_mcp", Name: "docs_search", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("gate.Run(docs_search) error = %v, want nil", err)
+	}
+	if result.IsError || resultText(result) != "found docs" {
+		t.Fatalf("gate.Run(docs_search) result = %+v text %q, want successful MCP result", result, resultText(result))
+	}
+	if searchTool.calls != 1 {
+		t.Fatalf("docs_search calls = %d, want 1", searchTool.calls)
+	}
+}
+
+func TestBuildGate_DuplicateMCPToolNamesAreErrors(t *testing.T) {
+	_, err := buildGate(Options{
+		ProjectRoot: t.TempDir(),
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{
+			&fakeMCPTool{name: "docs_search", description: "first"},
+			&fakeMCPTool{name: "docs_search", description: "second"},
+		}},
+	})
+	if err == nil {
+		t.Fatal("buildGate() error = nil, want duplicate MCP tool name error")
+	}
+	if !strings.Contains(err.Error(), "duplicate MCP tool name") || !strings.Contains(err.Error(), "docs_search") {
+		t.Fatalf("buildGate() error = %q, want clear duplicate docs_search diagnostic", err.Error())
+	}
+}
+
+func TestBuildGate_DiscoveredMCPToolRemainsVisibleAfterRuntimeFailure(t *testing.T) {
+	searchTool := &fakeMCPTool{name: "docs_search", description: "Search docs", result: agenttool.Result{Text: "connect refused", IsError: true}}
+	gate, err := buildGate(Options{
+		ProjectRoot:   t.TempDir(),
+		Prompter:      &fakePrompter{answer: permission.AnswerAllowOnce},
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{searchTool}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+	if !specNames(t, gate)["docs_search"] {
+		t.Fatal("gate specs missing docs_search after successful discovery")
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_mcp", Name: "docs_search", Input: json.RawMessage(`{"query":"mcp"}`)})
+	if err != nil {
+		t.Fatalf("gate.Run(docs_search) error = %v, want nil", err)
+	}
+	if !result.IsError || !strings.Contains(resultText(result), "connect refused") {
+		t.Fatalf("gate.Run(docs_search) result = %+v text %q, want tool-level runtime failure", result, resultText(result))
+	}
+	if !specNames(t, gate)["docs_search"] {
+		t.Fatal("gate specs lost docs_search after runtime failure")
+	}
+}
+
+func TestBuildGate_MCPToolsUseExistingPermissionGate(t *testing.T) {
+	searchTool := &fakeMCPTool{name: "docs_search", description: "Search docs", result: agenttool.Result{Text: "should not execute"}}
+	fp := &fakePrompter{answer: permission.AnswerDenyOnce}
+	gate, err := buildGate(Options{
+		ProjectRoot:   t.TempDir(),
+		Prompter:      fp,
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{searchTool}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_mcp", Name: "docs_search", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("gate.Run(docs_search) error = %v, want nil", err)
+	}
+	if !result.IsError || !strings.Contains(resultText(result), "permission denied") {
+		t.Fatalf("gate.Run(docs_search) result = %+v text %q, want permission denial", result, resultText(result))
+	}
+	if len(fp.calls) != 1 || fp.calls[0].Name != "docs_search" {
+		t.Fatalf("prompter calls = %+v, want one docs_search permission prompt", fp.calls)
+	}
+	if searchTool.calls != 0 {
+		t.Fatalf("docs_search calls = %d, want 0 after permission denial", searchTool.calls)
+	}
+}
+
+func TestBuildGate_MCPDiscoveryUsesBoundedContext(t *testing.T) {
+	discoverer := &fakeMCPDiscoverer{}
+	_, err := buildGate(Options{ProjectRoot: t.TempDir(), mcpDiscoverer: discoverer})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+	if discoverer.ctx == nil {
+		t.Fatal("Discover context = nil")
+	}
+	deadline, ok := discoverer.ctx.Deadline()
+	if !ok {
+		t.Fatal("Discover context has no deadline")
+	}
+	if remaining := time.Until(deadline); remaining <= 0 || remaining > mcpDiscoveryTimeout {
+		t.Fatalf("Discover deadline remaining = %s, want within %s", remaining, mcpDiscoveryTimeout)
+	}
+}
+
+func TestBuildGate_MCPDiscoveryFailureDoesNotFabricateTools(t *testing.T) {
+	gate, err := buildGate(Options{
+		ProjectRoot: t.TempDir(),
+		Prompter:    &fakePrompter{answer: permission.AnswerAllowOnce},
+		mcpDiscoverer: &fakeMCPDiscoverer{diagnostics: []mcpclient.Diagnostic{{
+			Server: "offline",
+			Err:    "connect refused",
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil degraded startup", err)
+	}
+	if specNames(t, gate)["offline_search"] {
+		t.Fatal("gate specs include offline_search, want no fabricated MCP tool after discovery failure")
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_mcp", Name: "offline_search", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("gate.Run(offline_search) error = %v, want nil unknown-tool result", err)
+	}
+	if !result.IsError || !strings.Contains(resultText(result), "unknown tool") {
+		t.Fatalf("gate.Run(offline_search) result = %+v text %q, want unknown tool", result, resultText(result))
 	}
 }
 

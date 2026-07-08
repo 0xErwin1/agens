@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/0xErwin1/agens/internal/message"
+	"github.com/bmatcuk/doublestar/v4"
 )
 
 // Engine resolves a tool call to a Decision by evaluating a fixed set of

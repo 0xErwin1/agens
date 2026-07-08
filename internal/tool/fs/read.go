@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/0xErwin1/agens/internal/tool"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // Read implements the "read" tool: it returns the contents of a file

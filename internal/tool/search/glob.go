@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"io/fs"
 
+	"github.com/0xErwin1/agens/internal/tool"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/0xErwin1/agens/internal/tool"
 )
 
 // Glob implements the "glob" tool: it lists worktree-relative file paths

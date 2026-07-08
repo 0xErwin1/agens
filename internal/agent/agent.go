@@ -1,6 +1,5 @@
 // Package agent is the composition root that wires a config.Config and an
-// auth.File into a ready-to-run *agentloop.Loop, with no network calls of
-// its own.
+// auth.File into a ready-to-run *agentloop.Loop.
 package agent
 
 import (
@@ -19,6 +18,7 @@ import (
 	"github.com/0xErwin1/agens/internal/auth"
 	chatgptauth "github.com/0xErwin1/agens/internal/auth/chatgpt"
 	"github.com/0xErwin1/agens/internal/config"
+	"github.com/0xErwin1/agens/internal/mcpclient"
 	"github.com/0xErwin1/agens/internal/message"
 	"github.com/0xErwin1/agens/internal/permission"
 	"github.com/0xErwin1/agens/internal/prompt"
@@ -37,8 +37,9 @@ import (
 // defaultProviderID and chatgptProviderID identify the two providers
 // BuildLoop can wire; each must match the corresponding provider's ID().
 const (
-	defaultProviderID = "openai-api"
-	chatgptProviderID = "openai-chatgpt"
+	defaultProviderID   = "openai-api"
+	chatgptProviderID   = "openai-chatgpt"
+	mcpDiscoveryTimeout = 10 * time.Second
 )
 
 // Options carries the per-invocation overrides a caller (typically the
@@ -69,12 +70,15 @@ type Options struct {
 	// A surface loads it once and passes it here so a live prompt rebuild keeps
 	// the same skills; a nil value makes BuildLoop discover them itself.
 	Skills *skill.Set
+
+	mcpServers    map[string]config.MCPServer
+	mcpDiscoverer mcpToolDiscoverer
 }
 
 // BuildLoop resolves cfg, creds, and opts into a ready-to-run
-// *agentloop.Loop. It performs no network I/O; it reads local config,
-// credentials, and instruction files and constructs the provider and loop,
-// both of which are pure construction.
+// *agentloop.Loop. It reads local config, credentials, and instruction files,
+// constructs the provider and loop, and discovers configured MCP tools for the
+// initial registry.
 //
 // The provider to wire is resolved by selectProviderID: an explicit
 // cfg.Provider.Type wins, otherwise it is inferred from which credentials
@@ -147,11 +151,14 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 		return nil, err
 	}
 
+	toolOpts := opts
+	toolOpts.mcpServers = cfg.MCP
+
 	// The subagent gate (base toolset, no task) depends on neither the delegated
 	// agent nor the model, so it is built once and shared across delegations,
 	// which run one at a time. Building it per delegation would leak an os.Root
 	// file descriptor each time, since the confinement root has no Close.
-	subGate, err := buildGate(opts)
+	subGate, err := buildGate(toolOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +197,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	runner := newSubagentRunner(buildSub, defs, catalog, model)
 
-	parentGate, err := buildParentGate(opts, runner, catalog, skills)
+	parentGate, err := buildParentGate(toolOpts, runner, catalog, skills)
 	if err != nil {
 		return nil, err
 	}
@@ -634,6 +641,10 @@ func buildGate(opts Options) (*permission.Gate, error) {
 // subagents — read/write/edit, bash, grep/glob, and webfetch — confined to
 // opts.ProjectRoot (or the working directory when empty), together with the
 // permission rules that pre-seed the read-only tools to Allow.
+type mcpToolDiscoverer interface {
+	Discover(context.Context) ([]tool.Tool, []mcpclient.Diagnostic)
+}
+
 func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 	rootDir := opts.ProjectRoot
 	if rootDir == "" {
@@ -657,6 +668,9 @@ func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 	reg.Register(search.NewGrep(dir.FS()))
 	reg.Register(search.NewGlob(dir.FS()))
 	reg.Register(webfetch.New())
+	if err := registerMCPTools(context.Background(), reg, opts); err != nil {
+		return nil, nil, err
+	}
 
 	rules := []permission.Rule{
 		{Decision: permission.DecisionAllow, Name: "read"},
@@ -664,6 +678,32 @@ func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 		{Decision: permission.DecisionAllow, Name: "glob"},
 	}
 	return reg, rules, nil
+}
+
+func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) error {
+	discoverer := opts.mcpDiscoverer
+	if discoverer == nil && len(opts.mcpServers) > 0 {
+		discoverer = mcpclient.New(opts.mcpServers)
+	}
+	if discoverer == nil {
+		return nil
+	}
+
+	discoverCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
+	defer cancel()
+	tools, _ := discoverer.Discover(discoverCtx)
+	seen := map[string]struct{}{}
+	for _, t := range tools {
+		name := t.Name()
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("agent: duplicate MCP tool name %q", name)
+		}
+		seen[name] = struct{}{}
+	}
+	for _, t := range tools {
+		reg.Register(t)
+	}
+	return nil
 }
 
 // assembleGate wraps reg and rules in a permission Gate that resolves Ask

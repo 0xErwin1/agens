@@ -1,12 +1,29 @@
 package config
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/exec"
 	"strings"
+	"time"
 	"unicode"
 )
 
+const (
+	commandSubstitutionTimeout = 2 * time.Second
+	commandSubstitutionMaxOut  = 64 * 1024
+)
+
 func ExpandEnv(input string, env map[string]string) (string, error) {
+	return expandEnv(input, env, false)
+}
+
+func ExpandEnvWithCommands(input string, env map[string]string) (string, error) {
+	return expandEnv(input, env, true)
+}
+
+func expandEnv(input string, env map[string]string, allowCommands bool) (string, error) {
 	var out strings.Builder
 	for i := 0; i < len(input); {
 		if input[i] != '$' {
@@ -21,6 +38,15 @@ func ExpandEnv(input string, env map[string]string) (string, error) {
 		}
 		if input[i+1] == '{' {
 			value, next, err := expandBraced(input, i, env)
+			if err != nil {
+				return "", err
+			}
+			out.WriteString(value)
+			i = next
+			continue
+		}
+		if input[i+1] == '(' && allowCommands {
+			value, next, err := expandCommand(input, i)
 			if err != nil {
 				return "", err
 			}
@@ -74,6 +100,52 @@ func scanName(input string, start int) (string, int) {
 		end++
 	}
 	return input[start:end], end
+}
+
+func expandCommand(input string, start int) (string, int, error) {
+	end := strings.IndexByte(input[start+2:], ')')
+	if end < 0 {
+		return "", 0, fmt.Errorf("unterminated command substitution")
+	}
+	end += start + 2
+	command := input[start+2 : end]
+	if strings.TrimSpace(command) == "" {
+		return "", 0, fmt.Errorf("empty command substitution")
+	}
+	value, err := runCommandSubstitution(command)
+	if err != nil {
+		return "", 0, err
+	}
+	return value, end + 1, nil
+}
+
+func runCommandSubstitution(command string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), commandSubstitutionTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	stdin, err := os.Open(os.DevNull)
+	if err != nil {
+		return "", fmt.Errorf("command substitution: open stdin: %w", err)
+	}
+	defer func() { _ = stdin.Close() }()
+	cmd.Stdin = stdin
+
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("command substitution timed out after %s", commandSubstitutionTimeout)
+	}
+	if len(output) > commandSubstitutionMaxOut {
+		return "", fmt.Errorf("command substitution output exceeds %d bytes", commandSubstitutionMaxOut)
+	}
+	if err != nil {
+		text := strings.TrimSpace(string(output))
+		if text == "" {
+			return "", fmt.Errorf("command substitution failed: %w", err)
+		}
+		return "", fmt.Errorf("command substitution failed: %w: %s", err, text)
+	}
+	return strings.TrimSuffix(string(output), "\n"), nil
 }
 
 func validName(name string) bool {
