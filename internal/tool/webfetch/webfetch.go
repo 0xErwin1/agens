@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/0xErwin1/agens/internal/tool"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 const (

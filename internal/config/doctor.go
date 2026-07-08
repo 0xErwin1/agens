@@ -11,6 +11,7 @@ func DoctorReport(loaded Loaded) string {
 	out.WriteString("Agens config doctor\n")
 	fmt.Fprintf(&out, "Global:  %s (%s)\n", loaded.GlobalPath, pathStatus(loaded.GlobalPath))
 	fmt.Fprintf(&out, "Project: %s (%s)\n", loaded.ProjectPath, pathStatus(loaded.ProjectPath))
+	fmt.Fprintf(&out, "MCP:     %d server(s)\n", len(loaded.Config.MCP))
 	out.WriteString("Status:  valid\n")
 	return out.String()
 }
@@ -20,6 +21,7 @@ func DoctorErrorReport(loaded Loaded, err error) string {
 	out.WriteString("Agens config doctor\n")
 	fmt.Fprintf(&out, "Global:  %s (%s)\n", loaded.GlobalPath, pathStatus(loaded.GlobalPath))
 	fmt.Fprintf(&out, "Project: %s (%s)\n", loaded.ProjectPath, pathStatus(loaded.ProjectPath))
+	fmt.Fprintf(&out, "MCP:     %d server(s)\n", len(loaded.Config.MCP))
 	out.WriteString("Status:  invalid\n")
 	fmt.Fprintf(&out, "Error:   %v\n", err)
 	return out.String()

@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/0xErwin1/agens/internal/tool"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // Write implements the "write" tool: it creates or overwrites a file

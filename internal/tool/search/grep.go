@@ -11,9 +11,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/0xErwin1/agens/internal/tool"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/0xErwin1/agens/internal/tool"
 )
 
 // Grep implements the "grep" tool: it searches file contents for a Go RE2
