@@ -14,13 +14,16 @@ fmt-check:
 lint:
     golangci-lint run
 
+sqlc:
+    sqlc generate
+
 test:
     go test ./...
 
 build:
     go build -o agens ./cmd/agens
 
-verify: fmt-check lint test build
+verify: sqlc fmt-check lint test build
 
 clean:
     rm -f agens

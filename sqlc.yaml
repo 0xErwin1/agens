@@ -1,0 +1,11 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    queries: "internal/session/sessiondb/query.sql"
+    schema: "internal/session/sessiondb/schema.sql"
+    gen:
+      go:
+        package: "dbgen"
+        out: "internal/session/sessiondb/dbgen"
+        sql_package: "database/sql"
+        emit_json_tags: true

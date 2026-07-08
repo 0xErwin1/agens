@@ -16,7 +16,7 @@ import (
 	usercommand "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/config"
 	"github.com/0xErwin1/agens/internal/permission"
-	"github.com/0xErwin1/agens/internal/session"
+	"github.com/0xErwin1/agens/internal/session/sessiondb"
 	"github.com/0xErwin1/agens/internal/tool/task"
 	"github.com/0xErwin1/agens/internal/tui"
 )
@@ -221,6 +221,11 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		files = src
 	}
 
+	sessions, err := sessiondb.Open(sessiondb.DefaultPath())
+	if err != nil {
+		return tuiSession{}, fmt.Errorf("tui: open sessions: %w", err)
+	}
+
 	return tuiSession{
 		loop:               loop,
 		lister:             prov,
@@ -228,7 +233,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		agentPrompt:        agentPrompt,
 		model:              modelName,
 		effortLevels:       prov.EffortLevels(),
-		sessions:           session.NewStore(session.DefaultDir()),
+		sessions:           sessions,
 		files:              files,
 		project:            opts.ProjectRoot,
 		agents:             defs,

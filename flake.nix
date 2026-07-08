@@ -19,6 +19,7 @@
             pkgs.gotools
             pkgs.golangci-lint
             pkgs.just
+            pkgs.sqlc
           ];
 
           shellHook = ''
