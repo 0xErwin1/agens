@@ -5,6 +5,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	usercommand "github.com/0xErwin1/agens/internal/command"
 )
 
 // maxPaletteItems caps how many command rows the palette shows at once so it
@@ -41,11 +43,13 @@ type CommandContext interface {
 	ToggleMouse() tea.Cmd
 	// CommandHelp returns the help text listing commands and key bindings.
 	CommandHelp() string
+	// SubmitUserPrompt submits expanded user-authored command text as a normal turn.
+	SubmitUserPrompt(text string) tea.Cmd
 }
 
-// CommandFunc runs a command against a context and optionally returns a
-// tea.Cmd (for example tea.Quit). It must not block.
-type CommandFunc func(ctx CommandContext) tea.Cmd
+// CommandFunc runs a command against a context and the original input, and
+// optionally returns a tea.Cmd (for example tea.Quit). It must not block.
+type CommandFunc func(ctx CommandContext, input string) tea.Cmd
 
 // Command is one slash command: how it is named and described in the palette,
 // and what it does when run. SafeWhileRunning marks a command that neither
@@ -156,43 +160,82 @@ func (r *CommandRegistry) Help() string {
 // self-contained closure over CommandContext; there is no central switch.
 func defaultCommands() *CommandRegistry {
 	return NewCommandRegistry(
-		Command{Name: "/new", Desc: "start a new chat", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/new", Desc: "start a new chat", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			ctx.NewConversation()
 			return nil
 		}},
-		Command{Name: "/clear", Desc: "clear the conversation", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/clear", Desc: "clear the conversation", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			ctx.NewConversation()
 			return nil
 		}},
-		Command{Name: "/model", Desc: "choose the model", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/model", Desc: "choose the model", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenModelSelector()
 		}},
-		Command{Name: "/effort", Desc: "set the reasoning effort", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/effort", Desc: "set the reasoning effort", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenEffortSelector()
 		}},
-		Command{Name: "/sessions", Desc: "resume a saved conversation", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/sessions", Desc: "resume a saved conversation", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenSessionPicker()
 		}},
-		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/subagents", Desc: "list active subagents", SafeWhileRunning: true, Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenSubagentTree()
 		}},
-		Command{Name: "/agent", Desc: "switch the active agent (or press tab)", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/agent", Desc: "switch the active agent (or press tab)", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenAgentPicker()
 		}},
-		Command{Name: "/agents", Desc: "define each subagent's available models", Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/agents", Desc: "define each subagent's available models", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenAgentMenu()
 		}},
-		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.ToggleMouse()
 		}},
-		Command{Name: "/help", Desc: "show commands and shortcuts", SafeWhileRunning: true, Run: func(ctx CommandContext) tea.Cmd {
+		Command{Name: "/help", Desc: "show commands and shortcuts", SafeWhileRunning: true, Run: func(ctx CommandContext, _ string) tea.Cmd {
 			ctx.Notify(ctx.CommandHelp())
 			return nil
 		}},
-		Command{Name: "/quit", Desc: "quit agens", SafeWhileRunning: true, Run: func(CommandContext) tea.Cmd {
+		Command{Name: "/quit", Desc: "quit agens", SafeWhileRunning: true, Run: func(CommandContext, string) tea.Cmd {
 			return tea.Quit
 		}},
 	)
+}
+
+func registerUserCommands(registry *CommandRegistry, set *usercommand.Set) {
+	if set == nil {
+		return
+	}
+	for _, userCmd := range set.All() {
+		cmd := userCmd
+		name := "/" + cmd.Name
+		if _, exists := registry.byName[name]; exists {
+			continue
+		}
+		registry.Register(Command{
+			Name: name,
+			Desc: commandDescription(cmd),
+			Run: func(ctx CommandContext, input string) tea.Cmd {
+				return ctx.SubmitUserPrompt(cmd.Expand(commandArguments(input)))
+			},
+		})
+	}
+}
+
+func commandDescription(cmd usercommand.Command) string {
+	desc := cmd.Description
+	if desc == "" {
+		desc = "user command"
+	}
+	if cmd.ArgumentHint != "" {
+		desc += " " + cmd.ArgumentHint
+	}
+	return desc
+}
+
+func commandArguments(input string) string {
+	trimmed := strings.TrimSpace(input)
+	if i := strings.IndexByte(trimmed, ' '); i >= 0 {
+		return strings.TrimSpace(trimmed[i+1:])
+	}
+	return ""
 }
 
 // keyBindingsHelp is the static key-binding section appended to /help.

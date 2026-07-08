@@ -6,6 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	slashcmd "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/message"
 )
 
@@ -46,7 +47,7 @@ func TestRegistryLookup(t *testing.T) {
 func TestRegistryRegisterIsExtensible(t *testing.T) {
 	r := NewCommandRegistry()
 	ran := false
-	r.Register(Command{Name: "/ping", Desc: "test", Run: func(CommandContext) tea.Cmd {
+	r.Register(Command{Name: "/ping", Desc: "test", Run: func(CommandContext, string) tea.Cmd {
 		ran = true
 		return nil
 	}})
@@ -55,7 +56,7 @@ func TestRegistryRegisterIsExtensible(t *testing.T) {
 	if !ok {
 		t.Fatal("registered command not found by Lookup")
 	}
-	c.Run(nil)
+	c.Run(nil, "/ping")
 	if !ran {
 		t.Fatal("registered command's handler did not run")
 	}
@@ -171,5 +172,56 @@ func TestModel_SlashDoesNotSubmitAsChat(t *testing.T) {
 
 	if m.running {
 		t.Fatal("a slash command started a chat turn, want it handled as a command")
+	}
+}
+
+func TestModel_UserCommandSubmitsExpandedPrompt(t *testing.T) {
+	loop := &scriptedLoopRunner{}
+	set := slashcmd.NewSet([]slashcmd.Command{{
+		Name:        "review",
+		Description: "review files",
+		Body:        "Please review $ARGUMENTS",
+	}})
+	m := New(Deps{Loop: loop, Model: "gpt-5.5", UserCommands: set})
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	typeString(m, "/review src/main.go   and tests")
+	cmd := sendKey(m, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if !m.running {
+		t.Fatal("user command did not start a normal user turn")
+	}
+	if cmd == nil {
+		t.Fatal("user command returned nil cmd, want turn command")
+	}
+	if len(m.history) != 1 {
+		t.Fatalf("history len = %d, want 1", len(m.history))
+	}
+	part, ok := m.history[0].Parts[0].(message.TextPart)
+	if !ok {
+		t.Fatalf("history part = %T, want TextPart", m.history[0].Parts[0])
+	}
+	if part.Text != "Please review src/main.go   and tests" {
+		t.Fatalf("submitted text = %q", part.Text)
+	}
+}
+
+func TestModel_UserCommandDoesNotOverrideBuiltin(t *testing.T) {
+	set := slashcmd.NewSet([]slashcmd.Command{{
+		Name: "quit",
+		Body: "do not quit",
+	}})
+	m := New(Deps{Loop: &scriptedLoopRunner{}, Model: "gpt-5.5", UserCommands: set})
+
+	cmdDef, ok := m.commands.Lookup("/quit")
+	if !ok {
+		t.Fatal("/quit missing")
+	}
+	cmd := cmdDef.Run(m, "/quit")
+	if cmd == nil {
+		t.Fatal("/quit returned no command, want tea.Quit")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatalf("/quit command produced %T, want tea.QuitMsg", cmd())
 	}
 }
