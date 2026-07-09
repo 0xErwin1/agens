@@ -2,6 +2,7 @@ package permission
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -492,6 +493,82 @@ func TestGate_Specs_PassThrough(t *testing.T) {
 
 	if !reflect.DeepEqual(gate.Specs(), wantSpecs) {
 		t.Fatalf("Specs() = %+v, want %+v", gate.Specs(), wantSpecs)
+	}
+}
+
+func TestGate_Ask_AllowAlways_PersistsAnArgumentScopedGrant(t *testing.T) {
+	store := NewMemoryStore()
+	inner := &recordingRunner{results: map[string]message.ToolResultPart{}}
+	prompter := &sequencePrompter{answers: []Answer{AnswerAllowAlways, AnswerDenyOnce}}
+	engine, err := NewEngine(nil, store, WithProjector(ProjectField))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	granted := message.ToolUsePart{ID: "c1", Name: "bash", Input: json.RawMessage(`{"command":"git status"}`)}
+	if _, err := gate.Run(context.Background(), granted); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	rules, _ := store.Rules(context.Background())
+	if len(rules) != 1 || rules[0].Name != "bash" || rules[0].Argument != "git status" {
+		t.Fatalf("store rules = %+v, want exactly one Rule{Name: bash, Argument: git status}", rules)
+	}
+
+	sameArg := message.ToolUsePart{ID: "c2", Name: "bash", Input: json.RawMessage(`{"command":"git status"}`)}
+	got, err := gate.Run(context.Background(), sameArg)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if got.IsError {
+		t.Fatalf("Run() for the granted argument = %+v, want it to execute without error", got)
+	}
+	if len(prompter.calls) != 1 {
+		t.Fatalf("prompter calls = %d after the same-argument call, want 1 (the persisted grant must skip the prompt)", len(prompter.calls))
+	}
+
+	differentArg := message.ToolUsePart{ID: "c3", Name: "bash", Input: json.RawMessage(`{"command":"git push"}`)}
+	if _, err := gate.Run(context.Background(), differentArg); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if len(prompter.calls) != 2 {
+		t.Fatalf("prompter calls = %d after a different argument, want 2 (a grant for one argument must not auto-allow another)", len(prompter.calls))
+	}
+}
+
+func TestGate_GlobalDeny_ShortCircuitsBeforePrompterAndAnyPersistedAllow(t *testing.T) {
+	inner := &fakeRunner{}
+	prompter := &fakePrompter{answer: AnswerAllowAlways}
+	store := NewMemoryStore()
+	if err := store.Append(context.Background(), Rule{Decision: DecisionAllow, Name: "bash", Argument: "rm -rf tmp"}); err != nil {
+		t.Fatalf("store.Append() error = %v", err)
+	}
+
+	engine, err := NewEngine(
+		nil,
+		store,
+		WithProjector(ProjectField),
+		WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "bash", Argument: "rm -rf tmp"}}),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	gate := NewGate(inner, engine, prompter)
+
+	call := message.ToolUsePart{ID: "c1", Name: "bash", Input: json.RawMessage(`{"command":"rm -rf tmp"}`)}
+	got, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil (a denial is a tool-level result, not a Go error)", err)
+	}
+	if !got.IsError {
+		t.Fatalf("IsError = false, want true (a global deny must win over a persisted allow)")
+	}
+	if inner.calls != 0 {
+		t.Fatalf("inner.calls = %d, want 0", inner.calls)
+	}
+	if prompter.calls != 0 {
+		t.Fatalf("prompter.calls = %d, want 0 (the Prompter must never be consulted for a globally denied call)", prompter.calls)
 	}
 }
 

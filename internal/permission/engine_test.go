@@ -174,3 +174,163 @@ func TestEngine_Remember_PropagatesStoreAppendError(t *testing.T) {
 		t.Fatalf("Remember() error = nil, want non-nil when Store.Append fails")
 	}
 }
+
+func TestNewEngine_ErrorsOnInvalidGlobalDenyGlob(t *testing.T) {
+	_, err := NewEngine(nil, &fakeStore{}, WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "["}}))
+	if err == nil {
+		t.Fatalf("NewEngine() with an invalid global-deny glob pattern error = nil, want non-nil")
+	}
+}
+
+// The denied command intentionally has no "/" in it: doublestar's glob
+// matching is path-segment-based (the same behavior rule_test.go's "single
+// star does not cross a path separator" pins for filesystem arguments), so a
+// literal "/" splits the match into segments a bare "*" cannot bridge. That
+// is a real, pre-existing limitation of the unchanged doublestar-based
+// evaluate() this Engine builds on — matchers meant to also block a
+// slash-containing invocation like "rm -rf /" need a "**" written as its own
+// path segment (e.g. "rm -rf /**"), not a bare "*". These tests instead pin
+// the hard pre-check's precedence: whatever the matcher matches, a global
+// deny hit must be unreachable by any allow, static or persisted.
+func TestEngine_Evaluate_GlobalDenyShortCircuitsProjectAllow(t *testing.T) {
+	engine, err := NewEngine(
+		[]Rule{{Decision: DecisionAllow, Name: "bash"}},
+		NewMemoryStore(),
+		WithProjector(ProjectField),
+		WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "bash", Argument: "rm -rf *"}}),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{
+		Name:  "bash",
+		Input: json.RawMessage(`{"command":"rm -rf tmp"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionDeny {
+		t.Fatalf("Evaluate() = %v, want %v (a static allow must never punch through a global deny)", got, DecisionDeny)
+	}
+}
+
+func TestEngine_Evaluate_GlobalDenyIsUnreachableByAPersistedAllow(t *testing.T) {
+	store := NewMemoryStore()
+	if err := store.Append(context.Background(), Rule{Decision: DecisionAllow, Name: "bash", Argument: "rm -rf *"}); err != nil {
+		t.Fatalf("store.Append() error = %v", err)
+	}
+	engine, err := NewEngine(
+		nil,
+		store,
+		WithProjector(ProjectField),
+		WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "bash", Argument: "rm -rf *"}}),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{
+		Name:  "bash",
+		Input: json.RawMessage(`{"command":"rm -rf tmp"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionDeny {
+		t.Fatalf("Evaluate() = %v, want %v (a persisted allow-always must never loosen a global deny)", got, DecisionDeny)
+	}
+}
+
+func TestEngine_Evaluate_GlobalDenyDoesNotBlockADifferentArgument(t *testing.T) {
+	engine, err := NewEngine(
+		[]Rule{{Decision: DecisionAllow, Name: "bash"}},
+		NewMemoryStore(),
+		WithProjector(ProjectField),
+		WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "bash", Argument: "rm -rf *"}}),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{
+		Name:  "bash",
+		Input: json.RawMessage(`{"command":"git status"}`),
+	})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionAllow {
+		t.Fatalf("Evaluate() = %v, want %v (the global deny's argument glob must not match an unrelated command)", got, DecisionAllow)
+	}
+}
+
+func TestEngine_RememberCall_ScopesGrantToTheTriggeringArgument(t *testing.T) {
+	store := NewMemoryStore()
+	engine, err := NewEngine(nil, store, WithProjector(ProjectField))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	granted := message.ToolUsePart{Name: "bash", Input: json.RawMessage(`{"command":"git status"}`)}
+	if err := engine.RememberCall(context.Background(), DecisionAllow, granted); err != nil {
+		t.Fatalf("RememberCall() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), granted)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionAllow {
+		t.Fatalf("Evaluate() for the granted call = %v, want %v", got, DecisionAllow)
+	}
+
+	differentArg := message.ToolUsePart{Name: "bash", Input: json.RawMessage(`{"command":"git push"}`)}
+	got2, err := engine.Evaluate(context.Background(), differentArg)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got2 != DecisionAsk {
+		t.Fatalf("Evaluate() for a different argument = %v, want %v (a grant must not widen to a different argument)", got2, DecisionAsk)
+	}
+}
+
+func TestEngine_RememberCall_EscapesGlobMetacharactersInTheArgument(t *testing.T) {
+	store := NewMemoryStore()
+	engine, err := NewEngine(nil, store, WithProjector(ProjectField))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	granted := message.ToolUsePart{Name: "bash", Input: json.RawMessage(`{"command":"ls *.go"}`)}
+	if err := engine.RememberCall(context.Background(), DecisionAllow, granted); err != nil {
+		t.Fatalf("RememberCall() error = %v", err)
+	}
+
+	other := message.ToolUsePart{Name: "bash", Input: json.RawMessage(`{"command":"ls main.go"}`)}
+	got, err := engine.Evaluate(context.Background(), other)
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionAsk {
+		t.Fatalf("Evaluate() = %v, want %v (the persisted argument must be literal, not a live glob)", got, DecisionAsk)
+	}
+}
+
+func TestEngine_RememberCall_ArgumentlessCallFallsBackToNameScoped(t *testing.T) {
+	store := NewMemoryStore()
+	engine, err := NewEngine(nil, store, WithProjector(ProjectField))
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	call := message.ToolUsePart{Name: "task"}
+	if err := engine.RememberCall(context.Background(), DecisionAllow, call); err != nil {
+		t.Fatalf("RememberCall() error = %v", err)
+	}
+
+	rules, _ := store.Rules(context.Background())
+	if len(rules) != 1 || rules[0].Argument != "" {
+		t.Fatalf("store rules = %+v, want exactly one rule with an empty Argument", rules)
+	}
+}

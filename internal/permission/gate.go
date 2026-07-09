@@ -124,11 +124,12 @@ func (g *Gate) authorize(ctx context.Context, call message.ToolUsePart) (bool, e
 }
 
 // resolveAsk consults the Prompter for a Decision that resolved to Ask.
-// The "always" answers additionally remember a name-only Rule before acting,
-// so a later matching call resolves without prompting again. A Prompter error
-// or an AnswerCancel answer returns a real error and never remembers a rule;
-// if ctx was also canceled, ctx's error takes priority over the Prompter's own
-// error.
+// The "always" answers additionally remember an argument-scoped Rule (via
+// RememberCall) before acting, so a later call to the same tool with the
+// same argument resolves without prompting again, while a different
+// argument still resolves to Ask. A Prompter error or an AnswerCancel answer
+// returns a real error and never remembers a rule; if ctx was also
+// canceled, ctx's error takes priority over the Prompter's own error.
 func (g *Gate) resolveAsk(ctx context.Context, call message.ToolUsePart) (bool, error) {
 	answer, err := g.prompter.Prompt(ctx, call)
 	if err != nil {
@@ -143,13 +144,13 @@ func (g *Gate) resolveAsk(ctx context.Context, call message.ToolUsePart) (bool, 
 		return true, nil
 
 	case AnswerAllowAlways:
-		if err := g.engine.Remember(ctx, Rule{Decision: DecisionAllow, Name: call.Name}); err != nil {
+		if err := g.engine.RememberCall(ctx, DecisionAllow, call); err != nil {
 			return false, err
 		}
 		return true, nil
 
 	case AnswerDenyAlways:
-		if err := g.engine.Remember(ctx, Rule{Decision: DecisionDeny, Name: call.Name}); err != nil {
+		if err := g.engine.RememberCall(ctx, DecisionDeny, call); err != nil {
 			return false, err
 		}
 		return false, nil
