@@ -1162,6 +1162,58 @@ func TestBuildGate_GlobalAndProjectAllowSkipThePrompter(t *testing.T) {
 	}
 }
 
+// stubPermissionStore is a permission.Store double returning a fixed set of
+// rules, proving buildGate wires opts.PermissionStore into the Engine
+// instead of always constructing a fresh permission.MemoryStore.
+type stubPermissionStore struct {
+	rules []permission.Rule
+}
+
+func (s *stubPermissionStore) Append(context.Context, permission.Rule) error { return nil }
+
+func (s *stubPermissionStore) Rules(context.Context) ([]permission.Rule, error) {
+	return s.rules, nil
+}
+
+func TestBuildGate_UsesProvidedPermissionStore(t *testing.T) {
+	store := &stubPermissionStore{rules: []permission.Rule{
+		{Decision: permission.DecisionAllow, Name: "bash"},
+	}}
+	gate, err := buildGate(Options{
+		ProjectRoot:     t.TempDir(),
+		Prompter:        failOnCallPrompter{t: t},
+		PermissionStore: store,
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want the provided store's persisted grant to allow without prompting", result)
+	}
+}
+
+func TestBuildGate_NilPermissionStoreFallsBackToMemoryStore(t *testing.T) {
+	fp := &fakePrompter{answer: permission.AnswerAllowOnce}
+	gate, err := buildGate(Options{ProjectRoot: t.TempDir(), Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	if _, err := gate.Run(context.Background(), call); err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s), want 1 (a nil PermissionStore falls back to an empty MemoryStore, so bash still resolves Ask)", len(fp.calls))
+	}
+}
+
 // fakeSubRunner is a scripted task.Runner recording the description it was asked
 // to run and returning a canned result, so the parent gate's task wiring can be
 // exercised without a provider or a nested loop.

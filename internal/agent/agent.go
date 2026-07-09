@@ -66,6 +66,14 @@ type Options struct {
 	// pre-check no allow rule — static or persisted — can reach.
 	Permissions config.Permissions
 
+	// PermissionStore backs the gate's remembered allow/deny-always answers.
+	// A nil value falls back to a fresh permission.MemoryStore, so grants
+	// live only for the process's lifetime — the behavior every existing
+	// caller and test relies on. A caller wanting grants to survive a
+	// restart supplies a *permissiondb.Store opened for the invoking
+	// project.
+	PermissionStore permission.Store
+
 	// Subagents, when non-nil, is the shared catalog of selectable subagents the
 	// task tool reads. BuildLoop populates it from the discovered definitions, so
 	// a surface holding the same catalog (the TUI's agents menu) can change the
@@ -718,7 +726,8 @@ func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) err
 // assembleGate wraps reg and rules in a permission Gate that resolves Ask
 // decisions through opts.Prompter (or DenyPrompter when nil). opts.Permissions
 // is parsed into the Engine's static rules and its global-deny hard
-// pre-check by configPermissionRules.
+// pre-check by configPermissionRules. The Engine's remembered-grant Store is
+// opts.PermissionStore, or a fresh permission.MemoryStore when nil.
 func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*permission.Gate, error) {
 	rules, globalDenies, err := configPermissionRules(rules, opts.Permissions)
 	if err != nil {
@@ -730,7 +739,12 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*p
 		engineOpts = append(engineOpts, permission.WithGlobalDenies(globalDenies))
 	}
 
-	engine, err := permission.NewEngine(rules, permission.NewMemoryStore(), engineOpts...)
+	store := opts.PermissionStore
+	if store == nil {
+		store = permission.NewMemoryStore()
+	}
+
+	engine, err := permission.NewEngine(rules, store, engineOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("agent: %w", err)
 	}
