@@ -19,11 +19,25 @@ const (
 )
 
 type Config struct {
-	Options  Options              `toml:"options"`
-	Provider Provider             `toml:"provider"`
-	Agent    Agent                `toml:"agent"`
-	UI       UI                   `toml:"ui"`
-	MCP      map[string]MCPServer `toml:"mcp"`
+	Options     Options              `toml:"options"`
+	Provider    Provider             `toml:"provider"`
+	Agent       Agent                `toml:"agent"`
+	UI          UI                   `toml:"ui"`
+	MCP         map[string]MCPServer `toml:"mcp"`
+	Permissions Permissions
+}
+
+// Permissions holds the merged [permissions] allow/deny matchers in
+// scope-separated buckets rather than a single merged list. GlobalDeny is
+// consumed only by the permission engine's hard pre-check layer, never by
+// the last-match-wins ruleset, so a project allow can never reach or loosen
+// it: applyPermissions routes each scope's patch into its own field and
+// never concatenates the two scopes together.
+type Permissions struct {
+	GlobalAllow  []string
+	GlobalDeny   []string
+	ProjectAllow []string
+	ProjectDeny  []string
 }
 
 const (
@@ -93,11 +107,21 @@ type LoadOptions struct {
 }
 
 type configPatch struct {
-	Options  *optionsPatch             `toml:"options"`
-	Provider *providerPatch            `toml:"provider"`
-	Agent    *agentPatch               `toml:"agent"`
-	UI       *uiPatch                  `toml:"ui"`
-	MCP      map[string]mcpServerPatch `toml:"mcp"`
+	Options     *optionsPatch             `toml:"options"`
+	Provider    *providerPatch            `toml:"provider"`
+	Agent       *agentPatch               `toml:"agent"`
+	UI          *uiPatch                  `toml:"ui"`
+	MCP         map[string]mcpServerPatch `toml:"mcp"`
+	Permissions *permissionsPatch         `toml:"permissions"`
+}
+
+// permissionsPatch is the [permissions] block as authored in a single config
+// file. Its Allow/Deny lists are matchers over native tool names (e.g.
+// "bash(rm -rf *)", "read"); syntax validation is deferred to
+// permission.ParseRule at composition, not performed here.
+type permissionsPatch struct {
+	Allow []string `toml:"allow"`
+	Deny  []string `toml:"deny"`
 }
 
 type uiPatch struct {
@@ -234,6 +258,7 @@ func (l *Loaded) applyFile(path string, scope Scope, env map[string]string) erro
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
 	applyPatch(&l.Config, patch)
+	applyPermissions(&l.Config, patch.Permissions, scope)
 	if err := validateConfig(l.Config); err != nil {
 		return fmt.Errorf("%s config %s: %w", scope, path, err)
 	}
