@@ -58,6 +58,14 @@ type Options struct {
 	// Prompter falls back to permission.DenyPrompter{}, denying every Ask.
 	Prompter permission.Prompter
 
+	// Permissions carries the scope-separated [permissions] config buckets
+	// assembleGate composes into the gate's ruleset: GlobalAllow,
+	// ProjectAllow, and ProjectDeny become static rules (in that order, so a
+	// project deny outranks a project allow under last-match-wins);
+	// GlobalDeny is fed to permission.WithGlobalDenies, an absolute hard
+	// pre-check no allow rule — static or persisted — can reach.
+	Permissions config.Permissions
+
 	// Subagents, when non-nil, is the shared catalog of selectable subagents the
 	// task tool reads. BuildLoop populates it from the discovered definitions, so
 	// a surface holding the same catalog (the TUI's agents menu) can change the
@@ -153,6 +161,7 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 
 	toolOpts := opts
 	toolOpts.mcpServers = cfg.MCP
+	toolOpts.Permissions = cfg.Permissions
 
 	// The subagent gate (base toolset, no task) depends on neither the delegated
 	// agent nor the model, so it is built once and shared across delegations,
@@ -707,9 +716,21 @@ func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) err
 }
 
 // assembleGate wraps reg and rules in a permission Gate that resolves Ask
-// decisions through opts.Prompter (or DenyPrompter when nil).
+// decisions through opts.Prompter (or DenyPrompter when nil). opts.Permissions
+// is parsed into the Engine's static rules and its global-deny hard
+// pre-check by configPermissionRules.
 func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*permission.Gate, error) {
-	engine, err := permission.NewEngine(rules, permission.NewMemoryStore())
+	rules, globalDenies, err := configPermissionRules(rules, opts.Permissions)
+	if err != nil {
+		return nil, fmt.Errorf("agent: %w", err)
+	}
+
+	var engineOpts []permission.EngineOption
+	if len(globalDenies) > 0 {
+		engineOpts = append(engineOpts, permission.WithGlobalDenies(globalDenies))
+	}
+
+	engine, err := permission.NewEngine(rules, permission.NewMemoryStore(), engineOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("agent: %w", err)
 	}
@@ -720,6 +741,40 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*p
 	}
 
 	return permission.NewGate(reg, engine, prompter), nil
+}
+
+// configPermissionRules appends perms' GlobalAllow, ProjectAllow, and
+// ProjectDeny buckets onto rules — ProjectDeny last, so within its own
+// scope a deny outranks an allow under last-match-wins — and parses perms'
+// GlobalDeny bucket into a separate slice for WithGlobalDenies. It returns
+// the first error encountered parsing any bucket, naming the offending
+// matcher, so a broken [permissions] entry fails composition loudly rather
+// than being silently dropped.
+func configPermissionRules(rules []permission.Rule, perms config.Permissions) ([]permission.Rule, []permission.Rule, error) {
+	globalAllow, err := permission.ParseRules(perms.GlobalAllow, permission.DecisionAllow)
+	if err != nil {
+		return nil, nil, err
+	}
+	projectAllow, err := permission.ParseRules(perms.ProjectAllow, permission.DecisionAllow)
+	if err != nil {
+		return nil, nil, err
+	}
+	projectDeny, err := permission.ParseRules(perms.ProjectDeny, permission.DecisionDeny)
+	if err != nil {
+		return nil, nil, err
+	}
+	globalDeny, err := permission.ParseRules(perms.GlobalDeny, permission.DecisionDeny)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	merged := make([]permission.Rule, 0, len(rules)+len(globalAllow)+len(projectAllow)+len(projectDeny))
+	merged = append(merged, rules...)
+	merged = append(merged, globalAllow...)
+	merged = append(merged, projectAllow...)
+	merged = append(merged, projectDeny...)
+
+	return merged, globalDeny, nil
 }
 
 // buildParentGate builds the main agent's gate: the base toolset plus the task

@@ -1078,6 +1078,90 @@ func TestBuildGate_EmptyProjectRootFallsBackToWorkingDir(t *testing.T) {
 	}
 }
 
+func TestBuildGate_InvalidPermissionsMatcherFailsWithAClearError(t *testing.T) {
+	tests := []struct {
+		name  string
+		perms config.Permissions
+	}{
+		{name: "invalid global allow", perms: config.Permissions{GlobalAllow: []string{"["}}},
+		{name: "invalid global deny", perms: config.Permissions{GlobalDeny: []string{"["}}},
+		{name: "invalid project allow", perms: config.Permissions{ProjectAllow: []string{"["}}},
+		{name: "invalid project deny", perms: config.Permissions{ProjectDeny: []string{"["}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := validOptions(t)
+			opts.Permissions = tt.perms
+
+			_, err := buildGate(opts)
+			if err == nil {
+				t.Fatalf("buildGate() error = nil, want a clear composition error for an invalid matcher")
+			}
+			if !strings.Contains(err.Error(), `"["`) {
+				t.Fatalf("buildGate() error = %q, want it to name the offending pattern %q", err.Error(), "[")
+			}
+		})
+	}
+}
+
+// These two tests use bare tool-name matchers (no argument pattern):
+// assembleGate's static-rule composition and WithGlobalDenies wiring is name
+// scoped regardless of which Projector the Engine uses, so they exercise
+// task 2.8's precedence wiring without depending on which Projector
+// assembleGate installs.
+func TestBuildGate_ProjectAllowCannotReachGlobalDeny(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerAllowOnce}
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    fp,
+		Permissions: config.Permissions{
+			GlobalDeny:   []string{"bash"},
+			ProjectAllow: []string{"bash"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash"}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil (a denial is a tool-level result, not a Go error)", err)
+	}
+	if !result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want IsError == true (a project allow must never reach a global deny)", result)
+	}
+	if len(fp.calls) != 0 {
+		t.Fatalf("prompter was consulted %d time(s), want 0 (a global deny must short-circuit before the Prompter)", len(fp.calls))
+	}
+}
+
+func TestBuildGate_GlobalAndProjectAllowSkipThePrompter(t *testing.T) {
+	dir := t.TempDir()
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Permissions: config.Permissions{
+			GlobalAllow:  []string{"engram_mem_save"},
+			ProjectAllow: []string{"bash"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want a project allow to run without prompting", result)
+	}
+}
+
 // fakeSubRunner is a scripted task.Runner recording the description it was asked
 // to run and returning a canned result, so the parent gate's task wiring can be
 // exercised without a provider or a nested loop.
