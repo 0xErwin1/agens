@@ -263,6 +263,100 @@ func TestLoadExpandsBaseURLOnlyNotSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestLoadPermissionsMergeSeparatesScopes(t *testing.T) {
+	home := t.TempDir()
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectConfigDir := filepath.Join(repo, ".agens")
+	if err := os.Mkdir(projectConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	global := "[permissions]\nallow = [\"read(**)\"]\ndeny = [\"bash(rm -rf *)\"]\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(global), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project := "[permissions]\nallow = [\"bash(**)\"]\ndeny = [\"edit(**/.env)\"]\n"
+	if err := os.WriteFile(filepath.Join(projectConfigDir, "config.toml"), []byte(project), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: repo, Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+
+	perms := loaded.Config.Permissions
+	if got, want := strings.Join(perms.GlobalAllow, ","), "read(**)"; got != want {
+		t.Fatalf("GlobalAllow = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(perms.GlobalDeny, ","), "bash(rm -rf *)"; got != want {
+		t.Fatalf("GlobalDeny = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(perms.ProjectAllow, ","), "bash(**)"; got != want {
+		t.Fatalf("ProjectAllow = %q, want %q", got, want)
+	}
+	if got, want := strings.Join(perms.ProjectDeny, ","), "edit(**/.env)"; got != want {
+		t.Fatalf("ProjectDeny = %q, want %q", got, want)
+	}
+}
+
+func TestLoadPermissionsProjectAllowCannotReachGlobalDenyBucket(t *testing.T) {
+	home := t.TempDir()
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	projectConfigDir := filepath.Join(repo, ".agens")
+	if err := os.Mkdir(projectConfigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	global := "[permissions]\ndeny = [\"bash(rm -rf *)\"]\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(global), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project := "[permissions]\nallow = [\"bash(**)\"]\n"
+	if err := os.WriteFile(filepath.Join(projectConfigDir, "config.toml"), []byte(project), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: repo, Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+
+	perms := loaded.Config.Permissions
+	if got, want := strings.Join(perms.GlobalDeny, ","), "bash(rm -rf *)"; got != want {
+		t.Fatalf("GlobalDeny = %q, want %q (project allow must not reach the global deny bucket)", got, want)
+	}
+	if len(perms.ProjectDeny) != 0 {
+		t.Fatalf("ProjectDeny = %v, want empty (project file set no deny)", perms.ProjectDeny)
+	}
+	if got, want := strings.Join(perms.ProjectAllow, ","), "bash(**)"; got != want {
+		t.Fatalf("ProjectAllow = %q, want %q", got, want)
+	}
+}
+
+func TestLoadWithoutPermissionsSectionKeepsBucketsEmpty(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte("[options]\ndebug = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadFrom(LoadOptions{ConfigHome: home, WorkingDir: t.TempDir(), Env: map[string]string{}})
+	if err != nil {
+		t.Fatalf("LoadFrom() error = %v", err)
+	}
+
+	perms := loaded.Config.Permissions
+	if len(perms.GlobalAllow) != 0 || len(perms.GlobalDeny) != 0 || len(perms.ProjectAllow) != 0 || len(perms.ProjectDeny) != 0 {
+		t.Fatalf("Permissions = %+v, want all buckets empty", perms)
+	}
+}
+
 func TestLoadRejectsAgentMaxIterationsLessThanOne(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

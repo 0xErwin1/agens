@@ -85,6 +85,31 @@ Those features must enter through new SDD artifacts and should preserve the depe
 
 TOML config files are for hand-authored bootstrap inputs only. Runtime state that Agens mutates — sessions, remembered permissions, model caches, discovered MCP state, and last-used values — belongs in a future SQLite-backed store, not in config files.
 
+## Permissions configuration
+
+An optional `[permissions]` table configures the permission engine's ruleset:
+
+```toml
+[permissions]
+deny  = ["bash(rm -rf *)", "read(**/.env)"]
+allow = ["read(**)", "engram_mem_save(**)"]
+```
+
+`allow`/`deny` entries are matchers over agens' NATIVE runtime tool names —
+lowercase native tools (`bash`, `read`, `edit`, ...) and `serverName_toolName`
+for MCP tools (e.g. `engram_mem_save`) — never a `mcp__…__…` or `Bash(...)`
+alias layer. Each entry is `tool(argPattern)` (a doublestar glob matched
+against a semantic projection of the call: bash → command, fs → path,
+webfetch → url) or a bare `tool` matching on name alone.
+
+`internal/config` keeps global and project permissions in separate buckets
+(`Permissions.{Global,Project}{Allow,Deny}`); a project `[permissions]` patch
+is routed only into its own `Project*` fields and never concatenated with the
+`Global*` fields. This physical separation is what lets the permission engine
+treat a global `deny` as absolute: a project `allow` can never reach, widen,
+or override it. Matcher syntax validation happens at composition time
+(`permission.ParseRule`), not during config load.
+
 ## Repository contracts
 
 - `justfile` is the canonical developer command surface.

@@ -64,6 +64,24 @@ func applyAgentPatch(cfg *Config, patch *agentPatch) {
 	}
 }
 
+// applyPermissions routes a single file's [permissions] patch into the
+// scope-specific bucket only. Global and project buckets are distinct
+// fields, never appended together, so a project patch can only ever grow
+// Project* fields and can never reach or widen Global*.
+func applyPermissions(cfg *Config, patch *permissionsPatch, scope Scope) {
+	if patch == nil {
+		return
+	}
+	switch scope {
+	case ScopeGlobal:
+		cfg.Permissions.GlobalAllow = append([]string(nil), patch.Allow...)
+		cfg.Permissions.GlobalDeny = append([]string(nil), patch.Deny...)
+	case ScopeProject:
+		cfg.Permissions.ProjectAllow = append([]string(nil), patch.Allow...)
+		cfg.Permissions.ProjectDeny = append([]string(nil), patch.Deny...)
+	}
+}
+
 func applyMCPPatch(cfg *Config, patch map[string]mcpServerPatch) {
 	if len(patch) == 0 {
 		return
