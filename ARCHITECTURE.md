@@ -16,6 +16,7 @@ internal/provider provider-neutral contracts for auth, chat streaming, and facto
 internal/provider/openai provider.Provider implementation for OpenAI's chat-completions API, API-key authenticated
 internal/provider/chatgpt provider.Provider implementation for OpenAI's Responses API ("/responses"), ChatGPT-OAuth authenticated, SSE streaming; no Cobra, no internal/auth
 internal/permission rule engine (Allow|Ask|Deny) and Gate decorator gating tool calls before dispatch; depends on internal/message, internal/provider, and github.com/bmatcuk/doublestar/v4; must not import internal/agentloop — the Gate satisfies agentloop.ToolRunner structurally, asserted only from a test file
+internal/permission/permissiondb SQLite-backed permission.Store: persists per-project, argument-scoped "allow always"/"deny always" grants so they survive a restart without leaking across projects; depends only on internal/permission
 internal/tool    uniform Tool contract and Registry the agent loop dispatches against; Cobra-free, depends on internal/message, internal/provider, jsonschema-go
 internal/tool/fs read/write/edit Tool implementations confined to a worktree via os.Root; Cobra-free, depends only on internal/tool, jsonschema-go, and the standard library
 internal/tool/bash bash Tool implementation (bash -c from the project root); turn-ctx-aware per-command timeout with turn-cancellation differentiation, process-group kill (no orphaned grandchildren), capped combined stdout/stderr output; Cobra-free, not sandboxed
@@ -48,6 +49,7 @@ internal/tool/search -> internal/tool, doublestar, jsonschema-go, stdlib io/fs +
 internal/tool/webfetch -> internal/tool, golang.org/x/net/html, jsonschema-go, stdlib net/http + net (no Cobra, no internal/agentloop, no internal/agent, no internal/cli)
 
 internal/permission -> internal/message, internal/provider
+internal/permission/permissiondb -> internal/permission, modernc.org/sqlite (leaf-ward: no internal/session import, no cycle)
 
 internal/agentloop -> internal/message, internal/provider
 
@@ -83,7 +85,7 @@ Those features must enter through new SDD artifacts and should preserve the depe
 
 ## Config and state boundary
 
-TOML config files are for hand-authored bootstrap inputs only. Runtime state that Agens mutates — sessions, remembered permissions, model caches, discovered MCP state, and last-used values — belongs in a future SQLite-backed store, not in config files.
+TOML config files are for hand-authored bootstrap inputs only. Runtime state that Agens mutates — sessions, remembered permissions, model caches, discovered MCP state, and last-used values — belongs in a SQLite-backed store, not in config files. Sessions live in `internal/session/sessiondb`; remembered permission grants live in `internal/permission/permissiondb` (see below) — deliberately separate databases and packages, so neither domain's migrations or failure modes couple to the other's.
 
 ## Permissions configuration
 
@@ -109,6 +111,26 @@ is routed only into its own `Project*` fields and never concatenated with the
 treat a global `deny` as absolute: a project `allow` can never reach, widen,
 or override it. Matcher syntax validation happens at composition time
 (`permission.ParseRule`), not during config load.
+
+## Persistent permission grants (permissiondb)
+
+Answering an Ask decision with "allow always" or "deny always" persists a
+`permission.Rule` through `internal/permission/permissiondb`, a
+`permission.Store` implementation backed by a SQLite database at
+`<data home>/agens/permissions.db`. A grant is scoped to both the invoking
+project and the specific argument that triggered the Ask (for example
+`bash(git status)`, not a blanket `bash` grant), so it never widens beyond
+what was actually approved and never leaks into a different project.
+
+`permissiondb.Open(path, project)` binds the project at construction, so the
+unchanged `permission.Store` interface (`Append`, `Rules`) stays
+project-agnostic in shape while grants stay isolated per project underneath.
+It mirrors `internal/session/sessiondb`'s conventions: `SetMaxOpenConns(1)`
+plus a mutex for single-writer access, WAL journaling, `synchronous=NORMAL`,
+a `busy_timeout`, an idempotent `CREATE TABLE IF NOT EXISTS` migration
+stamped with `PRAGMA user_version`, and a lazily created database file. It is
+hand-written SQL rather than sqlc-generated, since the store is a two-query
+package that does not warrant sqlc's generation step.
 
 ## Repository contracts
 
