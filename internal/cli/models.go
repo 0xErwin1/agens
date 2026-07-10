@@ -53,10 +53,11 @@ func newModelsCommandWithBuilder(build providerBuilder) *cobra.Command {
 	return cmd
 }
 
-// writeModelsTable renders models as an aligned ID/NAME/CONTEXT table to w,
-// or a single explanatory line when models is empty. A model's context
-// window is only printed when positive; a zero (unknown) value renders as
-// "-" instead of a misleading 0.
+// writeModelsTable renders models as an aligned ID/NAME/CONTEXT/PRICE table
+// to w, or a single explanatory line when models is empty. A model's context
+// window is only printed when positive, and its price only when the
+// registry supplied both input and output cost; either unknown value renders
+// as "-" instead of a misleading 0 or $0.
 func writeModelsTable(w io.Writer, models []provider.ModelInfo) error {
 	if len(models) == 0 {
 		_, err := fmt.Fprintln(w, "No models available.")
@@ -65,7 +66,7 @@ func writeModelsTable(w io.Writer, models []provider.ModelInfo) error {
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 
-	if _, err := fmt.Fprintln(tw, "ID\tNAME\tCONTEXT"); err != nil {
+	if _, err := fmt.Fprintln(tw, "ID\tNAME\tCONTEXT\tPRICE"); err != nil {
 		return err
 	}
 
@@ -75,12 +76,22 @@ func writeModelsTable(w io.Writer, models []provider.ModelInfo) error {
 			contextWindow = strconv.Itoa(m.ContextWindow)
 		}
 
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\n", m.ID, m.DisplayName, contextWindow); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", m.ID, m.DisplayName, contextWindow, formatPrice(m)); err != nil {
 			return err
 		}
 	}
 
 	return tw.Flush()
+}
+
+// formatPrice renders a model's input/output cost as "$in/$out" per million
+// tokens. Pricing is only ever known as a pair (see modelregistry.Enrich), so
+// checking either field for nil is enough to detect the unknown case.
+func formatPrice(m provider.ModelInfo) string {
+	if m.InputCostPerMTok == nil || m.OutputCostPerMTok == nil {
+		return "-"
+	}
+	return fmt.Sprintf("$%.2f/$%.2f", *m.InputCostPerMTok, *m.OutputCostPerMTok)
 }
 
 // defaultBuildProvider loads config + credentials from disk, then delegates

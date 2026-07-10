@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -113,10 +114,23 @@ func modelRows(items []provider.ModelInfo, selected int, current string, theme T
 		if info.ID == current {
 			label += lipgloss.NewStyle().Foreground(theme.Muted()).Render("  (current)")
 		}
+		if price := formatPrice(info); price != "" {
+			label += lipgloss.NewStyle().Foreground(theme.Muted()).Render("  " + price)
+		}
 
 		rows = append(rows, lipgloss.NewStyle().Inline(true).MaxWidth(inner).Render(marker+label))
 	}
 	return rows
+}
+
+// formatPrice renders a model's input/output cost as "$in/$out" per million
+// tokens, or "" when pricing is unknown so the caller can omit the suffix
+// entirely rather than render a misleading $0.
+func formatPrice(info provider.ModelInfo) string {
+	if info.InputCostPerMTok == nil || info.OutputCostPerMTok == nil {
+		return ""
+	}
+	return fmt.Sprintf("$%.2f/$%.2f", *info.InputCostPerMTok, *info.OutputCostPerMTok)
 }
 
 // windowStart returns the first index of a size-n window over a list of length
