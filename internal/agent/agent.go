@@ -74,6 +74,13 @@ type Options struct {
 	// project.
 	PermissionStore permission.Store
 
+	// Mode shares one live-mutable operating mode across the parent gate and
+	// every subagent gate, read once per tool-call Evaluate so a surface (the
+	// TUI's /mode command) can toggle it without rebuilding either loop. A
+	// nil value fixes the mode to permission.ModeEdit — today's behavior,
+	// unaffected by the chat-mode hard pre-check.
+	Mode *permission.ModeState
+
 	// Subagents, when non-nil, is the shared catalog of selectable subagents the
 	// task tool reads. BuildLoop populates it from the discovered definitions, so
 	// a surface holding the same catalog (the TUI's agents menu) can change the
@@ -647,34 +654,35 @@ func persistChatGPTEntry(entry auth.Entry) error {
 // DecisionAsk by default, resolved by opts.Prompter (or
 // permission.DenyPrompter{} when opts.Prompter is nil).
 func buildGate(opts Options) (*permission.Gate, error) {
-	reg, rules, err := baseToolset(opts)
+	reg, rules, writeNames, err := baseToolset(opts)
 	if err != nil {
 		return nil, err
 	}
-	return assembleGate(reg, rules, opts)
+	return assembleGate(reg, rules, writeNames, opts)
 }
 
 // baseToolset builds the registry of tools shared by the main agent and its
 // subagents — read/write/edit, bash, grep/glob, and webfetch — confined to
 // opts.ProjectRoot (or the working directory when empty), together with the
-// permission rules that pre-seed the read-only tools to Allow.
+// permission rules that pre-seed the read-only tools to Allow and the
+// per-tool-name write classification the chat-mode hard pre-check consults.
 type mcpToolDiscoverer interface {
 	Discover(context.Context) ([]tool.Tool, []mcpclient.Diagnostic)
 }
 
-func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
+func baseToolset(opts Options) (*tool.Registry, []permission.Rule, map[string]bool, error) {
 	rootDir := opts.ProjectRoot
 	if rootDir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return nil, nil, fmt.Errorf("agent: %w", err)
+			return nil, nil, nil, fmt.Errorf("agent: %w", err)
 		}
 		rootDir = wd
 	}
 
 	dir, err := fs.Open(rootDir)
 	if err != nil {
-		return nil, nil, fmt.Errorf("agent: %w", err)
+		return nil, nil, nil, fmt.Errorf("agent: %w", err)
 	}
 
 	reg := tool.NewRegistry()
@@ -685,8 +693,15 @@ func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 	reg.Register(search.NewGrep(dir.FS()))
 	reg.Register(search.NewGlob(dir.FS()))
 	reg.Register(webfetch.New())
-	if err := registerMCPTools(context.Background(), reg, opts); err != nil {
-		return nil, nil, err
+
+	// write, edit, and bash are the native tools the chat-mode hard pre-check
+	// blocks; ALL bash is treated as a write (a safe over-approximation, since
+	// per-command read/write classification is out of scope). Every other
+	// native tool defaults to non-write via a plain map lookup miss.
+	writeNames := map[string]bool{"write": true, "edit": true, "bash": true}
+
+	if err := registerMCPTools(context.Background(), reg, opts, writeNames); err != nil {
+		return nil, nil, nil, err
 	}
 
 	rules := []permission.Rule{
@@ -694,10 +709,15 @@ func baseToolset(opts Options) (*tool.Registry, []permission.Rule, error) {
 		{Decision: permission.DecisionAllow, Name: "grep"},
 		{Decision: permission.DecisionAllow, Name: "glob"},
 	}
-	return reg, rules, nil
+	return reg, rules, writeNames, nil
 }
 
-func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) error {
+// registerMCPTools discovers and registers opts' configured MCP tools onto
+// reg, classifying each into writeNames: a *mcpclient.Tool is a write unless
+// it verifiably carries an explicit ReadOnlyHint annotation; any other Tool
+// implementation (for example a test double) defaults to write too, the same
+// safe fallback for a read intent that cannot be verified.
+func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options, writeNames map[string]bool) error {
 	discoverer := opts.mcpDiscoverer
 	if discoverer == nil && len(opts.mcpServers) > 0 {
 		discoverer = mcpclient.New(opts.mcpServers)
@@ -719,8 +739,22 @@ func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) err
 	}
 	for _, t := range tools {
 		reg.Register(t)
+		writeNames[t.Name()] = mcpIsWrite(t)
 	}
 	return nil
+}
+
+// mcpIsWrite reports whether an MCP-discovered tool should be classified as a
+// write for the chat-mode hard pre-check. Only a genuine *mcpclient.Tool's own
+// ReadOnly method — which reflects a server-provided ToolAnnotations hint — can
+// mark it read-only; any other concrete type defaults to write, since its read
+// intent was never verified against a real MCP server.
+func mcpIsWrite(t tool.Tool) bool {
+	mt, ok := t.(*mcpclient.Tool)
+	if !ok {
+		return true
+	}
+	return !mt.ReadOnly()
 }
 
 // assembleGate wraps reg and rules in a permission Gate that resolves Ask
@@ -728,13 +762,28 @@ func registerMCPTools(ctx context.Context, reg *tool.Registry, opts Options) err
 // is parsed into the Engine's static rules and its global-deny hard
 // pre-check by configPermissionRules. The Engine's remembered-grant Store is
 // opts.PermissionStore, or a fresh permission.MemoryStore when nil.
-func assembleGate(reg *tool.Registry, rules []permission.Rule, opts Options) (*permission.Gate, error) {
+// permission.ProjectField is always installed as the Engine's Projector, so
+// every argument-scoped matcher — a config matcher, a global deny, or a
+// persisted grant — is matched against a call's semantic argument (command,
+// path, or url) instead of its raw JSON input. writeNames backs the
+// chat-mode hard pre-check via opts.Mode (or a fixed permission.ModeEdit
+// reader when opts.Mode is nil).
+func assembleGate(reg *tool.Registry, rules []permission.Rule, writeNames map[string]bool, opts Options) (*permission.Gate, error) {
 	rules, globalDenies, err := configPermissionRules(rules, opts.Permissions)
 	if err != nil {
 		return nil, fmt.Errorf("agent: %w", err)
 	}
 
-	var engineOpts []permission.EngineOption
+	modeFunc := func() permission.Mode { return permission.ModeEdit }
+	if opts.Mode != nil {
+		modeFunc = opts.Mode.Get
+	}
+
+	engineOpts := []permission.EngineOption{
+		permission.WithProjector(permission.ProjectField),
+		permission.WithMode(modeFunc),
+		permission.WithWriteClassifier(func(name string) bool { return writeNames[name] }),
+	}
 	if len(globalDenies) > 0 {
 		engineOpts = append(engineOpts, permission.WithGlobalDenies(globalDenies))
 	}
@@ -800,7 +849,7 @@ func configPermissionRules(rules []permission.Rule, perms config.Permissions) ([
 // built with buildGate (no task, no skill), so a delegation does not recurse and
 // cannot load skills.
 func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog, skills *skill.Set) (*permission.Gate, error) {
-	reg, rules, err := baseToolset(opts)
+	reg, rules, writeNames, err := baseToolset(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -813,7 +862,7 @@ func buildParentGate(opts Options, runner task.Runner, catalog *task.Catalog, sk
 		rules = append(rules, permission.Rule{Decision: permission.DecisionAllow, Name: "skill"})
 	}
 
-	return assembleGate(reg, rules, opts)
+	return assembleGate(reg, rules, writeNames, opts)
 }
 
 // subagentOptions projects the subagent-capable definitions of defs into the

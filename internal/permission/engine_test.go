@@ -317,6 +317,72 @@ func TestEngine_RememberCall_EscapesGlobMetacharactersInTheArgument(t *testing.T
 	}
 }
 
+// The next three tests pin Evaluate's chat-mode hard pre-check (hard-check #2)
+// directly at the Engine level: WithMode/WithWriteClassifier were built as
+// scaffolding in an earlier batch, unused by any real composition root until
+// this one wires them into internal/agent. These are approval tests for that
+// pre-existing Evaluate behavior, run ahead of (and pinning the contract for)
+// the composition-root wiring exercised in internal/agent's own tests.
+func TestEngine_Evaluate_ChatModeBlocksAllowListedWrite(t *testing.T) {
+	engine, err := NewEngine(
+		[]Rule{{Decision: DecisionAllow, Name: "edit"}},
+		NewMemoryStore(),
+		WithMode(func() Mode { return ModeChat }),
+		WithWriteClassifier(func(name string) bool { return name == "edit" }),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{Name: "edit"})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionDeny {
+		t.Fatalf("Evaluate() = %v, want %v (chat mode must block a write even when statically allow-listed)", got, DecisionDeny)
+	}
+}
+
+func TestEngine_Evaluate_EditModeHonorsAllowRule(t *testing.T) {
+	engine, err := NewEngine(
+		[]Rule{{Decision: DecisionAllow, Name: "edit"}},
+		NewMemoryStore(),
+		WithMode(func() Mode { return ModeEdit }),
+		WithWriteClassifier(func(name string) bool { return name == "edit" }),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{Name: "edit"})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionAllow {
+		t.Fatalf("Evaluate() = %v, want %v (edit mode must honor the static allow rule; the same rule that chat mode blocks above)", got, DecisionAllow)
+	}
+}
+
+func TestEngine_Evaluate_ChatModeDoesNotBlockANonWriteTool(t *testing.T) {
+	engine, err := NewEngine(
+		nil,
+		NewMemoryStore(),
+		WithMode(func() Mode { return ModeChat }),
+		WithWriteClassifier(func(name string) bool { return name == "edit" }),
+	)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	got, err := engine.Evaluate(context.Background(), message.ToolUsePart{Name: "read"})
+	if err != nil {
+		t.Fatalf("Evaluate() error = %v", err)
+	}
+	if got != DecisionAsk {
+		t.Fatalf("Evaluate() = %v, want %v (chat mode only blocks tools the classifier flags as a write)", got, DecisionAsk)
+	}
+}
+
 func TestEngine_RememberCall_ArgumentlessCallFallsBackToNameScoped(t *testing.T) {
 	store := NewMemoryStore()
 	engine, err := NewEngine(nil, store, WithProjector(ProjectField))

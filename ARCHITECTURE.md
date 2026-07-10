@@ -93,7 +93,7 @@ An optional `[permissions]` table configures the permission engine's ruleset:
 
 ```toml
 [permissions]
-deny  = ["bash(rm -rf *)", "read(**/.env)"]
+deny  = ["read(**/.env)"]
 allow = ["read(**)", "engram_mem_save(**)"]
 ```
 
@@ -101,8 +101,18 @@ allow = ["read(**)", "engram_mem_save(**)"]
 lowercase native tools (`bash`, `read`, `edit`, ...) and `serverName_toolName`
 for MCP tools (e.g. `engram_mem_save`) — never a `mcp__…__…` or `Bash(...)`
 alias layer. Each entry is `tool(argPattern)` (a doublestar glob matched
-against a semantic projection of the call: bash → command, fs → path,
-webfetch → url) or a bare `tool` matching on name alone.
+against a semantic projection of the call — bash → command, fs → path,
+webfetch → url — via the Engine's `Projector`, so an argument-scoped matcher
+like `read(**/.env)` above genuinely blocks a `.env` read through the real
+gate, not just an isolated engine test) or a bare `tool` matching on name
+alone.
+
+Doublestar's glob matching is path-segment based: a bare `*` does not cross a
+literal `/`. A pattern meant to block a whole subtree needs `**` written as
+its own path segment (for example `command/**`), not a bare `*` — a matcher
+like `bash(rm -rf *)` only matches a slash-free command and would NOT block
+`rm -rf /` or `rm -rf some/dir`; do not author a deny rule assuming a single
+`*` bridges directories.
 
 `internal/config` keeps global and project permissions in separate buckets
 (`Permissions.{Global,Project}{Allow,Deny}`); a project `[permissions]` patch
