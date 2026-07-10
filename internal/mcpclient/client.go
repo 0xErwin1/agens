@@ -121,6 +121,16 @@ func (t *Tool) Description() string {
 	return t.sdkTool.Description
 }
 
+// ReadOnly reports whether the MCP server annotated this tool as read-only via
+// its ToolAnnotations.ReadOnlyHint. A tool with no Annotations at all, or with
+// Annotations present but ReadOnlyHint left at its zero value (indistinguishable
+// on the wire from an explicit false), is treated as NOT read-only: the safe
+// default when a server's read intent cannot be verified is to classify the
+// tool as a write for chat-mode enforcement.
+func (t *Tool) ReadOnly() bool {
+	return t.sdkTool != nil && t.sdkTool.Annotations != nil && t.sdkTool.Annotations.ReadOnlyHint
+}
+
 func (t *Tool) Schema() *jsonschema.Schema {
 	schema, err := t.convertSchema()
 	if err != nil {
