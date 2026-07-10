@@ -25,6 +25,7 @@ import (
 	agenttool "github.com/0xErwin1/agens/internal/tool"
 	"github.com/0xErwin1/agens/internal/tool/task"
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // loadTestDefs returns the built-in agent definitions (build, plan) for wiring
@@ -1755,6 +1756,171 @@ func TestBuildGate_PersistentGrantSurvivesStoreReopenInRealPath(t *testing.T) {
 	}
 	if result.IsError {
 		t.Fatalf("gate.Run() (reopen) result = %+v, want the persisted allow-always to survive the restart without re-prompting", result)
+	}
+}
+
+// fakeMCPConnector and fakeMCPSession let this package wrap a genuine
+// *mcpclient.Tool (via the real mcpclient.Client, not a same-package double)
+// around a controllable SDK-level result, so a chat-mode classification test
+// can prove the tool actually executed through mcpclient.Tool.Execute rather
+// than merely asserting a permission decision in isolation.
+type fakeMCPConnector struct {
+	session mcpclient.Session
+}
+
+func (f *fakeMCPConnector) Connect(context.Context, config.MCPServer) (mcpclient.Session, error) {
+	return f.session, nil
+}
+
+type fakeMCPSession struct {
+	result *mcp.CallToolResult
+	calls  int
+}
+
+func (f *fakeMCPSession) ListTools(context.Context) ([]*mcp.Tool, error) { return nil, nil }
+
+func (f *fakeMCPSession) CallTool(_ context.Context, _ *mcp.CallToolParams) (*mcp.CallToolResult, error) {
+	f.calls++
+	return f.result, nil
+}
+
+func (f *fakeMCPSession) Close() error { return nil }
+
+// TestBuildGate_ReadOnlyHintedMCPToolAllowedInChatModeInRealPath closes verify
+// report SUGGESTION 1: the benign direction of MCP read-only classification —
+// a genuine *mcpclient.Tool (not a test double faking ReadOnly()) whose SDK
+// annotation carries ReadOnlyHint=true — was previously only unit-proven
+// (Tool.ReadOnly()==true in isolation). This wires that same concrete type
+// through the real assembleGate composition in chat mode with an explicit
+// GlobalAllow rule and asserts BOTH that chat mode's write pre-check does
+// not hard-deny it (the Prompter, wired to fail the test if consulted, is
+// never reached — mirroring TestBuildGate_ChatModeBlocksAllowListedWrite's
+// write-classified counterpart) AND that it actually executes end-to-end
+// (the fake session is consulted and its own result is returned).
+func TestBuildGate_ReadOnlyHintedMCPToolAllowedInChatModeInRealPath(t *testing.T) {
+	session := &fakeMCPSession{result: &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "docs found"}}}}
+	client := mcpclient.New(map[string]config.MCPServer{"docs": {}}, mcpclient.WithConnector(&fakeMCPConnector{session: session}))
+	readOnlyTool := client.WrapDiscoveredTool("docs", &mcp.Tool{
+		Name:        "search",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	})
+
+	mode := permission.NewModeState(permission.ModeChat)
+	gate, err := buildGate(Options{
+		ProjectRoot:   t.TempDir(),
+		Prompter:      failOnCallPrompter{t: t},
+		Mode:          mode,
+		Permissions:   config.Permissions{GlobalAllow: []string{"docs_search"}},
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{readOnlyTool}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_1", Name: "docs_search", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want a genuine *mcpclient.Tool with ReadOnlyHint=true to run in chat mode", result)
+	}
+	if got := resultText(result); got != "docs found" {
+		t.Fatalf("resultText() = %q, want the fake session's own result, proving the tool actually executed rather than the call being trivially unblocked", got)
+	}
+	if session.calls != 1 {
+		t.Fatalf("session.CallTool was invoked %d time(s), want exactly 1", session.calls)
+	}
+}
+
+// TestBuildGate_ConfigDenyOverridesChatModeForANonWriteToolInRealPath closes
+// verify report SUGGESTION 2: a config Deny still wins over an active chat
+// mode, proven through the real assembled gate with the Prompter never
+// consulted. It intentionally denies "read" — a tool the chat-mode
+// WriteClassifier does NOT flag as a write — so the denial provably comes
+// from the Evaluate hard-check ordering (global-deny before chat-mode), not
+// merely from chat mode already blocking a write-classified tool.
+func TestBuildGate_ConfigDenyOverridesChatModeForANonWriteToolInRealPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "config"), 0o755); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config", ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	mode := permission.NewModeState(permission.ModeChat)
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Mode:        mode,
+		Permissions: config.Permissions{GlobalDeny: []string{"read(**/.env)"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "read", Input: json.RawMessage(`{"path":"config/.env"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: a config deny must win over an active chat mode for a tool chat mode alone would never block")
+	}
+}
+
+// TestBuildGate_GlobalDenyOverridesAPersistedAllowAlwaysInRealPath closes the
+// remaining spec Given/When/Then not yet pinned end-to-end through the real
+// composition: a global deny is absolute even against a grant a user already
+// persisted via "allow always" in an earlier session. It uses a real
+// *permissiondb.Store (not a stub), first persisting an allow-always grant
+// with no conflicting config, then rebuilding the gate against the SAME store
+// with a global deny added — proving the deny wins over an existing stored
+// Allow rule, and that the Prompter is never re-consulted.
+func TestBuildGate_GlobalDenyOverridesAPersistedAllowAlwaysInRealPath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "permissions.db")
+	projectDir := t.TempDir()
+
+	store, err := permissiondb.Open(dbPath, projectDir)
+	if err != nil {
+		t.Fatalf("permissiondb.Open() error = %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	fp := &fakePrompter{answer: permission.AnswerAllowAlways}
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+
+	gateBeforeDeny, err := buildGate(Options{ProjectRoot: projectDir, Prompter: fp, PermissionStore: store})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+	beforeResult, err := gateBeforeDeny.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if beforeResult.IsError {
+		t.Fatalf("gate.Run() (before deny) result = %+v, want the allow-always grant to let the call through", beforeResult)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter calls = %d, want exactly 1 for the first Ask", len(fp.calls))
+	}
+
+	gateAfterDeny, err := buildGate(Options{
+		ProjectRoot:     projectDir,
+		Prompter:        failOnCallPrompter{t: t},
+		PermissionStore: store,
+		Permissions:     config.Permissions{GlobalDeny: []string{"bash(echo hi)"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	result, err := gateAfterDeny.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: a global deny must win over an already-persisted allow-always grant")
 	}
 }
 
