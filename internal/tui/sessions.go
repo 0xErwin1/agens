@@ -18,11 +18,11 @@ const maxSessionRows = 8
 // sessionTimeFormat is how a session's last-updated time is shown in the picker.
 const sessionTimeFormat = "Jan 2 15:04"
 
-// SessionStore lists, loads, and saves conversations. *session.Store satisfies
-// it, so the CLI passes the file-backed store; nil disables session history.
+// SessionStore lists, loads, and saves conversations. *sessiondb.Store
+// satisfies it; nil disables session history.
 type SessionStore interface {
 	Save(s session.Session) error
-	List() ([]session.Session, error)
+	ListMeta() ([]session.Session, error)
 	Load(id string) (session.Session, error)
 }
 
@@ -36,7 +36,7 @@ type sessionsLoadedMsg struct {
 // loadSessionsCmd lists the saved sessions off the UI goroutine.
 func loadSessionsCmd(store SessionStore) tea.Cmd {
 	return func() tea.Msg {
-		sessions, err := store.List()
+		sessions, err := store.ListMeta()
 		return sessionsLoadedMsg{sessions: sessions, err: err}
 	}
 }
