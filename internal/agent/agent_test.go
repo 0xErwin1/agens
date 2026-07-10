@@ -18,6 +18,7 @@ import (
 	"github.com/0xErwin1/agens/internal/mcpclient"
 	"github.com/0xErwin1/agens/internal/message"
 	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/permission/permissiondb"
 	"github.com/0xErwin1/agens/internal/provider"
 	"github.com/0xErwin1/agens/internal/provider/chatgpt"
 	"github.com/0xErwin1/agens/internal/provider/openai"
@@ -1214,6 +1215,185 @@ func TestBuildGate_NilPermissionStoreFallsBackToMemoryStore(t *testing.T) {
 	}
 }
 
+// TestBuildGate_GlobalDenyArgumentMatcherBlocksTheRealPath is the fail-open
+// regression guard for task 3.7: assembleGate must install
+// permission.WithProjector(permission.ProjectField) so an argument-scoped
+// global deny is matched against the call's semantic path, not raw JSON.
+// Before that wiring, this exact config denial was inert in the real
+// buildGate path (only bare tool-name matchers worked).
+func TestBuildGate_GlobalDenyArgumentMatcherBlocksTheRealPath(t *testing.T) {
+	dir := t.TempDir()
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Permissions: config.Permissions{GlobalDeny: []string{"read(**/.env)"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "read", Input: json.RawMessage(`{"path":"config/.env"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil (a denial is a tool-level result, not a Go error)", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: an argument-scoped global deny must reach the real gate")
+	}
+}
+
+func TestBuildGate_GlobalDenyArgumentMatcherDoesNotBlockAnUnrelatedPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Permissions: config.Permissions{GlobalDeny: []string{"read(**/.env)"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "read", Input: json.RawMessage(`{"path":"a.txt"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want the deny's argument glob to leave an unrelated path untouched", result)
+	}
+}
+
+func TestBuildGate_ChatModeBlocksAllowListedWriteWithoutPrompting(t *testing.T) {
+	dir := t.TempDir()
+	mode := permission.NewModeState(permission.ModeChat)
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Mode:        mode,
+		Permissions: config.Permissions{GlobalAllow: []string{"edit"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "edit", Input: json.RawMessage(`{"path":"a.txt"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: chat mode must block a write even when statically allow-listed")
+	}
+}
+
+func TestBuildGate_EditModeAllowsAllowListedWrite(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+
+	mode := permission.NewModeState(permission.ModeEdit)
+	gate, err := buildGate(Options{
+		ProjectRoot: dir,
+		Prompter:    failOnCallPrompter{t: t},
+		Mode:        mode,
+		Permissions: config.Permissions{GlobalAllow: []string{"edit"}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "edit", Input: json.RawMessage(`{"path":"a.txt","old_string":"hi","new_string":"hello"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want edit mode to honor the static allow rule", result)
+	}
+}
+
+func TestBuildGate_ChatModeBlocksBashWithNoRuleAtAll(t *testing.T) {
+	dir := t.TempDir()
+	mode := permission.NewModeState(permission.ModeChat)
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: failOnCallPrompter{t: t}, Mode: mode})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: bash is always classified as a write, blocked in chat mode")
+	}
+}
+
+func TestBuildGate_NilModeDefaultsToEditBehavior(t *testing.T) {
+	dir := t.TempDir()
+	fp := &fakePrompter{answer: permission.AnswerAllowOnce}
+	gate, err := buildGate(Options{ProjectRoot: dir, Prompter: fp})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	result, err := gate.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() result = %+v, want a nil Mode to behave like today (Ask resolved by the Prompter, not a hard deny)", result)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter was consulted %d time(s), want exactly 1 (a nil Mode must default to edit, never chat)", len(fp.calls))
+	}
+}
+
+// fakeMCPToolWithReadOnly wraps fakeMCPTool with a ReadOnly method so a
+// chat-mode write-classification test can exercise a non-*mcpclient.Tool that
+// still satisfies an (unexported) read-only-hint duck type. It intentionally
+// does NOT — mcpWrite's classification only special-cases the concrete
+// *mcpclient.Tool type, so this proves an MCP tool from an untrusted/unknown
+// discoverer degrades to the safe "treat as write" default rather than
+// silently trusting a coincidental ReadOnly() method.
+type fakeMCPToolWithReadOnly struct {
+	fakeMCPTool
+}
+
+func (f *fakeMCPToolWithReadOnly) ReadOnly() bool { return true }
+
+func TestBuildGate_UnknownMCPToolDefaultsToWriteInChatMode(t *testing.T) {
+	mode := permission.NewModeState(permission.ModeChat)
+	writeTool := &fakeMCPToolWithReadOnly{fakeMCPTool: fakeMCPTool{name: "docs_search", result: agenttool.Result{Text: "should not execute"}}}
+	gate, err := buildGate(Options{
+		ProjectRoot:   t.TempDir(),
+		Prompter:      failOnCallPrompter{t: t},
+		Mode:          mode,
+		mcpDiscoverer: &fakeMCPDiscoverer{tools: []agenttool.Tool{writeTool}},
+	})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	result, err := gate.Run(context.Background(), message.ToolUsePart{ID: "tu_1", Name: "docs_search", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatal("gate.Run() result IsError = false, want true: an MCP tool discovered outside the mcpclient package must default to write, since only *mcpclient.Tool's verified ReadOnlyHint is trusted")
+	}
+	if writeTool.calls != 0 {
+		t.Fatalf("writeTool.calls = %d, want 0 (chat mode must block it before it ever runs)", writeTool.calls)
+	}
+}
+
 // fakeSubRunner is a scripted task.Runner recording the description it was asked
 // to run and returning a canned result, so the parent gate's task wiring can be
 // exercised without a provider or a nested loop.
@@ -1522,6 +1702,59 @@ func TestSubagentSystemPrompt_AppendsInstructionToBase(t *testing.T) {
 
 	if got := subagentSystemPrompt(""); !strings.Contains(got, "subagent") {
 		t.Fatalf("subagentSystemPrompt(\"\") = %q, want the bare instruction", got)
+	}
+}
+
+// TestBuildGate_PersistentGrantSurvivesStoreReopenInRealPath pins the
+// "real path" round-trip the residual task 3.3 wiring depends on: a
+// *permissiondb.Store — the same concrete type internal/cli/{tui,chat}.go
+// open and hand to opts.PermissionStore — persists an allow-always grant
+// through buildGate's actual composition, and a second Store opened after the
+// first is closed (mirroring a process restart) still honors it, with no
+// stub in between.
+func TestBuildGate_PersistentGrantSurvivesStoreReopenInRealPath(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "permissions.db")
+	projectDir := t.TempDir()
+
+	store1, err := permissiondb.Open(dbPath, projectDir)
+	if err != nil {
+		t.Fatalf("permissiondb.Open() error = %v", err)
+	}
+
+	fp := &fakePrompter{answer: permission.AnswerAllowAlways}
+	gate1, err := buildGate(Options{ProjectRoot: projectDir, Prompter: fp, PermissionStore: store1})
+	if err != nil {
+		t.Fatalf("buildGate() error = %v, want nil", err)
+	}
+
+	call := message.ToolUsePart{ID: "tu_1", Name: "bash", Input: json.RawMessage(`{"command":"echo hi"}`)}
+	if _, err := gate1.Run(context.Background(), call); err != nil {
+		t.Fatalf("gate.Run() error = %v, want nil", err)
+	}
+	if len(fp.calls) != 1 {
+		t.Fatalf("prompter calls = %d, want exactly 1 for the first Ask", len(fp.calls))
+	}
+	if err := store1.Close(); err != nil {
+		t.Fatalf("store1.Close() error = %v", err)
+	}
+
+	store2, err := permissiondb.Open(dbPath, projectDir)
+	if err != nil {
+		t.Fatalf("permissiondb.Open() (reopen) error = %v", err)
+	}
+	defer func() { _ = store2.Close() }()
+
+	gate2, err := buildGate(Options{ProjectRoot: projectDir, Prompter: failOnCallPrompter{t: t}, PermissionStore: store2})
+	if err != nil {
+		t.Fatalf("buildGate() (reopen) error = %v, want nil", err)
+	}
+
+	result, err := gate2.Run(context.Background(), call)
+	if err != nil {
+		t.Fatalf("gate.Run() (reopen) error = %v, want nil", err)
+	}
+	if result.IsError {
+		t.Fatalf("gate.Run() (reopen) result = %+v, want the persisted allow-always to survive the restart without re-prompting", result)
 	}
 }
 
