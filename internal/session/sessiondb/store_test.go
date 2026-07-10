@@ -164,6 +164,88 @@ func TestStore_SaveRequiresID(t *testing.T) {
 	}
 }
 
+func TestStore_ListMetaReturnsNoMessages(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "sessions.db"))
+
+	for _, id := range []string{"a", "b"} {
+		sess := session.Session{
+			ID:      id,
+			Title:   id,
+			Project: "/home/me/projA",
+			Messages: []message.Message{
+				{ID: "msg", Role: message.RoleUser, Parts: message.Parts{message.TextPart{Text: "hi"}}, CreatedAt: time.Now().UTC()},
+			},
+		}
+		if err := store.Save(sess); err != nil {
+			t.Fatalf("Save(%s) error = %v", id, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	metas, err := store.ListMeta()
+	if err != nil {
+		t.Fatalf("ListMeta() error = %v", err)
+	}
+	if len(metas) != 2 || metas[0].ID != "b" || metas[1].ID != "a" {
+		t.Fatalf("ListMeta() order = %v, want most-recent (b) first", ids(metas))
+	}
+	for _, meta := range metas {
+		if meta.Messages != nil {
+			t.Fatalf("ListMeta() session %q has Messages = %#v, want nil", meta.ID, meta.Messages)
+		}
+		if meta.Project != "/home/me/projA" {
+			t.Fatalf("ListMeta() session %q Project = %q, want %q", meta.ID, meta.Project, "/home/me/projA")
+		}
+	}
+}
+
+func TestStore_DeleteCascadesMessages(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "sessions.db"))
+
+	sess := session.Session{
+		ID:    "abc",
+		Title: "to delete",
+		Messages: []message.Message{
+			{ID: "msg", Role: message.RoleUser, Parts: message.Parts{message.TextPart{Text: "hi"}}, CreatedAt: time.Now().UTC()},
+		},
+	}
+	if err := store.Save(sess); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	if err := store.Delete("abc"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+
+	if _, err := store.Load("abc"); err == nil {
+		t.Fatal("Load() after Delete() returned nil error, want not-found")
+	}
+	metas, err := store.ListMeta()
+	if err != nil {
+		t.Fatalf("ListMeta() error = %v", err)
+	}
+	if len(metas) != 0 {
+		t.Fatalf("ListMeta() after Delete() = %v, want empty", ids(metas))
+	}
+
+	var messageCount int
+	row := store.db.QueryRow("SELECT COUNT(*) FROM messages WHERE session_id = ?", "abc")
+	if err := row.Scan(&messageCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if messageCount != 0 {
+		t.Fatalf("messages remaining for deleted session = %d, want 0", messageCount)
+	}
+}
+
+func TestStore_DeleteMissingIDIsNoop(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "sessions.db"))
+
+	if err := store.Delete("does-not-exist"); err != nil {
+		t.Fatalf("Delete() of missing id error = %v, want nil", err)
+	}
+}
+
 func openTestStore(t *testing.T, path string) *Store {
 	t.Helper()
 	store, err := Open(path)

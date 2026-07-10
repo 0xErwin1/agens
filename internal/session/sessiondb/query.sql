@@ -10,6 +10,9 @@ ON CONFLICT(id) DO UPDATE SET
 -- name: DeleteMessagesForSession :exec
 DELETE FROM messages WHERE session_id = ?;
 
+-- name: DeleteSession :exec
+DELETE FROM sessions WHERE id = ?;
+
 -- name: InsertMessage :exec
 INSERT INTO messages (session_id, ordinal, message_id, role, model, stop_reason, created_at, payload_json)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
