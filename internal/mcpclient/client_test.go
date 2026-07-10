@@ -196,3 +196,38 @@ func TestDiscoverFailureDoesNotFabricateTools(t *testing.T) {
 		t.Fatalf("diagnostics = %#v, want offline connect failure", diagnostics)
 	}
 }
+
+func TestTool_ReadOnly_TrueWhenServerAnnotatesReadOnlyHint(t *testing.T) {
+	client := New(nil)
+	wrapper := client.WrapDiscoveredTool("docs", &mcp.Tool{
+		Name:        "search",
+		InputSchema: map[string]any{"type": "object"},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	})
+
+	if !wrapper.ReadOnly() {
+		t.Fatal("ReadOnly() = false, want true when the server sets readOnlyHint")
+	}
+}
+
+func TestTool_ReadOnly_FalseWhenNoAnnotations(t *testing.T) {
+	client := New(nil)
+	wrapper := client.WrapDiscoveredTool("docs", &mcp.Tool{Name: "search", InputSchema: map[string]any{"type": "object"}})
+
+	if wrapper.ReadOnly() {
+		t.Fatal("ReadOnly() = true, want false (safe default: treat as write when no annotation is present)")
+	}
+}
+
+func TestTool_ReadOnly_FalseWhenAnnotationsPresentButHintExplicitlyFalse(t *testing.T) {
+	client := New(nil)
+	wrapper := client.WrapDiscoveredTool("docs", &mcp.Tool{
+		Name:        "search",
+		InputSchema: map[string]any{"type": "object"},
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false},
+	})
+
+	if wrapper.ReadOnly() {
+		t.Fatal("ReadOnly() = true, want false when the annotation explicitly reports not read-only")
+	}
+}
