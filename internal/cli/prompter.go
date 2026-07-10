@@ -3,7 +3,6 @@ package cli
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -32,14 +31,6 @@ func newTTYPrompter(in io.Reader, out io.Writer) *ttyPrompter {
 
 var _ permission.Prompter = (*ttyPrompter)(nil)
 
-// promptArgumentInput is the best-effort shape used to extract a display
-// argument from a tool call's input: Path wins when non-empty, then URL,
-// otherwise the caller falls back to the raw input.
-type promptArgumentInput struct {
-	Path string `json:"path"`
-	URL  string `json:"url"`
-}
-
 // Prompt writes call's tool name and a best-effort argument to p.out, then
 // reads one line of input from p.in and maps it to a permission.Answer.
 //
@@ -49,7 +40,7 @@ type promptArgumentInput struct {
 // blocking on in until it is closed or produces a byte (accepted for
 // one-shot chat, where the process exits shortly after).
 func (p *ttyPrompter) Prompt(ctx context.Context, call message.ToolUsePart) (permission.Answer, error) {
-	if _, err := fmt.Fprintf(p.out, "%s %s — allow? [y]es once / [a]lways / [n]o / [d]eny always / [q]uit: ", call.Name, promptArgument(call.Input)); err != nil {
+	if _, err := fmt.Fprintf(p.out, "%s %s — allow? [y]es once / [a]lways / [n]o / [d]eny always / [q]uit: ", call.Name, permission.ProjectField(call.Input)); err != nil {
 		return permission.AnswerDenyOnce, fmt.Errorf("cli: write permission prompt: %w", err)
 	}
 
@@ -75,23 +66,6 @@ func (p *ttyPrompter) Prompt(ctx context.Context, call message.ToolUsePart) (per
 		}
 		return answerForKey(res.line), nil
 	}
-}
-
-// promptArgument returns the best-effort display argument for input: the
-// "path" field when input unmarshals into promptArgumentInput with a
-// non-empty Path, else the "url" field when non-empty, otherwise input
-// verbatim.
-func promptArgument(input json.RawMessage) string {
-	var p promptArgumentInput
-	if err := json.Unmarshal(input, &p); err == nil {
-		if p.Path != "" {
-			return p.Path
-		}
-		if p.URL != "" {
-			return p.URL
-		}
-	}
-	return string(input)
 }
 
 // answerForKey maps a single line of scripted or human input to a

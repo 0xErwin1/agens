@@ -146,7 +146,12 @@ func TestTTYPrompter_OutputPrefersPathOverURL(t *testing.T) {
 	}
 }
 
-func TestTTYPrompter_OutputFallsBackToRawInputWhenNoPath(t *testing.T) {
+// TestTTYPrompter_OutputShowsCommandForBash pins the consolidated
+// permission.ProjectField projector: the CLI prompter's displayed argument now
+// extracts a bash call's command field, the same projection the Engine itself
+// matches an argument-scoped rule against, instead of a bash-specific gap that
+// used to fall back to raw JSON only for this tool.
+func TestTTYPrompter_OutputShowsCommandForBash(t *testing.T) {
 	out := new(bytes.Buffer)
 	p := newTTYPrompter(strings.NewReader("n\n"), out)
 
@@ -156,11 +161,29 @@ func TestTTYPrompter_OutputFallsBackToRawInputWhenNoPath(t *testing.T) {
 	}
 
 	got := out.String()
-	if !strings.Contains(got, "bash") {
-		t.Fatalf("prompt output = %q, want it to mention the tool name %q", got, "bash")
+	if !strings.Contains(got, "bash ls —") {
+		t.Fatalf("prompt output = %q, want it to show the extracted command %q", got, "ls")
 	}
-	if !strings.Contains(got, `"command":"ls"`) {
-		t.Fatalf("prompt output = %q, want it to fall back to the raw input when no path field is present", got)
+	if strings.Contains(got, `"command"`) {
+		t.Fatalf("prompt output = %q, want the extracted command, not raw JSON", got)
+	}
+}
+
+func TestTTYPrompter_OutputFallsBackToRawInputWhenNoRecognizedField(t *testing.T) {
+	out := new(bytes.Buffer)
+	p := newTTYPrompter(strings.NewReader("n\n"), out)
+
+	call := message.ToolUsePart{Name: "grep", Input: []byte(`{"pattern":"needle"}`)}
+	if _, err := p.Prompt(context.Background(), call); err != nil {
+		t.Fatalf("Prompt() error = %v, want nil", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "grep") {
+		t.Fatalf("prompt output = %q, want it to mention the tool name %q", got, "grep")
+	}
+	if !strings.Contains(got, `"pattern":"needle"`) {
+		t.Fatalf("prompt output = %q, want it to fall back to the raw input when no recognized field is present", got)
 	}
 }
 
