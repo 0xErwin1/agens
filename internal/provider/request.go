@@ -42,6 +42,9 @@ type ModelInfo struct {
 	ContextWindow   int
 	MaxOutputTokens int
 	SupportsTools   bool
+
+	InputCostPerMTok  *float64 // USD per 1M input tokens; nil = no snapshot entry, never assume free
+	OutputCostPerMTok *float64 // USD per 1M output tokens; nil = no snapshot entry
 }
 
 // Usage reports token consumption. Additive-only.
