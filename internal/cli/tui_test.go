@@ -56,6 +56,76 @@ func TestTUICommand_FlagsReachBuilderOptions(t *testing.T) {
 	}
 }
 
+func TestTUICommand_ModeFlagDefaultsToEdit(t *testing.T) {
+	var received agent.Options
+	build := func(opts agent.Options) (tuiSession, error) {
+		received = opts
+		return tuiSession{loop: stubTUILoop(), model: "gpt-test"}, nil
+	}
+	run := func(tea.Model) error { return nil }
+
+	cmd := newRootCommand(build, run)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs(nil)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if received.Mode == nil {
+		t.Fatal("Options.Mode = nil, want a ModeState wired even without --mode")
+	}
+	if got := received.Mode.Get(); got != permission.ModeEdit {
+		t.Fatalf("Options.Mode.Get() = %v, want ModeEdit by default", got)
+	}
+}
+
+func TestTUICommand_ModeFlagSetsChatMode(t *testing.T) {
+	var received agent.Options
+	build := func(opts agent.Options) (tuiSession, error) {
+		received = opts
+		return tuiSession{loop: stubTUILoop(), model: "gpt-test"}, nil
+	}
+	run := func(tea.Model) error { return nil }
+
+	cmd := newRootCommand(build, run)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"--mode", "chat"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if got := received.Mode.Get(); got != permission.ModeChat {
+		t.Fatalf("Options.Mode.Get() = %v, want ModeChat", got)
+	}
+}
+
+func TestTUICommand_RejectsInvalidModeFlag(t *testing.T) {
+	builderCalled := false
+	build := func(agent.Options) (tuiSession, error) {
+		builderCalled = true
+		return tuiSession{loop: stubTUILoop(), model: "gpt-test"}, nil
+	}
+	run := func(tea.Model) error { return nil }
+
+	cmd := newRootCommand(build, run)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"--mode", "bogus"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil, want an invalid --mode error")
+	}
+	if !strings.Contains(err.Error(), "--mode") {
+		t.Fatalf("Execute() error = %q, want it to mention --mode", err.Error())
+	}
+	if builderCalled {
+		t.Fatal("builder was called, want validation to reject before building the loop")
+	}
+}
+
 func TestTUICommand_RejectsInvalidMaxIterationsFlag(t *testing.T) {
 	for _, args := range [][]string{
 		{"--max-iterations=0"},

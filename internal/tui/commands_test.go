@@ -22,8 +22,8 @@ func TestRegistryMatch(t *testing.T) {
 	if got := r.Match("/"); len(got) != len(r.All()) {
 		t.Fatalf("Match(%q) matched %d, want all %d", "/", len(got), len(r.All()))
 	}
-	if got := r.Match("/m"); len(got) != 1 || got[0].Name != "/model" {
-		t.Fatalf("Match(%q) = %v, want just /model", "/m", got)
+	if got := r.Match("/m"); len(got) != 2 || got[0].Name != "/model" || got[1].Name != "/mode" {
+		t.Fatalf("Match(%q) = %v, want /model then /mode", "/m", got)
 	}
 	if got := r.Match("hola"); got != nil {
 		t.Fatalf("Match(%q) = %v, want nil for non-command input", "hola", got)

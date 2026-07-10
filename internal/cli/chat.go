@@ -16,6 +16,8 @@ import (
 	"github.com/0xErwin1/agens/internal/auth"
 	"github.com/0xErwin1/agens/internal/config"
 	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/permission/permissiondb"
 )
 
 // loopBuilder resolves an agent.Options into a ready-to-run
@@ -31,6 +33,7 @@ func newChatCommand() *cobra.Command {
 func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 	var opts agent.Options
 	var allowAll bool
+	var modeFlag string
 
 	cmd := &cobra.Command{
 		Use:   "chat [prompt]",
@@ -45,6 +48,12 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 			if cmd.Flags().Changed("max-iterations") && opts.MaxIterations < 1 {
 				return errors.New("chat: --max-iterations must be >= 1")
 			}
+
+			mode, err := parseModeFlag(modeFlag)
+			if err != nil {
+				return fmt.Errorf("chat: %w", err)
+			}
+			opts.Mode = permission.NewModeState(mode)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
@@ -99,8 +108,24 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 	cmd.Flags().StringVar(&opts.SystemPrompt, "system", "", "override the configured system prompt")
 	cmd.Flags().IntVar(&opts.MaxIterations, "max-iterations", 0, "override the configured agent loop iteration limit")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
+	cmd.Flags().StringVar(&modeFlag, "mode", "edit", `starting operating mode: "edit" (default) or "chat" (blocks all writes and bash)`)
 
 	return cmd
+}
+
+// parseModeFlag resolves the --mode flag's value into a permission.Mode,
+// case-insensitively and trimmed. It is the CLI-flag counterpart of the TUI's
+// /mode command: unlike the command, a flag has no blank-toggle case, since
+// there is no live session yet to toggle relative to.
+func parseModeFlag(value string) (permission.Mode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "edit", "":
+		return permission.ModeEdit, nil
+	case "chat":
+		return permission.ModeChat, nil
+	default:
+		return 0, fmt.Errorf("--mode must be \"chat\" or \"edit\", got %q", value)
+	}
 }
 
 // resolvePrompt returns the prompt for one chat turn: the sole positional
@@ -126,6 +151,14 @@ func resolvePrompt(cmd *cobra.Command, args []string) (string, error) {
 
 // defaultBuildLoop is the production loopBuilder: it loads config and
 // credentials from disk before delegating to agent.BuildLoop.
+//
+// It also opens the project-scoped permissiondb.Store backing
+// opts.PermissionStore, so a one-shot chat run honors and can extend the same
+// persisted allow/deny-always grants an interactive session builds up. The
+// store is deliberately left open for the process's lifetime rather than
+// deferred-closed here: this function returns well before the loop actually
+// runs, and a one-shot command process exits shortly after RunE returns,
+// reclaiming the handle the same way sessiondb's already does.
 func defaultBuildLoop(opts agent.Options) (*agentloop.Loop, error) {
 	loaded, err := config.Load()
 	if err != nil {
@@ -140,6 +173,12 @@ func defaultBuildLoop(opts agent.Options) (*agentloop.Loop, error) {
 	if opts.ProjectRoot == "" {
 		opts.ProjectRoot = loaded.ProjectRoot
 	}
+
+	store, err := permissiondb.Open(permissiondb.DefaultPath(), opts.ProjectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("chat: open permissions: %w", err)
+	}
+	opts.PermissionStore = store
 
 	loop, err := agent.BuildLoop(loaded.Config, creds, opts)
 	if err != nil {

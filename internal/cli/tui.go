@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -16,6 +17,7 @@ import (
 	usercommand "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/config"
 	"github.com/0xErwin1/agens/internal/permission"
+	"github.com/0xErwin1/agens/internal/permission/permissiondb"
 	"github.com/0xErwin1/agens/internal/session/sessiondb"
 	"github.com/0xErwin1/agens/internal/tool/task"
 	"github.com/0xErwin1/agens/internal/tui"
@@ -41,6 +43,11 @@ type tuiSession struct {
 
 	collapseThinking   bool
 	truncateToolOutput bool
+
+	// permissionStore is the permissiondb.Store the session opened, kept open
+	// for the TUI program's lifetime and closed once it exits. nil only in
+	// tests that stub tuiLoopBuilder without opening a real store.
+	permissionStore io.Closer
 }
 
 // tuiLoopBuilder resolves an agent.Options into a tuiSession. It is the
@@ -61,11 +68,22 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 	var opts agent.Options
 	var allowAll bool
 	var resume bool
+	var modeFlag string
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		if cmd.Flags().Changed("max-iterations") && opts.MaxIterations < 1 {
 			return errors.New("tui: --max-iterations must be >= 1")
 		}
+
+		mode, err := parseModeFlag(modeFlag)
+		if err != nil {
+			return fmt.Errorf("tui: %w", err)
+		}
+		// modeState is shared with tui.Deps below, so the TUI's /mode command
+		// toggles the very same instance the running gate(s) read every
+		// Evaluate call — no loop rebuild needed for a live switch.
+		modeState := permission.NewModeState(mode)
+		opts.Mode = modeState
 
 		// The TUI owns the terminal, so it cannot use the tty-reading
 		// prompter the chat command does: an interactive decision is
@@ -84,6 +102,9 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 		if err != nil {
 			return err
 		}
+		if sess.permissionStore != nil {
+			defer func() { _ = sess.permissionStore.Close() }()
+		}
 
 		resumeID, openSessions := resolveResume(resume, args)
 
@@ -100,6 +121,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Files:              sess.files,
 			Project:            sess.project,
 			Agents:             sess.agents,
+			Mode:               modeState,
 			AgentWarnings:      sess.agentWarnings,
 			UserCommands:       sess.userCommands,
 			Subagents:          sess.subagents,
@@ -115,6 +137,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 	cmd.Flags().IntVar(&opts.MaxIterations, "max-iterations", 0, "override the configured agent loop iteration limit")
 	cmd.Flags().BoolVar(&allowAll, "dangerously-allow-all", false, "auto-approve every tool call without prompting (unsafe)")
 	cmd.Flags().BoolVar(&resume, "resume", false, "resume a saved conversation: pass a session id to open it, or omit the id to pick from the list")
+	cmd.Flags().StringVar(&modeFlag, "mode", "edit", `starting operating mode: "edit" (default) or "chat" (blocks all writes and bash)`)
 }
 
 // resolveResume maps the --resume flag and an optional positional session id to
@@ -146,6 +169,15 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 	if opts.ProjectRoot == "" {
 		opts.ProjectRoot = loaded.ProjectRoot
 	}
+
+	// The permission store persists allow/deny-always grants scoped to this
+	// project, surviving a restart; configureRootTUI closes it once the
+	// program exits.
+	permissionStore, err := permissiondb.Open(permissiondb.DefaultPath(), opts.ProjectRoot)
+	if err != nil {
+		return tuiSession{}, fmt.Errorf("tui: open permissions: %w", err)
+	}
+	opts.PermissionStore = permissionStore
 
 	// A shared subagent catalog lets the agents menu change what a delegation may
 	// pick in the current session: BuildLoop seeds it and the task tool reads it,
@@ -242,6 +274,7 @@ func defaultBuildTUI(opts agent.Options) (tuiSession, error) {
 		subagents:          catalog,
 		collapseThinking:   loaded.Config.UI.CollapseThinking,
 		truncateToolOutput: loaded.Config.UI.TruncateToolOutput,
+		permissionStore:    permissionStore,
 	}, nil
 }
 

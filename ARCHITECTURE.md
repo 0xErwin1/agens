@@ -55,8 +55,9 @@ internal/agentloop -> internal/message, internal/provider
 
 internal/agent -> internal/agentloop, internal/auth, internal/auth/chatgpt, internal/config, internal/permission, internal/prompt, internal/provider, internal/provider/openai, internal/provider/chatgpt, internal/tool, internal/tool/fs, internal/tool/bash, internal/tool/search, internal/tool/webfetch
 
-internal/cli -> internal/agent, internal/agentloop, internal/auth, internal/config, internal/message, internal/permission, golang.org/x/term
+internal/cli -> internal/agent, internal/agentloop, internal/auth, internal/config, internal/message, internal/permission, internal/permission/permissiondb, golang.org/x/term
              -> (ttyPrompter implements internal/permission.Prompter; it owns terminal I/O and never leaks into internal/agent or internal/tool/fs)
+             -> (internal/cli/{tui,chat}.go each open their own project-scoped permissiondb.Store — the persistent Options.PermissionStore backing the real binary)
 
 (future) internal/tui, internal/persistence -> internal/message
 ```
@@ -121,6 +122,25 @@ is routed only into its own `Project*` fields and never concatenated with the
 treat a global `deny` as absolute: a project `allow` can never reach, widen,
 or override it. Matcher syntax validation happens at composition time
 (`permission.ParseRule`), not during config load.
+
+## Chat and edit modes
+
+The Engine enforces a live-mutable operating `Mode` as a hard pre-check
+running before the ruleset and before the Prompter: `ModeEdit` (the default)
+is today's Allow/Ask/Deny behavior, unaffected. `ModeChat` blocks every call a
+`WriteClassifier` flags as a write — the native `write`, `edit`, and `bash`
+tools unconditionally (ALL bash is blocked in chat mode, a deliberate
+over-approximation versus "only mutating bash"; switch to edit mode to run a
+read-only bash command), plus any MCP tool that does not verifiably carry a
+`readOnlyHint` annotation. Mode gating can only tighten a decision, never
+loosen one: it cannot allow a call the ruleset already denies, and a Deny is
+never bypassed by any mode.
+
+Both the parent agent's gate and every subagent's gate share one
+`*permission.ModeState`, so a mode switch takes effect for delegations too,
+with no loop rebuild. The TUI's `/mode [chat|edit]` command (blank toggles
+between the two) flips it live; `--mode` (default `edit`) on both `agens` and
+`agens chat` sets the starting mode. Mode is not persisted across sessions.
 
 ## Persistent permission grants (permissiondb)
 

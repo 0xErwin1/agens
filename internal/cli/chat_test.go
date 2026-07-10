@@ -225,6 +225,73 @@ func TestChatCommand_FlagsReachBuilderOptions(t *testing.T) {
 	}
 }
 
+func TestChatCommand_ModeFlagDefaultsToEdit(t *testing.T) {
+	var received agent.Options
+	build := func(opts agent.Options) (*agentloop.Loop, error) {
+		received = opts
+		return agentloop.New(&chatFakeProvider{steps: textDeltaSteps("ok")}, nil, agentloop.WithModel("gpt-test")), nil
+	}
+
+	cmd := newChatCommandWithBuilder(build)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"hi"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if received.Mode == nil {
+		t.Fatal("Options.Mode = nil, want a ModeState wired even without --mode")
+	}
+	if got := received.Mode.Get(); got != permission.ModeEdit {
+		t.Fatalf("Options.Mode.Get() = %v, want ModeEdit by default", got)
+	}
+}
+
+func TestChatCommand_ModeFlagSetsChatMode(t *testing.T) {
+	var received agent.Options
+	build := func(opts agent.Options) (*agentloop.Loop, error) {
+		received = opts
+		return agentloop.New(&chatFakeProvider{steps: textDeltaSteps("ok")}, nil, agentloop.WithModel("gpt-test")), nil
+	}
+
+	cmd := newChatCommandWithBuilder(build)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"--mode", "chat", "hi"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if got := received.Mode.Get(); got != permission.ModeChat {
+		t.Fatalf("Options.Mode.Get() = %v, want ModeChat", got)
+	}
+}
+
+func TestChatCommand_RejectsInvalidModeFlag(t *testing.T) {
+	builderCalled := false
+	build := func(agent.Options) (*agentloop.Loop, error) {
+		builderCalled = true
+		return agentloop.New(&chatFakeProvider{steps: textDeltaSteps("ok")}, nil, agentloop.WithModel("gpt-test")), nil
+	}
+
+	cmd := newChatCommandWithBuilder(build)
+	cmd.SetOut(new(bytes.Buffer))
+	cmd.SetErr(new(bytes.Buffer))
+	cmd.SetArgs([]string{"--mode", "bogus", "hi"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil, want an invalid --mode error")
+	}
+	if !strings.Contains(err.Error(), "--mode") {
+		t.Fatalf("Execute() error = %q, want it to mention --mode", err.Error())
+	}
+	if builderCalled {
+		t.Fatal("builder was called, want validation to reject before building the loop")
+	}
+}
+
 func TestChatCommand_RejectsInvalidMaxIterationsFlag(t *testing.T) {
 	for _, args := range [][]string{
 		{"--max-iterations=0", "hi"},
