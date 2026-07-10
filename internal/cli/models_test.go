@@ -62,6 +62,51 @@ func TestModelsCommand_PrintsTableWithContextWindow(t *testing.T) {
 	}
 }
 
+func TestModelsCommand_PrintsTableWithPriceColumn(t *testing.T) {
+	inCost := 0.15
+	outCost := 0.6
+	fake := &modelsFakeProvider{
+		models: []provider.ModelInfo{
+			{ID: "gpt-4o-mini", DisplayName: "GPT-4o mini", ContextWindow: 128000, InputCostPerMTok: &inCost, OutputCostPerMTok: &outCost},
+			{ID: "custom-model", DisplayName: "Custom Model"},
+		},
+	}
+	build := func(agent.Options) (provider.Provider, error) { return fake, nil }
+
+	cmd := newModelsCommandWithBuilder(build)
+	out := new(bytes.Buffer)
+	cmd.SetOut(out)
+	cmd.SetErr(new(bytes.Buffer))
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+
+	got := out.String()
+	if !strings.Contains(got, "PRICE") {
+		t.Fatalf("stdout = %q, want a PRICE column header", got)
+	}
+	if !strings.Contains(got, "$0.15/$0.60") {
+		t.Fatalf("stdout = %q, want the formatted price for gpt-4o-mini", got)
+	}
+
+	var customLine string
+	for _, line := range strings.Split(strings.TrimRight(got, "\n"), "\n") {
+		if strings.Contains(line, "custom-model") {
+			customLine = line
+		}
+	}
+	if customLine == "" {
+		t.Fatalf("stdout = %q, want a row for custom-model", got)
+	}
+	if strings.Contains(customLine, "$0.00") || strings.Contains(customLine, "$0") {
+		t.Fatalf("row for custom-model = %q, want no $0 price rendered for nil pricing", customLine)
+	}
+	if !strings.HasSuffix(strings.TrimRight(customLine, " "), "-") {
+		t.Fatalf("row for custom-model = %q, want it to end in the %q placeholder for nil pricing", customLine, "-")
+	}
+}
+
 func TestModelsCommand_EmptyListPrintsNoModelsAvailable(t *testing.T) {
 	fake := &modelsFakeProvider{models: nil}
 	build := func(agent.Options) (provider.Provider, error) { return fake, nil }

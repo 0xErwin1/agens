@@ -134,6 +134,27 @@ func TestModel_ModelSelectorShowsLoadError(t *testing.T) {
 	}
 }
 
+func TestModelRows_ShowsPriceSuffixForKnownPricingAndHidesItForNil(t *testing.T) {
+	inCost := 0.15
+	outCost := 0.6
+	items := []provider.ModelInfo{
+		{ID: "gpt-4o-mini", InputCostPerMTok: &inCost, OutputCostPerMTok: &outCost},
+		{ID: "custom-model"},
+	}
+
+	rows := modelRows(items, 0, "", CurrentTheme(), 80)
+	if len(rows) != 2 {
+		t.Fatalf("modelRows returned %d rows, want 2", len(rows))
+	}
+
+	if got := stripANSI(rows[0]); !strings.Contains(got, "$0.15/$0.60") {
+		t.Fatalf("row[0] = %q, want the formatted price for gpt-4o-mini", got)
+	}
+	if got := stripANSI(rows[1]); strings.Contains(got, "$0.00") || strings.Contains(got, "$0") {
+		t.Fatalf("row[1] = %q, want no $0 price rendered for nil pricing", got)
+	}
+}
+
 func TestWindowStart(t *testing.T) {
 	cases := []struct{ selected, total, size, want int }{
 		{0, 3, 8, 0},
