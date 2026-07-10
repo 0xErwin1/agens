@@ -111,32 +111,12 @@ func answerForModalKey(msg tea.KeyMsg) (permission.Answer, bool) {
 	}
 }
 
-// permissionArgs is the best-effort shape used to pull a human-readable detail
-// out of a tool call's input: the shell command, the file path, or the URL,
-// whichever is present.
-type permissionArgs struct {
-	Command string `json:"command"`
-	Path    string `json:"path"`
-	URL     string `json:"url"`
-}
-
 // permissionDetail returns a short one-line description of what the tool call
-// will act on, or the empty string when the input carries nothing worth
-// showing.
+// will act on — the same semantic projection (command, path, or url) an
+// argument-scoped permission rule is matched against — or the empty string
+// when the input carries nothing worth showing.
 func permissionDetail(input json.RawMessage) string {
-	var a permissionArgs
-	if err := json.Unmarshal(input, &a); err == nil {
-		switch {
-		case a.Command != "":
-			return a.Command
-		case a.Path != "":
-			return a.Path
-		case a.URL != "":
-			return a.URL
-		}
-	}
-
-	raw := strings.TrimSpace(string(input))
+	raw := strings.TrimSpace(permission.ProjectField(input))
 	if raw == "" || raw == "{}" || raw == "null" {
 		return ""
 	}
