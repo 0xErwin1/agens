@@ -113,7 +113,12 @@ literal `/`. A pattern meant to block a whole subtree needs `**` written as
 its own path segment (for example `command/**`), not a bare `*` — a matcher
 like `bash(rm -rf *)` only matches a slash-free command and would NOT block
 `rm -rf /` or `rm -rf some/dir`; do not author a deny rule assuming a single
-`*` bridges directories.
+`*` bridges directories. To actually deny `rm -rf` against any path, anchor
+`**` at the segment boundary right after the command, for example
+`bash(rm -rf /**)` — verified to match both `rm -rf /` and
+`rm -rf /some/dir`, unlike the trailing-`*` form above; a bare `**` with no
+leading `/` (`bash(rm -rf **)`) does NOT match either, since it never aligns
+to a path-segment boundary.
 
 `internal/config` keeps global and project permissions in separate buckets
 (`Permissions.{Global,Project}{Allow,Deny}`); a project `[permissions]` patch
