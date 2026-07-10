@@ -38,6 +38,11 @@ type CommandContext interface {
 	// OpenAgentPicker opens the primary-agent picker used to switch the active
 	// agent.
 	OpenAgentPicker() tea.Cmd
+	// ToggleMode sets or toggles the live chat/edit operating mode: arg is
+	// "chat", "edit", or "" to flip between the two. It returns a note (and
+	// leaves the mode unchanged) when either no ModeState is wired or arg
+	// names neither mode.
+	ToggleMode(arg string) tea.Cmd
 	// ToggleMouse flips mouse reporting so the user can select/copy text from the
 	// conversation (mouse off) or scroll with the wheel (mouse on).
 	ToggleMouse() tea.Cmd
@@ -185,6 +190,9 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/agents", Desc: "define each subagent's available models", Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.OpenAgentMenu()
+		}},
+		Command{Name: "/mode", Desc: "toggle chat/edit mode: [chat|edit], blank to flip", Run: func(ctx CommandContext, input string) tea.Cmd {
+			return ctx.ToggleMode(commandArguments(input))
 		}},
 		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.ToggleMouse()

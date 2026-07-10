@@ -23,6 +23,7 @@ const statusHints = "enter send · ctrl+c quit"
 type Status struct {
 	model    string
 	agent    string
+	mode     string
 	state    string
 	effort   string
 	spinner  string
@@ -49,6 +50,11 @@ func (s *Status) SetModel(model string) { s.model = model }
 // SetAgent sets the active-agent segment shown after the model; empty (or the
 // default agent) hides it, since the default persona is the baseline.
 func (s *Status) SetAgent(agent string) { s.agent = agent }
+
+// SetMode sets the operating-mode segment ("chat" while writes are blocked);
+// empty hides it, since edit — the unrestricted default — is not worth a
+// segment of its own.
+func (s *Status) SetMode(mode string) { s.mode = mode }
 
 // SetEffort sets the reasoning-effort segment; empty hides it.
 func (s *Status) SetEffort(effort string) { s.effort = effort }
@@ -91,6 +97,9 @@ func (s *Status) View() string {
 	}
 	if s.effort != "" {
 		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Muted()).Render(s.effort)
+	}
+	if s.mode != "" {
+		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Error()).Bold(true).Render(s.mode)
 	}
 	left += statusSeparator + state
 	if s.duration != "" {

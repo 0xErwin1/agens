@@ -16,6 +16,7 @@ import (
 	"github.com/0xErwin1/agens/internal/agentloop"
 	usercommand "github.com/0xErwin1/agens/internal/command"
 	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/permission"
 	"github.com/0xErwin1/agens/internal/provider"
 	"github.com/0xErwin1/agens/internal/session"
 	"github.com/0xErwin1/agens/internal/tool/task"
@@ -187,6 +188,11 @@ type Model struct {
 	agentPickerOpen  bool
 	agentPickerIdx   int
 
+	// modeState is the live-mutable chat/edit mode shared with the running
+	// loop's gate(s); nil disables /mode (the loop was built with a fixed
+	// mode and has no live toggle to reach).
+	modeState *permission.ModeState
+
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
 	// @-picker's state while it is open.
@@ -245,6 +251,9 @@ type Deps struct {
 	// Agents are the agent definitions the /agents menu presents and edits; nil
 	// disables the menu.
 	Agents *agentdef.Set
+	// Mode is the live-mutable chat/edit mode shared with the running loop's
+	// gate(s); nil disables /mode, since there is nothing live to toggle.
+	Mode *permission.ModeState
 	// AgentWarnings are human-readable notes about startup files that were skipped
 	// (malformed or unreadable); they are shown once so skipped files are visible.
 	AgentWarnings []string
@@ -306,6 +315,7 @@ func New(deps Deps) *Model {
 		files:               deps.Files,
 		project:             deps.Project,
 		agents:              deps.Agents,
+		modeState:           deps.Mode,
 		subagents:           deps.Subagents,
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
@@ -316,6 +326,9 @@ func New(deps Deps) *Model {
 	}
 	m.messages.SetDisplayOptions(m.collapseThinking, m.truncateToolOutput)
 	m.messages.SetClock(m.now)
+	if m.modeState != nil {
+		m.status.SetMode(modeStatusLabel(m.modeState.Get()))
+	}
 	registerUserCommands(m.commands, deps.UserCommands)
 
 	// Surface any skipped agent-definition files once, as startup notes, so a
