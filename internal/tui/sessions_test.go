@@ -24,7 +24,7 @@ func (f *fakeSessionStore) Save(s session.Session) error {
 	return nil
 }
 
-func (f *fakeSessionStore) List() ([]session.Session, error) {
+func (f *fakeSessionStore) ListMeta() ([]session.Session, error) {
 	return f.list, f.listErr
 }
 
