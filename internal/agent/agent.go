@@ -20,6 +20,7 @@ import (
 	"github.com/0xErwin1/agens/internal/config"
 	"github.com/0xErwin1/agens/internal/mcpclient"
 	"github.com/0xErwin1/agens/internal/message"
+	"github.com/0xErwin1/agens/internal/modelregistry"
 	"github.com/0xErwin1/agens/internal/permission"
 	"github.com/0xErwin1/agens/internal/prompt"
 	"github.com/0xErwin1/agens/internal/provider"
@@ -527,7 +528,11 @@ func BuildProvider(cfg config.Config, creds auth.File, opts Options) (provider.P
 		return nil, errors.New("agent: no model configured")
 	}
 
-	return buildProvider(providerID, cfg, creds, model)
+	p, err := buildProvider(providerID, cfg, creds, model)
+	if err != nil {
+		return nil, err
+	}
+	return modelregistry.Enrich(p), nil
 }
 
 // ResolveModel returns the effective model name BuildLoop would run for cfg,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -513,6 +514,19 @@ func TestBuildProvider_ChatGPTOnlyCreds_Success(t *testing.T) {
 	}
 	if p.ID() != chatgptProviderID {
 		t.Fatalf("BuildProvider().ID() = %q, want %q", p.ID(), chatgptProviderID)
+	}
+}
+
+func TestBuildProvider_WrapsWithModelRegistryEnrichment(t *testing.T) {
+	p, err := BuildProvider(validConfig(), validCreds(), validOptions(t))
+	if err != nil {
+		t.Fatalf("BuildProvider() error = %v, want nil", err)
+	}
+	if got := fmt.Sprintf("%T", p); !strings.Contains(got, "modelregistry") {
+		t.Fatalf("BuildProvider() returned %T, want a modelregistry-enriched provider", p)
+	}
+	if p.ID() != defaultProviderID {
+		t.Fatalf("BuildProvider().ID() = %q, want %q (the decorator must pass ID() through unchanged)", p.ID(), defaultProviderID)
 	}
 }
 
