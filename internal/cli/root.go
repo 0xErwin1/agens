@@ -30,5 +30,6 @@ func newRootCommand(build tuiLoopBuilder, run tuiRunner) *cobra.Command {
 	cmd.AddCommand(newConfigCommand())
 	cmd.AddCommand(newChatCommand())
 	cmd.AddCommand(newModelsCommand())
+	cmd.AddCommand(newSessionsCommand())
 	return cmd
 }
