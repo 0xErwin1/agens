@@ -130,6 +130,47 @@ func (s *Store) List() ([]session.Session, error) {
 	return sessions, nil
 }
 
+// ListMeta returns saved sessions' metadata (id, title, project, agent,
+// updated_at) ordered by most recent save first, without loading or decoding
+// any messages. Use Load to hydrate a single session's full history.
+func (s *Store) ListMeta() ([]session.Session, error) {
+	if err := s.ensureReady(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.q.ListSessions(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("sessiondb: list sessions: %w", err)
+	}
+
+	sessions := make([]session.Session, 0, len(rows))
+	for _, row := range rows {
+		sess, err := sessionMetaFromRow(row)
+		if err != nil {
+			continue
+		}
+		sessions = append(sessions, sess)
+	}
+	return sessions, nil
+}
+
+// Delete removes the session with id and, via the messages table's FK
+// CASCADE, its messages. Deleting a nonexistent id is a no-op: sqlc's :exec
+// affecting zero rows still returns nil, so callers get idempotent deletes.
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.ensureReady(); err != nil {
+		return err
+	}
+
+	if err := s.q.DeleteSession(context.Background(), id); err != nil {
+		return fmt.Errorf("sessiondb: delete %q: %w", id, err)
+	}
+	return nil
+}
+
 // Load reads the session with id.
 func (s *Store) Load(id string) (session.Session, error) {
 	if err := s.ensureReady(); err != nil {
@@ -173,21 +214,29 @@ func (s *Store) ensureReady() error {
 }
 
 func (s *Store) sessionFromRow(row dbgen.Session) (session.Session, error) {
-	updated, err := parseTime(row.UpdatedAt)
+	sess, err := sessionMetaFromRow(row)
 	if err != nil {
-		return session.Session{}, fmt.Errorf("decode updated_at: %w", err)
+		return session.Session{}, err
 	}
 	messages, err := s.loadMessages(row.ID)
 	if err != nil {
 		return session.Session{}, err
 	}
+	sess.Messages = messages
+	return sess, nil
+}
+
+func sessionMetaFromRow(row dbgen.Session) (session.Session, error) {
+	updated, err := parseTime(row.UpdatedAt)
+	if err != nil {
+		return session.Session{}, fmt.Errorf("decode updated_at: %w", err)
+	}
 	return session.Session{
-		ID:       row.ID,
-		Title:    row.Title,
-		Project:  row.Project,
-		Agent:    row.Agent,
-		Updated:  updated,
-		Messages: messages,
+		ID:      row.ID,
+		Title:   row.Title,
+		Project: row.Project,
+		Agent:   row.Agent,
+		Updated: updated,
 	}, nil
 }
 
