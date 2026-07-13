@@ -1371,6 +1371,58 @@ func TestBuildGate_NilModeDefaultsToEditBehavior(t *testing.T) {
 	}
 }
 
+func TestBuildGates_SharesBypassStateBetweenParentAndSubagent(t *testing.T) {
+	dir := t.TempDir()
+	bypass := permission.NewBypassState(false)
+	opts := Options{
+		ProjectRoot: dir,
+		Bypass:      bypass,
+	}
+
+	runner := &fakeSubRunner{}
+	catalog := task.NewCatalog(subagentOptions(loadTestDefs(t)))
+	parentGate, subGate, err := buildGates(opts, func(*permission.Gate) (*permission.Gate, error) {
+		return buildParentGate(opts, runner, catalog, nil)
+	})
+	if err != nil {
+		t.Fatalf("buildGates() error = %v, want nil", err)
+	}
+
+	parentCall := message.ToolUsePart{ID: "parent", Name: "write", Input: json.RawMessage(`{"path":"parent.txt","content":"parent"}`)}
+	parentResult, err := parentGate.Run(context.Background(), parentCall)
+	if err != nil {
+		t.Fatalf("parentGate.Run() error = %v, want nil", err)
+	}
+	if !parentResult.IsError {
+		t.Fatal("parentGate.Run() succeeded while bypass is off, want its Ask call denied by the normal Prompter")
+	}
+
+	bypass.Set(true)
+
+	parentResult, err = parentGate.Run(context.Background(), parentCall)
+	if err != nil {
+		t.Fatalf("parentGate.Run() error = %v, want nil", err)
+	}
+	if parentResult.IsError {
+		t.Fatalf("parentGate.Run() result = %+v, want enabled bypass to execute its Ask call", parentResult)
+	}
+
+	subCall := message.ToolUsePart{ID: "subagent", Name: "write", Input: json.RawMessage(`{"path":"subagent.txt","content":"subagent"}`)}
+	subResult, err := subGate.Run(context.Background(), subCall)
+	if err != nil {
+		t.Fatalf("subGate.Run() error = %v, want nil", err)
+	}
+	if subResult.IsError {
+		t.Fatalf("subGate.Run() result = %+v, want the shared enabled bypass to execute its Ask call", subResult)
+	}
+
+	for _, file := range []string{"parent.txt", "subagent.txt"} {
+		if _, err := os.Stat(filepath.Join(dir, file)); err != nil {
+			t.Fatalf("Stat(%q) error = %v, want each gate to execute its write", file, err)
+		}
+	}
+}
+
 // fakeMCPToolWithReadOnly wraps fakeMCPTool with a ReadOnly method so a
 // chat-mode write-classification test can exercise a non-*mcpclient.Tool that
 // still satisfies an (unexported) read-only-hint duck type. It intentionally

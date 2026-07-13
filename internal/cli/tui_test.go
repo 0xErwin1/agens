@@ -158,7 +158,7 @@ func TestTUICommand_RejectsInvalidMaxIterationsFlag(t *testing.T) {
 	}
 }
 
-func TestTUICommand_DangerouslyAllowAllSelectsAllowPrompter(t *testing.T) {
+func TestTUICommand_DangerouslyAllowAllInitializesBypassAndRetainsModalPrompter(t *testing.T) {
 	var received agent.Options
 	build := func(opts agent.Options) (tuiSession, error) {
 		received = opts
@@ -175,8 +175,14 @@ func TestTUICommand_DangerouslyAllowAllSelectsAllowPrompter(t *testing.T) {
 		t.Fatalf("Execute() error = %v, want nil", err)
 	}
 
-	if _, ok := received.Prompter.(permission.AllowPrompter); !ok {
-		t.Fatalf("Options.Prompter = %T, want permission.AllowPrompter", received.Prompter)
+	if received.Bypass == nil || !received.Bypass.Enabled() {
+		t.Fatal("Options.Bypass is not enabled before build, want startup bypass active")
+	}
+	if received.Prompter == nil {
+		t.Fatal("Options.Prompter = nil, want the normal TUI modal Prompter installed")
+	}
+	if _, ok := received.Prompter.(permission.AllowPrompter); ok {
+		t.Fatalf("Options.Prompter = %T, want the normal TUI modal Prompter while bypass owns Ask-only approval", received.Prompter)
 	}
 }
 
@@ -199,6 +205,9 @@ func TestTUICommand_DefaultPrompterIsNotAllowPrompter(t *testing.T) {
 
 	if _, ok := received.Prompter.(permission.AllowPrompter); ok {
 		t.Fatal("Options.Prompter = permission.AllowPrompter, want it unset without --dangerously-allow-all")
+	}
+	if received.Bypass == nil || received.Bypass.Enabled() {
+		t.Fatal("Options.Bypass is not disabled, want a fresh default TUI session to start with bypass off")
 	}
 }
 

@@ -345,25 +345,41 @@ func TestChatCommand_BuilderErrorPropagatesWithoutLeakingKey(t *testing.T) {
 	}
 }
 
-func TestChatCommand_DangerouslyAllowAllFlagSelectsAllowPrompter(t *testing.T) {
-	fakeProvider := &chatFakeProvider{steps: textDeltaSteps("ok")}
-	var received agent.Options
-	build := func(opts agent.Options) (*agentloop.Loop, error) {
-		received = opts
-		return agentloop.New(fakeProvider, nil, agentloop.WithModel("gpt-test")), nil
+func TestChatCommand_DangerouslyAllowAllInitializesIndependentBypassState(t *testing.T) {
+	var flagged, defaulted agent.Options
+
+	run := func(args []string, received *agent.Options) {
+		t.Helper()
+		cmd := newChatCommandWithBuilder(func(opts agent.Options) (*agentloop.Loop, error) {
+			*received = opts
+			return agentloop.New(&chatFakeProvider{steps: textDeltaSteps("ok")}, nil, agentloop.WithModel("gpt-test")), nil
+		})
+		cmd.SetOut(new(bytes.Buffer))
+		cmd.SetErr(new(bytes.Buffer))
+		cmd.SetArgs(args)
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("Execute() error = %v, want nil", err)
+		}
 	}
 
-	cmd := newChatCommandWithBuilder(build)
-	cmd.SetOut(new(bytes.Buffer))
-	cmd.SetErr(new(bytes.Buffer))
-	cmd.SetArgs([]string{"--dangerously-allow-all", "hi"})
+	run([]string{"--dangerously-allow-all", "hi"}, &flagged)
+	run([]string{"hi"}, &defaulted)
 
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v, want nil", err)
+	if flagged.Bypass == nil || !flagged.Bypass.Enabled() {
+		t.Fatal("flagged Options.Bypass is not enabled before build, want startup bypass active")
 	}
-
-	if _, ok := received.Prompter.(permission.AllowPrompter); !ok {
-		t.Fatalf("Options.Prompter = %T, want permission.AllowPrompter when --dangerously-allow-all is set", received.Prompter)
+	if defaulted.Bypass == nil || defaulted.Bypass.Enabled() {
+		t.Fatal("default Options.Bypass is not disabled, want a fresh command invocation to reset bypass")
+	}
+	if flagged.Bypass == defaulted.Bypass {
+		t.Fatal("flagged and default commands share a BypassState, want independent process-local state")
+	}
+	if _, ok := flagged.Prompter.(permission.AllowPrompter); ok {
+		t.Fatalf("Options.Prompter = %T, want the normal chat Prompter while bypass owns Ask-only approval", flagged.Prompter)
+	}
+	if cmd := newChatCommand(); cmd.Flags().Lookup("bypass") != nil || len(cmd.Commands()) != 0 {
+		t.Fatal("chat exposes a live bypass command or flag, want startup --dangerously-allow-all only")
 	}
 }
 

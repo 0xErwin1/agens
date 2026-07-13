@@ -254,6 +254,10 @@ type Deps struct {
 	// Mode is the live-mutable chat/edit mode shared with the running loop's
 	// gate(s); nil disables /mode, since there is nothing live to toggle.
 	Mode *permission.ModeState
+	// Bypass is the live-mutable Ask-only permission state shared with the
+	// running loop's gates. It is wired at startup; command behavior is added
+	// separately.
+	Bypass *permission.BypassState
 	// AgentWarnings are human-readable notes about startup files that were skipped
 	// (malformed or unreadable); they are shown once so skipped files are visible.
 	AgentWarnings []string

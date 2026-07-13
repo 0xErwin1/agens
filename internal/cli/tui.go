@@ -84,19 +84,16 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 		// Evaluate call — no loop rebuild needed for a live switch.
 		modeState := permission.NewModeState(mode)
 		opts.Mode = modeState
+		bypassState := permission.NewBypassState(allowAll)
+		opts.Bypass = bypassState
 
 		// The TUI owns the terminal, so it cannot use the tty-reading
 		// prompter the chat command does: an interactive decision is
-		// routed through the Bubble Tea event loop as a modal instead.
-		// --dangerously-allow-all keeps its non-interactive AllowPrompter
-		// and installs no modal.
-		var prompter *tui.Prompter
-		if allowAll {
-			opts.Prompter = permission.AllowPrompter{}
-		} else {
-			prompter = tui.NewPrompter()
-			opts.Prompter = prompter
-		}
+		// routed through the Bubble Tea event loop as a modal instead. The
+		// normal modal remains installed so disabling bypass can restore Ask
+		// prompting without rebuilding the loop.
+		prompter := tui.NewPrompter()
+		opts.Prompter = prompter
 
 		sess, err := build(opts)
 		if err != nil {
@@ -122,6 +119,7 @@ func configureRootTUI(cmd *cobra.Command, build tuiLoopBuilder, run tuiRunner) {
 			Project:            sess.project,
 			Agents:             sess.agents,
 			Mode:               modeState,
+			Bypass:             bypassState,
 			AgentWarnings:      sess.agentWarnings,
 			UserCommands:       sess.userCommands,
 			Subagents:          sess.subagents,

@@ -82,6 +82,10 @@ type Options struct {
 	// unaffected by the chat-mode hard pre-check.
 	Mode *permission.ModeState
 
+	// Bypass shares one live-mutable Ask-only permission bypass across the
+	// parent gate and every subagent gate. A nil value leaves bypass disabled.
+	Bypass *permission.BypassState
+
 	// Subagents, when non-nil, is the shared catalog of selectable subagents the
 	// task tool reads. BuildLoop populates it from the discovered definitions, so
 	// a surface holding the same catalog (the TUI's agents menu) can change the
@@ -179,38 +183,6 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	toolOpts.mcpServers = cfg.MCP
 	toolOpts.Permissions = cfg.Permissions
 
-	// The subagent gate (base toolset, no task) depends on neither the delegated
-	// agent nor the model, so it is built once and shared across delegations,
-	// which run one at a time. Building it per delegation would leak an os.Root
-	// file descriptor each time, since the confinement root has no Close.
-	subGate, err := buildGate(toolOpts)
-	if err != nil {
-		return nil, err
-	}
-
-	buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
-		// A subagent has no skill tool, so its prompt must not advertise skills;
-		// withSystemPrompt carries the parent's opts, which may hold a skill set.
-		subPromptOpts := withSystemPrompt(opts, def.Prompt)
-		subPromptOpts.Skills = nil
-
-		subPrompt, err := BuildSystemPrompt(cfg, subPromptOpts, subModel)
-		if err != nil {
-			return nil, err
-		}
-
-		subOpts := []agentloop.Option{
-			agentloop.WithModel(subModel),
-			agentloop.WithSystemPrompt(subagentSystemPrompt(subPrompt)),
-			agentloop.WithParallelToolCalls(cfg.Agent.ParallelToolCalls),
-		}
-		if maxIterations > 0 {
-			subOpts = append(subOpts, agentloop.WithMaxIterations(maxIterations))
-		}
-
-		return agentloop.New(p, subGate, subOpts...), nil
-	}
-
 	// The task tool reads its selectable subagents from a shared catalog: an
 	// opts-provided one (so a surface can edit it live) or a private one. Either
 	// way it is (re)seeded from the discovered definitions.
@@ -220,9 +192,33 @@ func BuildLoop(cfg config.Config, creds auth.File, opts Options) (*agentloop.Loo
 	}
 	catalog.Replace(subagentOptions(defs))
 
-	runner := newSubagentRunner(buildSub, defs, catalog, model)
+	parentGate, _, err := buildGates(toolOpts, func(subGate *permission.Gate) (*permission.Gate, error) {
+		buildSub := func(def agentdef.Definition, subModel string) (loopRunner, error) {
+			// A subagent has no skill tool, so its prompt must not advertise skills;
+			// withSystemPrompt carries the parent's opts, which may hold a skill set.
+			subPromptOpts := withSystemPrompt(opts, def.Prompt)
+			subPromptOpts.Skills = nil
 
-	parentGate, err := buildParentGate(toolOpts, runner, catalog, skills)
+			subPrompt, err := BuildSystemPrompt(cfg, subPromptOpts, subModel)
+			if err != nil {
+				return nil, err
+			}
+
+			subOpts := []agentloop.Option{
+				agentloop.WithModel(subModel),
+				agentloop.WithSystemPrompt(subagentSystemPrompt(subPrompt)),
+				agentloop.WithParallelToolCalls(cfg.Agent.ParallelToolCalls),
+			}
+			if maxIterations > 0 {
+				subOpts = append(subOpts, agentloop.WithMaxIterations(maxIterations))
+			}
+
+			return agentloop.New(p, subGate, subOpts...), nil
+		}
+
+		runner := newSubagentRunner(buildSub, defs, catalog, model)
+		return buildParentGate(toolOpts, runner, catalog, skills)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -666,6 +662,26 @@ func buildGate(opts Options) (*permission.Gate, error) {
 	return assembleGate(reg, rules, writeNames, opts)
 }
 
+// buildGates constructs the subagent gate first, then the parent gate that
+// delegates through it. Both receive the same copied Options instance.
+func buildGates(opts Options, buildParent func(*permission.Gate) (*permission.Gate, error)) (*permission.Gate, *permission.Gate, error) {
+	// The subagent gate (base toolset, no task) depends on neither the delegated
+	// agent nor the model, so it is built once and shared across delegations,
+	// which run one at a time. Building it per delegation would leak an os.Root
+	// file descriptor each time, since the confinement root has no Close.
+	subGate, err := buildGate(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	parentGate, err := buildParent(subGate)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return parentGate, subGate, nil
+}
+
 // baseToolset builds the registry of tools shared by the main agent and its
 // subagents — read/write/edit, bash, grep/glob, and webfetch — confined to
 // opts.ProjectRoot (or the working directory when empty), together with the
@@ -808,7 +824,12 @@ func assembleGate(reg *tool.Registry, rules []permission.Rule, writeNames map[st
 		prompter = permission.DenyPrompter{}
 	}
 
-	return permission.NewGate(reg, engine, prompter), nil
+	var bypass func() bool
+	if opts.Bypass != nil {
+		bypass = opts.Bypass.Enabled
+	}
+
+	return permission.NewGate(reg, engine, prompter, permission.WithBypass(bypass)), nil
 }
 
 // configPermissionRules appends perms' GlobalAllow, ProjectAllow, and

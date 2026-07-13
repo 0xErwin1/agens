@@ -54,11 +54,12 @@ func newChatCommandWithBuilder(build loopBuilder) *cobra.Command {
 				return fmt.Errorf("chat: %w", err)
 			}
 			opts.Mode = permission.NewModeState(mode)
+			opts.Bypass = permission.NewBypassState(allowAll)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 
-			opts.Prompter = selectPrompter(allowAll)
+			opts.Prompter = selectPrompter(false)
 
 			// Surface any skipped agent-definition or skill files to stderr so a
 			// malformed file is visible rather than silently dropped; neither blocks
