@@ -24,6 +24,7 @@ type Status struct {
 	model    string
 	agent    string
 	mode     string
+	bypass   bool
 	state    string
 	effort   string
 	spinner  string
@@ -55,6 +56,10 @@ func (s *Status) SetAgent(agent string) { s.agent = agent }
 // empty hides it, since edit — the unrestricted default — is not worth a
 // segment of its own.
 func (s *Status) SetMode(mode string) { s.mode = mode }
+
+// SetBypass controls the prominent warning shown while Ask permission prompts
+// are bypassed for the current session.
+func (s *Status) SetBypass(enabled bool) { s.bypass = enabled }
 
 // SetEffort sets the reasoning-effort segment; empty hides it.
 func (s *Status) SetEffort(effort string) { s.effort = effort }
@@ -100,6 +105,9 @@ func (s *Status) View() string {
 	}
 	if s.mode != "" {
 		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Error()).Bold(true).Render(s.mode)
+	}
+	if s.bypass {
+		left += statusSeparator + lipgloss.NewStyle().Foreground(theme.Error()).Bold(true).Render("BYPASS")
 	}
 	left += statusSeparator + state
 	if s.duration != "" {

@@ -103,10 +103,8 @@ type Model struct {
 	events    <-chan tea.Msg
 	cancel    context.CancelFunc
 
-	// prompter routes tool-permission decisions into this event loop; it is
-	// nil when the caller pre-approved every call (--dangerously-allow-all),
-	// in which case no modal is ever shown. pending holds the request whose
-	// modal is currently on screen, or nil when none is.
+	// prompter routes Ask decisions into this event loop. pending holds the
+	// request whose modal is currently on screen, or nil when none is.
 	prompter *Prompter
 	pending  *PermissionRequest
 
@@ -192,6 +190,9 @@ type Model struct {
 	// loop's gate(s); nil disables /mode (the loop was built with a fixed
 	// mode and has no live toggle to reach).
 	modeState *permission.ModeState
+	// bypassState is the live-mutable Ask-only bypass shared with the running
+	// loop's gate(s); nil disables /bypass because no shared state was wired.
+	bypassState *permission.BypassState
 
 	// files provides the project files for @-references (nil disables them);
 	// fileCache is the list loaded once at startup. The picker fields hold the
@@ -320,6 +321,7 @@ func New(deps Deps) *Model {
 		project:             deps.Project,
 		agents:              deps.Agents,
 		modeState:           deps.Mode,
+		bypassState:         deps.Bypass,
 		subagents:           deps.Subagents,
 		resumeID:            deps.ResumeID,
 		openSessionsOnStart: deps.OpenSessions,
@@ -332,6 +334,9 @@ func New(deps Deps) *Model {
 	m.messages.SetClock(m.now)
 	if m.modeState != nil {
 		m.status.SetMode(modeStatusLabel(m.modeState.Get()))
+	}
+	if m.bypassState != nil {
+		m.status.SetBypass(m.bypassState.Enabled())
 	}
 	registerUserCommands(m.commands, deps.UserCommands)
 
@@ -1206,6 +1211,36 @@ func (m *Model) closeSessionPicker() {
 
 // Notify implements CommandContext: it appends a system note to the view.
 func (m *Model) Notify(text string) { m.messages.AddInfo(text) }
+
+// SetBypass implements CommandContext by changing the shared Ask-only bypass
+// while the session is idle.
+func (m *Model) SetBypass(arg string) tea.Cmd {
+	if m.bypassState == nil {
+		m.messages.AddInfo("bypass control not available")
+		return nil
+	}
+
+	var enabled bool
+	switch strings.ToLower(strings.TrimSpace(arg)) {
+	case "on":
+		enabled = true
+	case "off":
+		enabled = false
+	default:
+		m.messages.AddInfo("usage: /bypass on|off")
+		return nil
+	}
+
+	m.bypassState.Set(enabled)
+	m.status.SetBypass(enabled)
+	if enabled {
+		m.messages.AddInfo("bypass enabled")
+	} else {
+		m.messages.AddInfo("bypass disabled")
+	}
+
+	return nil
+}
 
 // ToggleMouse implements CommandContext: it flips mouse reporting. Turning it off
 // hands click-drag back to the terminal so the user can select and copy text

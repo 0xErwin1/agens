@@ -43,6 +43,8 @@ type CommandContext interface {
 	// leaves the mode unchanged) when either no ModeState is wired or arg
 	// names neither mode.
 	ToggleMode(arg string) tea.Cmd
+	// SetBypass sets the live Ask-only permission bypass to "on" or "off".
+	SetBypass(arg string) tea.Cmd
 	// ToggleMouse flips mouse reporting so the user can select/copy text from the
 	// conversation (mouse off) or scroll with the wheel (mouse on).
 	ToggleMouse() tea.Cmd
@@ -193,6 +195,9 @@ func defaultCommands() *CommandRegistry {
 		}},
 		Command{Name: "/mode", Desc: "toggle chat/edit mode: [chat|edit], blank to flip", Run: func(ctx CommandContext, input string) tea.Cmd {
 			return ctx.ToggleMode(commandArguments(input))
+		}},
+		Command{Name: "/bypass", Desc: "set permission bypass: on|off", Run: func(ctx CommandContext, input string) tea.Cmd {
+			return ctx.SetBypass(commandArguments(input))
 		}},
 		Command{Name: "/select", Desc: "toggle mouse off to select & copy text", SafeWhileRunning: true, Run: func(ctx CommandContext, _ string) tea.Cmd {
 			return ctx.ToggleMouse()

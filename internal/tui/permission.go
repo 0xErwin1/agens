@@ -73,9 +73,8 @@ type PermissionRequestMsg struct {
 }
 
 // waitForPermission returns a tea.Cmd that blocks on the next permission
-// request and wraps it in a PermissionRequestMsg. It returns nil when ch is
-// nil (no interactive prompter installed, e.g. --dangerously-allow-all) so it
-// is safe to Batch unconditionally.
+// request and wraps it in a PermissionRequestMsg. It returns nil when no
+// interactive prompter is installed, so it is safe to Batch unconditionally.
 func waitForPermission(ch <-chan PermissionRequest) tea.Cmd {
 	if ch == nil {
 		return nil

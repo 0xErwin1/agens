@@ -147,6 +147,21 @@ with no loop rebuild. The TUI's `/mode [chat|edit]` command (blank toggles
 between the two) flips it live; `--mode` (default `edit`) on both `agens` and
 `agens chat` sets the starting mode. Mode is not persisted across sessions.
 
+## Session-local permission bypass
+
+`--dangerously-allow-all` initializes one process-local `permission.BypassState`
+for a chat or TUI session; the TUI may change that same state while idle with
+`/bypass on` and `/bypass off`. The state is discarded when the process exits:
+it is never written to TOML configuration, project state, or the remembered
+permission-rule store. Parent and subagent gates share the pointer, so a live
+TUI change applies to both without rebuilding the loop.
+
+Bypass is intentionally narrower than an Allow rule. Every call is evaluated
+first: a resolved Deny remains denied, a resolved Allow is unchanged, and only
+a resolved Ask may run without invoking the normal Prompter. Skipping an Ask
+does not create a remembered permission grant. The retained Prompter therefore
+becomes active again as soon as bypass is disabled.
+
 ## Persistent permission grants (permissiondb)
 
 Answering an Ask decision with "allow always" or "deny always" persists a

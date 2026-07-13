@@ -90,14 +90,14 @@ func answerForKey(line string) permission.Answer {
 	}
 }
 
-// selectPrompter resolves the permission.Prompter used for the chat
-// command's Ask decisions. allowAll (the --dangerously-allow-all flag)
-// takes priority over terminal detection and always resolves to
-// permission.AllowPrompter. Otherwise /dev/tty is opened for both prompt
-// output and answer input: opening it successfully is itself the signal
-// that a controlling terminal is present, and its failure (no controlling
-// terminal, e.g. CI or a fully piped invocation) falls back to
-// permission.DenyPrompter, which denies every Ask decision.
+// selectPrompter resolves the normal permission.Prompter used for the chat
+// command's Ask decisions. Startup callers pass false because bypass state is
+// evaluated later by the permission gate, allowing normal prompting to resume
+// when bypass is disabled. /dev/tty is opened for both prompt output and answer
+// input: opening it successfully is itself the signal that a controlling
+// terminal is present, and its failure (no controlling terminal, e.g. CI or a
+// fully piped invocation) falls back to permission.DenyPrompter, which denies
+// every Ask decision.
 func selectPrompter(allowAll bool) permission.Prompter {
 	if allowAll {
 		return permission.AllowPrompter{}
