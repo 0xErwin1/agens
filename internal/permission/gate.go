@@ -21,12 +21,25 @@ type Gate struct {
 	inner    Runner
 	engine   *Engine
 	prompter Prompter
+	bypass   func() bool
+}
+
+// GateOption configures optional Gate behavior.
+type GateOption func(*Gate)
+
+// WithBypass installs an optional reader for the current bypass state.
+func WithBypass(enabled func() bool) GateOption {
+	return func(g *Gate) {
+		if enabled != nil {
+			g.bypass = enabled
+		}
+	}
 }
 
 // NewGate returns a Gate wrapping inner. It panics if inner, engine, or
 // prompter is nil: each is required for Run to behave meaningfully, a
 // wiring bug rather than a recoverable condition.
-func NewGate(inner Runner, engine *Engine, prompter Prompter) *Gate {
+func NewGate(inner Runner, engine *Engine, prompter Prompter, opts ...GateOption) *Gate {
 	if inner == nil {
 		panic("permission: NewGate called with a nil Runner")
 	}
@@ -36,7 +49,18 @@ func NewGate(inner Runner, engine *Engine, prompter Prompter) *Gate {
 	if prompter == nil {
 		panic("permission: NewGate called with a nil Prompter")
 	}
-	return &Gate{inner: inner, engine: engine, prompter: prompter}
+	gate := &Gate{
+		inner:    inner,
+		engine:   engine,
+		prompter: prompter,
+		bypass:   func() bool { return false },
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(gate)
+		}
+	}
+	return gate
 }
 
 // Specs returns the inner Runner's Specs() unchanged: permissions never
@@ -119,6 +143,9 @@ func (g *Gate) authorize(ctx context.Context, call message.ToolUsePart) (bool, e
 	case DecisionDeny:
 		return false, nil
 	default:
+		if g.bypass() {
+			return true, nil
+		}
 		return g.resolveAsk(ctx, call)
 	}
 }

@@ -52,6 +52,17 @@ func (f *fakePrompter) Prompt(ctx context.Context, call message.ToolUsePart) (An
 
 var _ Prompter = (*fakePrompter)(nil)
 
+type forbiddenPrompter struct {
+	calls int
+}
+
+func (p *forbiddenPrompter) Prompt(context.Context, message.ToolUsePart) (Answer, error) {
+	p.calls++
+	return AnswerCancel, errors.New("Prompt must not be called")
+}
+
+var _ Prompter = (*forbiddenPrompter)(nil)
+
 type recordingRunner struct {
 	order   *[]string
 	calls   []message.ToolUsePart
@@ -328,6 +339,187 @@ func TestGate_Ask_AllowOnce_DelegatesWithoutPersisting(t *testing.T) {
 	if prompter.calls != 2 {
 		t.Fatalf("prompter.calls after second identical call = %d, want 2 (allow-once must not skip the prompt)", prompter.calls)
 	}
+}
+
+func TestGate_BypassActive_AllowsAskWithoutPromptOrPersistence(t *testing.T) {
+	store := NewMemoryStore()
+	inner := &fakeRunner{result: message.ToolResultPart{ToolUseID: "c1"}}
+	prompter := &forbiddenPrompter{}
+	engine, err := NewEngine(nil, store)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	gate := NewGate(inner, engine, prompter, WithBypass(func() bool { return true }))
+	if _, err := gate.Run(context.Background(), message.ToolUsePart{ID: "c1", Name: "bash"}); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if inner.calls != 1 {
+		t.Fatalf("inner.calls = %d, want 1", inner.calls)
+	}
+	if prompter.calls != 0 {
+		t.Fatalf("prompter.calls = %d, want 0", prompter.calls)
+	}
+
+	rules, err := store.Rules(context.Background())
+	if err != nil {
+		t.Fatalf("Rules() error = %v", err)
+	}
+	if len(rules) != 0 {
+		t.Fatalf("Rules() = %+v, want no remembered rule", rules)
+	}
+}
+
+func TestGate_BypassInactive_PreservesAskPrompting(t *testing.T) {
+	inner := &fakeRunner{}
+	prompter := &fakePrompter{answer: AnswerAllowOnce}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	gate := NewGate(inner, engine, prompter, WithBypass(func() bool { return false }))
+	if _, err := gate.Run(context.Background(), message.ToolUsePart{ID: "c1", Name: "bash"}); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if inner.calls != 1 {
+		t.Fatalf("inner.calls = %d, want 1", inner.calls)
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("prompter.calls = %d, want 1", prompter.calls)
+	}
+}
+
+func TestGate_WithBypassNil_PreservesAskPrompting(t *testing.T) {
+	inner := &fakeRunner{}
+	prompter := &fakePrompter{answer: AnswerAllowOnce}
+	engine, err := NewEngine(nil, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	gate := NewGate(inner, engine, prompter, WithBypass(nil))
+	if _, err := gate.Run(context.Background(), message.ToolUsePart{ID: "c1", Name: "bash"}); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	if inner.calls != 1 {
+		t.Fatalf("inner.calls = %d, want 1", inner.calls)
+	}
+	if prompter.calls != 1 {
+		t.Fatalf("prompter.calls = %d, want 1", prompter.calls)
+	}
+}
+
+func TestGate_BypassActive_PreservesResolvedAllowAndDeny(t *testing.T) {
+	denyStore := NewMemoryStore()
+	if err := denyStore.Append(context.Background(), Rule{Decision: DecisionDeny, Name: "persisted-deny"}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		engine *Engine
+		call   message.ToolUsePart
+		allow  bool
+	}{
+		{
+			name:   "allow",
+			engine: mustNewEngine(t, []Rule{{Decision: DecisionAllow, Name: "allow"}}, NewMemoryStore()),
+			call:   message.ToolUsePart{ID: "allow", Name: "allow"},
+			allow:  true,
+		},
+		{
+			name:   "global deny",
+			engine: mustNewEngine(t, nil, NewMemoryStore(), WithGlobalDenies([]Rule{{Decision: DecisionDeny, Name: "global-deny"}})),
+			call:   message.ToolUsePart{ID: "global-deny", Name: "global-deny"},
+		},
+		{
+			name:   "project deny",
+			engine: mustNewEngine(t, []Rule{{Decision: DecisionDeny, Name: "project-deny"}}, NewMemoryStore()),
+			call:   message.ToolUsePart{ID: "project-deny", Name: "project-deny"},
+		},
+		{
+			name:   "persisted deny",
+			engine: mustNewEngine(t, nil, denyStore),
+			call:   message.ToolUsePart{ID: "persisted-deny", Name: "persisted-deny"},
+		},
+		{
+			name: "chat mode deny",
+			engine: mustNewEngine(t, nil, NewMemoryStore(), WithMode(func() Mode { return ModeChat }), WithWriteClassifier(func(name string) bool {
+				return name == "write"
+			})),
+			call: message.ToolUsePart{ID: "chat-deny", Name: "write"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := &fakeRunner{}
+			prompter := &forbiddenPrompter{}
+			gate := NewGate(inner, tt.engine, prompter, WithBypass(func() bool { return true }))
+
+			result, err := gate.Run(context.Background(), tt.call)
+			if err != nil {
+				t.Fatalf("Run() error = %v, want nil", err)
+			}
+			if result.IsError == tt.allow {
+				t.Fatalf("Run() IsError = %t, want allow = %t", result.IsError, tt.allow)
+			}
+			if inner.calls != boolToInt(tt.allow) {
+				t.Fatalf("inner.calls = %d, want %d", inner.calls, boolToInt(tt.allow))
+			}
+			if prompter.calls != 0 {
+				t.Fatalf("prompter.calls = %d, want 0", prompter.calls)
+			}
+		})
+	}
+}
+
+func TestGate_BypassActive_RunBatchPreflightsAskAndDenyWithoutPrompt(t *testing.T) {
+	inner := &recordingRunner{results: map[string]message.ToolResultPart{}}
+	prompter := &forbiddenPrompter{}
+	engine, err := NewEngine([]Rule{{Decision: DecisionDeny, Name: "deny"}}, NewMemoryStore())
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	gate := NewGate(inner, engine, prompter, WithBypass(func() bool { return true }))
+	results, err := gate.RunBatch(context.Background(), []message.ToolUsePart{
+		{ID: "ask", Name: "ask"},
+		{ID: "deny", Name: "deny"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("RunBatch() error = %v, want nil", err)
+	}
+
+	if len(results) != 2 || results[0].IsError || !results[1].IsError {
+		t.Fatalf("RunBatch() results = %+v, want allowed Ask and denied Deny", results)
+	}
+	if len(inner.calls) != 1 || inner.calls[0].ID != "ask" {
+		t.Fatalf("inner.calls = %+v, want only the Ask call", inner.calls)
+	}
+	if prompter.calls != 0 {
+		t.Fatalf("prompter.calls = %d, want 0", prompter.calls)
+	}
+}
+
+func mustNewEngine(t *testing.T, rules []Rule, store Store, options ...EngineOption) *Engine {
+	t.Helper()
+	engine, err := NewEngine(rules, store, options...)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+	return engine
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func TestGate_Ask_AllowAlways_AppendsRuleAndSecondCallSkipsPrompt(t *testing.T) {
