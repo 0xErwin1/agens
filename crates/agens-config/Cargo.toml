@@ -3,3 +3,6 @@ name = "agens-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[dependencies]
+toml = "0.8"
