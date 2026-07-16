@@ -37,6 +37,7 @@
             pkgs.gopls
             pkgs.gotools
             pkgs.golangci-lint
+            pkgs.jq
             pkgs.just
             pkgs.sqlc
           ];

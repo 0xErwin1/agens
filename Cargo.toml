@@ -1,0 +1,16 @@
+[workspace]
+members = [
+  "crates/agens-core",
+  "crates/agens-config",
+  "crates/agens-providers",
+  "crates/agens-tools",
+  "crates/agens-store",
+  "crates/agens-tui",
+  "crates/agens-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"

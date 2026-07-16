@@ -1,0 +1,17 @@
+[package]
+name = "agens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "agens"
+path = "src/main.rs"
+
+[dependencies]
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
+agens-providers = { path = "../agens-providers" }
+agens-store = { path = "../agens-store" }
+agens-tools = { path = "../agens-tools" }
+agens-tui = { path = "../agens-tui" }

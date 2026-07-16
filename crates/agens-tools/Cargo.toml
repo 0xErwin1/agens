@@ -1,0 +1,9 @@
+[package]
+name = "agens-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
