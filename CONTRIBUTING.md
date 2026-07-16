@@ -2,11 +2,13 @@
 
 ## Setup
 
-Agens is Nix-first:
+Agens uses devenv through its Nix development shell:
 
 ```sh
-nix develop
+nix develop --no-pure-eval
 ```
+
+Go remains the official product binary at `./agens`. The build-only Rust workspace writes its non-authoritative binary to `target/{debug,release}/agens`.
 
 With direnv enabled:
 
@@ -24,9 +26,14 @@ just lint
 just test
 just build
 just verify
+just verify-go
+just verify-rust
+just verify-dual
 ```
 
-Before a change is considered complete, `just verify` must pass.
+`just verify` invokes only the Go gate. `just verify-dual` runs Go and then Rust fail-fast. Before a change is considered complete, its applicable gate must pass.
+
+Rust `target/` is limited to 20 GiB. Verification never deletes build output; cleanup is manual only with `just target-clean`.
 
 ## TDD requirement
 
@@ -36,7 +43,7 @@ For non-trivial code changes, follow and record the red/green loop:
 2. Record the failure.
 3. Implement the smallest change.
 4. Record the passing test.
-5. Run `nix develop -c just verify`.
+5. Run `nix develop --no-pure-eval -c just verify`.
 
 ## Scope discipline
 

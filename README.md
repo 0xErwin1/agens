@@ -29,7 +29,7 @@ Still intentionally out of scope: packaging/release automation and editor protoc
 Enter the development shell and build the binary:
 
 ```sh
-nix develop
+nix develop --no-pure-eval
 just build
 ```
 
@@ -163,28 +163,35 @@ Mutable runtime state belongs in the runtime store, not in TOML config.
 
 ## Development
 
-This project is Nix-first:
+This project uses devenv through the Nix development shell:
 
 ```sh
-nix develop
+nix develop --no-pure-eval
 ```
+
+Go remains the official product binary at `./agens`. The build-only Rust workspace produces a non-authoritative binary at `target/{debug,release}/agens`.
 
 Canonical commands:
 
 ```sh
-just fmt        # format Go code
-just fmt-check  # check formatting
-just lint       # golangci-lint
-just test       # go test ./...
-just build      # build local ./agens binary
-just verify     # fmt-check + lint + test + build
-just clean      # remove local build output
+just fmt          # format Go code
+just fmt-check    # check Go formatting
+just lint         # golangci-lint
+just test         # go test ./...
+just build        # build the official Go ./agens binary
+just verify       # default gate; invokes only verify-go
+just verify-go    # sqlc, Go format check, lint, test, and build
+just verify-rust  # Rust budget, format, Clippy, test, build, budget
+just verify-dual  # Go gate followed by Rust gate, fail-fast
+just clean        # remove only the local Go build output
 ```
+
+Rust `target/` has a 20 GiB limit. Verification reports an overage but never deletes artifacts; cleanup is manual only with `just target-clean`.
 
 Before considering a code change complete, run:
 
 ```sh
-nix develop -c just verify
+nix develop --no-pure-eval -c just verify
 ```
 
 ## Architecture
@@ -205,4 +212,4 @@ For non-trivial production changes:
 2. Capture the red result.
 3. Implement the smallest change.
 4. Capture the green result.
-5. Finish with `nix develop -c just verify`.
+5. Finish with `nix develop --no-pure-eval -c just verify`.

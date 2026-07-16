@@ -14,17 +14,19 @@ Use these root documents as canonical references:
 
 ## Environment
 
-This project is Nix-first. Prefer running commands through the dev shell:
+This project uses devenv through the Nix development shell. Prefer:
 
 ```sh
-nix develop -c just verify
+nix develop --no-pure-eval -c just verify
 ```
 
 If you enter the shell interactively, use:
 
 ```sh
-nix develop
+nix develop --no-pure-eval
 ```
+
+Go remains official at `./agens`; the build-only Rust binary stays at `target/{debug,release}/agens`.
 
 ## Canonical commands
 
@@ -36,8 +38,13 @@ nix develop
 | Test | `just test` |
 | Build | `just build` |
 | Config diagnostics | `just build && ./agens config doctor` |
-| Full gate | `just verify` |
-| Clean | `just clean` |
+| Default/Go gate | `just verify` / `just verify-go` |
+| Rust gate | `just verify-rust` |
+| Go then Rust | `just verify-dual` |
+| Clean Go output | `just clean` |
+| Clean Rust output manually | `just target-clean` |
+
+The Rust `target/` budget is 20 GiB. Gates never clean it automatically; cleanup is manual only with `just target-clean`.
 
 ## Working principles
 
@@ -59,6 +66,6 @@ For every non-trivial production change:
 2. Capture the red result in the apply artifact.
 3. Implement the smallest change.
 4. Capture the green result.
-5. Run `nix develop -c just verify` before marking complete.
+5. Run `nix develop --no-pure-eval -c just verify` before marking complete.
 
 Tests should live near the package they cover and prefer table-driven cases when behavior branches.

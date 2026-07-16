@@ -37,7 +37,9 @@ Linting is mandatory:
 just lint
 ```
 
-`just verify` includes format check, `golangci-lint`, tests, and local build.
+`just verify` invokes only `verify-go`, which preserves sqlc generation, format check, `golangci-lint`, tests, and the official Go `./agens` build. Use `just verify-rust` for the build-only Rust workspace and `just verify-dual` for Go followed by Rust fail-fast. The Rust binary stays at `target/{debug,release}/agens`.
+
+Enter devenv with `nix develop --no-pure-eval`. Rust `target/` has a 20 GiB limit; verification never cleans it, and cleanup is manual only with `just target-clean`.
 
 ## Error handling
 
