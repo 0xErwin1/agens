@@ -12,6 +12,7 @@ dependencies = [
  "agens-store",
  "agens-tools",
  "agens-tui",
+ "toml",
 ]
 
 [[package]]
