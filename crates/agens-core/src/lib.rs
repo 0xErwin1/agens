@@ -128,6 +128,136 @@ impl CompletedTurnSnapshot {
     pub fn events(&self) -> &[TurnEvent] {
         &self.events
     }
+
+    pub fn from_persisted_events(
+        events: Vec<TurnEvent>,
+    ) -> Result<Self, CompletedTurnSnapshotError> {
+        validate_completed_turn_events(&events)?;
+
+        Ok(Self { events })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedTurnSnapshotError {
+    message: String,
+}
+
+impl CompletedTurnSnapshotError {
+    fn invalid() -> Self {
+        Self {
+            message: "invalid persisted completed turn events".into(),
+        }
+    }
+}
+
+impl fmt::Display for CompletedTurnSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompletedTurnSnapshotError {}
+
+fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedTurnSnapshotError> {
+    let mut coordinator = TurnCoordinator::new();
+    let mut event_index = 0;
+
+    consume_generated_events(&mut coordinator, events, &mut event_index, |coordinator| {
+        coordinator.begin()
+    })?;
+
+    while event_index < events.len() {
+        match coordinator.state() {
+            TurnState::Requesting => {
+                let Some(TurnEvent::StateChanged(TurnState::Streaming)) = events.get(event_index)
+                else {
+                    return Err(CompletedTurnSnapshotError::invalid());
+                };
+                let Some(TurnEvent::ProviderPart(part)) = events.get(event_index + 1) else {
+                    return Err(CompletedTurnSnapshotError::invalid());
+                };
+                let part = part.clone();
+
+                consume_generated_events(
+                    &mut coordinator,
+                    events,
+                    &mut event_index,
+                    move |coordinator| coordinator.accept_provider_part(part),
+                )?;
+            }
+            TurnState::Streaming => match events.get(event_index) {
+                Some(TurnEvent::ProviderPart(part)) => {
+                    let part = part.clone();
+
+                    consume_generated_events(
+                        &mut coordinator,
+                        events,
+                        &mut event_index,
+                        move |coordinator| coordinator.accept_provider_part(part),
+                    )?;
+                }
+                Some(TurnEvent::StateChanged(TurnState::Dispatching | TurnState::Completed)) => {
+                    consume_generated_events(
+                        &mut coordinator,
+                        events,
+                        &mut event_index,
+                        TurnCoordinator::finish_provider_iteration,
+                    )?;
+                }
+                _ => return Err(CompletedTurnSnapshotError::invalid()),
+            },
+            TurnState::Dispatching => {
+                let Some(TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                })) = events.get(event_index)
+                else {
+                    return Err(CompletedTurnSnapshotError::invalid());
+                };
+                let tool_call_id = tool_call_id.clone();
+                let content = content.clone();
+                let is_error = *is_error;
+
+                consume_generated_events(
+                    &mut coordinator,
+                    events,
+                    &mut event_index,
+                    move |coordinator| {
+                        coordinator.accept_tool_result(&tool_call_id, content, is_error)
+                    },
+                )?;
+            }
+            TurnState::Completed => break,
+            TurnState::Idle | TurnState::Cancelled | TurnState::Failed => {
+                return Err(CompletedTurnSnapshotError::invalid());
+            }
+        }
+    }
+
+    (coordinator.state() == TurnState::Completed && event_index == events.len())
+        .then_some(())
+        .ok_or_else(CompletedTurnSnapshotError::invalid)
+}
+
+fn consume_generated_events(
+    coordinator: &mut TurnCoordinator,
+    persisted_events: &[TurnEvent],
+    event_index: &mut usize,
+    operation: impl FnOnce(&mut TurnCoordinator) -> Result<(), TurnEventError>,
+) -> Result<(), CompletedTurnSnapshotError> {
+    let generated_start = coordinator.events.len();
+    operation(coordinator).map_err(|_| CompletedTurnSnapshotError::invalid())?;
+    let generated_events = &coordinator.events[generated_start..];
+    let persisted_end = event_index.saturating_add(generated_events.len());
+
+    if persisted_events.get(*event_index..persisted_end) != Some(generated_events) {
+        return Err(CompletedTurnSnapshotError::invalid());
+    }
+
+    *event_index = persisted_end;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

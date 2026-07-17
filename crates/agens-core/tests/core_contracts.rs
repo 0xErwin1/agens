@@ -400,6 +400,42 @@ fn completed_turn_is_persisted_once_with_its_ordered_events() {
 }
 
 #[test]
+fn restores_a_completed_snapshot_from_live_ordered_events() {
+    let events = completed_coordinator().events().to_vec();
+
+    let snapshot = CompletedTurnSnapshot::from_persisted_events(events.clone()).unwrap();
+
+    assert_eq!(snapshot.events(), events);
+}
+
+#[test]
+fn rejects_non_completed_or_invalid_persisted_snapshots() {
+    let invalid_event_sequences = [
+        vec![TurnEvent::StateChanged(TurnState::Requesting)],
+        vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Cancelled),
+        ],
+        vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Failed),
+        ],
+        vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "unexpected".into(),
+                is_error: false,
+            }),
+        ],
+    ];
+
+    for events in invalid_event_sequences {
+        assert!(CompletedTurnSnapshot::from_persisted_events(events).is_err());
+    }
+}
+
+#[test]
 fn non_completed_turns_never_invoke_completed_turn_persistence() {
     let mut active = TurnCoordinator::new();
     active.begin().unwrap();
