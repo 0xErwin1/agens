@@ -504,6 +504,20 @@ const COMPLETED_TURN_EVENTS_COLUMNS: [ExpectedColumnSignature; 10] = [
     ExpectedColumnSignature::new(8, "content", "TEXT", false, None, 0),
     ExpectedColumnSignature::new(9, "is_error", "INTEGER", false, None, 0),
 ];
+const COMPLETED_TURN_EVENTS_INDEXES: [ExpectedIndexSignature; 2] = [
+    ExpectedIndexSignature::new(0, "completed_turn_events_turn_sequence", true, "c", false),
+    ExpectedIndexSignature::new(
+        1,
+        "sqlite_autoindex_completed_turn_events_1",
+        true,
+        "pk",
+        false,
+    ),
+];
+const COMPLETED_TURN_EVENTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
+    ExpectedIndexColumnSignature::new(0, 0, "turn_id"),
+    ExpectedIndexColumnSignature::new(1, 1, "sequence"),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStoreError {
@@ -642,16 +656,16 @@ impl SessionStore {
             })?;
         let rows = statement
             .query_map([id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<i64>>(7)?,
-                ))
+                Ok(PersistedTurnEvent {
+                    kind: row.get(0)?,
+                    state: row.get(1)?,
+                    part_kind: row.get(2)?,
+                    call_id: row.get(3)?,
+                    name: row.get(4)?,
+                    input: row.get(5)?,
+                    content: row.get(6)?,
+                    is_error: row.get(7)?,
+                })
             })
             .map_err(|error| {
                 SessionStoreError::operation(
@@ -763,9 +777,11 @@ fn initialize_sessions_schema(
                  is_error INTEGER,
                  PRIMARY KEY (turn_id, sequence),
                  FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
-             );
-             PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};
-             COMMIT;"
+              );
+              CREATE UNIQUE INDEX completed_turn_events_turn_sequence
+                  ON completed_turn_events(turn_id, sequence);
+              PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};
+              COMMIT;"
             ))
             .map_err(|error| {
                 SessionStoreError::operation("initialize schema", database_path, error)
@@ -791,8 +807,17 @@ fn initialize_sessions_schema(
     .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
     let foreign_key_matches = completed_turn_events_foreign_key_matches(connection)
         .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
+    let indexes_match = completed_turn_events_indexes_match(connection)
+        .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
+    let completed_turns_indexes_match = completed_turns_indexes_match(connection)
+        .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
 
-    if !(completed_turns_matches && completed_turn_events_matches && foreign_key_matches) {
+    if !(completed_turns_matches
+        && completed_turn_events_matches
+        && foreign_key_matches
+        && indexes_match
+        && completed_turns_indexes_match)
+    {
         return Err(SessionStoreError::operation(
             "verify schema",
             database_path,
@@ -867,116 +892,246 @@ fn completed_turn_events_foreign_key_matches(connection: &Connection) -> rusqlit
     ))
 }
 
+fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA index_list('completed_turn_events')")?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if indexes.len() != COMPLETED_TURN_EVENTS_INDEXES.len()
+        || !indexes.iter().zip(COMPLETED_TURN_EVENTS_INDEXES).all(
+            |((sequence, name, unique, origin, partial), expected)| {
+                *sequence == expected.sequence
+                    && name == expected.name
+                    && *unique == expected.unique
+                    && origin == expected.origin
+                    && *partial == expected.partial
+            },
+        )
+    {
+        return Ok(false);
+    }
+
+    for index in COMPLETED_TURN_EVENTS_INDEXES {
+        let mut statement = connection.prepare(&format!("PRAGMA index_info('{}')", index.name))?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if columns.len() != COMPLETED_TURN_EVENTS_INDEX_COLUMNS.len()
+            || !columns.iter().zip(COMPLETED_TURN_EVENTS_INDEX_COLUMNS).all(
+                |((sequence, column_id, name), expected)| {
+                    *sequence == expected.sequence
+                        && *column_id == expected.column_id
+                        && name == expected.name
+                },
+            )
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn completed_turns_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA index_list('completed_turns')")?;
+    let indexes = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(indexes.is_empty())
+}
+
 fn insert_turn_event(
     transaction: &Transaction<'_>,
     turn_id: i64,
     sequence: i64,
     event: &TurnEvent,
 ) -> rusqlite::Result<()> {
-    let (kind, state, part_kind, call_id, name, input, content, is_error) =
-        encode_turn_event(event);
+    let fields = encode_turn_event(event);
     transaction.execute(
         "INSERT INTO completed_turn_events
          (turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
-            turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+            turn_id,
+            sequence,
+            fields.kind,
+            fields.state,
+            fields.part_kind,
+            fields.call_id,
+            fields.name,
+            fields.input,
+            fields.content,
+            fields.is_error,
         ],
     )?;
     Ok(())
 }
 
-type PersistedTurnEvent = (
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
+struct PersistedTurnEvent {
+    kind: String,
+    state: Option<String>,
+    part_kind: Option<String>,
+    call_id: Option<String>,
+    name: Option<String>,
+    input: Option<String>,
+    content: Option<String>,
+    is_error: Option<i64>,
+}
 
-fn encode_turn_event(
-    event: &TurnEvent,
-) -> (
-    &'static str,
-    Option<&str>,
-    Option<&'static str>,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-    Option<&str>,
-    Option<i64>,
-) {
+struct EncodedTurnEvent<'a> {
+    kind: &'static str,
+    state: Option<&'static str>,
+    part_kind: Option<&'static str>,
+    call_id: Option<&'a str>,
+    name: Option<&'a str>,
+    input: Option<&'a str>,
+    content: Option<&'a str>,
+    is_error: Option<i64>,
+}
+
+#[derive(Clone, Copy)]
+struct PersistedEventFieldMatrix {
+    state: bool,
+    part_kind: bool,
+    call_id: bool,
+    name: bool,
+    input: bool,
+    content: bool,
+    is_error: bool,
+}
+
+const STATE_CHANGED_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: true,
+    part_kind: false,
+    call_id: false,
+    name: false,
+    input: false,
+    content: false,
+    is_error: false,
+};
+const PROVIDER_TEXT_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: false,
+    part_kind: true,
+    call_id: false,
+    name: false,
+    input: false,
+    content: true,
+    is_error: false,
+};
+const PROVIDER_TOOL_CALL_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: false,
+    part_kind: true,
+    call_id: true,
+    name: true,
+    input: true,
+    content: false,
+    is_error: false,
+};
+const TOOL_CALL_REQUESTED_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: false,
+    part_kind: false,
+    call_id: true,
+    name: true,
+    input: true,
+    content: false,
+    is_error: false,
+};
+const TOOL_RESULT_FIELDS: PersistedEventFieldMatrix = PersistedEventFieldMatrix {
+    state: false,
+    part_kind: false,
+    call_id: true,
+    name: false,
+    input: false,
+    content: true,
+    is_error: true,
+};
+
+fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
     match event {
-        TurnEvent::StateChanged(state) => (
-            "state_changed",
-            Some(encode_turn_state(*state)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-        TurnEvent::ProviderPart(MessagePart::Text(text)) => (
-            "provider_part",
-            None,
-            Some("text"),
-            None,
-            None,
-            None,
-            Some(text),
-            None,
-        ),
-        TurnEvent::ProviderPart(MessagePart::Reasoning(text)) => (
-            "provider_part",
-            None,
-            Some("reasoning"),
-            None,
-            None,
-            None,
-            Some(text),
-            None,
-        ),
-        TurnEvent::ProviderPart(MessagePart::ToolCall { id, name, input }) => (
-            "provider_part",
-            None,
-            Some("tool_call"),
-            Some(id),
-            Some(name),
-            Some(input),
-            None,
-            None,
-        ),
+        TurnEvent::StateChanged(state) => EncodedTurnEvent {
+            kind: "state_changed",
+            state: Some(encode_turn_state(*state)),
+            part_kind: None,
+            call_id: None,
+            name: None,
+            input: None,
+            content: None,
+            is_error: None,
+        },
+        TurnEvent::ProviderPart(MessagePart::Text(text)) => EncodedTurnEvent {
+            kind: "provider_part",
+            state: None,
+            part_kind: Some("text"),
+            call_id: None,
+            name: None,
+            input: None,
+            content: Some(text),
+            is_error: None,
+        },
+        TurnEvent::ProviderPart(MessagePart::Reasoning(text)) => EncodedTurnEvent {
+            kind: "provider_part",
+            state: None,
+            part_kind: Some("reasoning"),
+            call_id: None,
+            name: None,
+            input: None,
+            content: Some(text),
+            is_error: None,
+        },
+        TurnEvent::ProviderPart(MessagePart::ToolCall { id, name, input }) => EncodedTurnEvent {
+            kind: "provider_part",
+            state: None,
+            part_kind: Some("tool_call"),
+            call_id: Some(id),
+            name: Some(name),
+            input: Some(input),
+            content: None,
+            is_error: None,
+        },
         TurnEvent::ProviderPart(MessagePart::ToolResult { .. }) => {
             unreachable!("completed snapshots reject provider tool results")
         }
-        TurnEvent::ToolCallRequested { id, name, input } => (
-            "tool_call_requested",
-            None,
-            None,
-            Some(id),
-            Some(name),
-            Some(input),
-            None,
-            None,
-        ),
+        TurnEvent::ToolCallRequested { id, name, input } => EncodedTurnEvent {
+            kind: "tool_call_requested",
+            state: None,
+            part_kind: None,
+            call_id: Some(id),
+            name: Some(name),
+            input: Some(input),
+            content: None,
+            is_error: None,
+        },
         TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id,
             content,
             is_error,
-        }) => (
-            "tool_result",
-            None,
-            None,
-            Some(tool_call_id),
-            None,
-            None,
-            Some(content),
-            Some(i64::from(*is_error)),
-        ),
+        }) => EncodedTurnEvent {
+            kind: "tool_result",
+            state: None,
+            part_kind: None,
+            call_id: Some(tool_call_id),
+            name: None,
+            input: None,
+            content: Some(content),
+            is_error: Some(i64::from(*is_error)),
+        },
         TurnEvent::ToolResult(_) => {
             unreachable!("completed snapshots reject non-result tool events")
         }
@@ -984,41 +1139,81 @@ fn encode_turn_event(
 }
 
 fn decode_turn_event(fields: PersistedTurnEvent) -> Result<TurnEvent, &'static str> {
-    let (kind, state, part_kind, call_id, name, input, content, is_error) = fields;
-    match kind.as_str() {
-        "state_changed" => Ok(TurnEvent::StateChanged(decode_turn_state(
-            state.as_deref(),
-        )?)),
-        "provider_part" => match part_kind.as_deref() {
-            Some("text") => Ok(TurnEvent::ProviderPart(MessagePart::Text(
-                content.ok_or("missing text content")?,
-            ))),
-            Some("reasoning") => Ok(TurnEvent::ProviderPart(MessagePart::Reasoning(
-                content.ok_or("missing reasoning content")?,
-            ))),
-            Some("tool_call") => Ok(TurnEvent::ProviderPart(MessagePart::ToolCall {
-                id: call_id.ok_or("missing tool call id")?,
-                name: name.ok_or("missing tool call name")?,
-                input: input.ok_or("missing tool call input")?,
-            })),
+    match fields.kind.as_str() {
+        "state_changed" => {
+            validate_field_matrix(&fields, STATE_CHANGED_FIELDS)?;
+            Ok(TurnEvent::StateChanged(decode_turn_state(
+                fields.state.as_deref(),
+            )?))
+        }
+        "provider_part" => match fields.part_kind.as_deref() {
+            Some("text") => {
+                let fields = required_fields(fields, PROVIDER_TEXT_FIELDS)?;
+                Ok(TurnEvent::ProviderPart(MessagePart::Text(
+                    fields.content.unwrap(),
+                )))
+            }
+            Some("reasoning") => {
+                let fields = required_fields(fields, PROVIDER_TEXT_FIELDS)?;
+                Ok(TurnEvent::ProviderPart(MessagePart::Reasoning(
+                    fields.content.unwrap(),
+                )))
+            }
+            Some("tool_call") => {
+                let fields = required_fields(fields, PROVIDER_TOOL_CALL_FIELDS)?;
+                Ok(TurnEvent::ProviderPart(MessagePart::ToolCall {
+                    id: fields.call_id.unwrap(),
+                    name: fields.name.unwrap(),
+                    input: fields.input.unwrap(),
+                }))
+            }
             _ => Err("invalid provider part"),
         },
-        "tool_call_requested" => Ok(TurnEvent::ToolCallRequested {
-            id: call_id.ok_or("missing requested tool id")?,
-            name: name.ok_or("missing requested tool name")?,
-            input: input.ok_or("missing requested tool input")?,
-        }),
-        "tool_result" => Ok(TurnEvent::ToolResult(MessagePart::ToolResult {
-            tool_call_id: call_id.ok_or("missing tool result id")?,
-            content: content.ok_or("missing tool result content")?,
-            is_error: match is_error {
-                Some(0) => false,
-                Some(1) => true,
-                _ => return Err("invalid tool result error flag"),
-            },
-        })),
+        "tool_call_requested" => {
+            let fields = required_fields(fields, TOOL_CALL_REQUESTED_FIELDS)?;
+            Ok(TurnEvent::ToolCallRequested {
+                id: fields.call_id.unwrap(),
+                name: fields.name.unwrap(),
+                input: fields.input.unwrap(),
+            })
+        }
+        "tool_result" => {
+            let fields = required_fields(fields, TOOL_RESULT_FIELDS)?;
+            Ok(TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: fields.call_id.unwrap(),
+                content: fields.content.unwrap(),
+                is_error: match fields.is_error {
+                    Some(0) => false,
+                    Some(1) => true,
+                    _ => return Err("invalid tool result error flag"),
+                },
+            }))
+        }
         _ => Err("invalid persisted event kind"),
     }
+}
+
+fn required_fields(
+    fields: PersistedTurnEvent,
+    matrix: PersistedEventFieldMatrix,
+) -> Result<PersistedTurnEvent, &'static str> {
+    validate_field_matrix(&fields, matrix)?;
+    Ok(fields)
+}
+
+fn validate_field_matrix(
+    fields: &PersistedTurnEvent,
+    matrix: PersistedEventFieldMatrix,
+) -> Result<(), &'static str> {
+    (fields.state.is_some() == matrix.state
+        && fields.part_kind.is_some() == matrix.part_kind
+        && fields.call_id.is_some() == matrix.call_id
+        && fields.name.is_some() == matrix.name
+        && fields.input.is_some() == matrix.input
+        && fields.content.is_some() == matrix.content
+        && fields.is_error.is_some() == matrix.is_error)
+        .then_some(())
+        .ok_or("invalid persisted event fields")
 }
 
 fn encode_turn_state(state: TurnState) -> &'static str {
