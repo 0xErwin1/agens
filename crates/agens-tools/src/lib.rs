@@ -27,10 +27,8 @@ const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
 const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
 const DEFAULT_MAX_SEARCH_DEPTH: usize = 32;
 const DEFAULT_FILE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-const MCP_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct McpRequestId(pub u64);
+const DEFAULT_MAX_MCP_LIST_PAGES: usize = 128;
+const DEFAULT_MAX_MCP_TOOLS: usize = 1_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpInitialize {
@@ -60,8 +58,35 @@ impl McpInitialize {
 pub enum McpRequest {
     Initialize(McpInitialize),
     Initialized,
-    ListTools,
+    ListTools { cursor: Option<String> },
     CallTool { name: String, arguments: Value },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpInitializeResult {
+    pub protocol_version: String,
+    pub capabilities: Value,
+}
+
+impl McpInitializeResult {
+    pub fn new(protocol_version: impl Into<String>, capabilities: Value) -> Self {
+        Self {
+            protocol_version: protocol_version.into(),
+            capabilities,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpToolsPage {
+    pub tools: Vec<McpToolDefinition>,
+    pub next_cursor: Option<String>,
+}
+
+impl McpToolsPage {
+    pub fn new(tools: Vec<McpToolDefinition>, next_cursor: Option<String>) -> Self {
+        Self { tools, next_cursor }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,8 +117,8 @@ pub struct McpCallResult {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpResponse {
-    Initialized,
-    ToolsListed(Vec<McpToolDefinition>),
+    Initialized(McpInitializeResult),
+    ToolsListed(McpToolsPage),
     ToolCalled(McpCallResult),
     ProtocolError(McpProtocolError),
 }
@@ -119,14 +144,51 @@ impl fmt::Display for McpTransportError {
 
 impl std::error::Error for McpTransportError {}
 
-pub trait McpTransport {
-    fn begin(&mut self, request: McpRequest) -> Result<McpRequestId, McpTransportError>;
+pub struct McpOperationContext {
+    cancellation: Arc<AtomicBool>,
+    deadline: Instant,
+}
 
-    fn poll(&mut self, request_id: McpRequestId) -> Result<Option<McpResponse>, McpTransportError>;
+impl McpOperationContext {
+    pub fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
+        Self {
+            cancellation,
+            deadline: Instant::now() + timeout,
+        }
+    }
 
-    fn cancel(&mut self, request_id: McpRequestId);
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
 
-    fn close(&mut self) -> Result<(), McpTransportError>;
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    pub fn check(&self) -> Result<(), McpTransportError> {
+        if self.is_cancelled() {
+            return Err(McpTransportError::Cancelled);
+        }
+        if self.is_expired() {
+            return Err(McpTransportError::TimedOut);
+        }
+        Ok(())
+    }
+}
+
+/// Implementations must cooperatively observe the context and must not block past its deadline.
+pub trait McpTransport: Send {
+    fn execute(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<McpResponse, McpTransportError>;
+    fn notify(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<(), McpTransportError>;
+    fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +196,35 @@ pub struct McpTimeouts {
     pub connect: Duration,
     pub list: Duration,
     pub call: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpLimits {
+    pub max_list_pages: usize,
+    pub max_tools: usize,
+}
+
+impl McpLimits {
+    pub fn new(max_list_pages: usize, max_tools: usize) -> Result<Self, McpTransportError> {
+        if max_list_pages == 0 || max_tools == 0 {
+            return Err(McpTransportError::Protocol(
+                "MCP list limits must be greater than zero".into(),
+            ));
+        }
+        Ok(Self {
+            max_list_pages,
+            max_tools,
+        })
+    }
+}
+
+impl Default for McpLimits {
+    fn default() -> Self {
+        Self {
+            max_list_pages: DEFAULT_MAX_MCP_LIST_PAGES,
+            max_tools: DEFAULT_MAX_MCP_TOOLS,
+        }
+    }
 }
 
 impl McpTimeouts {
@@ -235,125 +326,233 @@ impl McpRegistry {
     pub fn load_server<T: McpTransport>(
         &mut self,
         server_name: &str,
-        transport: &mut T,
+        transport: T,
         initialize: &McpInitialize,
         timeouts: McpTimeouts,
-        cancellation: &AtomicBool,
+        limits: McpLimits,
+        cancellation: Arc<AtomicBool>,
     ) -> McpServerReport {
-        let result = (|| {
-            validate_server_name(server_name)?;
-            let mut client = McpClient::new(transport, timeouts);
-            client.connect(initialize.clone(), cancellation)?;
-            let tools = client.list_tools(cancellation)?;
-            let metadata = tools
-                .into_iter()
-                .map(|tool| remote_tool_metadata(server_name, tool))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            if metadata
-                .iter()
-                .any(|tool| self.tools.contains_key(&tool.qualified_name))
-                || has_duplicate_qualified_name(&metadata)
+        match load_server_metadata(
+            server_name,
+            transport,
+            initialize.clone(),
+            timeouts,
+            limits,
+            cancellation,
+        ) {
+            Ok(metadata)
+                if !metadata
+                    .iter()
+                    .any(|tool| self.tools.contains_key(&tool.qualified_name))
+                    && !has_duplicate_qualified_name(&metadata) =>
             {
-                return Err(McpTransportError::Protocol(
-                    "duplicate qualified MCP tool name".into(),
-                ));
-            }
-
-            let tool_count = metadata.len();
-            for tool in metadata {
-                self.tools.insert(tool.qualified_name.clone(), tool);
-            }
-
-            Ok(tool_count)
-        })();
-
-        match result {
-            Ok(tool_count) => McpServerReport::loaded(server_name, tool_count),
-            Err(error) => {
-                if !matches!(
-                    error,
-                    McpTransportError::Cancelled | McpTransportError::TimedOut
-                ) {
-                    let _ = transport.close();
+                let tool_count = metadata.len();
+                for tool in metadata {
+                    self.tools.insert(tool.qualified_name.clone(), tool);
                 }
-                McpServerReport::Failed {
-                    server_name: server_name.into(),
-                    message: error.to_string(),
-                }
+                McpServerReport::loaded(server_name, tool_count)
             }
+            Ok(_) => McpServerReport::Failed {
+                server_name: server_name.into(),
+                message: "mcp protocol error: duplicate qualified MCP tool name".into(),
+            },
+            Err(error) => McpServerReport::Failed {
+                server_name: server_name.into(),
+                message: error.to_string(),
+            },
         }
     }
 
-    pub fn load_servers<'a, T: McpTransport + 'a>(
+    pub fn load_servers<T: McpTransport + 'static>(
         &mut self,
-        servers: impl IntoIterator<Item = (&'a str, &'a mut T)>,
+        servers: impl IntoIterator<Item = (String, T)>,
         initialize: &McpInitialize,
         timeouts: McpTimeouts,
-        cancellation: &AtomicBool,
+        limits: McpLimits,
+        cancellation: Arc<AtomicBool>,
     ) -> Vec<McpServerReport> {
-        servers
+        let mut workers = servers
             .into_iter()
-            .map(|(server_name, transport)| {
-                self.load_server(server_name, transport, initialize, timeouts, cancellation)
+            .enumerate()
+            .map(|(index, (name, transport))| {
+                let initialize = initialize.clone();
+                let cancellation = Arc::clone(&cancellation);
+                thread::spawn(move || {
+                    (
+                        index,
+                        name.clone(),
+                        load_server_metadata(
+                            &name,
+                            transport,
+                            initialize,
+                            timeouts,
+                            limits,
+                            cancellation,
+                        ),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = workers
+            .drain(..)
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("cooperative MCP worker must not panic")
+            })
+            .collect::<Vec<_>>();
+        results.sort_by_key(|(index, _, _)| *index);
+        results
+            .into_iter()
+            .map(|(_, name, result)| match result {
+                Ok(metadata)
+                    if !metadata
+                        .iter()
+                        .any(|tool| self.tools.contains_key(&tool.qualified_name))
+                        && !has_duplicate_qualified_name(&metadata) =>
+                {
+                    let tool_count = metadata.len();
+                    for tool in metadata {
+                        self.tools.insert(tool.qualified_name.clone(), tool);
+                    }
+                    McpServerReport::loaded(name, tool_count)
+                }
+                Ok(_) => McpServerReport::Failed {
+                    server_name: name,
+                    message: "mcp protocol error: duplicate qualified MCP tool name".into(),
+                },
+                Err(error) => McpServerReport::Failed {
+                    server_name: name,
+                    message: error.to_string(),
+                },
             })
             .collect()
     }
 }
 
-pub struct McpClient<'a, T: McpTransport> {
-    transport: &'a mut T,
+fn load_server_metadata<T: McpTransport>(
+    server_name: &str,
+    transport: T,
+    initialize: McpInitialize,
     timeouts: McpTimeouts,
+    limits: McpLimits,
+    cancellation: Arc<AtomicBool>,
+) -> Result<Vec<RemoteToolMetadata>, McpTransportError> {
+    validate_server_name(server_name)?;
+    let mut client = McpClient::new(transport, timeouts, limits);
+    let result = client
+        .connect(initialize, &cancellation)
+        .and_then(|_| client.list_tools(&cancellation))
+        .and_then(|tools| {
+            tools
+                .into_iter()
+                .map(|tool| remote_tool_metadata(server_name, tool))
+                .collect()
+        });
+    client.close();
+    result
 }
 
-impl<'a, T: McpTransport> McpClient<'a, T> {
-    pub fn new(transport: &'a mut T, timeouts: McpTimeouts) -> Self {
+pub struct McpClient<T: McpTransport> {
+    transport: T,
+    timeouts: McpTimeouts,
+    limits: McpLimits,
+}
+
+impl<T: McpTransport> McpClient<T> {
+    pub fn new(transport: T, timeouts: McpTimeouts, limits: McpLimits) -> Self {
         Self {
             transport,
             timeouts,
+            limits,
         }
+    }
+    pub fn into_transport(self) -> T {
+        self.transport
     }
 
     pub fn connect(
         &mut self,
         initialize: McpInitialize,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<(), McpTransportError> {
-        let response = self.request(
-            McpRequest::Initialize(initialize),
+        let initialized = expect_initialized(self.request(
+            McpRequest::Initialize(initialize.clone()),
             self.timeouts.connect,
             cancellation,
-        )?;
-        expect_initialized(response)?;
-        self.transport.begin(McpRequest::Initialized)?;
-        Ok(())
+        )?)?;
+        if initialized.protocol_version != initialize.protocol_version {
+            return Err(McpTransportError::Protocol(
+                "MCP protocol version negotiation failed".into(),
+            ));
+        }
+        if !initialized.capabilities.is_object()
+            || !initialized
+                .capabilities
+                .get("tools")
+                .is_some_and(Value::is_object)
+        {
+            return Err(McpTransportError::Protocol(
+                "MCP server does not advertise tools capability".into(),
+            ));
+        }
+        let context = McpOperationContext::new(Arc::clone(cancellation), self.timeouts.connect);
+        self.transport.notify(McpRequest::Initialized, &context)?;
+        context.check()
     }
 
     pub fn list_tools(
         &mut self,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<Vec<McpToolDefinition>, McpTransportError> {
-        match self.request(McpRequest::ListTools, self.timeouts.list, cancellation)? {
-            McpResponse::ToolsListed(tools) => Ok(tools),
-            McpResponse::ProtocolError(error) => Err(protocol_error(error)),
-            _ => Err(McpTransportError::Protocol(
-                "expected tools/list result".into(),
-            )),
+        let mut cursor = None;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut tools = Vec::new();
+        for _ in 0..self.limits.max_list_pages {
+            let McpResponse::ToolsListed(page) = self.request(
+                McpRequest::ListTools {
+                    cursor: cursor.clone(),
+                },
+                self.timeouts.list,
+                cancellation,
+            )?
+            else {
+                return Err(McpTransportError::Protocol(
+                    "expected tools/list result".into(),
+                ));
+            };
+            if tools.len().saturating_add(page.tools.len()) > self.limits.max_tools {
+                return Err(McpTransportError::Protocol(
+                    "MCP tools/list tool limit exceeded".into(),
+                ));
+            }
+            tools.extend(page.tools);
+            match page.next_cursor {
+                Some(next) if next.is_empty() || !seen.insert(next.clone()) => {
+                    return Err(McpTransportError::Protocol(
+                        "MCP tools/list cursor loop detected".into(),
+                    ));
+                }
+                Some(next) => cursor = Some(next),
+                None => return Ok(tools),
+            }
         }
+        Err(McpTransportError::Protocol(
+            "MCP tools/list page limit exceeded".into(),
+        ))
     }
 
     pub fn call_tool(
         &mut self,
         name: impl Into<String>,
         arguments: Value,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<ToolOutput, McpTransportError> {
         if !arguments.is_object() {
             return Ok(ToolOutput::failure(
                 "mcp: tool arguments must be a JSON object",
             ));
         }
-
         match self.request(
             McpRequest::CallTool {
                 name: name.into(),
@@ -377,48 +576,47 @@ impl<'a, T: McpTransport> McpClient<'a, T> {
         &mut self,
         request: McpRequest,
         timeout: Duration,
-        cancellation: &AtomicBool,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<McpResponse, McpTransportError> {
-        let request_id = self.transport.begin(request)?;
-        let deadline = Instant::now() + timeout;
-
-        loop {
-            if cancellation.load(Ordering::Acquire) {
-                return self.abort(request_id, McpTransportError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                return self.abort(request_id, McpTransportError::TimedOut);
-            }
-
-            if let Some(response) = self.transport.poll(request_id.clone())? {
-                if cancellation.load(Ordering::Acquire) {
-                    return self.abort(request_id, McpTransportError::Cancelled);
+        let context = McpOperationContext::new(Arc::clone(cancellation), timeout);
+        if let Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) =
+            context.check()
+        {
+            return self.abort(&context, error);
+        }
+        match self.transport.execute(request, &context) {
+            Ok(response) => match context.check() {
+                Ok(()) => Ok(response),
+                Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
+                    self.abort(&context, error)
                 }
-                if Instant::now() >= deadline {
-                    return self.abort(request_id, McpTransportError::TimedOut);
-                }
-                return Ok(response);
+                Err(error) => Err(error),
+            },
+            Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
+                self.abort(&context, error)
             }
-
-            thread::sleep(MCP_POLL_INTERVAL);
+            Err(error) => Err(error),
         }
     }
 
     fn abort(
         &mut self,
-        request_id: McpRequestId,
-        error: McpTransportError,
+        context: &McpOperationContext,
+        primary: McpTransportError,
     ) -> Result<McpResponse, McpTransportError> {
-        // A response observed after cancellation or expiry is never accepted as success.
-        self.transport.cancel(request_id);
-        self.transport.close()?;
-        Err(error)
+        let _ = self.transport.close(context);
+        Err(primary)
+    }
+    fn close(&mut self) {
+        let context =
+            McpOperationContext::new(Arc::new(AtomicBool::new(false)), self.timeouts.connect);
+        let _ = self.transport.close(&context);
     }
 }
 
-fn expect_initialized(response: McpResponse) -> Result<(), McpTransportError> {
+fn expect_initialized(response: McpResponse) -> Result<McpInitializeResult, McpTransportError> {
     match response {
-        McpResponse::Initialized => Ok(()),
+        McpResponse::Initialized(result) => Ok(result),
         McpResponse::ProtocolError(error) => Err(protocol_error(error)),
         _ => Err(McpTransportError::Protocol(
             "expected initialize result".into(),
@@ -456,9 +654,11 @@ fn remote_tool_metadata(
             "MCP tool name is required".into(),
         ));
     }
-    if !tool.input_schema.is_object() {
+    if !tool.input_schema.is_object()
+        || tool.input_schema.get("type") != Some(&Value::String("object".into()))
+    {
         return Err(McpTransportError::Protocol(format!(
-            "MCP tool {} inputSchema must be a JSON object",
+            "MCP tool {} inputSchema must be a JSON Schema object with type object",
             tool.name
         )));
     }
