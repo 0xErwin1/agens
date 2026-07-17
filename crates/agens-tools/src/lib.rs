@@ -12,7 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agens_core::Error;
+use agens_core::{
+    Error, PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
+    ProjectPermissionGrant, ToolAccess,
+};
 use serde_json::Value;
 
 #[cfg(unix)]
@@ -733,6 +736,124 @@ fn has_duplicate_qualified_name(metadata: &[RemoteToolMetadata]) -> bool {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+}
+
+pub trait DispatchTool: Send {
+    fn execute(&mut self, arguments: Value) -> Result<ToolOutput, Error>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolDispatchRequest {
+    permission: PermissionRequest,
+    arguments: Value,
+}
+
+impl ToolDispatchRequest {
+    pub fn new(permission: PermissionRequest, arguments: Value) -> Self {
+        Self {
+            permission,
+            arguments,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolDispatchOutcome {
+    Denied,
+    PromptRequired,
+    Executed(ToolOutput),
+}
+
+struct RegisteredDispatchTool {
+    access: ToolAccess,
+    tool: Box<dyn DispatchTool>,
+}
+
+#[derive(Default)]
+pub struct ToolDispatcher {
+    native_tools: BTreeMap<String, RegisteredDispatchTool>,
+    mcp_tools: BTreeMap<String, RegisteredDispatchTool>,
+}
+
+impl ToolDispatcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register_native(
+        &mut self,
+        name: impl Into<String>,
+        access: ToolAccess,
+        tool: impl DispatchTool + 'static,
+    ) -> Result<(), Error> {
+        let name = name.into();
+        self.ensure_available_name(&name)?;
+        Self::insert(&mut self.native_tools, name, access, tool);
+        Ok(())
+    }
+
+    pub fn register_mcp(
+        &mut self,
+        qualified_name: impl Into<String>,
+        access: ToolAccess,
+        tool: impl DispatchTool + 'static,
+    ) -> Result<(), Error> {
+        let qualified_name = qualified_name.into();
+        self.ensure_available_name(&qualified_name)?;
+        Self::insert(&mut self.mcp_tools, qualified_name, access, tool);
+        Ok(())
+    }
+
+    pub fn dispatch(
+        &mut self,
+        policy: &PermissionPolicy,
+        grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+        request: ToolDispatchRequest,
+    ) -> Result<ToolDispatchOutcome, Error> {
+        let registered = self
+            .native_tools
+            .get_mut(&request.permission.tool)
+            .or_else(|| self.mcp_tools.get_mut(&request.permission.tool))
+            .ok_or_else(|| Error::Tool(format!("unknown tool: {}", request.permission.tool)))?;
+        let mut permission = request.permission;
+        permission.access = registered.access;
+
+        match policy.evaluate(&permission, grants, session) {
+            PermissionDecision::Deny => Ok(ToolDispatchOutcome::Denied),
+            PermissionDecision::Ask => Ok(ToolDispatchOutcome::PromptRequired),
+            PermissionDecision::Allow => registered
+                .tool
+                .execute(request.arguments)
+                .map(ToolDispatchOutcome::Executed),
+        }
+    }
+
+    fn ensure_available_name(&self, name: &str) -> Result<(), Error> {
+        if name.is_empty()
+            || self.native_tools.contains_key(name)
+            || self.mcp_tools.contains_key(name)
+        {
+            return Err(Error::Tool("tool name must be unique and non-empty".into()));
+        }
+
+        Ok(())
+    }
+
+    fn insert(
+        registry: &mut BTreeMap<String, RegisteredDispatchTool>,
+        name: String,
+        access: ToolAccess,
+        tool: impl DispatchTool + 'static,
+    ) {
+        registry.insert(
+            name,
+            RegisteredDispatchTool {
+                access,
+                tool: Box::new(tool),
+            },
+        );
+    }
 }
 
 impl ToolOutput {
