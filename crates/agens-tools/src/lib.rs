@@ -17,7 +17,7 @@ use agens_core::{
     ProjectPermissionGrant, ToolAccess,
 };
 use serde::Deserialize;
-use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
 #[cfg(unix)]
@@ -402,13 +402,13 @@ impl<'de> Visitor<'de> for SkillFrontmatterVisitor {
                     if name.is_some() {
                         return Err(de::Error::duplicate_field("name"));
                     }
-                    name = Some(map.next_value()?);
+                    name = Some(map.next_value_seed(YamlString)?);
                 }
                 "description" => {
                     if description.is_some() {
                         return Err(de::Error::duplicate_field("description"));
                     }
-                    description = Some(map.next_value()?);
+                    description = Some(map.next_value_seed(YamlString)?);
                 }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
@@ -420,6 +420,50 @@ impl<'de> Visitor<'de> for SkillFrontmatterVisitor {
             name: name.ok_or_else(|| de::Error::missing_field("name"))?,
             description: description.ok_or_else(|| de::Error::missing_field("description"))?,
         })
+    }
+}
+
+struct YamlString;
+
+impl<'de> DeserializeSeed<'de> for YamlString {
+    type Value = String;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(YamlStringVisitor)
+    }
+}
+
+struct YamlStringVisitor;
+
+impl Visitor<'_> for YamlStringVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a YAML string scalar")
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_owned())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(value)
     }
 }
 

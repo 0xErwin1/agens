@@ -353,6 +353,71 @@ fn isolates_semantically_equivalent_quoted_critical_keys() {
     assert_eq!(discovery.diagnostics().len(), 8);
 }
 
+#[test]
+fn rejects_non_string_critical_metadata_values_and_keeps_yaml_string_scalars() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    for (directory, value) in [
+        ("numeric-name", "123"),
+        ("boolean-name", "true"),
+        ("null-name", "null"),
+        ("sequence-name", "[not, text]"),
+        ("mapping-name", "{value: not-text}"),
+    ] {
+        write_skill(
+            &root,
+            directory,
+            &format!("---\nname: {value}\ndescription: valid\n---\nbody\n"),
+        );
+    }
+
+    for (directory, value) in [
+        ("numeric-description", "123"),
+        ("boolean-description", "true"),
+        ("null-description", "null"),
+        ("sequence-description", "[not, text]"),
+        ("mapping-description", "{value: not-text}"),
+    ] {
+        write_skill(
+            &root,
+            directory,
+            &format!("---\nname: {directory}\ndescription: {value}\n---\nbody\n"),
+        );
+    }
+
+    write_skill(
+        &root,
+        "quoted",
+        "---\nname: \"quoted\"\ndescription: 'quoted description'\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "folded",
+        "---\nname: folded\ndescription: >\n  folded description\n  remains text\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "literal",
+        "---\nname: literal\ndescription: |\n  literal description\n  remains text\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 3);
+    assert!(discovery.catalog().skill("quoted").is_some());
+    assert_eq!(
+        discovery.catalog().skill("folded").unwrap().description(),
+        "folded description remains text"
+    );
+    assert_eq!(
+        discovery.catalog().skill("literal").unwrap().description(),
+        "literal description\nremains text"
+    );
+    assert_eq!(discovery.diagnostics().len(), 10);
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_symlinked_roots_and_manifests_while_loading_valid_siblings() {
