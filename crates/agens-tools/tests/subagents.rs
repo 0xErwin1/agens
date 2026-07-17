@@ -140,6 +140,16 @@ fn cancellation_and_child_failures_are_isolated_as_sanitized_tool_results() {
     assert!(cancelled.is_error);
     assert_eq!(cancelled.content, "subagent: cancelled");
 
+    let still_active = tool.execute(
+        SubagentInvocation::new("researcher", "while cancelled child completes"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(
+        still_active.content,
+        "subagent: concurrent child limit reached"
+    );
+
+    thread::sleep(Duration::from_millis(80));
     let failure = tool.execute(
         SubagentInvocation::new("researcher", "fail without secrets"),
         Arc::new(AtomicBool::new(false)),
@@ -381,6 +391,40 @@ fn converts_panic_and_infrastructure_failures_to_distinct_sanitized_results() {
 }
 
 #[test]
+fn releases_the_permit_before_publishing_a_panic_result() {
+    for _ in 0..128 {
+        let temporary = TemporaryDirectory::new();
+        let skills_root = temporary.path.join("skills");
+        write_skill(
+            &skills_root,
+            "researcher",
+            "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+        );
+        let tool = SubagentTool::discover(
+            &skills_root,
+            temporary.path.join("missing"),
+            PanicThenSuccessfulRunner::default(),
+            SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+        )
+        .expect("discover subagent skill");
+
+        let panic = tool.execute(
+            SubagentInvocation::new("researcher", "panic"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(panic.content, "subagent: infrastructure failure");
+        assert!(!panic.content.contains("PARENT_PROVIDER_SECRET_SENTINEL"));
+
+        let next = tool.execute(
+            SubagentInvocation::new("researcher", "immediate next"),
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(next.content, "subagent: infrastructure failure");
+        assert_ne!(next.content, "subagent: concurrent child limit reached");
+    }
+}
+
+#[test]
 fn caps_combined_prompt_and_context_before_calling_the_runner() {
     let temporary = TemporaryDirectory::new();
     let skills_root = temporary.path.join("skills");
@@ -458,6 +502,7 @@ impl SubagentRunner for CancellableFailureRunner {
         if self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
             self.entered.wait();
             self.release.wait();
+            thread::sleep(Duration::from_millis(50));
         }
 
         if context.is_cancelled() {

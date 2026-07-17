@@ -1050,17 +1050,21 @@ impl<R: SubagentRunner> SubagentTool<R> {
         let worker_context = context.clone();
 
         thread::spawn(move || {
-            let _permit = permit;
-            install_subagent_panic_hook();
-            IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(true));
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let mut runner = runner
-                    .lock()
-                    .map_err(|_| SubagentRunnerError::InfrastructureFailure)?;
-                runner.run(request, &worker_context)
-            }))
-            .unwrap_or(Err(SubagentRunnerError::InfrastructureFailure));
-            IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(false));
+            let result = {
+                let _permit = permit;
+                install_subagent_panic_hook();
+                IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(true));
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut runner = runner
+                        .lock()
+                        .map_err(|_| SubagentRunnerError::InfrastructureFailure)?;
+                    runner.run(request, &worker_context)
+                }))
+                .unwrap_or(Err(SubagentRunnerError::InfrastructureFailure));
+                IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(false));
+
+                result
+            };
 
             let _ = sender.send(result);
         });
