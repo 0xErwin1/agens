@@ -758,9 +758,30 @@ impl ToolDispatchRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionPromptContext {
+    pub project_id: String,
+    pub qualified_tool_name: String,
+    pub target_identifier: String,
+    pub access: ToolAccess,
+    pub reason: String,
+}
+
+impl PermissionPromptContext {
+    fn from_request(request: &PermissionRequest) -> Self {
+        Self {
+            project_id: request.project.clone(),
+            qualified_tool_name: request.tool.clone(),
+            target_identifier: request.target.clone(),
+            access: request.access,
+            reason: "permission policy requires confirmation".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolDispatchOutcome {
     Denied,
-    PromptRequired,
+    PromptRequired(PermissionPromptContext),
     Executed(ToolOutput),
 }
 
@@ -794,13 +815,16 @@ impl ToolDispatcher {
 
     pub fn register_mcp(
         &mut self,
-        qualified_name: impl Into<String>,
-        access: ToolAccess,
+        metadata: &RemoteToolMetadata,
         tool: impl DispatchTool + 'static,
     ) -> Result<(), Error> {
-        let qualified_name = qualified_name.into();
-        self.ensure_available_name(&qualified_name)?;
-        Self::insert(&mut self.mcp_tools, qualified_name, access, tool);
+        self.ensure_available_name(&metadata.qualified_name)?;
+        Self::insert(
+            &mut self.mcp_tools,
+            metadata.qualified_name.clone(),
+            remote_tool_access(metadata.access),
+            tool,
+        );
         Ok(())
     }
 
@@ -818,10 +842,17 @@ impl ToolDispatcher {
             .ok_or_else(|| Error::Tool(format!("unknown tool: {}", request.permission.tool)))?;
         let mut permission = request.permission;
         permission.access = registered.access;
+        let grants = if permission.project.trim().is_empty() {
+            &[]
+        } else {
+            grants
+        };
 
         match policy.evaluate(&permission, grants, session) {
             PermissionDecision::Deny => Ok(ToolDispatchOutcome::Denied),
-            PermissionDecision::Ask => Ok(ToolDispatchOutcome::PromptRequired),
+            PermissionDecision::Ask => Ok(ToolDispatchOutcome::PromptRequired(
+                PermissionPromptContext::from_request(&permission),
+            )),
             PermissionDecision::Allow => registered
                 .tool
                 .execute(request.arguments)
@@ -853,6 +884,13 @@ impl ToolDispatcher {
                 tool: Box::new(tool),
             },
         );
+    }
+}
+
+fn remote_tool_access(access: RemoteToolAccess) -> ToolAccess {
+    match access {
+        RemoteToolAccess::ReadOnly => ToolAccess::ReadOnly,
+        RemoteToolAccess::Write => ToolAccess::Write,
     }
 }
 

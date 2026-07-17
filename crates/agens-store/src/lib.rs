@@ -7,6 +7,7 @@ use agens_core::{PermissionDecision, PermissionPattern, ProjectPermissionGrant};
 use rusqlite::{Connection, Transaction, params};
 
 const PERMISSIONS_DATABASE: &str = "rust-permissions.db";
+const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionGrantStoreError {
@@ -14,9 +15,12 @@ pub struct PermissionGrantStoreError {
 }
 
 impl PermissionGrantStoreError {
-    fn sqlite(error: rusqlite::Error) -> Self {
+    fn operation(operation: &str, path: &Path, error: impl fmt::Display) -> Self {
         Self {
-            message: error.to_string(),
+            message: format!(
+                "permission grants {operation} at {}: {error}",
+                path.display()
+            ),
         }
     }
 
@@ -42,29 +46,18 @@ pub struct PermissionGrantStore {
 
 impl PermissionGrantStore {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, PermissionGrantStoreError> {
-        fs::create_dir_all(data_directory.as_ref())
-            .map_err(|error| PermissionGrantStoreError::invalid(error.to_string()))?;
+        let data_directory = data_directory.as_ref();
+        fs::create_dir_all(data_directory).map_err(|error| {
+            PermissionGrantStoreError::operation("create data directory", data_directory, error)
+        })?;
+        restrict_permissions(data_directory, 0o700)?;
 
-        let database_path = data_directory.as_ref().join(PERMISSIONS_DATABASE);
-        let connection =
-            Connection::open(&database_path).map_err(PermissionGrantStoreError::sqlite)?;
-        connection
-            .execute_batch(
-                "
-                CREATE TABLE IF NOT EXISTS permission_grants (
-                    id INTEGER PRIMARY KEY,
-                    project TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    tool_kind TEXT NOT NULL,
-                    tool_value TEXT,
-                    target_kind TEXT NOT NULL,
-                    target_value TEXT
-                );
-                CREATE INDEX IF NOT EXISTS permission_grants_project
-                    ON permission_grants(project, id);
-                ",
-            )
-            .map_err(PermissionGrantStoreError::sqlite)?;
+        let database_path = data_directory.join(PERMISSIONS_DATABASE);
+        let connection = Connection::open(&database_path).map_err(|error| {
+            PermissionGrantStoreError::operation("open database", &database_path, error)
+        })?;
+        restrict_permissions(&database_path, 0o600)?;
+        initialize_schema(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -84,23 +77,22 @@ impl PermissionGrantStore {
             validate_grant(grant)?;
         }
 
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(PermissionGrantStoreError::sqlite)?;
+        let transaction = self.connection.transaction().map_err(|error| {
+            PermissionGrantStoreError::operation("start transaction", &self.database_path, error)
+        })?;
         for grant in grants {
             insert_grant(&transaction, grant)?;
         }
-        transaction
-            .commit()
-            .map_err(PermissionGrantStoreError::sqlite)
+        transaction.commit().map_err(|error| {
+            PermissionGrantStoreError::operation("commit transaction", &self.database_path, error)
+        })
     }
 
     pub fn grants_for_project(
         &self,
         project: &str,
     ) -> Result<Vec<ProjectPermissionGrant>, PermissionGrantStoreError> {
-        if project.is_empty() {
+        if project.trim().is_empty() {
             return Err(PermissionGrantStoreError::invalid("project is required"));
         }
 
@@ -110,7 +102,13 @@ impl PermissionGrantStore {
                 "SELECT decision, tool_kind, tool_value, target_kind, target_value
                  FROM permission_grants WHERE project = ?1 ORDER BY id",
             )
-            .map_err(PermissionGrantStoreError::sqlite)?;
+            .map_err(|error| {
+                PermissionGrantStoreError::operation(
+                    "prepare project lookup",
+                    &self.database_path,
+                    error,
+                )
+            })?;
         let rows = statement
             .query_map([project], |row| {
                 Ok((
@@ -121,11 +119,23 @@ impl PermissionGrantStore {
                     row.get::<_, Option<String>>(4)?,
                 ))
             })
-            .map_err(PermissionGrantStoreError::sqlite)?;
+            .map_err(|error| {
+                PermissionGrantStoreError::operation(
+                    "query project grants",
+                    &self.database_path,
+                    error,
+                )
+            })?;
 
         rows.map(|row| {
             let (decision, tool_kind, tool_value, target_kind, target_value) =
-                row.map_err(PermissionGrantStoreError::sqlite)?;
+                row.map_err(|error| {
+                    PermissionGrantStoreError::operation(
+                        "read project grants",
+                        &self.database_path,
+                        error,
+                    )
+                })?;
             Ok(ProjectPermissionGrant::new(
                 project,
                 decode_decision(&decision)?,
@@ -135,6 +145,87 @@ impl PermissionGrantStore {
         })
         .collect()
     }
+}
+
+fn initialize_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), PermissionGrantStoreError> {
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| {
+            PermissionGrantStoreError::operation("read schema version", database_path, error)
+        })?;
+
+    match version {
+        0 => connection
+            .execute_batch(&format!(
+                "
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS permission_grants (
+                    id INTEGER PRIMARY KEY,
+                    project TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    tool_kind TEXT NOT NULL,
+                    tool_value TEXT,
+                    target_kind TEXT NOT NULL,
+                    target_value TEXT
+                );
+                CREATE INDEX IF NOT EXISTS permission_grants_project
+                    ON permission_grants(project, id);
+                PRAGMA user_version = {PERMISSIONS_SCHEMA_VERSION};
+                COMMIT;
+                "
+            ))
+            .map_err(|error| {
+                PermissionGrantStoreError::operation("initialize schema", database_path, error)
+            }),
+        PERMISSIONS_SCHEMA_VERSION => verify_schema(connection, database_path),
+        unsupported => Err(PermissionGrantStoreError::operation(
+            "check schema version",
+            database_path,
+            format!("unsupported schema version {unsupported}"),
+        )),
+    }
+}
+
+fn verify_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), PermissionGrantStoreError> {
+    connection
+        .prepare(
+            "SELECT project, decision, tool_kind, tool_value, target_kind, target_value
+             FROM permission_grants LIMIT 0",
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            PermissionGrantStoreError::operation("verify schema", database_path, error)
+        })
+}
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), PermissionGrantStoreError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::metadata(path).map_err(|error| {
+        PermissionGrantStoreError::operation("inspect permissions", path, error)
+    })?;
+    let current_mode = metadata.mode() & 0o777;
+    let restricted_mode = current_mode & maximum_mode;
+
+    if restricted_mode != current_mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(restricted_mode)).map_err(
+            |error| PermissionGrantStoreError::operation("restrict permissions", path, error),
+        )?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_: &Path, _: u32) -> Result<(), PermissionGrantStoreError> {
+    Ok(())
 }
 
 fn insert_grant(
@@ -157,12 +248,12 @@ fn insert_grant(
                 target_value,
             ],
         )
-        .map_err(PermissionGrantStoreError::sqlite)?;
+        .map_err(|error| PermissionGrantStoreError::invalid(error.to_string()))?;
     Ok(())
 }
 
 fn validate_grant(grant: &ProjectPermissionGrant) -> Result<(), PermissionGrantStoreError> {
-    if grant.project.is_empty() {
+    if grant.project.trim().is_empty() {
         return Err(PermissionGrantStoreError::invalid("project is required"));
     }
 
