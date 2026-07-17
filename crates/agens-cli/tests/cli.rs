@@ -2,6 +2,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agens::{CliDependencies, ExitStatus, execute, execute_os};
+use agens_core::{
+    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
+    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
+    PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
+};
+use agens_store::SessionStore;
 
 #[test]
 fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
@@ -359,6 +365,165 @@ fn non_utf8_os_arguments_are_rejected_without_echoing_input() {
         "error: usage: command arguments must be valid UTF-8\n"
     );
     assert!(!result.stderr.contains("SECRET"));
+}
+
+#[test]
+fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume() {
+    let temporary = TemporaryDirectory::new("headless-e2e");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
+        )]),
+    )
+    .with_headless_chat(|_, bootstrap| {
+        let mut provider = LocalProvider {
+            iterations: vec![
+                Ok(vec![
+                    MessagePart::ToolCall {
+                        id: "ask".into(),
+                        name: "read".into(),
+                        input: "notes.md".into(),
+                    },
+                    MessagePart::ToolCall {
+                        id: "deny".into(),
+                        name: "write".into(),
+                        input: "notes.md".into(),
+                    },
+                    MessagePart::ToolCall {
+                        id: "allow".into(),
+                        name: "search".into(),
+                        input: "runtime".into(),
+                    },
+                ]),
+                Ok(vec![MessagePart::Text("completed locally".into())]),
+            ],
+        };
+        let mut gate = LocalPermissionGate {
+            decisions: vec![
+                PermissionDecision::Ask,
+                PermissionDecision::Deny,
+                PermissionDecision::Allow,
+            ],
+        };
+        let mut resolver = LocalPermissionResolver {
+            decisions: vec![PermissionDecision::Allow],
+        };
+        let mut dispatcher = LocalToolDispatcher {
+            outputs: vec![
+                Ok(HeadlessToolOutput::success("asked result")),
+                Ok(HeadlessToolOutput::success("allowed result")),
+            ],
+        };
+        let mut store = SessionStore::open(bootstrap.data_directory())
+            .expect("local session store should open");
+
+        let snapshot = block_on_ready(run_headless_turn(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut dispatcher,
+            &mut store,
+            &LocalCancellation,
+        ))
+        .expect("local headless turn should complete");
+
+        Ok(format!("{} events", snapshot.events().len()))
+    });
+
+    let chat = execute(["chat", "hello"], &dependencies);
+    let sessions = execute(["sessions", "list"], &dependencies);
+    let resumed = execute(["sessions", "show", "1"], &dependencies);
+
+    assert_eq!(chat.status, ExitStatus::Success);
+    assert_eq!(chat.stdout, "16 events\n");
+    assert_eq!(sessions.status, ExitStatus::Success);
+    assert_eq!(sessions.stdout, "ID\tEVENTS\n1\t16 event(s)\n");
+    assert_eq!(resumed.status, ExitStatus::Success);
+    assert_eq!(resumed.stdout, "Session 1: 16 event(s)\n");
+    assert!(!format!("{}{}{}", chat.stdout, sessions.stdout, resumed.stdout).contains("secret"));
+}
+
+struct LocalProvider {
+    iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
+}
+
+impl TurnProvider for LocalProvider {
+    fn next_parts(
+        &mut self,
+        _events: &[TurnEvent],
+    ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(self.iterations.remove(0))
+    }
+}
+
+struct LocalPermissionGate {
+    decisions: Vec<PermissionDecision>,
+}
+
+impl HeadlessPermissionGate for LocalPermissionGate {
+    fn evaluate(
+        &mut self,
+        _call: &HeadlessToolCall,
+    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Ok(self.decisions.remove(0)))
+    }
+}
+
+struct LocalPermissionResolver {
+    decisions: Vec<PermissionDecision>,
+}
+
+impl HeadlessPermissionResolver for LocalPermissionResolver {
+    fn resolve(
+        &mut self,
+        _call: &HeadlessToolCall,
+    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Ok(self.decisions.remove(0)))
+    }
+}
+
+struct LocalToolDispatcher {
+    outputs: Vec<Result<HeadlessToolOutput, HeadlessTurnPortError>>,
+}
+
+impl HeadlessToolDispatcher for LocalToolDispatcher {
+    fn dispatch(
+        &mut self,
+        _call: HeadlessToolCall,
+    ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(self.outputs.remove(0))
+    }
+}
+
+struct LocalCancellation;
+
+impl HeadlessTurnCancellation for LocalCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+    match future.as_mut().poll(context) {
+        std::task::Poll::Ready(value) => value,
+        std::task::Poll::Pending => panic!("local test ports must complete immediately"),
+    }
 }
 
 struct TemporaryDirectory {

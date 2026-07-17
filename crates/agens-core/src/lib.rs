@@ -520,6 +520,238 @@ impl TurnCoordinator {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadlessToolCall {
+    pub id: String,
+    pub name: String,
+    pub input: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadlessToolOutput {
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl HeadlessToolOutput {
+    pub fn success(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    pub fn failure(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadlessTurnPortError {
+    Cancelled,
+    Provider,
+    Permission,
+    Tool,
+}
+
+pub trait TurnProvider {
+    fn next_parts(
+        &mut self,
+        events: &[TurnEvent],
+    ) -> impl Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send;
+}
+
+pub trait HeadlessPermissionGate {
+    fn evaluate(
+        &mut self,
+        call: &HeadlessToolCall,
+    ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
+}
+
+pub trait HeadlessPermissionResolver {
+    fn resolve(
+        &mut self,
+        call: &HeadlessToolCall,
+    ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
+}
+
+pub trait HeadlessToolDispatcher {
+    fn dispatch(
+        &mut self,
+        call: HeadlessToolCall,
+    ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send;
+}
+
+pub trait HeadlessTurnCancellation {
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadlessTurnError {
+    Cancelled,
+    Provider,
+    Permission,
+    Tool,
+    Store,
+    State,
+}
+
+impl fmt::Display for HeadlessTurnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Cancelled => "turn cancelled",
+            Self::Provider => "provider operation failed",
+            Self::Permission => "permission operation failed",
+            Self::Tool => "tool operation failed",
+            Self::Store => "completed turn could not be saved",
+            Self::State => "invalid headless turn state",
+        };
+
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for HeadlessTurnError {}
+
+pub async fn run_headless_turn(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &impl HeadlessTurnCancellation,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    let mut coordinator = TurnCoordinator::new();
+    coordinator.begin().map_err(|_| HeadlessTurnError::State)?;
+
+    loop {
+        check_cancelled(&mut coordinator, cancellation)?;
+
+        let parts = provider
+            .next_parts(coordinator.events())
+            .await
+            .map_err(|error| {
+                finish_port_error(&mut coordinator, error, HeadlessTurnError::Provider)
+            })?;
+        let tool_calls = parts
+            .iter()
+            .filter_map(headless_tool_call)
+            .collect::<Vec<_>>();
+
+        for part in parts {
+            coordinator
+                .accept_provider_part(part)
+                .map_err(|_| fail_state(&mut coordinator))?;
+        }
+
+        coordinator
+            .finish_provider_iteration()
+            .map_err(|_| fail_state(&mut coordinator))?;
+
+        if coordinator.state() == TurnState::Completed {
+            coordinator
+                .persist_completed_turn(repository)
+                .await
+                .map_err(|_| HeadlessTurnError::Store)?;
+
+            return CompletedTurnSnapshot::from_persisted_events(coordinator.events().to_vec())
+                .map_err(|_| HeadlessTurnError::State);
+        }
+
+        for call in tool_calls {
+            check_cancelled(&mut coordinator, cancellation)?;
+
+            let decision = permission_gate.evaluate(&call).await.map_err(|error| {
+                finish_port_error(&mut coordinator, error, HeadlessTurnError::Permission)
+            })?;
+            let decision =
+                resolve_permission_decision(decision, &call, permission_resolver, &mut coordinator)
+                    .await?;
+
+            let output = match decision {
+                PermissionDecision::Allow => {
+                    dispatcher.dispatch(call.clone()).await.map_err(|error| {
+                        finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
+                    })?
+                }
+                PermissionDecision::Deny => HeadlessToolOutput::failure("permission denied"),
+                PermissionDecision::Ask => return Err(fail_state(&mut coordinator)),
+            };
+
+            coordinator
+                .accept_tool_result(&call.id, output.content, output.is_error)
+                .map_err(|_| fail_state(&mut coordinator))?;
+        }
+    }
+}
+
+fn headless_tool_call(part: &MessagePart) -> Option<HeadlessToolCall> {
+    let MessagePart::ToolCall { id, name, input } = part else {
+        return None;
+    };
+
+    Some(HeadlessToolCall {
+        id: id.clone(),
+        name: name.clone(),
+        input: input.clone(),
+    })
+}
+
+async fn resolve_permission_decision(
+    decision: PermissionDecision,
+    call: &HeadlessToolCall,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    coordinator: &mut TurnCoordinator,
+) -> Result<PermissionDecision, HeadlessTurnError> {
+    if decision != PermissionDecision::Ask {
+        return Ok(decision);
+    }
+
+    permission_resolver
+        .resolve(call)
+        .await
+        .map_err(|error| finish_port_error(coordinator, error, HeadlessTurnError::Permission))
+}
+
+fn check_cancelled(
+    coordinator: &mut TurnCoordinator,
+    cancellation: &impl HeadlessTurnCancellation,
+) -> Result<(), HeadlessTurnError> {
+    if !cancellation.is_cancelled() {
+        return Ok(());
+    }
+
+    coordinator.cancel().map_err(|_| HeadlessTurnError::State)?;
+    Err(HeadlessTurnError::Cancelled)
+}
+
+fn finish_port_error(
+    coordinator: &mut TurnCoordinator,
+    error: HeadlessTurnPortError,
+    failure: HeadlessTurnError,
+) -> HeadlessTurnError {
+    if error == HeadlessTurnPortError::Cancelled {
+        return coordinator
+            .cancel()
+            .map(|()| HeadlessTurnError::Cancelled)
+            .unwrap_or(HeadlessTurnError::State);
+    }
+
+    if coordinator.fail().is_err() {
+        HeadlessTurnError::State
+    } else {
+        failure
+    }
+}
+
+fn fail_state(coordinator: &mut TurnCoordinator) -> HeadlessTurnError {
+    let _ = coordinator.fail();
+    HeadlessTurnError::State
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
