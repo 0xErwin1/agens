@@ -1,5 +1,6 @@
 use agens_core::{
-    Error, ErrorCategory, Message, MessagePart, Role, TurnState, TurnTransitionError,
+    Error, ErrorCategory, Message, MessagePart, Role, TurnCoordinator, TurnEvent, TurnEventError,
+    TurnState, TurnTransitionError,
 };
 
 #[test]
@@ -124,4 +125,148 @@ fn invalid_and_terminal_turn_transitions_return_typed_source_and_target_errors()
             format!("invalid turn state transition: {source:?} -> Requesting")
         );
     }
+}
+
+#[test]
+fn coordinator_emits_deterministic_events_for_two_tool_iterations() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Reasoning("inspect the repository".into()))
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "search".into(),
+            input: "{\"query\":\"core\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result("call-1", "found core".into(), false)
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("continue".into()))
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-2".into(),
+            name: "read".into(),
+            input: "{\"path\":\"Cargo.toml\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result("call-2", "package manifest".into(), false)
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("complete".into()))
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    assert_eq!(coordinator.state(), TurnState::Completed);
+    assert_eq!(
+        coordinator.events(),
+        &[
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Reasoning("inspect the repository".into())),
+            TurnEvent::ProviderPart(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: "{\"query\":\"core\"}".into(),
+            }),
+            TurnEvent::StateChanged(TurnState::Dispatching),
+            TurnEvent::ToolCallRequested {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: "{\"query\":\"core\"}".into(),
+            },
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "found core".into(),
+                is_error: false,
+            }),
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("continue".into())),
+            TurnEvent::ProviderPart(MessagePart::ToolCall {
+                id: "call-2".into(),
+                name: "read".into(),
+                input: "{\"path\":\"Cargo.toml\"}".into(),
+            }),
+            TurnEvent::StateChanged(TurnState::Dispatching),
+            TurnEvent::ToolCallRequested {
+                id: "call-2".into(),
+                name: "read".into(),
+                input: "{\"path\":\"Cargo.toml\"}".into(),
+            },
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-2".into(),
+                content: "package manifest".into(),
+                is_error: false,
+            }),
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("complete".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ]
+    );
+}
+
+#[test]
+fn coordinator_rejects_out_of_order_and_uncorrelated_tool_results() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    assert_eq!(
+        coordinator.accept_tool_result("call-1", "result".into(), false),
+        Err(TurnEventError::UnexpectedToolResult {
+            tool_call_id: "call-1".into(),
+        })
+    );
+
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "search".into(),
+            input: "{}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    assert_eq!(
+        coordinator.accept_tool_result("call-2", "result".into(), false),
+        Err(TurnEventError::UnexpectedToolResult {
+            tool_call_id: "call-2".into(),
+        })
+    );
+}
+
+#[test]
+fn cancellation_and_failure_reject_all_further_events() {
+    let mut cancelled = TurnCoordinator::new();
+
+    cancelled.begin().unwrap();
+    cancelled.cancel().unwrap();
+    assert_eq!(
+        cancelled.accept_provider_part(MessagePart::Text("late".into())),
+        Err(TurnEventError::Transition(TurnTransitionError {
+            source: TurnState::Cancelled,
+            target: TurnState::Streaming,
+        }))
+    );
+
+    let mut failed = TurnCoordinator::new();
+
+    failed.begin().unwrap();
+    failed.fail().unwrap();
+    assert_eq!(
+        failed.finish_provider_iteration(),
+        Err(TurnEventError::Transition(TurnTransitionError {
+            source: TurnState::Failed,
+            target: TurnState::Streaming,
+        }))
+    );
 }
