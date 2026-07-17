@@ -32,6 +32,443 @@ const DEFAULT_MAX_SEARCH_DEPTH: usize = 32;
 const DEFAULT_FILE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_MCP_LIST_PAGES: usize = 128;
 const DEFAULT_MAX_MCP_TOOLS: usize = 1_000;
+const SKILL_MANIFEST_NAME: &str = "SKILL.md";
+const MAX_SKILL_DIRECTORIES_PER_ROOT: usize = 128;
+const MAX_SKILL_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_SKILL_NAME_CHARS: usize = 64;
+const MAX_SKILL_DESCRIPTION_CHARS: usize = 1_024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skill {
+    name: String,
+    description: String,
+    body: String,
+    source: PathBuf,
+}
+
+impl Skill {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillCatalog {
+    skills: Vec<Skill>,
+    positions: BTreeMap<String, usize>,
+}
+
+impl SkillCatalog {
+    pub fn discover(
+        global_root: impl AsRef<Path>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<SkillDiscovery, SkillDiscoveryError> {
+        let global = load_skill_root(global_root.as_ref())?;
+        let project = load_skill_root(project_root.as_ref())?;
+        let mut catalog = Self::default();
+        let mut diagnostics = global.diagnostics;
+        let mut shadowed = Vec::new();
+
+        for skill in global.skills {
+            catalog.insert(skill);
+        }
+
+        diagnostics.extend(project.diagnostics);
+        for skill in project.skills {
+            if let Some(previous) = catalog.skill(skill.name()) {
+                shadowed.push(SkillShadow {
+                    name: skill.name.clone(),
+                    global_source: previous.source.clone(),
+                    project_source: skill.source.clone(),
+                });
+            }
+            catalog.insert(skill);
+        }
+
+        Ok(SkillDiscovery {
+            catalog,
+            diagnostics,
+            shadowed,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.skills.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty()
+    }
+
+    pub fn skill(&self, name: &str) -> Option<&Skill> {
+        self.positions
+            .get(name)
+            .map(|position| &self.skills[*position])
+    }
+
+    pub fn skills(&self) -> impl ExactSizeIterator<Item = &Skill> {
+        self.skills.iter()
+    }
+
+    fn insert(&mut self, skill: Skill) {
+        if let Some(position) = self.positions.get(skill.name()).copied() {
+            self.skills[position] = skill;
+            return;
+        }
+
+        self.positions.insert(skill.name.clone(), self.skills.len());
+        self.skills.push(skill);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDiscovery {
+    catalog: SkillCatalog,
+    diagnostics: Vec<SkillDiagnostic>,
+    shadowed: Vec<SkillShadow>,
+}
+
+impl SkillDiscovery {
+    pub fn catalog(&self) -> &SkillCatalog {
+        &self.catalog
+    }
+
+    pub fn diagnostics(&self) -> &[SkillDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn shadowed(&self) -> &[SkillShadow] {
+        &self.shadowed
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillDiagnostic {
+    path: PathBuf,
+    message: String,
+}
+
+impl SkillDiagnostic {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillShadow {
+    name: String,
+    global_source: PathBuf,
+    project_source: PathBuf,
+}
+
+impl SkillShadow {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn global_source(&self) -> &Path {
+        &self.global_source
+    }
+
+    pub fn project_source(&self) -> &Path {
+        &self.project_source
+    }
+}
+
+#[derive(Debug)]
+pub struct SkillDiscoveryError {
+    path: PathBuf,
+    operation: &'static str,
+    source: io::Error,
+}
+
+impl fmt::Display for SkillDiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot {} skill root {}: {}",
+            self.operation,
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for SkillDiscoveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+struct SkillRootLoad {
+    skills: Vec<Skill>,
+    diagnostics: Vec<SkillDiagnostic>,
+}
+
+fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SkillRootLoad {
+                skills: Vec::new(),
+                diagnostics: Vec::new(),
+            });
+        }
+        Err(error) => return Err(skill_root_error(root, "inspect", error)),
+    };
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(skill_root_error(
+            root,
+            "use",
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "root must be a non-symbolic-link directory",
+            ),
+        ));
+    }
+
+    let root = fs::canonicalize(root).map_err(|error| skill_root_error(root, "resolve", error))?;
+    let mut entries = fs::read_dir(&root)
+        .map_err(|error| skill_root_error(&root, "read", error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| skill_root_error(&root, "read", error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut diagnostics = Vec::new();
+    if entries.len() > MAX_SKILL_DIRECTORIES_PER_ROOT {
+        diagnostics.push(skill_diagnostic(
+            &root,
+            format!(
+                "skill directory limit of {MAX_SKILL_DIRECTORIES_PER_ROOT} exceeded; later entries were skipped"
+            ),
+        ));
+        entries.truncate(MAX_SKILL_DIRECTORIES_PER_ROOT);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let directory = entry.path();
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                diagnostics.push(skill_diagnostic(
+                    &directory,
+                    format!("cannot inspect: {error}"),
+                ));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            diagnostics.push(skill_diagnostic(
+                &directory,
+                "symbolic-link skill directories are not allowed".into(),
+            ));
+            continue;
+        }
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        match load_skill_manifest(&root, &directory) {
+            Ok(Some(skill)) => candidates.push(skill),
+            Ok(None) => {}
+            Err(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+
+    let mut ambiguous = BTreeMap::<String, usize>::new();
+    for skill in &candidates {
+        *ambiguous.entry(skill.name.clone()).or_default() += 1;
+    }
+    let mut skills = Vec::new();
+    for skill in candidates {
+        if ambiguous[&skill.name] == 1 {
+            skills.push(skill);
+        } else {
+            diagnostics.push(skill_diagnostic(
+                &skill.source,
+                format!("duplicate skill name {} in the same root", skill.name),
+            ));
+        }
+    }
+
+    Ok(SkillRootLoad {
+        skills,
+        diagnostics,
+    })
+}
+
+fn load_skill_manifest(root: &Path, directory: &Path) -> Result<Option<Skill>, SkillDiagnostic> {
+    let manifest = directory.join(SKILL_MANIFEST_NAME);
+    let metadata = match fs::symlink_metadata(&manifest) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(skill_diagnostic(
+                &manifest,
+                format!("cannot inspect: {error}"),
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(skill_diagnostic(
+            &manifest,
+            "manifest must be a regular non-symbolic-link file".into(),
+        ));
+    }
+    if metadata.len() > MAX_SKILL_MANIFEST_BYTES {
+        return Err(skill_diagnostic(
+            &manifest,
+            format!("manifest exceeds {MAX_SKILL_MANIFEST_BYTES} byte limit"),
+        ));
+    }
+
+    let resolved_manifest = fs::canonicalize(&manifest)
+        .map_err(|error| skill_diagnostic(&manifest, format!("cannot resolve: {error}")))?;
+    if !resolved_manifest.starts_with(root) || resolved_manifest.parent() != Some(directory) {
+        return Err(skill_diagnostic(
+            &manifest,
+            "manifest resolves outside its direct skill directory".into(),
+        ));
+    }
+
+    let contents = fs::read_to_string(&resolved_manifest).map_err(|error| {
+        skill_diagnostic(&manifest, format!("cannot read UTF-8 manifest: {error}"))
+    })?;
+    parse_skill_manifest(&resolved_manifest, &contents)
+        .map(Some)
+        .map_err(|message| skill_diagnostic(&manifest, message))
+}
+
+fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> {
+    let mut lines = contents.lines();
+    if lines.next() != Some("---") {
+        return Err("frontmatter must begin with ---".into());
+    }
+
+    let mut name = None;
+    let mut description = None;
+    let mut found_closing_delimiter = false;
+    for line in lines.by_ref() {
+        if line == "---" {
+            found_closing_delimiter = true;
+            break;
+        }
+        let (key, value) = line
+            .split_once(':')
+            .ok_or_else(|| "frontmatter entries must use key: value".to_string())?;
+        let value = unquote_frontmatter_value(value.trim())?;
+        match key.trim() {
+            "name" => {
+                if name.is_some() {
+                    return Err("frontmatter field is duplicated".into());
+                }
+                name = Some(value);
+            }
+            "description" => {
+                if description.is_some() {
+                    return Err("frontmatter field is duplicated".into());
+                }
+                description = Some(value);
+            }
+            _ => {}
+        }
+    }
+    if !found_closing_delimiter {
+        return Err("frontmatter closing --- is required".into());
+    }
+
+    let name = name.ok_or_else(|| "frontmatter name is required".to_string())?;
+    let description =
+        description.ok_or_else(|| "frontmatter description is required".to_string())?;
+    validate_skill_name(&name)?;
+    validate_skill_description(&description)?;
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
+    if body.is_empty() {
+        return Err("markdown body is required".into());
+    }
+
+    Ok(Skill {
+        name,
+        description,
+        body,
+        source: source.to_path_buf(),
+    })
+}
+
+fn unquote_frontmatter_value(value: &str) -> Result<String, String> {
+    let quoted = value.starts_with('"') || value.starts_with('\'');
+    if !quoted {
+        return Ok(value.to_owned());
+    }
+    if value.len() < 2 || !value.ends_with(value.chars().next().expect("non-empty value")) {
+        return Err("frontmatter quoted value is not terminated".into());
+    }
+    Ok(value[1..value.len() - 1].to_owned())
+}
+
+fn validate_skill_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.chars().count() > MAX_SKILL_NAME_CHARS {
+        return Err(format!(
+            "name must contain 1 to {MAX_SKILL_NAME_CHARS} characters"
+        ));
+    }
+    if name
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("name cannot contain whitespace or control characters".into());
+    }
+    Ok(())
+}
+
+fn validate_skill_description(description: &str) -> Result<(), String> {
+    if description.trim().is_empty() || description.chars().count() > MAX_SKILL_DESCRIPTION_CHARS {
+        return Err(format!(
+            "description must contain 1 to {MAX_SKILL_DESCRIPTION_CHARS} characters"
+        ));
+    }
+    if description.chars().any(char::is_control) {
+        return Err("description cannot contain control characters".into());
+    }
+    Ok(())
+}
+
+fn skill_root_error(
+    root: &Path,
+    operation: &'static str,
+    source: io::Error,
+) -> SkillDiscoveryError {
+    SkillDiscoveryError {
+        path: root.to_path_buf(),
+        operation,
+        source,
+    }
+}
+
+fn skill_diagnostic(path: &Path, message: String) -> SkillDiagnostic {
+    SkillDiagnostic {
+        path: path.to_path_buf(),
+        message,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpInitialize {
