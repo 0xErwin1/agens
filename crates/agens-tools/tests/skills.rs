@@ -209,6 +209,7 @@ fn rejects_unsafe_names_and_keeps_valid_siblings() {
         ("separator", "nested/name"),
         ("leading-hyphen", "-bad"),
         ("trailing-hyphen", "bad-"),
+        ("consecutive-hyphens", "bad--hyphen"),
         ("uppercase", "Bad"),
     ] {
         write_skill(
@@ -228,7 +229,7 @@ fn rejects_unsafe_names_and_keeps_valid_siblings() {
 
     assert_eq!(discovery.catalog().len(), 1);
     assert!(discovery.catalog().skill("valid-name-2").is_some());
-    assert_eq!(discovery.diagnostics().len(), 5);
+    assert_eq!(discovery.diagnostics().len(), 6);
 }
 
 #[test]
@@ -292,6 +293,64 @@ fn isolates_duplicate_critical_fields_and_malformed_frontmatter_delimiters() {
     assert_eq!(discovery.catalog().len(), 1);
     assert!(discovery.catalog().skill("valid").is_some());
     assert_eq!(discovery.diagnostics().len(), 4);
+}
+
+#[test]
+fn isolates_semantically_equivalent_quoted_critical_keys() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    for (directory, contents) in [
+        (
+            "double-quoted-name-first",
+            "---\n\"name\" : first\nname: second\ndescription: valid\n---\nbody\n",
+        ),
+        (
+            "double-quoted-name-second",
+            "---\nname: first\n  \"name\"  : second\ndescription: valid\n---\nbody\n",
+        ),
+        (
+            "single-quoted-name-first",
+            "---\n'name' : first\nname: second\ndescription: valid\n---\nbody\n",
+        ),
+        (
+            "single-quoted-name-second",
+            "---\nname: first\n  'name'  : second\ndescription: valid\n---\nbody\n",
+        ),
+        (
+            "double-quoted-description-first",
+            "---\nname: valid\n\"description\" : >\n  folded first description\ndescription: second description\n---\nbody\n",
+        ),
+        (
+            "double-quoted-description-second",
+            "---\nname: valid\ndescription: first description\n  \"description\"  : >\n    folded second description\n---\nbody\n",
+        ),
+        (
+            "single-quoted-description-first",
+            "---\nname: valid\n'description' : >\n  folded first description\ndescription: second description\n---\nbody\n",
+        ),
+        (
+            "single-quoted-description-second",
+            "---\nname: valid\ndescription: first description\n  'description'  : >\n    folded second description\n---\nbody\n",
+        ),
+    ] {
+        write_skill(&root, directory, contents);
+    }
+    write_skill(
+        &root,
+        "valid",
+        "---\n\"name\": valid\n'description': >\n  valid folded description\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 1);
+    assert_eq!(
+        discovery.catalog().skill("valid").unwrap().description(),
+        "valid folded description"
+    );
+    assert_eq!(discovery.diagnostics().len(), 8);
 }
 
 #[cfg(unix)]

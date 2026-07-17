@@ -50,6 +50,7 @@ dependencies = [
  "agens-config",
  "agens-core",
  "libc",
+ "serde",
  "serde_json",
  "serde_yaml",
 ]

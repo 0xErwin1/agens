@@ -16,6 +16,8 @@ use agens_core::{
     Error, PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
     ProjectPermissionGrant, ToolAccess,
 };
+use serde::Deserialize;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
 #[cfg(unix)]
@@ -345,11 +347,10 @@ fn load_skill_manifest(
 
 fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> {
     let (frontmatter, body) = split_skill_frontmatter(contents)?;
-    validate_critical_frontmatter_fields(frontmatter)?;
-    let mut fields: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(frontmatter)
+    let fields: SkillFrontmatter = serde_yaml::from_str(frontmatter)
         .map_err(|error| format!("invalid frontmatter: {error}"))?;
-    let name = required_frontmatter_string(&mut fields, "name")?;
-    let description = required_frontmatter_string(&mut fields, "description")?;
+    let name = fields.name.trim().to_owned();
+    let description = fields.description.trim().to_owned();
     validate_skill_name(&name)?;
     validate_skill_description(&description)?;
     let body = body.trim().to_owned();
@@ -365,28 +366,61 @@ fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> 
     })
 }
 
-fn validate_critical_frontmatter_fields(frontmatter: &str) -> Result<(), String> {
-    let mut names = 0;
-    let mut descriptions = 0;
+struct SkillFrontmatter {
+    name: String,
+    description: String,
+}
 
-    for line in frontmatter.lines() {
-        if line.chars().next().is_some_and(char::is_whitespace) {
-            continue;
-        }
-        let Some((key, _)) = line.split_once(':') else {
-            continue;
-        };
-        match key.trim() {
-            "name" => names += 1,
-            "description" => descriptions += 1,
-            _ => {}
-        }
+impl<'de> Deserialize<'de> for SkillFrontmatter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SkillFrontmatterVisitor)
+    }
+}
+
+struct SkillFrontmatterVisitor;
+
+impl<'de> Visitor<'de> for SkillFrontmatterVisitor {
+    type Value = SkillFrontmatter;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a skill frontmatter mapping")
     }
 
-    if names > 1 || descriptions > 1 {
-        return Err("frontmatter critical field is duplicated".into());
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut name = None;
+        let mut description = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(de::Error::duplicate_field("name"));
+                    }
+                    name = Some(map.next_value()?);
+                }
+                "description" => {
+                    if description.is_some() {
+                        return Err(de::Error::duplicate_field("description"));
+                    }
+                    description = Some(map.next_value()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        Ok(SkillFrontmatter {
+            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            description: description.ok_or_else(|| de::Error::missing_field("description"))?,
+        })
     }
-    Ok(())
 }
 
 fn split_skill_frontmatter(contents: &str) -> Result<(&str, &str), String> {
@@ -424,17 +458,6 @@ fn split_skill_frontmatter(contents: &str) -> Result<(&str, &str), String> {
     Err("frontmatter closing --- is required".into())
 }
 
-fn required_frontmatter_string(
-    fields: &mut BTreeMap<String, serde_yaml::Value>,
-    field: &str,
-) -> Result<String, String> {
-    match fields.remove(field) {
-        Some(serde_yaml::Value::String(value)) => Ok(value.trim().to_owned()),
-        Some(_) => Err(format!("frontmatter {field} must be a string")),
-        None => Err(format!("frontmatter {field} is required")),
-    }
-}
-
 fn validate_skill_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.chars().count() > MAX_SKILL_NAME_CHARS {
         return Err(format!(
@@ -447,6 +470,7 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
         || bytes
             .iter()
             .any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && *byte != b'-')
+        || name.contains("--")
     {
         return Err("name must use lowercase ASCII letters, digits, and internal hyphens".into());
     }
