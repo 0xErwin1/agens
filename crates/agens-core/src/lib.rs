@@ -45,7 +45,44 @@ impl TurnState {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
     }
+
+    pub const fn transition_to(self, target: Self) -> Result<Self, TurnTransitionError> {
+        match (self, target) {
+            (Self::Idle, Self::Requesting)
+            | (Self::Requesting, Self::Streaming)
+            | (Self::Requesting, Self::Completed)
+            | (Self::Streaming, Self::Dispatching)
+            | (Self::Streaming, Self::Completed)
+            | (Self::Dispatching, Self::Requesting)
+            | (
+                Self::Requesting | Self::Streaming | Self::Dispatching,
+                Self::Cancelled | Self::Failed,
+            ) => Ok(target),
+            _ => Err(TurnTransitionError {
+                source: self,
+                target,
+            }),
+        }
+    }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnTransitionError {
+    pub source: TurnState,
+    pub target: TurnState,
+}
+
+impl fmt::Display for TurnTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid turn state transition: {:?} -> {:?}",
+            self.source, self.target
+        )
+    }
+}
+
+impl std::error::Error for TurnTransitionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCategory {
