@@ -1,4 +1,4 @@
-use agens_config::{parse_toml_document, validate_toml_document};
+use agens_config::{mcp_stdio_servers, parse_toml_document, validate_toml_document};
 
 #[test]
 fn parses_a_valid_toml_document() {
@@ -32,4 +32,18 @@ fn rejects_semantically_invalid_configuration_fields() {
 
     assert!(validate_toml_document(&wrong_type).is_err());
     assert!(validate_toml_document(&unknown_field).is_err());
+}
+
+#[test]
+fn extracts_only_safe_configured_stdio_mcp_servers() {
+    let document = parse_toml_document("[mcp.files]\ntransport = \"stdio\"\ncommand = \"server\"\nargs = [\"--safe\"]\ntimeout_ms = 50\n[mcp.files.env]\nLANG = \"C\"").unwrap();
+    let servers = mcp_stdio_servers(&document).unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "files");
+    assert_eq!(servers[0].args, ["--safe"]);
+    assert_eq!(servers[0].timeout_ms, 50);
+    let unsafe_server =
+        parse_toml_document("[mcp.bad]\ntransport = \"stdio\"\ncommand = \" \"\ntimeout_ms = 0")
+            .unwrap();
+    assert!(mcp_stdio_servers(&unsafe_server).is_err());
 }

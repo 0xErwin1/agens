@@ -8,6 +8,85 @@ pub struct ConfigPaths {
     pub project_config: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServerConfig {
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub environment: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+}
+
+pub fn mcp_stdio_servers(
+    document: &toml::Table,
+) -> Result<Vec<McpServerConfig>, ConfigValidationError> {
+    validate_mcp(document)?;
+    let Some(servers) = document.get("mcp").and_then(toml::Value::as_table) else {
+        return Ok(Vec::new());
+    };
+    servers
+        .iter()
+        .map(|(name, value)| {
+            let server = value.as_table().ok_or_else(|| invalid_field("mcp", name))?;
+            if server.get("transport").and_then(toml::Value::as_str) != Some("stdio") {
+                return Err(invalid_field("mcp", name));
+            }
+            if server.contains_key("cwd") {
+                return Err(invalid_field(&format!("mcp.{name}"), "cwd"));
+            }
+            let command = server
+                .get("command")
+                .and_then(toml::Value::as_str)
+                .filter(|command| !command.trim().is_empty() && !command.contains('\0'))
+                .ok_or_else(|| invalid_field(&format!("mcp.{name}"), "command"))?;
+            let args = server
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .map_or_else(Vec::new, |args| {
+                    args.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                });
+            let environment = server
+                .get("env")
+                .and_then(toml::Value::as_table)
+                .map_or_else(BTreeMap::new, |env| {
+                    env.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_owned()))
+                        })
+                        .collect()
+                });
+            let timeout_ms = server
+                .get("timeout_ms")
+                .and_then(toml::Value::as_integer)
+                .and_then(|timeout| u64::try_from(timeout).ok())
+                .filter(|timeout| *timeout > 0)
+                .ok_or_else(|| invalid_field(&format!("mcp.{name}"), "timeout_ms"))?;
+            if name.is_empty()
+                || name.contains("::")
+                || args.iter().any(|arg| arg.contains('\0'))
+                || environment.iter().any(|(key, value)| {
+                    key.is_empty()
+                        || key.contains('=')
+                        || key.contains('\0')
+                        || value.contains('\0')
+                })
+            {
+                return Err(invalid_field("mcp", name));
+            }
+            Ok(McpServerConfig {
+                name: name.clone(),
+                command: PathBuf::from(command),
+                args,
+                environment,
+                timeout_ms,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentExpansionError {
     MissingVariable(String),
@@ -242,6 +321,7 @@ fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
                 "url",
                 "headers",
                 "max_retries",
+                "timeout_ms",
             ],
         )?;
         validate_optional(server, "transport", &path, toml::Value::is_str)?;
@@ -252,6 +332,7 @@ fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
         validate_optional(server, "url", &path, toml::Value::is_str)?;
         validate_optional(server, "headers", &path, is_string_table)?;
         validate_optional(server, "max_retries", &path, toml::Value::is_integer)?;
+        validate_optional(server, "timeout_ms", &path, toml::Value::is_integer)?;
     }
 
     Ok(())

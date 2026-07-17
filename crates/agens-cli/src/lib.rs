@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agens_config::{
-    ConfigPaths, expand_environment, merge_toml_documents, parse_toml_document, resolve_paths,
-    validate_toml_document,
+    ConfigPaths, expand_environment, mcp_stdio_servers, merge_toml_documents, parse_toml_document,
+    resolve_paths, validate_toml_document,
 };
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
@@ -15,6 +15,7 @@ use agens_core::{
 };
 use agens_providers::{ChatGptAuthState, OpenAiResponsesProvider, load_chatgpt_auth_state};
 use agens_store::SessionStore;
+use agens_tools::{McpStdioTransport, McpStdioTransportConfig};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -476,6 +477,7 @@ pub struct Bootstrap {
     provider_type: Option<String>,
     provider_base_url: Option<String>,
     data_directory: PathBuf,
+    mcp_servers: Vec<agens_config::McpServerConfig>,
 }
 
 impl Bootstrap {
@@ -498,6 +500,29 @@ impl Bootstrap {
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
     }
+
+    pub fn mcp_transports(
+        &self,
+        project_root: &Path,
+    ) -> Result<Vec<(String, McpStdioTransport, std::time::Duration)>, CliError> {
+        self.mcp_servers
+            .iter()
+            .map(|server| {
+                let transport = McpStdioTransport::spawn(McpStdioTransportConfig {
+                    command: server.command.clone(),
+                    args: server.args.clone(),
+                    environment: server.environment.clone(),
+                    project_root: project_root.to_path_buf(),
+                })
+                .map_err(|_| CliError::configuration("MCP server configuration is unavailable"))?;
+                Ok((
+                    server.name.clone(),
+                    transport,
+                    std::time::Duration::from_millis(server.timeout_ms),
+                ))
+            })
+            .collect()
+    }
 }
 
 fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
@@ -511,11 +536,14 @@ fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
 
+    let mcp_servers = mcp_stdio_servers(&document)
+        .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
     Ok(Bootstrap {
         model: string_value(&document, &["provider", "model"]),
         provider_type: string_value(&document, &["provider", "type"]),
         provider_base_url: string_value(&document, &["provider", "base_url"]),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
+        mcp_servers,
         paths,
         global_loaded,
         project_loaded,

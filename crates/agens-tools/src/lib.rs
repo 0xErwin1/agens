@@ -23,6 +23,10 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
+mod stdio_mcp;
+
+pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
