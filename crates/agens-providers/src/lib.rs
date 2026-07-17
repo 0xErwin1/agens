@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime};
 
-use agens_core::{Error, Message, MessagePart, Role};
+use agens_core::{
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, Role, TurnEvent,
+    TurnProvider,
+};
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -35,6 +38,96 @@ pub enum ChatGptAuthState {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderCancellation {
     cancelled: Arc<AtomicBool>,
+}
+
+/// OpenAI Responses API adapter used by the headless CLI composition root.
+pub struct OpenAiResponsesProvider {
+    api_key: String,
+    base_url: String,
+    model: String,
+    prompt: String,
+    sent_initial_request: bool,
+}
+
+impl OpenAiResponsesProvider {
+    pub fn from_api_key(
+        api_key: String,
+        base_url: Option<&str>,
+        model: String,
+        prompt: String,
+    ) -> Result<Self, Error> {
+        if api_key.trim().is_empty() || model.trim().is_empty() || prompt.trim().is_empty() {
+            return Err(Error::Auth(
+                "OpenAI API authentication is unavailable".into(),
+            ));
+        }
+
+        Ok(Self {
+            api_key,
+            base_url: base_url
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/')
+                .to_owned(),
+            model,
+            prompt,
+            sent_initial_request: false,
+        })
+    }
+
+    fn request_initial_response(&self) -> Result<Vec<MessagePart>, Error> {
+        let payload = serde_json::json!({
+            "model": self.model,
+            "input": [{ "role": "user", "content": self.prompt }],
+            "stream": true,
+        });
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(120)))
+            .build()
+            .into();
+        let mut response = agent
+            .post(&format!("{}/responses", self.base_url))
+            .header("Authorization", &format!("Bearer {}", self.api_key))
+            .header("Accept", "text/event-stream")
+            .send_json(&payload)
+            .map_err(|_| Error::Provider("OpenAI API request failed".into()))?;
+        let reader = BufReader::new(response.body_mut().as_reader());
+        let lines = reader
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| Error::Provider("OpenAI API response could not be read".into()))?;
+        let events = lines
+            .into_iter()
+            .filter_map(|line| line.strip_prefix("data: ").map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+
+        decode_openai_response_events(events)
+    }
+}
+
+impl TurnProvider for OpenAiResponsesProvider {
+    fn next_parts(
+        &mut self,
+        _events: &[TurnEvent],
+        cancellation: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+    {
+        if cancellation.is_cancelled() || cancellation.is_expired() {
+            return std::future::ready(Err(HeadlessTurnPortError::Cancelled));
+        }
+        if self.sent_initial_request {
+            return std::future::ready(Err(HeadlessTurnPortError::Provider));
+        }
+
+        self.sent_initial_request = true;
+        let result = self
+            .request_initial_response()
+            .map_err(|error| match error {
+                Error::Cancelled => HeadlessTurnPortError::Cancelled,
+                _ => HeadlessTurnPortError::Provider,
+            });
+        std::future::ready(result)
+    }
 }
 
 impl ProviderCancellation {

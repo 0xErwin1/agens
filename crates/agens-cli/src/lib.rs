@@ -8,8 +8,12 @@ use agens_config::{
     ConfigPaths, expand_environment, merge_toml_documents, parse_toml_document, resolve_paths,
     validate_toml_document,
 };
-use agens_core::PermissionMode;
-use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
+use agens_core::{
+    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
+    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
+    PermissionDecision, PermissionMode, run_headless_turn,
+};
+use agens_providers::{ChatGptAuthState, OpenAiResponsesProvider, load_chatgpt_auth_state};
 use agens_store::SessionStore;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
@@ -48,7 +52,7 @@ impl CliDependencies {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(_) => Err(CliError::configuration("configuration file is unavailable")),
             }),
-            headless_chat: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
@@ -142,6 +146,18 @@ impl CliError {
 
     fn storage(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Failure, "store", message)
+    }
+
+    fn runtime(error: HeadlessTurnError) -> Self {
+        let (category, message) = match error {
+            HeadlessTurnError::Cancelled => ("cancelled", "headless turn was cancelled"),
+            HeadlessTurnError::Provider => ("provider", "provider request failed"),
+            HeadlessTurnError::Permission => ("permission", "permission evaluation failed"),
+            HeadlessTurnError::Tool => ("tool", "tool execution failed"),
+            HeadlessTurnError::Store => ("store", "completed turn could not be saved"),
+            HeadlessTurnError::State => ("runtime", "headless turn entered an invalid state"),
+        };
+        Self::new(ExitStatus::Failure, category, message)
     }
 
     fn new(status: ExitStatus, category: &'static str, message: impl Into<String>) -> Self {
@@ -457,6 +473,8 @@ pub struct Bootstrap {
     global_loaded: bool,
     project_loaded: bool,
     model: Option<String>,
+    provider_type: Option<String>,
+    provider_base_url: Option<String>,
     data_directory: PathBuf,
 }
 
@@ -467,6 +485,14 @@ impl Bootstrap {
 
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
+    }
+
+    pub fn provider_type(&self) -> Option<&str> {
+        self.provider_type.as_deref()
+    }
+
+    pub fn provider_base_url(&self) -> Option<&str> {
+        self.provider_base_url.as_deref()
     }
 
     pub fn data_directory(&self) -> &Path {
@@ -487,11 +513,131 @@ fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
 
     Ok(Bootstrap {
         model: string_value(&document, &["provider", "model"]),
+        provider_type: string_value(&document, &["provider", "type"]),
+        provider_base_url: string_value(&document, &["provider", "base_url"]),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         paths,
         global_loaded,
         project_loaded,
     })
+}
+
+fn run_production_headless_chat(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+) -> Result<String, CliError> {
+    match bootstrap.provider_type() {
+        Some("openai-api") => run_openai_api_chat(request, bootstrap),
+        Some("openai-chatgpt") => Err(CliError::authentication(
+            "ChatGPT subscription authentication is unavailable for headless chat",
+        )),
+        _ => Err(CliError::configuration(
+            "headless chat requires provider.type = \"openai-api\"",
+        )),
+    }
+}
+
+fn run_openai_api_chat(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+) -> Result<String, CliError> {
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
+    let model = request
+        .model
+        .or_else(|| bootstrap.model().map(ToOwned::to_owned))
+        .ok_or_else(|| CliError::configuration("headless chat requires a provider model"))?;
+    let mut provider = OpenAiResponsesProvider::from_api_key(
+        api_key,
+        bootstrap.provider_base_url(),
+        model,
+        request.prompt,
+    )
+    .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
+    let mut store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let cancellation = HeadlessTurnCancellation::new();
+    let mut gate = ProductionPermissionGate;
+    let mut resolver = ProductionPermissionResolver;
+    let mut dispatcher = ProductionToolDispatcher;
+    let snapshot = block_on_headless_turn(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut store,
+        &cancellation,
+    ))
+    .map_err(CliError::runtime)?;
+
+    let text = snapshot
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            agens_core::TurnEvent::ProviderPart(agens_core::MessagePart::Text(text)) => {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect::<String>();
+
+    if text.is_empty() {
+        Ok("completed".to_owned())
+    } else {
+        Ok(text)
+    }
+}
+
+struct ProductionPermissionGate;
+
+impl HeadlessPermissionGate for ProductionPermissionGate {
+    fn evaluate(
+        &mut self,
+        _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Ok(PermissionDecision::Ask))
+    }
+}
+
+struct ProductionPermissionResolver;
+
+impl HeadlessPermissionResolver for ProductionPermissionResolver {
+    fn resolve(
+        &mut self,
+        _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Ok(PermissionDecision::Deny))
+    }
+}
+
+struct ProductionToolDispatcher;
+
+impl HeadlessToolDispatcher for ProductionToolDispatcher {
+    fn dispatch(
+        &mut self,
+        _call: HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Err(HeadlessTurnPortError::Tool))
+    }
+}
+
+fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+    loop {
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(context) {
+            return value;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 fn load_toml(

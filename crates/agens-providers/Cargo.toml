@@ -9,3 +9,4 @@ agens-config = { path = "../agens-config" }
 agens-core = { path = "../agens-core" }
 serde_json = "1"
 time = { version = "0.3", features = ["parsing"] }
+ureq = { version = "3", features = ["json"] }

@@ -1,4 +1,12 @@
-use std::{fmt, future::Future};
+use std::{
+    fmt,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -561,6 +569,7 @@ pub trait TurnProvider {
     fn next_parts(
         &mut self,
         events: &[TurnEvent],
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send;
 }
 
@@ -568,6 +577,7 @@ pub trait HeadlessPermissionGate {
     fn evaluate(
         &mut self,
         call: &HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
 }
 
@@ -575,6 +585,7 @@ pub trait HeadlessPermissionResolver {
     fn resolve(
         &mut self,
         call: &HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
 }
 
@@ -582,11 +593,40 @@ pub trait HeadlessToolDispatcher {
     fn dispatch(
         &mut self,
         call: HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send;
 }
 
-pub trait HeadlessTurnCancellation {
-    fn is_cancelled(&self) -> bool;
+#[derive(Clone, Debug, Default)]
+pub struct HeadlessTurnCancellation {
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl HeadlessTurnCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_deadline(timeout: Duration) -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            deadline: Some(Instant::now() + timeout),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,7 +662,7 @@ pub async fn run_headless_turn(
     permission_resolver: &mut impl HeadlessPermissionResolver,
     dispatcher: &mut impl HeadlessToolDispatcher,
     repository: &mut impl CompletedTurnRepository,
-    cancellation: &impl HeadlessTurnCancellation,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = TurnCoordinator::new();
     coordinator.begin().map_err(|_| HeadlessTurnError::State)?;
@@ -631,11 +671,12 @@ pub async fn run_headless_turn(
         check_cancelled(&mut coordinator, cancellation)?;
 
         let parts = provider
-            .next_parts(coordinator.events())
+            .next_parts(coordinator.events(), cancellation)
             .await
             .map_err(|error| {
                 finish_port_error(&mut coordinator, error, HeadlessTurnError::Provider)
             })?;
+        check_cancelled(&mut coordinator, cancellation)?;
         let tool_calls = parts
             .iter()
             .filter_map(headless_tool_call)
@@ -664,22 +705,34 @@ pub async fn run_headless_turn(
         for call in tool_calls {
             check_cancelled(&mut coordinator, cancellation)?;
 
-            let decision = permission_gate.evaluate(&call).await.map_err(|error| {
-                finish_port_error(&mut coordinator, error, HeadlessTurnError::Permission)
-            })?;
-            let decision =
-                resolve_permission_decision(decision, &call, permission_resolver, &mut coordinator)
-                    .await?;
+            let decision = permission_gate
+                .evaluate(&call, cancellation)
+                .await
+                .map_err(|error| {
+                    finish_port_error(&mut coordinator, error, HeadlessTurnError::Permission)
+                })?;
+            check_cancelled(&mut coordinator, cancellation)?;
+            let decision = resolve_permission_decision(
+                decision,
+                &call,
+                permission_resolver,
+                &mut coordinator,
+                cancellation,
+            )
+            .await?;
+            check_cancelled(&mut coordinator, cancellation)?;
 
             let output = match decision {
-                PermissionDecision::Allow => {
-                    dispatcher.dispatch(call.clone()).await.map_err(|error| {
+                PermissionDecision::Allow => dispatcher
+                    .dispatch(call.clone(), cancellation)
+                    .await
+                    .map_err(|error| {
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
-                    })?
-                }
+                    })?,
                 PermissionDecision::Deny => HeadlessToolOutput::failure("permission denied"),
                 PermissionDecision::Ask => return Err(fail_state(&mut coordinator)),
             };
+            check_cancelled(&mut coordinator, cancellation)?;
 
             coordinator
                 .accept_tool_result(&call.id, output.content, output.is_error)
@@ -705,22 +758,23 @@ async fn resolve_permission_decision(
     call: &HeadlessToolCall,
     permission_resolver: &mut impl HeadlessPermissionResolver,
     coordinator: &mut TurnCoordinator,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<PermissionDecision, HeadlessTurnError> {
     if decision != PermissionDecision::Ask {
         return Ok(decision);
     }
 
     permission_resolver
-        .resolve(call)
+        .resolve(call, cancellation)
         .await
         .map_err(|error| finish_port_error(coordinator, error, HeadlessTurnError::Permission))
 }
 
 fn check_cancelled(
     coordinator: &mut TurnCoordinator,
-    cancellation: &impl HeadlessTurnCancellation,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<(), HeadlessTurnError> {
-    if !cancellation.is_cancelled() {
+    if !cancellation.is_cancelled() && !cancellation.is_expired() {
         return Ok(());
     }
 

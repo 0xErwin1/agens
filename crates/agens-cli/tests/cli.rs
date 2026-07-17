@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::process::Command;
+use std::thread;
 
 use agens::{CliDependencies, ExitStatus, execute, execute_os};
 use agens_core::{
@@ -432,7 +436,7 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
             &mut resolver,
             &mut dispatcher,
             &mut store,
-            &LocalCancellation,
+            &HeadlessTurnCancellation::new(),
         ))
         .expect("local headless turn should complete");
 
@@ -452,6 +456,52 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
     assert!(!format!("{}{}{}", chat.stdout, sessions.stdout, resumed.stdout).contains("secret"));
 }
 
+#[test]
+fn production_binary_runs_configured_openai_responses_transport_and_persists_the_turn() {
+    let temporary = TemporaryDirectory::new("production-headless");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = OpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "hello from production"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("production binary should list sessions");
+
+    assert!(chat.status.success());
+    assert_eq!(String::from_utf8_lossy(&chat.stdout), "Hello from OpenAI\n");
+    assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
+    assert!(sessions.status.success());
+    assert!(String::from_utf8_lossy(&sessions.stdout).contains("1\t4 event(s)"));
+    assert!(
+        !format!(
+            "{}{}",
+            String::from_utf8_lossy(&chat.stdout),
+            String::from_utf8_lossy(&chat.stderr)
+        )
+        .contains("SENTINEL_OPENAI_API_KEY")
+    );
+
+    server.join();
+}
+
 struct LocalProvider {
     iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
 }
@@ -460,6 +510,7 @@ impl TurnProvider for LocalProvider {
     fn next_parts(
         &mut self,
         _events: &[TurnEvent],
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
     {
         std::future::ready(self.iterations.remove(0))
@@ -474,6 +525,7 @@ impl HeadlessPermissionGate for LocalPermissionGate {
     fn evaluate(
         &mut self,
         _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
         std::future::ready(Ok(self.decisions.remove(0)))
@@ -488,6 +540,7 @@ impl HeadlessPermissionResolver for LocalPermissionResolver {
     fn resolve(
         &mut self,
         _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
         std::future::ready(Ok(self.decisions.remove(0)))
@@ -502,17 +555,10 @@ impl HeadlessToolDispatcher for LocalToolDispatcher {
     fn dispatch(
         &mut self,
         _call: HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
     {
         std::future::ready(self.outputs.remove(0))
-    }
-}
-
-struct LocalCancellation;
-
-impl HeadlessTurnCancellation for LocalCancellation {
-    fn is_cancelled(&self) -> bool {
-        false
     }
 }
 
@@ -553,5 +599,63 @@ impl TemporaryDirectory {
 impl Drop for TemporaryDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct OpenAiMockServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<()>,
+}
+
+impl OpenAiMockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .expect("mock server should accept a request");
+            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+            let mut request = String::new();
+            reader
+                .read_line(&mut request)
+                .expect("request line should be readable");
+            assert_eq!(request, "POST /responses HTTP/1.1\r\n");
+
+            let mut authorization = String::new();
+            loop {
+                let mut header = String::new();
+                reader
+                    .read_line(&mut header)
+                    .expect("header should be readable");
+                if header == "\r\n" {
+                    break;
+                }
+                if header.to_ascii_lowercase().starts_with("authorization:") {
+                    authorization = header;
+                }
+            }
+            assert_eq!(
+                authorization,
+                "authorization: Bearer SENTINEL_OPENAI_API_KEY\r\n"
+            );
+
+            let mut stream = stream;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello from OpenAI\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                .expect("mock response should be written");
+        });
+
+        Self { address, worker }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
     }
 }

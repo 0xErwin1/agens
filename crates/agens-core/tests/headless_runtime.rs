@@ -1,4 +1,6 @@
 use std::future::{Future, ready};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
@@ -16,6 +18,7 @@ impl TurnProvider for Provider {
     fn next_parts(
         &mut self,
         _events: &[TurnEvent],
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send {
         ready(self.iterations.remove(0))
     }
@@ -30,6 +33,7 @@ impl HeadlessPermissionGate for PermissionGate {
     fn evaluate(
         &mut self,
         _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
         ready(Ok(self.decisions.remove(0)))
     }
@@ -44,6 +48,7 @@ impl HeadlessPermissionResolver for PermissionResolver {
     fn resolve(
         &mut self,
         _call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
         ready(Ok(self.decisions.remove(0)))
     }
@@ -58,6 +63,7 @@ impl HeadlessToolDispatcher for ToolDispatcher {
     fn dispatch(
         &mut self,
         _call: HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send {
         ready(self.outputs.remove(0))
     }
@@ -83,11 +89,39 @@ impl CompletedTurnRepository for Repository {
     }
 }
 
-struct Cancellation(bool);
+struct PendingUntilCancelled {
+    cancellation: HeadlessTurnCancellation,
+}
 
-impl HeadlessTurnCancellation for Cancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0
+impl Future for PendingUntilCancelled {
+    type Output = Result<Vec<MessagePart>, HeadlessTurnPortError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.cancellation.is_cancelled() {
+            std::task::Poll::Ready(Err(HeadlessTurnPortError::Cancelled))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+struct InFlightProvider {
+    started: Arc<AtomicBool>,
+}
+
+impl TurnProvider for InFlightProvider {
+    fn next_parts(
+        &mut self,
+        _events: &[TurnEvent],
+        cancellation: &HeadlessTurnCancellation,
+    ) -> impl Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send {
+        self.started.store(true, Ordering::Release);
+        PendingUntilCancelled {
+            cancellation: cancellation.clone(),
+        }
     }
 }
 
@@ -150,7 +184,7 @@ fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
         &mut resolver,
         &mut dispatcher,
         &mut repository,
-        &Cancellation(false),
+        &HeadlessTurnCancellation::new(),
     ))
     .expect("headless turn should complete");
 
@@ -200,7 +234,11 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
         &mut PermissionResolver::default(),
         &mut ToolDispatcher::default(),
         &mut cancelled_repository,
-        &Cancellation(true),
+        &{
+            let cancellation = HeadlessTurnCancellation::new();
+            cancellation.cancel();
+            cancellation
+        },
     ));
     assert_eq!(cancelled, Err(agens_core::HeadlessTurnError::Cancelled));
     assert!(cancelled_repository.snapshots.is_empty());
@@ -215,7 +253,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
         &mut PermissionResolver::default(),
         &mut ToolDispatcher::default(),
         &mut provider_repository,
-        &Cancellation(false),
+        &HeadlessTurnCancellation::new(),
     ));
     assert_eq!(
         provider_result,
@@ -241,7 +279,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
             outputs: vec![Err(HeadlessTurnPortError::Tool)],
         },
         &mut tool_repository,
-        &Cancellation(false),
+        &HeadlessTurnCancellation::new(),
     ));
     assert_eq!(tool_result, Err(agens_core::HeadlessTurnError::Tool));
     assert!(tool_repository.snapshots.is_empty());
@@ -259,8 +297,48 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
         &mut PermissionResolver::default(),
         &mut ToolDispatcher::default(),
         &mut store_repository,
-        &Cancellation(false),
+        &HeadlessTurnCancellation::new(),
     ));
     assert_eq!(store_result, Err(agens_core::HeadlessTurnError::Store));
     assert!(store_repository.snapshots.is_empty());
+}
+
+#[test]
+fn cancellation_reaches_an_in_flight_provider_and_suppresses_persistence() {
+    let started = Arc::new(AtomicBool::new(false));
+    let cancellation = HeadlessTurnCancellation::new();
+    let canceller = cancellation.clone();
+    let mut provider = InFlightProvider {
+        started: Arc::clone(&started),
+    };
+    let mut gate = PermissionGate::default();
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher::default();
+    let mut repository = Repository::default();
+
+    let result = {
+        let mut turn = std::pin::pin!(run_headless_turn(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut dispatcher,
+            &mut repository,
+            &cancellation,
+        ));
+        let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            turn.as_mut().poll(context),
+            std::task::Poll::Pending
+        ));
+        assert!(started.load(Ordering::Acquire));
+        canceller.cancel();
+        turn.as_mut().poll(context)
+    };
+
+    assert_eq!(
+        result,
+        std::task::Poll::Ready(Err(agens_core::HeadlessTurnError::Cancelled))
+    );
+    assert!(repository.snapshots.is_empty());
 }
