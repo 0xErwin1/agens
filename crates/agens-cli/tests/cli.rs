@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agens::{CliDependencies, ExitStatus, execute};
+use agens::{CliDependencies, ExitStatus, execute, execute_os};
 
 #[test]
 fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
@@ -193,6 +193,172 @@ fn sessions_list_uses_configured_data_directory_and_reports_empty_store() {
     assert_eq!(result.status, ExitStatus::Success);
     assert_eq!(result.stdout, "No saved sessions.\n");
     assert!(data_directory.join("rust-sessions.db").is_file());
+}
+
+#[test]
+fn config_doctor_rejects_semantically_invalid_configuration() {
+    let temporary = TemporaryDirectory::new("semantic-config");
+    let config_home = temporary.path().join("config");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            "[provider]\nmodel = 123\nunknown = \"SENTINEL_CONFIG_42\"\n".to_owned(),
+        )]),
+    );
+
+    let result = execute(["config", "doctor"], &dependencies);
+
+    assert_eq!(result.status, ExitStatus::Configuration);
+    assert_eq!(result.stdout, "Agens config doctor\nStatus:  invalid\n");
+    assert!(!result.stderr.contains("SENTINEL_CONFIG_42"));
+}
+
+#[test]
+fn config_doctor_discovers_repository_root_from_nested_directory() {
+    let temporary = TemporaryDirectory::new("nested-project-config");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let nested_directory = project_root.join("src/nested");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
+    std::fs::create_dir_all(&nested_directory).expect("nested directory should exist");
+
+    let dependencies = CliDependencies::for_test(
+        nested_directory,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                "[provider]\nmodel = \"global-model\"\n".to_owned(),
+            ),
+            (
+                project_root.join(".agens/config.toml"),
+                "[provider]\nmodel = \"project-model\"\n".to_owned(),
+            ),
+        ]),
+    );
+
+    let result = execute(["config", "doctor"], &dependencies);
+
+    assert_eq!(result.status, ExitStatus::Success);
+    assert!(result.stdout.contains("Model:   project-model\n"));
+    assert!(result.stdout.contains(&format!(
+        "Project: {} (loaded)",
+        project_root.join(".agens/config.toml").display()
+    )));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_doctor_resolves_a_symlinked_working_directory_before_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new("symlinked-project-config");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let nested_directory = project_root.join("src/nested");
+    let symlinked_directory = temporary.path().join("working-directory");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
+    std::fs::create_dir_all(&nested_directory).expect("nested directory should exist");
+    symlink(&nested_directory, &symlinked_directory)
+        .expect("working directory symlink should exist");
+
+    let dependencies = CliDependencies::for_test(
+        symlinked_directory,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            project_root.join(".agens/config.toml"),
+            "[provider]\nmodel = \"project-model\"\n".to_owned(),
+        )]),
+    );
+
+    let result = execute(["config", "doctor"], &dependencies);
+
+    assert_eq!(result.status, ExitStatus::Success);
+    assert!(result.stdout.contains("Model:   project-model\n"));
+}
+
+#[test]
+fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
+    let dependencies = CliDependencies::for_test(
+        PathBuf::from("/project"),
+        Some(PathBuf::from("/home/user")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+
+    for arguments in [
+        ["config", "doctor", "--help"].as_slice(),
+        ["auth", "status", "--help"].as_slice(),
+        ["auth", "login", "--help"].as_slice(),
+        ["auth", "logout", "--help"].as_slice(),
+        ["models", "--help"].as_slice(),
+        ["sessions", "list", "--help"].as_slice(),
+        ["sessions", "show", "--help"].as_slice(),
+        ["sessions", "rm", "--help"].as_slice(),
+    ] {
+        let result = execute(arguments, &dependencies);
+
+        assert_eq!(result.status, ExitStatus::Success, "{arguments:?}");
+        assert!(result.stdout.starts_with("Usage: agens "), "{arguments:?}");
+    }
+}
+
+#[test]
+fn preserved_tui_resume_shapes_are_explicitly_unavailable() {
+    let dependencies = CliDependencies::for_test(
+        PathBuf::from("/project"),
+        Some(PathBuf::from("/home/user")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+
+    for arguments in [["--resume"].as_slice(), ["123"].as_slice()] {
+        let result = execute(arguments, &dependencies);
+
+        assert_eq!(result.status, ExitStatus::Unavailable, "{arguments:?}");
+        assert_eq!(result.stdout, "", "{arguments:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_os_arguments_are_rejected_without_echoing_input() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dependencies = CliDependencies::for_test(
+        PathBuf::from("/project"),
+        Some(PathBuf::from("/home/user")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let result = execute_os(
+        [std::ffi::OsString::from_vec(vec![
+            b'S', b'E', b'C', b'R', b'E', b'T', 0xff,
+        ])],
+        &dependencies,
+    );
+
+    assert_eq!(result.status, ExitStatus::Usage);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "error: usage: command arguments must be valid UTF-8\n"
+    );
+    assert!(!result.stderr.contains("SECRET"));
 }
 
 struct TemporaryDirectory {

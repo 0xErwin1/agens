@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let result = agens::execute(
-        std::env::args().skip(1),
+    let result = agens::execute_os(
+        std::env::args_os().skip(1),
         &agens::CliDependencies::production(),
     );
 

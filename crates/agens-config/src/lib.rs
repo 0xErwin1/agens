@@ -37,6 +37,76 @@ pub fn parse_toml_document(input: &str) -> Result<toml::Table, toml::de::Error> 
     input.parse()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValidationError {
+    field: String,
+}
+
+impl fmt::Display for ConfigValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid configuration field {}", self.field)
+    }
+}
+
+impl std::error::Error for ConfigValidationError {}
+
+pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
+    reject_unknown_fields(
+        document,
+        "",
+        &["options", "provider", "agent", "ui", "mcp", "permissions"],
+    )?;
+
+    validate_named_table(
+        document,
+        "options",
+        &["debug", "data_dir"],
+        |table, path| {
+            validate_optional(table, "debug", path, toml::Value::is_bool)?;
+            validate_optional(table, "data_dir", path, toml::Value::is_str)
+        },
+    )?;
+    validate_named_table(
+        document,
+        "provider",
+        &["type", "model", "base_url"],
+        |table, path| {
+            validate_optional(table, "type", path, toml::Value::is_str)?;
+            validate_optional(table, "model", path, toml::Value::is_str)?;
+            validate_optional(table, "base_url", path, toml::Value::is_str)
+        },
+    )?;
+    validate_named_table(
+        document,
+        "agent",
+        &["system_prompt", "max_iterations", "parallel_tool_calls"],
+        |table, path| {
+            validate_optional(table, "system_prompt", path, toml::Value::is_str)?;
+            validate_optional(table, "max_iterations", path, toml::Value::is_integer)?;
+            validate_optional(table, "parallel_tool_calls", path, toml::Value::is_bool)
+        },
+    )?;
+    validate_named_table(
+        document,
+        "ui",
+        &["collapse_thinking", "truncate_tool_output"],
+        |table, path| {
+            validate_optional(table, "collapse_thinking", path, toml::Value::is_bool)?;
+            validate_optional(table, "truncate_tool_output", path, toml::Value::is_bool)
+        },
+    )?;
+    validate_named_table(
+        document,
+        "permissions",
+        &["allow", "deny"],
+        |table, path| {
+            validate_optional(table, "allow", path, is_string_array)?;
+            validate_optional(table, "deny", path, is_string_array)
+        },
+    )?;
+    validate_mcp(document)
+}
+
 pub fn merge_toml_documents(mut global: toml::Table, project: toml::Table) -> toml::Table {
     merge_tables(&mut global, project);
     global
@@ -108,6 +178,105 @@ fn merge_tables(global: &mut toml::Table, project: toml::Table) {
 
         global.insert(key, project_value);
     }
+}
+
+fn reject_unknown_fields(
+    table: &toml::Table,
+    path: &str,
+    allowed_fields: &[&str],
+) -> Result<(), ConfigValidationError> {
+    for field in table.keys() {
+        if !allowed_fields.contains(&field.as_str()) {
+            return Err(invalid_field(path, field));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_named_table(
+    document: &toml::Table,
+    name: &str,
+    allowed_fields: &[&str],
+    validate: impl FnOnce(&toml::Table, &str) -> Result<(), ConfigValidationError>,
+) -> Result<(), ConfigValidationError> {
+    let Some(value) = document.get(name) else {
+        return Ok(());
+    };
+    let table = value.as_table().ok_or_else(|| invalid_field("", name))?;
+
+    reject_unknown_fields(table, name, allowed_fields)?;
+    validate(table, name)
+}
+
+fn validate_optional(
+    table: &toml::Table,
+    name: &str,
+    path: &str,
+    predicate: impl FnOnce(&toml::Value) -> bool,
+) -> Result<(), ConfigValidationError> {
+    match table.get(name) {
+        Some(value) if !predicate(value) => Err(invalid_field(path, name)),
+        _ => Ok(()),
+    }
+}
+
+fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
+    let Some(value) = document.get("mcp") else {
+        return Ok(());
+    };
+    let servers = value.as_table().ok_or_else(|| invalid_field("", "mcp"))?;
+
+    for (name, value) in servers {
+        let path = format!("mcp.{name}");
+        let server = value.as_table().ok_or_else(|| invalid_field("mcp", name))?;
+        reject_unknown_fields(
+            server,
+            &path,
+            &[
+                "transport",
+                "command",
+                "args",
+                "env",
+                "cwd",
+                "url",
+                "headers",
+                "max_retries",
+            ],
+        )?;
+        validate_optional(server, "transport", &path, toml::Value::is_str)?;
+        validate_optional(server, "command", &path, toml::Value::is_str)?;
+        validate_optional(server, "args", &path, is_string_array)?;
+        validate_optional(server, "env", &path, is_string_table)?;
+        validate_optional(server, "cwd", &path, toml::Value::is_str)?;
+        validate_optional(server, "url", &path, toml::Value::is_str)?;
+        validate_optional(server, "headers", &path, is_string_table)?;
+        validate_optional(server, "max_retries", &path, toml::Value::is_integer)?;
+    }
+
+    Ok(())
+}
+
+fn is_string_array(value: &toml::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|values| values.iter().all(toml::Value::is_str))
+}
+
+fn is_string_table(value: &toml::Value) -> bool {
+    value
+        .as_table()
+        .is_some_and(|values| values.values().all(toml::Value::is_str))
+}
+
+fn invalid_field(path: &str, field: &str) -> ConfigValidationError {
+    let field = if path.is_empty() {
+        field.to_owned()
+    } else {
+        format!("{path}.{field}")
+    };
+
+    ConfigValidationError { field }
 }
 
 fn read_braced_expression(

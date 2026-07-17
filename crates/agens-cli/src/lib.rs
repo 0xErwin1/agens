@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use agens_config::{
     ConfigPaths, expand_environment, merge_toml_documents, parse_toml_document, resolve_paths,
+    validate_toml_document,
 };
 use agens_core::PermissionMode;
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
@@ -179,23 +181,50 @@ where
         .map(|argument| argument.as_ref().to_owned())
         .collect::<Vec<_>>();
 
+    execute_strings(arguments, dependencies)
+}
+
+pub fn execute_os<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| {
+            argument
+                .into()
+                .into_string()
+                .map_err(|_| CliError::usage("command arguments must be valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>();
+
+    match arguments {
+        Ok(arguments) => execute_strings(arguments, dependencies),
+        Err(error) => error_result(&[], error),
+    }
+}
+
+fn execute_strings(arguments: Vec<String>, dependencies: &CliDependencies) -> CommandResult {
     match execute_command(&arguments, dependencies) {
         Ok(stdout) => CommandResult {
             status: ExitStatus::Success,
             stdout,
             stderr: String::new(),
         },
-        Err(error) => CommandResult {
-            status: error.status,
-            stdout: if arguments.as_slice() == ["config", "doctor"]
-                && error.status == ExitStatus::Configuration
-            {
-                "Agens config doctor\nStatus:  invalid\n".to_owned()
-            } else {
-                String::new()
-            },
-            stderr: format!("error: {error}\n"),
+        Err(error) => error_result(&arguments, error),
+    }
+}
+
+fn error_result(arguments: &[String], error: CliError) -> CommandResult {
+    CommandResult {
+        status: error.status,
+        stdout: if arguments == ["config", "doctor"] && error.status == ExitStatus::Configuration {
+            "Agens config doctor\nStatus:  invalid\n".to_owned()
+        } else {
+            String::new()
         },
+        stderr: format!("error: {error}\n"),
     }
 }
 
@@ -205,6 +234,11 @@ fn execute_command(
 ) -> Result<String, CliError> {
     match arguments {
         [] => run_tui(dependencies),
+        [resume] if resume == "--resume" => run_tui(dependencies),
+        [resume, identifier] if resume == "--resume" && identifier.parse::<i64>().is_ok() => {
+            run_tui(dependencies)
+        }
+        [identifier] if identifier.parse::<i64>().is_ok() => run_tui(dependencies),
         [command] if is_help(command) => Ok(root_help()),
         [command] if is_version(command) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
         [command, rest @ ..] if command == "config" => run_config(rest, dependencies),
@@ -217,6 +251,10 @@ fn execute_command(
 }
 
 fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+    if arguments.iter().any(|argument| is_help(argument)) {
+        return Ok("Usage: agens config doctor\n".to_owned());
+    }
+
     match arguments {
         [command] if is_help(command) => Ok("Usage: agens config doctor\n".to_owned()),
         [command] if command == "doctor" => {
@@ -235,6 +273,10 @@ fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<St
 }
 
 fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+    if arguments.iter().any(|argument| is_help(argument)) {
+        return Ok("Usage: agens auth <status|login|logout>\n".to_owned());
+    }
+
     match arguments {
         [command] if is_help(command) => Ok("Usage: agens auth <status|login|logout>\n".to_owned()),
         [command] if command == "status" => {
@@ -272,6 +314,10 @@ fn run_chat(arguments: &[String], dependencies: &CliDependencies) -> Result<Stri
 }
 
 fn run_models(arguments: &[String]) -> Result<String, CliError> {
+    if arguments.iter().any(|argument| is_help(argument)) {
+        return Ok("Usage: agens models\n".to_owned());
+    }
+
     match arguments {
         [command] if is_help(command) => Ok("Usage: agens models\n".to_owned()),
         [] => Err(CliError::unavailable(UNAVAILABLE_MESSAGE)),
@@ -280,6 +326,10 @@ fn run_models(arguments: &[String]) -> Result<String, CliError> {
 }
 
 fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+    if arguments.iter().any(|argument| is_help(argument)) {
+        return Ok("Usage: agens sessions <list|show|rm>\n".to_owned());
+    }
+
     match arguments {
         [command] if is_help(command) => Ok("Usage: agens sessions <list|show|rm>\n".to_owned()),
         [command] if command == "list" => {
@@ -428,7 +478,8 @@ fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
     let current_directory = (dependencies.current_directory)()?;
     let home_directory = (dependencies.home_directory)();
     let environment = (dependencies.environment)();
-    let paths = resolve_paths(&current_directory, home_directory.as_deref(), &environment);
+    let project_root = discover_project_root(&current_directory);
+    let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
     let (global, global_loaded) = load_toml(&paths.global_config, "global", dependencies)?;
     let (project, project_loaded) = load_toml(&paths.project_config, "project", dependencies)?;
     let document = merge_toml_documents(global, project);
@@ -452,9 +503,29 @@ fn load_toml(
         return Ok((toml::Table::new(), false));
     };
 
-    parse_toml_document(&contents)
-        .map(|document| (document, true))
-        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))
+    let document = parse_toml_document(&contents)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+    validate_toml_document(&document)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+
+    Ok((document, true))
+}
+
+fn discover_project_root(current_directory: &Path) -> PathBuf {
+    let mut current =
+        fs::canonicalize(current_directory).unwrap_or_else(|_| current_directory.to_path_buf());
+
+    loop {
+        if current.join(".git").exists() {
+            return current;
+        }
+
+        let parent = current.parent().map(Path::to_path_buf);
+        match parent {
+            Some(parent) if parent != current => current = parent,
+            _ => return current_directory.to_path_buf(),
+        }
+    }
 }
 
 fn expand_document(
