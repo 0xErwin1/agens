@@ -41,13 +41,14 @@ where
         decoder.process(event.as_ref())?;
     }
 
-    Ok(decoder.parts)
+    decoder.finish()
 }
 
 #[derive(Default)]
 struct OpenAiResponseDecoder {
     parts: Vec<MessagePart>,
     function_calls: BTreeMap<String, FunctionCall>,
+    completed: bool,
 }
 
 struct FunctionCall {
@@ -73,10 +74,26 @@ impl OpenAiResponseDecoder {
             "response.function_call_arguments.delta" => self.append_function_arguments(&event)?,
             "response.function_call_arguments.done" => self.finish_function_call(&event)?,
             "error" => return Err(upstream_error(&event)),
+            "response.failed" => return Err(response_failed_error(&event)),
+            "response.completed" => self.completed = true,
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<MessagePart>, Error> {
+        if !self.completed {
+            return Err(protocol_error("stream ended before response.completed"));
+        }
+
+        if !self.function_calls.is_empty() {
+            return Err(protocol_error(
+                "stream completed with unfinished function calls",
+            ));
+        }
+
+        Ok(self.parts)
     }
 
     fn process_output_item(&mut self, event: &Value) -> Result<(), Error> {
@@ -172,6 +189,17 @@ fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, E
 fn upstream_error(event: &Value) -> Error {
     let message = event
         .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("the upstream provider did not provide an error message");
+
+    Error::Provider(format!("OpenAI stream failed: {message}"))
+}
+
+fn response_failed_error(event: &Value) -> Error {
+    let message = event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("the upstream provider did not provide an error message");
 

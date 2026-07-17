@@ -81,3 +81,36 @@ fn reports_protocol_failures_without_returning_partial_parts() {
         ))
     );
 }
+
+#[test]
+fn rejects_failed_or_incomplete_streams_without_returning_partial_parts() {
+    let failed_stream = [
+        r#"{"type":"response.output_text.delta","delta":"partial"}"#,
+        r#"{"type":"response.failed","response":{"error":{"message":"upstream rejected the request"}}}"#,
+    ];
+    let truncated_stream = [r#"{"type":"response.output_text.delta","delta":"partial"}"#];
+    let incomplete_function_call = [
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
+        r#"{"type":"response.completed"}"#,
+    ];
+
+    assert_eq!(
+        decode_openai_response_events(failed_stream),
+        Err(Error::Provider(
+            "OpenAI stream failed: upstream rejected the request".to_owned()
+        ))
+    );
+    assert_eq!(
+        decode_openai_response_events(truncated_stream),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: stream ended before response.completed".to_owned()
+        ))
+    );
+    assert_eq!(
+        decode_openai_response_events(incomplete_function_call),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: stream completed with unfinished function calls"
+                .to_owned()
+        ))
+    );
+}
