@@ -7,3 +7,4 @@ rust-version.workspace = true
 [dependencies]
 agens-config = { path = "../agens-config" }
 agens-core = { path = "../agens-core" }
+libc = "0.2"
