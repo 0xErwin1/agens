@@ -5,13 +5,14 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
-use agens::{CliDependencies, ExitStatus, execute, execute_os};
+use agens::{CliDependencies, ExitStatus, bootstrap, execute, execute_os};
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
     PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
 };
 use agens_store::SessionStore;
+use agens_tools::McpTransport;
 
 #[test]
 fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
@@ -48,6 +49,70 @@ fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
     assert!(result.stdout.contains("Project: "));
     assert!(result.stdout.contains("Status:  valid\n"));
     assert!(result.stdout.contains("Model:   project-model\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy() {
+    let temporary = TemporaryDirectory::new("mcp-transport-factory");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let launch_record = temporary.path().join("launch-record");
+    let config_path = config_home.join("config.toml");
+    std::fs::create_dir_all(&project_root).expect("project root should exist");
+    let script = format!(
+        "printf '%s|%s|%s' \"$PWD\" \"$1\" \"$MCP_SENTINEL\" > '{}' ; sleep 5",
+        launch_record.display()
+    );
+    let dependencies = CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([
+            (
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            ),
+            ("PWD".to_owned(), "$PWD".to_owned()),
+            ("MCP_SENTINEL".to_owned(), "$MCP_SENTINEL".to_owned()),
+        ]),
+        BTreeMap::from([(
+            config_path,
+            format!(
+                "[mcp.files]\ntransport = \"stdio\"\ncommand = \"/bin/sh\"\nargs = [\"-c\", {script:?}, \"ignored\", \"configured-argument\"]\ntimeout_ms = 50\n[mcp.files.env]\nMCP_SENTINEL = \"configured-environment\"\n"
+            ),
+        )]),
+    );
+
+    let bootstrap = bootstrap(&dependencies).expect("validated config should bootstrap");
+    let mut transports = bootstrap
+        .mcp_transports(&project_root)
+        .expect("factory should create stdio transport");
+
+    assert_eq!(transports.len(), 1);
+    assert_eq!(transports[0].0, "files");
+    assert_eq!(transports[0].2, std::time::Duration::from_millis(50));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !launch_record.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "configured MCP process should record its launch policy"
+        );
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(
+        std::fs::read_to_string(launch_record).expect("launch policy should be readable"),
+        format!(
+            "{}|configured-argument|configured-environment",
+            project_root.display()
+        )
+    );
+    transports[0]
+        .1
+        .close(&agens_tools::McpOperationContext::new(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_secs(1),
+        ))
+        .expect("factory transport should close without dispatching chat");
 }
 
 #[test]

@@ -525,7 +525,7 @@ impl Bootstrap {
     }
 }
 
-fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
+pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
     let current_directory = (dependencies.current_directory)()?;
     let home_directory = (dependencies.home_directory)();
     let environment = (dependencies.environment)();

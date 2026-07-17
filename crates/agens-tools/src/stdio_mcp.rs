@@ -126,7 +126,18 @@ impl McpStdioTransport {
         });
         loop {
             match receiver.recv_timeout(POLL_INTERVAL) {
-                Ok(result) => return context.check().and(result),
+                Ok(result) => match context.check() {
+                    Ok(()) => {
+                        if result.is_err() {
+                            let _ = self.terminate();
+                        }
+                        return result;
+                    }
+                    Err(primary) => {
+                        let _ = self.terminate();
+                        return Err(primary);
+                    }
+                },
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Err(primary) = context.check() {
                         let _ = self.terminate();

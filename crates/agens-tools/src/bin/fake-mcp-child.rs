@@ -4,6 +4,12 @@ use serde_json::{Value, json};
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "success".into());
+    if mode == "descendant" {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        return;
+    }
+
+    let descendant_pid_path = std::env::args().nth(2);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     for line in stdin.lock().lines() {
@@ -17,6 +23,27 @@ fn main() {
         };
         if mode == "crash" {
             std::process::exit(9);
+        }
+        if mode.starts_with("descendant-") {
+            let descendant = std::process::Command::new(
+                std::env::current_exe().expect("fake MCP executable path should be available"),
+            )
+            .arg("descendant")
+            .spawn()
+            .expect("fake MCP descendant should start");
+            std::fs::write(
+                descendant_pid_path
+                    .as_deref()
+                    .expect("descendant PID path should be supplied"),
+                descendant.id().to_string(),
+            )
+            .expect("descendant PID should be recorded");
+            std::mem::forget(descendant);
+
+            if mode == "descendant-crash" {
+                std::process::exit(9);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
         if mode == "sleep" {
             std::thread::sleep(std::time::Duration::from_secs(5));
