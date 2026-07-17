@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -87,27 +88,39 @@ impl McpTransport for LocalTransport {
 struct StepDelayTransport {
     responses: VecDeque<Result<McpResponse, McpTransportError>>,
     delays: VecDeque<Duration>,
+    phases: mpsc::SyncSender<McpRequest>,
+    permits: mpsc::Receiver<()>,
 }
 
 impl StepDelayTransport {
     fn new(
         responses: impl IntoIterator<Item = Result<McpResponse, McpTransportError>>,
         delays: impl IntoIterator<Item = Duration>,
+        phases: mpsc::SyncSender<McpRequest>,
+        permits: mpsc::Receiver<()>,
     ) -> Self {
         Self {
             responses: responses.into_iter().collect(),
             delays: delays.into_iter().collect(),
+            phases,
+            permits,
         }
     }
 
-    fn wait_for_step(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
-        let mut remaining = self.delays.pop_front().unwrap_or(Duration::ZERO);
-        while remaining > Duration::ZERO {
-            context.check()?;
-            let slice = remaining.min(Duration::from_millis(1));
-            thread::sleep(slice);
-            remaining = remaining.saturating_sub(slice);
-        }
+    fn wait_for_step(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<(), McpTransportError> {
+        self.phases
+            .send(request)
+            .expect("test must observe every transport step");
+        self.permits
+            .recv_timeout(Duration::from_secs(2))
+            .expect("test must release every observed transport step");
+
+        context.check()?;
+        thread::sleep(self.delays.pop_front().unwrap_or(Duration::ZERO));
         context.check()
     }
 }
@@ -115,10 +128,10 @@ impl StepDelayTransport {
 impl McpTransport for StepDelayTransport {
     fn execute(
         &mut self,
-        _: McpRequest,
+        request: McpRequest,
         context: &McpOperationContext,
     ) -> Result<McpResponse, McpTransportError> {
-        self.wait_for_step(context)?;
+        self.wait_for_step(request, context)?;
         self.responses.pop_front().unwrap_or_else(|| {
             Err(McpTransportError::Protocol(
                 "missing deterministic response".into(),
@@ -128,10 +141,10 @@ impl McpTransport for StepDelayTransport {
 
     fn notify(
         &mut self,
-        _: McpRequest,
+        request: McpRequest,
         context: &McpOperationContext,
     ) -> Result<(), McpTransportError> {
-        self.wait_for_step(context)
+        self.wait_for_step(request, context)
     }
 
     fn close(&mut self, _: &McpOperationContext) -> Result<(), McpTransportError> {
@@ -396,36 +409,101 @@ fn timeout_and_cancellation_preserve_primary_result_despite_cleanup_error_and_su
 #[test]
 fn connect_and_list_tools_enforce_one_deadline_across_internal_steps() {
     let cancellation = Arc::new(AtomicBool::new(false));
-    let operation_timeout = Duration::from_millis(20);
-    let step_delay = Duration::from_millis(15);
+    let operation_timeout = Duration::from_secs(2);
+    let first_step_delay = Duration::from_millis(400);
+    let second_step_delay = Duration::from_millis(1800);
     let timeouts =
         McpTimeouts::new(operation_timeout, operation_timeout, operation_timeout).unwrap();
 
+    let (connect_phases, connect_phase_receiver) = mpsc::sync_channel(2);
+    let (connect_permits, connect_permit_receiver) = mpsc::sync_channel(2);
+    let (connect_result, connect_result_receiver) = mpsc::sync_channel(1);
     let mut connect_client = McpClient::new(
-        StepDelayTransport::new([Ok(initialized())], [step_delay, step_delay]),
+        StepDelayTransport::new(
+            [Ok(initialized())],
+            [first_step_delay, second_step_delay],
+            connect_phases,
+            connect_permit_receiver,
+        ),
         timeouts,
         limits(),
     );
-    assert_eq!(
-        connect_client.connect(initialize(), &cancellation),
-        Err(McpTransportError::TimedOut)
-    );
+    let connect_cancellation = Arc::clone(&cancellation);
+    let connect_worker = thread::spawn(move || {
+        connect_result
+            .send(connect_client.connect(initialize(), &connect_cancellation))
+            .unwrap();
+    });
 
+    assert_eq!(
+        connect_phase_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        McpRequest::Initialize(initialize())
+    );
+    connect_permits.send(()).unwrap();
+    assert_eq!(
+        connect_phase_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        McpRequest::Initialized
+    );
+    connect_permits.send(()).unwrap();
+    let connect_outcome = connect_result_receiver
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap();
+    connect_worker.join().unwrap();
+
+    let (list_phases, list_phase_receiver) = mpsc::sync_channel(2);
+    let (list_permits, list_permit_receiver) = mpsc::sync_channel(2);
+    let (list_result, list_result_receiver) = mpsc::sync_channel(1);
     let mut list_client = McpClient::new(
         StepDelayTransport::new(
             [
                 Ok(page(vec![tool("one", None)], Some("next"))),
                 Ok(page(vec![tool("two", None)], None)),
             ],
-            [step_delay, step_delay],
+            [first_step_delay, second_step_delay],
+            list_phases,
+            list_permit_receiver,
         ),
         timeouts,
         limits(),
     );
+    let list_cancellation = Arc::clone(&cancellation);
+    let list_worker = thread::spawn(move || {
+        list_result
+            .send(list_client.list_tools(&list_cancellation))
+            .unwrap();
+    });
+
     assert_eq!(
-        list_client.list_tools(&cancellation),
-        Err(McpTransportError::TimedOut)
+        list_phase_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        McpRequest::ListTools { cursor: None }
     );
+    list_permits.send(()).unwrap();
+    assert_eq!(
+        list_phase_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap(),
+        McpRequest::ListTools {
+            cursor: Some("next".into())
+        }
+    );
+    list_permits.send(()).unwrap();
+    let list_outcome = list_result_receiver
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap();
+    assert_eq!(
+        (connect_outcome, list_outcome),
+        (
+            Err(McpTransportError::TimedOut),
+            Err(McpTransportError::TimedOut)
+        )
+    );
+    list_worker.join().unwrap();
 }
 
 #[test]
