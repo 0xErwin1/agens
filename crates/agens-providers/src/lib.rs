@@ -3,8 +3,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, SystemTime};
 
 use agens_core::{Error, Message, MessagePart, Role};
 use serde_json::Value;
@@ -12,6 +14,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
+const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -27,6 +30,25 @@ pub struct ChatGptCapabilities {
 pub enum ChatGptAuthState {
     Ready,
     RefreshRequired,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProviderCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ProviderCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 pub const fn chatgpt_capabilities() -> ChatGptCapabilities {
@@ -141,6 +163,31 @@ where
     }
 
     decoder.finish()
+}
+
+pub fn decode_openai_response_stream(
+    events: Receiver<String>,
+    cancellation: &ProviderCancellation,
+) -> Result<Vec<MessagePart>, Error> {
+    let mut decoder = OpenAiResponseDecoder::default();
+
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+
+        match events.recv_timeout(CANCELLATION_POLL_INTERVAL) {
+            Ok(event) => {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+
+                decoder.process(&event)?;
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return decoder.finish(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -286,23 +333,13 @@ fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, E
 }
 
 fn upstream_error(event: &Value) -> Error {
-    let message = event
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("the upstream provider did not provide an error message");
-
-    Error::Provider(format!("OpenAI stream failed: {message}"))
+    let _ = event;
+    Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
 }
 
 fn response_failed_error(event: &Value) -> Error {
-    let message = event
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("the upstream provider did not provide an error message");
-
-    Error::Provider(format!("OpenAI stream failed: {message}"))
+    let _ = event;
+    Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
 }
 
 fn protocol_error(detail: &str) -> Error {

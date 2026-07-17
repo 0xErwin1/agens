@@ -71,7 +71,7 @@ fn reports_protocol_failures_without_returning_partial_parts() {
     assert_eq!(
         decode_openai_response_events(upstream_error),
         Err(Error::Provider(
-            "OpenAI stream failed: upstream rejected the request".to_owned()
+            "OpenAI stream failed: upstream provider reported an error".to_owned()
         ))
     );
     assert_eq!(
@@ -97,7 +97,7 @@ fn rejects_failed_or_incomplete_streams_without_returning_partial_parts() {
     assert_eq!(
         decode_openai_response_events(failed_stream),
         Err(Error::Provider(
-            "OpenAI stream failed: upstream rejected the request".to_owned()
+            "OpenAI stream failed: upstream provider reported an error".to_owned()
         ))
     );
     assert_eq!(
