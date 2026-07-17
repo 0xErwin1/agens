@@ -160,6 +160,182 @@ fn bounds_manifest_size_and_ignores_nested_manifests() {
     assert!(discovery.diagnostics()[0].message().contains("byte limit"));
 }
 
+#[test]
+fn parses_yaml_quoted_folded_and_literal_descriptions() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    write_skill(
+        &root,
+        "quoted",
+        "---\nname: quoted\ndescription: \"quoted: description\"\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "folded",
+        "---\nname: folded\ndescription: >\n  folded description\n  keeps its text\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "literal",
+        "---\nname: literal\ndescription: |\n  literal description\n  keeps its newline\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 3);
+    assert_eq!(
+        discovery.catalog().skill("quoted").unwrap().description(),
+        "quoted: description"
+    );
+    assert_eq!(
+        discovery.catalog().skill("folded").unwrap().description(),
+        "folded description keeps its text"
+    );
+    assert_eq!(
+        discovery.catalog().skill("literal").unwrap().description(),
+        "literal description\nkeeps its newline"
+    );
+}
+
+#[test]
+fn rejects_unsafe_names_and_keeps_valid_siblings() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    for (directory, name) in [
+        ("traversal", "../escape"),
+        ("separator", "nested/name"),
+        ("leading-hyphen", "-bad"),
+        ("trailing-hyphen", "bad-"),
+        ("uppercase", "Bad"),
+    ] {
+        write_skill(
+            &root,
+            directory,
+            &format!("---\nname: {name}\ndescription: invalid name\n---\nbody\n"),
+        );
+    }
+    write_skill(
+        &root,
+        "valid",
+        "---\nname: valid-name-2\ndescription: valid\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 1);
+    assert!(discovery.catalog().skill("valid-name-2").is_some());
+    assert_eq!(discovery.diagnostics().len(), 5);
+}
+
+#[test]
+fn ignores_unrelated_entries_without_consuming_the_skill_limit() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    for index in 0..128 {
+        let name = format!("skill-{index:03}");
+        write_skill(
+            &root,
+            &name,
+            &format!("---\nname: {name}\ndescription: valid skill\n---\nbody\n"),
+        );
+    }
+    fs::write(root.join("unrelated-file"), "not a skill").expect("unrelated file");
+    fs::create_dir_all(root.join("unrelated-directory")).expect("unrelated directory");
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 128);
+    assert!(discovery.catalog().skill("skill-127").is_some());
+    assert!(discovery.diagnostics().is_empty());
+}
+
+#[test]
+fn isolates_duplicate_critical_fields_and_malformed_frontmatter_delimiters() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+
+    write_skill(
+        &root,
+        "duplicate-name",
+        "---\nname: duplicate\nname: repeated\ndescription: invalid\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "non-string-description",
+        "---\nname: typed\ndescription: [not, text]\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "bad-opening-delimiter",
+        "----\nname: malformed\ndescription: invalid\n---\nbody\n",
+    );
+    write_skill(
+        &root,
+        "missing-closing-delimiter",
+        "---\nname: unclosed\ndescription: invalid\nbody\n",
+    );
+    write_skill(
+        &root,
+        "valid",
+        "---\nname: valid\ndescription: usable\nmetadata:\n  author: test\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 1);
+    assert!(discovery.catalog().skill("valid").is_some());
+    assert_eq!(discovery.diagnostics().len(), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlinked_roots_and_manifests_while_loading_valid_siblings() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    let outside = temporary.path.join("outside");
+    write_skill(
+        &outside,
+        "escaped",
+        "---\nname: escaped\ndescription: outside root\n---\nbody\n",
+    );
+    fs::create_dir_all(root.join("manifest-link")).expect("linked manifest directory");
+    symlink(
+        outside.join("escaped").join("SKILL.md"),
+        root.join("manifest-link").join("SKILL.md"),
+    )
+    .expect("manifest symlink");
+    write_skill(
+        &root,
+        "valid",
+        "---\nname: valid\ndescription: in root\n---\nbody\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+
+    assert_eq!(discovery.catalog().len(), 1);
+    assert!(discovery.catalog().skill("valid").is_some());
+    assert_eq!(discovery.diagnostics().len(), 1);
+    assert!(
+        discovery.diagnostics()[0]
+            .message()
+            .contains("symbolic-link")
+    );
+
+    let root_link = temporary.path.join("root-link");
+    symlink(&root, &root_link).expect("root symlink");
+    assert!(SkillCatalog::discover(&root_link, temporary.path.join("missing")).is_err());
+}
+
 fn write_skill(root: &Path, directory: &str, contents: &str) {
     let skill_directory = root.join(directory);
     fs::create_dir_all(&skill_directory).expect("skill directory");

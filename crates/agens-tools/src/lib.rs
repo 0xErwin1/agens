@@ -34,6 +34,7 @@ const DEFAULT_MAX_MCP_LIST_PAGES: usize = 128;
 const DEFAULT_MAX_MCP_TOOLS: usize = 1_000;
 const SKILL_MANIFEST_NAME: &str = "SKILL.md";
 const MAX_SKILL_DIRECTORIES_PER_ROOT: usize = 128;
+const MAX_SKILL_ROOT_ENTRIES: usize = 1_024;
 const MAX_SKILL_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 1_024;
@@ -216,78 +217,47 @@ impl std::error::Error for SkillDiscoveryError {
     }
 }
 
+#[derive(Default)]
 struct SkillRootLoad {
     skills: Vec<Skill>,
     diagnostics: Vec<SkillDiagnostic>,
 }
 
+#[cfg(unix)]
 fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
-    let metadata = match fs::symlink_metadata(root) {
-        Ok(metadata) => metadata,
+    let root_directory = match open_skill_root(root) {
+        Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(SkillRootLoad {
-                skills: Vec::new(),
-                diagnostics: Vec::new(),
-            });
+            return Ok(SkillRootLoad::default());
         }
-        Err(error) => return Err(skill_root_error(root, "inspect", error)),
+        Err(error) => return Err(skill_root_error(root, "open", error)),
     };
-
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(skill_root_error(
-            root,
-            "use",
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "root must be a non-symbolic-link directory",
-            ),
-        ));
-    }
-
-    let root = fs::canonicalize(root).map_err(|error| skill_root_error(root, "resolve", error))?;
-    let mut entries = fs::read_dir(&root)
-        .map_err(|error| skill_root_error(&root, "read", error))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| skill_root_error(&root, "read", error))?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let (entries, truncated) = read_skill_root_entries(&root_directory)
+        .map_err(|error| skill_root_error(root, "read", error))?;
 
     let mut diagnostics = Vec::new();
-    if entries.len() > MAX_SKILL_DIRECTORIES_PER_ROOT {
+    if truncated {
         diagnostics.push(skill_diagnostic(
-            &root,
-            format!(
-                "skill directory limit of {MAX_SKILL_DIRECTORIES_PER_ROOT} exceeded; later entries were skipped"
-            ),
+            root,
+            format!("skill root entry limit of {MAX_SKILL_ROOT_ENTRIES} exceeded; later entries were skipped"),
         ));
-        entries.truncate(MAX_SKILL_DIRECTORIES_PER_ROOT);
     }
 
     let mut candidates = Vec::new();
     for entry in entries {
-        let directory = entry.path();
-        let metadata = match fs::symlink_metadata(&directory) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                diagnostics.push(skill_diagnostic(
-                    &directory,
-                    format!("cannot inspect: {error}"),
-                ));
-                continue;
+        match load_skill_manifest(root, &root_directory, &entry) {
+            Ok(Some(skill)) if candidates.len() < MAX_SKILL_DIRECTORIES_PER_ROOT => {
+                candidates.push(skill)
             }
-        };
-        if metadata.file_type().is_symlink() {
-            diagnostics.push(skill_diagnostic(
-                &directory,
-                "symbolic-link skill directories are not allowed".into(),
-            ));
-            continue;
-        }
-        if !metadata.is_dir() {
-            continue;
-        }
-
-        match load_skill_manifest(&root, &directory) {
-            Ok(Some(skill)) => candidates.push(skill),
+            Ok(Some(_)) => {
+                diagnostics.push(skill_diagnostic(
+                    root,
+                    format!(
+                        "skill directory limit of {MAX_SKILL_DIRECTORIES_PER_ROOT} exceeded; later skills were skipped"
+                    ),
+                ));
+                break;
+            }
             Ok(None) => {}
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
@@ -315,22 +285,48 @@ fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
     })
 }
 
-fn load_skill_manifest(root: &Path, directory: &Path) -> Result<Option<Skill>, SkillDiagnostic> {
+#[cfg(not(unix))]
+fn load_skill_root(root: &Path) -> Result<SkillRootLoad, SkillDiscoveryError> {
+    Err(skill_root_error(
+        root,
+        "use",
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure skill discovery is unavailable on this platform",
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn load_skill_manifest(
+    root: &Path,
+    root_directory: &fs::File,
+    directory_name: &std::ffi::OsStr,
+) -> Result<Option<Skill>, SkillDiagnostic> {
+    use std::os::unix::fs::MetadataExt;
+
+    let directory = root.join(directory_name);
     let manifest = directory.join(SKILL_MANIFEST_NAME);
-    let metadata = match fs::symlink_metadata(&manifest) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(skill_diagnostic(
-                &manifest,
-                format!("cannot inspect: {error}"),
-            ));
-        }
+    let directory_descriptor = match open_child_directory(root_directory, directory_name) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(skill_diagnostic(&directory, error)),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let mut manifest_descriptor = match open_manifest(&directory_descriptor) {
+        Ok(Some(descriptor)) => descriptor,
+        Ok(None) => return Ok(None),
+        Err(error) => return Err(skill_diagnostic(&manifest, error)),
+    };
+    let metadata = manifest_descriptor.metadata().map_err(|error| {
+        skill_diagnostic(
+            &manifest,
+            format!("cannot inspect opened manifest: {error}"),
+        )
+    })?;
+    if !metadata.is_file() || metadata.nlink() > 1 {
         return Err(skill_diagnostic(
             &manifest,
-            "manifest must be a regular non-symbolic-link file".into(),
+            "manifest must be a single-link regular file".into(),
         ));
     }
     if metadata.len() > MAX_SKILL_MANIFEST_BYTES {
@@ -340,67 +336,23 @@ fn load_skill_manifest(root: &Path, directory: &Path) -> Result<Option<Skill>, S
         ));
     }
 
-    let resolved_manifest = fs::canonicalize(&manifest)
-        .map_err(|error| skill_diagnostic(&manifest, format!("cannot resolve: {error}")))?;
-    if !resolved_manifest.starts_with(root) || resolved_manifest.parent() != Some(directory) {
-        return Err(skill_diagnostic(
-            &manifest,
-            "manifest resolves outside its direct skill directory".into(),
-        ));
-    }
-
-    let contents = fs::read_to_string(&resolved_manifest).map_err(|error| {
-        skill_diagnostic(&manifest, format!("cannot read UTF-8 manifest: {error}"))
-    })?;
-    parse_skill_manifest(&resolved_manifest, &contents)
+    let contents = read_bounded_utf8(&mut manifest_descriptor)
+        .map_err(|message| skill_diagnostic(&manifest, message))?;
+    parse_skill_manifest(&manifest, &contents)
         .map(Some)
         .map_err(|message| skill_diagnostic(&manifest, message))
 }
 
 fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> {
-    let mut lines = contents.lines();
-    if lines.next() != Some("---") {
-        return Err("frontmatter must begin with ---".into());
-    }
-
-    let mut name = None;
-    let mut description = None;
-    let mut found_closing_delimiter = false;
-    for line in lines.by_ref() {
-        if line == "---" {
-            found_closing_delimiter = true;
-            break;
-        }
-        let (key, value) = line
-            .split_once(':')
-            .ok_or_else(|| "frontmatter entries must use key: value".to_string())?;
-        let value = unquote_frontmatter_value(value.trim())?;
-        match key.trim() {
-            "name" => {
-                if name.is_some() {
-                    return Err("frontmatter field is duplicated".into());
-                }
-                name = Some(value);
-            }
-            "description" => {
-                if description.is_some() {
-                    return Err("frontmatter field is duplicated".into());
-                }
-                description = Some(value);
-            }
-            _ => {}
-        }
-    }
-    if !found_closing_delimiter {
-        return Err("frontmatter closing --- is required".into());
-    }
-
-    let name = name.ok_or_else(|| "frontmatter name is required".to_string())?;
-    let description =
-        description.ok_or_else(|| "frontmatter description is required".to_string())?;
+    let (frontmatter, body) = split_skill_frontmatter(contents)?;
+    validate_critical_frontmatter_fields(frontmatter)?;
+    let mut fields: BTreeMap<String, serde_yaml::Value> = serde_yaml::from_str(frontmatter)
+        .map_err(|error| format!("invalid frontmatter: {error}"))?;
+    let name = required_frontmatter_string(&mut fields, "name")?;
+    let description = required_frontmatter_string(&mut fields, "description")?;
     validate_skill_name(&name)?;
     validate_skill_description(&description)?;
-    let body = lines.collect::<Vec<_>>().join("\n").trim().to_owned();
+    let body = body.trim().to_owned();
     if body.is_empty() {
         return Err("markdown body is required".into());
     }
@@ -413,15 +365,74 @@ fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> 
     })
 }
 
-fn unquote_frontmatter_value(value: &str) -> Result<String, String> {
-    let quoted = value.starts_with('"') || value.starts_with('\'');
-    if !quoted {
-        return Ok(value.to_owned());
+fn validate_critical_frontmatter_fields(frontmatter: &str) -> Result<(), String> {
+    let mut names = 0;
+    let mut descriptions = 0;
+
+    for line in frontmatter.lines() {
+        if line.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        match key.trim() {
+            "name" => names += 1,
+            "description" => descriptions += 1,
+            _ => {}
+        }
     }
-    if value.len() < 2 || !value.ends_with(value.chars().next().expect("non-empty value")) {
-        return Err("frontmatter quoted value is not terminated".into());
+
+    if names > 1 || descriptions > 1 {
+        return Err("frontmatter critical field is duplicated".into());
     }
-    Ok(value[1..value.len() - 1].to_owned())
+    Ok(())
+}
+
+fn split_skill_frontmatter(contents: &str) -> Result<(&str, &str), String> {
+    let Some(first_end) = contents.find('\n') else {
+        return Err("frontmatter must begin with --- followed by a newline".into());
+    };
+    if contents[..first_end].trim_end_matches('\r') != "---" {
+        return Err("frontmatter must begin with ---".into());
+    }
+
+    let frontmatter_start = first_end + 1;
+    let mut offset = frontmatter_start;
+    while offset < contents.len() {
+        let line_end = contents[offset..]
+            .find('\n')
+            .map(|index| offset + index)
+            .unwrap_or(contents.len());
+        if contents[offset..line_end].trim_end_matches('\r') == "---" {
+            let body_start = if line_end == contents.len() {
+                line_end
+            } else {
+                line_end + 1
+            };
+            return Ok((
+                &contents[frontmatter_start..offset],
+                &contents[body_start..],
+            ));
+        }
+        if line_end == contents.len() {
+            break;
+        }
+        offset = line_end + 1;
+    }
+
+    Err("frontmatter closing --- is required".into())
+}
+
+fn required_frontmatter_string(
+    fields: &mut BTreeMap<String, serde_yaml::Value>,
+    field: &str,
+) -> Result<String, String> {
+    match fields.remove(field) {
+        Some(serde_yaml::Value::String(value)) => Ok(value.trim().to_owned()),
+        Some(_) => Err(format!("frontmatter {field} must be a string")),
+        None => Err(format!("frontmatter {field} is required")),
+    }
 }
 
 fn validate_skill_name(name: &str) -> Result<(), String> {
@@ -430,11 +441,14 @@ fn validate_skill_name(name: &str) -> Result<(), String> {
             "name must contain 1 to {MAX_SKILL_NAME_CHARS} characters"
         ));
     }
-    if name
-        .chars()
-        .any(|character| character.is_whitespace() || character.is_control())
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit()
+        || !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit()
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit() && *byte != b'-')
     {
-        return Err("name cannot contain whitespace or control characters".into());
+        return Err("name must use lowercase ASCII letters, digits, and internal hyphens".into());
     }
     Ok(())
 }
@@ -445,10 +459,196 @@ fn validate_skill_description(description: &str) -> Result<(), String> {
             "description must contain 1 to {MAX_SKILL_DESCRIPTION_CHARS} characters"
         ));
     }
-    if description.chars().any(char::is_control) {
+    if description
+        .chars()
+        .any(|character| character.is_control() && character != '\n')
+    {
         return Err("description cannot contain control characters".into());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_skill_root(root: &Path) -> io::Result<fs::File> {
+    use std::{
+        ffi::CString,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+
+    let root = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "root contains a null byte"))?;
+    let descriptor = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn read_skill_root_entries(root: &fs::File) -> io::Result<(Vec<std::ffi::OsString>, bool)> {
+    use std::{
+        ffi::CStr,
+        os::{fd::IntoRawFd, unix::ffi::OsStrExt},
+    };
+
+    let root = root.try_clone()?;
+    let directory = unsafe { libc::fdopendir(root.into_raw_fd()) };
+    if directory.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let mut entries = Vec::new();
+        loop {
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(directory) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(0) {
+                    entries.sort();
+                    return Ok((entries, false));
+                }
+                return Err(error);
+            }
+
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            if entries.len() == MAX_SKILL_ROOT_ENTRIES {
+                entries.sort();
+                return Ok((entries, true));
+            }
+            entries.push(std::ffi::OsStr::from_bytes(name).to_os_string());
+        }
+    })();
+    unsafe {
+        libc::closedir(directory);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn open_child_directory(
+    root: &fs::File,
+    directory_name: &std::ffi::OsStr,
+) -> Result<Option<fs::File>, String> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let directory_name_c = CString::new(directory_name.as_bytes())
+        .map_err(|_| "skill directory name contains a null byte".to_string())?;
+    let descriptor = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            directory_name_c.as_ptr(),
+            libc::O_RDONLY
+                | libc::O_DIRECTORY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor >= 0 {
+        return Ok(Some(unsafe { fs::File::from_raw_fd(descriptor) }));
+    }
+
+    let error = io::Error::last_os_error();
+    if child_is_symlink(root, directory_name)? {
+        return Err("symbolic-link skill directories are not allowed".into());
+    }
+    if error.kind() == io::ErrorKind::NotADirectory {
+        return Ok(None);
+    }
+    Err(format!("cannot open skill directory: {error}"))
+}
+
+#[cfg(unix)]
+fn child_is_symlink(root: &fs::File, name: &std::ffi::OsStr) -> Result<bool, String> {
+    use std::{
+        ffi::CString,
+        mem::MaybeUninit,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| "skill directory name contains a null byte".to_string())?;
+    let mut metadata = MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        return Err(format!(
+            "cannot inspect skill directory: {}",
+            io::Error::last_os_error()
+        ));
+    }
+
+    let metadata = unsafe { metadata.assume_init() };
+    Ok(metadata.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+#[cfg(unix)]
+fn open_manifest(directory: &fs::File) -> Result<Option<fs::File>, String> {
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
+    let manifest_name =
+        CString::new(SKILL_MANIFEST_NAME).expect("static manifest name has no null byte");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            manifest_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor >= 0 {
+        return Ok(Some(unsafe { fs::File::from_raw_fd(descriptor) }));
+    }
+
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+    }
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return Err("manifest must be a regular non-symbolic-link file".into());
+    }
+    Err(format!("cannot open manifest: {error}"))
+}
+
+#[cfg(unix)]
+fn read_bounded_utf8(file: &mut fs::File) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    file.take(MAX_SKILL_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read opened manifest: {error}"))?;
+    if bytes.len() > MAX_SKILL_MANIFEST_BYTES as usize {
+        return Err(format!(
+            "manifest exceeds {MAX_SKILL_MANIFEST_BYTES} byte limit"
+        ));
+    }
+
+    String::from_utf8(bytes).map_err(|error| format!("cannot read UTF-8 manifest: {error}"))
 }
 
 fn skill_root_error(
