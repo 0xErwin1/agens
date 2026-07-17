@@ -174,6 +174,11 @@ impl McpOperationContext {
         }
         Ok(())
     }
+
+    pub fn remaining(&self) -> Result<Duration, McpTransportError> {
+        self.check()?;
+        Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
 }
 
 /// Implementations must cooperatively observe the context and must not block past its deadline.
@@ -476,11 +481,10 @@ impl<T: McpTransport> McpClient<T> {
         initialize: McpInitialize,
         cancellation: &Arc<AtomicBool>,
     ) -> Result<(), McpTransportError> {
-        let initialized = expect_initialized(self.request(
-            McpRequest::Initialize(initialize.clone()),
-            self.timeouts.connect,
-            cancellation,
-        )?)?;
+        let context = McpOperationContext::new(Arc::clone(cancellation), self.timeouts.connect);
+        let initialized = expect_initialized(
+            self.request(McpRequest::Initialize(initialize.clone()), &context)?,
+        )?;
         if initialized.protocol_version != initialize.protocol_version {
             return Err(McpTransportError::Protocol(
                 "MCP protocol version negotiation failed".into(),
@@ -496,15 +500,14 @@ impl<T: McpTransport> McpClient<T> {
                 "MCP server does not advertise tools capability".into(),
             ));
         }
-        let context = McpOperationContext::new(Arc::clone(cancellation), self.timeouts.connect);
-        self.transport.notify(McpRequest::Initialized, &context)?;
-        context.check()
+        self.notify(McpRequest::Initialized, &context)
     }
 
     pub fn list_tools(
         &mut self,
         cancellation: &Arc<AtomicBool>,
     ) -> Result<Vec<McpToolDefinition>, McpTransportError> {
+        let context = McpOperationContext::new(Arc::clone(cancellation), self.timeouts.list);
         let mut cursor = None;
         let mut seen = std::collections::BTreeSet::new();
         let mut tools = Vec::new();
@@ -513,8 +516,7 @@ impl<T: McpTransport> McpClient<T> {
                 McpRequest::ListTools {
                     cursor: cursor.clone(),
                 },
-                self.timeouts.list,
-                cancellation,
+                &context,
             )?
             else {
                 return Err(McpTransportError::Protocol(
@@ -553,13 +555,13 @@ impl<T: McpTransport> McpClient<T> {
                 "mcp: tool arguments must be a JSON object",
             ));
         }
+        let context = McpOperationContext::new(Arc::clone(cancellation), self.timeouts.call);
         match self.request(
             McpRequest::CallTool {
                 name: name.into(),
                 arguments,
             },
-            self.timeouts.call,
-            cancellation,
+            &context,
         )? {
             McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
             McpResponse::ProtocolError(error) => Ok(ToolOutput::failure(format!(
@@ -575,25 +577,48 @@ impl<T: McpTransport> McpClient<T> {
     fn request(
         &mut self,
         request: McpRequest,
-        timeout: Duration,
-        cancellation: &Arc<AtomicBool>,
+        context: &McpOperationContext,
     ) -> Result<McpResponse, McpTransportError> {
-        let context = McpOperationContext::new(Arc::clone(cancellation), timeout);
         if let Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) =
-            context.check()
+            context.remaining()
         {
-            return self.abort(&context, error);
+            return self.abort(context, error);
         }
-        match self.transport.execute(request, &context) {
+        match self.transport.execute(request, context) {
             Ok(response) => match context.check() {
                 Ok(()) => Ok(response),
                 Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
-                    self.abort(&context, error)
+                    self.abort(context, error)
                 }
                 Err(error) => Err(error),
             },
             Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
-                self.abort(&context, error)
+                self.abort(context, error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn notify(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<(), McpTransportError> {
+        if let Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) =
+            context.remaining()
+        {
+            return self.abort_notification(context, error);
+        }
+        match self.transport.notify(request, context) {
+            Ok(()) => match context.check() {
+                Ok(()) => Ok(()),
+                Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
+                    self.abort_notification(context, error)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error @ (McpTransportError::Cancelled | McpTransportError::TimedOut)) => {
+                self.abort_notification(context, error)
             }
             Err(error) => Err(error),
         }
@@ -604,6 +629,15 @@ impl<T: McpTransport> McpClient<T> {
         context: &McpOperationContext,
         primary: McpTransportError,
     ) -> Result<McpResponse, McpTransportError> {
+        let _ = self.transport.close(context);
+        Err(primary)
+    }
+
+    fn abort_notification(
+        &mut self,
+        context: &McpOperationContext,
+        primary: McpTransportError,
+    ) -> Result<(), McpTransportError> {
         let _ = self.transport.close(context);
         Err(primary)
     }

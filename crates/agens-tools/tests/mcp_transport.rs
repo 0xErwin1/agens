@@ -84,6 +84,61 @@ impl McpTransport for LocalTransport {
     }
 }
 
+struct StepDelayTransport {
+    responses: VecDeque<Result<McpResponse, McpTransportError>>,
+    delays: VecDeque<Duration>,
+}
+
+impl StepDelayTransport {
+    fn new(
+        responses: impl IntoIterator<Item = Result<McpResponse, McpTransportError>>,
+        delays: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        Self {
+            responses: responses.into_iter().collect(),
+            delays: delays.into_iter().collect(),
+        }
+    }
+
+    fn wait_for_step(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
+        let mut remaining = self.delays.pop_front().unwrap_or(Duration::ZERO);
+        while remaining > Duration::ZERO {
+            context.check()?;
+            let slice = remaining.min(Duration::from_millis(1));
+            thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+        }
+        context.check()
+    }
+}
+
+impl McpTransport for StepDelayTransport {
+    fn execute(
+        &mut self,
+        _: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<McpResponse, McpTransportError> {
+        self.wait_for_step(context)?;
+        self.responses.pop_front().unwrap_or_else(|| {
+            Err(McpTransportError::Protocol(
+                "missing deterministic response".into(),
+            ))
+        })
+    }
+
+    fn notify(
+        &mut self,
+        _: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<(), McpTransportError> {
+        self.wait_for_step(context)
+    }
+
+    fn close(&mut self, _: &McpOperationContext) -> Result<(), McpTransportError> {
+        Ok(())
+    }
+}
+
 fn initialize() -> McpInitialize {
     McpInitialize::new("2025-06-18", json!({}), "agens", "0.1.0")
 }
@@ -335,6 +390,41 @@ fn timeout_and_cancellation_preserve_primary_result_despite_cleanup_error_and_su
     assert_eq!(
         cancelled_client.call_tool("slow", json!({}), &cancellation),
         Err(McpTransportError::Cancelled)
+    );
+}
+
+#[test]
+fn connect_and_list_tools_enforce_one_deadline_across_internal_steps() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let operation_timeout = Duration::from_millis(20);
+    let step_delay = Duration::from_millis(15);
+    let timeouts =
+        McpTimeouts::new(operation_timeout, operation_timeout, operation_timeout).unwrap();
+
+    let mut connect_client = McpClient::new(
+        StepDelayTransport::new([Ok(initialized())], [step_delay, step_delay]),
+        timeouts,
+        limits(),
+    );
+    assert_eq!(
+        connect_client.connect(initialize(), &cancellation),
+        Err(McpTransportError::TimedOut)
+    );
+
+    let mut list_client = McpClient::new(
+        StepDelayTransport::new(
+            [
+                Ok(page(vec![tool("one", None)], Some("next"))),
+                Ok(page(vec![tool("two", None)], None)),
+            ],
+            [step_delay, step_delay],
+        ),
+        timeouts,
+        limits(),
+    );
+    assert_eq!(
+        list_client.list_tools(&cancellation),
+        Err(McpTransportError::TimedOut)
     );
 }
 
