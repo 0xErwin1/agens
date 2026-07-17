@@ -13,6 +13,10 @@ use time::format_description::well_known::Rfc3339;
 
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChatGptCapabilities {
@@ -350,6 +354,10 @@ fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), Erro
             .map_err(|_| auth_error("refreshed credentials could not be persisted"))?;
         drop(temporary_file);
 
+        if fail_before_rename_for_test() {
+            return Err(auth_error("refreshed credentials could not be persisted"));
+        }
+
         fs::rename(&temporary_path, path)
             .map_err(|_| auth_error("refreshed credentials could not be persisted"))?;
         File::open(parent)
@@ -381,6 +389,21 @@ fn ensure_private_directory(path: &Path) -> Result<(), Error> {
             }
         })
         .map_err(|_| auth_error("credentials directory could not be created"))
+}
+
+#[cfg(test)]
+fn fail_before_rename_for_test() -> bool {
+    FAIL_BEFORE_RENAME.with(|failure| failure.replace(false))
+}
+
+#[cfg(not(test))]
+fn fail_before_rename_for_test() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn inject_pre_rename_failure() {
+    FAIL_BEFORE_RENAME.with(|failure| failure.set(true));
 }
 
 fn create_private_temporary_file(parent: &Path) -> Result<(std::path::PathBuf, File), Error> {
@@ -415,4 +438,114 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<SystemTime> {
 
 fn auth_error(detail: &str) -> Error {
     Error::Auth(format!("ChatGPT authentication required: {detail}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn preserves_existing_credentials_and_removes_temporary_file_after_pre_rename_failure() {
+        let directory = temporary_directory("pre-rename-failure");
+        let credentials_path = directory.join("auth.json");
+        let original = credentials();
+        fs::write(&credentials_path, &original).expect("credentials should be written");
+
+        inject_pre_rename_failure();
+
+        assert_eq!(
+            persist_chatgpt_refresh(
+                &credentials_path,
+                "synthetic-new-access",
+                Some("synthetic-new-refresh"),
+                "2026-07-17T13:00:00Z",
+            ),
+            Err(Error::Auth(
+                "ChatGPT authentication required: refreshed credentials could not be persisted"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            fs::read(&credentials_path).expect("existing credentials should remain readable"),
+            original.as_bytes()
+        );
+        assert!(
+            fs::read_dir(&directory)
+                .expect("credential directory should remain readable")
+                .all(|entry| {
+                    !entry
+                        .expect("credential directory entry should be readable")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".auth-")
+                })
+        );
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creates_private_credential_directory_and_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = temporary_directory("permissions");
+        let credentials_directory = directory.join("credentials");
+        let credentials_path = credentials_directory.join("auth.json");
+
+        ensure_private_directory(&credentials_directory)
+            .expect("credential directory should be created");
+        fs::write(&credentials_path, credentials()).expect("credentials should be written");
+
+        persist_chatgpt_refresh(
+            &credentials_path,
+            "synthetic-new-access",
+            Some("synthetic-new-refresh"),
+            "2026-07-17T13:00:00Z",
+        )
+        .expect("refresh should persist credentials");
+
+        assert_eq!(
+            fs::metadata(&credentials_path)
+                .expect("credential file metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+        assert_eq!(
+            fs::metadata(&credentials_directory)
+                .expect("credential directory metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    fn credentials() -> String {
+        r#"{
+            "openai-chatgpt": {
+                "access_token": "synthetic-old-access",
+                "refresh_token": "synthetic-old-refresh",
+                "account_id": "account_123",
+                "expires_at": "2026-07-17T11:00:00Z"
+            }
+        }"#
+        .to_owned()
+    }
+
+    fn temporary_directory(name: &str) -> std::path::PathBuf {
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "agens-providers-chatgpt-auth-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+
+        fs::create_dir(&path).expect("temporary directory should be created");
+        path
+    }
 }
