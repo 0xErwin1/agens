@@ -245,6 +245,53 @@ fn coordinator_rejects_out_of_order_and_uncorrelated_tool_results() {
 }
 
 #[test]
+fn coordinator_rejects_provider_tool_results_without_mutating_state_or_events() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    let events_before_rejection = coordinator.events().to_vec();
+
+    assert_eq!(
+        coordinator.accept_provider_part(MessagePart::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "result".into(),
+            is_error: false,
+        }),
+        Err(TurnEventError::InvalidProviderPart)
+    );
+    assert_eq!(coordinator.state(), TurnState::Requesting);
+    assert_eq!(coordinator.events(), events_before_rejection);
+}
+
+#[test]
+fn coordinator_rejects_duplicate_pending_tool_call_ids_without_mutating_state_or_events() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "search".into(),
+            input: "{}".into(),
+        })
+        .unwrap();
+    let events_before_rejection = coordinator.events().to_vec();
+
+    assert_eq!(
+        coordinator.accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "read".into(),
+            input: "{}".into(),
+        }),
+        Err(TurnEventError::DuplicateToolCallId {
+            id: "call-1".into(),
+        })
+    );
+    assert_eq!(coordinator.state(), TurnState::Streaming);
+    assert_eq!(coordinator.events(), events_before_rejection);
+}
+
+#[test]
 fn cancellation_and_failure_reject_all_further_events() {
     let mut cancelled = TurnCoordinator::new();
 

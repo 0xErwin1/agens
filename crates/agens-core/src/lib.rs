@@ -161,26 +161,18 @@ impl TurnCoordinator {
     }
 
     pub fn accept_provider_part(&mut self, part: MessagePart) -> Result<(), TurnEventError> {
+        self.validate_provider_part(&part)?;
+
         if self.state == TurnState::Requesting {
             self.transition_to(TurnState::Streaming)?;
         }
 
-        self.require_state(TurnState::Streaming)?;
-
         if let MessagePart::ToolCall { id, name, input } = &part {
-            if self.pending_tool_calls.iter().any(|call| call.id == *id) {
-                return Err(TurnEventError::DuplicateToolCallId { id: id.clone() });
-            }
-
             self.pending_tool_calls.push(PendingToolCall {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
             });
-        }
-
-        if matches!(part, MessagePart::ToolResult { .. }) {
-            return Err(TurnEventError::InvalidProviderPart);
         }
 
         self.events.push(TurnEvent::ProviderPart(part));
@@ -261,6 +253,24 @@ impl TurnCoordinator {
             source: self.state,
             target,
         }))
+    }
+
+    fn validate_provider_part(&self, part: &MessagePart) -> Result<(), TurnEventError> {
+        if !matches!(self.state, TurnState::Requesting | TurnState::Streaming) {
+            return self.require_state(TurnState::Streaming);
+        }
+
+        if matches!(part, MessagePart::ToolResult { .. }) {
+            return Err(TurnEventError::InvalidProviderPart);
+        }
+
+        if let MessagePart::ToolCall { id, .. } = part
+            && self.pending_tool_calls.iter().any(|call| call.id == *id)
+        {
+            return Err(TurnEventError::DuplicateToolCallId { id: id.clone() });
+        }
+
+        Ok(())
     }
 
     fn transition_to(&mut self, target: TurnState) -> Result<(), TurnEventError> {
