@@ -49,6 +49,7 @@ dependencies = [
  "agens-config",
  "agens-core",
  "libc",
+ "serde_json",
 ]
 
 [[package]]
