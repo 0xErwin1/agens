@@ -125,6 +125,138 @@ fn rejects_supported_version_without_the_expected_schema() {
 }
 
 #[test]
+fn rejects_version_one_databases_with_incompatible_permission_grant_contracts() {
+    let incompatible_schemas = [
+        (
+            "wrong column affinity",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project BLOB NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "nullable required column",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "missing primary key",
+            "CREATE TABLE permission_grants (
+                id INTEGER NOT NULL,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "unexpected required default",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL DEFAULT '',
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "incompatible index",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE UNIQUE INDEX permission_grants_project ON permission_grants(project);",
+        ),
+        (
+            "unexpected column",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT,
+                expires_at TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "missing nullable column",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);",
+        ),
+        (
+            "unexpected index",
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            CREATE INDEX permission_grants_project ON permission_grants(project, id);
+            CREATE INDEX permission_grants_decision ON permission_grants(decision);",
+        ),
+    ];
+
+    for (name, schema) in incompatible_schemas {
+        let directory = data_directory();
+        let database = directory.join("rust-permissions.db");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(schema).unwrap();
+        connection.pragma_update(None, "user_version", 1).unwrap();
+        drop(connection);
+
+        let error = match PermissionGrantStore::open(&directory) {
+            Ok(_) => panic!("{name}: incompatible schema opened successfully"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("verify schema"), "{name}: {error}");
+        assert!(
+            error.contains(database.to_string_lossy().as_ref()),
+            "{name}: {error}"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn corrupt_database_open_failure_includes_operation_and_path() {
     let directory = data_directory();
     let database = directory.join("rust-permissions.db");

@@ -8,6 +8,95 @@ use rusqlite::{Connection, Transaction, params};
 
 const PERMISSIONS_DATABASE: &str = "rust-permissions.db";
 const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
+const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
+    ExpectedColumnSignature::new(0, "id", "INTEGER", false, None, 1),
+    ExpectedColumnSignature::new(1, "project", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(2, "decision", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(3, "tool_kind", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(4, "tool_value", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(5, "target_kind", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(6, "target_value", "TEXT", false, None, 0),
+];
+const PERMISSION_GRANTS_INDEX: ExpectedIndexSignature =
+    ExpectedIndexSignature::new(0, "permission_grants_project", false, "c", false);
+const PERMISSION_GRANTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
+    ExpectedIndexColumnSignature::new(0, 1, "project"),
+    ExpectedIndexColumnSignature::new(1, 0, "id"),
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExpectedColumnSignature {
+    column_id: i64,
+    name: &'static str,
+    declared_type: &'static str,
+    not_null: bool,
+    default_value: Option<&'static str>,
+    primary_key_position: i64,
+}
+
+impl ExpectedColumnSignature {
+    const fn new(
+        column_id: i64,
+        name: &'static str,
+        declared_type: &'static str,
+        not_null: bool,
+        default_value: Option<&'static str>,
+        primary_key_position: i64,
+    ) -> Self {
+        Self {
+            column_id,
+            name,
+            declared_type,
+            not_null,
+            default_value,
+            primary_key_position,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExpectedIndexSignature {
+    sequence: i64,
+    name: &'static str,
+    unique: bool,
+    origin: &'static str,
+    partial: bool,
+}
+
+impl ExpectedIndexSignature {
+    const fn new(
+        sequence: i64,
+        name: &'static str,
+        unique: bool,
+        origin: &'static str,
+        partial: bool,
+    ) -> Self {
+        Self {
+            sequence,
+            name,
+            unique,
+            origin,
+            partial,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExpectedIndexColumnSignature {
+    sequence: i64,
+    column_id: i64,
+    name: &'static str,
+}
+
+impl ExpectedIndexColumnSignature {
+    const fn new(sequence: i64, column_id: i64, name: &'static str) -> Self {
+        Self {
+            sequence,
+            column_id,
+            name,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionGrantStoreError {
@@ -158,9 +247,10 @@ fn initialize_schema(
         })?;
 
     match version {
-        0 => connection
-            .execute_batch(&format!(
-                "
+        0 => {
+            connection
+                .execute_batch(&format!(
+                    "
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS permission_grants (
                     id INTEGER PRIMARY KEY,
@@ -176,10 +266,13 @@ fn initialize_schema(
                 PRAGMA user_version = {PERMISSIONS_SCHEMA_VERSION};
                 COMMIT;
                 "
-            ))
-            .map_err(|error| {
-                PermissionGrantStoreError::operation("initialize schema", database_path, error)
-            }),
+                ))
+                .map_err(|error| {
+                    PermissionGrantStoreError::operation("initialize schema", database_path, error)
+                })?;
+
+            verify_schema(connection, database_path)
+        }
         PERMISSIONS_SCHEMA_VERSION => verify_schema(connection, database_path),
         unsupported => Err(PermissionGrantStoreError::operation(
             "check schema version",
@@ -193,15 +286,103 @@ fn verify_schema(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), PermissionGrantStoreError> {
-    connection
-        .prepare(
-            "SELECT project, decision, tool_kind, tool_value, target_kind, target_value
-             FROM permission_grants LIMIT 0",
-        )
-        .map(|_| ())
-        .map_err(|error| {
-            PermissionGrantStoreError::operation("verify schema", database_path, error)
-        })
+    let table_matches = permission_grants_table_matches(connection).map_err(|error| {
+        PermissionGrantStoreError::operation("verify schema", database_path, error)
+    })?;
+    let index_matches = permission_grants_index_matches(connection).map_err(|error| {
+        PermissionGrantStoreError::operation("verify schema", database_path, error)
+    })?;
+
+    if table_matches && index_matches {
+        return Ok(());
+    }
+
+    Err(PermissionGrantStoreError::operation(
+        "verify schema",
+        database_path,
+        "incompatible permission grants schema",
+    ))
+}
+
+fn permission_grants_table_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info('permission_grants')")?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(columns.len() == PERMISSION_GRANTS_COLUMNS.len()
+        && columns.iter().zip(PERMISSION_GRANTS_COLUMNS).all(
+            |(
+                (column_id, name, declared_type, not_null, default_value, primary_key_position),
+                expected,
+            )| {
+                *column_id == expected.column_id
+                    && name == expected.name
+                    && declared_type == expected.declared_type
+                    && *not_null == expected.not_null
+                    && default_value.as_deref() == expected.default_value
+                    && *primary_key_position == expected.primary_key_position
+            },
+        ))
+}
+
+fn permission_grants_index_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA index_list('permission_grants')")?;
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let indexes_match = indexes.len() == 1
+        && indexes
+            .first()
+            .is_some_and(|(sequence, name, unique, origin, partial)| {
+                *sequence == PERMISSION_GRANTS_INDEX.sequence
+                    && name == PERMISSION_GRANTS_INDEX.name
+                    && *unique == PERMISSION_GRANTS_INDEX.unique
+                    && origin == PERMISSION_GRANTS_INDEX.origin
+                    && *partial == PERMISSION_GRANTS_INDEX.partial
+            });
+
+    if !indexes_match {
+        return Ok(false);
+    }
+
+    let mut statement = connection.prepare("PRAGMA index_info('permission_grants_project')")?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(columns.len() == PERMISSION_GRANTS_INDEX_COLUMNS.len()
+        && columns.iter().zip(PERMISSION_GRANTS_INDEX_COLUMNS).all(
+            |((sequence, column_id, name), expected)| {
+                *sequence == expected.sequence
+                    && *column_id == expected.column_id
+                    && name == expected.name
+            },
+        ))
 }
 
 #[cfg(unix)]
