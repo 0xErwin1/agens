@@ -457,20 +457,36 @@ impl PermissionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionRule {
     pub scope: PermissionScope,
+    pub project: Option<String>,
     pub decision: PermissionDecision,
     pub tool: PermissionPattern,
     pub target: PermissionPattern,
 }
 
 impl PermissionRule {
-    pub const fn new(
-        scope: PermissionScope,
+    pub fn global(
         decision: PermissionDecision,
         tool: PermissionPattern,
         target: PermissionPattern,
     ) -> Self {
         Self {
-            scope,
+            scope: PermissionScope::Global,
+            project: None,
+            decision,
+            tool,
+            target,
+        }
+    }
+
+    pub fn project(
+        project: impl Into<String>,
+        decision: PermissionDecision,
+        tool: PermissionPattern,
+        target: PermissionPattern,
+    ) -> Self {
+        Self {
+            scope: PermissionScope::Project,
+            project: Some(project.into()),
             decision,
             tool,
             target,
@@ -478,7 +494,12 @@ impl PermissionRule {
     }
 
     fn matches(&self, request: &PermissionRequest) -> bool {
-        self.tool.matches(&request.tool) && self.target.matches(&request.target)
+        let project_matches = match self.scope {
+            PermissionScope::Global => true,
+            PermissionScope::Project => self.project.as_deref() == Some(request.project.as_str()),
+        };
+
+        project_matches && self.tool.matches(&request.tool) && self.target.matches(&request.target)
     }
 }
 
@@ -566,18 +587,14 @@ impl PermissionPolicy {
         }
 
         if let Some(decision) = self.static_decision(request) {
-            return decision;
+            return Self::resolve_ask(decision, session);
         }
 
         if let Some(decision) = Self::grant_decision(project_grants, request) {
-            return decision;
+            return Self::resolve_ask(decision, session);
         }
 
-        if session.temporary_bypass {
-            PermissionDecision::Allow
-        } else {
-            PermissionDecision::Ask
-        }
+        Self::resolve_ask(PermissionDecision::Ask, session)
     }
 
     fn static_decision(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
@@ -585,6 +602,12 @@ impl PermissionPolicy {
             || self.matches_static(PermissionScope::Project, PermissionDecision::Deny, request)
         {
             return Some(PermissionDecision::Deny);
+        }
+
+        if self.matches_static(PermissionScope::Global, PermissionDecision::Ask, request)
+            || self.matches_static(PermissionScope::Project, PermissionDecision::Ask, request)
+        {
+            return Some(PermissionDecision::Ask);
         }
 
         if self.matches_static(PermissionScope::Global, PermissionDecision::Allow, request)
@@ -605,6 +628,17 @@ impl PermissionPolicy {
         self.static_rules
             .iter()
             .any(|rule| rule.scope == scope && rule.decision == decision && rule.matches(request))
+    }
+
+    fn resolve_ask(
+        decision: PermissionDecision,
+        session: &PermissionSession,
+    ) -> PermissionDecision {
+        if decision == PermissionDecision::Ask && session.temporary_bypass {
+            PermissionDecision::Allow
+        } else {
+            decision
+        }
     }
 
     fn grant_decision(
