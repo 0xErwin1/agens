@@ -1,14 +1,17 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Barrier, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agens_tools::{
-    ChildCapability, SubagentInvocation, SubagentLimits, SubagentRunner, SubagentTool,
-    SubagentTurnRequest, SubagentTurnResult,
+    ChildCapability, SubagentInvocation, SubagentLimits, SubagentRunner, SubagentRunnerError,
+    SubagentTool, SubagentTurnRequest, SubagentTurnResult,
 };
 
 #[test]
@@ -247,6 +250,166 @@ fn rejects_oversized_prompt_or_context_before_calling_the_runner() {
     assert!(observed.lock().expect("recorded request").is_none());
 }
 
+#[test]
+fn returns_by_deadline_and_retains_the_permit_until_a_non_cooperative_runner_finishes() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        DelayedThenSuccessfulRunner::default(),
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_millis(5)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+
+    let started = Instant::now();
+    let timed_out = tool.execute(
+        SubagentInvocation::new("researcher", "first"),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert!(started.elapsed() < Duration::from_millis(80));
+    assert_eq!(timed_out.content, "subagent: deadline exceeded");
+    assert!(timed_out.is_error);
+
+    let rejected = tool.execute(
+        SubagentInvocation::new("researcher", "second"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(rejected.content, "subagent: concurrent child limit reached");
+
+    thread::sleep(Duration::from_millis(180));
+    let recovered = tool.execute(
+        SubagentInvocation::new("researcher", "third"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(recovered.content, "child result");
+    assert!(!recovered.is_error);
+}
+
+#[test]
+fn returns_promptly_when_cancellation_reaches_a_non_cooperative_runner() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        DelayedThenSuccessfulRunner::default(),
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&cancellation);
+    let cancellation_worker = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(5));
+        trigger.store(true, Ordering::Release);
+    });
+
+    let started = Instant::now();
+    let cancelled = tool.execute(SubagentInvocation::new("researcher", "first"), cancellation);
+
+    cancellation_worker.join().expect("cancellation worker");
+    assert!(started.elapsed() < Duration::from_millis(80));
+    assert_eq!(cancelled.content, "subagent: cancelled");
+
+    let rejected = tool.execute(
+        SubagentInvocation::new("researcher", "second"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(rejected.content, "subagent: concurrent child limit reached");
+
+    thread::sleep(Duration::from_millis(180));
+}
+
+#[test]
+fn converts_panic_and_infrastructure_failures_to_distinct_sanitized_results() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let panic_tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        PanicThenSuccessfulRunner::default(),
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+    let infrastructure_tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        InfrastructureFailureRunner,
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+
+    let panic = panic_tool.execute(
+        SubagentInvocation::new("researcher", "panic"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(panic.content, "subagent: infrastructure failure");
+    assert!(!panic.content.contains("PARENT_PROVIDER_SECRET_SENTINEL"));
+
+    let recovered = panic_tool.execute(
+        SubagentInvocation::new("researcher", "recover"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(recovered.content, "subagent: infrastructure failure");
+    assert_ne!(
+        recovered.content,
+        "subagent: concurrent child limit reached"
+    );
+
+    let infrastructure = infrastructure_tool.execute(
+        SubagentInvocation::new("researcher", "internal failure"),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(infrastructure.content, "subagent: infrastructure failure");
+    assert!(infrastructure.is_error);
+}
+
+#[test]
+fn caps_combined_prompt_and_context_before_calling_the_runner() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let runner = RecordingRunner::default();
+    let observed = Arc::clone(&runner.observed);
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        runner,
+        SubagentLimits::new(1, 2, 4, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+
+    let output = tool.execute(
+        SubagentInvocation::new("researcher", "abc")
+            .with_context("de")
+            .expect("bounded context"),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    assert_eq!(output.content, "subagent: input exceeds configured bounds");
+    assert!(observed.lock().expect("recorded request").is_none());
+}
+
 #[derive(Default)]
 struct RecordingRunner {
     observed: Arc<Mutex<Option<SubagentTurnRequest>>>,
@@ -298,10 +461,60 @@ impl SubagentRunner for CancellableFailureRunner {
         }
 
         if context.is_cancelled() {
-            return Err(agens_tools::SubagentRunnerError::Failed);
+            return Err(SubagentRunnerError::ModelFailure);
         }
 
-        Err(agens_tools::SubagentRunnerError::Failed)
+        Err(SubagentRunnerError::ModelFailure)
+    }
+}
+
+#[derive(Default)]
+struct DelayedThenSuccessfulRunner {
+    calls: AtomicUsize,
+}
+
+impl SubagentRunner for DelayedThenSuccessfulRunner {
+    fn run(
+        &mut self,
+        _request: SubagentTurnRequest,
+        _context: &agens_tools::SubagentRunContext,
+    ) -> Result<SubagentTurnResult, SubagentRunnerError> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            thread::sleep(Duration::from_millis(150));
+        }
+
+        Ok(SubagentTurnResult::new("child result", 1))
+    }
+}
+
+#[derive(Default)]
+struct PanicThenSuccessfulRunner {
+    calls: AtomicUsize,
+}
+
+impl SubagentRunner for PanicThenSuccessfulRunner {
+    fn run(
+        &mut self,
+        _request: SubagentTurnRequest,
+        _context: &agens_tools::SubagentRunContext,
+    ) -> Result<SubagentTurnResult, SubagentRunnerError> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            panic!("PARENT_PROVIDER_SECRET_SENTINEL");
+        }
+
+        Ok(SubagentTurnResult::new("child result", 1))
+    }
+}
+
+struct InfrastructureFailureRunner;
+
+impl SubagentRunner for InfrastructureFailureRunner {
+    fn run(
+        &mut self,
+        _request: SubagentTurnRequest,
+        _context: &agens_tools::SubagentRunContext,
+    ) -> Result<SubagentTurnResult, SubagentRunnerError> {
+        Err(SubagentRunnerError::InfrastructureFailure)
     }
 }
 

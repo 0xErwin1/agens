@@ -1,12 +1,15 @@
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
+    panic::{self, AssertUnwindSafe, catch_unwind},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -45,6 +48,25 @@ const DEFAULT_MAX_SUBAGENT_ITERATIONS: usize = 16;
 const DEFAULT_MAX_SUBAGENT_INPUT_CHARS: usize = 16 * 1024;
 const DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS: usize = 64 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(30);
+const SUBAGENT_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+static SUBAGENT_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+thread_local! {
+    static IS_SUBAGENT_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Suppress only worker panic payloads because they can contain provider secrets.
+fn install_subagent_panic_hook() {
+    SUBAGENT_PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let default_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |panic_info| {
+            if !IS_SUBAGENT_WORKER.with(Cell::get) {
+                default_hook(panic_info);
+            }
+        }));
+    });
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
@@ -907,9 +929,11 @@ impl SubagentTurnResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubagentRunnerError {
-    Failed,
+    ModelFailure,
+    InfrastructureFailure,
 }
 
+#[derive(Clone)]
 pub struct SubagentRunContext {
     cancellation: Arc<AtomicBool>,
     deadline: Instant,
@@ -933,14 +957,14 @@ impl SubagentRunContext {
 
     pub fn check(&self) -> Result<(), SubagentRunnerError> {
         if self.is_cancelled() || self.is_expired() {
-            return Err(SubagentRunnerError::Failed);
+            return Err(SubagentRunnerError::ModelFailure);
         }
         Ok(())
     }
 }
 
 /// The runner owns provider credentials and must cooperatively check the supplied context.
-pub trait SubagentRunner: Send {
+pub trait SubagentRunner: Send + 'static {
     fn run(
         &mut self,
         request: SubagentTurnRequest,
@@ -995,8 +1019,12 @@ impl<R: SubagentRunner> SubagentTool<R> {
             return ToolOutput::failure("subagent: requested skill is unavailable");
         };
         if invocation.prompt.is_empty()
-            || invocation.prompt.chars().count() > self.limits.max_input_chars
-            || invocation.context.chars().count() > self.limits.max_input_chars
+            || invocation
+                .prompt
+                .chars()
+                .count()
+                .saturating_add(invocation.context.chars().count())
+                > self.limits.max_input_chars
         {
             return ToolOutput::failure("subagent: input exceeds configured bounds");
         }
@@ -1004,8 +1032,7 @@ impl<R: SubagentRunner> SubagentTool<R> {
             return ToolOutput::failure("subagent: cancelled");
         }
 
-        let Some(_permit) = SubagentPermit::acquire(&self.active, self.limits.max_concurrent)
-        else {
+        let Some(permit) = SubagentPermit::acquire(&self.active, self.limits.max_concurrent) else {
             return ToolOutput::failure("subagent: concurrent child limit reached");
         };
         let context = SubagentRunContext::new(cancellation, self.limits.timeout);
@@ -1018,18 +1045,57 @@ impl<R: SubagentRunner> SubagentTool<R> {
             capabilities: ChildCapabilityRegistry::isolated(),
         };
 
-        let result = self
-            .runner
-            .lock()
-            .map_err(|_| SubagentRunnerError::Failed)
-            .and_then(|mut runner| runner.run(request, &context));
-        if context.is_cancelled() {
-            return ToolOutput::failure("subagent: cancelled");
-        }
-        if context.is_expired() {
-            return ToolOutput::failure("subagent: deadline exceeded");
-        }
+        let (sender, receiver) = mpsc::channel();
+        let runner = Arc::clone(&self.runner);
+        let worker_context = context.clone();
 
+        thread::spawn(move || {
+            let _permit = permit;
+            install_subagent_panic_hook();
+            IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(true));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                let mut runner = runner
+                    .lock()
+                    .map_err(|_| SubagentRunnerError::InfrastructureFailure)?;
+                runner.run(request, &worker_context)
+            }))
+            .unwrap_or(Err(SubagentRunnerError::InfrastructureFailure));
+            IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(false));
+
+            let _ = sender.send(result);
+        });
+
+        loop {
+            if context.is_cancelled() {
+                return ToolOutput::failure("subagent: cancelled");
+            }
+            if context.is_expired() {
+                return ToolOutput::failure("subagent: deadline exceeded");
+            }
+
+            let remaining = context.deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(SUBAGENT_RESULT_POLL_INTERVAL);
+
+            match receiver.recv_timeout(wait) {
+                Ok(result) => {
+                    if context.is_cancelled() {
+                        return ToolOutput::failure("subagent: cancelled");
+                    }
+                    if context.is_expired() {
+                        return ToolOutput::failure("subagent: deadline exceeded");
+                    }
+
+                    return self.result_output(result);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return ToolOutput::failure("subagent: infrastructure failure");
+                }
+            }
+        }
+    }
+
+    fn result_output(&self, result: Result<SubagentTurnResult, SubagentRunnerError>) -> ToolOutput {
         match result {
             Ok(result)
                 if result.iterations <= self.limits.max_iterations
@@ -1041,7 +1107,12 @@ impl<R: SubagentRunner> SubagentTool<R> {
                 ToolOutput::failure("subagent: iteration limit exceeded")
             }
             Ok(_) => ToolOutput::failure("subagent: output limit exceeded"),
-            Err(_) => ToolOutput::failure("subagent: child execution failed"),
+            Err(SubagentRunnerError::ModelFailure) => {
+                ToolOutput::failure("subagent: child execution failed")
+            }
+            Err(SubagentRunnerError::InfrastructureFailure) => {
+                ToolOutput::failure("subagent: infrastructure failure")
+            }
         }
     }
 }
