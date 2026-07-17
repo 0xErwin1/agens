@@ -40,6 +40,11 @@ const MAX_SKILL_ROOT_ENTRIES: usize = 1_024;
 const MAX_SKILL_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 1_024;
+const DEFAULT_MAX_SUBAGENT_CONCURRENCY: usize = 4;
+const DEFAULT_MAX_SUBAGENT_ITERATIONS: usize = 16;
+const DEFAULT_MAX_SUBAGENT_INPUT_CHARS: usize = 16 * 1024;
+const DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS: usize = 64 * 1024;
+const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
@@ -735,6 +740,346 @@ fn skill_diagnostic(path: &Path, message: String) -> SkillDiagnostic {
     SkillDiagnostic {
         path: path.to_path_buf(),
         message,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildCapability {
+    FilesystemRead,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChildCapabilityRegistry {
+    allowed: Vec<ChildCapability>,
+}
+
+impl ChildCapabilityRegistry {
+    pub fn isolated() -> Self {
+        Self {
+            allowed: vec![ChildCapability::FilesystemRead],
+        }
+    }
+
+    pub fn allowed(&self) -> &[ChildCapability] {
+        &self.allowed
+    }
+
+    pub const fn allows_descendants(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentInvocation {
+    skill_name: String,
+    prompt: String,
+    context: String,
+}
+
+impl SubagentInvocation {
+    pub fn new(skill_name: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            skill_name: skill_name.into(),
+            prompt: prompt.into(),
+            context: String::new(),
+        }
+    }
+
+    pub fn with_context(mut self, context: impl Into<String>) -> Result<Self, SubagentInputError> {
+        self.context = context.into();
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubagentLimits {
+    max_concurrent: usize,
+    max_iterations: usize,
+    max_input_chars: usize,
+    max_output_chars: usize,
+    timeout: Duration,
+}
+
+impl SubagentLimits {
+    pub fn new(
+        max_concurrent: usize,
+        max_iterations: usize,
+        max_input_chars: usize,
+        max_output_chars: usize,
+        timeout: Duration,
+    ) -> Result<Self, SubagentInputError> {
+        if max_concurrent == 0
+            || max_iterations == 0
+            || max_input_chars == 0
+            || max_output_chars == 0
+            || timeout.is_zero()
+        {
+            return Err(SubagentInputError::InvalidLimits);
+        }
+
+        Ok(Self {
+            max_concurrent,
+            max_iterations,
+            max_input_chars,
+            max_output_chars,
+            timeout,
+        })
+    }
+}
+
+impl Default for SubagentLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent: DEFAULT_MAX_SUBAGENT_CONCURRENCY,
+            max_iterations: DEFAULT_MAX_SUBAGENT_ITERATIONS,
+            max_input_chars: DEFAULT_MAX_SUBAGENT_INPUT_CHARS,
+            max_output_chars: DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS,
+            timeout: DEFAULT_SUBAGENT_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubagentInputError {
+    InvalidLimits,
+}
+
+impl fmt::Display for SubagentInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimits => formatter.write_str("subagent limits must be greater than zero"),
+        }
+    }
+}
+
+impl std::error::Error for SubagentInputError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentTurnRequest {
+    skill_name: String,
+    skill_description: String,
+    instructions: String,
+    prompt: String,
+    context: String,
+    capabilities: ChildCapabilityRegistry,
+}
+
+impl SubagentTurnRequest {
+    pub fn skill_name(&self) -> &str {
+        &self.skill_name
+    }
+
+    pub fn skill_description(&self) -> &str {
+        &self.skill_description
+    }
+
+    pub fn instructions(&self) -> &str {
+        &self.instructions
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    pub fn capabilities(&self) -> &ChildCapabilityRegistry {
+        &self.capabilities
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentTurnResult {
+    output: String,
+    iterations: usize,
+}
+
+impl SubagentTurnResult {
+    pub fn new(output: impl Into<String>, iterations: usize) -> Self {
+        Self {
+            output: output.into(),
+            iterations,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentRunnerError {
+    Failed,
+}
+
+pub struct SubagentRunContext {
+    cancellation: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl SubagentRunContext {
+    fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
+        Self {
+            cancellation,
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    pub fn check(&self) -> Result<(), SubagentRunnerError> {
+        if self.is_cancelled() || self.is_expired() {
+            return Err(SubagentRunnerError::Failed);
+        }
+        Ok(())
+    }
+}
+
+/// The runner owns provider credentials and must cooperatively check the supplied context.
+pub trait SubagentRunner: Send {
+    fn run(
+        &mut self,
+        request: SubagentTurnRequest,
+        context: &SubagentRunContext,
+    ) -> Result<SubagentTurnResult, SubagentRunnerError>;
+}
+
+pub struct SubagentTool<R> {
+    catalog: SkillCatalog,
+    runner: Arc<Mutex<R>>,
+    limits: SubagentLimits,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl<R> Clone for SubagentTool<R> {
+    fn clone(&self) -> Self {
+        Self {
+            catalog: self.catalog.clone(),
+            runner: Arc::clone(&self.runner),
+            limits: self.limits,
+            active: Arc::clone(&self.active),
+        }
+    }
+}
+
+impl<R: SubagentRunner> SubagentTool<R> {
+    pub fn discover(
+        global_root: impl AsRef<Path>,
+        project_root: impl AsRef<Path>,
+        runner: R,
+        limits: SubagentLimits,
+    ) -> Result<Self, SkillDiscoveryError> {
+        let discovery = SkillCatalog::discover(global_root, project_root)?;
+        Ok(Self::from_catalog(discovery.catalog, runner, limits))
+    }
+
+    pub fn from_catalog(catalog: SkillCatalog, runner: R, limits: SubagentLimits) -> Self {
+        Self {
+            catalog,
+            runner: Arc::new(Mutex::new(runner)),
+            limits,
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn execute(
+        &self,
+        invocation: SubagentInvocation,
+        cancellation: Arc<AtomicBool>,
+    ) -> ToolOutput {
+        let Some(skill) = self.catalog.skill(&invocation.skill_name) else {
+            return ToolOutput::failure("subagent: requested skill is unavailable");
+        };
+        if invocation.prompt.is_empty()
+            || invocation.prompt.chars().count() > self.limits.max_input_chars
+            || invocation.context.chars().count() > self.limits.max_input_chars
+        {
+            return ToolOutput::failure("subagent: input exceeds configured bounds");
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return ToolOutput::failure("subagent: cancelled");
+        }
+
+        let Some(_permit) = SubagentPermit::acquire(&self.active, self.limits.max_concurrent)
+        else {
+            return ToolOutput::failure("subagent: concurrent child limit reached");
+        };
+        let context = SubagentRunContext::new(cancellation, self.limits.timeout);
+        let request = SubagentTurnRequest {
+            skill_name: skill.name.clone(),
+            skill_description: skill.description.clone(),
+            instructions: skill.body.clone(),
+            prompt: invocation.prompt,
+            context: invocation.context,
+            capabilities: ChildCapabilityRegistry::isolated(),
+        };
+
+        let result = self
+            .runner
+            .lock()
+            .map_err(|_| SubagentRunnerError::Failed)
+            .and_then(|mut runner| runner.run(request, &context));
+        if context.is_cancelled() {
+            return ToolOutput::failure("subagent: cancelled");
+        }
+        if context.is_expired() {
+            return ToolOutput::failure("subagent: deadline exceeded");
+        }
+
+        match result {
+            Ok(result)
+                if result.iterations <= self.limits.max_iterations
+                    && result.output.chars().count() <= self.limits.max_output_chars =>
+            {
+                ToolOutput::success(result.output)
+            }
+            Ok(result) if result.iterations > self.limits.max_iterations => {
+                ToolOutput::failure("subagent: iteration limit exceeded")
+            }
+            Ok(_) => ToolOutput::failure("subagent: output limit exceeded"),
+            Err(_) => ToolOutput::failure("subagent: child execution failed"),
+        }
+    }
+}
+
+struct SubagentPermit {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SubagentPermit {
+    fn acquire(
+        active: &Arc<std::sync::atomic::AtomicUsize>,
+        max_concurrent: usize,
+    ) -> Option<Self> {
+        let mut current = active.load(Ordering::Acquire);
+        loop {
+            if current >= max_concurrent {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        active: Arc::clone(active),
+                    });
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+}
+
+impl Drop for SubagentPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
