@@ -185,7 +185,13 @@ pub fn decode_openai_response_stream(
                 decoder.process(&event)?;
             }
             Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return decoder.finish(),
+            Err(RecvTimeoutError::Disconnected) => {
+                if cancellation.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+
+                return decoder.finish();
+            }
         }
     }
 }

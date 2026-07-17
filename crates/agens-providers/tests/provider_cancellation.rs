@@ -31,6 +31,37 @@ fn cancelling_a_pending_stream_returns_the_typed_cancelled_outcome_promptly() {
 }
 
 #[test]
+fn cancellation_wins_when_the_event_source_disconnects() {
+    let (sender, receiver) = mpsc::channel();
+    let cancellation = ProviderCancellation::new();
+    let canceller = cancellation.clone();
+
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        canceller.cancel();
+        drop(sender);
+    });
+
+    assert_eq!(
+        decode_openai_response_stream(receiver, &cancellation),
+        Err(Error::Cancelled)
+    );
+}
+
+#[test]
+fn disconnecting_without_cancellation_remains_a_protocol_failure() {
+    let (sender, receiver) = mpsc::channel();
+    let cancellation = ProviderCancellation::new();
+
+    drop(sender);
+
+    assert!(matches!(
+        decode_openai_response_stream(receiver, &cancellation),
+        Err(Error::Provider(message)) if message == "OpenAI stream protocol error: stream ended before response.completed"
+    ));
+}
+
+#[test]
 fn cancellation_does_not_commit_queued_stream_parts_after_it_is_requested() {
     let (sender, receiver) = mpsc::channel();
     let cancellation = ProviderCancellation::new();
