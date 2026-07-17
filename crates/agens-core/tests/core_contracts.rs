@@ -5,7 +5,9 @@ use std::{
 
 use agens_core::{
     CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, Role, TurnCoordinator,
+    CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, PermissionDecision,
+    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest, PermissionRule,
+    PermissionScope, PermissionSession, ProjectPermissionGrant, Role, ToolAccess, TurnCoordinator,
     TurnEvent, TurnEventError, TurnState, TurnTransitionError,
 };
 
@@ -488,4 +490,161 @@ fn completed_turn_persistence_failure_is_typed_and_does_not_claim_success() {
         Err(CompletedTurnPersistenceError::AlreadyAttempted)
     );
     assert_eq!(repository.calls, 1);
+}
+
+fn write_request(project: &str, target: &str) -> PermissionRequest {
+    PermissionRequest::new(project, "edit", target, ToolAccess::Write)
+}
+
+#[test]
+fn permission_global_deny_and_chat_mode_cannot_be_weakened() {
+    let policy = PermissionPolicy::new(
+        PermissionMode::Chat,
+        vec![
+            PermissionRule::new(
+                PermissionScope::Global,
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("edit".into()),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::new(
+                PermissionScope::Project,
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("edit".into()),
+                PermissionPattern::Any,
+            ),
+        ],
+    );
+    let session = PermissionSession::with_temporary_bypass();
+    let grant = ProjectPermissionGrant::allow(
+        "project-a",
+        PermissionPattern::Exact("edit".into()),
+        PermissionPattern::Any,
+    );
+
+    assert_eq!(
+        policy.evaluate(
+            &write_request("project-a", "src/lib.rs"),
+            &[grant],
+            &session
+        ),
+        PermissionDecision::Deny
+    );
+
+    let mode_only_policy = PermissionPolicy::new(PermissionMode::Chat, Vec::new());
+
+    assert_eq!(
+        mode_only_policy.evaluate(
+            &write_request("project-a", "src/lib.rs"),
+            &[ProjectPermissionGrant::allow(
+                "project-a",
+                PermissionPattern::Exact("edit".into()),
+                PermissionPattern::Any,
+            )],
+            &session,
+        ),
+        PermissionDecision::Deny
+    );
+}
+
+#[test]
+fn permission_static_rules_are_scoped_deterministic_and_deny_wins_conflicts() {
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![
+            PermissionRule::new(
+                PermissionScope::Global,
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("read".into()),
+                PermissionPattern::Any,
+            ),
+            PermissionRule::new(
+                PermissionScope::Project,
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("edit".into()),
+                PermissionPattern::Exact("src/lib.rs".into()),
+            ),
+            PermissionRule::new(
+                PermissionScope::Project,
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("edit".into()),
+                PermissionPattern::Exact("src/lib.rs".into()),
+            ),
+        ],
+    );
+    let session = PermissionSession::new();
+
+    assert_eq!(
+        policy.evaluate(
+            &PermissionRequest::new("project-a", "read", "README.md", ToolAccess::ReadOnly),
+            &[],
+            &session,
+        ),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate(&write_request("project-a", "src/lib.rs"), &[], &session),
+        PermissionDecision::Deny
+    );
+}
+
+#[test]
+fn permission_project_grants_match_their_project_and_input_without_persistence() {
+    let policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
+    let session = PermissionSession::new();
+    let grants = [
+        ProjectPermissionGrant::allow(
+            "project-a",
+            PermissionPattern::Exact("edit".into()),
+            PermissionPattern::Exact("src/lib.rs".into()),
+        ),
+        ProjectPermissionGrant::new(
+            "project-a",
+            PermissionDecision::Deny,
+            PermissionPattern::Exact("edit".into()),
+            PermissionPattern::Exact("secrets.env".into()),
+        ),
+    ];
+
+    assert_eq!(
+        policy.evaluate(&write_request("project-a", "src/lib.rs"), &grants, &session),
+        PermissionDecision::Allow
+    );
+    assert_eq!(
+        policy.evaluate(
+            &write_request("project-a", "src/main.rs"),
+            &grants,
+            &session
+        ),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate(&write_request("project-b", "src/lib.rs"), &grants, &session),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate(
+            &write_request("project-a", "secrets.env"),
+            &grants,
+            &session
+        ),
+        PermissionDecision::Deny
+    );
+}
+
+#[test]
+fn permission_temporary_bypass_only_resolves_otherwise_ask_for_its_session() {
+    let policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
+    let disabled = PermissionSession::new();
+    let bypassed = PermissionSession::with_temporary_bypass();
+    let request = write_request("project-a", "src/lib.rs");
+
+    assert_eq!(
+        policy.evaluate(&request, &[], &disabled),
+        PermissionDecision::Ask
+    );
+    assert_eq!(
+        policy.evaluate(&request, &[], &bypassed),
+        PermissionDecision::Allow
+    );
 }

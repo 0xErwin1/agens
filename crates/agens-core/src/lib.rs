@@ -391,6 +391,241 @@ impl TurnCoordinator {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionScope {
+    Global,
+    Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionMode {
+    Edit,
+    Chat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolAccess {
+    ReadOnly,
+    Write,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionPattern {
+    Any,
+    Exact(String),
+}
+
+impl PermissionPattern {
+    fn matches(&self, value: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(expected) => expected == value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionRequest {
+    pub project: String,
+    pub tool: String,
+    pub target: String,
+    pub access: ToolAccess,
+}
+
+impl PermissionRequest {
+    pub fn new(
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        target: impl Into<String>,
+        access: ToolAccess,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            tool: tool.into(),
+            target: target.into(),
+            access,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionRule {
+    pub scope: PermissionScope,
+    pub decision: PermissionDecision,
+    pub tool: PermissionPattern,
+    pub target: PermissionPattern,
+}
+
+impl PermissionRule {
+    pub const fn new(
+        scope: PermissionScope,
+        decision: PermissionDecision,
+        tool: PermissionPattern,
+        target: PermissionPattern,
+    ) -> Self {
+        Self {
+            scope,
+            decision,
+            tool,
+            target,
+        }
+    }
+
+    fn matches(&self, request: &PermissionRequest) -> bool {
+        self.tool.matches(&request.tool) && self.target.matches(&request.target)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectPermissionGrant {
+    pub project: String,
+    pub decision: PermissionDecision,
+    pub tool: PermissionPattern,
+    pub target: PermissionPattern,
+}
+
+impl ProjectPermissionGrant {
+    pub fn new(
+        project: impl Into<String>,
+        decision: PermissionDecision,
+        tool: PermissionPattern,
+        target: PermissionPattern,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            decision,
+            tool,
+            target,
+        }
+    }
+
+    pub fn allow(
+        project: impl Into<String>,
+        tool: PermissionPattern,
+        target: PermissionPattern,
+    ) -> Self {
+        Self::new(project, PermissionDecision::Allow, tool, target)
+    }
+
+    fn matches(&self, request: &PermissionRequest) -> bool {
+        self.project == request.project
+            && self.tool.matches(&request.tool)
+            && self.target.matches(&request.target)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PermissionSession {
+    temporary_bypass: bool,
+}
+
+impl PermissionSession {
+    pub const fn new() -> Self {
+        Self {
+            temporary_bypass: false,
+        }
+    }
+
+    pub const fn with_temporary_bypass() -> Self {
+        Self {
+            temporary_bypass: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionPolicy {
+    mode: PermissionMode,
+    static_rules: Vec<PermissionRule>,
+}
+
+impl PermissionPolicy {
+    pub fn new(mode: PermissionMode, static_rules: Vec<PermissionRule>) -> Self {
+        Self { mode, static_rules }
+    }
+
+    pub fn evaluate(
+        &self,
+        request: &PermissionRequest,
+        project_grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+    ) -> PermissionDecision {
+        // Global denials are evaluated outside ordinary conflicts so no later input can weaken them.
+        if self.matches_static(PermissionScope::Global, PermissionDecision::Deny, request) {
+            return PermissionDecision::Deny;
+        }
+
+        if self.mode == PermissionMode::Chat && request.access == ToolAccess::Write {
+            return PermissionDecision::Deny;
+        }
+
+        if let Some(decision) = self.static_decision(request) {
+            return decision;
+        }
+
+        if let Some(decision) = Self::grant_decision(project_grants, request) {
+            return decision;
+        }
+
+        if session.temporary_bypass {
+            PermissionDecision::Allow
+        } else {
+            PermissionDecision::Ask
+        }
+    }
+
+    fn static_decision(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
+        if self.matches_static(PermissionScope::Global, PermissionDecision::Deny, request)
+            || self.matches_static(PermissionScope::Project, PermissionDecision::Deny, request)
+        {
+            return Some(PermissionDecision::Deny);
+        }
+
+        if self.matches_static(PermissionScope::Global, PermissionDecision::Allow, request)
+            || self.matches_static(PermissionScope::Project, PermissionDecision::Allow, request)
+        {
+            return Some(PermissionDecision::Allow);
+        }
+
+        None
+    }
+
+    fn matches_static(
+        &self,
+        scope: PermissionScope,
+        decision: PermissionDecision,
+        request: &PermissionRequest,
+    ) -> bool {
+        self.static_rules
+            .iter()
+            .any(|rule| rule.scope == scope && rule.decision == decision && rule.matches(request))
+    }
+
+    fn grant_decision(
+        project_grants: &[ProjectPermissionGrant],
+        request: &PermissionRequest,
+    ) -> Option<PermissionDecision> {
+        if project_grants
+            .iter()
+            .any(|grant| grant.decision == PermissionDecision::Deny && grant.matches(request))
+        {
+            return Some(PermissionDecision::Deny);
+        }
+
+        project_grants
+            .iter()
+            .any(|grant| grant.decision == PermissionDecision::Allow && grant.matches(request))
+            .then_some(PermissionDecision::Allow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCategory {
     Config,
     Auth,
