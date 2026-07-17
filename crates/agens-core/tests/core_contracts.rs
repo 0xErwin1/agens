@@ -1,7 +1,59 @@
-use agens_core::{
-    Error, ErrorCategory, Message, MessagePart, Role, TurnCoordinator, TurnEvent, TurnEventError,
-    TurnState, TurnTransitionError,
+use std::{
+    future::{Future, ready},
+    task::{Context, Poll, Waker},
 };
+
+use agens_core::{
+    CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
+    CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, Role, TurnCoordinator,
+    TurnEvent, TurnEventError, TurnState, TurnTransitionError,
+};
+
+#[derive(Default)]
+struct RecordingCompletedTurnRepository {
+    calls: usize,
+    snapshots: Vec<CompletedTurnSnapshot>,
+    failure: Option<CompletedTurnStoreError>,
+}
+
+impl CompletedTurnRepository for RecordingCompletedTurnRepository {
+    fn persist_completed_turn(
+        &mut self,
+        snapshot: CompletedTurnSnapshot,
+    ) -> impl Future<Output = Result<(), CompletedTurnStoreError>> + Send {
+        self.calls += 1;
+
+        if let Some(error) = self.failure.clone() {
+            return ready(Err(error));
+        }
+
+        self.snapshots.push(snapshot);
+        ready(Ok(()))
+    }
+}
+
+fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut future = std::pin::pin!(future);
+
+    match future.as_mut().poll(&mut context) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("test repository must complete immediately"),
+    }
+}
+
+fn completed_coordinator() -> TurnCoordinator {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("complete".into()))
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    coordinator
+}
 
 #[test]
 fn message_preserves_each_closed_part_payload() {
@@ -316,4 +368,124 @@ fn cancellation_and_failure_reject_all_further_events() {
             target: TurnState::Streaming,
         }))
     );
+}
+
+#[test]
+fn completed_turn_is_persisted_once_with_its_ordered_events() {
+    let mut coordinator = completed_coordinator();
+    let mut repository = RecordingCompletedTurnRepository::default();
+
+    block_on_ready(coordinator.persist_completed_turn(&mut repository)).unwrap();
+
+    assert_eq!(repository.snapshots.len(), 1);
+    assert_eq!(repository.calls, 1);
+    assert_eq!(
+        repository.snapshots[0].events(),
+        &[
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("complete".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ]
+    );
+    assert!(coordinator.has_persisted_completed_turn());
+    assert_eq!(
+        block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+        Err(CompletedTurnPersistenceError::AlreadyPersisted)
+    );
+    assert_eq!(repository.snapshots.len(), 1);
+    assert_eq!(repository.calls, 1);
+}
+
+#[test]
+fn non_completed_turns_never_invoke_completed_turn_persistence() {
+    let mut active = TurnCoordinator::new();
+    active.begin().unwrap();
+
+    for mut coordinator in [TurnCoordinator::new(), active] {
+        let mut repository = RecordingCompletedTurnRepository::default();
+
+        assert_eq!(
+            block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+            Err(CompletedTurnPersistenceError::NotCompleted {
+                state: coordinator.state(),
+            })
+        );
+        assert_eq!(repository.calls, 0);
+        assert!(repository.snapshots.is_empty());
+    }
+
+    for mut coordinator in [
+        {
+            let mut coordinator = TurnCoordinator::new();
+            coordinator.begin().unwrap();
+            coordinator.cancel().unwrap();
+            coordinator
+        },
+        {
+            let mut coordinator = TurnCoordinator::new();
+            coordinator.begin().unwrap();
+            coordinator.fail().unwrap();
+            coordinator
+        },
+    ] {
+        let mut repository = RecordingCompletedTurnRepository::default();
+
+        assert_eq!(
+            block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+            Err(CompletedTurnPersistenceError::NotCompleted {
+                state: coordinator.state(),
+            })
+        );
+        assert_eq!(repository.calls, 0);
+        assert!(repository.snapshots.is_empty());
+    }
+}
+
+#[test]
+fn rejected_turn_events_never_invoke_completed_turn_persistence() {
+    let mut coordinator = TurnCoordinator::new();
+    let mut repository = RecordingCompletedTurnRepository::default();
+
+    coordinator.begin().unwrap();
+    assert_eq!(
+        coordinator.accept_provider_part(MessagePart::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "rejected".into(),
+            is_error: false,
+        }),
+        Err(TurnEventError::InvalidProviderPart)
+    );
+    assert_eq!(
+        block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+        Err(CompletedTurnPersistenceError::NotCompleted {
+            state: TurnState::Requesting,
+        })
+    );
+    assert_eq!(repository.calls, 0);
+    assert!(repository.snapshots.is_empty());
+}
+
+#[test]
+fn completed_turn_persistence_failure_is_typed_and_does_not_claim_success() {
+    let mut coordinator = completed_coordinator();
+    let failure = CompletedTurnStoreError::new("database unavailable");
+    let mut repository = RecordingCompletedTurnRepository {
+        calls: 0,
+        snapshots: Vec::new(),
+        failure: Some(failure.clone()),
+    };
+
+    assert_eq!(
+        block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+        Err(CompletedTurnPersistenceError::Store(failure))
+    );
+    assert_eq!(repository.calls, 1);
+    assert!(!coordinator.has_persisted_completed_turn());
+    assert!(repository.snapshots.is_empty());
+    assert_eq!(
+        block_on_ready(coordinator.persist_completed_turn(&mut repository)),
+        Err(CompletedTurnPersistenceError::AlreadyAttempted)
+    );
+    assert_eq!(repository.calls, 1);
 }

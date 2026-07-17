@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, future::Future};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
@@ -120,6 +120,73 @@ impl fmt::Display for TurnEventError {
 impl std::error::Error for TurnEventError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedTurnSnapshot {
+    events: Vec<TurnEvent>,
+}
+
+impl CompletedTurnSnapshot {
+    pub fn events(&self) -> &[TurnEvent] {
+        &self.events
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedTurnStoreError {
+    message: String,
+}
+
+impl CompletedTurnStoreError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for CompletedTurnStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CompletedTurnStoreError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletedTurnPersistenceError {
+    NotCompleted { state: TurnState },
+    AlreadyPersisted,
+    AlreadyAttempted,
+    Store(CompletedTurnStoreError),
+}
+
+impl fmt::Display for CompletedTurnPersistenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotCompleted { state } => {
+                write!(
+                    formatter,
+                    "cannot persist incomplete turn in state: {state:?}"
+                )
+            }
+            Self::AlreadyPersisted => formatter.write_str("completed turn already persisted"),
+            Self::AlreadyAttempted => {
+                formatter.write_str("completed turn persistence already attempted")
+            }
+            Self::Store(error) => write!(formatter, "store: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for CompletedTurnPersistenceError {}
+
+pub trait CompletedTurnRepository {
+    fn persist_completed_turn(
+        &mut self,
+        snapshot: CompletedTurnSnapshot,
+    ) -> impl Future<Output = Result<(), CompletedTurnStoreError>> + Send;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingToolCall {
     id: String,
     name: String,
@@ -131,6 +198,8 @@ pub struct TurnCoordinator {
     state: TurnState,
     events: Vec<TurnEvent>,
     pending_tool_calls: Vec<PendingToolCall>,
+    completed_turn_persisted: bool,
+    completed_turn_persistence_attempted: bool,
 }
 
 impl Default for TurnCoordinator {
@@ -145,6 +214,8 @@ impl TurnCoordinator {
             state: TurnState::Idle,
             events: Vec::new(),
             pending_tool_calls: Vec::new(),
+            completed_turn_persisted: false,
+            completed_turn_persistence_attempted: false,
         }
     }
 
@@ -154,6 +225,42 @@ impl TurnCoordinator {
 
     pub fn events(&self) -> &[TurnEvent] {
         &self.events
+    }
+
+    pub const fn has_persisted_completed_turn(&self) -> bool {
+        self.completed_turn_persisted
+    }
+
+    pub async fn persist_completed_turn(
+        &mut self,
+        repository: &mut impl CompletedTurnRepository,
+    ) -> Result<(), CompletedTurnPersistenceError> {
+        if self.state != TurnState::Completed {
+            return Err(CompletedTurnPersistenceError::NotCompleted { state: self.state });
+        }
+
+        if self.completed_turn_persisted {
+            return Err(CompletedTurnPersistenceError::AlreadyPersisted);
+        }
+
+        if self.completed_turn_persistence_attempted {
+            return Err(CompletedTurnPersistenceError::AlreadyAttempted);
+        }
+
+        let snapshot = CompletedTurnSnapshot {
+            events: self.events.clone(),
+        };
+
+        self.completed_turn_persistence_attempted = true;
+
+        repository
+            .persist_completed_turn(snapshot)
+            .await
+            .map_err(CompletedTurnPersistenceError::Store)?;
+
+        // Mark success only after the repository has durably accepted the snapshot.
+        self.completed_turn_persisted = true;
+        Ok(())
     }
 
     pub fn begin(&mut self) -> Result<(), TurnEventError> {
