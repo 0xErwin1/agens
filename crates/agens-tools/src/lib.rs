@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     sync::{
@@ -17,10 +17,14 @@ use agens_core::Error;
 use std::os::unix::process::CommandExt;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_SEARCH_RESULTS: usize = 100;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const DEFAULT_MAX_LIST_ENTRIES: usize = 1_000;
+const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
+const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
+const DEFAULT_MAX_SEARCH_DEPTH: usize = 32;
+const DEFAULT_FILE_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
@@ -96,6 +100,27 @@ impl SearchInput {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeToolLimits {
+    pub max_list_entries: usize,
+    pub max_search_entries: usize,
+    pub max_search_results: usize,
+    pub max_search_depth: usize,
+    pub operation_timeout: Duration,
+}
+
+impl Default for NativeToolLimits {
+    fn default() -> Self {
+        Self {
+            max_list_entries: DEFAULT_MAX_LIST_ENTRIES,
+            max_search_entries: DEFAULT_MAX_SEARCH_ENTRIES,
+            max_search_results: DEFAULT_MAX_SEARCH_RESULTS,
+            max_search_depth: DEFAULT_MAX_SEARCH_DEPTH,
+            operation_timeout: DEFAULT_FILE_OPERATION_TIMEOUT,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BashInput {
     command: String,
@@ -123,13 +148,24 @@ impl BashInput {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NativeTools {
     project_root: PathBuf,
+    limits: NativeToolLimits,
+    #[cfg(unix)]
+    project_root_dir: fs::File,
 }
 
 impl NativeTools {
     pub fn open(project_root: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::open_with_limits(project_root, NativeToolLimits::default())
+    }
+
+    pub fn open_with_limits(
+        project_root: impl AsRef<Path>,
+        limits: NativeToolLimits,
+    ) -> Result<Self, Error> {
+        validate_limits(&limits)?;
         let project_root = fs::canonicalize(project_root)
             .map_err(|error| Error::Tool(format!("cannot resolve project root: {error}")))?;
 
@@ -137,7 +173,13 @@ impl NativeTools {
             return Err(Error::Tool("project root is not a directory".into()));
         }
 
-        Ok(Self { project_root })
+        Ok(Self {
+            #[cfg(unix)]
+            project_root_dir: fs::File::open(&project_root)
+                .map_err(|error| Error::Tool(format!("cannot open project root: {error}")))?,
+            project_root,
+            limits,
+        })
     }
 
     pub fn read_file(&self, input: ReadFileInput) -> Result<ToolOutput, Error> {
@@ -166,17 +208,28 @@ impl NativeTools {
     }
 
     pub fn write_file(&self, input: WriteFileInput) -> Result<ToolOutput, Error> {
-        let path = match self.resolve_write_path(&input.path) {
-            Ok(path) => path,
-            Err(output) => return Ok(output),
-        };
+        if let Err(output) = self.validate_relative(&input.path) {
+            return Ok(output);
+        }
 
-        match fs::write(path, input.content) {
+        #[cfg(unix)]
+        let result = write_file_confined(
+            &self.project_root_dir,
+            &input.path,
+            input.content.as_bytes(),
+        );
+
+        #[cfg(not(unix))]
+        let result = Err(ToolOutput::failure(
+            "write: secure confined writes are unavailable on this platform",
+        ));
+
+        match result {
             Ok(()) => Ok(ToolOutput::success(format!(
                 "wrote {}",
                 input.path.display()
             ))),
-            Err(error) => Ok(ToolOutput::failure(format!("write: {error}"))),
+            Err(output) => Ok(output),
         }
     }
 
@@ -190,13 +243,27 @@ impl NativeTools {
             return Ok(ToolOutput::failure("list: path is not a directory"));
         }
 
-        let mut entries = match fs::read_dir(path) {
-            Ok(entries) => entries
-                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
-                .collect::<Result<Vec<_>, _>>(),
+        let deadline = Instant::now() + self.limits.operation_timeout;
+        let directory = match fs::read_dir(path) {
+            Ok(directory) => directory,
             Err(error) => return Ok(ToolOutput::failure(format!("list: {error}"))),
+        };
+        let mut entries = Vec::new();
+
+        for entry in directory {
+            if Instant::now() >= deadline {
+                return Ok(ToolOutput::failure("list: operation timed out"));
+            }
+            if entries.len() == self.limits.max_list_entries {
+                return Ok(ToolOutput::failure(format!(
+                    "list: entry limit of {} exceeded",
+                    self.limits.max_list_entries
+                )));
+            }
+
+            let entry = entry.map_err(|error| Error::Tool(format!("list: {error}")))?;
+            entries.push(entry.file_name().to_string_lossy().into_owned());
         }
-        .map_err(|error| Error::Tool(format!("list: {error}")))?;
         entries.sort();
 
         Ok(ToolOutput::success(entries.join("\n") + "\n"))
@@ -217,7 +284,10 @@ impl NativeTools {
         }
 
         let mut results = Vec::new();
-        if let Err(output) = self.search_directory(&path, &input.query, &mut results) {
+        let mut budget = SearchBudget::new(&self.limits);
+        if let Err(output) =
+            self.search_directory(&path, &input.query, 0, &mut budget, &mut results)
+        {
             return Ok(output);
         }
 
@@ -326,57 +396,26 @@ impl NativeTools {
         }
     }
 
-    fn resolve_write_path(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
-        self.validate_relative(path)?;
-        let Some(parent) = path.parent() else {
-            return Err(ToolOutput::failure(
-                "write: parent directory does not exist",
-            ));
-        };
-        let parent = match fs::canonicalize(self.project_root.join(parent)) {
-            Ok(parent) => parent,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(ToolOutput::failure(
-                    "write: parent directory does not exist",
-                ));
-            }
-            Err(error) => return Err(ToolOutput::failure(format!("write: {error}"))),
-        };
-
-        if !parent.starts_with(&self.project_root) {
-            return Err(ToolOutput::failure("path: outside project root"));
-        }
-
-        let Some(file_name) = path.file_name() else {
-            return Err(ToolOutput::failure("write: path must name a file"));
-        };
-        let path = parent.join(file_name);
-        match fs::canonicalize(&path) {
-            Ok(path) if !path.starts_with(&self.project_root) => {
-                Err(ToolOutput::failure("path: outside project root"))
-            }
-            Ok(path) => Ok(path),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
-            Err(error) => Err(ToolOutput::failure(format!("write: {error}"))),
-        }
-    }
-
     fn search_directory(
         &self,
         directory: &Path,
         query: &str,
+        depth: usize,
+        budget: &mut SearchBudget,
         results: &mut Vec<String>,
     ) -> Result<(), ToolOutput> {
-        let mut entries = fs::read_dir(directory)
-            .map_err(|error| ToolOutput::failure(format!("search: {error}")))?
-            .collect::<Result<Vec<_>, _>>()
+        let directory_entries = fs::read_dir(directory)
             .map_err(|error| ToolOutput::failure(format!("search: {error}")))?;
+        let mut entries = Vec::new();
+
+        for entry in directory_entries {
+            budget.consume_entry()?;
+            entries.push(entry.map_err(|error| ToolOutput::failure(format!("search: {error}")))?);
+        }
         entries.sort_by_key(|entry| entry.file_name());
 
         for entry in entries {
-            if results.len() == MAX_SEARCH_RESULTS {
-                return Ok(());
-            }
+            budget.check_deadline()?;
 
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)
@@ -387,7 +426,14 @@ impl NativeTools {
             }
 
             if metadata.is_dir() {
-                self.search_directory(&path, query, results)?;
+                let next_depth = depth + 1;
+                if next_depth > self.limits.max_search_depth {
+                    return Err(ToolOutput::failure(format!(
+                        "search: traversal depth limit of {} exceeded",
+                        self.limits.max_search_depth
+                    )));
+                }
+                self.search_directory(&path, query, next_depth, budget, results)?;
                 continue;
             }
 
@@ -402,11 +448,15 @@ impl NativeTools {
                 .map_err(|_| ToolOutput::failure("path: outside project root"))?;
 
             for (line, text) in content.lines().enumerate() {
+                budget.check_deadline()?;
                 if text.contains(query) {
-                    results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
-                    if results.len() == MAX_SEARCH_RESULTS {
-                        return Ok(());
+                    if results.len() == self.limits.max_search_results {
+                        return Err(ToolOutput::failure(format!(
+                            "search: result limit of {} exceeded",
+                            self.limits.max_search_results
+                        )));
                     }
+                    results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
                 }
             }
         }
@@ -430,6 +480,147 @@ impl NativeTools {
             Err(ToolOutput::failure("path: traversal is not allowed"))
         }
     }
+}
+
+fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
+    if limits.max_list_entries == 0
+        || limits.max_search_entries == 0
+        || limits.max_search_results == 0
+        || limits.operation_timeout.is_zero()
+    {
+        return Err(Error::Tool(
+            "native tool limits must be greater than zero".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+struct SearchBudget {
+    deadline: Instant,
+    entries_seen: usize,
+    max_entries: usize,
+}
+
+impl SearchBudget {
+    fn new(limits: &NativeToolLimits) -> Self {
+        Self {
+            deadline: Instant::now() + limits.operation_timeout,
+            entries_seen: 0,
+            max_entries: limits.max_search_entries,
+        }
+    }
+
+    fn check_deadline(&self) -> Result<(), ToolOutput> {
+        if Instant::now() >= self.deadline {
+            return Err(ToolOutput::failure("search: operation timed out"));
+        }
+
+        Ok(())
+    }
+
+    fn consume_entry(&mut self) -> Result<(), ToolOutput> {
+        self.check_deadline()?;
+        if self.entries_seen == self.max_entries {
+            return Err(ToolOutput::failure(format!(
+                "search: entry limit of {} exceeded",
+                self.max_entries
+            )));
+        }
+
+        self.entries_seen += 1;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_file_confined(
+    project_root: &fs::File,
+    path: &Path,
+    content: &[u8],
+) -> Result<(), ToolOutput> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| ToolOutput::failure("write: path must name a file"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let mut directory = project_root
+        .try_clone()
+        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+
+    // Each component is opened beneath an already-open directory descriptor, so renames and
+    // symlink substitutions cannot redirect the final open outside the canonical root.
+    for component in parent.components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        let component = CString::new(component.as_bytes())
+            .map_err(|_| ToolOutput::failure("write: invalid path component"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            return Err(write_open_error(error, true));
+        }
+        directory = unsafe { fs::File::from_raw_fd(descriptor) };
+    }
+
+    let file_name = CString::new(file_name.as_bytes())
+        .map_err(|_| ToolOutput::failure("write: invalid path component"))?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+            0o666,
+        )
+    };
+    if descriptor < 0 {
+        return Err(write_open_error(io::Error::last_os_error(), false));
+    }
+
+    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+    if !metadata.is_file() {
+        return Err(ToolOutput::failure("write: path is not a regular file"));
+    }
+    use std::os::unix::fs::MetadataExt;
+    if metadata.nlink() > 1 {
+        return Err(ToolOutput::failure("write: path has multiple hard links"));
+    }
+
+    file.set_len(0)
+        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+    file.write_all(content)
+        .map_err(|error| ToolOutput::failure(format!("write: {error}")))
+}
+
+#[cfg(unix)]
+fn write_open_error(error: io::Error, parent: bool) -> ToolOutput {
+    if error.raw_os_error() == Some(libc::ELOOP)
+        || (parent && error.kind() == io::ErrorKind::NotADirectory)
+    {
+        return ToolOutput::failure("path: outside project root");
+    }
+    if parent && error.kind() == io::ErrorKind::NotFound {
+        return ToolOutput::failure("write: parent directory does not exist");
+    }
+
+    ToolOutput::failure(format!("write: {error}"))
 }
 
 #[derive(Default)]

@@ -9,8 +9,8 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, ListDirectoryInput, NativeTools, ReadFileInput, SearchInput, ToolOutput,
-    WriteFileInput,
+    BashInput, ListDirectoryInput, NativeToolLimits, NativeTools, ReadFileInput, SearchInput,
+    ToolOutput, WriteFileInput,
 };
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +58,14 @@ fn rejects_absolute_traversal_and_symlink_escape_paths() {
                 .unwrap(),
             ToolOutput::failure("path: outside project root")
         );
+        std::os::unix::fs::symlink(&outside, root.join("outside-parent")).unwrap();
+        assert_eq!(
+            tools
+                .write_file(WriteFileInput::new("outside-parent/created.txt", "escape"))
+                .unwrap(),
+            ToolOutput::failure("path: outside project root")
+        );
+        assert!(!outside.join("created.txt").exists());
         assert_eq!(
             tools
                 .list_directory(ListDirectoryInput::new("escape-directory"))
@@ -225,4 +233,81 @@ fn reads_a_project_relative_file() {
 
     assert_eq!(output, ToolOutput::success("project note"));
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn list_and_search_fail_when_configured_work_budgets_are_exhausted() {
+    let root = project_root();
+    let limits = NativeToolLimits {
+        max_list_entries: 2,
+        max_search_entries: 3,
+        max_search_results: 2,
+        max_search_depth: 1,
+        operation_timeout: Duration::from_secs(1),
+    };
+    let tools = NativeTools::open_with_limits(&root, limits).unwrap();
+
+    for index in 0..3 {
+        fs::write(root.join(format!("entry-{index}")), "content").unwrap();
+    }
+    assert_eq!(
+        tools.list_directory(ListDirectoryInput::new(".")).unwrap(),
+        ToolOutput::failure("list: entry limit of 2 exceeded")
+    );
+
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::create_dir(root.join("nested/deeper")).unwrap();
+    fs::create_dir(root.join("nested/deeper/too-deep")).unwrap();
+    assert_eq!(
+        tools.search(SearchInput::new("nested", "absent")).unwrap(),
+        ToolOutput::failure("search: traversal depth limit of 1 exceeded")
+    );
+
+    fs::create_dir(root.join("flat")).unwrap();
+    for index in 0..4 {
+        fs::write(root.join("flat").join(format!("file-{index}")), "absent").unwrap();
+    }
+    assert_eq!(
+        tools.search(SearchInput::new("flat", "needle")).unwrap(),
+        ToolOutput::failure("search: entry limit of 3 exceeded")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn final_symlink_replacement_never_redirects_a_write_outside_the_project() {
+    use std::os::unix::fs::symlink;
+
+    let root = project_root();
+    let outside = project_root();
+    let victim = root.join("victim");
+    let outside_target = outside.join("outside-target");
+    fs::write(&outside_target, "original").unwrap();
+
+    let tools = NativeTools::open(&root).unwrap();
+    let keep_flipping = Arc::new(AtomicBool::new(true));
+    let flipper_running = Arc::clone(&keep_flipping);
+    let flipper_victim = victim.clone();
+    let flipper_target = outside_target.clone();
+    let flipper = thread::spawn(move || {
+        while flipper_running.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&flipper_victim);
+            let _ = symlink(&flipper_target, &flipper_victim);
+            thread::yield_now();
+        }
+        let _ = fs::remove_file(flipper_victim);
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let _ = tools.write_file(WriteFileInput::new("victim", "escaped"));
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "original");
+    }
+
+    keep_flipping.store(false, Ordering::Release);
+    flipper.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
 }
