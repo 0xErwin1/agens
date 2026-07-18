@@ -117,10 +117,14 @@ impl OpenAiResponsesProvider {
             .build()
             .map_err(|_| HeadlessTurnPortError::Provider)?;
         let response = tokio::select! {
-            response = self.client.execute(request) => response.map_err(|_| HeadlessTurnPortError::Provider)?,
+            response = self.client.execute(request) => {
+                stop_before_mapping(cancellation)?;
+                response.map_err(|_| HeadlessTurnPortError::Provider)?
+            }
             stop = wait_for_stop(cancellation) => return Err(stop),
         };
 
+        stop_before_mapping(cancellation)?;
         if !response.status().is_success() {
             return Err(HeadlessTurnPortError::Provider);
         }
@@ -159,40 +163,38 @@ async fn decode_http_response_stream(
 
     loop {
         let next_chunk = tokio::select! {
-            chunk = response.chunk() => chunk.map_err(|_| HeadlessTurnPortError::Provider)?,
+            chunk = response.chunk() => {
+                stop_before_mapping(cancellation)?;
+                chunk.map_err(|_| HeadlessTurnPortError::Provider)?
+            }
             stop = wait_for_stop(cancellation) => return Err(stop),
         };
         let Some(chunk) = next_chunk else {
-            return decoder
-                .finish()
-                .map_err(|_| HeadlessTurnPortError::Provider);
+            let completed = decoder.finish();
+            stop_before_mapping(cancellation)?;
+            return completed.map_err(|_| HeadlessTurnPortError::Provider);
         };
 
         for byte in chunk {
             if byte == b'\n' {
-                process_sse_frame(&mut decoder, &mut frame)?;
+                let processed = process_sse_frame(&mut decoder, &mut frame);
+                stop_before_mapping(cancellation)?;
+                processed.map_err(|_| HeadlessTurnPortError::Provider)?;
                 continue;
             }
 
             if frame.len() == MAX_SSE_FRAME_BYTES {
+                stop_before_mapping(cancellation)?;
                 return Err(HeadlessTurnPortError::Provider);
             }
             frame.push(byte);
         }
 
-        if cancellation.is_cancelled() {
-            return Err(HeadlessTurnPortError::Cancelled);
-        }
-        if cancellation.is_expired() {
-            return Err(HeadlessTurnPortError::TimedOut);
-        }
+        stop_before_mapping(cancellation)?;
     }
 }
 
-fn process_sse_frame(
-    decoder: &mut OpenAiResponseDecoder,
-    frame: &mut Vec<u8>,
-) -> Result<(), HeadlessTurnPortError> {
+fn process_sse_frame(decoder: &mut OpenAiResponseDecoder, frame: &mut Vec<u8>) -> Result<(), ()> {
     if frame.last() == Some(&b'\r') {
         frame.pop();
     }
@@ -201,12 +203,22 @@ fn process_sse_frame(
         .strip_prefix(b"data:")
         .map(|value| value.strip_prefix(b" ").unwrap_or(value));
     if let Some(data) = data.filter(|data| !data.is_empty()) {
-        let event = std::str::from_utf8(data).map_err(|_| HeadlessTurnPortError::Provider)?;
-        decoder
-            .process(event)
-            .map_err(|_| HeadlessTurnPortError::Provider)?;
+        let event = std::str::from_utf8(data).map_err(|_| ())?;
+        decoder.process(event).map_err(|_| ())?;
     }
     frame.clear();
+    Ok(())
+}
+
+fn stop_before_mapping(
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<(), HeadlessTurnPortError> {
+    if cancellation.is_cancelled() {
+        return Err(HeadlessTurnPortError::Cancelled);
+    }
+    if cancellation.is_expired() {
+        return Err(HeadlessTurnPortError::TimedOut);
+    }
     Ok(())
 }
 

@@ -2,10 +2,14 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
-use agens::{CliDependencies, ExitStatus, bootstrap, execute, execute_os};
+use agens::{
+    CliDependencies, ExitStatus, bootstrap, execute, execute_os, execute_with_cancellation,
+};
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
@@ -185,7 +189,7 @@ fn command_boundaries_invoke_injected_headless_and_tui_services_without_network(
         BTreeMap::new(),
         BTreeMap::new(),
     )
-    .with_headless_chat(|request, _| Ok(format!("answer:{}", request.prompt)))
+    .with_headless_chat(|request, _, _| Ok(format!("answer:{}", request.prompt)))
     .with_tui_launcher(|_| Ok("tui-selected".to_owned()));
 
     let chat = execute(["chat", "hello"], &dependencies);
@@ -487,7 +491,7 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
             format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
         )]),
     )
-    .with_headless_chat(|_, bootstrap| {
+    .with_headless_chat(|_, bootstrap, _| {
         let mut provider = LocalProvider {
             iterations: vec![
                 Ok(vec![
@@ -556,6 +560,34 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
 }
 
 #[test]
+fn injected_shutdown_cancels_headless_chat_with_deterministic_output_and_no_session() {
+    let temporary = TemporaryDirectory::new("cancelled-headless");
+    let data_directory = temporary.path().join("data");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .with_headless_chat(|_, _, cancellation| {
+        assert!(cancellation.is_cancelled());
+        Ok("must not be emitted".to_owned())
+    });
+    let cancellation = HeadlessTurnCancellation::new();
+    cancellation.cancel();
+
+    let result = execute_with_cancellation(["chat", "cancelled"], &dependencies, &cancellation);
+
+    assert_eq!(result.status, ExitStatus::Failure);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "error: cancelled: headless turn was cancelled\n"
+    );
+    assert!(!data_directory.join("rust-sessions.db").exists());
+}
+
+#[test]
 fn production_binary_runs_configured_openai_responses_transport_and_persists_the_turn() {
     let temporary = TemporaryDirectory::new("production-headless");
     let config_home = temporary.path().join("config");
@@ -597,6 +629,103 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
         )
         .contains("SENTINEL_OPENAI_API_KEY")
     );
+
+    server.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn production_binary_cancellation_has_deterministic_output_exit_and_no_persistence() {
+    let temporary = TemporaryDirectory::new("production-cancellation");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let mut server = StalledOpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "cancel production request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("production binary should start");
+    server.wait_for_request();
+    let signal_status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("SIGINT command should execute");
+    assert!(signal_status.success(), "SIGINT delivery should succeed");
+
+    let output = child
+        .wait_with_output()
+        .expect("production binary should exit after cancellation");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: cancelled: headless turn was cancelled\n"
+    );
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions command should execute");
+    assert!(sessions.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "No saved sessions.\n"
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_sanitizes_remote_response_headers_and_body() {
+    let temporary = TemporaryDirectory::new("production-remote-error");
+    let config_home = temporary.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = ErrorOpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n",
+            server.base_url(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "remote error"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(diagnostics, "error: provider: provider request failed\n");
+    for secret in [
+        "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_REMOTE_ERROR_HEADER",
+        "SENTINEL_REMOTE_ERROR_BODY",
+    ] {
+        assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
+    }
 
     server.join();
 }
@@ -756,5 +885,112 @@ impl OpenAiMockServer {
 
     fn join(self) {
         self.worker.join().expect("mock server should finish");
+    }
+}
+
+struct StalledOpenAiMockServer {
+    address: std::net::SocketAddr,
+    observed_request: mpsc::Receiver<()>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl StalledOpenAiMockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let (observed_sender, observed_request) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener
+                .accept()
+                .expect("mock server should accept a request");
+            read_openai_request(&stream);
+            observed_sender
+                .send(())
+                .expect("test should receive the request observation");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("client-close timeout should be configured");
+            let mut byte = [0_u8; 1];
+            let _ = std::io::Read::read(
+                &mut stream.try_clone().expect("stream should clone"),
+                &mut byte,
+            );
+        });
+
+        Self {
+            address,
+            observed_request,
+            worker,
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn wait_for_request(&mut self) {
+        self.observed_request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("production request should reach the local server");
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
+    }
+}
+
+struct ErrorOpenAiMockServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<()>,
+}
+
+impl ErrorOpenAiMockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock server should accept a request");
+            read_openai_request(&stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_REMOTE_ERROR_HEADER\r\nContent-Length: 26\r\nConnection: close\r\n\r\nSENTINEL_REMOTE_ERROR_BODY",
+                )
+                .expect("error response should be written");
+        });
+
+        Self { address, worker }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
+    }
+}
+
+fn read_openai_request(stream: &std::net::TcpStream) {
+    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+    let mut request = String::new();
+    reader
+        .read_line(&mut request)
+        .expect("request line should be readable");
+    assert_eq!(request, "POST /responses HTTP/1.1\r\n");
+
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("header should be readable");
+        if header == "\r\n" {
+            return;
+        }
     }
 }

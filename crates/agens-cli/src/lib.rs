@@ -23,7 +23,9 @@ type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
 type Environment = Box<dyn Fn() -> BTreeMap<String, String>>;
 type ConfigReader = Box<dyn Fn(&Path) -> Result<Option<String>, CliError>>;
-type HeadlessChat = Box<dyn Fn(HeadlessChatRequest, &Bootstrap) -> Result<String, CliError>>;
+type HeadlessChat = Box<
+    dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
+>;
 type TuiLauncher = Box<dyn Fn(&Bootstrap) -> Result<String, CliError>>;
 
 pub struct CliDependencies {
@@ -69,14 +71,19 @@ impl CliDependencies {
             home_directory: Box::new(move || home_directory.clone()),
             environment: Box::new(move || environment.clone()),
             read_file: Box::new(move |path| Ok(files.get(path).cloned())),
-            headless_chat: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
 
     pub fn with_headless_chat(
         mut self,
-        handler: impl Fn(HeadlessChatRequest, &Bootstrap) -> Result<String, CliError> + 'static,
+        handler: impl Fn(
+            HeadlessChatRequest,
+            &Bootstrap,
+            &HeadlessTurnCancellation,
+        ) -> Result<String, CliError>
+        + 'static,
     ) -> Self {
         self.headless_chat = Box::new(handler);
         self
@@ -199,7 +206,25 @@ where
         .map(|argument| argument.as_ref().to_owned())
         .collect::<Vec<_>>();
 
-    execute_strings(arguments, dependencies)
+    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+    execute_strings(arguments, dependencies, &cancellation)
+}
+
+pub fn execute_with_cancellation<I, S>(
+    arguments: I,
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> CommandResult
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| argument.as_ref().to_owned())
+        .collect::<Vec<_>>();
+
+    execute_strings(arguments, dependencies, cancellation)
 }
 
 pub fn execute_os<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
@@ -218,13 +243,46 @@ where
         .collect::<Result<Vec<_>, _>>();
 
     match arguments {
-        Ok(arguments) => execute_strings(arguments, dependencies),
+        Ok(arguments) => {
+            let cancellation =
+                HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+            execute_strings(arguments, dependencies, &cancellation)
+        }
         Err(error) => error_result(&[], error),
     }
 }
 
-fn execute_strings(arguments: Vec<String>, dependencies: &CliDependencies) -> CommandResult {
-    match execute_command(&arguments, dependencies) {
+pub fn execute_os_with_cancellation<I, S>(
+    arguments: I,
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> CommandResult
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let arguments = arguments
+        .into_iter()
+        .map(|argument| {
+            argument
+                .into()
+                .into_string()
+                .map_err(|_| CliError::usage("command arguments must be valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>();
+
+    match arguments {
+        Ok(arguments) => execute_strings(arguments, dependencies, cancellation),
+        Err(error) => error_result(&[], error),
+    }
+}
+
+fn execute_strings(
+    arguments: Vec<String>,
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> CommandResult {
+    match execute_command(&arguments, dependencies, cancellation) {
         Ok(stdout) => CommandResult {
             status: ExitStatus::Success,
             stdout,
@@ -249,6 +307,7 @@ fn error_result(arguments: &[String], error: CliError) -> CommandResult {
 fn execute_command(
     arguments: &[String],
     dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     match arguments {
         [] => run_tui(dependencies),
@@ -261,7 +320,7 @@ fn execute_command(
         [command] if is_version(command) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
         [command, rest @ ..] if command == "config" => run_config(rest, dependencies),
         [command, rest @ ..] if command == "auth" => run_auth(rest, dependencies),
-        [command, rest @ ..] if command == "chat" => run_chat(rest, dependencies),
+        [command, rest @ ..] if command == "chat" => run_chat(rest, dependencies, cancellation),
         [command, rest @ ..] if command == "models" => run_models(rest),
         [command, rest @ ..] if command == "sessions" => run_sessions(rest, dependencies),
         _ => Err(CliError::usage("unknown command; run agens --help")),
@@ -319,14 +378,20 @@ fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<Stri
     }
 }
 
-fn run_chat(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+fn run_chat(
+    arguments: &[String],
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
     if matches!(arguments, [argument] if is_help(argument)) {
         return Ok("Usage: agens chat [flags] <prompt>\n".to_owned());
     }
 
     let request = parse_chat_request(arguments)?;
+    cancellation_result(cancellation)?;
     let bootstrap = bootstrap(dependencies)?;
-    let output = (dependencies.headless_chat)(request, &bootstrap)?;
+    let output = (dependencies.headless_chat)(request, &bootstrap, cancellation)?;
+    cancellation_result(cancellation)?;
 
     Ok(format!("{output}\n"))
 }
@@ -560,9 +625,10 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
 fn run_production_headless_chat(
     request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     match bootstrap.provider_type() {
-        Some("openai-api") => run_openai_api_chat(request, bootstrap),
+        Some("openai-api") => run_openai_api_chat(request, bootstrap, cancellation),
         Some("openai-chatgpt") => Err(CliError::authentication(
             "ChatGPT subscription authentication is unavailable for headless chat",
         )),
@@ -575,6 +641,7 @@ fn run_production_headless_chat(
 fn run_openai_api_chat(
     request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
@@ -589,9 +656,9 @@ fn run_openai_api_chat(
         request.prompt,
     )
     .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
+    cancellation_result(cancellation)?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
     let mut gate = ProductionPermissionGate;
     let mut resolver = ProductionPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher;
@@ -601,7 +668,7 @@ fn run_openai_api_chat(
         &mut resolver,
         &mut dispatcher,
         &mut store,
-        &cancellation,
+        cancellation,
     ))?
     .map_err(CliError::runtime)?;
 
@@ -621,6 +688,16 @@ fn run_openai_api_chat(
     } else {
         Ok(text)
     }
+}
+
+fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), CliError> {
+    if cancellation.is_cancelled() {
+        return Err(CliError::runtime(HeadlessTurnError::Cancelled));
+    }
+    if cancellation.is_expired() {
+        return Err(CliError::runtime(HeadlessTurnError::TimedOut));
+    }
+    Ok(())
 }
 
 struct ProductionPermissionGate;

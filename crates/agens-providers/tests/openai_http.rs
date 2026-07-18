@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError, TurnProvider};
 use agens_providers::OpenAiResponsesProvider;
 
-const SECRET_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
+const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
+const SECRET_HEADER_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_HEADER";
 
 #[test]
 fn cancellation_interrupts_connect_headers_stalled_body_and_late_events() {
     for mode in [
-        ServerMode::DelayedAccept,
+        ServerMode::StalledConnect,
         ServerMode::DelayedHeaders,
         ServerMode::StalledBody,
         ServerMode::LateEvent,
@@ -21,7 +22,7 @@ fn cancellation_interrupts_connect_headers_stalled_body_and_late_events() {
         let cancellation = HeadlessTurnCancellation::new();
         let canceller = cancellation.clone();
         let observed_request =
-            (!matches!(mode, ServerMode::DelayedAccept)).then(|| server.take_observed_request());
+            (!matches!(mode, ServerMode::StalledConnect)).then(|| server.take_observed_request());
 
         let canceller_thread = thread::spawn(move || {
             if let Some(observed_request) = observed_request {
@@ -47,8 +48,10 @@ fn cancellation_interrupts_connect_headers_stalled_body_and_late_events() {
 }
 
 #[test]
-fn timeout_is_distinct_from_cancellation_and_repeated_stops_do_not_accumulate_workers() {
-    for _ in 0..8 {
+fn one_hundred_same_process_cancellations_and_timeouts_have_bounded_resources() {
+    let baseline = ResourceSnapshot::capture();
+
+    for _ in 0..100 {
         let server = LocalResponsesServer::start(ServerMode::DelayedHeaders);
         let cancellation = HeadlessTurnCancellation::with_deadline(Duration::from_millis(25));
 
@@ -57,12 +60,70 @@ fn timeout_is_distinct_from_cancellation_and_repeated_stops_do_not_accumulate_wo
         assert_eq!(result, Err(HeadlessTurnPortError::TimedOut));
         server.join();
     }
+
+    for _ in 0..100 {
+        let mut server = LocalResponsesServer::start(ServerMode::DelayedHeaders);
+        let cancellation = HeadlessTurnCancellation::new();
+        let observed_request = server.take_observed_request();
+        let canceller = cancellation.clone();
+        let cancellation_thread = thread::spawn(move || {
+            observed_request
+                .recv_timeout(Duration::from_secs(1))
+                .expect("server should observe the request before cancellation");
+            canceller.cancel();
+        });
+
+        let result = run_provider(server.base_url(), cancellation, Duration::from_secs(1));
+
+        assert_eq!(result, Err(HeadlessTurnPortError::Cancelled));
+        cancellation_thread
+            .join()
+            .expect("cancellation thread should finish");
+        server.join();
+    }
+
+    let after = ResourceSnapshot::capture();
+    assert!(
+        after.tasks <= baseline.tasks + 2,
+        "task count grew from {} to {}",
+        baseline.tasks,
+        after.tasks
+    );
+    assert!(
+        after.file_descriptors <= baseline.file_descriptors + 2,
+        "file descriptor count grew from {} to {}",
+        baseline.file_descriptors,
+        after.file_descriptors
+    );
 }
 
 #[test]
-fn malformed_or_oversized_frames_and_remote_errors_are_sanitized_provider_failures() {
+fn cancellation_wins_when_a_remote_error_completes_after_cancellation() {
+    let mut server = LocalResponsesServer::start(ServerMode::CancelledError);
+    let cancellation = HeadlessTurnCancellation::new();
+    let observed_request = server.take_observed_request();
+    let canceller = cancellation.clone();
+    let cancellation_thread = thread::spawn(move || {
+        observed_request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should observe the request");
+        canceller.cancel();
+    });
+
+    let result = run_provider(server.base_url(), cancellation, Duration::from_secs(1));
+
+    assert_eq!(result, Err(HeadlessTurnPortError::Cancelled));
+    cancellation_thread
+        .join()
+        .expect("cancellation thread should finish");
+    server.join();
+}
+
+#[test]
+fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_provider_failures() {
     for mode in [
         ServerMode::MalformedFrame,
+        ServerMode::UnterminatedOversizedFrame,
         ServerMode::OversizedFrame,
         ServerMode::ErrorBody,
     ] {
@@ -104,13 +165,15 @@ fn run_provider(
 
 #[derive(Clone, Copy)]
 enum ServerMode {
-    DelayedAccept,
+    StalledConnect,
     DelayedHeaders,
     StalledBody,
     LateEvent,
     MalformedFrame,
     OversizedFrame,
+    UnterminatedOversizedFrame,
     ErrorBody,
+    CancelledError,
 }
 
 struct LocalResponsesServer {
@@ -127,9 +190,36 @@ impl LocalResponsesServer {
             .expect("server address should be available");
         let (observed_sender, observed_request) = mpsc::channel();
         let worker = thread::spawn(move || {
-            if matches!(mode, ServerMode::DelayedAccept) {
-                thread::sleep(Duration::from_millis(100));
-                let _ = listener.accept();
+            if matches!(mode, ServerMode::StalledConnect) {
+                let mut backlog_fillers = Vec::new();
+                listener
+                    .set_nonblocking(true)
+                    .expect("listener should be nonblocking while the connect backlog is filled");
+                let mut backlog_full = false;
+                for _ in 0..512 {
+                    match TcpStream::connect_timeout(&address, Duration::from_millis(5)) {
+                        Ok(stream) => backlog_fillers.push(stream),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            backlog_full = true;
+                            break;
+                        }
+                        Err(error) => panic!("backlog fill should only stop when full: {error}"),
+                    }
+                }
+                assert!(
+                    !backlog_fillers.is_empty(),
+                    "the local listener should accept at least one queued connect"
+                );
+                assert!(
+                    backlog_full,
+                    "the local connect backlog should fill before the request starts"
+                );
+                thread::sleep(Duration::from_millis(250));
                 return;
             }
 
@@ -140,7 +230,9 @@ impl LocalResponsesServer {
                 .expect("test should receive request observation");
 
             match mode {
-                ServerMode::DelayedAccept => unreachable!("delayed accept returns before handling"),
+                ServerMode::StalledConnect => {
+                    unreachable!("stalled connect returns before handling")
+                }
                 ServerMode::DelayedHeaders => wait_for_client_close(&stream),
                 ServerMode::StalledBody => {
                     write_sse_headers(&mut stream);
@@ -170,15 +262,33 @@ impl LocalResponsesServer {
                         .write_all(frame.as_bytes())
                         .expect("oversized frame should be written");
                 }
+                ServerMode::UnterminatedOversizedFrame => {
+                    write_sse_headers(&mut stream);
+                    stream
+                        .write_all(
+                            format!(
+                                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}",
+                                "x".repeat(128 * 1024)
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("unterminated oversized frame should be written");
+                }
                 ServerMode::ErrorBody => {
                     stream
                         .write_all(
                             format!(
-                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SECRET_SENTINEL}",
-                                SECRET_SENTINEL.len()
+                                "HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: {SECRET_HEADER_SENTINEL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SECRET_BODY_SENTINEL}",
+                                SECRET_BODY_SENTINEL.len()
                             )
                             .as_bytes(),
                         )
+                        .expect("error response should be written");
+                }
+                ServerMode::CancelledError => {
+                    thread::sleep(Duration::from_millis(25));
+                    stream
+                        .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .expect("error response should be written");
                 }
             }
@@ -203,6 +313,26 @@ impl LocalResponsesServer {
 
     fn join(self) {
         self.worker.join().expect("server worker should finish");
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ResourceSnapshot {
+    tasks: usize,
+    file_descriptors: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl ResourceSnapshot {
+    fn capture() -> Self {
+        Self {
+            tasks: std::fs::read_dir("/proc/self/task")
+                .expect("task directory should be readable")
+                .count(),
+            file_descriptors: std::fs::read_dir("/proc/self/fd")
+                .expect("file descriptor directory should be readable")
+                .count(),
+        }
     }
 }
 
