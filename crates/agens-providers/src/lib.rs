@@ -24,6 +24,9 @@ const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
+const AGENS_USER_AGENT: &str = concat!("Agens/", env!("CARGO_PKG_VERSION"));
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -59,6 +62,19 @@ pub struct OpenAiResponsesProvider {
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
     continuation_rounds: usize,
+}
+
+/// ChatGPT subscription Responses transport using existing auth.json credentials.
+pub struct ChatGptResponsesProvider {
+    access_token: String,
+    account_id: String,
+    base_url: String,
+    model: String,
+    instructions: String,
+    input: String,
+    session_id: String,
+    client: reqwest::Client,
+    completed: bool,
 }
 
 enum ContinuationState {
@@ -233,6 +249,156 @@ impl OpenAiResponsesProvider {
         }
 
         decode_http_response_stream(response, cancellation).await
+    }
+}
+
+impl ChatGptResponsesProvider {
+    pub fn from_credentials(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        model: String,
+        instructions: String,
+        input: String,
+    ) -> Result<Self, Error> {
+        Self::from_credentials_with_timeout(
+            credentials_path,
+            base_url,
+            model,
+            instructions,
+            input,
+            DEFAULT_OPENAI_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn from_credentials_with_timeout(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        model: String,
+        instructions: String,
+        input: String,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
+        if model.trim().is_empty() || instructions.trim().is_empty() || input.trim().is_empty() {
+            return Err(auth_error("request configuration is incomplete"));
+        }
+
+        if load_chatgpt_auth_state(credentials_path, SystemTime::now())?
+            == ChatGptAuthState::RefreshRequired
+        {
+            return Err(auth_error("credentials require refresh"));
+        }
+
+        let credentials = read_credentials(credentials_path)?;
+        let entry = chatgpt_entry(&credentials)?;
+        let access_token = required_credential_string(entry, "access_token")?.to_owned();
+        let account_id = required_credential_string(entry, "account_id")?.to_owned();
+        required_credential_string(entry, "refresh_token")?;
+        required_credential_string(entry, "expires_at")?;
+
+        Ok(Self {
+            access_token,
+            account_id,
+            base_url: base_url
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEFAULT_CHATGPT_BASE_URL)
+                .trim_end_matches('/')
+                .to_owned(),
+            model,
+            instructions,
+            input,
+            session_id: format!(
+                "agens-{}",
+                TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
+            client: reqwest::Client::builder()
+                .connect_timeout(request_timeout)
+                .build()
+                .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
+            completed: false,
+        })
+    }
+
+    async fn request_response(
+        &self,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<DecodedResponse, HeadlessTurnPortError> {
+        let request = self
+            .client
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(&self.access_token)
+            .header("ChatGPT-Account-ID", &self.account_id)
+            .header("Accept", "text/event-stream")
+            .header("originator", CHATGPT_ORIGINATOR)
+            .header("User-Agent", AGENS_USER_AGENT)
+            .header("session-id", &self.session_id)
+            .json(&self.request_payload())
+            .build()
+            .map_err(|_| HeadlessTurnPortError::Provider)?;
+        let response = tokio::select! {
+            response = self.client.execute(request) => {
+                stop_before_mapping(cancellation)?;
+                response.map_err(|_| HeadlessTurnPortError::Provider)?
+            }
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+
+        stop_before_mapping(cancellation)?;
+        match response.status().as_u16() {
+            401 | 403 => return Err(HeadlessTurnPortError::Authentication),
+            400 | 429 | 500..=599 => return Err(HeadlessTurnPortError::Provider),
+            _ if !response.status().is_success() => return Err(HeadlessTurnPortError::Provider),
+            _ => {}
+        }
+
+        decode_http_response_stream(response, cancellation).await
+    }
+
+    fn request_payload(&self) -> Value {
+        serde_json::json!({
+            "model": self.model,
+            "instructions": self.instructions,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": self.input}],
+            }],
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "store": false,
+            "stream": true,
+            "include": ["reasoning.encrypted_content"],
+            "reasoning": {"summary": "auto"},
+        })
+    }
+}
+
+impl TurnProvider for ChatGptResponsesProvider {
+    async fn next_parts(
+        &mut self,
+        _events: &[TurnEvent],
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        if cancellation.is_cancelled() {
+            return Err(HeadlessTurnPortError::Cancelled);
+        }
+        if cancellation.is_expired() {
+            return Err(HeadlessTurnPortError::TimedOut);
+        }
+        if self.completed {
+            return Err(HeadlessTurnPortError::Provider);
+        }
+
+        let response = self.request_response(cancellation).await?;
+        if response
+            .parts
+            .iter()
+            .any(|part| !matches!(part, MessagePart::Text(_)))
+        {
+            return Err(HeadlessTurnPortError::Provider);
+        }
+
+        self.completed = true;
+        Ok(response.parts)
     }
 }
 
