@@ -6,3 +6,4 @@ rust-version.workspace = true
 
 [dependencies]
 agens-core = { path = "../agens-core" }
+crossterm = "0.29"
