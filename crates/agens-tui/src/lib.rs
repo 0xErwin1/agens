@@ -16,10 +16,10 @@ use crossterm::{
 use ratatui::{
     Terminal as RatatuiTerminal,
     backend::Backend,
-    layout::{Constraint, Layout},
-    style::{Color, Style},
+    layout::{Alignment, Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
@@ -79,6 +79,8 @@ pub enum TranscriptEntry {
     User(String),
     /// Text returned by the shared runtime.
     Assistant(String),
+    /// Provider reasoning returned by the shared runtime.
+    Reasoning(String),
     /// A sanitized runtime failure.
     Error(String),
     /// A local session or lifecycle note.
@@ -87,7 +89,7 @@ pub enum TranscriptEntry {
     Tool(String),
 }
 
-/// State passed to renderers. Prompt/session/provider presentation belongs to WU-20.
+/// State passed to renderers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewState<'a> {
     /// The editable prompt text.
@@ -104,6 +106,16 @@ pub struct ViewState<'a> {
     pub following_bottom: bool,
     /// The manual transcript offset when bottom following is disabled.
     pub scroll_offset: u16,
+    /// Current provider and model selected by the CLI composition root.
+    pub provider_model: &'a str,
+    /// Active session label supplied by the CLI composition root.
+    pub session: &'a str,
+    /// Current active-turn state for the dedicated status row.
+    pub turn_state: Option<TurnState>,
+    /// Tool name currently being dispatched, when known.
+    pub active_tool: Option<&'a str>,
+    /// Current byte cursor position in the editable prompt.
+    pub input_cursor: usize,
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -132,93 +144,287 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let composer_rows = area.height.clamp(3, 6);
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(composer_rows),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    let header = format!(
-        " Agens  {}",
-        if state.running { "working" } else { "ready" }
-    );
-    frame.render_widget(
-        Paragraph::new(header).style(Style::default().fg(Color::Cyan)),
-        chunks[0],
-    );
+    let layout = screen_layout(area, state.running);
 
-    let lines = transcript_lines(state.transcript);
+    if layout.header.height > 0 {
+        render_header(frame, layout.header, &state, layout.show_context);
+    }
+
+    let transcript = transcript_lines(state.transcript);
+    let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
+    let bottom_scroll = transcript.len().saturating_sub(visible_rows) as u16;
     let scroll = if state.following_bottom {
-        u16::MAX
+        bottom_scroll
     } else {
-        state.scroll_offset
+        bottom_scroll.saturating_sub(state.scroll_offset)
     };
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::TOP))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        chunks[1],
-    );
-    let status = if state.running {
-        " Responding — Esc/Ctrl+C cancels"
+    let scroll_label = if state.following_bottom {
+        " LIVE".to_owned()
     } else {
-        ""
+        format!(" SCROLL +{}", state.scroll_offset)
     };
-    frame.render_widget(Paragraph::new(status), chunks[2]);
-    frame.render_widget(
-        Paragraph::new(state.input)
-            .block(Block::default().borders(Borders::ALL).title("Compose"))
-            .wrap(Wrap { trim: false }),
-        chunks[3],
-    );
-    frame.render_widget(
-        Paragraph::new(" Enter send · Shift+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel/quit"),
-        chunks[4],
-    );
+    if layout.transcript.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(transcript))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(Span::styled(
+                            " transcript ",
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .title_bottom(Span::styled(
+                            scroll_label,
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .title_alignment(Alignment::Right),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            layout.transcript,
+        );
+    }
 
-    let (line, column) = cursor_position(state.input);
-    let cursor_y = chunks[3].y.saturating_add(1).saturating_add(line as u16);
-    let cursor_x = chunks[3].x.saturating_add(1).saturating_add(column as u16);
-    if cursor_y < chunks[3].bottom() && cursor_x < chunks[3].right() {
+    if layout.status.height > 0 {
+        render_turn_status(frame, layout.status, &state);
+    }
+
+    let composer_title = if state.running {
+        " Compose · running "
+    } else {
+        " Compose "
+    };
+    let composer_color = if state.running {
+        Color::Yellow
+    } else {
+        Color::Cyan
+    };
+    if layout.composer.height > 0 {
+        frame.render_widget(
+            Paragraph::new(state.input)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(composer_color))
+                        .title(Span::styled(
+                            composer_title,
+                            Style::default()
+                                .fg(composer_color)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .title_bottom(Span::styled(
+                            composer_metadata(state.input),
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .title_alignment(Alignment::Right),
+                )
+                .wrap(Wrap { trim: false }),
+            layout.composer,
+        );
+    }
+
+    if layout.footer.height > 0 {
+        frame.render_widget(
+            Paragraph::new(footer_text(area.width)).style(Style::default().fg(Color::DarkGray)),
+            layout.footer,
+        );
+    }
+
+    let (line, column) = cursor_position(state.input, state.input_cursor);
+    let cursor_y = layout
+        .composer
+        .y
+        .saturating_add(1)
+        .saturating_add(line as u16);
+    let cursor_x = layout
+        .composer
+        .x
+        .saturating_add(1)
+        .saturating_add(column as u16);
+    if cursor_y < layout.composer.bottom() && cursor_x < layout.composer.right() {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
-fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
-    entries
-        .iter()
-        .map(|entry| match entry {
-            TranscriptEntry::User(text) => Line::from(vec![
-                Span::styled("You: ", Style::default().fg(Color::Green)),
-                Span::raw(text.clone()),
-            ]),
-            TranscriptEntry::Assistant(text) => Line::from(vec![
-                Span::styled("Assistant: ", Style::default().fg(Color::Cyan)),
-                Span::raw(text.clone()),
-            ]),
-            TranscriptEntry::Error(text) => Line::from(vec![
-                Span::styled("Error: ", Style::default().fg(Color::Red)),
-                Span::raw(text.clone()),
-            ]),
-            TranscriptEntry::Info(text) => Line::from(vec![
-                Span::styled("Info: ", Style::default().fg(Color::Yellow)),
-                Span::raw(text.clone()),
-            ]),
-            TranscriptEntry::Tool(text) => Line::from(vec![
-                Span::styled("Tool: ", Style::default().fg(Color::Magenta)),
-                Span::raw(text.clone()),
-            ]),
-        })
-        .collect()
+struct ScreenLayout {
+    header: Rect,
+    transcript: Rect,
+    status: Rect,
+    composer: Rect,
+    footer: Rect,
+    show_context: bool,
 }
 
-fn cursor_position(input: &str) -> (usize, usize) {
-    let line = input.lines().count().saturating_sub(1);
-    let column = input
+fn screen_layout(area: Rect, running: bool) -> ScreenLayout {
+    let show_header = area.height >= 8;
+    let show_context = area.width >= 80 && area.height > 16;
+    let show_footer = area.height >= 10;
+    let show_status = running && area.height > 16;
+    let composer_rows = if area.height < 8 { 2 } else { 3 };
+    let chunks = Layout::vertical([
+        Constraint::Length(u16::from(show_header)),
+        Constraint::Min(1),
+        Constraint::Length(u16::from(show_status)),
+        Constraint::Length(composer_rows),
+        Constraint::Length(u16::from(show_footer)),
+    ])
+    .split(area);
+
+    ScreenLayout {
+        header: chunks[0],
+        transcript: chunks[1],
+        status: chunks[2],
+        composer: chunks[3],
+        footer: chunks[4],
+        show_context,
+    }
+}
+
+fn render_header(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    state: &ViewState<'_>,
+    show_context: bool,
+) {
+    let state_label = turn_state_label(state.turn_state, state.running);
+    let mut left = vec![Span::styled(
+        " agens ",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if show_context {
+        left.push(Span::styled("  ", Style::default()));
+        left.push(Span::styled(
+            state.provider_model,
+            Style::default().fg(Color::Gray),
+        ));
+        left.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        left.push(Span::styled(
+            state.session,
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    let state_width = state_label.len() as u16 + 1;
+    if area.width > state_width {
+        let state_area = Rect::new(area.right() - state_width, area.y, state_width, area.height);
+        frame.render_widget(
+            Paragraph::new(state_label)
+                .style(Style::default().fg(turn_state_color(state.turn_state, state.running)))
+                .alignment(Alignment::Right),
+            state_area,
+        );
+    }
+}
+
+fn render_turn_status(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
+    let label = match (state.turn_state, state.active_tool) {
+        (Some(TurnState::Dispatching), Some(tool)) => {
+            format!(" {} Tool: {tool}", activity_marker(state))
+        }
+        _ => format!(
+            " {} {}",
+            activity_marker(state),
+            turn_state_label(state.turn_state, state.running)
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(label)
+            .style(Style::default().fg(turn_state_color(state.turn_state, state.running))),
+        area,
+    );
+}
+
+fn activity_marker(state: &ViewState<'_>) -> &'static str {
+    match state.turn_state {
+        Some(TurnState::Requesting) => "·",
+        Some(TurnState::Streaming) => "~",
+        Some(TurnState::Dispatching) => "*",
+        Some(TurnState::Cancelled) => "·",
+        Some(TurnState::Failed) => "!",
+        _ if state.running => "~",
+        _ => "·",
+    }
+}
+
+fn turn_state_label(state: Option<TurnState>, running: bool) -> &'static str {
+    match state {
+        Some(TurnState::Requesting) => "Waiting",
+        Some(TurnState::Streaming) => "Responding",
+        Some(TurnState::Dispatching) => "Using tool",
+        Some(TurnState::Cancelled) => "Cancelling",
+        Some(TurnState::Failed) => "Failed",
+        _ if running => "Working",
+        _ => "Ready",
+    }
+}
+
+fn turn_state_color(state: Option<TurnState>, running: bool) -> Color {
+    match state {
+        Some(TurnState::Failed) => Color::Red,
+        Some(TurnState::Cancelled) => Color::Yellow,
+        Some(TurnState::Dispatching) => Color::Magenta,
+        Some(TurnState::Streaming) => Color::Cyan,
+        _ if running => Color::Cyan,
+        _ => Color::DarkGray,
+    }
+}
+
+fn composer_metadata(input: &str) -> String {
+    let lines = input.lines().count().max(1);
+    format!(" {lines} lines · {} chars ", input.chars().count())
+}
+
+fn footer_text(width: u16) -> &'static str {
+    if width < 60 {
+        " Enter send  ·  Ctrl+C cancel/quit "
+    } else {
+        " Enter send  ·  Shift+Enter newline  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow "
+    }
+}
+
+fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        let (label, color, text, card) = match entry {
+            TranscriptEntry::User(text) => ("USER", Color::Green, text, false),
+            TranscriptEntry::Assistant(text) => ("ASSISTANT", Color::Cyan, text, false),
+            TranscriptEntry::Reasoning(text) => ("THINKING", Color::Blue, text, false),
+            TranscriptEntry::Error(text) => ("ERROR", Color::Red, text, true),
+            TranscriptEntry::Info(text) => ("INFO", Color::Yellow, text, false),
+            TranscriptEntry::Tool(text) => ("TOOL", Color::Magenta, text, true),
+        };
+        let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+        if card {
+            lines.push(Line::from(Span::styled(
+                format!("  ┌ {label} "),
+                label_style,
+            )));
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(color)),
+                Span::raw(text.clone()),
+            ]));
+            lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(color)),
+                Span::styled(format!("{label:<9} "), label_style),
+                Span::raw(text.clone()),
+            ]));
+        }
+        lines.push(Line::default());
+    }
+    lines
+}
+
+fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
+    let cursor = cursor.min(input.len());
+    let before_cursor = &input[..cursor];
+    let line = before_cursor.bytes().filter(|byte| *byte == b'\n').count();
+    let column = before_cursor
         .rsplit('\n')
         .next()
         .map_or(0, |line| line.chars().count());
@@ -243,6 +449,7 @@ impl Renderer for PlainRenderer {
             match entry {
                 TranscriptEntry::User(text) => writeln!(stdout, "You: {text}\n")?,
                 TranscriptEntry::Assistant(text) => writeln!(stdout, "Assistant: {text}\n")?,
+                TranscriptEntry::Reasoning(text) => writeln!(stdout, "Reasoning: {text}\n")?,
                 TranscriptEntry::Error(text) => writeln!(stdout, "Error: {text}\n")?,
                 TranscriptEntry::Info(text) => writeln!(stdout, "{text}\n")?,
                 TranscriptEntry::Tool(text) => writeln!(stdout, "Tool: {text}\n")?,
@@ -268,6 +475,10 @@ pub struct Tui<E> {
     transcript: Vec<TranscriptEntry>,
     following_bottom: bool,
     scroll_offset: u16,
+    provider_model: String,
+    session: String,
+    turn_state: Option<TurnState>,
+    active_tool: Option<String>,
 }
 
 impl<E> Tui<E>
@@ -286,6 +497,10 @@ where
             transcript: Vec::new(),
             following_bottom: true,
             scroll_offset: 0,
+            provider_model: "provider / model".to_owned(),
+            session: "new session".to_owned(),
+            turn_state: None,
+            active_tool: None,
         }
     }
 
@@ -321,7 +536,25 @@ where
         self.running = running;
         if running {
             self.quit_armed = false;
+            self.turn_state = Some(TurnState::Requesting);
+        } else if !matches!(
+            self.turn_state,
+            Some(TurnState::Failed | TurnState::Cancelled)
+        ) {
+            self.turn_state = None;
+            self.active_tool = None;
         }
+    }
+
+    /// Supplies concise provider, model, and active-session context for the terminal surface.
+    pub fn set_presentation(
+        &mut self,
+        provider: impl AsRef<str>,
+        model: impl AsRef<str>,
+        session: impl Into<String>,
+    ) {
+        self.provider_model = format!("{} / {}", provider.as_ref(), model.as_ref());
+        self.session = session.into();
     }
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
@@ -366,6 +599,11 @@ where
             transcript: &self.transcript,
             following_bottom: self.following_bottom,
             scroll_offset: self.scroll_offset,
+            provider_model: &self.provider_model,
+            session: &self.session,
+            turn_state: self.turn_state,
+            active_tool: self.active_tool.as_deref(),
+            input_cursor: self.input_cursor,
         }
     }
 
@@ -376,23 +614,25 @@ where
     /// Applies ordered runtime progress without changing completed persistence semantics.
     pub fn apply_progress(&mut self, event: TurnEvent) {
         match event {
-            TurnEvent::ProviderPart(MessagePart::Text(delta)) => match self.transcript.last_mut() {
-                Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
-                _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
-            },
-            TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
+            TurnEvent::ProviderPart(MessagePart::Text(delta)) => {
+                self.turn_state = Some(TurnState::Streaming);
                 match self.transcript.last_mut() {
-                    Some(TranscriptEntry::Info(text)) if text.starts_with("Reasoning: ") => {
-                        text.push_str(&delta)
-                    }
-                    _ => self
-                        .transcript
-                        .push(TranscriptEntry::Info(format!("Reasoning: {delta}"))),
+                    Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
+                    _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
                 }
             }
-            TurnEvent::ToolCallRequested { name, .. } => self
-                .transcript
-                .push(TranscriptEntry::Tool(format!("{name} started"))),
+            TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
+                match self.transcript.last_mut() {
+                    Some(TranscriptEntry::Reasoning(text)) => text.push_str(&delta),
+                    _ => self.transcript.push(TranscriptEntry::Reasoning(delta)),
+                }
+            }
+            TurnEvent::ToolCallRequested { name, .. } => {
+                self.turn_state = Some(TurnState::Dispatching);
+                self.active_tool = Some(name.clone());
+                self.transcript
+                    .push(TranscriptEntry::Tool(format!("{name} started")));
+            }
             TurnEvent::ToolResult(MessagePart::ToolResult {
                 content, is_error, ..
             }) => {
@@ -410,9 +650,13 @@ where
                     "{name} {outcome}: {content}"
                 )));
             }
-            TurnEvent::StateChanged(
-                TurnState::Completed | TurnState::Cancelled | TurnState::Failed,
-            ) => self.set_running(false),
+            TurnEvent::StateChanged(TurnState::Completed) => self.set_running(false),
+            TurnEvent::StateChanged(state @ (TurnState::Cancelled | TurnState::Failed)) => {
+                self.running = false;
+                self.turn_state = Some(state);
+                self.active_tool = None;
+            }
+            TurnEvent::StateChanged(state) => self.turn_state = Some(state),
             _ => {}
         }
         if self.following_bottom {
@@ -515,6 +759,7 @@ where
     fn cancel_running(&mut self) -> Action {
         self.engine.cancel();
         self.quit_armed = false;
+        self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
     }
 }

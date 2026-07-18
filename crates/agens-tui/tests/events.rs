@@ -176,6 +176,144 @@ fn ratatui_layout_degrades_without_overlapping_at_standard_narrow_and_short_size
 
         assert_eq!(buffer.area.width, width);
         assert_eq!(buffer.area.height, height);
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "A"));
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "a"));
     }
+}
+
+#[test]
+fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
+    let backend = TestBackend::new(96, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_presentation("openai-api", "gpt-4.1", "session #42");
+    tui.begin_submission("Inspect the project structure.");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "Checking the workspace.".into(),
+    )));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "The workspace contains focused Rust crates.".into(),
+    )));
+    tui.handle(Event::Key(Key::Char('n')));
+    tui.handle(Event::Key(Key::ShiftEnter));
+    tui.handle(Event::Key(Key::Char('o')));
+
+    renderer.render(tui.view()).unwrap();
+    let buffer = renderer.terminal().backend().buffer();
+    let text = buffer
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(text.contains("agens"));
+    assert!(text.contains("openai-api / gpt-4.1"));
+    assert!(text.contains("session #42"));
+    assert!(text.contains("USER"));
+    assert!(text.contains("THINKING"));
+    assert!(text.contains("ASSISTANT"));
+    assert!(text.contains("Compose"));
+    assert!(text.contains("2 lines"));
+    assert!(text.contains("Shift+Enter"));
+    assert!(text.contains("LIVE"));
+
+    let user_cell = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "U")
+        .expect("user role label is rendered");
+    assert_eq!(user_cell.fg, ratatui::style::Color::Green);
+
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "call-1".into(),
+        name: "native::read".into(),
+        input: "omitted".into(),
+    });
+    renderer.render(tui.view()).unwrap();
+    let tool_text = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(tool_text.contains("TOOL"));
+    assert!(tool_text.contains("Tool: native::read"));
+
+    let backend = TestBackend::new(50, 14);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    renderer.render(tui.view()).unwrap();
+    let narrow_text = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(narrow_text.contains("agens"));
+    assert!(narrow_text.contains("Enter"));
+    assert!(!narrow_text.contains("Shift+Enter"));
+    assert!(narrow_text.contains("Compose"));
+}
+
+#[test]
+fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failure() {
+    let backend = TestBackend::new(80, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("status test");
+
+    renderer.render(tui.view()).unwrap();
+    let waiting = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(waiting.contains("Waiting"));
+
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "response".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+    let responding = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(responding.contains("Responding"));
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    renderer.render(tui.view()).unwrap();
+    let cancelling = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(cancelling.contains("Cancelling"));
+
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Failed));
+    renderer.render(tui.view()).unwrap();
+    let failed = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(failed.contains("Failed"));
 }

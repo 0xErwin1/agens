@@ -673,6 +673,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    let provider = bootstrap.provider_type().unwrap_or("provider");
+    let model = bootstrap.model().unwrap_or("default model");
+    let mut session_label = "new session".to_owned();
 
     if let Some(identifier) = resume {
         let resumed = resume_tui_session(bootstrap, identifier)?;
@@ -680,7 +683,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
+        session_label = format!("session #{identifier}");
     }
+    tui.set_presentation(provider, model, session_label);
 
     let bootstrap = bootstrap.clone();
     let session = Arc::clone(&session);
