@@ -56,3 +56,37 @@ fn repeated_control_c_quits_only_when_idle_and_input_is_empty() {
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
 }
+
+#[test]
+fn submitted_prompt_and_provider_output_are_retained_in_order() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.begin_submission("explain the project");
+    tui.finish_submission(Ok("Agens is a coding agent.".into()));
+
+    assert_eq!(
+        tui.transcript(),
+        [
+            agens_tui::TranscriptEntry::User("explain the project".into()),
+            agens_tui::TranscriptEntry::Assistant("Agens is a coding agent.".into()),
+        ]
+    );
+    assert!(!tui.view().running);
+}
+
+#[test]
+fn provider_failures_are_shown_without_leaving_the_turn_running() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.begin_submission("use the provider");
+    tui.finish_submission(Err("provider: provider request failed".into()));
+
+    assert_eq!(
+        tui.transcript(),
+        [
+            agens_tui::TranscriptEntry::User("use the provider".into()),
+            agens_tui::TranscriptEntry::Error("provider: provider request failed".into()),
+        ]
+    );
+    assert!(!tui.view().running);
+}

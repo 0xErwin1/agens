@@ -1,7 +1,9 @@
 //! Terminal lifecycle and input-event boundary for the interactive surface.
 
 use std::{
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
+    sync::{Arc, mpsc},
+    thread,
     time::Duration,
 };
 
@@ -54,6 +56,19 @@ pub enum Action {
     Quit,
 }
 
+/// A visible conversation entry in chronological order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TranscriptEntry {
+    /// A prompt submitted by the user.
+    User(String),
+    /// Text returned by the shared runtime.
+    Assistant(String),
+    /// A sanitized runtime failure.
+    Error(String),
+    /// A local session or lifecycle note.
+    Info(String),
+}
+
 /// State passed to renderers. Prompt/session/provider presentation belongs to WU-20.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewState<'a> {
@@ -65,12 +80,39 @@ pub struct ViewState<'a> {
     pub running: bool,
     /// Whether an idle second Ctrl+C will quit.
     pub quit_armed: bool,
+    /// Conversation entries rendered in the order they occurred.
+    pub transcript: &'a [TranscriptEntry],
 }
 
 /// Renders the current TUI state. Rendering is deliberately independent of event handling.
 pub trait Renderer {
     /// Draws one frame for the supplied TUI state.
     fn render(&mut self, state: ViewState<'_>) -> io::Result<()>;
+}
+
+/// Minimal terminal renderer for the runnable TUI command.
+pub struct PlainRenderer;
+
+impl Renderer for PlainRenderer {
+    fn render(&mut self, state: ViewState<'_>) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        write!(stdout, "\x1b[2J\x1b[HAgens\n\n")?;
+
+        for entry in state.transcript {
+            match entry {
+                TranscriptEntry::User(text) => writeln!(stdout, "You: {text}\n")?,
+                TranscriptEntry::Assistant(text) => writeln!(stdout, "Assistant: {text}\n")?,
+                TranscriptEntry::Error(text) => writeln!(stdout, "Error: {text}\n")?,
+                TranscriptEntry::Info(text) => writeln!(stdout, "{text}\n")?,
+            }
+        }
+
+        if state.running {
+            writeln!(stdout, "Working…")?;
+        }
+        write!(stdout, "> {}", state.input)?;
+        stdout.flush()
+    }
 }
 
 /// Small event engine shared by the terminal lifecycle and future TUI components.
@@ -80,6 +122,7 @@ pub struct Tui<E> {
     size: (u16, u16),
     running: bool,
     quit_armed: bool,
+    transcript: Vec<TranscriptEntry>,
 }
 
 impl<E> Tui<E>
@@ -94,6 +137,7 @@ where
             size: (0, 0),
             running: false,
             quit_armed: false,
+            transcript: Vec::new(),
         }
     }
 
@@ -132,6 +176,38 @@ where
         }
     }
 
+    /// Adds a user prompt before the composition layer starts the shared runtime.
+    pub fn begin_submission(&mut self, prompt: impl Into<String>) {
+        self.transcript.push(TranscriptEntry::User(prompt.into()));
+        self.set_running(true);
+    }
+
+    /// Records a completed runtime result without exposing provider internals.
+    pub fn finish_submission(&mut self, result: Result<String, String>) {
+        let entry = match result {
+            Ok(output) => TranscriptEntry::Assistant(output),
+            Err(error) => TranscriptEntry::Error(error),
+        };
+        self.transcript.push(entry);
+        self.set_running(false);
+    }
+
+    /// Adds a local session or lifecycle note to the visible conversation.
+    pub fn add_info(&mut self, text: impl Into<String>) {
+        self.transcript.push(TranscriptEntry::Info(text.into()));
+    }
+
+    /// Clears the current visible conversation for a new session.
+    pub fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.set_running(false);
+    }
+
+    /// Returns the visible conversation for composition and focused tests.
+    pub fn transcript(&self) -> &[TranscriptEntry] {
+        &self.transcript
+    }
+
     /// Returns an immutable snapshot for a renderer.
     pub fn view(&self) -> ViewState<'_> {
         ViewState {
@@ -139,6 +215,7 @@ where
             size: self.size,
             running: self.running,
             quit_armed: self.quit_armed,
+            transcript: &self.transcript,
         }
     }
 
@@ -249,6 +326,44 @@ where
         match tui.handle(event) {
             Action::Quit => return Ok(()),
             Action::Render | Action::Submit(_) | Action::Cancel => renderer.render(tui.view())?,
+        }
+    }
+}
+
+/// Runs the terminal loop while sending prompt submissions through the injected shared runtime.
+pub fn run_with_submit<E, R, F>(tui: &mut Tui<E>, renderer: &mut R, submit: F) -> io::Result<()>
+where
+    E: Engine + Send,
+    R: Renderer,
+    F: Fn(String) -> Result<String, String> + Send + Sync + 'static,
+{
+    let submit = Arc::new(submit);
+    let (sender, receiver) = mpsc::channel();
+    let mut terminal = Terminal::enter()?;
+    renderer.render(tui.view())?;
+
+    loop {
+        while let Ok(result) = receiver.try_recv() {
+            tui.finish_submission(result);
+            renderer.render(tui.view())?;
+        }
+
+        let Some(event) = terminal.poll(Duration::from_millis(100))? else {
+            continue;
+        };
+
+        match tui.handle(event) {
+            Action::Quit => return Ok(()),
+            Action::Submit(prompt) => {
+                tui.begin_submission(prompt.clone());
+                let submit = Arc::clone(&submit);
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    let _ = sender.send(submit(prompt));
+                });
+                renderer.render(tui.view())?;
+            }
+            Action::Render | Action::Cancel => renderer.render(tui.view())?,
         }
     }
 }

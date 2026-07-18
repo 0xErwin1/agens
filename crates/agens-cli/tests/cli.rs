@@ -190,15 +190,15 @@ fn command_boundaries_invoke_injected_headless_and_tui_services_without_network(
         BTreeMap::new(),
     )
     .with_headless_chat(|request, _, _| Ok(format!("answer:{}", request.prompt)))
-    .with_tui_launcher(|_| Ok("tui-selected".to_owned()));
+    .with_tui_launcher(|_, resume| Ok(format!("tui-selected:{resume:?}")));
 
     let chat = execute(["chat", "hello"], &dependencies);
-    let tui = execute(std::iter::empty::<&str>(), &dependencies);
+    let tui = execute(["--resume", "7"], &dependencies);
 
     assert_eq!(chat.status, ExitStatus::Success);
     assert_eq!(chat.stdout, "answer:hello\n");
     assert_eq!(tui.status, ExitStatus::Success);
-    assert_eq!(tui.stdout, "tui-selected\n");
+    assert_eq!(tui.stdout, "tui-selected:Some(7)\n");
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
 }
 
 #[test]
-fn preserved_tui_resume_shapes_are_explicitly_unavailable() {
+fn tui_resume_shapes_reach_the_injected_tui_launcher() {
     let dependencies = CliDependencies::for_test(
         PathBuf::from("/project"),
         Some(PathBuf::from("/home/user")),
@@ -514,11 +514,21 @@ fn preserved_tui_resume_shapes_are_explicitly_unavailable() {
         BTreeMap::new(),
     );
 
-    for arguments in [["--resume"].as_slice(), ["123"].as_slice()] {
+    let dependencies = dependencies.with_tui_launcher(|_, resume| {
+        Ok(match resume {
+            Some(identifier) => format!("resume:{identifier}"),
+            None => "new-session".to_owned(),
+        })
+    });
+
+    for (arguments, expected) in [
+        (["--resume"].as_slice(), "new-session\n"),
+        (["123"].as_slice(), "resume:123\n"),
+    ] {
         let result = execute(arguments, &dependencies);
 
-        assert_eq!(result.status, ExitStatus::Unavailable, "{arguments:?}");
-        assert_eq!(result.stdout, "", "{arguments:?}");
+        assert_eq!(result.status, ExitStatus::Success, "{arguments:?}");
+        assert_eq!(result.stdout, expected, "{arguments:?}");
     }
 }
 

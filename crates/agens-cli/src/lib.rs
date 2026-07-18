@@ -31,6 +31,7 @@ use agens_tools::{
     McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools, RemoteToolMetadata,
     ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
+use agens_tui::{Engine as TuiEngine, PlainRenderer, Tui, run_with_submit};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -41,7 +42,7 @@ type ConfigReader = Box<dyn Fn(&Path) -> Result<Option<String>, CliError>>;
 type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
-type TuiLauncher = Box<dyn Fn(&Bootstrap) -> Result<String, CliError>>;
+type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>) -> Result<String, CliError>>;
 type AuthLogin = Box<dyn Fn(&Path, bool) -> Result<String, CliError>>;
 
 pub struct CliDependencies {
@@ -73,7 +74,7 @@ impl CliDependencies {
                 Err(_) => Err(CliError::configuration("configuration file is unavailable")),
             }),
             headless_chat: Box::new(run_production_headless_chat),
-            tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            tui_launcher: Box::new(run_production_tui),
             auth_login: Box::new(run_production_auth_login),
         }
     }
@@ -90,7 +91,7 @@ impl CliDependencies {
             environment: Box::new(move || environment.clone()),
             read_file: Box::new(move |path| Ok(files.get(path).cloned())),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
-            tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             auth_login: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
@@ -110,7 +111,7 @@ impl CliDependencies {
 
     pub fn with_tui_launcher(
         mut self,
-        launcher: impl Fn(&Bootstrap) -> Result<String, CliError> + 'static,
+        launcher: impl Fn(&Bootstrap, Option<i64>) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.tui_launcher = Box::new(launcher);
         self
@@ -367,12 +368,14 @@ fn execute_command(
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     match arguments {
-        [] => run_tui(dependencies),
-        [resume] if resume == "--resume" => run_tui(dependencies),
+        [] => run_tui(dependencies, None),
+        [resume] if resume == "--resume" => run_tui(dependencies, None),
         [resume, identifier] if resume == "--resume" && identifier.parse::<i64>().is_ok() => {
-            run_tui(dependencies)
+            run_tui(dependencies, identifier.parse().ok())
         }
-        [identifier] if identifier.parse::<i64>().is_ok() => run_tui(dependencies),
+        [identifier] if identifier.parse::<i64>().is_ok() => {
+            run_tui(dependencies, identifier.parse().ok())
+        }
         [command] if is_help(command) => Ok(root_help()),
         [command] if is_version(command) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
         [command, rest @ ..] if command == "config" => run_config(rest, dependencies),
@@ -578,10 +581,126 @@ fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<
     }
 }
 
-fn run_tui(dependencies: &CliDependencies) -> Result<String, CliError> {
+fn run_tui(dependencies: &CliDependencies, resume: Option<i64>) -> Result<String, CliError> {
     let bootstrap = bootstrap(dependencies)?;
-    let output = (dependencies.tui_launcher)(&bootstrap)?;
+    let output = (dependencies.tui_launcher)(&bootstrap, resume)?;
     Ok(format!("{output}\n"))
+}
+
+struct ProductionTuiEngine {
+    cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+}
+
+impl TuiEngine for ProductionTuiEngine {
+    fn cancel(&mut self) {
+        if let Ok(cancellation) = self.cancellation.lock()
+            && let Some(cancellation) = cancellation.as_ref()
+        {
+            cancellation.cancel();
+        }
+    }
+}
+
+fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
+    let cancellation = Arc::new(Mutex::new(None));
+    let engine = ProductionTuiEngine {
+        cancellation: Arc::clone(&cancellation),
+    };
+    let mut tui = Tui::new(engine);
+
+    if let Some(identifier) = resume {
+        tui.add_info(resume_tui_session(bootstrap, identifier)?);
+    }
+
+    let bootstrap = bootstrap.clone();
+    let mut renderer = PlainRenderer;
+    run_with_submit(&mut tui, &mut renderer, move |prompt| {
+        let turn_cancellation =
+            HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+        let Ok(mut active) = cancellation.lock() else {
+            return Err("runtime: TUI cancellation is unavailable".to_owned());
+        };
+        *active = Some(turn_cancellation.clone());
+        drop(active);
+
+        let result = run_tui_prompt(&bootstrap, &prompt, &turn_cancellation)
+            .map_err(|error| error.to_string());
+
+        if let Ok(mut active) = cancellation.lock() {
+            *active = None;
+        }
+
+        result
+    })
+    .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
+
+    Ok(String::new())
+}
+
+fn run_tui_prompt(
+    bootstrap: &Bootstrap,
+    prompt: &str,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
+    match prompt.trim() {
+        "/sessions" => list_tui_sessions(bootstrap),
+        "/new" => Ok("Started a new session.".to_owned()),
+        command if command.starts_with("/resume ") => {
+            let identifier = command[8..]
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
+            resume_tui_session(bootstrap, identifier)
+        }
+        prompt => run_production_headless_chat(
+            HeadlessChatRequest {
+                prompt: prompt.to_owned(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+            },
+            bootstrap,
+            cancellation,
+        ),
+    }
+}
+
+fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
+    let store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let sessions = store
+        .list_completed_turns()
+        .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
+
+    if sessions.is_empty() {
+        return Ok("No saved sessions.".to_owned());
+    }
+
+    Ok(sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}\t{} event(s)",
+                session.id,
+                session.snapshot.events().len()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn resume_tui_session(bootstrap: &Bootstrap, identifier: i64) -> Result<String, CliError> {
+    let store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let snapshot = store
+        .load_completed_turn_for_resume(identifier)
+        .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    Ok(format!(
+        "Session {identifier}: {} event(s)",
+        snapshot.events().len()
+    ))
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -664,6 +783,27 @@ pub struct Bootstrap {
     project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
     permission_rules: Vec<ConfigPermissionRule>,
+}
+
+impl Clone for Bootstrap {
+    fn clone(&self) -> Self {
+        Self {
+            paths: ConfigPaths {
+                global_config: self.paths.global_config.clone(),
+                credentials: self.paths.credentials.clone(),
+                project_config: self.paths.project_config.clone(),
+            },
+            global_loaded: self.global_loaded,
+            project_loaded: self.project_loaded,
+            model: self.model.clone(),
+            provider_type: self.provider_type.clone(),
+            provider_base_url: self.provider_base_url.clone(),
+            data_directory: self.data_directory.clone(),
+            project_root: self.project_root.clone(),
+            mcp_servers: self.mcp_servers.clone(),
+            permission_rules: self.permission_rules.clone(),
+        }
+    }
 }
 
 impl Bootstrap {
