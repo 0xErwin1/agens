@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use globset::{GlobBuilder, GlobMatcher};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
@@ -604,6 +606,31 @@ pub struct HeadlessTurnCancellation {
     deadline: Option<Instant>,
 }
 
+#[derive(Clone, Debug)]
+pub struct HeadlessTurnCancellationAdapter {
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+}
+
+impl HeadlessTurnCancellationAdapter {
+    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn remaining_duration(&self) -> Option<Duration> {
+        self.deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 impl HeadlessTurnCancellation {
     pub fn new() -> Self {
         Self::default()
@@ -627,6 +654,13 @@ impl HeadlessTurnCancellation {
     pub fn is_expired(&self) -> bool {
         self.deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub fn adapter_view(&self) -> HeadlessTurnCancellationAdapter {
+        HeadlessTurnCancellationAdapter {
+            cancelled: Arc::clone(&self.cancelled),
+            deadline: self.deadline,
+        }
     }
 }
 
@@ -850,16 +884,73 @@ pub enum ToolAccess {
 pub enum PermissionPattern {
     Any,
     Exact(String),
+    Glob(ValidatedPermissionGlob),
 }
 
 impl PermissionPattern {
-    fn matches(&self, value: &str) -> bool {
+    pub fn glob(pattern: impl Into<String>) -> Result<Self, PermissionPatternError> {
+        ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
+    }
+
+    pub fn matches(&self, value: &str) -> bool {
         match self {
             Self::Any => true,
             Self::Exact(expected) => expected == value,
+            Self::Glob(pattern) => pattern.matches(value),
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct ValidatedPermissionGlob {
+    pattern: String,
+    matcher: GlobMatcher,
+}
+
+impl ValidatedPermissionGlob {
+    fn new(pattern: String) -> Result<Self, PermissionPatternError> {
+        if pattern.trim().is_empty() {
+            return Err(PermissionPatternError::InvalidGlob { pattern });
+        }
+
+        let matcher = GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .build()
+            .map_err(|_| PermissionPatternError::InvalidGlob {
+                pattern: pattern.clone(),
+            })?
+            .compile_matcher();
+
+        Ok(Self { pattern, matcher })
+    }
+
+    fn matches(&self, value: &str) -> bool {
+        self.matcher.is_match(value)
+    }
+}
+
+impl PartialEq for ValidatedPermissionGlob {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl Eq for ValidatedPermissionGlob {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionPatternError {
+    InvalidGlob { pattern: String },
+}
+
+impl fmt::Display for PermissionPatternError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidGlob { .. } => formatter.write_str("invalid permission glob"),
+        }
+    }
+}
+
+impl std::error::Error for PermissionPatternError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionRequest {
