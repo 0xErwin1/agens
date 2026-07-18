@@ -1,17 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, Role, TurnEvent,
     TurnProvider,
 };
+use fs4::fs_std::FileExt;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -30,8 +31,6 @@ const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
 const AGENS_USER_AGENT: &str = concat!("Agens/", env!("CARGO_PKG_VERSION"));
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static CHATGPT_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -86,6 +85,10 @@ pub struct ChatGptResponsesProvider {
 enum ChatGptResponseError {
     Authentication(u16),
     Other(HeadlessTurnPortError),
+}
+
+struct RefreshFileLock {
+    _file: File,
 }
 
 enum ContinuationState {
@@ -411,11 +414,7 @@ impl ChatGptResponsesProvider {
         &mut self,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<(), HeadlessTurnPortError> {
-        let lock = refresh_lock(&self.credentials_path)?;
-        let _guard = tokio::select! {
-            guard = lock.lock() => guard,
-            stop = wait_for_stop(cancellation) => return Err(stop),
-        };
+        let _lock = acquire_refresh_file_lock(&self.credentials_path, cancellation).await?;
 
         stop_before_mapping(cancellation)?;
         let credentials = read_credentials(&self.credentials_path)
@@ -427,7 +426,15 @@ impl ChatGptResponsesProvider {
         let account_id = required_credential_string(entry, "account_id")
             .map_err(|_| HeadlessTurnPortError::Authentication)?;
 
-        if account_id == self.account_id && access_token != self.access_token {
+        if account_id != self.account_id {
+            return Err(HeadlessTurnPortError::Authentication);
+        }
+
+        if access_token != self.access_token
+            && load_chatgpt_auth_state(&self.credentials_path, SystemTime::now())
+                .map_err(|_| HeadlessTurnPortError::Authentication)?
+                == ChatGptAuthState::Ready
+        {
             self.access_token = access_token.to_owned();
             return stop_before_mapping(cancellation);
         }
@@ -458,18 +465,28 @@ impl ChatGptResponsesProvider {
         }
 
         let status = response.status();
-        let body = response
-            .json::<Value>()
-            .await
-            .map_err(|_| HeadlessTurnPortError::Authentication)?;
-        stop_before_mapping(cancellation)?;
         if !status.is_success() {
-            return Err(if is_permanent_refresh_failure(&body) {
+            if status.is_server_error() {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+
+            let body = tokio::select! {
+                body = response.json::<Value>() => body.ok(),
+                stop = wait_for_stop(cancellation) => return Err(stop),
+            };
+            stop_before_mapping(cancellation)?;
+            return Err(if body.as_ref().is_some_and(is_permanent_refresh_failure) {
                 HeadlessTurnPortError::Authentication
             } else {
                 HeadlessTurnPortError::Provider
             });
         }
+
+        let body = tokio::select! {
+            body = response.json::<Value>() => body.map_err(|_| HeadlessTurnPortError::Authentication)?,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+        stop_before_mapping(cancellation)?;
 
         let access_token = body
             .get("access_token")
@@ -1290,6 +1307,7 @@ fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), Erro
 
         fs::rename(&temporary_path, path)
             .map_err(|_| auth_error("refreshed credentials could not be persisted"))?;
+        set_private_file_permissions(path)?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|_| auth_error("refreshed credentials could not be persisted"))
@@ -1303,22 +1321,23 @@ fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), Erro
 }
 
 fn ensure_private_directory(path: &Path) -> Result<(), Error> {
-    if path.exists() {
-        return Ok(());
+    if !path.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(|_| auth_error("credentials directory could not be created"))?;
     }
 
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .or_else(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(error)
-            }
-        })
-        .map_err(|_| auth_error("credentials directory could not be created"))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|_| auth_error("credentials directory could not be secured"))
 }
 
 #[cfg(test)]
@@ -1360,6 +1379,11 @@ fn create_private_temporary_file(parent: &Path) -> Result<(std::path::PathBuf, F
     Err(auth_error(
         "temporary credentials file could not be created",
     ))
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<(), Error> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|_| auth_error("credentials file could not be secured"))
 }
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<SystemTime> {
@@ -1410,13 +1434,65 @@ fn jwt_expiry(token: &str) -> Option<SystemTime> {
     (seconds >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64))
 }
 
-fn refresh_lock(path: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, HeadlessTurnPortError> {
-    let locks = CHATGPT_REFRESH_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = locks.lock().map_err(|_| HeadlessTurnPortError::Provider)?;
-    Ok(locks
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
+async fn acquire_refresh_file_lock(
+    credentials_path: &Path,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<RefreshFileLock, HeadlessTurnPortError> {
+    let credentials_path = canonical_credential_identity(credentials_path)?;
+    let lock_path = refresh_lock_path(&credentials_path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|_| HeadlessTurnPortError::Provider)?;
+    set_private_file_permissions(&lock_path).map_err(|_| HeadlessTurnPortError::Provider)?;
+
+    loop {
+        stop_before_mapping(cancellation)?;
+
+        let locked = match file.try_lock_exclusive() {
+            Ok(locked) => locked,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => return Err(HeadlessTurnPortError::Provider),
+        };
+        if locked {
+            return Ok(RefreshFileLock { _file: file });
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(HTTP_CANCELLATION_POLL_INTERVAL) => {}
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        }
+    }
+}
+
+fn canonical_credential_identity(path: &Path) -> Result<PathBuf, HeadlessTurnPortError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or(HeadlessTurnPortError::Authentication)?;
+    let filename = path
+        .file_name()
+        .filter(|filename| !filename.is_empty())
+        .ok_or(HeadlessTurnPortError::Authentication)?;
+    let parent = fs::canonicalize(parent).map_err(|_| HeadlessTurnPortError::Authentication)?;
+
+    Ok(parent.join(filename))
+}
+
+fn refresh_lock_path(credentials_path: &Path) -> Result<PathBuf, HeadlessTurnPortError> {
+    let parent = credentials_path
+        .parent()
+        .ok_or(HeadlessTurnPortError::Authentication)?;
+    let filename = credentials_path
+        .file_name()
+        .ok_or(HeadlessTurnPortError::Authentication)?
+        .to_string_lossy();
+
+    Ok(parent.join(format!(".{filename}.refresh.lock")))
 }
 
 fn is_permanent_refresh_failure(body: &Value) -> bool {
@@ -1429,7 +1505,7 @@ fn is_permanent_refresh_failure(body: &Value) -> bool {
         })
         .unwrap_or_default()
         .to_ascii_lowercase();
-    ["expired", "reused", "invalidated"]
+    ["invalid_grant", "expired", "reused", "invalidated"]
         .iter()
         .any(|needle| error.contains(needle))
 }
@@ -1495,6 +1571,10 @@ mod tests {
         ensure_private_directory(&credentials_directory)
             .expect("credential directory should be created");
         fs::write(&credentials_path, credentials()).expect("credentials should be written");
+        fs::set_permissions(&credentials_directory, fs::Permissions::from_mode(0o755))
+            .expect("credential directory permissions should be relaxed for the test");
+        fs::set_permissions(&credentials_path, fs::Permissions::from_mode(0o644))
+            .expect("credential file permissions should be relaxed for the test");
 
         persist_chatgpt_refresh(
             &credentials_path,
