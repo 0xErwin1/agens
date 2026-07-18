@@ -15,7 +15,7 @@ use agens_core::{
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
     PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
 };
-use agens_store::SessionStore;
+use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::McpTransport;
 
 #[test]
@@ -634,6 +634,227 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
 }
 
 #[test]
+fn production_binary_executes_allowed_native_read_then_continues_and_persists() {
+    let temporary = TemporaryDirectory::new("production-native-read");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    std::fs::write(project_root.join("notes.md"), "native tool content")
+        .expect("native read fixture should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"tools\"".to_owned(),
+                "native::read".to_owned(),
+                "native::search".to_owned(),
+            ],
+            response: native_tool_call_response(
+                "call_read",
+                "native::read",
+                r#"{"path":"notes.md"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"type\":\"function_call_output\"".to_owned(),
+                "\"call_id\":\"call_read\"".to_owned(),
+                "native tool content".to_owned(),
+            ],
+            response: text_response("native read completed"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"read(notes.md)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "read the native file"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions command should execute");
+    let resumed = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "show", "1"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("session resume command should execute");
+
+    assert!(chat.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&chat.stdout),
+        "native read completed\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "ID\tEVENTS\n1\t10 event(s)\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&resumed.stdout),
+        "Session 1: 10 event(s)\n"
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_executes_allowed_native_search_then_continues() {
+    let temporary = TemporaryDirectory::new("production-native-search");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    std::fs::write(
+        project_root.join("notes.md"),
+        "needle in the native search fixture",
+    )
+    .expect("native search fixture should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::search".to_owned()],
+            response: native_tool_call_response(
+                "call_search",
+                "native::search",
+                r#"{"path":".","query":"needle"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_search\"".to_owned(),
+                "needle in the native search fixture".to_owned(),
+            ],
+            response: text_response("native search completed"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "--dangerously-allow-all", "search the native file"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(
+        chat.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&chat.stdout),
+        String::from_utf8_lossy(&chat.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&chat.stdout),
+        "native search completed\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
+    assert!(
+        PermissionGrantStore::open(&data_directory)
+            .expect("grant store should open")
+            .grants_for_project(&project_root.display().to_string())
+            .expect("project grants should load")
+            .is_empty(),
+        "temporary bypass must not persist a grant"
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_denies_native_read_without_side_effect_and_continues_safely() {
+    let temporary = TemporaryDirectory::new("production-native-deny");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let protected = project_root.join("SENTINEL_DENIED_INPUT.txt");
+    std::fs::write(&protected, "must not be read").expect("protected fixture should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::read".to_owned()],
+            response: native_tool_call_response(
+                "call_denied",
+                "native::read",
+                r#"{"path":"SENTINEL_DENIED_INPUT.txt"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_denied\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+            ],
+            response: text_response("denial handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"read(SENTINEL_DENIED_INPUT.txt)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "chat",
+            "--dangerously-allow-all",
+            "attempt denied native read",
+        ])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(chat.status.success());
+    assert_eq!(String::from_utf8_lossy(&chat.stdout), "denial handled\n");
+    assert_eq!(
+        std::fs::read_to_string(&protected).unwrap(),
+        "must not be read"
+    );
+    assert!(
+        !format!(
+            "{}{}",
+            String::from_utf8_lossy(&chat.stdout),
+            String::from_utf8_lossy(&chat.stderr)
+        )
+        .contains("SENTINEL_DENIED_INPUT")
+    );
+
+    server.join();
+}
+
+#[test]
 fn production_binary_returns_permission_required_without_dispatching_an_unresolved_native_call() {
     let temporary = TemporaryDirectory::new("production-native-ask");
     let config_home = temporary.path().join("config");
@@ -884,6 +1105,52 @@ struct NativeToolCallOpenAiMockServer {
     worker: thread::JoinHandle<()>,
 }
 
+struct ScriptedOpenAiResponse {
+    required_body_fragments: Vec<String>,
+    response: String,
+}
+
+struct ScriptedNativeOpenAiMockServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<()>,
+}
+
+impl ScriptedNativeOpenAiMockServer {
+    fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let worker = thread::spawn(move || {
+            for scripted in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("mock server should accept a request");
+                let body = read_openai_request_body(&stream);
+                for fragment in scripted.required_body_fragments {
+                    assert!(
+                        body.contains(&fragment),
+                        "request body should contain {fragment:?}: {body}"
+                    );
+                }
+                stream
+                    .write_all(scripted.response.as_bytes())
+                    .expect("scripted response should be written");
+            }
+        });
+
+        Self { address, worker }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
+    }
+}
+
 impl NativeToolCallOpenAiMockServer {
     fn start() -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
@@ -1070,4 +1337,48 @@ fn read_openai_request(stream: &std::net::TcpStream) {
             return;
         }
     }
+}
+
+fn read_openai_request_body(stream: &std::net::TcpStream) -> String {
+    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+    let mut request = String::new();
+    reader
+        .read_line(&mut request)
+        .expect("request line should be readable");
+    assert_eq!(request, "POST /responses HTTP/1.1\r\n");
+
+    let mut content_length = None;
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("header should be readable");
+        if header == "\r\n" {
+            break;
+        }
+        if let Some(value) = header.strip_prefix("content-length: ") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("content length should be numeric"),
+            );
+        }
+    }
+
+    let mut body = vec![0_u8; content_length.expect("request should include content length")];
+    std::io::Read::read_exact(&mut reader, &mut body).expect("request body should be readable");
+    String::from_utf8(body).expect("request body should be UTF-8")
+}
+
+fn native_tool_call_response(call_id: &str, name: &str, arguments: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {{\"type\":\"response.output_item.added\",\"item\":{{\"id\":\"item_{call_id}\",\"type\":\"function_call\",\"call_id\":\"{call_id}\",\"name\":\"{name}\",\"arguments\":\"\"}}}}\n\ndata: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_{call_id}\",\"arguments\":{arguments:?}}}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"response_{call_id}\"}}}}\n\n"
+    )
+}
+
+fn text_response(text: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":{text:?}}}\n\ndata: {{\"type\":\"response.completed\"}}\n\n"
+    )
 }
