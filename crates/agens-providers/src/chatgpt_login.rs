@@ -40,10 +40,14 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_CALLBACK_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const MAX_DEVICE_FIELD_BYTES: usize = 4096;
+const MAX_DEVICE_JSON_BYTES: usize = 16 * 1024;
 const MAX_DEVICE_POLL_INTERVAL_SECONDS: f64 = 60.0;
 const DEVICE_WAIT_SLICE: Duration = Duration::from_millis(5);
 const DEVICE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
+const MIN_PKCE_VERIFIER_BYTES: usize = 43;
+const MAX_PKCE_VERIFIER_BYTES: usize = 128;
+const PKCE_CHALLENGE_BYTES: usize = 32;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -296,7 +300,8 @@ pub fn device_code_login(
             deadline,
         )?;
         if let Some(token) = response {
-            let (authorization_code, _code_challenge, code_verifier) = parse_device_token(&token)?;
+            let (authorization_code, code_challenge, code_verifier) = parse_device_token(&token)?;
+            validate_device_pkce(&code_challenge, &code_verifier)?;
             let credentials = exchange_code_cancellable(
                 &options.token_endpoint,
                 &authorization_code,
@@ -814,11 +819,14 @@ fn device_user_code_request(
             .post(endpoint)
             .json(&serde_json::json!({ "client_id": CLIENT_ID }))
             .send()
-            .map(|response| (response.status().as_u16(), response.json::<Value>().ok()))
+            .map(|mut response| {
+                let status = response.status().as_u16();
+                (status, read_device_json(&mut response))
+            })
     })?;
     match response {
         (404, _) => Err(LoginError::Authentication("Authentication unavailable")),
-        (status, Some(body)) if (200..300).contains(&status) => Ok(body),
+        (status, Ok(body)) if (200..300).contains(&status) => Ok(body),
         _ => Err(LoginError::Authentication("device authorization failed")),
     }
 }
@@ -844,11 +852,14 @@ fn device_token_request(
                 "user_code": user_code,
             }))
             .send()
-            .map(|response| (response.status().as_u16(), response.json::<Value>().ok()))
+            .map(|mut response| {
+                let status = response.status().as_u16();
+                (status, read_device_json(&mut response))
+            })
     })?;
     match response {
         (403 | 404, _) => Ok(None),
-        (status, Some(body)) if (200..300).contains(&status) => Ok(Some(body)),
+        (status, Ok(body)) if (200..300).contains(&status) => Ok(Some(body)),
         _ => Err(LoginError::Authentication("device authorization failed")),
     }
 }
@@ -880,11 +891,62 @@ fn parse_device_user_code(value: &Value) -> Result<(String, String, Duration), L
 }
 
 fn parse_device_token(value: &Value) -> Result<(String, String, String), LoginError> {
-    Ok((
-        bounded_device_string(value, "authorization_code")?,
-        bounded_device_string(value, "code_challenge")?,
-        bounded_device_string(value, "code_verifier")?,
-    ))
+    let authorization_code = bounded_device_string(value, "authorization_code")?;
+    let code_challenge = bounded_device_string(value, "code_challenge")?;
+    let code_verifier = bounded_device_string(value, "code_verifier")?;
+
+    Ok((authorization_code, code_challenge, code_verifier))
+}
+
+fn validate_device_pkce(code_challenge: &str, code_verifier: &str) -> Result<(), LoginError> {
+    if !valid_base64url_no_pad(code_verifier)
+        || !(MIN_PKCE_VERIFIER_BYTES..=MAX_PKCE_VERIFIER_BYTES).contains(&code_verifier.len())
+        || !valid_base64url_no_pad(code_challenge)
+        || URL_SAFE_NO_PAD
+            .decode(code_challenge)
+            .ok()
+            .is_none_or(|decoded| decoded.len() != PKCE_CHALLENGE_BYTES)
+    {
+        return Err(LoginError::Authentication(
+            "device authorization response is invalid",
+        ));
+    }
+
+    let expected_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
+    if !constant_time_equal(expected_challenge.as_bytes(), code_challenge.as_bytes()) {
+        return Err(LoginError::Authentication(
+            "device authorization response is invalid",
+        ));
+    }
+
+    Ok(())
+}
+
+fn valid_base64url_no_pad(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn read_device_json(response: &mut reqwest::blocking::Response) -> Result<Value, ()> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DEVICE_JSON_BYTES as u64)
+    {
+        return Err(());
+    }
+
+    let mut body = Vec::new();
+    response
+        .take((MAX_DEVICE_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| ())?;
+    if body.len() > MAX_DEVICE_JSON_BYTES {
+        return Err(());
+    }
+
+    serde_json::from_slice(&body).map_err(|_| ())
 }
 
 fn bounded_device_string(value: &Value, field: &str) -> Result<String, LoginError> {

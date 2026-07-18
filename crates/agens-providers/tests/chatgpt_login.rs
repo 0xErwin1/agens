@@ -69,7 +69,7 @@ fn authorization_url_uses_the_codex_pkce_contract_without_workspace_selection() 
 }
 
 #[test]
-fn device_code_login_uses_exact_json_requests_and_exchanges_only_the_verifier() {
+fn device_code_login_uses_exact_json_requests_and_validates_the_server_pkce_pair() {
     let device_listener = TcpListener::bind("127.0.0.1:0").expect("device listener should bind");
     let device_endpoint = format!(
         "http://{}/api/accounts/deviceauth/usercode",
@@ -85,6 +85,10 @@ fn device_code_login_uses_exact_json_requests_and_exchanges_only_the_verifier() 
         "http://{}/oauth/token",
         oauth_listener.local_addr().expect("OAuth address")
     );
+
+    let pkce = generate_pkce(&|length| Ok(vec![42; length])).expect("PKCE should generate");
+    let verifier = pkce.verifier;
+    let challenge = pkce.challenge;
 
     let device_server = thread::spawn(move || {
         let (mut stream, _) = device_listener
@@ -119,7 +123,9 @@ fn device_code_login_uses_exact_json_requests_and_exchanges_only_the_verifier() 
                 write_http_response(
                     &mut stream,
                     status,
-                    r#"{"authorization_code":"authorization-code","code_challenge":"challenge","code_verifier":"verifier"}"#,
+                    &format!(
+                        r#"{{"authorization_code":"authorization-code","code_challenge":"{challenge}","code_verifier":"{verifier}"}}"#
+                    ),
                 );
             }
         }
@@ -134,7 +140,7 @@ fn device_code_login_uses_exact_json_requests_and_exchanges_only_the_verifier() 
         assert!(
             request.contains("redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback")
         );
-        assert!(request.contains("code_verifier=verifier"));
+        assert!(request.contains("code_verifier="));
         assert!(!request.contains("code_challenge"));
         let id_token = jwt(json!({"https://api.openai.com/auth.chatgpt_account_id":"account_123"}));
         let access_token = jwt(json!({"exp":1893456000}));
@@ -160,6 +166,268 @@ fn device_code_login_uses_exact_json_requests_and_exchanges_only_the_verifier() 
     assert_eq!(result.user_code, "ABCD-EFGH");
     assert_eq!(result.credentials.account_id, "account_123");
     device_server.join().expect("device server should finish");
+    poll_server.join().expect("poll server should finish");
+    oauth_server.join().expect("OAuth server should finish");
+}
+
+#[test]
+fn device_code_login_rejects_mismatched_or_malformed_server_pkce_without_token_exchange() {
+    for (challenge, verifier) in [
+        ("mismatched-challenge".to_owned(), "verifier".to_owned()),
+        ("not+base64url".to_owned(), "verifier".to_owned()),
+        ("challenge".to_owned(), "bad=padding".to_owned()),
+    ] {
+        let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
+        let user_endpoint = format!(
+            "http://{}/usercode",
+            user_listener.local_addr().expect("address")
+        );
+        let poll_listener = TcpListener::bind("127.0.0.1:0").expect("poll listener should bind");
+        let poll_endpoint = format!(
+            "http://{}/token",
+            poll_listener.local_addr().expect("address")
+        );
+        let oauth_listener = TcpListener::bind("127.0.0.1:0").expect("OAuth listener should bind");
+        let oauth_endpoint = format!(
+            "http://{}/token",
+            oauth_listener.local_addr().expect("address")
+        );
+
+        let user_server = thread::spawn(move || {
+            let (mut stream, _) = user_listener.accept().expect("user request should arrive");
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                200,
+                r#"{"device_auth_id":"private-device-id","user_code":"code","interval":"0.001"}"#,
+            );
+        });
+        let response_challenge = challenge.clone();
+        let response_verifier = verifier.clone();
+        let poll_server = thread::spawn(move || {
+            let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
+            let _ = read_http_request(&mut stream);
+            write_http_response(
+                &mut stream,
+                200,
+                &format!(
+                    r#"{{"authorization_code":"secret-code","code_challenge":"{response_challenge}","code_verifier":"{response_verifier}"}}"#
+                ),
+            );
+        });
+
+        let rendered = device_code_login(
+            ChatGptDeviceCodeLoginOptions::for_test(
+                &user_endpoint,
+                &poll_endpoint,
+                &oauth_endpoint,
+            ),
+            LoginCancellation::new(),
+        )
+        .expect_err("invalid server PKCE must fail before exchanging tokens")
+        .to_string();
+
+        assert!(rendered.starts_with("ChatGPT authentication required:"));
+        assert!(!rendered.contains("secret-code"));
+        assert!(!rendered.contains(&challenge));
+        assert!(!rendered.contains(&verifier));
+        oauth_listener
+            .set_nonblocking(true)
+            .expect("OAuth listener should become nonblocking");
+        thread::sleep(Duration::from_millis(20));
+        assert!(matches!(
+            oauth_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        user_server.join().expect("user server should finish");
+        poll_server.join().expect("poll server should finish");
+    }
+}
+
+#[test]
+fn device_code_login_retries_many_pending_responses_before_success_with_exact_request_count() {
+    let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
+    let user_endpoint = format!(
+        "http://{}/usercode",
+        user_listener.local_addr().expect("address")
+    );
+    let poll_listener = TcpListener::bind("127.0.0.1:0").expect("poll listener should bind");
+    let poll_endpoint = format!(
+        "http://{}/token",
+        poll_listener.local_addr().expect("address")
+    );
+    let oauth_listener = TcpListener::bind("127.0.0.1:0").expect("OAuth listener should bind");
+    let oauth_endpoint = format!(
+        "http://{}/token",
+        oauth_listener.local_addr().expect("address")
+    );
+    let pkce = generate_pkce(&|length| Ok(vec![7; length])).expect("PKCE should generate");
+
+    let user_server = thread::spawn(move || {
+        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
+        let _ = read_http_request(&mut stream);
+        write_http_response(
+            &mut stream,
+            200,
+            r#"{"device_auth_id":"device","user_code":"code","interval":"0.001"}"#,
+        );
+    });
+    let poll_server = thread::spawn(move || {
+        for status in [403, 404, 403, 404, 403, 404, 200] {
+            let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
+            let request = read_http_request(&mut stream);
+            assert!(request.ends_with(r#"{"device_auth_id":"device","user_code":"code"}"#));
+            let body = if status == 200 {
+                format!(
+                    r#"{{"authorization_code":"code","code_challenge":"{}","code_verifier":"{}"}}"#,
+                    pkce.challenge, pkce.verifier
+                )
+            } else {
+                "{}".to_owned()
+            };
+            write_http_response(&mut stream, status, &body);
+        }
+    });
+    let oauth_server = thread::spawn(move || {
+        let (mut stream, _) = oauth_listener
+            .accept()
+            .expect("OAuth request should arrive");
+        let _ = read_http_request(&mut stream);
+        let id_token = jwt(json!({"https://api.openai.com/auth.chatgpt_account_id":"account"}));
+        let access_token = jwt(json!({"exp":1893456000}));
+        write_http_response(
+            &mut stream,
+            200,
+            &format!(
+                r#"{{"id_token":"{id_token}","access_token":"{access_token}","refresh_token":"refresh"}}"#
+            ),
+        );
+    });
+
+    let result = device_code_login(
+        ChatGptDeviceCodeLoginOptions::for_test(&user_endpoint, &poll_endpoint, &oauth_endpoint),
+        LoginCancellation::new(),
+    )
+    .expect("seventh poll should succeed");
+
+    assert_eq!(result.credentials.account_id, "account");
+    user_server.join().expect("user server should finish");
+    poll_server.join().expect("poll server should finish");
+    oauth_server.join().expect("OAuth server should finish");
+}
+
+#[test]
+fn device_code_login_cancels_while_a_poll_request_is_blocked() {
+    let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
+    let user_endpoint = format!(
+        "http://{}/usercode",
+        user_listener.local_addr().expect("address")
+    );
+    let poll_listener = TcpListener::bind("127.0.0.1:0").expect("poll listener should bind");
+    let poll_endpoint = format!(
+        "http://{}/token",
+        poll_listener.local_addr().expect("address")
+    );
+    let user_server = thread::spawn(move || {
+        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
+        let _ = read_http_request(&mut stream);
+        write_http_response(
+            &mut stream,
+            200,
+            r#"{"device_auth_id":"device","user_code":"code","interval":"1"}"#,
+        );
+    });
+    let poll_server = thread::spawn(move || {
+        let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
+        let _ = read_http_request(&mut stream);
+        thread::sleep(Duration::from_millis(150));
+        write_http_response(&mut stream, 403, "{}");
+    });
+    let cancellation = LoginCancellation::new();
+    let canceller = cancellation.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(15));
+        canceller.cancel();
+    });
+
+    let started = Instant::now();
+    assert_eq!(
+        device_code_login(
+            ChatGptDeviceCodeLoginOptions::for_test(
+                &user_endpoint,
+                &poll_endpoint,
+                "http://127.0.0.1:1/token"
+            ),
+            cancellation,
+        ),
+        Err(LoginError::Cancelled)
+    );
+    assert!(started.elapsed() < Duration::from_millis(150));
+    user_server.join().expect("user server should finish");
+    poll_server.join().expect("poll server should finish");
+}
+
+#[test]
+fn device_code_login_uses_one_absolute_deadline_across_user_code_polls_and_exchange() {
+    let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
+    let user_endpoint = format!(
+        "http://{}/usercode",
+        user_listener.local_addr().expect("address")
+    );
+    let poll_listener = TcpListener::bind("127.0.0.1:0").expect("poll listener should bind");
+    let poll_endpoint = format!(
+        "http://{}/token",
+        poll_listener.local_addr().expect("address")
+    );
+    let oauth_listener = TcpListener::bind("127.0.0.1:0").expect("OAuth listener should bind");
+    let oauth_endpoint = format!(
+        "http://{}/token",
+        oauth_listener.local_addr().expect("address")
+    );
+    let pkce = generate_pkce(&|length| Ok(vec![3; length])).expect("PKCE should generate");
+
+    let user_server = thread::spawn(move || {
+        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
+        let _ = read_http_request(&mut stream);
+        thread::sleep(Duration::from_millis(4));
+        write_http_response(
+            &mut stream,
+            200,
+            r#"{"device_auth_id":"device","user_code":"code","interval":"0.001"}"#,
+        );
+    });
+    let poll_server = thread::spawn(move || {
+        let (mut pending, _) = poll_listener.accept().expect("pending poll should arrive");
+        let _ = read_http_request(&mut pending);
+        thread::sleep(Duration::from_millis(4));
+        write_http_response(&mut pending, 403, "{}");
+        let (mut ready, _) = poll_listener.accept().expect("ready poll should arrive");
+        let _ = read_http_request(&mut ready);
+        thread::sleep(Duration::from_millis(4));
+        write_http_response(
+            &mut ready,
+            200,
+            &format!(
+                r#"{{"authorization_code":"code","code_challenge":"{}","code_verifier":"{}"}}"#,
+                pkce.challenge, pkce.verifier
+            ),
+        );
+    });
+    let oauth_server = thread::spawn(move || {
+        let (mut stream, _) = oauth_listener.accept().expect("exchange should arrive");
+        let _ = read_http_request(&mut stream);
+        thread::sleep(Duration::from_millis(150));
+        write_http_response(&mut stream, 500, "{}");
+    });
+    let mut options =
+        ChatGptDeviceCodeLoginOptions::for_test(&user_endpoint, &poll_endpoint, &oauth_endpoint);
+    options.timeout = Duration::from_millis(100);
+
+    assert_eq!(
+        device_code_login(options, LoginCancellation::new()),
+        Err(LoginError::TimedOut)
+    );
+    user_server.join().expect("user server should finish");
     poll_server.join().expect("poll server should finish");
     oauth_server.join().expect("OAuth server should finish");
 }
@@ -405,6 +673,7 @@ fn device_code_login_rejects_nonpending_and_malformed_success_and_cancels_token_
         "http://{}/token",
         oauth_listener.local_addr().expect("address")
     );
+    let pkce = generate_pkce(&|length| Ok(vec![9; length])).expect("PKCE should generate");
     let user_server = thread::spawn(move || {
         let (mut stream, _) = user_listener.accept().expect("user request should arrive");
         let _ = read_http_request(&mut stream);
@@ -420,7 +689,10 @@ fn device_code_login_rejects_nonpending_and_malformed_success_and_cancels_token_
         write_http_response(
             &mut stream,
             200,
-            r#"{"authorization_code":"authorization-code","code_challenge":"challenge","code_verifier":"verifier"}"#,
+            &format!(
+                r#"{{"authorization_code":"authorization-code","code_challenge":"{}","code_verifier":"{}"}}"#,
+                pkce.challenge, pkce.verifier
+            ),
         );
     });
     let oauth_server = thread::spawn(move || {
