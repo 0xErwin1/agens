@@ -15,8 +15,8 @@ use agens_core::{
     CompletedTurnSnapshot, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
-    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProvider,
-    run_headless_turn, run_headless_turn_with_max_iterations,
+    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProgressSink,
+    run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
@@ -24,7 +24,7 @@ use agens_providers::chatgpt_login::{
 };
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
-    load_chatgpt_auth_state,
+    ProgressAwareProvider, load_chatgpt_auth_state,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
@@ -33,7 +33,7 @@ use agens_tools::{
     RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
     ToolExecutionContext, ToolOutput,
 };
-use agens_tui::{Engine as TuiEngine, Tui, run_with_default_submit};
+use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -684,7 +684,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
 
     let bootstrap = bootstrap.clone();
     let session = Arc::clone(&session);
-    run_with_default_submit(&mut tui, move |prompt| {
+    run_with_default_progress_submit(&mut tui, move |prompt, progress| {
         let turn_cancellation =
             HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
         let Ok(mut active) = cancellation.lock() else {
@@ -693,8 +693,17 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         *active = Some(turn_cancellation.clone());
         drop(active);
 
-        let result = run_tui_prompt(&bootstrap, &prompt, &turn_cancellation, &session)
-            .map_err(|error| error.to_string());
+        let sink: TurnProgressSink = Arc::new(move |event| {
+            let _ = progress.send(event);
+        });
+        let result = run_tui_prompt(
+            &bootstrap,
+            &prompt,
+            &turn_cancellation,
+            &session,
+            Some(&sink),
+        )
+        .map_err(|error| error.to_string());
 
         if let Ok(mut active) = cancellation.lock() {
             *active = None;
@@ -712,6 +721,7 @@ fn run_tui_prompt(
     prompt: &str,
     cancellation: &HeadlessTurnCancellation,
     session: &Arc<Mutex<TuiSessionContext>>,
+    progress: Option<&TurnProgressSink>,
 ) -> Result<String, CliError> {
     match prompt.trim() {
         "/sessions" => list_tui_sessions(bootstrap),
@@ -747,7 +757,7 @@ fn run_tui_prompt(
                     mode: PermissionMode::Edit,
                     dangerously_allow_all: false,
                 });
-            run_production_headless_chat(request, bootstrap, cancellation)
+            run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
         }
     }
 }
@@ -1028,6 +1038,15 @@ fn run_production_headless_chat(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
+    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None)
+}
+
+fn run_production_headless_chat_with_progress(
+    request: HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+) -> Result<String, CliError> {
     match bootstrap.provider_type() {
         Some("openai-api") => {
             let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
@@ -1037,6 +1056,7 @@ fn run_production_headless_chat(
                 request,
                 bootstrap,
                 cancellation,
+                progress,
                 move |model, prompt, tools| {
                     OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
                         api_key,
@@ -1063,6 +1083,7 @@ fn run_production_headless_chat(
                 request,
                 bootstrap,
                 cancellation,
+                progress,
                 move |model, prompt, tools| {
                     ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
                         &credentials_path,
@@ -1090,10 +1111,11 @@ fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
     build_provider: impl FnOnce(String, String, Vec<OpenAiFunctionTool>) -> Result<P, CliError>,
 ) -> Result<String, CliError>
 where
-    P: TurnProvider,
+    P: ProgressAwareProvider,
 {
     let model = request
         .model
@@ -1120,6 +1142,9 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let mut provider = build_provider(model, request.prompt, provider_tools)?;
+    if let Some(progress) = progress {
+        provider = provider.with_progress_sink(Arc::clone(progress));
+    }
     cancellation_result(cancellation)?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -1134,22 +1159,26 @@ where
     let mut resolver = ProductionPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot = match request.max_iterations.or(bootstrap.max_iterations) {
-        Some(max_iterations) => block_on_headless_turn(run_headless_turn_with_max_iterations(
+        Some(max_iterations) => {
+            block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
+                &mut provider,
+                &mut gate,
+                &mut resolver,
+                &mut dispatcher,
+                &mut store,
+                cancellation,
+                max_iterations,
+                progress,
+            ))
+        }
+        None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
             &mut provider,
             &mut gate,
             &mut resolver,
             &mut dispatcher,
             &mut store,
             cancellation,
-            max_iterations,
-        )),
-        None => block_on_headless_turn(run_headless_turn(
-            &mut provider,
-            &mut gate,
-            &mut resolver,
-            &mut dispatcher,
-            &mut store,
-            cancellation,
+            progress,
         )),
     }?
     .map_err(CliError::runtime)?;

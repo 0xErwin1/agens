@@ -679,9 +679,14 @@ where
                     let progress = sender.clone();
                     let _ = sender.send(TurnEvent::StateChanged(TurnState::Requesting));
                     let result = submit(prompt, progress);
-                    if let Err(error) = result {
-                        let _ = sender.send(TurnEvent::StateChanged(TurnState::Failed));
-                        let _ = sender.send(TurnEvent::ProviderPart(MessagePart::Text(error)));
+                    match result {
+                        Ok(_) => {
+                            let _ = sender.send(TurnEvent::StateChanged(TurnState::Completed));
+                        }
+                        Err(error) => {
+                            let _ = sender.send(TurnEvent::StateChanged(TurnState::Failed));
+                            let _ = sender.send(TurnEvent::ProviderPart(MessagePart::Text(error)));
+                        }
                     }
                 });
             }

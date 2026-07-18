@@ -753,6 +753,30 @@ pub async fn run_headless_turn_with_max_iterations(
     cancellation: &HeadlessTurnCancellation,
     max_iterations: usize,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_max_iterations_and_progress(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        max_iterations,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_headless_turn_with_max_iterations_and_progress(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: usize,
+    progress: Option<&TurnProgressSink>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     run_headless_turn_with_iteration_limit(
         provider,
         permission_gate,
@@ -761,7 +785,7 @@ pub async fn run_headless_turn_with_max_iterations(
         repository,
         cancellation,
         Some(max_iterations),
-        None,
+        progress,
     )
     .await
 }
