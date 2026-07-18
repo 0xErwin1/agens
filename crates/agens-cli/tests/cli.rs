@@ -1766,7 +1766,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
 }
 
 #[test]
-fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
+fn production_binary_persists_model_visible_mcp_arguments_without_transport_secrets() {
     let temporary = TemporaryDirectory::new("production-mcp-secrets");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -1834,22 +1834,29 @@ fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
         .expect("session store should open")
         .load_completed_turn_for_resume(1)
         .expect("completed session should be readable");
+    assert!(
+        format!("{snapshot:?}").contains("SENTINEL_MCP_ARGUMENT"),
+        "model-visible MCP arguments must remain resumable conversation content"
+    );
     assert!(!format!("{snapshot:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
-            "SENTINEL_MCP_ARGUMENT",
             "SENTINEL_MCP_REMOTE_BODY",
             "SENTINEL_MCP_STDERR",
         ],
+    );
+    assert_sqlite_contains_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &["SENTINEL_MCP_ARGUMENT"],
     );
 
     server.join();
 }
 
 #[test]
-fn production_binary_sanitizes_native_tool_arguments_and_error_output_before_persistence() {
+fn production_binary_persists_model_visible_native_arguments_without_error_output() {
     let temporary = TemporaryDirectory::new("production-native-secret-matrix");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -1912,13 +1919,24 @@ fn production_binary_sanitizes_native_tool_arguments_and_error_output_before_per
     ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
+    let snapshot = SessionStore::open(&data_directory)
+        .expect("session store should open")
+        .load_completed_turn_for_resume(1)
+        .expect("completed session should be readable");
+    assert!(
+        format!("{snapshot:?}").contains("SENTINEL_NATIVE_ARGUMENT"),
+        "model-visible native arguments must remain resumable conversation content"
+    );
+    assert!(snapshot.events().iter().all(|event| {
+        !matches!(event, TurnEvent::ToolResult(MessagePart::ToolResult { content, .. }) if content.contains("SENTINEL_NATIVE_OUTPUT"))
+    }));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
-        &[
-            "SENTINEL_OPENAI_API_KEY",
-            "SENTINEL_NATIVE_OUTPUT",
-            "SENTINEL_NATIVE_ARGUMENT",
-        ],
+        &["SENTINEL_OPENAI_API_KEY"],
+    );
+    assert_sqlite_contains_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &["SENTINEL_NATIVE_ARGUMENT"],
     );
 
     server.join();
@@ -1964,6 +1982,7 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
         assert_no_saved_sessions(&project_root, &config_home);
+        assert_sqlite_has_no_rows(&data_directory.join("rust-sessions.db"));
 
         server.join();
     }
@@ -2801,6 +2820,25 @@ fn assert_no_saved_sessions(project_root: &std::path::Path, config_home: &std::p
 }
 
 fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]) {
+    for (location, value) in sqlite_text_values(database) {
+        for sentinel in sentinels {
+            assert!(!value.contains(sentinel), "{location} leaked {sentinel}");
+        }
+    }
+}
+
+fn assert_sqlite_contains_sentinels(database: &std::path::Path, sentinels: &[&str]) {
+    let values = sqlite_text_values(database);
+
+    for sentinel in sentinels {
+        assert!(
+            values.iter().any(|(_, value)| value.contains(sentinel)),
+            "persisted SQLite content omitted {sentinel}"
+        );
+    }
+}
+
+fn sqlite_text_values(database: &std::path::Path) -> Vec<(String, String)> {
     let connection = rusqlite::Connection::open(database).expect("session database should open");
     let mut tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -2810,6 +2848,8 @@ fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]
         .expect("table query should run")
         .collect::<Result<Vec<_>, _>>()
         .expect("table names should be readable");
+
+    let mut sqlite_values = Vec::new();
 
     for table in tables {
         let quoted_table = table.replace('"', "\"\"");
@@ -2842,13 +2882,36 @@ fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]
                 .expect("serialized values should be readable");
 
             for value in values.into_iter().flatten() {
-                for sentinel in sentinels {
-                    assert!(
-                        !value.contains(sentinel),
-                        "{table}.{column} leaked {sentinel}"
-                    );
-                }
+                sqlite_values.push((format!("{table}.{column}"), value));
             }
         }
+    }
+
+    sqlite_values
+}
+
+fn assert_sqlite_has_no_rows(database: &std::path::Path) {
+    assert!(database.exists(), "session database should exist");
+
+    let connection = rusqlite::Connection::open(database).expect("session database should open");
+    let mut tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .expect("tables should be queryable");
+    let tables = tables
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("table query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("table names should be readable");
+
+    for table in tables {
+        let quoted_table = table.replace('"', "\"\"");
+        let row_count = connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM \"{quoted_table}\""),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("table row count should be readable");
+        assert_eq!(row_count, 0, "{table} should have no persisted rows");
     }
 }
