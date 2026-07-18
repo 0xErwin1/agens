@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -21,6 +21,7 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
+const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -49,8 +50,59 @@ pub struct OpenAiResponsesProvider {
     base_url: String,
     model: String,
     prompt: String,
+    tools: Vec<OpenAiFunctionTool>,
     client: reqwest::Client,
-    sent_initial_request: bool,
+    state: ContinuationState,
+    seen_item_ids: BTreeSet<String>,
+    seen_call_ids: BTreeSet<String>,
+}
+
+enum ContinuationState {
+    Initial,
+    AwaitingToolOutputs {
+        previous_response_id: String,
+        pending_calls: Vec<PendingToolCall>,
+        event_cursor: usize,
+    },
+    Completed,
+    Failed,
+}
+
+#[derive(Clone)]
+struct PendingToolCall {
+    item_id: String,
+    call_id: String,
+}
+
+/// A validated function tool definition for the OpenAI Responses API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenAiFunctionTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl OpenAiFunctionTool {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: Value,
+    ) -> Result<Self, Error> {
+        let name = name.into();
+        let description = description.into();
+
+        if name.trim().is_empty() || description.trim().is_empty() || !parameters.is_object() {
+            return Err(Error::Provider(
+                "OpenAI request error: function tools require a name, description, and object parameters".to_owned(),
+            ));
+        }
+
+        Ok(Self {
+            name,
+            description,
+            parameters,
+        })
+    }
 }
 
 impl OpenAiResponsesProvider {
@@ -76,6 +128,24 @@ impl OpenAiResponsesProvider {
         prompt: String,
         request_timeout: Duration,
     ) -> Result<Self, Error> {
+        Self::from_api_key_with_tools_and_timeout(
+            api_key,
+            base_url,
+            model,
+            prompt,
+            Vec::new(),
+            request_timeout,
+        )
+    }
+
+    pub fn from_api_key_with_tools_and_timeout(
+        api_key: String,
+        base_url: Option<&str>,
+        model: String,
+        prompt: String,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
         if api_key.trim().is_empty() || model.trim().is_empty() || prompt.trim().is_empty() {
             return Err(Error::Auth(
                 "OpenAI API authentication is unavailable".into(),
@@ -91,23 +161,22 @@ impl OpenAiResponsesProvider {
                 .to_owned(),
             model,
             prompt,
+            tools,
             client: reqwest::Client::builder()
                 .connect_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("OpenAI HTTP client is unavailable".into()))?,
-            sent_initial_request: false,
+            state: ContinuationState::Initial,
+            seen_item_ids: BTreeSet::new(),
+            seen_call_ids: BTreeSet::new(),
         })
     }
 
-    async fn request_initial_response(
+    async fn request_response(
         &self,
+        payload: Value,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
-        let payload = serde_json::json!({
-            "model": self.model,
-            "input": [{ "role": "user", "content": self.prompt }],
-            "stream": true,
-        });
+    ) -> Result<DecodedResponse, HeadlessTurnPortError> {
         let request = self
             .client
             .post(format!("{}/responses", self.base_url))
@@ -145,19 +214,150 @@ impl TurnProvider for OpenAiResponsesProvider {
         if cancellation.is_expired() {
             return Err(HeadlessTurnPortError::TimedOut);
         }
-        if self.sent_initial_request {
+        let state = std::mem::replace(&mut self.state, ContinuationState::Failed);
+        let payload = match state {
+            ContinuationState::Initial => self.initial_payload(),
+            ContinuationState::AwaitingToolOutputs {
+                previous_response_id,
+                pending_calls,
+                event_cursor,
+            } => match continuation_payload(
+                &self.model,
+                &self.tools,
+                &previous_response_id,
+                &pending_calls,
+                &_events[event_cursor..],
+            ) {
+                Ok(payload) => payload,
+                Err(()) => return Err(HeadlessTurnPortError::Provider),
+            },
+            ContinuationState::Completed | ContinuationState::Failed => {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+        };
+
+        let response = match self.request_response(payload, cancellation).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.state = ContinuationState::Failed;
+                return Err(error);
+            }
+        };
+
+        if response.pending_calls.iter().any(|call| {
+            !self.seen_item_ids.insert(call.item_id.clone())
+                || !self.seen_call_ids.insert(call.call_id.clone())
+        }) {
+            self.state = ContinuationState::Failed;
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        self.sent_initial_request = true;
-        self.request_initial_response(cancellation).await
+        if response.pending_calls.is_empty() {
+            self.state = ContinuationState::Completed;
+        } else {
+            let Some(previous_response_id) = response.response_id else {
+                self.state = ContinuationState::Failed;
+                return Err(HeadlessTurnPortError::Provider);
+            };
+            self.state = ContinuationState::AwaitingToolOutputs {
+                previous_response_id,
+                pending_calls: response.pending_calls,
+                event_cursor: _events.len(),
+            };
+        }
+
+        Ok(response.parts)
     }
+}
+
+impl OpenAiResponsesProvider {
+    fn initial_payload(&self) -> Value {
+        let mut payload = serde_json::json!({
+            "model": self.model,
+            "input": [{ "role": "user", "content": self.prompt }],
+            "stream": true,
+        });
+
+        if !self.tools.is_empty() {
+            payload["tools"] = function_tools_json(&self.tools);
+        }
+
+        payload
+    }
+}
+
+fn continuation_payload(
+    model: &str,
+    tools: &[OpenAiFunctionTool],
+    previous_response_id: &str,
+    pending_calls: &[PendingToolCall],
+    events: &[TurnEvent],
+) -> Result<Value, ()> {
+    let mut outputs = BTreeMap::new();
+
+    for event in events {
+        let TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        }) = event
+        else {
+            continue;
+        };
+
+        if !pending_calls
+            .iter()
+            .any(|call| call.call_id == *tool_call_id)
+            || outputs.contains_key(tool_call_id)
+        {
+            return Err(());
+        }
+
+        let output = if *is_error {
+            "Tool execution failed".to_owned()
+        } else {
+            bounded_tool_output(content)
+        };
+        outputs.insert(tool_call_id, output);
+    }
+
+    if outputs.len() != pending_calls.len() {
+        return Err(());
+    }
+
+    let input = pending_calls
+        .iter()
+        .map(|call| {
+            let output = outputs.remove(&call.call_id).ok_or(())?;
+            Ok(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output,
+            }))
+        })
+        .collect::<Result<Vec<_>, ()>>()?;
+    let mut payload = serde_json::json!({
+        "model": model,
+        "previous_response_id": previous_response_id,
+        "input": input,
+        "stream": true,
+    });
+
+    if !tools.is_empty() {
+        payload["tools"] = function_tools_json(tools);
+    }
+
+    Ok(payload)
+}
+
+fn bounded_tool_output(content: &str) -> String {
+    content.chars().take(MAX_TOOL_OUTPUT_BYTES).collect()
 }
 
 async fn decode_http_response_stream(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
-) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+) -> Result<DecodedResponse, HeadlessTurnPortError> {
     let mut decoder = OpenAiResponseDecoder::default();
     let mut frame = Vec::new();
 
@@ -323,6 +523,14 @@ pub fn persist_chatgpt_refresh(
 }
 
 pub fn encode_openai_response_request(model: &str, message: &Message) -> Result<String, Error> {
+    encode_openai_response_request_with_tools(model, message, &[])
+}
+
+pub fn encode_openai_response_request_with_tools(
+    model: &str,
+    message: &Message,
+    tools: &[OpenAiFunctionTool],
+) -> Result<String, Error> {
     let content = match message.parts.as_slice() {
         [MessagePart::Text(content)] => content,
         _ => {
@@ -341,12 +549,17 @@ pub fn encode_openai_response_request(model: &str, message: &Message) -> Result<
         }
     };
 
-    Ok(serde_json::json!({
+    let mut request = serde_json::json!({
         "model": model,
         "input": [{ "role": role, "content": content }],
         "stream": true,
-    })
-    .to_string())
+    });
+
+    if !tools.is_empty() {
+        request["tools"] = function_tools_json(tools);
+    }
+
+    Ok(request.to_string())
 }
 
 pub fn decode_openai_response_events<I, S>(events: I) -> Result<Vec<MessagePart>, Error>
@@ -360,7 +573,7 @@ where
         decoder.process(event.as_ref())?;
     }
 
-    decoder.finish()
+    decoder.finish().map(|response| response.parts)
 }
 
 pub fn decode_openai_response_stream(
@@ -388,7 +601,7 @@ pub fn decode_openai_response_stream(
                     return Err(Error::Cancelled);
                 }
 
-                return decoder.finish();
+                return decoder.finish().map(|response| response.parts);
             }
         }
     }
@@ -398,7 +611,18 @@ pub fn decode_openai_response_stream(
 struct OpenAiResponseDecoder {
     parts: Vec<MessagePart>,
     function_calls: BTreeMap<String, FunctionCall>,
+    response_id: Option<String>,
+    seen_item_ids: BTreeMap<String, ()>,
+    seen_call_ids: BTreeMap<String, ()>,
+    function_call_order: Vec<String>,
+    completed_calls: BTreeMap<String, PendingToolCall>,
     completed: bool,
+}
+
+struct DecodedResponse {
+    parts: Vec<MessagePart>,
+    response_id: Option<String>,
+    pending_calls: Vec<PendingToolCall>,
 }
 
 struct FunctionCall {
@@ -414,6 +638,7 @@ impl OpenAiResponseDecoder {
         let event_type = required_string(&event, "type")?;
 
         match event_type {
+            "response.created" => self.capture_response_id(&event)?,
             "response.output_text.delta" => {
                 self.parts.push(MessagePart::Text(
                     required_string(&event, "delta")?.to_owned(),
@@ -425,14 +650,17 @@ impl OpenAiResponseDecoder {
             "response.function_call_arguments.done" => self.finish_function_call(&event)?,
             "error" => return Err(upstream_error(&event)),
             "response.failed" => return Err(response_failed_error(&event)),
-            "response.completed" => self.completed = true,
+            "response.completed" => {
+                self.capture_response_id(&event)?;
+                self.completed = true;
+            }
             _ => {}
         }
 
         Ok(())
     }
 
-    fn finish(self) -> Result<Vec<MessagePart>, Error> {
+    fn finish(mut self) -> Result<DecodedResponse, Error> {
         if !self.completed {
             return Err(protocol_error("stream ended before response.completed"));
         }
@@ -443,7 +671,30 @@ impl OpenAiResponseDecoder {
             ));
         }
 
-        Ok(self.parts)
+        if self
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::ToolCall { .. }))
+            && self.response_id.is_none()
+        {
+            return Err(protocol_error("tool calls require a response ID"));
+        }
+
+        let pending_calls = self
+            .function_call_order
+            .iter()
+            .map(|item_id| {
+                self.completed_calls.remove(item_id).ok_or_else(|| {
+                    protocol_error("stream completed with unfinished function calls")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(DecodedResponse {
+            parts: self.parts,
+            response_id: self.response_id,
+            pending_calls,
+        })
     }
 
     fn process_output_item(&mut self, event: &Value) -> Result<(), Error> {
@@ -474,8 +725,15 @@ impl OpenAiResponseDecoder {
         }
 
         let id = required_string(item, "id")?.to_owned();
+        if self.seen_item_ids.insert(id.clone(), ()).is_some() {
+            return Err(protocol_error("duplicate function call item"));
+        }
+        let call_id = required_string(item, "call_id")?.to_owned();
+        if self.seen_call_ids.insert(call_id.clone(), ()).is_some() {
+            return Err(protocol_error("duplicate function call ID"));
+        }
         let call = FunctionCall {
-            call_id: required_string(item, "call_id")?.to_owned(),
+            call_id,
             name: required_string(item, "name")?.to_owned(),
             arguments: required_string(item, "arguments")?.to_owned(),
         };
@@ -483,7 +741,27 @@ impl OpenAiResponseDecoder {
         if self.function_calls.insert(id, call).is_some() {
             return Err(protocol_error("duplicate function call item"));
         }
+        self.function_call_order
+            .push(required_string(item, "id")?.to_owned());
 
+        Ok(())
+    }
+
+    fn capture_response_id(&mut self, event: &Value) -> Result<(), Error> {
+        let Some(response) = event.get("response") else {
+            return Ok(());
+        };
+        let id = required_string(response, "id")?.to_owned();
+
+        if self
+            .response_id
+            .as_ref()
+            .is_some_and(|existing| existing != &id)
+        {
+            return Err(protocol_error("conflicting response IDs"));
+        }
+
+        self.response_id = Some(id);
         Ok(())
     }
 
@@ -505,6 +783,13 @@ impl OpenAiResponseDecoder {
         })?;
 
         call.arguments = required_string(event, "arguments")?.to_owned();
+        self.completed_calls.insert(
+            id.to_owned(),
+            PendingToolCall {
+                item_id: id.to_owned(),
+                call_id: call.call_id.clone(),
+            },
+        );
         self.parts.push(MessagePart::ToolCall {
             id: call.call_id,
             name: call.name,
@@ -513,6 +798,23 @@ impl OpenAiResponseDecoder {
 
         Ok(())
     }
+}
+
+fn function_tools_json(tools: &[OpenAiFunctionTool]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                    "strict": true,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {

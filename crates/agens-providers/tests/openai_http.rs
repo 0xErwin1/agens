@@ -4,8 +4,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError, TurnProvider};
-use agens_providers::OpenAiResponsesProvider;
+use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError, TurnEvent, TurnProvider};
+use agens_providers::{OpenAiFunctionTool, OpenAiResponsesProvider};
+use serde_json::json;
 
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
 const SECRET_HEADER_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_HEADER";
@@ -139,6 +140,304 @@ fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_pr
     }
 }
 
+#[test]
+fn tool_enabled_initial_request_uses_flat_function_tool_json() {
+    let mut server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_initial\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initial\"}}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let observed_body = server.take_observed_body();
+    let tool = OpenAiFunctionTool::new(
+        "lookup_weather",
+        "Looks up current weather.",
+        json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    )
+    .expect("tool should be valid");
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        vec![tool],
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("runtime should build");
+
+    runtime
+        .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+        .expect("initial response should complete");
+
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should capture initial request"),
+        json!({
+            "model": "test-model",
+            "input": [{"role": "user", "content": "test prompt"}],
+            "tools": [{
+                "type": "function",
+                "name": "lookup_weather",
+                "description": "Looks up current weather.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
+                "strict": true,
+            }],
+            "stream": true,
+        })
+    );
+    server.join();
+}
+
+#[test]
+fn sends_ordered_tool_outputs_in_a_second_responses_request() {
+    let mut server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_initial\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_first\",\"call_id\":\"call_first\",\"name\":\"first\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_second\",\"call_id\":\"call_second\",\"name\":\"second\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_second\",\"arguments\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_first\",\"arguments\":\"{}\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initial\"}}\n\n"
+        )
+        .to_owned(),
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_second\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\"}}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let observed_body = server.take_observed_body();
+    let tool = OpenAiFunctionTool::new(
+        "lookup_weather",
+        "Looks up current weather.",
+        json!({"type": "object", "properties": {}, "additionalProperties": false}),
+    )
+    .expect("tool should be valid");
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        vec![tool],
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("runtime should build");
+    let cancellation = HeadlessTurnCancellation::new();
+
+    runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("initial tool-call response should complete");
+    let parts = runtime
+        .block_on(provider.next_parts(
+            &[
+                TurnEvent::ToolResult(agens_core::MessagePart::ToolResult {
+                    tool_call_id: "call_second".to_owned(),
+                    content: "second result".to_owned(),
+                    is_error: false,
+                }),
+                TurnEvent::ToolResult(agens_core::MessagePart::ToolResult {
+                    tool_call_id: "call_first".to_owned(),
+                    content: "first result".to_owned(),
+                    is_error: false,
+                }),
+            ],
+            &cancellation,
+        ))
+        .expect("continuation should complete");
+
+    assert_eq!(
+        parts,
+        vec![agens_core::MessagePart::Text("done".to_owned())]
+    );
+    let _initial_body = observed_body
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should capture initial request");
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should capture continuation request"),
+        json!({
+            "model": "test-model",
+            "previous_response_id": "resp_initial",
+            "input": [
+                {"type": "function_call_output", "call_id": "call_first", "output": "first result"},
+                {"type": "function_call_output", "call_id": "call_second", "output": "second result"},
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "lookup_weather",
+                "description": "Looks up current weather.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
+                "strict": true,
+            }],
+            "stream": true,
+        })
+    );
+    server.join();
+}
+
+#[test]
+fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
+    let mut server = LocalResponsesServer::start_scripted(vec![
+        tool_call_response("resp_first", "fc_first", "call_first"),
+        tool_call_response("resp_second", "fc_second", "call_second"),
+        completed_text_response("resp_third", "complete"),
+    ]);
+    let observed_body = server.take_observed_body();
+    let mut provider = scripted_provider(server.base_url());
+    let runtime = provider_runtime();
+    let cancellation = HeadlessTurnCancellation::new();
+    let first_events = [tool_result(
+        "call_first",
+        "internal failure: secret=hidden",
+        true,
+    )];
+    let second_events = [
+        tool_result("call_first", "internal failure: secret=hidden", true),
+        tool_result("call_second", "second result", false),
+    ];
+
+    runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("first tool-call response should complete");
+    runtime
+        .block_on(provider.next_parts(&first_events, &cancellation))
+        .expect("second tool-call response should complete");
+    assert_eq!(
+        runtime
+            .block_on(provider.next_parts(&second_events, &cancellation))
+            .expect("third response should complete"),
+        vec![agens_core::MessagePart::Text("complete".to_owned())]
+    );
+
+    let _initial = observed_body
+        .recv_timeout(Duration::from_secs(1))
+        .expect("initial body");
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second body"),
+        json!({
+            "model": "test-model",
+            "previous_response_id": "resp_first",
+            "input": [{"type": "function_call_output", "call_id": "call_first", "output": "Tool execution failed"}],
+            "stream": true,
+        })
+    );
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("third body"),
+        json!({
+            "model": "test-model",
+            "previous_response_id": "resp_second",
+            "input": [{"type": "function_call_output", "call_id": "call_second", "output": "second result"}],
+            "stream": true,
+        })
+    );
+    server.join();
+}
+
+#[test]
+fn rejects_missing_duplicate_and_foreign_tool_results_before_a_continuation_request() {
+    for events in [
+        Vec::new(),
+        vec![
+            tool_result("call_first", "first", false),
+            tool_result("call_first", "again", false),
+        ],
+        vec![tool_result("foreign", "foreign", false)],
+    ] {
+        let mut server = LocalResponsesServer::start_scripted(vec![tool_call_response(
+            "resp_first",
+            "fc_first",
+            "call_first",
+        )]);
+        let observed_body = server.take_observed_body();
+        let mut provider = scripted_provider(server.base_url());
+        let runtime = provider_runtime();
+        let cancellation = HeadlessTurnCancellation::new();
+
+        runtime
+            .block_on(provider.next_parts(&[], &cancellation))
+            .expect("initial tool-call response should complete");
+        assert_eq!(
+            runtime.block_on(provider.next_parts(&events, &cancellation)),
+            Err(HeadlessTurnPortError::Provider)
+        );
+        assert!(
+            observed_body
+                .recv_timeout(Duration::from_secs(1))
+                .expect("initial request should be observed")
+                .get("input")
+                .is_some()
+        );
+        assert!(
+            observed_body
+                .recv_timeout(Duration::from_millis(25))
+                .is_err()
+        );
+        server.join();
+    }
+}
+
+fn tool_call_response(response_id: &str, item_id: &str, call_id: &str) -> String {
+    format!(
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
+data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\",\"id\":\"{item_id}\",\"call_id\":\"{call_id}\",\"name\":\"lookup\",\"arguments\":\"\"}}}}\n\n\
+data: {{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"{item_id}\",\"arguments\":\"{{}}\"}}\n\n\
+data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n"
+    )
+}
+
+fn completed_text_response(response_id: &str, text: &str) -> String {
+    format!(
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
+data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
+data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n"
+    )
+}
+
+fn tool_result(call_id: &str, content: &str, is_error: bool) -> TurnEvent {
+    TurnEvent::ToolResult(agens_core::MessagePart::ToolResult {
+        tool_call_id: call_id.to_owned(),
+        content: content.to_owned(),
+        is_error,
+    })
+}
+
+fn scripted_provider(base_url: String) -> OpenAiResponsesProvider {
+    OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&base_url),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+}
+
+fn provider_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("runtime should build")
+}
+
 fn run_provider(
     base_url: String,
     cancellation: HeadlessTurnCancellation,
@@ -179,6 +478,7 @@ enum ServerMode {
 struct LocalResponsesServer {
     address: std::net::SocketAddr,
     observed_request: Option<mpsc::Receiver<()>>,
+    observed_body: Option<mpsc::Receiver<serde_json::Value>>,
     worker: thread::JoinHandle<()>,
 }
 
@@ -297,6 +597,35 @@ impl LocalResponsesServer {
         Self {
             address,
             observed_request: Some(observed_request),
+            observed_body: None,
+            worker,
+        }
+    }
+
+    fn start_scripted(responses: Vec<String>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+        let address = listener
+            .local_addr()
+            .expect("server address should be available");
+        let (body_sender, observed_body) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("server should accept a request");
+                let body = read_request_body(&stream);
+                body_sender
+                    .send(body)
+                    .expect("test should receive the request body");
+                write_sse_headers(&mut stream);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("scripted response should be written");
+            }
+        });
+
+        Self {
+            address,
+            observed_request: None,
+            observed_body: Some(observed_body),
             worker,
         }
     }
@@ -309,6 +638,12 @@ impl LocalResponsesServer {
         self.observed_request
             .take()
             .expect("request observation should only be taken once")
+    }
+
+    fn take_observed_body(&mut self) -> mpsc::Receiver<serde_json::Value> {
+        self.observed_body
+            .take()
+            .expect("request body observation should only be taken once")
     }
 
     fn join(self) {
@@ -353,6 +688,40 @@ fn read_request(stream: &TcpStream) {
             return;
         }
     }
+}
+
+fn read_request_body(stream: &TcpStream) -> serde_json::Value {
+    let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
+        .expect("request line should be readable");
+    assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+    let mut content_length = None;
+    loop {
+        let mut header = String::new();
+        reader
+            .read_line(&mut header)
+            .expect("request header should be readable");
+        if header == "\r\n" {
+            break;
+        }
+        if let Some(value) = header.strip_prefix("content-length: ") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("content length should be numeric"),
+            );
+        }
+    }
+
+    let mut body = vec![0; content_length.expect("request should include a content length")];
+    reader
+        .read_exact(&mut body)
+        .expect("request body should be readable");
+    serde_json::from_slice(&body).expect("request body should be JSON")
 }
 
 fn write_sse_headers(stream: &mut TcpStream) {

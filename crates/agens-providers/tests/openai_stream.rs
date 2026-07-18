@@ -1,5 +1,9 @@
 use agens_core::{Error, Message, MessagePart, Role};
-use agens_providers::{decode_openai_response_events, encode_openai_response_request};
+use agens_providers::{
+    OpenAiFunctionTool, decode_openai_response_events, encode_openai_response_request,
+    encode_openai_response_request_with_tools,
+};
+use serde_json::json;
 
 #[test]
 fn encodes_a_text_user_prompt_as_a_streaming_responses_request() {
@@ -37,8 +41,86 @@ fn rejects_request_parts_that_have_no_wire_mapping_in_this_slice() {
 }
 
 #[test]
+fn encodes_validated_function_tools_as_flat_responses_api_definitions() {
+    let tool = OpenAiFunctionTool::new(
+        "lookup_weather",
+        "Looks up the current weather for a city.",
+        json!({
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+            "additionalProperties": false,
+        }),
+    )
+    .expect("a complete function tool should be valid");
+
+    let request = encode_openai_response_request_with_tools(
+        "gpt-5.6",
+        &Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(
+                "What is the weather in Paris?".to_owned(),
+            )],
+        },
+        &[tool],
+    )
+    .expect("tool-enabled request should encode");
+
+    assert_eq!(
+        request,
+        r#"{"input":[{"content":"What is the weather in Paris?","role":"user"}],"model":"gpt-5.6","stream":true,"tools":[{"description":"Looks up the current weather for a city.","name":"lookup_weather","parameters":{"additionalProperties":false,"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":true,"type":"function"}]}"#
+    );
+}
+
+#[test]
+fn rejects_tool_calls_without_a_response_id_or_with_a_reused_call_id() {
+    let missing_response_id = [
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
+        r#"{"type":"response.function_call_arguments.done","item_id":"fc_123","arguments":"{}"}"#,
+        r#"{"type":"response.completed"}"#,
+    ];
+    let reused_call_id = [
+        r#"{"type":"response.created","response":{"id":"resp_123"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
+        r#"{"type":"response.function_call_arguments.done","item_id":"fc_123","arguments":"{}"}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_456","call_id":"call_123","name":"lookup","arguments":""}}"#,
+    ];
+
+    assert_eq!(
+        decode_openai_response_events(missing_response_id),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: tool calls require a response ID".to_owned()
+        ))
+    );
+    assert_eq!(
+        decode_openai_response_events(reused_call_id),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: duplicate function call ID".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn rejects_a_reused_function_item_id_after_its_first_call_completes() {
+    let events = [
+        r#"{"type":"response.created","response":{"id":"resp_123"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
+        r#"{"type":"response.function_call_arguments.done","item_id":"fc_123","arguments":"{}"}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_456","name":"lookup","arguments":""}}"#,
+    ];
+
+    assert_eq!(
+        decode_openai_response_events(events),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: duplicate function call item".to_owned()
+        ))
+    );
+}
+
+#[test]
 fn decodes_text_reasoning_and_function_call_parts_in_arrival_order() {
     let events = [
+        r#"{"type":"response.created","response":{"id":"resp_123"}}"#,
         r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
         r#"{"type":"response.output_item.done","item":{"type":"reasoning","summary":[{"type":"summary_text","text":"Plan first"}]}}"#,
         r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
