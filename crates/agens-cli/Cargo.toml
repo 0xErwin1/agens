@@ -16,3 +16,4 @@ agens-store = { path = "../agens-store" }
 agens-tools = { path = "../agens-tools" }
 agens-tui = { path = "../agens-tui" }
 toml = "0.8"
+tokio = { version = "1", features = ["net", "rt", "time"] }

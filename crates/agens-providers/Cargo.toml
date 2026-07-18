@@ -9,4 +9,5 @@ agens-config = { path = "../agens-config" }
 agens-core = { path = "../agens-core" }
 serde_json = "1"
 time = { version = "0.3", features = ["parsing"] }
-ureq = { version = "3", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }

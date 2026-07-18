@@ -560,6 +560,7 @@ impl HeadlessToolOutput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadlessTurnPortError {
     Cancelled,
+    TimedOut,
     Provider,
     Permission,
     Tool,
@@ -632,6 +633,7 @@ impl HeadlessTurnCancellation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadlessTurnError {
     Cancelled,
+    TimedOut,
     Provider,
     Permission,
     Tool,
@@ -643,6 +645,7 @@ impl fmt::Display for HeadlessTurnError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Cancelled => "turn cancelled",
+            Self::TimedOut => "turn timed out",
             Self::Provider => "provider operation failed",
             Self::Permission => "permission operation failed",
             Self::Tool => "tool operation failed",
@@ -778,8 +781,13 @@ fn check_cancelled(
         return Ok(());
     }
 
-    coordinator.cancel().map_err(|_| HeadlessTurnError::State)?;
-    Err(HeadlessTurnError::Cancelled)
+    if cancellation.is_cancelled() {
+        coordinator.cancel().map_err(|_| HeadlessTurnError::State)?;
+        return Err(HeadlessTurnError::Cancelled);
+    }
+
+    coordinator.fail().map_err(|_| HeadlessTurnError::State)?;
+    Err(HeadlessTurnError::TimedOut)
 }
 
 fn finish_port_error(
@@ -791,6 +799,13 @@ fn finish_port_error(
         return coordinator
             .cancel()
             .map(|()| HeadlessTurnError::Cancelled)
+            .unwrap_or(HeadlessTurnError::State);
+    }
+
+    if error == HeadlessTurnPortError::TimedOut {
+        return coordinator
+            .fail()
+            .map(|()| HeadlessTurnError::TimedOut)
             .unwrap_or(HeadlessTurnError::State);
     }
 

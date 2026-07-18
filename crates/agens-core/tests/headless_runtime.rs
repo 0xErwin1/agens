@@ -342,3 +342,24 @@ fn cancellation_reaches_an_in_flight_provider_and_suppresses_persistence() {
     );
     assert!(repository.snapshots.is_empty());
 }
+
+#[test]
+fn expired_deadline_is_a_distinct_failure_and_never_persists_a_partial_turn() {
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![MessagePart::Text("late".into())])],
+    };
+    let mut repository = Repository::default();
+    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
+
+    let result = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut PermissionGate::default(),
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &cancellation,
+    ));
+
+    assert_eq!(result, Err(agens_core::HeadlessTurnError::TimedOut));
+    assert!(repository.snapshots.is_empty());
+}

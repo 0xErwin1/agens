@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +18,9 @@ use time::format_description::well_known::Rfc3339;
 
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -46,6 +49,7 @@ pub struct OpenAiResponsesProvider {
     base_url: String,
     model: String,
     prompt: String,
+    client: reqwest::Client,
     sent_initial_request: bool,
 }
 
@@ -55,6 +59,22 @@ impl OpenAiResponsesProvider {
         base_url: Option<&str>,
         model: String,
         prompt: String,
+    ) -> Result<Self, Error> {
+        Self::from_api_key_with_timeout(
+            api_key,
+            base_url,
+            model,
+            prompt,
+            DEFAULT_OPENAI_REQUEST_TIMEOUT,
+        )
+    }
+
+    pub fn from_api_key_with_timeout(
+        api_key: String,
+        base_url: Option<&str>,
+        model: String,
+        prompt: String,
+        request_timeout: Duration,
     ) -> Result<Self, Error> {
         if api_key.trim().is_empty() || model.trim().is_empty() || prompt.trim().is_empty() {
             return Err(Error::Auth(
@@ -71,62 +91,135 @@ impl OpenAiResponsesProvider {
                 .to_owned(),
             model,
             prompt,
+            client: reqwest::Client::builder()
+                .connect_timeout(request_timeout)
+                .build()
+                .map_err(|_| Error::Provider("OpenAI HTTP client is unavailable".into()))?,
             sent_initial_request: false,
         })
     }
 
-    fn request_initial_response(&self) -> Result<Vec<MessagePart>, Error> {
+    async fn request_initial_response(
+        &self,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
         let payload = serde_json::json!({
             "model": self.model,
             "input": [{ "role": "user", "content": self.prompt }],
             "stream": true,
         });
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(120)))
-            .build()
-            .into();
-        let mut response = agent
-            .post(&format!("{}/responses", self.base_url))
-            .header("Authorization", &format!("Bearer {}", self.api_key))
+        let request = self
+            .client
+            .post(format!("{}/responses", self.base_url))
+            .bearer_auth(&self.api_key)
             .header("Accept", "text/event-stream")
-            .send_json(&payload)
-            .map_err(|_| Error::Provider("OpenAI API request failed".into()))?;
-        let reader = BufReader::new(response.body_mut().as_reader());
-        let lines = reader
-            .lines()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| Error::Provider("OpenAI API response could not be read".into()))?;
-        let events = lines
-            .into_iter()
-            .filter_map(|line| line.strip_prefix("data: ").map(ToOwned::to_owned))
-            .collect::<Vec<_>>();
+            .json(&payload)
+            .build()
+            .map_err(|_| HeadlessTurnPortError::Provider)?;
+        let response = tokio::select! {
+            response = self.client.execute(request) => response.map_err(|_| HeadlessTurnPortError::Provider)?,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
 
-        decode_openai_response_events(events)
+        if !response.status().is_success() {
+            return Err(HeadlessTurnPortError::Provider);
+        }
+
+        decode_http_response_stream(response, cancellation).await
     }
 }
 
 impl TurnProvider for OpenAiResponsesProvider {
-    fn next_parts(
+    async fn next_parts(
         &mut self,
         _events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
-    ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
-    {
-        if cancellation.is_cancelled() || cancellation.is_expired() {
-            return std::future::ready(Err(HeadlessTurnPortError::Cancelled));
+    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        if cancellation.is_cancelled() {
+            return Err(HeadlessTurnPortError::Cancelled);
+        }
+        if cancellation.is_expired() {
+            return Err(HeadlessTurnPortError::TimedOut);
         }
         if self.sent_initial_request {
-            return std::future::ready(Err(HeadlessTurnPortError::Provider));
+            return Err(HeadlessTurnPortError::Provider);
         }
 
         self.sent_initial_request = true;
-        let result = self
-            .request_initial_response()
-            .map_err(|error| match error {
-                Error::Cancelled => HeadlessTurnPortError::Cancelled,
-                _ => HeadlessTurnPortError::Provider,
-            });
-        std::future::ready(result)
+        self.request_initial_response(cancellation).await
+    }
+}
+
+async fn decode_http_response_stream(
+    mut response: reqwest::Response,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+    let mut decoder = OpenAiResponseDecoder::default();
+    let mut frame = Vec::new();
+
+    loop {
+        let next_chunk = tokio::select! {
+            chunk = response.chunk() => chunk.map_err(|_| HeadlessTurnPortError::Provider)?,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+        let Some(chunk) = next_chunk else {
+            return decoder
+                .finish()
+                .map_err(|_| HeadlessTurnPortError::Provider);
+        };
+
+        for byte in chunk {
+            if byte == b'\n' {
+                process_sse_frame(&mut decoder, &mut frame)?;
+                continue;
+            }
+
+            if frame.len() == MAX_SSE_FRAME_BYTES {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+            frame.push(byte);
+        }
+
+        if cancellation.is_cancelled() {
+            return Err(HeadlessTurnPortError::Cancelled);
+        }
+        if cancellation.is_expired() {
+            return Err(HeadlessTurnPortError::TimedOut);
+        }
+    }
+}
+
+fn process_sse_frame(
+    decoder: &mut OpenAiResponseDecoder,
+    frame: &mut Vec<u8>,
+) -> Result<(), HeadlessTurnPortError> {
+    if frame.last() == Some(&b'\r') {
+        frame.pop();
+    }
+
+    let data = frame
+        .strip_prefix(b"data:")
+        .map(|value| value.strip_prefix(b" ").unwrap_or(value));
+    if let Some(data) = data.filter(|data| !data.is_empty()) {
+        let event = std::str::from_utf8(data).map_err(|_| HeadlessTurnPortError::Provider)?;
+        decoder
+            .process(event)
+            .map_err(|_| HeadlessTurnPortError::Provider)?;
+    }
+    frame.clear();
+    Ok(())
+}
+
+async fn wait_for_stop(cancellation: &HeadlessTurnCancellation) -> HeadlessTurnPortError {
+    loop {
+        if cancellation.is_cancelled() {
+            return HeadlessTurnPortError::Cancelled;
+        }
+        if cancellation.is_expired() {
+            return HeadlessTurnPortError::TimedOut;
+        }
+
+        tokio::time::sleep(HTTP_CANCELLATION_POLL_INTERVAL).await;
     }
 }
 

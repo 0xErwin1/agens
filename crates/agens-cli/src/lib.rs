@@ -152,6 +152,7 @@ impl CliError {
     fn runtime(error: HeadlessTurnError) -> Self {
         let (category, message) = match error {
             HeadlessTurnError::Cancelled => ("cancelled", "headless turn was cancelled"),
+            HeadlessTurnError::TimedOut => ("timeout", "headless turn timed out"),
             HeadlessTurnError::Provider => ("provider", "provider request failed"),
             HeadlessTurnError::Permission => ("permission", "permission evaluation failed"),
             HeadlessTurnError::Tool => ("tool", "tool execution failed"),
@@ -590,7 +591,7 @@ fn run_openai_api_chat(
     .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let cancellation = HeadlessTurnCancellation::new();
+    let cancellation = HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
     let mut gate = ProductionPermissionGate;
     let mut resolver = ProductionPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher;
@@ -601,7 +602,7 @@ fn run_openai_api_chat(
         &mut dispatcher,
         &mut store,
         &cancellation,
-    ))
+    ))?
     .map_err(CliError::runtime)?;
 
     let text = snapshot
@@ -661,17 +662,14 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
     }
 }
 
-fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> T {
-    let mut future = std::pin::pin!(future);
-    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> Result<T, CliError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| CliError::runtime(HeadlessTurnError::Provider))?;
 
-    loop {
-        if let std::task::Poll::Ready(value) = future.as_mut().poll(context) {
-            return value;
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    Ok(runtime.block_on(future))
 }
 
 fn load_toml(
