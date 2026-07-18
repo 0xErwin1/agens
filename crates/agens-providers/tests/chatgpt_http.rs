@@ -3,10 +3,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Barrier, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, TurnProvider,
@@ -18,6 +18,9 @@ static TEMP_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_CHATGPT_REMOTE_BODY";
 const SECRET_HEADER_SENTINEL: &str = "SENTINEL_CHATGPT_REMOTE_HEADER";
 const REFRESH_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_WORKER";
+const REFRESH_LOCK_WORKER_ENV: &str = "AGENS_CHATGPT_REFRESH_LOCK_WORKER";
+const LOCK_TEST_REPETITIONS: usize = 20;
+const LOCK_TEST_WAIT: Duration = Duration::from_secs(1);
 
 #[test]
 fn subscription_transport_posts_the_codex_request_and_returns_text() {
@@ -634,6 +637,95 @@ fn refresh_subprocess_worker() {
 }
 
 #[test]
+fn refresh_lock_subprocess_worker() {
+    let Some(mode) = std::env::var_os(REFRESH_LOCK_WORKER_ENV) else {
+        return;
+    };
+    let credentials = PathBuf::from(
+        std::env::var_os("AGENS_CHATGPT_REFRESH_PATH")
+            .expect("refresh lock worker requires a credentials path"),
+    );
+    let responses_url = std::env::var("AGENS_CHATGPT_RESPONSES_URL")
+        .expect("refresh lock worker requires a Responses URL");
+    let oauth_url = std::env::var("AGENS_CHATGPT_OAUTH_URL")
+        .expect("refresh lock worker requires an OAuth URL");
+    let cancellation = HeadlessTurnCancellation::new();
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&responses_url),
+        Some(&oauth_url),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(2),
+    )
+    .expect("refresh lock worker provider should be configured");
+
+    match mode.to_string_lossy().as_ref() {
+        "holder" => {
+            let release = PathBuf::from(
+                std::env::var_os("AGENS_CHATGPT_HOLDER_RELEASE")
+                    .expect("holder requires a release marker"),
+            );
+            let canceller = cancellation.clone();
+            let watcher = thread::spawn(move || {
+                wait_for_file(&release, "holder release marker should arrive");
+                canceller.cancel();
+            });
+
+            assert_eq!(
+                run(&mut provider, cancellation),
+                Err(HeadlessTurnPortError::Cancelled)
+            );
+            watcher
+                .join()
+                .expect("holder release watcher should finish");
+        }
+        "crash-holder" => {
+            let _ = run(&mut provider, cancellation);
+            panic!("crash holder should be terminated by the parent test");
+        }
+        "cancelled-caller" => {
+            let started = PathBuf::from(
+                std::env::var_os("AGENS_CHATGPT_CALLER_STARTED")
+                    .expect("cancelled caller requires a start marker"),
+            );
+            let cancel = PathBuf::from(
+                std::env::var_os("AGENS_CHATGPT_CALLER_CANCEL")
+                    .expect("cancelled caller requires a cancellation marker"),
+            );
+            let cancelled = PathBuf::from(
+                std::env::var_os("AGENS_CHATGPT_CALLER_CANCELLED")
+                    .expect("cancelled caller requires a result marker"),
+            );
+            fs::write(&started, b"started").expect("caller start marker should be written");
+            let canceller = cancellation.clone();
+            let watcher = thread::spawn(move || {
+                wait_for_file(&cancel, "caller cancellation marker should arrive");
+                canceller.cancel();
+            });
+
+            assert_eq!(
+                run(&mut provider, cancellation),
+                Err(HeadlessTurnPortError::Cancelled)
+            );
+            watcher
+                .join()
+                .expect("caller cancellation watcher should finish");
+            fs::write(cancelled, b"cancelled")
+                .expect("caller cancellation marker should be written");
+        }
+        "recovery" => {
+            assert_eq!(
+                run(&mut provider, cancellation),
+                Ok(vec![MessagePart::Text("recovered".to_owned())])
+            );
+        }
+        _ => panic!("unknown refresh lock worker mode"),
+    }
+}
+
+#[test]
 fn subscription_transport_returns_cancelled_while_waiting_for_refresh() {
     let directory = temporary_directory("refresh-cancel");
     let credentials = directory.join("auth.json");
@@ -767,6 +859,139 @@ fn subscription_transport_times_out_while_waiting_for_an_existing_refresh_lock()
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
+#[cfg(unix)]
+#[test]
+fn subscription_refresh_lock_wait_cancellation_preserves_holder_and_credentials() {
+    for iteration in 0..LOCK_TEST_REPETITIONS {
+        let directory = temporary_directory(&format!("refresh-lock-cancel-{iteration}"));
+        let credentials = write_expired_credentials(&directory);
+        let holder_release = directory.join("holder-release");
+        let caller_started = directory.join("caller-started");
+        let caller_cancelled = directory.join("caller-cancelled");
+        let oauth = ControlledOAuthServer::start();
+
+        let mut holder = spawn_refresh_lock_worker(
+            "holder",
+            &credentials,
+            "http://127.0.0.1:1/backend-api/codex",
+            &oauth.url(),
+            &[("AGENS_CHATGPT_HOLDER_RELEASE", &holder_release)],
+        );
+        let first_request = oauth
+            .requests()
+            .recv_timeout(LOCK_TEST_WAIT)
+            .expect("holder should signal that it acquired the refresh lock");
+        assert_eq!(first_request.path, "/oauth/token");
+        let credentials_before =
+            fs::read(&credentials).expect("credentials should remain readable");
+
+        let mut caller = spawn_refresh_lock_worker(
+            "cancelled-caller",
+            &credentials,
+            "http://127.0.0.1:1/backend-api/codex",
+            &oauth.url(),
+            &[
+                ("AGENS_CHATGPT_CALLER_STARTED", &caller_started),
+                (
+                    "AGENS_CHATGPT_CALLER_CANCEL",
+                    &directory.join("caller-cancel"),
+                ),
+                ("AGENS_CHATGPT_CALLER_CANCELLED", &caller_cancelled),
+            ],
+        );
+        wait_for_file(
+            &caller_started,
+            "caller should start after the holder signal",
+        );
+        thread::sleep(Duration::from_millis(25));
+        fs::write(directory.join("caller-cancel"), b"cancel")
+            .expect("caller cancellation marker should be written");
+
+        wait_for_success(&mut caller, "cancelled lock waiter should exit promptly");
+        assert!(caller_cancelled.exists());
+        assert_eq!(
+            fs::read(&credentials).expect("credentials should remain readable"),
+            credentials_before
+        );
+        assert_eq!(oauth.request_count(), 1);
+        assert!(
+            holder
+                .try_wait()
+                .expect("holder status should be readable")
+                .is_none()
+        );
+
+        fs::write(&holder_release, b"release").expect("holder release marker should be written");
+        wait_for_success(
+            &mut holder,
+            "holder should release normally after cancellation test",
+        );
+        oauth.join();
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn subscription_refresh_recovers_after_lock_holder_crash_without_stale_sidecar_deadlock() {
+    for iteration in 0..LOCK_TEST_REPETITIONS {
+        let directory = temporary_directory(&format!("refresh-lock-crash-{iteration}"));
+        let credentials = write_expired_credentials(&directory);
+        let oauth = ControlledOAuthServer::start();
+        let mut responses =
+            LocalServer::start(ServerBehavior::Sse(completed_text_sse("recovered")));
+        let response_request = responses.take_observed_request();
+        let mut holder = spawn_refresh_lock_worker(
+            "crash-holder",
+            &credentials,
+            "http://127.0.0.1:1/backend-api/codex",
+            &oauth.url(),
+            &[],
+        );
+
+        oauth
+            .requests()
+            .recv_timeout(LOCK_TEST_WAIT)
+            .expect("holder should acquire the refresh lock before it crashes");
+        assert!(directory.join(".auth.json.refresh.lock").exists());
+        holder.kill().expect("holder should be force-killed");
+        holder.wait().expect("force-killed holder should be reaped");
+
+        let mut recovery = spawn_refresh_lock_worker(
+            "recovery",
+            &credentials,
+            &responses.base_url(),
+            &oauth.url(),
+            &[],
+        );
+        wait_for_success(
+            &mut recovery,
+            "subsequent process should reacquire the OS lock",
+        );
+        assert_eq!(oauth.request_count(), 2);
+        assert_eq!(
+            response_request
+                .recv_timeout(LOCK_TEST_WAIT)
+                .expect("recovery should issue one Responses request")
+                .header("authorization"),
+            Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+        );
+        let persisted = serde_json::from_slice::<Value>(
+            &fs::read(&credentials).expect("credentials should persist after recovery"),
+        )
+        .expect("recovered credentials should remain JSON");
+        assert_eq!(
+            persisted["openai-chatgpt"]["access_token"],
+            "header.eyJleHAiOjE4OTM0NTYwMDB9.signature"
+        );
+        assert!(directory.join(".auth.json.refresh.lock").exists());
+
+        oauth.join();
+        responses.join();
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
 fn provider(credentials: &Path, base_url: &str) -> ChatGptResponsesProvider {
     ChatGptResponsesProvider::from_credentials_with_timeout(
         credentials,
@@ -800,6 +1025,60 @@ fn write_credentials(directory: &Path) -> PathBuf {
     )
     .expect("credentials should be written");
     credentials
+}
+
+fn write_expired_credentials(directory: &Path) -> PathBuf {
+    let credentials = directory.join("auth.json");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("expired credentials should be written");
+    credentials
+}
+
+fn spawn_refresh_lock_worker(
+    mode: &str,
+    credentials: &Path,
+    responses_url: &str,
+    oauth_url: &str,
+    markers: &[(&str, &Path)],
+) -> std::process::Child {
+    let executable = std::env::current_exe().expect("test executable should be available");
+    let mut command = Command::new(executable);
+    command
+        .args(["--exact", "refresh_lock_subprocess_worker", "--nocapture"])
+        .env(REFRESH_LOCK_WORKER_ENV, mode)
+        .env("AGENS_CHATGPT_REFRESH_PATH", credentials)
+        .env("AGENS_CHATGPT_RESPONSES_URL", responses_url)
+        .env("AGENS_CHATGPT_OAUTH_URL", oauth_url);
+
+    for (name, marker) in markers {
+        command.env(name, marker);
+    }
+
+    command.spawn().expect("refresh lock worker should start")
+}
+
+fn wait_for_file(path: &Path, description: &str) {
+    let deadline = Instant::now() + LOCK_TEST_WAIT;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{description}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_success(child: &mut std::process::Child, description: &str) {
+    let deadline = Instant::now() + LOCK_TEST_WAIT;
+    loop {
+        if let Some(status) = child.try_wait().expect("child status should be readable") {
+            assert!(status.success(), "{description}");
+            return;
+        }
+
+        assert!(Instant::now() < deadline, "{description}");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn temporary_directory(name: &str) -> PathBuf {
@@ -851,6 +1130,14 @@ struct OAuthServer {
     worker: thread::JoinHandle<ObservedRequest>,
 }
 
+struct ControlledOAuthServer {
+    address: std::net::SocketAddr,
+    requests: mpsc::Receiver<ObservedRequest>,
+    request_count: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
 impl OAuthServer {
     fn start(status: u16, body: &'static str) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth server should bind");
@@ -883,6 +1170,83 @@ impl OAuthServer {
 
     fn join(self) -> ObservedRequest {
         self.worker.join().expect("OAuth server should finish")
+    }
+}
+
+impl ControlledOAuthServer {
+    fn start() -> Self {
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).expect("controlled OAuth server should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("controlled OAuth listener should be nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("controlled OAuth address should be available");
+        let (sender, requests) = mpsc::channel();
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_request_count = request_count.clone();
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let sender = sender.clone();
+                        let request_number = worker_request_count.fetch_add(1, Ordering::AcqRel);
+                        thread::spawn(move || {
+                            let mut stream = stream;
+                            let request = read_request(&stream);
+                            sender
+                                .send(request)
+                                .expect("test should receive the OAuth request");
+
+                            if request_number == 0 {
+                                wait_for_client_close(&stream);
+                            } else {
+                                write_json(
+                                    &mut stream,
+                                    200,
+                                    r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#,
+                                );
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                }
+            }
+        });
+
+        Self {
+            address,
+            requests,
+            request_count,
+            stop,
+            worker,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/oauth/token", self.address)
+    }
+
+    fn requests(&self) -> &mpsc::Receiver<ObservedRequest> {
+        &self.requests
+    }
+
+    fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Acquire)
+    }
+
+    fn join(self) {
+        self.stop.store(true, Ordering::Release);
+        self.worker
+            .join()
+            .expect("controlled OAuth server should finish");
     }
 }
 
