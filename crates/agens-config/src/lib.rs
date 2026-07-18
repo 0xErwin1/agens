@@ -207,7 +207,6 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                         || !args.is_empty()
                         || !environment.is_empty()
                         || cwd.is_some()
-                        || max_retries != 0
                     {
                         return Err(invalid_field("mcp", name));
                     }

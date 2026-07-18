@@ -74,6 +74,8 @@ fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
             [mcp.events]
             transport = "sse"
             url = "https://mcp.example.test/sse"
+            headers = { Authorization = "Bearer token" }
+            max_retries = 2
         "#,
     )
     .expect("legacy MCP fixture should parse");
@@ -95,6 +97,15 @@ fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
             ("files", McpTransport::Stdio),
         ]
     );
+    let events = servers
+        .iter()
+        .find(|server| server.name == "events")
+        .expect("SSE server should be present");
+    assert_eq!(
+        events.headers.get("Authorization"),
+        Some(&"Bearer token".into())
+    );
+    assert_eq!(events.max_retries, 2);
 }
 
 #[test]
