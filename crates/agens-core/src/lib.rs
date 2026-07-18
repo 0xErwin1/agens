@@ -613,17 +613,16 @@ pub struct HeadlessTurnCancellationAdapter {
 }
 
 impl HeadlessTurnCancellationAdapter {
-    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancelled)
-    }
-
     pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 
     pub fn remaining_duration(&self) -> Option<Duration> {
-        self.deadline
-            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        self.deadline.map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO)
+        })
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -887,6 +886,10 @@ pub enum PermissionPattern {
     Glob(ValidatedPermissionGlob),
 }
 
+pub const MAX_PERMISSION_GLOB_PATTERN_BYTES: usize = 16 * 1024;
+pub const MAX_PERMISSION_GLOB_SEGMENTS: usize = 256;
+pub const MAX_PERMISSION_TARGET_BYTES: usize = 16 * 1024;
+
 impl PermissionPattern {
     pub fn glob(pattern: impl Into<String>) -> Result<Self, PermissionPatternError> {
         ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
@@ -913,6 +916,21 @@ impl ValidatedPermissionGlob {
             return Err(PermissionPatternError::InvalidGlob { pattern });
         }
 
+        if pattern.len() > MAX_PERMISSION_GLOB_PATTERN_BYTES {
+            return Err(PermissionPatternError::GlobTooLarge {
+                actual: pattern.len(),
+                limit: MAX_PERMISSION_GLOB_PATTERN_BYTES,
+            });
+        }
+
+        let segments = pattern.split('/').count();
+        if segments > MAX_PERMISSION_GLOB_SEGMENTS {
+            return Err(PermissionPatternError::GlobTooLarge {
+                actual: segments,
+                limit: MAX_PERMISSION_GLOB_SEGMENTS,
+            });
+        }
+
         let matcher = GlobBuilder::new(&pattern)
             .literal_separator(true)
             .build()
@@ -925,7 +943,7 @@ impl ValidatedPermissionGlob {
     }
 
     fn matches(&self, value: &str) -> bool {
-        self.matcher.is_match(value)
+        value.len() <= MAX_PERMISSION_TARGET_BYTES && self.matcher.is_match(value)
     }
 }
 
@@ -940,12 +958,14 @@ impl Eq for ValidatedPermissionGlob {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PermissionPatternError {
     InvalidGlob { pattern: String },
+    GlobTooLarge { actual: usize, limit: usize },
 }
 
 impl fmt::Display for PermissionPatternError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidGlob { .. } => formatter.write_str("invalid permission glob"),
+            Self::GlobTooLarge { .. } => formatter.write_str("permission glob exceeds size limit"),
         }
     }
 }

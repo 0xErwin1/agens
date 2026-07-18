@@ -1,30 +1,42 @@
-use std::{sync::atomic::Ordering, time::Duration};
+use std::time::Duration;
 
 use agens_core::{
-    HeadlessTurnCancellation, PermissionDecision, PermissionMode, PermissionPattern,
-    PermissionPatternError, PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope,
-    PermissionSession, ProjectPermissionGrant, ToolAccess,
+    HeadlessTurnCancellation, MAX_PERMISSION_GLOB_SEGMENTS, MAX_PERMISSION_TARGET_BYTES,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPatternError,
+    PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PermissionSession,
+    ProjectPermissionGrant, ToolAccess,
 };
 
 #[test]
-fn cancellation_adapter_view_shares_the_live_flag_and_deadline() {
+fn cancellation_adapter_view_is_cloneable_read_only_and_observes_live_cancellation() {
     let cancellation = HeadlessTurnCancellation::with_deadline(Duration::from_secs(1));
     let adapter = cancellation.adapter_view();
-    let flag = adapter.cancellation_flag();
+    let cloned_adapter = adapter.clone();
     let deadline = adapter.deadline().expect("deadline should be available");
     let remaining = adapter
         .remaining_duration()
         .expect("remaining duration should be available");
 
-    assert!(!flag.load(Ordering::Acquire));
+    assert!(!adapter.is_cancelled());
+    assert!(!cloned_adapter.is_cancelled());
     assert!(deadline > std::time::Instant::now());
     assert!(remaining > Duration::ZERO);
     assert!(remaining <= Duration::from_secs(1));
 
     cancellation.cancel();
 
-    assert!(flag.load(Ordering::Acquire));
     assert!(adapter.is_cancelled());
+    assert!(cloned_adapter.is_cancelled());
+}
+
+#[test]
+fn cancellation_adapter_distinguishes_absent_and_elapsed_deadlines() {
+    let no_deadline = HeadlessTurnCancellation::new().adapter_view();
+    let elapsed_deadline = HeadlessTurnCancellation::with_deadline(Duration::ZERO).adapter_view();
+
+    assert_eq!(no_deadline.deadline(), None);
+    assert_eq!(no_deadline.remaining_duration(), None);
+    assert_eq!(elapsed_deadline.remaining_duration(), Some(Duration::ZERO));
 }
 
 #[test]
@@ -59,6 +71,33 @@ fn malformed_target_globs_are_rejected_by_the_safe_constructor() {
             Err(PermissionPatternError::InvalidGlob { .. })
         ));
     }
+}
+
+#[test]
+fn oversized_glob_patterns_are_rejected_by_bytes_and_segments() {
+    let oversized_bytes = "a".repeat(400_001);
+    let oversized_segments = std::iter::repeat_n("a", MAX_PERMISSION_GLOB_SEGMENTS + 1)
+        .collect::<Vec<_>>()
+        .join("/");
+
+    for pattern in [oversized_bytes, oversized_segments] {
+        let error = PermissionPattern::glob(pattern).expect_err("glob should exceed a limit");
+        let PermissionPatternError::GlobTooLarge { actual, limit } = error else {
+            panic!("glob should return a typed size error");
+        };
+
+        assert!(actual > limit);
+    }
+}
+
+#[test]
+fn oversized_glob_targets_fail_closed_before_matching() {
+    let pattern = PermissionPattern::glob("src/**").expect("glob should be valid");
+    let target_within_limit = format!("src/{}", "a".repeat(MAX_PERMISSION_TARGET_BYTES - 4));
+    let oversized_target = format!("src/{}", "a".repeat(MAX_PERMISSION_TARGET_BYTES));
+
+    assert!(pattern.matches(&target_within_limit));
+    assert!(!pattern.matches(&oversized_target));
 }
 
 #[test]
