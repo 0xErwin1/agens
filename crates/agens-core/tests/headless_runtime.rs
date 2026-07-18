@@ -1,14 +1,51 @@
 use std::future::{Future, ready};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    MessagePart, PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
-    run_headless_turn_with_max_iterations,
+    MessagePart, PermissionDecision, TurnEvent, TurnProgressSink, TurnProvider, TurnState,
+    run_headless_turn, run_headless_turn_with_max_iterations, run_headless_turn_with_progress,
 };
+
+#[test]
+fn progress_sink_receives_state_and_provider_events_before_completion() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let progress: TurnProgressSink = {
+        let observed = Arc::clone(&observed);
+        Arc::new(move |event| observed.lock().unwrap().push(event))
+    };
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![MessagePart::Text("visible early".into())])],
+    };
+    let mut gate = PermissionGate::default();
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher::default();
+    let mut repository = Repository::default();
+
+    block_on_ready(run_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+        Some(&progress),
+    ))
+    .unwrap();
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("visible early".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ]
+    );
+}
 
 #[derive(Default)]
 struct Provider {

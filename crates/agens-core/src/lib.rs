@@ -106,6 +106,9 @@ pub enum TurnEvent {
     ToolResult(MessagePart),
 }
 
+/// Optional observational output for interactive surfaces. It never affects turn results.
+pub type TurnProgressSink = Arc<dyn Fn(TurnEvent) + Send + Sync>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnEventError {
     Transition(TurnTransitionError),
@@ -707,6 +710,27 @@ pub async fn run_headless_turn(
     repository: &mut impl CompletedTurnRepository,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_progress(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub async fn run_headless_turn_with_progress(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    progress: Option<&TurnProgressSink>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     run_headless_turn_with_iteration_limit(
         provider,
         permission_gate,
@@ -715,6 +739,7 @@ pub async fn run_headless_turn(
         repository,
         cancellation,
         None,
+        progress,
     )
     .await
 }
@@ -736,10 +761,12 @@ pub async fn run_headless_turn_with_max_iterations(
         repository,
         cancellation,
         Some(max_iterations),
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_headless_turn_with_iteration_limit(
     provider: &mut impl TurnProvider,
     permission_gate: &mut impl HeadlessPermissionGate,
@@ -748,15 +775,20 @@ async fn run_headless_turn_with_iteration_limit(
     repository: &mut impl CompletedTurnRepository,
     cancellation: &HeadlessTurnCancellation,
     max_iterations: Option<usize>,
+    progress: Option<&TurnProgressSink>,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = TurnCoordinator::new();
     coordinator.begin().map_err(|_| HeadlessTurnError::State)?;
+    let mut progress_cursor = 0;
+    flush_progress(&coordinator, progress, &mut progress_cursor);
     let mut iterations = 0;
 
     loop {
         check_cancelled(&mut coordinator, cancellation)?;
+        flush_progress(&coordinator, progress, &mut progress_cursor);
         if max_iterations.is_some_and(|limit| iterations >= limit) {
             coordinator.fail().map_err(|_| HeadlessTurnError::State)?;
+            flush_progress(&coordinator, progress, &mut progress_cursor);
             return Err(HeadlessTurnError::MaxIterations);
         }
         iterations += 1;
@@ -778,10 +810,12 @@ async fn run_headless_turn_with_iteration_limit(
                 .accept_provider_part(part)
                 .map_err(|_| fail_state(&mut coordinator))?;
         }
+        flush_progress(&coordinator, progress, &mut progress_cursor);
 
         coordinator
             .finish_provider_iteration()
             .map_err(|_| fail_state(&mut coordinator))?;
+        flush_progress(&coordinator, progress, &mut progress_cursor);
 
         if coordinator.state() == TurnState::Completed {
             coordinator
@@ -795,6 +829,7 @@ async fn run_headless_turn_with_iteration_limit(
 
         for call in tool_calls {
             check_cancelled(&mut coordinator, cancellation)?;
+            flush_progress(&coordinator, progress, &mut progress_cursor);
 
             let decision = permission_gate
                 .evaluate(&call, cancellation)
@@ -828,8 +863,24 @@ async fn run_headless_turn_with_iteration_limit(
             coordinator
                 .accept_tool_result(&call.id, output.content, output.is_error)
                 .map_err(|_| fail_state(&mut coordinator))?;
+            flush_progress(&coordinator, progress, &mut progress_cursor);
         }
     }
+}
+
+fn flush_progress(
+    coordinator: &TurnCoordinator,
+    progress: Option<&TurnProgressSink>,
+    cursor: &mut usize,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+
+    for event in &coordinator.events()[*cursor..] {
+        progress(event.clone());
+    }
+    *cursor = coordinator.events().len();
 }
 
 fn headless_tool_call(part: &MessagePart) -> Option<HeadlessToolCall> {

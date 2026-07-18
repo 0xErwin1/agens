@@ -33,7 +33,7 @@ use agens_tools::{
     RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
     ToolExecutionContext, ToolOutput,
 };
-use agens_tui::{Engine as TuiEngine, PlainRenderer, Tui, run_with_submit};
+use agens_tui::{Engine as TuiEngine, Tui, run_with_default_submit};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -684,8 +684,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
 
     let bootstrap = bootstrap.clone();
     let session = Arc::clone(&session);
-    let mut renderer = PlainRenderer;
-    run_with_submit(&mut tui, &mut renderer, move |prompt| {
+    run_with_default_submit(&mut tui, move |prompt| {
         let turn_cancellation =
             HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
         let Ok(mut active) = cancellation.lock() else {

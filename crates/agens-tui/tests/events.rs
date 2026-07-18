@@ -1,4 +1,6 @@
-use agens_tui::{Action, Engine, Event, Key, Tui};
+use agens_core::{MessagePart, TurnEvent, TurnState};
+use agens_tui::{Action, Engine, Event, Key, RatatuiRenderer, Renderer, TranscriptEntry, Tui};
+use ratatui::{Terminal, backend::TestBackend};
 
 #[derive(Default)]
 struct FakeEngine {
@@ -108,4 +110,72 @@ fn provider_failures_are_shown_without_leaving_the_turn_running() {
         ]
     );
     assert!(!tui.view().running);
+}
+
+#[test]
+fn streaming_events_update_stable_entries_and_preserve_tool_order() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("inspect the project");
+
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("First ".into())));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "call-1".into(),
+        name: "native::read".into(),
+        input: "secret path omitted".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "call-1".into(),
+        content: "file contents".into(),
+        is_error: false,
+    }));
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+
+    assert_eq!(
+        tui.transcript(),
+        [
+            TranscriptEntry::User("inspect the project".into()),
+            TranscriptEntry::Assistant("First answer".into()),
+            TranscriptEntry::Tool("native::read started".into()),
+            TranscriptEntry::Tool("native::read completed: file contents".into()),
+        ]
+    );
+    assert!(!tui.view().running);
+}
+
+#[test]
+fn multiline_editing_and_scroll_follow_are_deterministic() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Key(Key::Char('a')));
+    tui.handle(Event::Key(Key::ShiftEnter));
+    tui.handle(Event::Key(Key::Char('b')));
+    tui.handle(Event::Key(Key::Left));
+    tui.handle(Event::Key(Key::Backspace));
+    tui.handle(Event::Key(Key::PageUp));
+
+    assert_eq!(tui.input(), "ab");
+    assert!(!tui.following_bottom());
+    assert_eq!(tui.handle(Event::Key(Key::End)), Action::Render);
+    assert!(tui.following_bottom());
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("ab".into())
+    );
+}
+
+#[test]
+fn ratatui_layout_degrades_without_overlapping_at_standard_narrow_and_short_sizes() {
+    for (width, height) in [(80, 24), (35, 24), (80, 10)] {
+        let backend = TestBackend::new(width, height);
+        let terminal = Terminal::new(backend).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        let tui = Tui::new(FakeEngine::default());
+
+        renderer.render(tui.view()).unwrap();
+        let buffer = renderer.terminal().backend().buffer();
+
+        assert_eq!(buffer.area.width, width);
+        assert_eq!(buffer.area.height, height);
+        assert!(buffer.content.iter().any(|cell| cell.symbol() == "A"));
+    }
 }

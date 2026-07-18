@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, Role, TurnEvent,
-    TurnProvider,
+    TurnProgressSink, TurnProvider,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -70,6 +70,7 @@ pub struct OpenAiResponsesProvider {
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
     continuation_rounds: usize,
+    progress: Option<TurnProgressSink>,
 }
 
 /// ChatGPT subscription Responses transport using existing auth.json credentials.
@@ -90,6 +91,7 @@ pub struct ChatGptResponsesProvider {
     seen_call_ids: BTreeSet<String>,
     seen_replay_item_ids: BTreeSet<String>,
     continuation_rounds: usize,
+    progress: Option<TurnProgressSink>,
 }
 
 enum ChatGptResponseError {
@@ -254,6 +256,7 @@ impl OpenAiResponsesProvider {
             seen_item_ids: BTreeSet::new(),
             seen_call_ids: BTreeSet::new(),
             continuation_rounds: 0,
+            progress: None,
         })
     }
 
@@ -283,7 +286,7 @@ impl OpenAiResponsesProvider {
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        decode_http_response_stream(response, cancellation, false).await
+        decode_http_response_stream(response, cancellation, false, self.progress.as_ref()).await
     }
 }
 
@@ -397,6 +400,7 @@ impl ChatGptResponsesProvider {
             seen_call_ids: BTreeSet::new(),
             seen_replay_item_ids: BTreeSet::new(),
             continuation_rounds: 0,
+            progress: None,
         })
     }
 
@@ -441,7 +445,7 @@ impl ChatGptResponsesProvider {
             _ => {}
         }
 
-        decode_http_response_stream(response, cancellation, true)
+        decode_http_response_stream(response, cancellation, true, self.progress.as_ref())
             .await
             .map_err(ChatGptResponseError::Other)
     }
@@ -695,6 +699,25 @@ impl TurnProvider for ChatGptResponsesProvider {
     }
 }
 
+/// Allows the CLI to observe decoded stream deltas without changing final results.
+pub trait ProgressAwareProvider: TurnProvider {
+    fn with_progress_sink(self, progress: TurnProgressSink) -> Self;
+}
+
+impl ProgressAwareProvider for OpenAiResponsesProvider {
+    fn with_progress_sink(mut self, progress: TurnProgressSink) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+}
+
+impl ProgressAwareProvider for ChatGptResponsesProvider {
+    fn with_progress_sink(mut self, progress: TurnProgressSink) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+}
+
 impl TurnProvider for OpenAiResponsesProvider {
     async fn next_parts(
         &mut self,
@@ -936,6 +959,7 @@ async fn decode_http_response_stream(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
     require_encrypted_reasoning: bool,
+    progress: Option<&TurnProgressSink>,
 ) -> Result<DecodedResponse, HeadlessTurnPortError> {
     let mut decoder = OpenAiResponseDecoder::new(require_encrypted_reasoning);
     let mut frame = Vec::new();
@@ -956,7 +980,7 @@ async fn decode_http_response_stream(
 
         for byte in chunk {
             if byte == b'\n' {
-                let processed = process_sse_frame(&mut decoder, &mut frame);
+                let processed = process_sse_frame(&mut decoder, &mut frame, progress);
                 stop_before_mapping(cancellation)?;
                 processed.map_err(|_| HeadlessTurnPortError::Provider)?;
                 continue;
@@ -973,7 +997,11 @@ async fn decode_http_response_stream(
     }
 }
 
-fn process_sse_frame(decoder: &mut OpenAiResponseDecoder, frame: &mut Vec<u8>) -> Result<(), ()> {
+fn process_sse_frame(
+    decoder: &mut OpenAiResponseDecoder,
+    frame: &mut Vec<u8>,
+    progress: Option<&TurnProgressSink>,
+) -> Result<(), ()> {
     if frame.last() == Some(&b'\r') {
         frame.pop();
     }
@@ -983,7 +1011,13 @@ fn process_sse_frame(decoder: &mut OpenAiResponseDecoder, frame: &mut Vec<u8>) -
         .map(|value| value.strip_prefix(b" ").unwrap_or(value));
     if let Some(data) = data.filter(|data| !data.is_empty()) {
         let event = std::str::from_utf8(data).map_err(|_| ())?;
+        let start = decoder.parts.len();
         decoder.process(event).map_err(|_| ())?;
+        if let Some(progress) = progress {
+            for part in &decoder.parts[start..] {
+                progress(agens_core::TurnEvent::ProviderPart(part.clone()));
+            }
+        }
     }
     frame.clear();
     Ok(())
