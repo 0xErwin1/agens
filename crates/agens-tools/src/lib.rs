@@ -8,7 +8,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
@@ -1534,6 +1534,10 @@ impl McpRegistry {
         self.tools.get(qualified_name)
     }
 
+    pub fn tools(&self) -> Vec<&RemoteToolMetadata> {
+        self.tools.values().collect()
+    }
+
     pub fn load_server<T: McpTransport + 'static>(
         &mut self,
         server_name: &str,
@@ -1551,26 +1555,35 @@ impl McpRegistry {
             limits,
             cancellation,
         ) {
-            Ok((metadata, client))
-                if !metadata
-                    .iter()
-                    .any(|tool| self.tools.contains_key(&tool.qualified_name))
-                    && !has_duplicate_qualified_name(&metadata) =>
-            {
+            Ok((metadata, mut client)) => {
+                let conflicts = metadata.iter().any(|tool| {
+                    self.tools
+                        .get(&tool.qualified_name)
+                        .is_some_and(|existing| existing.server_name != server_name)
+                });
+                if conflicts || has_duplicate_qualified_name(&metadata) {
+                    client.close();
+                    return McpServerReport::Failed {
+                        server_name: server_name.into(),
+                        message: "mcp server load failed".into(),
+                    };
+                }
+
                 let tool_count = metadata.len();
+                self.tools.retain(|_, tool| tool.server_name != server_name);
                 for tool in metadata {
                     self.tools.insert(tool.qualified_name.clone(), tool);
                 }
-                self.clients.insert(server_name.into(), Box::new(client));
+                if let Some(mut previous) =
+                    self.clients.insert(server_name.into(), Box::new(client))
+                {
+                    previous.close();
+                }
                 McpServerReport::loaded(server_name, tool_count)
             }
-            Ok(_) => McpServerReport::Failed {
-                server_name: server_name.into(),
-                message: "mcp protocol error: duplicate qualified MCP tool name".into(),
-            },
             Err(error) => McpServerReport::Failed {
                 server_name: server_name.into(),
-                message: error.to_string(),
+                message: sanitized_mcp_load_error(&error).into(),
             },
         }
     }
@@ -1623,6 +1636,8 @@ trait McpCallable: Send {
         arguments: Value,
         context: &ToolExecutionContext,
     ) -> Result<ToolOutput, Error>;
+
+    fn close(&mut self);
 }
 
 impl<T: McpTransport> McpCallable for McpClient<T> {
@@ -1636,6 +1651,14 @@ impl<T: McpTransport> McpCallable for McpClient<T> {
             .map(sanitize_tool_output)
             .or_else(|_| Ok(ToolOutput::failure("tool infrastructure failure")))
     }
+
+    fn close(&mut self) {
+        Self::close(self);
+    }
+}
+
+fn sanitized_mcp_load_error(_: &McpTransportError) -> &'static str {
+    "mcp server load failed"
 }
 
 fn load_server_client<T: McpTransport>(
@@ -1772,10 +1795,7 @@ impl<T: McpTransport> McpClient<T> {
             &context,
         )? {
             McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
-            McpResponse::ProtocolError(error) => Ok(ToolOutput::failure(format!(
-                "mcp protocol error {}: {}",
-                error.code, error.message
-            ))),
+            McpResponse::ProtocolError(_) => Ok(ToolOutput::failure("mcp protocol failure")),
             _ => Err(McpTransportError::Protocol(
                 "expected tools/call result".into(),
             )),
@@ -1801,10 +1821,7 @@ impl<T: McpTransport> McpClient<T> {
             context,
         )? {
             McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
-            McpResponse::ProtocolError(error) => Ok(ToolOutput::failure(format!(
-                "mcp protocol error {}: {}",
-                error.code, error.message
-            ))),
+            McpResponse::ProtocolError(_) => Ok(ToolOutput::failure("mcp protocol failure")),
             _ => Err(McpTransportError::Protocol(
                 "expected tools/call result".into(),
             )),
@@ -1888,15 +1905,13 @@ impl<T: McpTransport> McpClient<T> {
 fn expect_initialized(response: McpResponse) -> Result<McpInitializeResult, McpTransportError> {
     match response {
         McpResponse::Initialized(result) => Ok(result),
-        McpResponse::ProtocolError(error) => Err(protocol_error(error)),
+        McpResponse::ProtocolError(_) => Err(McpTransportError::Protocol(
+            "MCP initialize protocol failure".into(),
+        )),
         _ => Err(McpTransportError::Protocol(
             "expected initialize result".into(),
         )),
     }
-}
-
-fn protocol_error(error: McpProtocolError) -> McpTransportError {
-    McpTransportError::Protocol(format!("{}: {}", error.code, error.message))
 }
 
 fn map_call_result(result: McpCallResult) -> ToolOutput {
@@ -1973,6 +1988,15 @@ pub struct ToolOutput {
 }
 
 pub trait DispatchTool: Send {
+    /// Projects the exact execution arguments into the permission target.
+    fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
+        arguments
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Tool("tool target is required".into()))
+    }
+
     fn execute(
         &mut self,
         context: &ToolExecutionContext,
@@ -1982,14 +2006,20 @@ pub trait DispatchTool: Send {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolDispatchRequest {
-    permission: PermissionRequest,
+    project_id: String,
+    qualified_tool_name: String,
     arguments: Value,
 }
 
 impl ToolDispatchRequest {
-    pub fn new(permission: PermissionRequest, arguments: Value) -> Self {
+    pub fn new(
+        project_id: impl Into<String>,
+        qualified_tool_name: impl Into<String>,
+        arguments: Value,
+    ) -> Self {
         Self {
-            permission,
+            project_id: project_id.into(),
+            qualified_tool_name: qualified_tool_name.into(),
             arguments,
         }
     }
@@ -2049,7 +2079,6 @@ struct RegisteredDispatchTool {
     tool: Box<dyn DispatchTool>,
 }
 
-#[derive(Default)]
 pub struct ToolDispatcher {
     native_tools: BTreeMap<String, RegisteredDispatchTool>,
     mcp_tools: BTreeMap<String, RegisteredDispatchTool>,
@@ -2059,11 +2088,20 @@ pub struct ToolDispatcher {
 
 impl ToolDispatcher {
     pub fn new() -> Self {
-        static NEXT_DISPATCHER_ID: AtomicUsize = AtomicUsize::new(1);
+        static NEXT_DISPATCHER_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        static PROCESS_NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+            use std::hash::{BuildHasher, Hasher};
+
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        });
         Self {
-            dispatcher_id: NEXT_DISPATCHER_ID.fetch_add(1, Ordering::AcqRel) as u64,
+            dispatcher_id: *PROCESS_NONCE ^ NEXT_DISPATCHER_ID.fetch_add(1, Ordering::AcqRel),
             next_version: 1,
-            ..Self::default()
+            native_tools: BTreeMap::new(),
+            mcp_tools: BTreeMap::new(),
         }
     }
 
@@ -2125,11 +2163,15 @@ impl ToolDispatcher {
     ) -> Result<ToolEvaluationOutcome, Error> {
         let registered = self
             .native_tools
-            .get(&request.permission.tool)
-            .or_else(|| self.mcp_tools.get(&request.permission.tool))
-            .ok_or_else(|| Error::Tool(format!("unknown tool: {}", request.permission.tool)))?;
-        let mut permission = request.permission;
-        permission.access = registered.access;
+            .get(&request.qualified_tool_name)
+            .or_else(|| self.mcp_tools.get(&request.qualified_tool_name))
+            .ok_or_else(|| Error::Tool("unknown tool".into()))?;
+        let permission = PermissionRequest::new(
+            request.project_id,
+            request.qualified_tool_name,
+            registered.tool.permission_target(&request.arguments)?,
+            registered.access,
+        );
         let grants = if permission.project.trim().is_empty() {
             &[]
         } else {
@@ -2242,11 +2284,22 @@ fn sanitized_execution_status(status: ToolExecutionStatus) -> ToolOutput {
 
 fn sanitize_tool_output(mut output: ToolOutput) -> ToolOutput {
     const MAX_MODEL_VISIBLE_OUTPUT: usize = 16 * 1024;
+    const TRUNCATION_NOTICE: &str = "\n[output truncated]";
     if output.content.len() > MAX_MODEL_VISIBLE_OUTPUT {
-        output.content.truncate(MAX_MODEL_VISIBLE_OUTPUT);
-        output.content.push_str("\n[output truncated]");
+        let mut boundary = MAX_MODEL_VISIBLE_OUTPUT.saturating_sub(TRUNCATION_NOTICE.len());
+        while !output.content.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.content.truncate(boundary);
+        output.content.push_str(TRUNCATION_NOTICE);
     }
     output
+}
+
+impl Default for ToolDispatcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn remote_tool_access(access: RemoteToolAccess) -> ToolAccess {
@@ -2529,7 +2582,8 @@ impl NativeTools {
             ));
         }
 
-        let output = Arc::new(Mutex::new(CappedOutput::default()));
+        let stdout_output = Arc::new(Mutex::new(CappedOutput::default()));
+        let stderr_output = Arc::new(Mutex::new(CappedOutput::default()));
         let mut command = Command::new("bash");
         command
             .arg("-c")
@@ -2552,8 +2606,8 @@ impl NativeTools {
             .stderr
             .take()
             .ok_or_else(|| Error::Tool("bash: stderr pipe unavailable".into()))?;
-        let stdout_reader = read_capped(stdout, Arc::clone(&output));
-        let stderr_reader = read_capped(stderr, Arc::clone(&output));
+        let stdout_reader = read_capped(stdout, Arc::clone(&stdout_output));
+        let stderr_reader = read_capped(stderr, stderr_output);
         let deadline = Instant::now() + input.timeout;
 
         let status = loop {
@@ -2588,7 +2642,7 @@ impl NativeTools {
             thread::sleep(PROCESS_POLL_INTERVAL);
         };
 
-        let output = output
+        let output = stdout_output
             .lock()
             .map_err(|_| Error::Tool("bash: output collector unavailable".into()))?
             .render();
@@ -2599,6 +2653,13 @@ impl NativeTools {
             } else {
                 output
             }));
+        }
+
+        if output.is_empty() {
+            return Ok(ToolOutput::failure(format!(
+                "bash: exit status: {}",
+                exit_code(status)
+            )));
         }
 
         Ok(ToolOutput::failure(format!(

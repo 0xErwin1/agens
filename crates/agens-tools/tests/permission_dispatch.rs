@@ -5,8 +5,8 @@ use std::sync::{
 use std::time::Duration;
 
 use agens_core::{
-    Error, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
-    PermissionRequest, PermissionRule, PermissionSession, ProjectPermissionGrant, ToolAccess,
+    Error, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+    PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use agens_tools::{
     DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext,
@@ -29,8 +29,9 @@ impl DispatchTool for CountingTool {
 
 fn request(project: &str, tool: &str, target: &str) -> ToolDispatchRequest {
     ToolDispatchRequest::new(
-        PermissionRequest::new(project, tool, target, ToolAccess::Write),
-        json!({"secret": "SECRET_SENTINEL"}),
+        project,
+        tool,
+        json!({"target": target, "secret": "SECRET_SENTINEL"}),
     )
 }
 

@@ -160,6 +160,19 @@ fn bash_uses_the_project_root_and_reports_tool_failures() {
 }
 
 #[test]
+fn bash_does_not_expose_raw_stderr_to_model_output() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    let failure = tools
+        .bash(BashInput::new("printf SECRET_SENTINEL >&2; exit 7"))
+        .unwrap();
+
+    assert_eq!(failure, ToolOutput::failure("bash: exit status: 7"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bash_bounds_timeout_and_captured_output() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();

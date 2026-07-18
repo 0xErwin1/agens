@@ -379,11 +379,72 @@ fn maps_call_errors_and_rejects_non_object_arguments_without_sending() {
     assert!(requests.lock().unwrap().is_empty());
     assert_eq!(
         client.call_tool("write", json!({}), &cancellation),
-        Ok(ToolOutput::failure("mcp protocol error -32001: denied"))
+        Ok(ToolOutput::failure("mcp protocol failure"))
     );
     assert_eq!(
         client.call_tool("write", json!({}), &cancellation),
         Ok(ToolOutput::failure("invalid input"))
+    );
+}
+
+#[test]
+fn registry_enumerates_metadata_and_atomically_replaces_a_reloaded_server() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut registry = McpRegistry::new();
+
+    assert_eq!(
+        registry.load_server(
+            "server",
+            LocalTransport::with_responses([
+                Ok(initialized()),
+                Ok(page(vec![tool("old", Some(true))], None))
+            ]),
+            &initialize(),
+            timeouts(),
+            limits(),
+            Arc::clone(&cancellation),
+        ),
+        McpServerReport::loaded("server", 1)
+    );
+    assert_eq!(registry.tools().len(), 1);
+
+    let failed_reload = registry.load_server(
+        "server",
+        LocalTransport::with_responses([
+            Ok(initialized()),
+            Ok(page(vec![tool("bad", Some(true))], Some("loop"))),
+            Ok(page(vec![], Some("loop"))),
+        ]),
+        &initialize(),
+        timeouts(),
+        limits(),
+        Arc::clone(&cancellation),
+    );
+    assert!(failed_reload.is_failed());
+    assert!(registry.tool("server::old").is_some());
+
+    assert_eq!(
+        registry.load_server(
+            "server",
+            LocalTransport::with_responses([
+                Ok(initialized()),
+                Ok(page(vec![tool("new", Some(true))], None))
+            ]),
+            &initialize(),
+            timeouts(),
+            limits(),
+            cancellation,
+        ),
+        McpServerReport::loaded("server", 1)
+    );
+    assert!(registry.tool("server::old").is_none());
+    assert_eq!(
+        registry
+            .tools()
+            .iter()
+            .map(|tool| tool.qualified_name.as_str())
+            .collect::<Vec<_>>(),
+        ["server::new"]
     );
 }
 
