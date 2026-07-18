@@ -1058,9 +1058,20 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
                         is_error: output.is_error,
                     }
                 })
-                .map_err(|_| HeadlessTurnPortError::Tool)
+                .map_err(headless_tool_error)
         });
         std::future::ready(output)
+    }
+}
+
+fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
+    match error {
+        agens_core::Error::Cancelled => HeadlessTurnPortError::Cancelled,
+        agens_core::Error::Tool(message) if message == "mcp operation timed out" => {
+            HeadlessTurnPortError::TimedOut
+        }
+        agens_core::Error::Tool(_) | agens_core::Error::Extension(_) => HeadlessTurnPortError::Tool,
+        _ => HeadlessTurnPortError::Tool,
     }
 }
 
@@ -1076,7 +1087,7 @@ fn permission_policy(
                 ConfigPermissionDecision::Allow => PermissionDecision::Allow,
                 ConfigPermissionDecision::Deny => PermissionDecision::Deny,
             };
-            let tool = PermissionPattern::Exact(native_tool_name(&rule.tool_pattern)?.to_owned());
+            let tool = PermissionPattern::Exact(configured_tool_name(&rule.tool_pattern)?);
             let target = match &rule.target_pattern {
                 Some(pattern) => PermissionPattern::glob(pattern.clone())
                     .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
@@ -1093,13 +1104,19 @@ fn permission_policy(
     Ok(PermissionPolicy::new(mode, rules))
 }
 
-fn native_tool_name(name: &str) -> Result<&'static str, CliError> {
+fn configured_tool_name(name: &str) -> Result<String, CliError> {
     match name {
-        "read" => Ok("native::read"),
-        "write" | "edit" => Ok("native::write"),
-        "list" => Ok("native::list"),
-        "search" => Ok("native::search"),
-        "bash" => Ok("native::bash"),
+        "read" => Ok("native::read".to_owned()),
+        "write" | "edit" => Ok("native::write".to_owned()),
+        "list" => Ok("native::list".to_owned()),
+        "search" => Ok("native::search".to_owned()),
+        "bash" => Ok("native::bash".to_owned()),
+        name if name.contains('_') => {
+            let (server, tool) = name
+                .split_once('_')
+                .expect("MCP permission name was validated by configuration parsing");
+            Ok(format!("{server}::{tool}"))
+        }
         _ => Err(CliError::configuration(
             "permission configuration is invalid",
         )),

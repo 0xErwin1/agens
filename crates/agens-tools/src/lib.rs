@@ -1676,11 +1676,21 @@ impl<T: McpTransport> McpCallable for McpClient<T> {
     ) -> Result<ToolOutput, Error> {
         self.call_tool_with_context(tool_name, arguments, &context.mcp_context())
             .map(sanitize_tool_output)
-            .or_else(|_| Ok(ToolOutput::failure("tool infrastructure failure")))
+            .map_err(mcp_call_error)
     }
 
     fn close(&mut self) {
         Self::close(self);
+    }
+}
+
+fn mcp_call_error(error: McpTransportError) -> Error {
+    match error {
+        McpTransportError::Cancelled => Error::Cancelled,
+        McpTransportError::TimedOut => Error::Tool("mcp operation timed out".into()),
+        McpTransportError::Protocol(_) | McpTransportError::Transport(_) => {
+            Error::Extension("mcp tool infrastructure failure".into())
+        }
     }
 }
 
@@ -1840,12 +1850,17 @@ impl<T: McpTransport> McpClient<T> {
                 "mcp: tool arguments must be a JSON object",
             ));
         }
+        let context = McpOperationContext {
+            cancellation: Arc::clone(&context.cancellation),
+            headless_cancellation: context.headless_cancellation.clone(),
+            deadline: context.deadline.min(Instant::now() + self.timeouts.call),
+        };
         match self.request(
             McpRequest::CallTool {
                 name: name.into(),
                 arguments,
             },
-            context,
+            &context,
         )? {
             McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
             McpResponse::ProtocolError(_) => Ok(ToolOutput::failure("mcp protocol failure")),
@@ -1926,6 +1941,15 @@ impl<T: McpTransport> McpClient<T> {
         let context =
             McpOperationContext::new(Arc::new(AtomicBool::new(false)), self.timeouts.connect);
         let _ = self.transport.close(&context);
+    }
+}
+
+fn terminal_mcp_error(error: &Error) -> bool {
+    match error {
+        Error::Cancelled => true,
+        Error::Tool(message) => message == "mcp operation timed out",
+        Error::Extension(message) => message == "mcp tool infrastructure failure",
+        _ => false,
     }
 }
 
@@ -2256,6 +2280,7 @@ impl ToolDispatcher {
                 }
                 Ok(sanitize_tool_output(output))
             }
+            Err(error) if terminal_mcp_error(&error) => Err(error),
             Err(_) => Ok(ToolOutput::failure("tool infrastructure failure")),
         }
     }

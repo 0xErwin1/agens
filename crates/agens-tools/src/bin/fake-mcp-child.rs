@@ -51,7 +51,9 @@ fn main() {
         let Some(id) = request.get("id").cloned() else {
             continue;
         };
-        if mode == "crash" {
+        if mode == "crash"
+            || (mode == "call-crash" && request.get("method") == Some(&json!("tools/call")))
+        {
             if let Some(secret) = std::env::var_os("FAKE_MCP_TRANSPORT_SECRET") {
                 let _ = writeln!(io::stderr(), "{secret:?}");
             }
@@ -91,6 +93,11 @@ fn main() {
             let frame =
                 std::env::var("FAKE_MCP_PROTOCOL_SECRET").unwrap_or_else(|_| "not-json".into());
             let _ = writeln!(stdout, "{frame}");
+            let _ = stdout.flush();
+            continue;
+        }
+        if mode == "call-malformed" && request.get("method") == Some(&json!("tools/call")) {
+            let _ = writeln!(stdout, "not-json");
             let _ = stdout.flush();
             continue;
         }

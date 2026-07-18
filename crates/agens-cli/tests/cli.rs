@@ -1749,6 +1749,118 @@ fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
         .load_completed_turn_for_resume(1)
         .expect("completed session should be readable");
     assert!(!format!("{snapshot:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_MCP_REMOTE_BODY",
+            "SENTINEL_MCP_STDERR",
+        ],
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_or_persistence() {
+    for (name, mode, timeout_ms) in [
+        ("timeout", "call-sleep", 20),
+        ("crash", "call-crash", 1_000),
+        ("malformed protocol", "call-malformed", 1_000),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-mcp-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+            required_body_fragments: vec!["files::first".to_owned()],
+            response: native_tool_call_response("call_mcp_infrastructure", "files::first", r#"{}"#),
+        }]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n",
+                server.base_url(),
+                data_directory.display(),
+                env!("CARGO_BIN_EXE_fake-mcp-child"),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "--dangerously-allow-all", "run broken MCP tool"])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_no_saved_sessions(&project_root, &config_home);
+
+        server.join();
+    }
+}
+
+#[test]
+fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
+    let temporary = TemporaryDirectory::new("production-mcp-static-deny");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let call_marker = temporary.path().join("mcp-child-call");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["files::second".to_owned()],
+            response: native_tool_call_response("call_mcp_deny", "files::second", r#"{}"#),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_mcp_deny\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+            ],
+            response: text_response("MCP denial handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"files_second(*)\"]\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            call_marker.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "deny configured MCP write"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "MCP denial handled\n"
+    );
+    assert!(!call_marker.exists(), "denied MCP tool must not execute");
 
     server.join();
 }
@@ -2242,4 +2354,57 @@ fn assert_no_saved_sessions(project_root: &std::path::Path, config_home: &std::p
         String::from_utf8_lossy(&sessions.stdout),
         "No saved sessions.\n"
     );
+}
+
+fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]) {
+    let connection = rusqlite::Connection::open(database).expect("session database should open");
+    let mut tables = connection
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .expect("tables should be queryable");
+    let tables = tables
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("table query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("table names should be readable");
+
+    for table in tables {
+        let quoted_table = table.replace('"', "\"\"");
+        let mut columns = connection
+            .prepare(&format!("PRAGMA table_info(\"{quoted_table}\")"))
+            .expect("table metadata should be queryable");
+        let columns = columns
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .expect("column query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("column metadata should be readable");
+
+        for (column, declared_type) in columns {
+            let declared_type = declared_type.to_ascii_uppercase();
+            if !declared_type.contains("TEXT") && !declared_type.contains("BLOB") {
+                continue;
+            }
+            let quoted_column = column.replace('"', "\"\"");
+            let mut values = connection
+                .prepare(&format!(
+                    "SELECT CAST(\"{quoted_column}\" AS TEXT) FROM \"{quoted_table}\""
+                ))
+                .expect("serialized values should be queryable");
+            let values = values
+                .query_map([], |row| row.get::<_, Option<String>>(0))
+                .expect("serialized value query should run")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("serialized values should be readable");
+
+            for value in values.into_iter().flatten() {
+                for sentinel in sentinels {
+                    assert!(
+                        !value.contains(sentinel),
+                        "{table}.{column} leaked {sentinel}"
+                    );
+                }
+            }
+        }
+    }
 }

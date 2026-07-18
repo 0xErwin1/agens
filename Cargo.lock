@@ -13,6 +13,7 @@ dependencies = [
  "agens-tools",
  "agens-tui",
  "libc",
+ "rusqlite",
  "serde_json",
  "tokio",
  "toml",
