@@ -139,7 +139,12 @@ fn main() {
             }
             Some("tools/call") => {
                 if let Some(path) = std::env::var_os("FAKE_MCP_CALL_READY") {
-                    std::fs::write(path, "called")
+                    let count = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    std::fs::write(path, count.to_string())
                         .expect("fake MCP call readiness should be recorded");
                 }
                 if mode == "call-sleep" {

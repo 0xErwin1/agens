@@ -348,6 +348,28 @@ impl Default for TurnCoordinator {
     }
 }
 
+fn sanitized_persisted_events(events: &[TurnEvent]) -> Vec<TurnEvent> {
+    events
+        .iter()
+        .cloned()
+        .map(|event| match event {
+            TurnEvent::ProviderPart(MessagePart::ToolCall { id, name, .. }) => {
+                TurnEvent::ProviderPart(MessagePart::ToolCall {
+                    id,
+                    name,
+                    input: "{}".to_owned(),
+                })
+            }
+            TurnEvent::ToolCallRequested { id, name, .. } => TurnEvent::ToolCallRequested {
+                id,
+                name,
+                input: "{}".to_owned(),
+            },
+            event => event,
+        })
+        .collect()
+}
+
 impl TurnCoordinator {
     pub const fn new() -> Self {
         Self {
@@ -388,7 +410,7 @@ impl TurnCoordinator {
         }
 
         let snapshot = CompletedTurnSnapshot {
-            events: self.events.clone(),
+            events: sanitized_persisted_events(&self.events),
         };
 
         self.completed_turn_persistence_attempted = true;

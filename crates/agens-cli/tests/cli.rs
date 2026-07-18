@@ -1544,6 +1544,61 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
 }
 
 #[test]
+fn production_binary_sanitizes_config_and_store_error_sources() {
+    let temporary = TemporaryDirectory::new("production-config-store-secret-matrix");
+    let config_home = temporary.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let malformed_value = "SENTINEL_CONFIG_PARSE_VALUE";
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!("[provider\nmodel = {malformed_value:?}\n"),
+    )
+    .expect("malformed config should be written");
+
+    let config_output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "reject malformed config"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("production binary should execute");
+    assert_eq!(config_output.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&config_output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&config_output.stderr),
+        "error: config: global configuration is invalid\n"
+    );
+    assert!(!format!("{config_output:?}").contains(malformed_value));
+
+    let store_config_home = temporary.path().join("store-config");
+    let store_path = temporary.path().join("SENTINEL_STORE_PATH");
+    std::fs::create_dir_all(&store_config_home).expect("store config directory should exist");
+    std::fs::write(&store_path, "not a directory").expect("store error fixture should exist");
+    std::fs::write(
+        store_config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"http://127.0.0.1:1\"\n\n[options]\ndata_dir = \"{}\"\n",
+            store_path.display()
+        ),
+    )
+    .expect("store config should be written");
+
+    let store_output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "reject store path"])
+        .env("AGENS_CONFIG_HOME", &store_config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    assert_eq!(store_output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&store_output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&store_output.stderr),
+        "error: store: permission grants are unavailable\n"
+    );
+    for secret in ["SENTINEL_STORE_PATH", "SENTINEL_OPENAI_API_KEY"] {
+        assert!(!format!("{store_output:?}").contains(secret));
+    }
+}
+
+#[test]
 fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persists() {
     let temporary = TemporaryDirectory::new("production-mcp-composition");
     let project_root = temporary.path().join("project");
@@ -1619,6 +1674,30 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
                 .stdout,
         ),
         "ID\tEVENTS\n1\t10 event(s)\n"
+    );
+    let snapshot = SessionStore::open(&data_directory)
+        .expect("session store should open")
+        .load_completed_turn_for_resume(1)
+        .expect("completed session should be readable");
+    for secret in [
+        "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_MCP_PROTOCOL",
+        "SENTINEL_MCP_STDERR",
+        "SENTINEL_MCP_TRANSPORT",
+    ] {
+        assert!(
+            !format!("{snapshot:?}").contains(secret),
+            "snapshot leaked {secret}"
+        );
+    }
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_MCP_PROTOCOL",
+            "SENTINEL_MCP_STDERR",
+            "SENTINEL_MCP_TRANSPORT",
+        ],
     );
 
     server.join();
@@ -1698,12 +1777,18 @@ fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
     let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
             required_body_fragments: vec!["files::first".to_owned()],
-            response: native_tool_call_response("call_mcp_error", "files::first", r#"{}"#),
+            response: native_tool_call_response(
+                "call_mcp_error",
+                "files::first",
+                r#"{"token":"SENTINEL_MCP_ARGUMENT"}"#,
+            ),
         },
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_mcp_error\"".to_owned(),
                 "\"output\":\"Tool execution failed\"".to_owned(),
+                "!SENTINEL_MCP_ARGUMENT".to_owned(),
+                "!SENTINEL_MCP_REMOTE_BODY".to_owned(),
             ],
             response: text_response("MCP failure handled"),
         },
@@ -1732,13 +1817,14 @@ fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(output.status.success());
+    assert!(output.status.success(), "{diagnostics}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "MCP failure handled\n"
     );
     for secret in [
         "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_MCP_ARGUMENT",
         "SENTINEL_MCP_REMOTE_BODY",
         "SENTINEL_MCP_STDERR",
     ] {
@@ -1753,8 +1839,85 @@ fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
         &data_directory.join("rust-sessions.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_MCP_ARGUMENT",
             "SENTINEL_MCP_REMOTE_BODY",
             "SENTINEL_MCP_STDERR",
+        ],
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_sanitizes_native_tool_arguments_and_error_output_before_persistence() {
+    let temporary = TemporaryDirectory::new("production-native-secret-matrix");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let command = ": SENTINEL_NATIVE_ARGUMENT; printf SENTINEL_NATIVE_OUTPUT >&2; exit 1";
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::bash".to_owned()],
+            response: native_tool_call_response(
+                "call_native_secret",
+                "native::bash",
+                &format!(r#"{{"command":{command:?}}}"#),
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_native_secret\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+                "!SENTINEL_NATIVE_ARGUMENT".to_owned(),
+                "!SENTINEL_NATIVE_OUTPUT".to_owned(),
+            ],
+            response: text_response("native failure handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "run failing native command"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success(), "{diagnostics}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "native failure handled\n"
+    );
+    for secret in [
+        "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_NATIVE_OUTPUT",
+        "SENTINEL_NATIVE_ARGUMENT",
+    ] {
+        assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
+    }
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_NATIVE_OUTPUT",
+            "SENTINEL_NATIVE_ARGUMENT",
         ],
     );
 
@@ -1863,6 +2026,273 @@ fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
     assert!(!call_marker.exists(), "denied MCP tool must not execute");
 
     server.join();
+}
+
+#[test]
+fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_once() {
+    for (name, tool, rule, arguments, flags, expected_exit, expected_output, executes, persists) in [
+        (
+            "read only static allow",
+            "files::first",
+            Some("allow = [\"files_first(*)\"]"),
+            r#"{}"#,
+            vec![],
+            Some(0),
+            "MCP permission handled\n",
+            true,
+            true,
+        ),
+        (
+            "write unresolved ask",
+            "files::second",
+            None,
+            r#"{}"#,
+            vec![],
+            Some(1),
+            "",
+            false,
+            false,
+        ),
+        (
+            "explicit deny",
+            "files::second",
+            Some("deny = [\"files_second(*)\"]"),
+            r#"{}"#,
+            vec![],
+            Some(0),
+            "MCP permission handled\n",
+            false,
+            true,
+        ),
+        (
+            "bypass ordinary write",
+            "files::second",
+            None,
+            r#"{}"#,
+            vec!["--dangerously-allow-all"],
+            Some(0),
+            "MCP permission handled\n",
+            true,
+            true,
+        ),
+        (
+            "bypass explicit deny",
+            "files::second",
+            Some("deny = [\"files_second(*)\"]"),
+            r#"{}"#,
+            vec!["--dangerously-allow-all"],
+            Some(0),
+            "MCP permission handled\n",
+            false,
+            true,
+        ),
+        (
+            "chat mode write restriction",
+            "files::second",
+            None,
+            r#"{}"#,
+            vec!["--mode", "chat", "--dangerously-allow-all"],
+            Some(0),
+            "MCP permission handled\n",
+            false,
+            true,
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-mcp-permission-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        let call_marker = temporary.path().join("mcp-call-count");
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+        let first_response = ScriptedOpenAiResponse {
+            required_body_fragments: vec![tool.to_owned()],
+            response: native_tool_call_response("call_mcp_permission", tool, arguments),
+        };
+        let server = BoundedScriptedOpenAiMockServer::start(if persists {
+            vec![
+                first_response,
+                ScriptedOpenAiResponse {
+                    required_body_fragments: vec![
+                        "\"call_id\":\"call_mcp_permission\"".to_owned(),
+                        if executes {
+                            "tool succeeded".to_owned()
+                        } else {
+                            "\"output\":\"Tool execution failed\"".to_owned()
+                        },
+                    ],
+                    response: text_response("MCP permission handled"),
+                },
+            ]
+        } else {
+            vec![first_response]
+        });
+        let permissions =
+            rule.map_or_else(String::new, |rule| format!("\n[permissions]\n{rule}\n"));
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+                server.base_url(),
+                data_directory.display(),
+                env!("CARGO_BIN_EXE_fake-mcp-child"),
+                call_marker.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+        command.arg("chat");
+        command.args(flags);
+        let output = command
+            .arg("exercise MCP permission policy")
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), expected_exit, "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected_output,
+            "{name}"
+        );
+        if !persists {
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr),
+                "error: permission: permission approval is required\n",
+                "{name}"
+            );
+        }
+        assert_eq!(call_marker.exists(), executes, "{name}");
+        if executes {
+            assert_eq!(
+                std::fs::read_to_string(&call_marker).expect("MCP marker should be readable"),
+                "1",
+                "{name}"
+            );
+        }
+        if persists {
+            assert_eq!(
+                String::from_utf8_lossy(
+                    &Command::new(env!("CARGO_BIN_EXE_agens"))
+                        .args(["sessions", "list"])
+                        .current_dir(&project_root)
+                        .env("AGENS_CONFIG_HOME", &config_home)
+                        .output()
+                        .expect("sessions command should execute")
+                        .stdout,
+                ),
+                "ID\tEVENTS\n1\t10 event(s)\n",
+                "{name}"
+            );
+        } else {
+            assert_no_saved_sessions(&project_root, &config_home);
+        }
+        assert!(
+            PermissionGrantStore::open(&data_directory)
+                .expect("grant store should open")
+                .grants_for_project(&project_root.display().to_string())
+                .expect("project grants should load")
+                .is_empty(),
+            "{name}: temporary bypass must not persist a grant"
+        );
+
+        server.join();
+    }
+}
+
+#[test]
+fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_items() {
+    for (name, responses, expected_calls) in [
+        (
+            "duplicate provider call ID replay",
+            vec![
+                ScriptedOpenAiResponse {
+                    required_body_fragments: vec!["files::first".to_owned()],
+                    response: native_tool_call_response(
+                        "call_mcp_integrity",
+                        "files::first",
+                        r#"{}"#,
+                    ),
+                },
+                ScriptedOpenAiResponse {
+                    required_body_fragments: vec![
+                        "\"call_id\":\"call_mcp_integrity\"".to_owned(),
+                        "tool succeeded".to_owned(),
+                    ],
+                    response: native_tool_call_response(
+                        "call_mcp_integrity",
+                        "files::second",
+                        r#"{}"#,
+                    ),
+                },
+            ],
+            Some("1"),
+        ),
+        (
+            "mismatched item arguments",
+            vec![ScriptedOpenAiResponse {
+                required_body_fragments: vec!["files::first".to_owned()],
+                response: sse_response(&[
+                    r#"{"type":"response.created","response":{"id":"response_mcp_mismatch"}}"#,
+                    r#"{"type":"response.output_item.added","item":{"id":"item_mcp_expected","type":"function_call","call_id":"call_mcp_mismatch","name":"files::first","arguments":""}}"#,
+                    r#"{"type":"response.function_call_arguments.done","item_id":"item_mcp_other","arguments":"{}"}"#,
+                ]),
+            }],
+            None,
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-mcp-integrity-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        let call_marker = temporary.path().join("mcp-call-count");
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        let server = BoundedScriptedOpenAiMockServer::start(responses);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+                server.base_url(),
+                data_directory.display(),
+                env!("CARGO_BIN_EXE_fake-mcp-child"),
+                call_marker.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "--dangerously-allow-all", "reject MCP replay"])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "error: provider: provider request failed\n",
+            "{name}"
+        );
+        assert_eq!(
+            call_marker
+                .exists()
+                .then(|| std::fs::read_to_string(&call_marker)
+                    .expect("MCP marker should be readable"))
+                .as_deref(),
+            expected_calls,
+            "{name}"
+        );
+        assert_no_saved_sessions(&project_root, &config_home);
+
+        server.join();
+    }
 }
 
 struct LocalProvider {
@@ -1998,6 +2428,13 @@ impl ScriptedNativeOpenAiMockServer {
                     .expect("mock server should accept a request");
                 let body = read_openai_request_body(&stream);
                 for fragment in scripted.required_body_fragments {
+                    if let Some(forbidden) = fragment.strip_prefix('!') {
+                        assert!(
+                            !body.contains(forbidden),
+                            "request body leaked {forbidden:?}: {body}"
+                        );
+                        continue;
+                    }
                     assert!(
                         body.contains(&fragment),
                         "request body should contain {fragment:?}: {body}"
@@ -2034,6 +2471,13 @@ impl BoundedScriptedOpenAiMockServer {
                     .expect("mock server should accept a request");
                 let body = read_openai_request_body(&stream);
                 for fragment in scripted.required_body_fragments {
+                    if let Some(forbidden) = fragment.strip_prefix('!') {
+                        assert!(
+                            !body.contains(forbidden),
+                            "request body leaked {forbidden:?}: {body}"
+                        );
+                        continue;
+                    }
                     assert!(
                         body.contains(&fragment),
                         "request body should contain {fragment:?}: {body}"
