@@ -895,6 +895,13 @@ impl PermissionPattern {
         ValidatedPermissionGlob::new(pattern.into()).map(Self::Glob)
     }
 
+    pub fn glob_source(&self) -> Option<&str> {
+        match self {
+            Self::Glob(pattern) => Some(pattern.pattern.as_str()),
+            Self::Any | Self::Exact(_) => None,
+        }
+    }
+
     pub fn matches(&self, value: &str) -> bool {
         match self {
             Self::Any => true,
@@ -1260,3 +1267,20 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::PermissionPattern;
+
+    #[test]
+    fn validated_glob_source_is_available_read_only_for_persistence() {
+        let pattern = PermissionPattern::glob("src/**/*.rs").unwrap();
+
+        assert_eq!(pattern.glob_source(), Some("src/**/*.rs"));
+        assert_eq!(PermissionPattern::Any.glob_source(), None);
+        assert_eq!(
+            PermissionPattern::Exact("native::edit".into()).glob_source(),
+            None
+        );
+    }
+}

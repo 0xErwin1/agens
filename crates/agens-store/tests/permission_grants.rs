@@ -272,6 +272,143 @@ fn corrupt_database_open_failure_includes_operation_and_path() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn persists_glob_patterns_with_explicit_kind_and_value_without_changing_schema_version_one() {
+    let directory = data_directory();
+    let grants = vec![
+        ProjectPermissionGrant::allow(
+            "project-a",
+            PermissionPattern::glob("native::*").unwrap(),
+            PermissionPattern::Exact("src/lib.rs".into()),
+        ),
+        ProjectPermissionGrant::new(
+            "project-a",
+            PermissionDecision::Ask,
+            PermissionPattern::Exact("native::edit".into()),
+            PermissionPattern::glob("src/**/*.rs").unwrap(),
+        ),
+        ProjectPermissionGrant::new(
+            "project-a",
+            PermissionDecision::Deny,
+            PermissionPattern::Any,
+            PermissionPattern::Any,
+        ),
+    ];
+
+    {
+        let mut store = PermissionGrantStore::open(&directory).unwrap();
+        store.append_grants(&grants).unwrap();
+    }
+
+    let database = directory.join("rust-permissions.db");
+    let connection = Connection::open(&database).unwrap();
+    let rows = connection
+        .prepare(
+            "SELECT decision, tool_kind, tool_value, target_kind, target_value
+             FROM permission_grants WHERE project = ?1 ORDER BY id",
+        )
+        .unwrap()
+        .query_map(["project-a"], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "allow".into(),
+                "glob".into(),
+                Some("native::*".into()),
+                "exact".into(),
+                Some("src/lib.rs".into()),
+            ),
+            (
+                "ask".into(),
+                "exact".into(),
+                Some("native::edit".into()),
+                "glob".into(),
+                Some("src/**/*.rs".into()),
+            ),
+            ("deny".into(), "any".into(), None, "any".into(), None),
+        ]
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    assert_eq!(
+        PermissionGrantStore::open(&directory)
+            .unwrap()
+            .grants_for_project("project-a")
+            .unwrap(),
+        grants
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn rejects_malformed_or_unknown_stored_pattern_kinds_with_decode_context() {
+    let corrupt_patterns = [
+        ("missing glob value", "glob", None),
+        ("blank glob", "glob", Some(" ")),
+        ("invalid glob", "glob", Some("[")),
+        ("unknown kind", "unknown", Some("value")),
+    ];
+
+    for (name, tool_kind, tool_value) in corrupt_patterns {
+        let directory = data_directory();
+        let store = PermissionGrantStore::open(&directory).unwrap();
+        let database = store.database_path();
+        drop(store);
+
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO permission_grants
+                 (project, decision, tool_kind, tool_value, target_kind, target_value)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    "project-a",
+                    "allow",
+                    tool_kind,
+                    tool_value,
+                    "any",
+                    None::<String>,
+                ),
+            )
+            .unwrap();
+
+        let error = PermissionGrantStore::open(&directory)
+            .unwrap()
+            .grants_for_project("project-a")
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("decode project grant"), "{name}: {error}");
+        assert!(
+            error.contains(database.to_string_lossy().as_ref()),
+            "{name}: {error}"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn creates_or_repairs_restrictive_unix_permissions_without_widening_safe_modes() {

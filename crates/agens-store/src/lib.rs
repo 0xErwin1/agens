@@ -228,12 +228,29 @@ impl PermissionGrantStore {
                         error,
                     )
                 })?;
-            Ok(ProjectPermissionGrant::new(
-                project,
-                decode_decision(&decision)?,
-                decode_pattern(&tool_kind, tool_value)?,
-                decode_pattern(&target_kind, target_value)?,
-            ))
+            let decision = decode_decision(&decision).map_err(|error| {
+                PermissionGrantStoreError::operation(
+                    "decode project grant",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+            let tool = decode_pattern(&tool_kind, tool_value).map_err(|error| {
+                PermissionGrantStoreError::operation(
+                    "decode project grant",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+            let target = decode_pattern(&target_kind, target_value).map_err(|error| {
+                PermissionGrantStoreError::operation(
+                    "decode project grant",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+            Ok(ProjectPermissionGrant::new(project, decision, tool, target))
         })
         .collect()
     }
@@ -471,6 +488,7 @@ fn encode_pattern(pattern: &PermissionPattern) -> (&'static str, Option<&str>) {
     match pattern {
         PermissionPattern::Any => ("any", None),
         PermissionPattern::Exact(value) => ("exact", Some(value)),
+        PermissionPattern::Glob(_) => ("glob", pattern.glob_source()),
     }
 }
 
@@ -481,6 +499,8 @@ fn decode_pattern(
     match (kind, value) {
         ("any", None) => Ok(PermissionPattern::Any),
         ("exact", Some(value)) if !value.is_empty() => Ok(PermissionPattern::Exact(value)),
+        ("glob", Some(value)) => PermissionPattern::glob(value)
+            .map_err(|_| PermissionGrantStoreError::invalid("invalid stored grant pattern")),
         _ => Err(PermissionGrantStoreError::invalid(
             "invalid stored grant pattern",
         )),
