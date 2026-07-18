@@ -1,10 +1,10 @@
 # Agens
 
-Agens is a Go CLI coding agent with an interactive terminal UI, one-shot chat mode, provider integrations, guarded tool execution, and saved conversations.
+Agens is a Rust CLI coding agent with an interactive terminal UI, one-shot chat mode, provider integrations, guarded tool execution, and saved conversations.
 
 ## What works today
 
-- Interactive Bubble Tea TUI launched by bare `agens`.
+- Interactive Rust TUI launched by bare `agens`.
 - One-shot prompt streaming with `agens chat`.
 - Provider support for:
   - `openai-api`: OpenAI Chat Completions API with an API key.
@@ -37,36 +37,36 @@ Authenticate with one provider:
 
 ```sh
 # ChatGPT/Codex subscription OAuth login
-./agens auth login
+./target/debug/agens auth login
 
 # or OpenAI API-key auth
-./agens auth login api-key openai-api
+./target/debug/agens auth login api-key openai-api
 ```
 
 Run the interactive UI:
 
 ```sh
-./agens
+./target/debug/agens
 ```
 
 Or send a one-shot prompt:
 
 ```sh
-./agens chat "Explain this repository"
+./target/debug/agens chat "Explain this repository"
 ```
 
 ## Commands
 
 ```sh
-./agens --help
-./agens auth login
-./agens auth login api-key openai-api
-./agens auth status
-./agens auth logout <provider>
-./agens config doctor
-./agens models
-./agens chat [prompt]
-./agens --resume [session-id]
+./target/debug/agens --help
+./target/debug/agens auth login
+./target/debug/agens auth login api-key openai-api
+./target/debug/agens auth status
+./target/debug/agens auth logout <provider>
+./target/debug/agens config doctor
+./target/debug/agens models
+./target/debug/agens chat [prompt]
+./target/debug/agens --resume [session-id]
 ```
 
 Common flags on interactive and chat modes:
@@ -146,7 +146,7 @@ parallel_tool_calls = true
 Validate the loaded config with:
 
 ```sh
-./agens config doctor
+./target/debug/agens config doctor
 ```
 
 ## Credentials and sessions
@@ -169,24 +169,21 @@ This project uses devenv through the Nix development shell:
 nix develop --no-pure-eval
 ```
 
-Go remains the official product binary at `./agens`. The build-only Rust workspace produces a non-authoritative binary at `target/{debug,release}/agens`.
+Rust is the only product implementation. `just build` produces the development binary at `target/debug/agens`; release builds use `target/release/agens`.
 
 Canonical commands:
 
 ```sh
-just fmt          # format Go code
-just fmt-check    # check Go formatting
-just lint         # golangci-lint
-just test         # go test ./...
-just build        # build the official Go ./agens binary
-just verify       # default gate; invokes only verify-go
-just verify-go    # sqlc, Go format check, lint, test, and build
-just verify-rust  # Rust budget, format, Clippy, test, build, budget
-just verify-dual  # Go gate followed by Rust gate, fail-fast
-just clean        # remove only the local Go build output
+just fmt          # format the Rust workspace
+just fmt-check    # check Rust formatting
+just lint         # run Clippy with warnings denied
+just test         # run Rust workspace tests
+just build        # build target/debug/agens
+just verify       # Rust budget, format, lint, test, and build gate
+just clean        # remove Rust build output
 ```
 
-Rust `target/` has a 20 GiB limit. Verification reports an overage but never deletes artifacts; cleanup is manual only with `just target-clean`.
+Rust `target/` has a 20 GiB limit. Verification reports an overage but never deletes artifacts; cleanup is manual only with `just clean`.
 
 Before considering a code change complete, run:
 
@@ -199,7 +196,7 @@ nix develop --no-pure-eval -c just verify
 The entrypoint is intentionally thin:
 
 ```text
-cmd/agens -> internal/app -> internal/cli
+crates/agens-cli -> agens-core, agens-config, agens-providers, agens-tools, agens-store, agens-tui
 ```
 
 Core package responsibilities are documented in `ARCHITECTURE.md`. Contributor workflow and style rules live in `CONTRIBUTING.md`, `CODE_STYLE.md`, and `AGENTS.md`.

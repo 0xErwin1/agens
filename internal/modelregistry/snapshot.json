@@ -1,9 +1,0 @@
-[
-  { "id": "gpt-4o", "name": "GPT-4o", "context": 128000, "output": 16384, "input_cost": 2.5, "output_cost": 10 },
-  { "id": "gpt-4o-mini", "name": "GPT-4o mini", "context": 128000, "output": 16384, "input_cost": 0.15, "output_cost": 0.6 },
-  { "id": "gpt-4.1", "name": "GPT-4.1", "context": 1047576, "output": 32768, "input_cost": 2, "output_cost": 8 },
-  { "id": "gpt-4.1-mini", "name": "GPT-4.1 mini", "context": 1047576, "output": 32768, "input_cost": 0.4, "output_cost": 1.6 },
-  { "id": "gpt-4.1-nano", "name": "GPT-4.1 nano", "context": 1047576, "output": 32768, "input_cost": 0.1, "output_cost": 0.4 },
-  { "id": "o3", "name": "o3", "context": 200000, "output": 100000, "input_cost": 2, "output_cost": 8 },
-  { "id": "o4-mini", "name": "o4-mini", "context": 200000, "output": 100000, "input_cost": 1.1, "output_cost": 4.4 }
-]

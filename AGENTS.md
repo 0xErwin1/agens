@@ -1,15 +1,15 @@
 # AGENTS.md — Agens
 
-Guidelines for AI agents and contributors working in this Go codebase.
+Guidelines for AI agents and contributors working in this Rust codebase.
 
 ## Project overview
 
-Agens is a Go CLI coding agent. The codebase starts with a headless, testable core and will later grow into providers, tools, MCP, skills, sub-agents, persistence, and a TUI.
+Agens is a Rust CLI coding agent with providers, tools, MCP, skills, sub-agents, persistence, and a TUI.
 
 Use these root documents as canonical references:
 
 - `ARCHITECTURE.md` — package boundaries and dependency direction.
-- `CODE_STYLE.md` — Go style, linting, testing, and error-handling conventions.
+- `CODE_STYLE.md` — Rust style, linting, testing, and error-handling conventions.
 - `CONTRIBUTING.md` — local setup and verification workflow.
 
 ## Environment
@@ -26,7 +26,7 @@ If you enter the shell interactively, use:
 nix develop --no-pure-eval
 ```
 
-Go remains official at `./agens`; the build-only Rust binary stays at `target/{debug,release}/agens`.
+Rust is the only implementation. Binaries are written to `target/{debug,release}/agens`.
 
 ## Canonical commands
 
@@ -37,24 +37,19 @@ Go remains official at `./agens`; the build-only Rust binary stays at `target/{d
 | Lint | `just lint` |
 | Test | `just test` |
 | Build | `just build` |
-| Config diagnostics | `just build && ./agens config doctor` |
-| Default/Go gate | `just verify` / `just verify-go` |
-| Rust gate | `just verify-rust` |
-| Go then Rust | `just verify-dual` |
-| Clean Go output | `just clean` |
-| Clean Rust output manually | `just target-clean` |
+| Config diagnostics | `just build && ./target/debug/agens config doctor` |
+| Verification | `just verify` |
+| Clean build output manually | `just clean` |
 
-The Rust `target/` budget is 20 GiB. Gates never clean it automatically; cleanup is manual only with `just target-clean`.
+The Rust `target/` budget is 20 GiB. Gates never clean it automatically; cleanup is manual only with `just clean`.
 
 ## Working principles
 
 - Prefer small, boring, explicit code.
 - Do not invent APIs or behavior; read existing code and docs first.
-- Keep `cmd/agens` thin. It only adapts process exit behavior to `internal/app`.
-- Keep Cobra details in `internal/cli`; future domain logic must not depend on Cobra types.
-- Do not add `pkg/` until Agens has a real external Go API.
-- Do not add providers, Codex integration, TUI, packaging, or release automation as part of foundation tasks unless their SDD scope explicitly includes them.
-- Keep hand-authored TOML config separate from future SQLite-backed runtime state.
+- Keep `crates/agens-cli` as the composition root; domain crates must not depend on it.
+- Keep `agens-tui` as a surface adapter over the shared runtime.
+- Keep hand-authored TOML configuration separate from SQLite-backed runtime state.
 - Keep comments rare and focused on non-obvious why.
 - Never log or print secrets.
 

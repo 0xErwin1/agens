@@ -2,40 +2,18 @@ default:
     @just --list
 
 fmt:
-    gofmt -w ./cmd ./internal
-    goimports -w ./cmd ./internal
-
-fmt-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    test -z "$(gofmt -l ./cmd ./internal)"
-    test -z "$(goimports -l ./cmd ./internal)"
-
-lint:
-    golangci-lint run
-
-sqlc:
-    sqlc generate
-
-test:
-    go test ./...
-
-build:
-    go build -o agens ./cmd/agens
-
-rust-fmt:
     cargo fmt --all
 
-rust-fmt-check:
+fmt-check:
     cargo fmt --all -- --check
 
-rust-lint:
+lint:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
-rust-test:
+test:
     cargo test --workspace --all-targets --locked
 
-rust-build:
+build:
     cargo build --workspace --locked
 
 target-size:
@@ -54,19 +32,13 @@ target-budget:
 target-clean:
     cargo clean
 
-verify-go: sqlc fmt-check lint test build
-
-verify: verify-go
-
-verify-rust:
+verify:
     just target-budget
-    just rust-fmt-check
-    just rust-lint
-    just rust-test
-    just rust-build
+    just fmt-check
+    just lint
+    just test
+    just build
     just target-budget
-
-verify-dual: verify-go verify-rust
 
 clean:
-    rm -f agens
+    cargo clean

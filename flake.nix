@@ -33,13 +33,8 @@
       perSystem = { pkgs, ... }: {
         devenv.shells.default = {
           packages = [
-            pkgs.go
-            pkgs.gopls
-            pkgs.gotools
-            pkgs.golangci-lint
             pkgs.jq
             pkgs.just
-            pkgs.sqlc
           ];
 
           languages.rust = {
@@ -48,7 +43,7 @@
           };
 
           enterShell = ''
-            echo "Agens dev shell (Go, Rust, just, golangci-lint)"
+            echo "Agens dev shell (Rust, just)"
           '';
         };
 

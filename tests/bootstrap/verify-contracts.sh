@@ -24,20 +24,27 @@ assert_lines() {
     fi
 }
 
-assert_lines $'sqlc\nfmt-check\nlint\ntest\nbuild' "$(dependencies verify-go)" "verify-go dependency order"
-assert_lines 'verify-go' "$(dependencies verify)" "verify dependency graph"
-assert_lines '' "$(dependencies verify-rust)" "verify-rust dependency graph"
-assert_lines $'just target-budget\njust rust-fmt-check\njust rust-lint\njust rust-test\njust rust-build\njust target-budget' "$(body verify-rust)" "verify-rust execution order"
-assert_lines $'verify-go\nverify-rust' "$(dependencies verify-dual)" "verify-dual dependency order"
+assert_lines '' "$(dependencies verify)" "verify dependency graph"
+assert_lines $'just target-budget\njust fmt-check\njust lint\njust test\njust build\njust target-budget' "$(body verify)" "verify execution order"
 
-assert_lines 'cargo fmt --all -- --check' "$(body rust-fmt-check)" "Rust format check"
-assert_lines 'cargo clippy --workspace --all-targets --locked -- -D warnings' "$(body rust-lint)" "Rust lint"
-assert_lines 'cargo test --workspace --all-targets --locked' "$(body rust-test)" "Rust tests"
-assert_lines 'cargo build --workspace --locked' "$(body rust-build)" "Rust build"
+assert_lines 'cargo fmt --all -- --check' "$(body fmt-check)" "Rust format check"
+assert_lines 'cargo clippy --workspace --all-targets --locked -- -D warnings' "$(body lint)" "Rust lint"
+assert_lines 'cargo test --workspace --all-targets --locked' "$(body test)" "Rust tests"
+assert_lines 'cargo build --workspace --locked' "$(body build)" "Rust build"
 
-for gate in verify verify-go verify-rust verify-dual build rust-build; do
+for gate in verify build; do
     if just --dry-run "$gate" | grep -Eq '(^|[[:space:]])(cargo clean|just target-clean|rm -rf target)($|[[:space:]])'; then
         echo "$gate must not clean build output" >&2
         exit 1
     fi
 done
+
+if git ls-files -- 'cmd/**' 'internal/**' '*.go' go.mod go.sum .golangci.yml sqlc.yaml | grep -q .; then
+    echo "tracked Go production, test, module, or tooling files remain" >&2
+    exit 1
+fi
+
+if just --list --unsorted | grep -Eq '^(sqlc|verify-go|verify-rust|verify-dual|rust-fmt|rust-fmt-check|rust-lint|rust-test|rust-build)[[:space:]]'; then
+    echo "Go or dual-runtime recipes remain" >&2
+    exit 1
+fi

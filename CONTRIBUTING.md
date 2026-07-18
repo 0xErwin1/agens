@@ -8,7 +8,7 @@ Agens uses devenv through its Nix development shell:
 nix develop --no-pure-eval
 ```
 
-Go remains the official product binary at `./agens`. The build-only Rust workspace writes its non-authoritative binary to `target/{debug,release}/agens`.
+Rust is the only product implementation. Development and release binaries are written to `target/{debug,release}/agens`.
 
 With direnv enabled:
 
@@ -26,14 +26,12 @@ just lint
 just test
 just build
 just verify
-just verify-go
-just verify-rust
-just verify-dual
+just clean
 ```
 
-`just verify` invokes only the Go gate. `just verify-dual` runs Go and then Rust fail-fast. Before a change is considered complete, its applicable gate must pass.
+`just verify` runs the Rust budget, format, lint, test, and build gate. Before a change is considered complete, this gate must pass.
 
-Rust `target/` is limited to 20 GiB. Verification never deletes build output; cleanup is manual only with `just target-clean`.
+Rust `target/` is limited to 20 GiB. Verification never deletes build output; cleanup is manual only with `just clean`.
 
 ## TDD requirement
 
