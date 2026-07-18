@@ -1,6 +1,7 @@
 use agens_config::{
-    ConfigPermissionDecision, ConfigPermissionScope, McpServerConfig, extract_permission_rules,
-    mcp_stdio_servers, parse_toml_document, validate_toml_document,
+    ConfigPermissionDecision, ConfigPermissionScope, McpServerConfig, McpTransport,
+    extract_permission_rules, mcp_servers, mcp_stdio_servers, parse_toml_document,
+    validate_toml_document,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -54,12 +55,60 @@ fn extracts_only_safe_configured_stdio_mcp_servers() {
 }
 
 #[test]
+fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
+    let document = parse_toml_document(
+        r#"
+            [mcp.files]
+            transport = "stdio"
+            command = "server"
+            args = ["--safe"]
+            cwd = "/workspace"
+            env = { LANG = "C" }
+
+            [mcp.docs]
+            transport = "http"
+            url = "https://mcp.example.test/mcp"
+            headers = { Authorization = "Bearer token" }
+            max_retries = 2
+
+            [mcp.events]
+            transport = "sse"
+            url = "https://mcp.example.test/sse"
+        "#,
+    )
+    .expect("legacy MCP fixture should parse");
+
+    let servers = mcp_servers(&document).expect("legacy MCP shapes should extract");
+
+    assert_eq!(servers.len(), 3);
+    for server in &servers {
+        assert_eq!(server.timeout_ms, 10_000);
+    }
+    assert_eq!(
+        servers
+            .iter()
+            .map(|server| (server.name.as_str(), server.transport))
+            .collect::<Vec<_>>(),
+        [
+            ("docs", McpTransport::Http),
+            ("events", McpTransport::Sse),
+            ("files", McpTransport::Stdio),
+        ]
+    );
+}
+
+#[test]
 fn mcp_server_config_debug_redacts_environment_values_and_arguments() {
     let config = McpServerConfig {
         name: "files".into(),
-        command: PathBuf::from("server"),
+        transport: McpTransport::Stdio,
+        command: Some(PathBuf::from("server")),
         args: vec!["--token".into(), "SENTINEL_ARGUMENT_SECRET".into()],
         environment: BTreeMap::from([("API_TOKEN".into(), "SENTINEL_ENV_SECRET".into())]),
+        cwd: None,
+        url: None,
+        headers: BTreeMap::new(),
+        max_retries: 0,
         timeout_ms: 50,
     };
 

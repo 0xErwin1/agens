@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
-    expand_environment, extract_permission_rules, mcp_stdio_servers, merge_toml_documents,
+    McpTransport, expand_environment, extract_permission_rules, mcp_servers, merge_toml_documents,
     parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
@@ -28,9 +28,10 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
-    AuthorizedToolCall, DispatchTool, McpInitialize, McpLimits, McpRegistry, McpStdioTransport,
-    McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools, RemoteToolMetadata,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    AuthorizedToolCall, DispatchTool, McpHttpTransport, McpInitialize, McpLimits, McpRegistry,
+    McpStdioTransport, McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools,
+    RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, PlainRenderer, Tui, run_with_submit};
 
@@ -859,6 +860,9 @@ pub struct Bootstrap {
     model: Option<String>,
     provider_type: Option<String>,
     provider_base_url: Option<String>,
+    system_prompt: Option<String>,
+    max_iterations: Option<usize>,
+    parallel_tool_calls: bool,
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
@@ -878,6 +882,9 @@ impl Clone for Bootstrap {
             model: self.model.clone(),
             provider_type: self.provider_type.clone(),
             provider_base_url: self.provider_base_url.clone(),
+            system_prompt: self.system_prompt.clone(),
+            max_iterations: self.max_iterations,
+            parallel_tool_calls: self.parallel_tool_calls,
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
@@ -924,12 +931,19 @@ impl Bootstrap {
             .ok_or_else(|| CliError::configuration("MCP project root is unavailable"))?;
         self.mcp_servers
             .iter()
+            .filter(|server| server.transport == McpTransport::Stdio)
             .map(|server| {
                 let transport = McpStdioTransport::spawn(McpStdioTransportConfig {
-                    command: server.command.clone(),
+                    command: server
+                        .command
+                        .clone()
+                        .expect("stdio MCP commands are validated"),
                     args: server.args.clone(),
                     environment: server.environment.clone(),
-                    project_root: project_root.to_path_buf(),
+                    project_root: server
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| project_root.to_path_buf()),
                 })
                 .map_err(|_| CliError::configuration("MCP server configuration is unavailable"))?;
                 Ok((
@@ -951,17 +965,42 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     let paths = resolve_paths(config_root, home_directory.as_deref(), &environment);
     let (global, global_loaded) = load_toml(&paths.global_config, "global", dependencies)?;
     let (project, project_loaded) = load_toml(&paths.project_config, "project", dependencies)?;
+    if project.contains_key("mcp") {
+        return Err(CliError::configuration(
+            "project configuration cannot define MCP servers",
+        ));
+    }
     let permission_rules = extract_permission_rules(&global, &project)
         .map_err(|_| CliError::configuration("permission configuration is invalid"))?;
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
 
-    let mcp_servers = mcp_stdio_servers(&document)
+    let mcp_servers = mcp_servers(&document)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
+    let credentials = (dependencies.read_file)(&paths.credentials)?;
+    let provider_type = resolve_provider_type(
+        string_value(&document, &["provider", "type"]),
+        credentials.as_deref(),
+        &environment,
+    );
     Ok(Bootstrap {
         model: string_value(&document, &["provider", "model"]),
-        provider_type: string_value(&document, &["provider", "type"]),
+        provider_type,
         provider_base_url: string_value(&document, &["provider", "base_url"]),
+        system_prompt: string_value(&document, &["agent", "system_prompt"]),
+        max_iterations: document
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agent| agent.get("max_iterations"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0),
+        parallel_tool_calls: document
+            .get("agent")
+            .and_then(toml::Value::as_table)
+            .and_then(|agent| agent.get("parallel_tool_calls"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
@@ -1006,6 +1045,7 @@ fn run_production_headless_chat(
             let instructions = request
                 .system_prompt
                 .clone()
+                .or_else(|| bootstrap.system_prompt.clone())
                 .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned());
             run_production_headless_chat_with_provider(
                 request,
@@ -1046,7 +1086,10 @@ where
     let model = request
         .model
         .or_else(|| bootstrap.model().map(ToOwned::to_owned))
-        .ok_or_else(|| CliError::configuration("headless chat requires a provider model"))?;
+        .unwrap_or_else(|| match bootstrap.provider_type() {
+            Some("openai-chatgpt") => "gpt-5.5".to_owned(),
+            _ => "gpt-4.1".to_owned(),
+        });
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
@@ -1171,27 +1214,54 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
     let initialize = McpInitialize::new("2025-06-18", serde_json::json!({}), "agens", "0.1.0");
 
     for server in &bootstrap.mcp_servers {
-        let Ok(transport) = McpStdioTransport::spawn(McpStdioTransportConfig {
-            command: server.command.clone(),
-            args: server.args.clone(),
-            environment: server.environment.clone(),
-            project_root: project_root.to_path_buf(),
-        }) else {
-            continue;
-        };
         let timeout = std::time::Duration::from_millis(server.timeout_ms);
         let Ok(timeouts) = McpTimeouts::new(timeout, timeout, timeout) else {
             continue;
         };
 
-        let _ = registry.load_server(
-            &server.name,
-            transport,
-            &initialize,
-            timeouts,
-            McpLimits::default(),
-            Arc::clone(&cancellation),
-        );
+        match server.transport {
+            McpTransport::Stdio => {
+                let Ok(transport) = McpStdioTransport::spawn(McpStdioTransportConfig {
+                    command: server
+                        .command
+                        .clone()
+                        .expect("stdio MCP commands are validated"),
+                    args: server.args.clone(),
+                    environment: server.environment.clone(),
+                    project_root: server
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| project_root.to_path_buf()),
+                }) else {
+                    continue;
+                };
+                let _ = registry.load_server(
+                    &server.name,
+                    transport,
+                    &initialize,
+                    timeouts,
+                    McpLimits::default(),
+                    Arc::clone(&cancellation),
+                );
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let Ok(transport) = McpHttpTransport::new(
+                    server.url.clone().expect("HTTP MCP URLs are validated"),
+                    server.headers.clone(),
+                    server.max_retries,
+                ) else {
+                    continue;
+                };
+                let _ = registry.load_server(
+                    &server.name,
+                    transport,
+                    &initialize,
+                    timeouts,
+                    McpLimits::default(),
+                    Arc::clone(&cancellation),
+                );
+            }
+        }
     }
 
     registry
@@ -1537,31 +1607,104 @@ fn discover_project_root(current_directory: &Path) -> Option<PathBuf> {
 }
 
 fn expand_document(
-    document: toml::Table,
+    mut document: toml::Table,
     environment: &BTreeMap<String, String>,
 ) -> Result<toml::Table, CliError> {
-    document
-        .into_iter()
-        .map(|(key, value)| expand_value(value, environment).map(|value| (key, value)))
-        .collect()
+    for (section, field) in [("options", "data_dir"), ("provider", "base_url")] {
+        if let Some(table) = document
+            .get_mut(section)
+            .and_then(toml::Value::as_table_mut)
+        {
+            expand_string_field(table, field, environment)?;
+        }
+    }
+    if let Some(servers) = document.get_mut("mcp").and_then(toml::Value::as_table_mut) {
+        for server in servers
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            for field in ["command", "cwd", "url"] {
+                expand_string_field(server, field, environment)?;
+            }
+            for field in ["env", "headers"] {
+                if let Some(values) = server.get_mut(field).and_then(toml::Value::as_table_mut) {
+                    for (_, value) in values.iter_mut() {
+                        expand_value_in_place(value, environment)?;
+                    }
+                }
+            }
+            if let Some(args) = server.get_mut("args").and_then(toml::Value::as_array_mut) {
+                for value in args {
+                    expand_value_in_place(value, environment)?;
+                }
+            }
+        }
+    }
+    Ok(document)
 }
 
-fn expand_value(
-    value: toml::Value,
+fn resolve_provider_type(
+    configured: Option<String>,
+    credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
-) -> Result<toml::Value, CliError> {
-    match value {
-        toml::Value::String(value) => expand_environment(&value, environment)
-            .map(toml::Value::String)
-            .map_err(|_| CliError::configuration("configuration environment expansion failed")),
-        toml::Value::Array(values) => values
-            .into_iter()
-            .map(|value| expand_value(value, environment))
-            .collect::<Result<Vec<_>, _>>()
-            .map(toml::Value::Array),
-        toml::Value::Table(table) => expand_document(table, environment).map(toml::Value::Table),
-        value => Ok(value),
+) -> Option<String> {
+    if matches!(configured.as_deref(), Some("openai-api" | "openai-chatgpt")) {
+        return configured;
     }
+    let credentials =
+        credentials.and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok());
+    let chatgpt = credentials
+        .as_ref()
+        .and_then(|credentials| credentials.get("openai-chatgpt"));
+    if chatgpt.is_some_and(|entry| {
+        ["access_token", "refresh_token", "account_id", "expires_at"]
+            .iter()
+            .all(|field| {
+                entry
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+    }) {
+        return Some("openai-chatgpt".to_owned());
+    }
+    if credentials
+        .as_ref()
+        .and_then(|credentials| credentials.get("openai-api"))
+        .and_then(|entry| entry.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        || environment
+            .get("OPENAI_API_KEY")
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Some("openai-api".to_owned());
+    }
+    None
+}
+
+fn expand_value_in_place(
+    value: &mut toml::Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(raw) = value.as_str() {
+        *value =
+            toml::Value::String(expand_environment(raw, environment).map_err(|_| {
+                CliError::configuration("configuration environment expansion failed")
+            })?);
+    }
+    Ok(())
+}
+
+fn expand_string_field(
+    table: &mut toml::Table,
+    field: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(value) = table.get_mut(field) {
+        expand_value_in_place(value, environment)?;
+    }
+    Ok(())
 }
 
 fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {

@@ -246,7 +246,7 @@ impl Drop for McpStdioTransport {
     }
 }
 
-fn request_wire(request: McpRequest, id: Option<u64>) -> Value {
+pub(crate) fn request_wire(request: McpRequest, id: Option<u64>) -> Value {
     let (method, params) = match request {
         McpRequest::Initialize(value) => (
             "initialize",
@@ -351,7 +351,10 @@ fn wait_for_write(
     }
 }
 
-fn parse_response(value: Value, expected_id: u64) -> Result<McpResponse, McpTransportError> {
+pub(crate) fn parse_response(
+    value: Value,
+    expected_id: u64,
+) -> Result<McpResponse, McpTransportError> {
     let object = value
         .as_object()
         .ok_or_else(|| McpTransportError::Protocol("MCP response must be an object".into()))?;

@@ -40,12 +40,26 @@ pub struct ConfigPaths {
     pub project_config: PathBuf,
 }
 
+pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpTransport {
+    Stdio,
+    Http,
+    Sse,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
-    pub command: PathBuf,
+    pub transport: McpTransport,
+    pub command: Option<PathBuf>,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub url: Option<String>,
+    pub headers: BTreeMap<String, String>,
+    pub max_retries: u32,
     pub timeout_ms: u64,
 }
 
@@ -54,6 +68,7 @@ impl fmt::Debug for McpServerConfig {
         formatter
             .debug_struct("McpServerConfig")
             .field("name", &self.name)
+            .field("transport", &self.transport)
             .field("command", &self.command)
             .field("args_count", &self.args.len())
             .field(
@@ -61,6 +76,10 @@ impl fmt::Debug for McpServerConfig {
                 &self.environment.keys().collect::<Vec<_>>(),
             )
             .field("environment_count", &self.environment.len())
+            .field("cwd", &self.cwd)
+            .field("url", &self.url)
+            .field("header_keys", &self.headers.keys().collect::<Vec<_>>())
+            .field("max_retries", &self.max_retries)
             .field("timeout_ms", &self.timeout_ms)
             .finish()
     }
@@ -69,6 +88,13 @@ impl fmt::Debug for McpServerConfig {
 pub fn mcp_stdio_servers(
     document: &toml::Table,
 ) -> Result<Vec<McpServerConfig>, ConfigValidationError> {
+    Ok(mcp_servers(document)?
+        .into_iter()
+        .filter(|server| server.transport == McpTransport::Stdio)
+        .collect())
+}
+
+pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, ConfigValidationError> {
     validate_mcp(document)?;
     let Some(servers) = document.get("mcp").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
@@ -77,17 +103,14 @@ pub fn mcp_stdio_servers(
         .iter()
         .map(|(name, value)| {
             let server = value.as_table().ok_or_else(|| invalid_field("mcp", name))?;
-            if server.get("transport").and_then(toml::Value::as_str) != Some("stdio") {
-                return Err(invalid_field("mcp", name));
-            }
-            if server.contains_key("cwd") {
-                return Err(invalid_field(&format!("mcp.{name}"), "cwd"));
-            }
-            let command = server
-                .get("command")
-                .and_then(toml::Value::as_str)
-                .filter(|command| !command.trim().is_empty() && !command.contains('\0'))
-                .ok_or_else(|| invalid_field(&format!("mcp.{name}"), "command"))?;
+            let path = format!("mcp.{name}");
+            let transport = match server.get("transport").and_then(toml::Value::as_str) {
+                Some("stdio") => McpTransport::Stdio,
+                Some("http") => McpTransport::Http,
+                Some("sse") => McpTransport::Sse,
+                _ => return Err(invalid_field(&path, "transport")),
+            };
+            let command = server.get("command").and_then(toml::Value::as_str);
             let args = server
                 .get("args")
                 .and_then(toml::Value::as_array)
@@ -112,7 +135,38 @@ pub fn mcp_stdio_servers(
                 .and_then(toml::Value::as_integer)
                 .and_then(|timeout| u64::try_from(timeout).ok())
                 .filter(|timeout| *timeout > 0)
-                .ok_or_else(|| invalid_field(&format!("mcp.{name}"), "timeout_ms"))?;
+                .unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+            let url = server
+                .get("url")
+                .and_then(toml::Value::as_str)
+                .map(ToOwned::to_owned);
+            let headers = server
+                .get("headers")
+                .and_then(toml::Value::as_table)
+                .map_or_else(BTreeMap::new, |headers| {
+                    headers
+                        .iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_owned()))
+                        })
+                        .collect()
+                });
+            let max_retries = server
+                .get("max_retries")
+                .and_then(toml::Value::as_integer)
+                .and_then(|retries| u32::try_from(retries).ok())
+                .ok_or_else(|| invalid_field(&path, "max_retries"))
+                .or_else(|_| {
+                    if server.contains_key("max_retries") {
+                        Err(invalid_field(&path, "max_retries"))
+                    } else {
+                        Ok(0)
+                    }
+                })?;
+            let cwd = server
+                .get("cwd")
+                .and_then(toml::Value::as_str)
+                .map(PathBuf::from);
             if name.is_empty()
                 || name.contains("::")
                 || args.iter().any(|arg| arg.contains('\0'))
@@ -125,11 +179,49 @@ pub fn mcp_stdio_servers(
             {
                 return Err(invalid_field("mcp", name));
             }
+            match transport {
+                McpTransport::Stdio => {
+                    if command
+                        .is_none_or(|command| command.trim().is_empty() || command.contains('\0'))
+                        || url.is_some()
+                        || !headers.is_empty()
+                        || max_retries != 0
+                    {
+                        return Err(invalid_field("mcp", name));
+                    }
+                }
+                McpTransport::Http => {
+                    if url.as_deref().is_none_or(|url| url.trim().is_empty())
+                        || command.is_some()
+                        || !args.is_empty()
+                        || !environment.is_empty()
+                        || cwd.is_some()
+                    {
+                        return Err(invalid_field("mcp", name));
+                    }
+                }
+                McpTransport::Sse => {
+                    if url.as_deref().is_none_or(|url| url.trim().is_empty())
+                        || command.is_some()
+                        || !args.is_empty()
+                        || !environment.is_empty()
+                        || cwd.is_some()
+                        || max_retries != 0
+                    {
+                        return Err(invalid_field("mcp", name));
+                    }
+                }
+            }
             Ok(McpServerConfig {
                 name: name.clone(),
-                command: PathBuf::from(command),
+                transport,
+                command: command.map(PathBuf::from),
                 args,
                 environment,
+                cwd,
+                url,
+                headers,
+                max_retries,
                 timeout_ms,
             })
         })

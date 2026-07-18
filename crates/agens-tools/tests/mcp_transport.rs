@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    io::{BufRead, BufReader, Write},
+    net::TcpListener,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -10,10 +12,10 @@ use std::{
 };
 
 use agens_tools::{
-    McpCallResult, McpClient, McpContentBlock, McpInitialize, McpInitializeResult, McpLimits,
-    McpOperationContext, McpProtocolError, McpRegistry, McpRequest, McpResponse, McpServerReport,
-    McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage, McpTransport,
-    McpTransportError, RemoteToolAccess, ToolOutput,
+    McpCallResult, McpClient, McpContentBlock, McpHttpTransport, McpInitialize,
+    McpInitializeResult, McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest,
+    McpResponse, McpServerReport, McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage,
+    McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
 };
 use serde_json::json;
 
@@ -659,5 +661,48 @@ fn repeated_cooperative_timeouts_do_not_accumulate_workers() {
         );
         let transport = client.into_transport();
         assert_eq!(transport.cancelled.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn http_and_sse_transports_send_json_rpc_requests() {
+    for content_type in ["application/json", "text/event-stream"] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            assert_eq!(request, "POST /mcp HTTP/1.1\r\n");
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}"#;
+            let body = if content_type == "text/event-stream" {
+                format!("data: {body}\n\n")
+            } else {
+                body.to_owned()
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .try_clone()
+                .unwrap()
+                .write_all(response.as_bytes())
+                .unwrap();
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut transport =
+            McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+
+        let response = transport
+            .execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(cancellation, Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        assert_eq!(response, initialized());
+        server.join().unwrap();
     }
 }
