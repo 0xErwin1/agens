@@ -12,10 +12,11 @@ use agens_config::{
     parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
-    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-    PermissionSession, TurnProvider, run_headless_turn,
+    CompletedTurnSnapshot, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
+    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
+    HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
+    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProvider,
+    run_headless_turn,
 };
 use agens_providers::chatgpt_login::{
     ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
@@ -591,6 +592,64 @@ struct ProductionTuiEngine {
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
 }
 
+#[derive(Clone, Default)]
+struct TuiSessionContext {
+    identifier: Option<i64>,
+    snapshot: Option<CompletedTurnSnapshot>,
+}
+
+impl TuiSessionContext {
+    fn fresh() -> Self {
+        Self::default()
+    }
+
+    fn resumed(identifier: i64, snapshot: CompletedTurnSnapshot) -> Self {
+        Self {
+            identifier: Some(identifier),
+            snapshot: Some(snapshot),
+        }
+    }
+
+    fn note(&self) -> String {
+        let identifier = self
+            .identifier
+            .expect("resumed TUI session context always has an identifier");
+        let events = self
+            .snapshot
+            .as_ref()
+            .expect("resumed TUI session context always has a snapshot")
+            .events()
+            .len();
+        format!("Resumed session {identifier}: {events} event(s)")
+    }
+
+    fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return request;
+        };
+        let Some(identifier) = self.identifier else {
+            return request;
+        };
+        let context = snapshot
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ProviderPart(MessagePart::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        if !context.is_empty() {
+            request.prompt = format!(
+                "Resumed session {identifier} context:\n{context}\n\nUser: {}",
+                request.prompt
+            );
+        }
+
+        request
+    }
+}
+
 impl TuiEngine for ProductionTuiEngine {
     fn cancel(&mut self) {
         if let Ok(cancellation) = self.cancellation.lock()
@@ -603,16 +662,22 @@ impl TuiEngine for ProductionTuiEngine {
 
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
+    let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
     let engine = ProductionTuiEngine {
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
 
     if let Some(identifier) = resume {
-        tui.add_info(resume_tui_session(bootstrap, identifier)?);
+        let resumed = resume_tui_session(bootstrap, identifier)?;
+        tui.add_info(resumed.note());
+        *session.lock().map_err(|_| {
+            CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+        })? = resumed;
     }
 
     let bootstrap = bootstrap.clone();
+    let session = Arc::clone(&session);
     let mut renderer = PlainRenderer;
     run_with_submit(&mut tui, &mut renderer, move |prompt| {
         let turn_cancellation =
@@ -623,7 +688,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         *active = Some(turn_cancellation.clone());
         drop(active);
 
-        let result = run_tui_prompt(&bootstrap, &prompt, &turn_cancellation)
+        let result = run_tui_prompt(&bootstrap, &prompt, &turn_cancellation, &session)
             .map_err(|error| error.to_string());
 
         if let Ok(mut active) = cancellation.lock() {
@@ -641,29 +706,44 @@ fn run_tui_prompt(
     bootstrap: &Bootstrap,
     prompt: &str,
     cancellation: &HeadlessTurnCancellation,
+    session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
     match prompt.trim() {
         "/sessions" => list_tui_sessions(bootstrap),
-        "/new" => Ok("Started a new session.".to_owned()),
+        "/new" => {
+            *session.lock().map_err(|_| {
+                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+            })? = TuiSessionContext::fresh();
+            Ok("Started a new session.".to_owned())
+        }
         command if command.starts_with("/resume ") => {
             let identifier = command[8..]
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
-            resume_tui_session(bootstrap, identifier)
+            let resumed = resume_tui_session(bootstrap, identifier)?;
+            let note = resumed.note();
+            *session.lock().map_err(|_| {
+                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+            })? = resumed;
+            Ok(note)
         }
-        prompt => run_production_headless_chat(
-            HeadlessChatRequest {
-                prompt: prompt.to_owned(),
-                model: None,
-                system_prompt: None,
-                max_iterations: None,
-                mode: PermissionMode::Edit,
-                dangerously_allow_all: false,
-            },
-            bootstrap,
-            cancellation,
-        ),
+        prompt => {
+            let request = session
+                .lock()
+                .map_err(|_| {
+                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+                })?
+                .apply_to(HeadlessChatRequest {
+                    prompt: prompt.to_owned(),
+                    model: None,
+                    system_prompt: None,
+                    max_iterations: None,
+                    mode: PermissionMode::Edit,
+                    dangerously_allow_all: false,
+                });
+            run_production_headless_chat(request, bootstrap, cancellation)
+        }
     }
 }
 
@@ -691,16 +771,16 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
         .join("\n"))
 }
 
-fn resume_tui_session(bootstrap: &Bootstrap, identifier: i64) -> Result<String, CliError> {
+fn resume_tui_session(
+    bootstrap: &Bootstrap,
+    identifier: i64,
+) -> Result<TuiSessionContext, CliError> {
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let snapshot = store
         .load_completed_turn_for_resume(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
-    Ok(format!(
-        "Session {identifier}: {} event(s)",
-        snapshot.events().len()
-    ))
+    Ok(TuiSessionContext::resumed(identifier, snapshot))
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -1530,4 +1610,50 @@ fn root_help() -> String {
         "Agens is a coding agent CLI\n\nUsage: agens <command>\n\nCommands:\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  config    inspect configuration\n  models    list provider models\n  sessions  inspect completed turns\n\nVersion: {}\n",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agens_core::TurnState;
+
+    #[test]
+    fn resumed_tui_session_adds_restored_context_to_the_next_prompt() {
+        let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("previous answer".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ])
+        .expect("completed turn snapshot should be valid");
+
+        let request = TuiSessionContext::resumed(7, snapshot).apply_to(HeadlessChatRequest {
+            prompt: "next question".into(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+        });
+
+        assert_eq!(
+            request.prompt,
+            "Resumed session 7 context:\nprevious answer\n\nUser: next question"
+        );
+        assert_eq!(request.system_prompt, None);
+    }
+
+    #[test]
+    fn fresh_tui_session_does_not_reuse_prior_context() {
+        let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
+            prompt: "new question".into(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+        });
+
+        assert_eq!(request.system_prompt, None);
+    }
 }

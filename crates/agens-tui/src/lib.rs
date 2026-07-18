@@ -234,6 +234,12 @@ where
                 Action::Render
             }
             Key::Enter if self.input.is_empty() => Action::Render,
+            Key::Enter if self.running => {
+                self.transcript.push(TranscriptEntry::Info(
+                    "A response is already in progress.".into(),
+                ));
+                Action::Render
+            }
             Key::Enter => Action::Submit(std::mem::take(&mut self.input)),
             Key::Escape if self.running => self.cancel_running(),
             Key::Escape => Action::Render,

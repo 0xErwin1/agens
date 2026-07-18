@@ -25,6 +25,25 @@ fn normal_input_submits_the_composed_prompt() {
 }
 
 #[test]
+fn second_submission_is_rejected_while_a_turn_owns_cancellation() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.begin_submission("first prompt");
+    assert_eq!(tui.handle(Event::Key(Key::Char('s'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "s");
+    assert_eq!(
+        tui.transcript(),
+        [
+            agens_tui::TranscriptEntry::User("first prompt".into()),
+            agens_tui::TranscriptEntry::Info("A response is already in progress.".into()),
+        ]
+    );
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
+}
+
+#[test]
 fn resize_updates_the_render_state() {
     let mut tui = Tui::new(FakeEngine::default());
 
