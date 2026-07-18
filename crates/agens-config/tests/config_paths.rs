@@ -1,4 +1,7 @@
-use agens_config::{expand_environment, merge_toml_documents, parse_toml_document, resolve_paths};
+use agens_config::{
+    expand_environment, expand_environment_with_commands, merge_toml_documents,
+    parse_toml_document, resolve_paths,
+};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -76,6 +79,17 @@ fn environment_expansion_rejects_missing_or_malformed_variables() {
         "environment variable \"MISSING\" is not set"
     );
     assert_eq!(malformed.to_string(), "unterminated environment expression");
+}
+
+#[test]
+fn mcp_command_expansion_trims_one_newline_and_does_not_reexpand_output() {
+    let expanded = expand_environment_with_commands(
+        "${BIN:-printf} $(printf '$TOKEN\\n')",
+        &environment(&[("TOKEN", "secret")]),
+    )
+    .expect("MCP command expansion should succeed");
+
+    assert_eq!(expanded, "printf $TOKEN");
 }
 
 #[test]

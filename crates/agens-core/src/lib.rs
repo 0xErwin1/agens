@@ -674,6 +674,7 @@ pub enum HeadlessTurnError {
     PermissionRequired,
     Tool,
     Store,
+    MaxIterations,
     State,
 }
 
@@ -688,6 +689,7 @@ impl fmt::Display for HeadlessTurnError {
             Self::PermissionRequired => "permission required",
             Self::Tool => "tool operation failed",
             Self::Store => "completed turn could not be saved",
+            Self::MaxIterations => "turn reached the maximum iterations",
             Self::State => "invalid headless turn state",
         };
 
@@ -705,11 +707,59 @@ pub async fn run_headless_turn(
     repository: &mut impl CompletedTurnRepository,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+pub async fn run_headless_turn_with_max_iterations(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: usize,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
+    run_headless_turn_with_iteration_limit(
+        provider,
+        permission_gate,
+        permission_resolver,
+        dispatcher,
+        repository,
+        cancellation,
+        Some(max_iterations),
+    )
+    .await
+}
+
+async fn run_headless_turn_with_iteration_limit(
+    provider: &mut impl TurnProvider,
+    permission_gate: &mut impl HeadlessPermissionGate,
+    permission_resolver: &mut impl HeadlessPermissionResolver,
+    dispatcher: &mut impl HeadlessToolDispatcher,
+    repository: &mut impl CompletedTurnRepository,
+    cancellation: &HeadlessTurnCancellation,
+    max_iterations: Option<usize>,
+) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     let mut coordinator = TurnCoordinator::new();
     coordinator.begin().map_err(|_| HeadlessTurnError::State)?;
+    let mut iterations = 0;
 
     loop {
         check_cancelled(&mut coordinator, cancellation)?;
+        if max_iterations.is_some_and(|limit| iterations >= limit) {
+            coordinator.fail().map_err(|_| HeadlessTurnError::State)?;
+            return Err(HeadlessTurnError::MaxIterations);
+        }
+        iterations += 1;
 
         let parts = provider
             .next_parts(coordinator.events(), cancellation)

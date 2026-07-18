@@ -154,6 +154,128 @@ fn bootstrap_factory_rejects_an_unusable_project_root() {
 }
 
 #[test]
+fn global_mcp_command_and_environment_fields_expand_without_expanding_system_prompt() {
+    let temporary = TemporaryDirectory::new("mcp-command-expansion");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let launch_record = temporary.path().join("launch-record");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
+    let script = format!(
+        "printf '%s|' \"$1\" > '{}'; printenv MCP_SENTINEL >> '{}'",
+        launch_record.display(),
+        launch_record.display()
+    );
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!(
+                "[agent]\nsystem_prompt = \"literal $(printf ignored)\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"$(printf /bin/sh)\"\nargs = [\"-c\", {script:?}, \"ignored\", \"$(printf configured-argument)\"]\n[mcp.files.env]\nMCP_SENTINEL = \"$(printf 'configured-environment\\\\n')\"\n"
+            ),
+        )]),
+    );
+
+    let bootstrap = bootstrap(&dependencies).expect("global MCP substitutions should expand");
+    let mut transports = bootstrap
+        .mcp_transports()
+        .expect("expanded MCP transport should launch");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::fs::read_to_string(&launch_record)
+        .map(|contents| !contents.contains("configured-environment"))
+        .unwrap_or(true)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MCP process should launch"
+        );
+        thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(launch_record).expect("launch record should be readable"),
+        "configured-argument|configured-environment\n"
+    );
+    assert_eq!(bootstrap.system_prompt(), Some("literal $(printf ignored)"));
+    transports[0]
+        .1
+        .close(&agens_tools::McpOperationContext::new(
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::time::Duration::from_secs(1),
+        ))
+        .expect("transport should close");
+}
+
+#[test]
+fn project_mcp_is_rejected_before_its_command_substitution_runs() {
+    let temporary = TemporaryDirectory::new("project-mcp-rejection");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let marker = temporary.path().join("must-not-exist");
+    std::fs::create_dir_all(project_root.join(".agens"))
+        .expect("project config directory should exist");
+
+    let dependencies = CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            project_root.join(".agens/config.toml"),
+            format!(
+                "[mcp.forbidden]\ntransport = \"stdio\"\ncommand = \"$(touch {})\"\n",
+                marker.display(),
+            ),
+        )]),
+    );
+
+    let result = execute(["config", "doctor"], &dependencies);
+
+    assert_eq!(result.status, ExitStatus::Configuration);
+    assert_eq!(
+        result.stderr,
+        "error: config: project configuration cannot define MCP servers\n"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn explicit_provider_selection_overrides_credential_inference() {
+    let temporary = TemporaryDirectory::new("explicit-provider-selection");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([
+            (
+                config_home.join("config.toml"),
+                "[provider]\ntype = \"openai-chatgpt\"\n".to_owned(),
+            ),
+            (
+                config_home.join("auth.json"),
+                r#"{"openai-api":{"api_key":"api-key"},"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#.to_owned(),
+            ),
+        ]),
+    );
+
+    let bootstrap = bootstrap(&dependencies).expect("explicit provider should bootstrap");
+
+    assert_eq!(bootstrap.provider_type(), Some("openai-chatgpt"));
+    assert_eq!(bootstrap.model(), None);
+}
+
+#[test]
 fn invalid_config_is_a_sanitized_configuration_failure() {
     let temporary = TemporaryDirectory::new("invalid-config");
     let config_home = temporary.path().join("config");
@@ -778,6 +900,42 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
         &data_directory.join("rust-sessions.db"),
         &["SENTINEL_CHATGPT_REFRESH"],
     );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_uses_auth_json_api_key_when_openai_is_inferred_without_environment_key() {
+    let temporary = TemporaryDirectory::new("production-auth-json-api-key");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = OpenAiMockServer::start_with_api_key("SENTINEL_AUTH_JSON_API_KEY");
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-api":{"api_key":"SENTINEL_AUTH_JSON_API_KEY"}}"#,
+    )
+    .expect("legacy API credentials should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "hello from auth json"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(chat.status.success());
+    assert_eq!(String::from_utf8_lossy(&chat.stdout), "Hello from OpenAI\n");
+    assert!(!format!("{chat:?}").contains("SENTINEL_AUTH_JSON_API_KEY"));
 
     server.join();
 }
@@ -2947,6 +3105,11 @@ impl BoundedScriptedOpenAiMockServer {
 
 impl OpenAiMockServer {
     fn start() -> Self {
+        Self::start_with_api_key("SENTINEL_OPENAI_API_KEY")
+    }
+
+    fn start_with_api_key(api_key: &str) -> Self {
+        let expected_authorization = format!("authorization: Bearer {api_key}\r\n");
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
         let address = listener
             .local_addr()
@@ -2975,10 +3138,7 @@ impl OpenAiMockServer {
                     authorization = header;
                 }
             }
-            assert_eq!(
-                authorization,
-                "authorization: Bearer SENTINEL_OPENAI_API_KEY\r\n"
-            );
+            assert_eq!(authorization, expected_authorization);
 
             let mut stream = stream;
             stream

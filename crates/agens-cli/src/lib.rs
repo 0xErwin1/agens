@@ -8,15 +8,15 @@ use std::sync::{Arc, Mutex};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
-    McpTransport, expand_environment, extract_permission_rules, mcp_servers, merge_toml_documents,
-    parse_toml_document, resolve_paths, validate_toml_document,
+    McpTransport, expand_environment, expand_environment_with_commands, extract_permission_rules,
+    mcp_servers, merge_toml_documents, parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
     CompletedTurnSnapshot, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
     HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
     PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProvider,
-    run_headless_turn,
+    run_headless_turn, run_headless_turn_with_max_iterations,
 };
 use agens_providers::chatgpt_login::{
     ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
@@ -219,6 +219,11 @@ impl CliError {
                 ExitStatus::Failure,
                 "store",
                 "completed turn could not be saved",
+            ),
+            HeadlessTurnError::MaxIterations => (
+                ExitStatus::Failure,
+                "runtime",
+                "headless turn reached the maximum iterations",
             ),
             HeadlessTurnError::State => (
                 ExitStatus::Failure,
@@ -863,6 +868,7 @@ pub struct Bootstrap {
     system_prompt: Option<String>,
     max_iterations: Option<usize>,
     parallel_tool_calls: bool,
+    openai_api_key: Option<String>,
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
@@ -885,6 +891,7 @@ impl Clone for Bootstrap {
             system_prompt: self.system_prompt.clone(),
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
+            openai_api_key: self.openai_api_key.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
@@ -908,6 +915,10 @@ impl Bootstrap {
 
     pub fn provider_base_url(&self) -> Option<&str> {
         self.provider_base_url.as_deref()
+    }
+
+    pub fn system_prompt(&self) -> Option<&str> {
+        self.system_prompt.as_deref()
     }
 
     pub fn data_directory(&self) -> &Path {
@@ -972,6 +983,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     }
     let permission_rules = extract_permission_rules(&global, &project)
         .map_err(|_| CliError::configuration("permission configuration is invalid"))?;
+    let global = expand_global_mcp(global, &environment)?;
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
 
@@ -1001,6 +1013,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
             .and_then(|agent| agent.get("parallel_tool_calls"))
             .and_then(toml::Value::as_bool)
             .unwrap_or(true),
+        openai_api_key: openai_api_key(credentials.as_deref(), &environment),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
@@ -1018,7 +1031,7 @@ fn run_production_headless_chat(
 ) -> Result<String, CliError> {
     match bootstrap.provider_type() {
         Some("openai-api") => {
-            let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+            let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
                 CliError::authentication("OpenAI API authentication is unavailable")
             })?;
             run_production_headless_chat_with_provider(
@@ -1121,14 +1134,25 @@ where
     );
     let mut resolver = ProductionPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = block_on_headless_turn(run_headless_turn(
-        &mut provider,
-        &mut gate,
-        &mut resolver,
-        &mut dispatcher,
-        &mut store,
-        cancellation,
-    ))?
+    let snapshot = match request.max_iterations.or(bootstrap.max_iterations) {
+        Some(max_iterations) => block_on_headless_turn(run_headless_turn_with_max_iterations(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut dispatcher,
+            &mut store,
+            cancellation,
+            max_iterations,
+        )),
+        None => block_on_headless_turn(run_headless_turn(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut dispatcher,
+            &mut store,
+            cancellation,
+        )),
+    }?
     .map_err(CliError::runtime)?;
 
     let text = snapshot
@@ -1618,24 +1642,31 @@ fn expand_document(
             expand_string_field(table, field, environment)?;
         }
     }
+    Ok(document)
+}
+
+fn expand_global_mcp(
+    mut document: toml::Table,
+    environment: &BTreeMap<String, String>,
+) -> Result<toml::Table, CliError> {
     if let Some(servers) = document.get_mut("mcp").and_then(toml::Value::as_table_mut) {
         for server in servers
             .iter_mut()
             .filter_map(|(_, value)| value.as_table_mut())
         {
             for field in ["command", "cwd", "url"] {
-                expand_string_field(server, field, environment)?;
+                expand_mcp_string_field(server, field, environment)?;
             }
             for field in ["env", "headers"] {
                 if let Some(values) = server.get_mut(field).and_then(toml::Value::as_table_mut) {
                     for (_, value) in values.iter_mut() {
-                        expand_value_in_place(value, environment)?;
+                        expand_mcp_value_in_place(value, environment)?;
                     }
                 }
             }
             if let Some(args) = server.get_mut("args").and_then(toml::Value::as_array_mut) {
                 for value in args {
-                    expand_value_in_place(value, environment)?;
+                    expand_mcp_value_in_place(value, environment)?;
                 }
             }
         }
@@ -1683,6 +1714,28 @@ fn resolve_provider_type(
     None
 }
 
+fn openai_api_key(
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    environment
+        .get("OPENAI_API_KEY")
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .or_else(|| {
+            credentials
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+                .and_then(|credentials| {
+                    credentials
+                        .get("openai-api")?
+                        .get("api_key")?
+                        .as_str()
+                        .filter(|key| !key.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+        })
+}
+
 fn expand_value_in_place(
     value: &mut toml::Value,
     environment: &BTreeMap<String, String>,
@@ -1696,6 +1749,19 @@ fn expand_value_in_place(
     Ok(())
 }
 
+fn expand_mcp_value_in_place(
+    value: &mut toml::Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(raw) = value.as_str() {
+        *value =
+            toml::Value::String(expand_environment_with_commands(raw, environment).map_err(
+                |_| CliError::configuration("configuration environment expansion failed"),
+            )?);
+    }
+    Ok(())
+}
+
 fn expand_string_field(
     table: &mut toml::Table,
     field: &str,
@@ -1703,6 +1769,17 @@ fn expand_string_field(
 ) -> Result<(), CliError> {
     if let Some(value) = table.get_mut(field) {
         expand_value_in_place(value, environment)?;
+    }
+    Ok(())
+}
+
+fn expand_mcp_string_field(
+    table: &mut toml::Table,
+    field: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(value) = table.get_mut(field) {
+        expand_mcp_value_in_place(value, environment)?;
     }
     Ok(())
 }

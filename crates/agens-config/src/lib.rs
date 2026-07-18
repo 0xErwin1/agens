@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigPermissionDecision {
@@ -386,6 +387,58 @@ pub fn expand_environment(
     }
 
     Ok(output)
+}
+
+/// Expands environment expressions and bounded `$(...)` substitutions for MCP
+/// fields only. Command output is inserted literally and is never re-expanded.
+pub fn expand_environment_with_commands(
+    input: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<String, EnvironmentExpansionError> {
+    let mut output = String::new();
+    let mut remainder = input;
+    while let Some(start) = remainder.find("$(") {
+        output.push_str(&expand_environment(&remainder[..start], environment)?);
+        let command_start = start + 2;
+        let Some(end) = remainder[command_start..].find(')') else {
+            return Err(EnvironmentExpansionError::UnterminatedExpression);
+        };
+        let command = &remainder[command_start..command_start + end];
+        if command.trim().is_empty() {
+            return Err(EnvironmentExpansionError::InvalidVariable(
+                "command substitution".into(),
+            ));
+        }
+        output.push_str(&run_command_substitution(command)?);
+        remainder = &remainder[command_start + end + 1..];
+    }
+    output.push_str(&expand_environment(remainder, environment)?);
+    Ok(output)
+}
+
+fn run_command_substitution(command: &str) -> Result<String, EnvironmentExpansionError> {
+    let command = format!("{command} 2>&1");
+    let output = Command::new("timeout")
+        .args(["2s", "sh", "-c", &command])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|_| EnvironmentExpansionError::InvalidVariable("command substitution".into()))?;
+    if output.status.code() == Some(124) || output.stdout.len() > 64 * 1024 {
+        return Err(EnvironmentExpansionError::InvalidVariable(
+            "command substitution".into(),
+        ));
+    }
+    if !output.status.success() {
+        return Err(EnvironmentExpansionError::InvalidVariable(
+            "command substitution".into(),
+        ));
+    }
+    let mut value = String::from_utf8(output.stdout)
+        .map_err(|_| EnvironmentExpansionError::InvalidVariable("command substitution".into()))?;
+    if value.ends_with('\n') {
+        value.pop();
+    }
+    Ok(value)
 }
 
 pub fn resolve_paths(

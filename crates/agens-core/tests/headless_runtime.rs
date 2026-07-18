@@ -7,6 +7,7 @@ use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     MessagePart, PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
+    run_headless_turn_with_max_iterations,
 };
 
 #[derive(Default)]
@@ -535,4 +536,37 @@ fn permission_port_errors_remain_distinct_from_unresolved_asks() {
         assert_eq!(result, Err(HeadlessTurnError::Permission));
         assert!(repository.snapshots.is_empty());
     }
+}
+
+#[test]
+fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "continue".into(),
+                name: "read".into(),
+                input: "file.txt".into(),
+            }]),
+            Ok(vec![MessagePart::Text("must not be requested".into())]),
+        ],
+    };
+    let mut repository = Repository::default();
+
+    let result = block_on_ready(run_headless_turn_with_max_iterations(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow],
+        },
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher {
+            outputs: vec![Ok(HeadlessToolOutput::success("read result"))],
+        },
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+        1,
+    ));
+
+    assert_eq!(result, Err(HeadlessTurnError::MaxIterations));
+    assert_eq!(provider.iterations.len(), 1);
+    assert!(repository.snapshots.is_empty());
 }
