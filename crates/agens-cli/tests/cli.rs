@@ -633,6 +633,50 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     server.join();
 }
 
+#[test]
+fn production_binary_returns_permission_required_without_dispatching_an_unresolved_native_call() {
+    let temporary = TemporaryDirectory::new("production-native-ask");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = NativeToolCallOpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "request native tool"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: permission: permission approval is required\n"
+    );
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions command should execute");
+    assert!(sessions.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "No saved sessions.\n"
+    );
+
+    server.join();
+}
+
 #[cfg(unix)]
 #[test]
 fn production_binary_cancellation_has_deterministic_output_exit_and_no_persistence() {
@@ -833,6 +877,39 @@ impl Drop for TemporaryDirectory {
 struct OpenAiMockServer {
     address: std::net::SocketAddr,
     worker: thread::JoinHandle<()>,
+}
+
+struct NativeToolCallOpenAiMockServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<()>,
+}
+
+impl NativeToolCallOpenAiMockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock server should accept a request");
+            read_openai_request(&stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"native::read\",\"arguments\":\"\"}}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"{\\\"path\\\":\\\"notes.md\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response_1\"}}\n\n")
+                .expect("tool call response should be written");
+        });
+
+        Self { address, worker }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
+    }
 }
 
 impl OpenAiMockServer {

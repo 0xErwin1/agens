@@ -16,8 +16,8 @@ use std::{
 };
 
 use agens_core::{
-    Error, PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
-    ProjectPermissionGrant, ToolAccess,
+    Error, HeadlessTurnCancellationAdapter, PermissionDecision, PermissionPolicy,
+    PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
@@ -1299,7 +1299,8 @@ impl fmt::Display for ToolExecutionStatus {
 /// Shared cancellation and absolute-deadline contract for every callable tool.
 #[derive(Clone, Debug)]
 pub struct ToolExecutionContext {
-    cancellation: Arc<AtomicBool>,
+    cancellation: Option<Arc<AtomicBool>>,
+    headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Instant,
 }
 
@@ -1314,13 +1315,32 @@ impl ToolExecutionContext {
 
     pub fn with_deadline(cancellation: Arc<AtomicBool>, deadline: Instant) -> Self {
         Self {
-            cancellation,
+            cancellation: Some(cancellation),
+            headless_cancellation: None,
+            deadline,
+        }
+    }
+
+    /// Adapts core's opaque turn cancellation view without exposing its internals.
+    pub fn from_headless_adapter(cancellation: HeadlessTurnCancellationAdapter) -> Self {
+        let deadline = cancellation
+            .deadline()
+            .unwrap_or_else(|| Instant::now() + DEFAULT_BASH_TIMEOUT);
+        Self {
+            cancellation: None,
+            headless_cancellation: Some(cancellation),
             deadline,
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.load(Ordering::Acquire)
+        self.cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+            || self
+                .headless_cancellation
+                .as_ref()
+                .is_some_and(HeadlessTurnCancellationAdapter::is_cancelled)
     }
 
     pub fn is_expired(&self) -> bool {
@@ -1344,13 +1364,13 @@ impl ToolExecutionContext {
 
     fn mcp_context(&self) -> McpOperationContext {
         McpOperationContext {
-            cancellation: Arc::clone(&self.cancellation),
+            cancellation: self
+                .cancellation
+                .as_ref()
+                .map(Arc::clone)
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(self.is_cancelled()))),
             deadline: self.deadline,
         }
-    }
-
-    fn cancellation(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancellation)
     }
 }
 
@@ -2403,6 +2423,7 @@ pub struct BashInput {
     command: String,
     timeout: Duration,
     cancellation: Option<Arc<AtomicBool>>,
+    execution_context: Option<ToolExecutionContext>,
 }
 
 impl BashInput {
@@ -2411,6 +2432,7 @@ impl BashInput {
             command: command.into(),
             timeout: DEFAULT_BASH_TIMEOUT,
             cancellation: None,
+            execution_context: None,
         }
     }
 
@@ -2421,6 +2443,11 @@ impl BashInput {
 
     pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    fn with_execution_context(mut self, context: ToolExecutionContext) -> Self {
+        self.execution_context = Some(context);
         self
     }
 }
@@ -2612,9 +2639,13 @@ impl NativeTools {
 
         let status = loop {
             if input
-                .cancellation
+                .execution_context
                 .as_ref()
-                .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+                .is_some_and(ToolExecutionContext::is_cancelled)
+                || input
+                    .cancellation
+                    .as_ref()
+                    .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
             {
                 terminate_process_group(&mut child)?;
                 wait_for_readers(stdout_reader, stderr_reader)?;
@@ -2853,7 +2884,7 @@ impl NativeToolCatalog {
             "native::bash" => self.tools.bash(
                 BashInput::new(string("command")?)
                     .with_timeout(context.remaining().unwrap_or_default())
-                    .with_cancellation(context.cancellation()),
+                    .with_execution_context(context.clone()),
             )?,
             _ => return Err(Error::Tool("unknown native tool".into())),
         };

@@ -5,17 +5,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agens_config::{
-    ConfigPaths, expand_environment, mcp_stdio_servers, merge_toml_documents, parse_toml_document,
-    resolve_paths, validate_toml_document,
+    ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
+    expand_environment, extract_permission_rules, mcp_stdio_servers, merge_toml_documents,
+    parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    PermissionDecision, PermissionMode, run_headless_turn,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest,
+    PermissionRule, PermissionSession, run_headless_turn,
 };
-use agens_providers::{ChatGptAuthState, OpenAiResponsesProvider, load_chatgpt_auth_state};
-use agens_store::SessionStore;
-use agens_tools::{McpStdioTransport, McpStdioTransportConfig};
+use agens_providers::{
+    ChatGptAuthState, OpenAiFunctionTool, OpenAiResponsesProvider, load_chatgpt_auth_state,
+};
+use agens_store::{PermissionGrantStore, SessionStore};
+use agens_tools::{
+    McpStdioTransport, McpStdioTransportConfig, NativeToolCatalog, NativeTools,
+    ToolExecutionContext,
+};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -162,6 +169,9 @@ impl CliError {
             HeadlessTurnError::TimedOut => ("timeout", "headless turn timed out"),
             HeadlessTurnError::Provider => ("provider", "provider request failed"),
             HeadlessTurnError::Permission => ("permission", "permission evaluation failed"),
+            HeadlessTurnError::PermissionRequired => {
+                ("permission", "permission approval is required")
+            }
             HeadlessTurnError::Tool => ("tool", "tool execution failed"),
             HeadlessTurnError::Store => ("store", "completed turn could not be saved"),
             HeadlessTurnError::State => ("runtime", "headless turn entered an invalid state"),
@@ -545,6 +555,7 @@ pub struct Bootstrap {
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
+    permission_rules: Vec<ConfigPermissionRule>,
 }
 
 impl Bootstrap {
@@ -566,6 +577,14 @@ impl Bootstrap {
 
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
+    }
+
+    fn project_root(&self) -> Option<&Path> {
+        self.project_root.as_deref()
+    }
+
+    fn permission_rules(&self) -> &[ConfigPermissionRule] {
+        &self.permission_rules
     }
 
     pub fn mcp_transports(
@@ -604,6 +623,8 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     let paths = resolve_paths(config_root, home_directory.as_deref(), &environment);
     let (global, global_loaded) = load_toml(&paths.global_config, "global", dependencies)?;
     let (project, project_loaded) = load_toml(&paths.project_config, "project", dependencies)?;
+    let permission_rules = extract_permission_rules(&global, &project)
+        .map_err(|_| CliError::configuration("permission configuration is invalid"))?;
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
 
@@ -616,6 +637,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
+        permission_rules,
         paths,
         global_loaded,
         project_loaded,
@@ -649,19 +671,53 @@ fn run_openai_api_chat(
         .model
         .or_else(|| bootstrap.model().map(ToOwned::to_owned))
         .ok_or_else(|| CliError::configuration("headless chat requires a provider model"))?;
-    let mut provider = OpenAiResponsesProvider::from_api_key(
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    let native_tools = NativeTools::open(project_root)
+        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let native_catalog = NativeToolCatalog::new(native_tools);
+    let provider_tools = NativeToolCatalog::metadata()
+        .into_iter()
+        .map(|tool| {
+            OpenAiFunctionTool::new(tool.qualified_name, tool.description, tool.input_schema)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let project = project_root.display().to_string();
+    let policy = permission_policy(bootstrap.permission_rules(), &project, request.mode)?;
+    let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("permission grants are unavailable"))?;
+    let grants = grant_store
+        .grants_for_project(&project)
+        .map_err(|_| CliError::storage("permission grants are unavailable"))?;
+    let session = if request.dangerously_allow_all {
+        PermissionSession::with_temporary_bypass()
+    } else {
+        PermissionSession::new()
+    };
+    let pending = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
         api_key,
         bootstrap.provider_base_url(),
         model,
         request.prompt,
+        provider_tools,
+        std::time::Duration::from_secs(120),
     )
     .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
     cancellation_result(cancellation)?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let mut gate = ProductionPermissionGate;
+    let mut gate = ProductionPermissionGate::new(
+        policy,
+        grants,
+        session,
+        project,
+        std::sync::Arc::clone(&pending),
+    );
     let mut resolver = ProductionPermissionResolver;
-    let mut dispatcher = ProductionToolDispatcher;
+    let mut dispatcher = ProductionToolDispatcher::new(native_catalog, pending);
     let snapshot = block_on_headless_turn(run_headless_turn(
         &mut provider,
         &mut gate,
@@ -700,16 +756,67 @@ fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), Cl
     Ok(())
 }
 
-struct ProductionPermissionGate;
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowedNativeCall {
+    name: String,
+    input: String,
+}
+
+struct ProductionPermissionGate {
+    policy: PermissionPolicy,
+    grants: Vec<agens_core::ProjectPermissionGrant>,
+    session: PermissionSession,
+    project: String,
+    allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+}
+
+impl ProductionPermissionGate {
+    fn new(
+        policy: PermissionPolicy,
+        grants: Vec<agens_core::ProjectPermissionGrant>,
+        session: PermissionSession,
+        project: String,
+        allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+    ) -> Self {
+        Self {
+            policy,
+            grants,
+            session,
+            project,
+            allowed,
+        }
+    }
+}
 
 impl HeadlessPermissionGate for ProductionPermissionGate {
     fn evaluate(
         &mut self,
-        _call: &HeadlessToolCall,
+        call: &HeadlessToolCall,
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
-        std::future::ready(Ok(PermissionDecision::Ask))
+        let request = native_permission_request(&self.project, call);
+        let decision =
+            request.map(|request| self.policy.evaluate(&request, &self.grants, &self.session));
+        let result = match decision {
+            Ok(PermissionDecision::Allow) => self
+                .allowed
+                .lock()
+                .map_err(|_| HeadlessTurnPortError::Permission)
+                .map(|mut allowed| {
+                    allowed.insert(
+                        call.id.clone(),
+                        AllowedNativeCall {
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                        },
+                    );
+                    PermissionDecision::Allow
+                }),
+            Ok(decision) => Ok(decision),
+            Err(()) => Ok(PermissionDecision::Deny),
+        };
+        std::future::ready(result)
     }
 }
 
@@ -722,21 +829,117 @@ impl HeadlessPermissionResolver for ProductionPermissionResolver {
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
-        std::future::ready(Ok(PermissionDecision::Deny))
+        std::future::ready(Ok(PermissionDecision::Ask))
     }
 }
 
-struct ProductionToolDispatcher;
+struct ProductionToolDispatcher {
+    catalog: NativeToolCatalog,
+    allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+}
+
+impl ProductionToolDispatcher {
+    fn new(
+        catalog: NativeToolCatalog,
+        allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+    ) -> Self {
+        Self { catalog, allowed }
+    }
+}
 
 impl HeadlessToolDispatcher for ProductionToolDispatcher {
     fn dispatch(
         &mut self,
-        _call: HeadlessToolCall,
-        _cancellation: &HeadlessTurnCancellation,
+        call: HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
     {
-        std::future::ready(Err(HeadlessTurnPortError::Tool))
+        let allowed = self
+            .allowed
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Tool)
+            .and_then(|mut allowed| allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool));
+        let output = allowed.and_then(|allowed| {
+            if allowed.name != call.name || allowed.input != call.input {
+                return Err(HeadlessTurnPortError::Tool);
+            }
+            let arguments =
+                serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Tool)?;
+            self.catalog
+                .execute(
+                    &call.name,
+                    arguments,
+                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+                )
+                .map(|output| HeadlessToolOutput {
+                    content: output.content,
+                    is_error: output.is_error,
+                })
+                .map_err(|_| HeadlessTurnPortError::Tool)
+        });
+        std::future::ready(output)
     }
+}
+
+fn permission_policy(
+    rules: &[ConfigPermissionRule],
+    project: &str,
+    mode: PermissionMode,
+) -> Result<PermissionPolicy, CliError> {
+    let rules = rules
+        .iter()
+        .map(|rule| {
+            let decision = match rule.decision {
+                ConfigPermissionDecision::Allow => PermissionDecision::Allow,
+                ConfigPermissionDecision::Deny => PermissionDecision::Deny,
+            };
+            let tool = PermissionPattern::Exact(native_tool_name(&rule.tool_pattern)?.to_owned());
+            let target = match &rule.target_pattern {
+                Some(pattern) => PermissionPattern::glob(pattern.clone())
+                    .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
+                None => PermissionPattern::Any,
+            };
+            Ok(match rule.scope {
+                ConfigPermissionScope::Global => PermissionRule::global(decision, tool, target),
+                ConfigPermissionScope::Project => {
+                    PermissionRule::project(project, decision, tool, target)
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    Ok(PermissionPolicy::new(mode, rules))
+}
+
+fn native_tool_name(name: &str) -> Result<&'static str, CliError> {
+    match name {
+        "read" => Ok("native::read"),
+        "write" | "edit" => Ok("native::write"),
+        "bash" => Ok("native::bash"),
+        _ => Err(CliError::configuration(
+            "permission configuration is invalid",
+        )),
+    }
+}
+
+fn native_permission_request(
+    project: &str,
+    call: &HeadlessToolCall,
+) -> Result<PermissionRequest, ()> {
+    let access = NativeToolCatalog::metadata()
+        .into_iter()
+        .find(|tool| tool.qualified_name == call.name)
+        .map(|tool| tool.access)
+        .ok_or(())?;
+    let input = serde_json::from_str::<serde_json::Value>(&call.input).map_err(|_| ())?;
+    let target = match call.name.as_str() {
+        "native::read" | "native::write" | "native::list" | "native::search" => {
+            input.get("path").and_then(serde_json::Value::as_str)
+        }
+        "native::bash" => input.get("command").and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+    .ok_or(())?;
+    Ok(PermissionRequest::new(project, &call.name, target, access))
 }
 
 fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> Result<T, CliError> {
