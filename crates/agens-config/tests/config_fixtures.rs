@@ -1,5 +1,6 @@
 use agens_config::{
-    McpServerConfig, mcp_stdio_servers, parse_toml_document, validate_toml_document,
+    ConfigPermissionDecision, ConfigPermissionScope, McpServerConfig, extract_permission_rules,
+    mcp_stdio_servers, parse_toml_document, validate_toml_document,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -69,4 +70,129 @@ fn mcp_server_config_debug_redacts_environment_values_and_arguments() {
     assert!(debug.contains("environment_count: 1"));
     assert!(!debug.contains("SENTINEL_ARGUMENT_SECRET"));
     assert!(!debug.contains("SENTINEL_ENV_SECRET"));
+}
+
+#[test]
+fn extracts_ordered_global_and_project_permission_rules() {
+    let global = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read", "bash(git status *)"]
+            deny = ["bash(rm -rf *)"]
+        "#,
+    )
+    .expect("global fixture should parse");
+    let project = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["mcp::files::read(path/*.txt)"]
+            deny = ["write(secrets/*)"]
+        "#,
+    )
+    .expect("project fixture should parse");
+
+    let rules = extract_permission_rules(&global, &project)
+        .expect("supported global and project rules should extract");
+
+    assert_eq!(rules.len(), 5);
+    assert_eq!(rules[0].scope, ConfigPermissionScope::Global);
+    assert_eq!(rules[0].decision, ConfigPermissionDecision::Allow);
+    assert_eq!(rules[0].tool_pattern, "read");
+    assert_eq!(rules[0].target_pattern, None);
+    assert_eq!(rules[1].tool_pattern, "bash");
+    assert_eq!(rules[1].target_pattern.as_deref(), Some("git status *"));
+    assert_eq!(rules[2].decision, ConfigPermissionDecision::Deny);
+    assert_eq!(rules[3].scope, ConfigPermissionScope::Project);
+    assert_eq!(rules[3].tool_pattern, "mcp::files::read");
+    assert_eq!(rules[3].target_pattern.as_deref(), Some("path/*.txt"));
+    assert_eq!(rules[4].decision, ConfigPermissionDecision::Deny);
+}
+
+#[test]
+fn permission_rule_extraction_rejects_invalid_or_unsafe_entries_without_echoing_values() {
+    let cases = [
+        ("empty", "", "permissions.allow[0]"),
+        ("whitespace", "   ", "permissions.allow[0]"),
+        (
+            "malformed separator",
+            "bash(one)(two)",
+            "permissions.allow[0]",
+        ),
+        (
+            "missing closing separator",
+            "bash(one",
+            "permissions.allow[0]",
+        ),
+        ("unsafe tool traversal", "../read", "permissions.allow[0]"),
+        (
+            "unsafe target traversal",
+            "read(../secret)",
+            "permissions.allow[0]",
+        ),
+        ("ambiguous tool wildcard", "read*", "permissions.allow[0]"),
+    ];
+
+    for (name, rule, field) in cases {
+        let document = parse_toml_document(&format!("[permissions]\nallow = [{rule:?}]"))
+            .expect("fixture should be syntactically valid TOML");
+
+        let error = extract_permission_rules(&document, &toml::Table::new()).expect_err(name);
+
+        assert_eq!(
+            error.to_string(),
+            format!("invalid configuration field {field}")
+        );
+        if !rule.is_empty() {
+            assert!(!error.to_string().contains(rule));
+        }
+    }
+
+    let sentinel = "SENTINEL_PERMISSION_SECRET";
+    let document = parse_toml_document(&format!(
+        "[permissions]\nallow = [\"read({sentinel})(second)\"]"
+    ))
+    .expect("secret sentinel fixture should be syntactically valid TOML");
+    let error = extract_permission_rules(&document, &toml::Table::new())
+        .expect_err("malformed secret-bearing rule must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid configuration field permissions.allow[0]"
+    );
+    assert!(!error.to_string().contains(sentinel));
+}
+
+#[test]
+fn permission_rule_extraction_rejects_conflicts_and_semantically_invalid_documents() {
+    let conflicting = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(path/*.txt)"]
+            deny = ["read(path/*.txt)"]
+        "#,
+    )
+    .expect("conflict fixture should parse");
+    let wrong_type = parse_toml_document("[permissions]\nallow = [42]")
+        .expect("wrong type fixture should parse");
+    let unknown = parse_toml_document("[permissions]\nunknown = [\"read\"]")
+        .expect("unknown field fixture should parse");
+
+    assert_eq!(
+        extract_permission_rules(&conflicting, &toml::Table::new())
+            .expect_err("conflicting global rules must fail")
+            .to_string(),
+        "invalid configuration field permissions.deny[0]"
+    );
+    assert_eq!(
+        extract_permission_rules(&wrong_type, &toml::Table::new())
+            .expect_err("non-string permission entry must fail")
+            .to_string(),
+        "invalid configuration field permissions.allow"
+    );
+    assert_eq!(
+        extract_permission_rules(&unknown, &toml::Table::new())
+            .expect_err("unknown permission field must still fail")
+            .to_string(),
+        "invalid configuration field permissions.unknown"
+    );
 }

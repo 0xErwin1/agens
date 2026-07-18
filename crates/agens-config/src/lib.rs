@@ -2,6 +2,38 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigPermissionDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigPermissionScope {
+    Global,
+    Project,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConfigPermissionRule {
+    pub scope: ConfigPermissionScope,
+    pub decision: ConfigPermissionDecision,
+    pub tool_pattern: String,
+    pub target_pattern: Option<String>,
+}
+
+impl fmt::Debug for ConfigPermissionRule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigPermissionRule")
+            .field("scope", &self.scope)
+            .field("decision", &self.decision)
+            .field("has_tool_pattern", &true)
+            .field("has_target_pattern", &self.target_pattern.is_some())
+            .finish()
+    }
+}
+
 pub struct ConfigPaths {
     pub global_config: PathBuf,
     pub credentials: PathBuf,
@@ -102,6 +134,21 @@ pub fn mcp_stdio_servers(
             })
         })
         .collect()
+}
+
+pub fn extract_permission_rules(
+    global: &toml::Table,
+    project: &toml::Table,
+) -> Result<Vec<ConfigPermissionRule>, ConfigValidationError> {
+    validate_toml_document(global)?;
+    validate_toml_document(project)?;
+
+    let mut rules = Vec::new();
+
+    extract_scoped_permission_rules(global, ConfigPermissionScope::Global, &mut rules)?;
+    extract_scoped_permission_rules(project, ConfigPermissionScope::Project, &mut rules)?;
+
+    Ok(rules)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +323,95 @@ fn merge_tables(global: &mut toml::Table, project: toml::Table) {
     }
 }
 
+fn extract_scoped_permission_rules(
+    document: &toml::Table,
+    scope: ConfigPermissionScope,
+    rules: &mut Vec<ConfigPermissionRule>,
+) -> Result<(), ConfigValidationError> {
+    let Some(permissions) = document.get("permissions").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    let scope_start = rules.len();
+
+    for (field, decision) in [
+        ("allow", ConfigPermissionDecision::Allow),
+        ("deny", ConfigPermissionDecision::Deny),
+    ] {
+        let Some(entries) = permissions.get(field).and_then(toml::Value::as_array) else {
+            continue;
+        };
+
+        for (index, entry) in entries.iter().enumerate() {
+            let value = entry
+                .as_str()
+                .ok_or_else(|| invalid_field("permissions", field))?;
+            let (tool_pattern, target_pattern) = parse_permission_rule(value)
+                .ok_or_else(|| invalid_indexed_field("permissions", field, index))?;
+
+            if rules[scope_start..].iter().any(|rule| {
+                rule.tool_pattern == tool_pattern
+                    && rule.target_pattern == target_pattern
+                    && rule.decision != decision
+            }) {
+                return Err(invalid_indexed_field("permissions", field, index));
+            }
+
+            rules.push(ConfigPermissionRule {
+                scope,
+                decision,
+                tool_pattern,
+                target_pattern,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_permission_rule(value: &str) -> Option<(String, Option<String>)> {
+    if value.trim().is_empty() || value.trim() != value {
+        return None;
+    }
+
+    let (tool_pattern, target_pattern) = match value.split_once('(') {
+        Some((tool_pattern, target_pattern)) => {
+            let target_pattern = target_pattern.strip_suffix(')')?;
+            if target_pattern.is_empty()
+                || target_pattern.trim().is_empty()
+                || target_pattern.contains(['(', ')'])
+            {
+                return None;
+            }
+            (tool_pattern, Some(target_pattern.to_owned()))
+        }
+        None if !value.contains(')') => (value, None),
+        None => return None,
+    };
+
+    if !is_safe_tool_pattern(tool_pattern)
+        || target_pattern.as_deref().is_some_and(has_traversal_segment)
+    {
+        return None;
+    }
+
+    Some((tool_pattern.to_owned(), target_pattern))
+}
+
+fn is_safe_tool_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.split("::").all(|segment| {
+            segment == "*"
+                || (!segment.is_empty()
+                    && segment.chars().all(|character| {
+                        character.is_alphanumeric() || matches!(character, '_' | '-')
+                    }))
+        })
+}
+
+fn has_traversal_segment(pattern: &str) -> bool {
+    pattern.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 fn reject_unknown_fields(
     table: &toml::Table,
     path: &str,
@@ -375,6 +511,10 @@ fn invalid_field(path: &str, field: &str) -> ConfigValidationError {
     };
 
     ConfigValidationError { field }
+}
+
+fn invalid_indexed_field(path: &str, field: &str, index: usize) -> ConfigValidationError {
+    invalid_field(path, &format!("{field}[{index}]"))
 }
 
 fn read_braced_expression(
