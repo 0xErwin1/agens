@@ -22,6 +22,7 @@ const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
+const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -53,8 +54,10 @@ pub struct OpenAiResponsesProvider {
     tools: Vec<OpenAiFunctionTool>,
     client: reqwest::Client,
     state: ContinuationState,
+    seen_response_ids: BTreeSet<String>,
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
+    continuation_rounds: usize,
 }
 
 enum ContinuationState {
@@ -77,9 +80,9 @@ struct PendingToolCall {
 /// A validated function tool definition for the OpenAI Responses API.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpenAiFunctionTool {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 impl OpenAiFunctionTool {
@@ -91,7 +94,13 @@ impl OpenAiFunctionTool {
         let name = name.into();
         let description = description.into();
 
-        if name.trim().is_empty() || description.trim().is_empty() || !parameters.is_object() {
+        let is_object_root_schema = parameters
+            .as_object()
+            .and_then(|schema| schema.get("type"))
+            .and_then(Value::as_str)
+            == Some("object");
+
+        if name.trim().is_empty() || description.trim().is_empty() || !is_object_root_schema {
             return Err(Error::Provider(
                 "OpenAI request error: function tools require a name, description, and object parameters".to_owned(),
             ));
@@ -101,6 +110,28 @@ impl OpenAiFunctionTool {
             name,
             description,
             parameters,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn parameters(&self) -> &Value {
+        &self.parameters
+    }
+
+    pub fn to_response_api_json(&self) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+            "strict": true,
         })
     }
 }
@@ -167,8 +198,10 @@ impl OpenAiResponsesProvider {
                 .build()
                 .map_err(|_| Error::Provider("OpenAI HTTP client is unavailable".into()))?,
             state: ContinuationState::Initial,
+            seen_response_ids: BTreeSet::new(),
             seen_item_ids: BTreeSet::new(),
             seen_call_ids: BTreeSet::new(),
+            continuation_rounds: 0,
         })
     }
 
@@ -221,16 +254,22 @@ impl TurnProvider for OpenAiResponsesProvider {
                 previous_response_id,
                 pending_calls,
                 event_cursor,
-            } => match continuation_payload(
-                &self.model,
-                &self.tools,
-                &previous_response_id,
-                &pending_calls,
-                &_events[event_cursor..],
-            ) {
-                Ok(payload) => payload,
-                Err(()) => return Err(HeadlessTurnPortError::Provider),
-            },
+            } => {
+                let Some(events) = _events.get(event_cursor..) else {
+                    return Err(HeadlessTurnPortError::Provider);
+                };
+
+                match continuation_payload(
+                    &self.model,
+                    &self.tools,
+                    &previous_response_id,
+                    &pending_calls,
+                    events,
+                ) {
+                    Ok(payload) => payload,
+                    Err(()) => return Err(HeadlessTurnPortError::Provider),
+                }
+            }
             ContinuationState::Completed | ContinuationState::Failed => {
                 return Err(HeadlessTurnPortError::Provider);
             }
@@ -244,10 +283,15 @@ impl TurnProvider for OpenAiResponsesProvider {
             }
         };
 
-        if response.pending_calls.iter().any(|call| {
-            !self.seen_item_ids.insert(call.item_id.clone())
-                || !self.seen_call_ids.insert(call.call_id.clone())
-        }) {
+        if response
+            .response_id
+            .as_ref()
+            .is_some_and(|response_id| !self.seen_response_ids.insert(response_id.clone()))
+            || response.pending_calls.iter().any(|call| {
+                !self.seen_item_ids.insert(call.item_id.clone())
+                    || !self.seen_call_ids.insert(call.call_id.clone())
+            })
+        {
             self.state = ContinuationState::Failed;
             return Err(HeadlessTurnPortError::Provider);
         }
@@ -255,10 +299,15 @@ impl TurnProvider for OpenAiResponsesProvider {
         if response.pending_calls.is_empty() {
             self.state = ContinuationState::Completed;
         } else {
+            if self.continuation_rounds == MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
+                self.state = ContinuationState::Failed;
+                return Err(HeadlessTurnPortError::Provider);
+            }
             let Some(previous_response_id) = response.response_id else {
                 self.state = ContinuationState::Failed;
                 return Err(HeadlessTurnPortError::Provider);
             };
+            self.continuation_rounds += 1;
             self.state = ContinuationState::AwaitingToolOutputs {
                 previous_response_id,
                 pending_calls: response.pending_calls,
@@ -724,11 +773,11 @@ impl OpenAiResponseDecoder {
             return Ok(());
         }
 
-        let id = required_string(item, "id")?.to_owned();
+        let id = required_nonempty_string(item, "id")?.to_owned();
         if self.seen_item_ids.insert(id.clone(), ()).is_some() {
             return Err(protocol_error("duplicate function call item"));
         }
-        let call_id = required_string(item, "call_id")?.to_owned();
+        let call_id = required_nonempty_string(item, "call_id")?.to_owned();
         if self.seen_call_ids.insert(call_id.clone(), ()).is_some() {
             return Err(protocol_error("duplicate function call ID"));
         }
@@ -742,7 +791,7 @@ impl OpenAiResponseDecoder {
             return Err(protocol_error("duplicate function call item"));
         }
         self.function_call_order
-            .push(required_string(item, "id")?.to_owned());
+            .push(required_nonempty_string(item, "id")?.to_owned());
 
         Ok(())
     }
@@ -751,7 +800,7 @@ impl OpenAiResponseDecoder {
         let Some(response) = event.get("response") else {
             return Ok(());
         };
-        let id = required_string(response, "id")?.to_owned();
+        let id = required_nonempty_string(response, "id")?.to_owned();
 
         if self
             .response_id
@@ -766,7 +815,7 @@ impl OpenAiResponseDecoder {
     }
 
     fn append_function_arguments(&mut self, event: &Value) -> Result<(), Error> {
-        let id = required_string(event, "item_id")?;
+        let id = required_nonempty_string(event, "item_id")?;
         let call = self.function_calls.get_mut(id).ok_or_else(|| {
             protocol_error("function arguments arrived before the function call item")
         })?;
@@ -777,7 +826,7 @@ impl OpenAiResponseDecoder {
     }
 
     fn finish_function_call(&mut self, event: &Value) -> Result<(), Error> {
-        let id = required_string(event, "item_id")?;
+        let id = required_nonempty_string(event, "item_id")?;
         let mut call = self.function_calls.remove(id).ok_or_else(|| {
             protocol_error("function arguments completed before the function call item")
         })?;
@@ -804,15 +853,7 @@ fn function_tools_json(tools: &[OpenAiFunctionTool]) -> Value {
     Value::Array(
         tools
             .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                    "strict": true,
-                })
-            })
+            .map(OpenAiFunctionTool::to_response_api_json)
             .collect(),
     )
 }
@@ -822,6 +863,15 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> 
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| protocol_error("event is missing a required string field"))
+}
+
+fn required_nonempty_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
+    match required_string(value, field) {
+        Ok(candidate) if !candidate.is_empty() => Ok(candidate),
+        Ok(_) | Err(_) => Err(protocol_error(
+            "event is missing a required non-empty string field",
+        )),
+    }
 }
 
 fn required_object<'a>(value: &'a Value, field: &str) -> Result<&'a Value, Error> {

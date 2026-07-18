@@ -1,6 +1,6 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -394,6 +394,180 @@ fn rejects_missing_duplicate_and_foreign_tool_results_before_a_continuation_requ
     }
 }
 
+#[test]
+fn rejects_reused_response_ids_and_truncated_event_history_before_another_request() {
+    let mut duplicate_server = LocalResponsesServer::start_scripted(vec![
+        tool_call_response("resp_duplicate", "fc_first", "call_first"),
+        tool_call_response("resp_duplicate", "fc_second", "call_second"),
+    ]);
+    let duplicate_bodies = duplicate_server.take_observed_body();
+    let mut duplicate_provider = scripted_provider(duplicate_server.base_url());
+    let runtime = provider_runtime();
+    let cancellation = HeadlessTurnCancellation::new();
+
+    runtime
+        .block_on(duplicate_provider.next_parts(&[], &cancellation))
+        .expect("first response should produce a tool call");
+    assert_eq!(
+        runtime.block_on(duplicate_provider.next_parts(
+            &[tool_result("call_first", "first result", false)],
+            &cancellation,
+        )),
+        Err(HeadlessTurnPortError::Provider)
+    );
+    assert!(
+        duplicate_bodies
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial request should be observed")
+            .get("input")
+            .is_some()
+    );
+    assert!(
+        duplicate_bodies
+            .recv_timeout(Duration::from_secs(1))
+            .expect("continuation request should be observed")
+            .get("previous_response_id")
+            .is_some()
+    );
+    assert!(
+        duplicate_bodies
+            .recv_timeout(Duration::from_millis(25))
+            .is_err()
+    );
+    duplicate_server.join();
+
+    let mut cursor_server = LocalResponsesServer::start_scripted(vec![tool_call_response(
+        "resp_cursor",
+        "fc_cursor",
+        "call_cursor",
+    )]);
+    let cursor_bodies = cursor_server.take_observed_body();
+    let mut cursor_provider = scripted_provider(cursor_server.base_url());
+
+    runtime
+        .block_on(cursor_provider.next_parts(
+            &[tool_result("previous", "previous result", false)],
+            &cancellation,
+        ))
+        .expect("first response should produce a tool call");
+    assert_eq!(
+        runtime.block_on(cursor_provider.next_parts(&[], &cancellation)),
+        Err(HeadlessTurnPortError::Provider)
+    );
+    assert!(
+        cursor_bodies
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial request should be observed")
+            .get("input")
+            .is_some()
+    );
+    assert!(
+        cursor_bodies
+            .recv_timeout(Duration::from_millis(25))
+            .is_err()
+    );
+    cursor_server.join();
+}
+
+#[test]
+fn continuation_rounds_cancel_or_timeout_during_headers_bodies_and_late_sse_without_replay() {
+    for (round, mode, stop) in [
+        (2, ContinuationStall::DelayedHeaders, Stop::Cancellation),
+        (2, ContinuationStall::StalledBody, Stop::Deadline),
+        (2, ContinuationStall::LateEvent, Stop::Cancellation),
+        (3, ContinuationStall::DelayedHeaders, Stop::Deadline),
+        (3, ContinuationStall::StalledBody, Stop::Cancellation),
+        (3, ContinuationStall::LateEvent, Stop::Deadline),
+    ] {
+        let immediate_responses = match round {
+            2 => vec![tool_call_response("resp_first", "fc_first", "call_first")],
+            3 => vec![
+                tool_call_response("resp_first", "fc_first", "call_first"),
+                tool_call_response("resp_second", "fc_second", "call_second"),
+            ],
+            _ => unreachable!("only second and third rounds are tested"),
+        };
+        let mut server = LocalResponsesServer::start_scripted_with_stall(immediate_responses, mode);
+        let observed_bodies = Arc::new(Mutex::new(server.take_observed_body()));
+        let mut provider = scripted_provider(server.base_url());
+        let runtime = provider_runtime();
+        let cancellation = match stop {
+            Stop::Cancellation => HeadlessTurnCancellation::new(),
+            Stop::Deadline => HeadlessTurnCancellation::with_deadline(Duration::from_millis(25)),
+        };
+
+        runtime
+            .block_on(provider.next_parts(&[], &cancellation))
+            .expect("first response should produce a tool call");
+        observed_bodies
+            .lock()
+            .expect("request receiver should remain available")
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial request should be observed");
+
+        if round == 3 {
+            runtime
+                .block_on(provider.next_parts(
+                    &[tool_result("call_first", "first result", false)],
+                    &cancellation,
+                ))
+                .expect("second response should produce a tool call");
+            observed_bodies
+                .lock()
+                .expect("request receiver should remain available")
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second request should be observed");
+        }
+
+        let events = if round == 2 {
+            vec![tool_result("call_first", "first result", false)]
+        } else {
+            vec![
+                tool_result("call_first", "first result", false),
+                tool_result("call_second", "second result", false),
+            ]
+        };
+        let expected_error = match stop {
+            Stop::Cancellation => HeadlessTurnPortError::Cancelled,
+            Stop::Deadline => HeadlessTurnPortError::TimedOut,
+        };
+        let cancellation_thread = matches!(stop, Stop::Cancellation).then(|| {
+            let canceller = cancellation.clone();
+            let observed_bodies = Arc::clone(&observed_bodies);
+            thread::spawn(move || {
+                observed_bodies
+                    .lock()
+                    .expect("request receiver should remain available")
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("continuation request should be observed");
+                canceller.cancel();
+            })
+        });
+
+        assert_eq!(
+            runtime.block_on(provider.next_parts(&events, &cancellation)),
+            Err(expected_error)
+        );
+        assert_eq!(
+            runtime.block_on(provider.next_parts(&events, &HeadlessTurnCancellation::new())),
+            Err(HeadlessTurnPortError::Provider)
+        );
+
+        if let Some(cancellation_thread) = cancellation_thread {
+            cancellation_thread
+                .join()
+                .expect("cancellation thread should finish");
+        } else {
+            observed_bodies
+                .lock()
+                .expect("request receiver should remain available")
+                .recv_timeout(Duration::from_secs(1))
+                .expect("timed-out continuation request should be observed");
+        }
+        server.join();
+    }
+}
+
 fn tool_call_response(response_id: &str, item_id: &str, call_id: &str) -> String {
     format!(
         "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"{response_id}\"}}}}\n\n\
@@ -473,6 +647,19 @@ enum ServerMode {
     UnterminatedOversizedFrame,
     ErrorBody,
     CancelledError,
+}
+
+#[derive(Clone, Copy)]
+enum ContinuationStall {
+    DelayedHeaders,
+    StalledBody,
+    LateEvent,
+}
+
+#[derive(Clone, Copy)]
+enum Stop {
+    Cancellation,
+    Deadline,
 }
 
 struct LocalResponsesServer {
@@ -619,6 +806,55 @@ impl LocalResponsesServer {
                 stream
                     .write_all(response.as_bytes())
                     .expect("scripted response should be written");
+            }
+        });
+
+        Self {
+            address,
+            observed_request: None,
+            observed_body: Some(observed_body),
+            worker,
+        }
+    }
+
+    fn start_scripted_with_stall(responses: Vec<String>, stall: ContinuationStall) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+        let address = listener
+            .local_addr()
+            .expect("server address should be available");
+        let (body_sender, observed_body) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("server should accept a request");
+                body_sender
+                    .send(read_request_body(&stream))
+                    .expect("test should receive the request body");
+                write_sse_headers(&mut stream);
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("scripted response should be written");
+            }
+
+            let (mut stream, _) = listener.accept().expect("server should accept a request");
+            body_sender
+                .send(read_request_body(&stream))
+                .expect("test should receive the continuation request body");
+            match stall {
+                ContinuationStall::DelayedHeaders => wait_for_client_close(&stream),
+                ContinuationStall::StalledBody => {
+                    write_sse_headers(&mut stream);
+                    wait_for_client_close(&stream);
+                }
+                ContinuationStall::LateEvent => {
+                    write_sse_headers(&mut stream);
+                    stream
+                        .write_all(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"early\"}\n\n",
+                        )
+                        .expect("early event should be written");
+                    wait_for_client_close(&stream);
+                    let _ = stream.write_all(b"data: {\"type\":\"response.completed\"}\n\n");
+                }
             }
         });
 

@@ -73,6 +73,28 @@ fn encodes_validated_function_tools_as_flat_responses_api_definitions() {
 }
 
 #[test]
+fn function_tools_require_a_nonempty_name_description_and_object_root_schema() {
+    for (name, description, parameters) in [
+        ("", "Looks up weather.", json!({"type": "object"})),
+        ("lookup", "", json!({"type": "object"})),
+        ("lookup", "Looks up weather.", json!({})),
+        (
+            "lookup",
+            "Looks up weather.",
+            json!({"type": "array", "items": {}}),
+        ),
+    ] {
+        assert_eq!(
+            OpenAiFunctionTool::new(name, description, parameters),
+            Err(Error::Provider(
+                "OpenAI request error: function tools require a name, description, and object parameters"
+                    .to_owned()
+            ))
+        );
+    }
+}
+
+#[test]
 fn rejects_tool_calls_without_a_response_id_or_with_a_reused_call_id() {
     let missing_response_id = [
         r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":""}}"#,
@@ -96,6 +118,33 @@ fn rejects_tool_calls_without_a_response_id_or_with_a_reused_call_id() {
         decode_openai_response_events(reused_call_id),
         Err(Error::Provider(
             "OpenAI stream protocol error: duplicate function call ID".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn rejects_empty_response_ids_and_function_identity_fields() {
+    let empty_response_id = [
+        r#"{"type":"response.created","response":{"id":""}}"#,
+        r#"{"type":"response.completed","response":{"id":""}}"#,
+    ];
+    let empty_function_id = [
+        r#"{"type":"response.created","response":{"id":"resp_123"}}"#,
+        r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"","call_id":"call_123","name":"lookup","arguments":""}}"#,
+    ];
+
+    assert_eq!(
+        decode_openai_response_events(empty_response_id),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: event is missing a required non-empty string field"
+                .to_owned()
+        ))
+    );
+    assert_eq!(
+        decode_openai_response_events(empty_function_id),
+        Err(Error::Provider(
+            "OpenAI stream protocol error: event is missing a required non-empty string field"
+                .to_owned()
         ))
     );
 }
