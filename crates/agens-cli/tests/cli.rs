@@ -1572,9 +1572,10 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.crashed]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"crash\"]\ntimeout_ms = 1000\n[mcp.crashed.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
             server.base_url(),
             data_directory.display(),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
             env!("CARGO_BIN_EXE_fake-mcp-child"),
             env!("CARGO_BIN_EXE_fake-mcp-child"),
         ),
@@ -1606,6 +1607,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     );
     assert!(!diagnostics.contains("SENTINEL_MCP_PROTOCOL"));
     assert!(!diagnostics.contains("SENTINEL_MCP_STDERR"));
+    assert!(!diagnostics.contains("SENTINEL_MCP_TRANSPORT"));
     assert_eq!(
         String::from_utf8_lossy(
             &Command::new(env!("CARGO_BIN_EXE_agens"))

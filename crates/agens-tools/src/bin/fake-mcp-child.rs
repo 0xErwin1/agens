@@ -52,6 +52,9 @@ fn main() {
             continue;
         };
         if mode == "crash" {
+            if let Some(secret) = std::env::var_os("FAKE_MCP_TRANSPORT_SECRET") {
+                let _ = writeln!(io::stderr(), "{secret:?}");
+            }
             std::process::exit(9);
         }
         if mode.starts_with("descendant-") {
