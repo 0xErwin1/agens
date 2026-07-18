@@ -331,8 +331,6 @@ fn extract_scoped_permission_rules(
     let Some(permissions) = document.get("permissions").and_then(toml::Value::as_table) else {
         return Ok(());
     };
-    let scope_start = rules.len();
-
     for (field, decision) in [
         ("allow", ConfigPermissionDecision::Allow),
         ("deny", ConfigPermissionDecision::Deny),
@@ -348,7 +346,7 @@ fn extract_scoped_permission_rules(
             let (tool_pattern, target_pattern) = parse_permission_rule(value)
                 .ok_or_else(|| invalid_indexed_field("permissions", field, index))?;
 
-            if rules[scope_start..].iter().any(|rule| {
+            if rules.iter().any(|rule| {
                 permission_rules_overlap(rule, &tool_pattern, target_pattern.as_deref())
             }) {
                 return Err(invalid_indexed_field("permissions", field, index));
@@ -427,7 +425,20 @@ fn is_safe_target_pattern(pattern: &str) -> bool {
 fn is_separator_confusable(character: char) -> bool {
     matches!(
         character,
-        '\\' | '\u{2044}' | '\u{2215}' | '\u{ff0f}' | '\u{ff3c}'
+        '\\' | '\u{2044}'
+            | '\u{2215}'
+            | '\u{29f5}'
+            | '\u{29f6}'
+            | '\u{29f7}'
+            | '\u{29f8}'
+            | '\u{29f9}'
+            | '\u{2e4a}'
+            | '\u{2f03}'
+            | '\u{fe68}'
+            | '\u{ff0f}'
+            | '\u{ff3c}'
+            | '\u{1f67c}'
+            | '\u{1f67d}'
     )
 }
 
@@ -559,6 +570,16 @@ fn glob_matches_from(
         None => candidate_index == candidate.len(),
         Some('*') => {
             let crosses_segments = pattern.get(pattern_index + 1) == Some(&'*');
+
+            if crosses_segments && pattern.get(pattern_index + 2) == Some(&'/') {
+                return globstar_directory_matches(
+                    pattern,
+                    candidate,
+                    pattern_index + 3,
+                    candidate_index,
+                );
+            }
+
             let next_index = pattern_index + usize::from(crosses_segments) + 1;
             let maximum = if crosses_segments {
                 candidate.len()
@@ -598,6 +619,24 @@ fn glob_matches_from(
                 && glob_matches_from(pattern, candidate, pattern_index + 1, candidate_index + 1)
         }
     }
+}
+
+fn globstar_directory_matches(
+    pattern: &[char],
+    candidate: &[char],
+    next_pattern_index: usize,
+    candidate_index: usize,
+) -> bool {
+    glob_matches_from(pattern, candidate, next_pattern_index, candidate_index)
+        || candidate[candidate_index..]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, character)| {
+                (*character == '/').then_some(candidate_index + offset + 1)
+            })
+            .any(|next_candidate_index| {
+                glob_matches_from(pattern, candidate, next_pattern_index, next_candidate_index)
+            })
 }
 
 fn glob_class_matches(class: &[char], candidate: char) -> bool {

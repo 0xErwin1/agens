@@ -242,7 +242,22 @@ fn permission_rule_extraction_rejects_ungrounded_tools_and_invalid_target_globs(
 
 #[test]
 fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules() {
-    let unsafe_targets = ["..∕secret", "..／secret", "..⁄secret", "..＼secret"];
+    let unsafe_targets = [
+        "..∕secret",
+        "..／secret",
+        "..⁄secret",
+        "..＼secret",
+        "..⧵secret",
+        "..⧶secret",
+        "..⧷secret",
+        "..⧸secret",
+        "..⧹secret",
+        "..⹊secret",
+        "..⼃secret",
+        "..﹨secret",
+        "..🙼secret",
+        "..🙽secret",
+    ];
 
     for target in unsafe_targets {
         let document = parse_toml_document(&format!("[permissions]\nallow = [\"read({target})\"]"))
@@ -250,7 +265,7 @@ fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules()
 
         assert_eq!(
             extract_permission_rules(&document, &toml::Table::new())
-                .expect_err("Unicode traversal separator must fail")
+                .expect_err(target)
                 .to_string(),
             "invalid configuration field permissions.allow[0]"
         );
@@ -273,6 +288,14 @@ fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules()
             "exact glob duplicate",
             "allow = [\"read(secret)\", \"read(s*)\"]",
         ),
+        (
+            "zero-segment doublestar conflict",
+            "allow = [\"read(dir/**/secret)\"]\ndeny = [\"read(dir/secret)\"]",
+        ),
+        (
+            "nested doublestar conflict",
+            "allow = [\"read(dir/**/secret)\"]\ndeny = [\"read(dir/nested/secret)\"]",
+        ),
     ];
 
     for (name, fields) in conflicts {
@@ -286,4 +309,66 @@ fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules()
                 || error.to_string() == "invalid configuration field permissions.deny[0]"
         );
     }
+}
+
+#[test]
+fn permission_rule_extraction_rejects_cross_scope_duplicates_and_keeps_distinct_rules() {
+    let global = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(**)"]
+        "#,
+    )
+    .expect("global fixture should parse");
+    let project = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(**)"]
+        "#,
+    )
+    .expect("project fixture should parse");
+
+    assert_eq!(
+        extract_permission_rules(&global, &project)
+            .expect_err("cross-scope duplicate must fail")
+            .to_string(),
+        "invalid configuration field permissions.allow[0]"
+    );
+
+    let conflicting_project = parse_toml_document(
+        r#"
+            [permissions]
+            deny = ["read(**)"]
+        "#,
+    )
+    .expect("project fixture should parse");
+
+    assert_eq!(
+        extract_permission_rules(&global, &conflicting_project)
+            .expect_err("cross-scope conflict must fail")
+            .to_string(),
+        "invalid configuration field permissions.deny[0]"
+    );
+
+    let distinct_global = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(global/**)"]
+        "#,
+    )
+    .expect("global fixture should parse");
+    let distinct_project = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(project/**)"]
+        "#,
+    )
+    .expect("project fixture should parse");
+
+    let rules = extract_permission_rules(&distinct_global, &distinct_project)
+        .expect("distinct scoped rules should extract");
+
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].scope, ConfigPermissionScope::Global);
+    assert_eq!(rules[1].scope, ConfigPermissionScope::Project);
 }
