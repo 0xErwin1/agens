@@ -23,6 +23,7 @@ const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
+const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
@@ -517,7 +518,13 @@ pub fn load_chatgpt_auth_state(
     required_credential_string(entry, "refresh_token")?;
     required_credential_string(entry, "account_id")?;
 
-    if required_credential_string(entry, "access_token").is_err() || now >= expires_at {
+    let access_token = required_credential_string(entry, "access_token")?;
+    let expiry = jwt_expiry(access_token).unwrap_or(expires_at);
+
+    if now
+        .checked_add(PROACTIVE_REFRESH_WINDOW)
+        .is_none_or(|refresh_at| refresh_at >= expiry)
+    {
         return Ok(ChatGptAuthState::RefreshRequired);
     }
 
@@ -1027,6 +1034,37 @@ fn create_private_temporary_file(parent: &Path) -> Result<(std::path::PathBuf, F
 
 fn parse_rfc3339_timestamp(value: &str) -> Option<SystemTime> {
     OffsetDateTime::parse(value, &Rfc3339).ok().map(Into::into)
+}
+
+fn jwt_expiry(token: &str) -> Option<SystemTime> {
+    let payload = token.split('.').nth(1)?;
+    let mut value = 0_u32;
+    let mut bits = 0_u8;
+    let mut bytes = Vec::new();
+
+    for byte in payload.bytes() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        value = (value << 6) | sextet;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((value >> bits) as u8);
+            value &= (1 << bits) - 1;
+        }
+    }
+
+    let seconds = serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_i64()?;
+    (seconds >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64))
 }
 
 fn auth_error(detail: &str) -> Error {

@@ -66,6 +66,26 @@ fn classifies_expired_credentials_as_refresh_required() {
 }
 
 #[test]
+fn classifies_a_jwt_expiring_within_five_minutes_as_refresh_required() {
+    let directory = temporary_directory("proactive-refresh");
+    let credentials = directory.join("auth.json");
+    write_credentials(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODkwMDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2026-07-17T13:00:00Z"}}"#,
+    );
+
+    assert_eq!(
+        load_chatgpt_auth_state(
+            &credentials,
+            UNIX_EPOCH + Duration::from_secs(1_784_288_900)
+        ),
+        Ok(ChatGptAuthState::RefreshRequired)
+    );
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
 fn rejects_missing_or_malformed_credentials_without_exposing_tokens() {
     let directory = temporary_directory("invalid");
     let missing_credentials = directory.join("missing.json");
