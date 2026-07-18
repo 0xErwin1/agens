@@ -787,6 +787,256 @@ fn production_binary_executes_allowed_native_search_then_continues() {
 }
 
 #[test]
+fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_search() {
+    for (name, tool, path, arguments, rule, expected_output) in [
+        (
+            "list exact",
+            "native::list",
+            "list-exact",
+            r#"{"path":"list-exact"}"#,
+            "list(list-exact)",
+            "listed.txt",
+        ),
+        (
+            "list glob",
+            "native::list",
+            "list-glob",
+            r#"{"path":"list-glob"}"#,
+            "list(list-*)",
+            "listed.txt",
+        ),
+        (
+            "search exact",
+            "native::search",
+            "search-exact",
+            r#"{"path":"search-exact","query":"needle"}"#,
+            "search(search-exact)",
+            "needle",
+        ),
+        (
+            "search glob",
+            "native::search",
+            "search-glob",
+            r#"{"path":"search-glob","query":"needle"}"#,
+            "search(search-*)",
+            "needle",
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-static-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        let fixture_directory = project_root.join(path);
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        std::fs::create_dir_all(&fixture_directory).expect("fixture directory should exist");
+        std::fs::write(
+            fixture_directory.join("listed.txt"),
+            "needle in static policy fixture",
+        )
+        .expect("fixture file should exist");
+
+        let call_id = format!("call_{path}");
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![tool.to_owned()],
+                response: native_tool_call_response(&call_id, tool, arguments),
+            },
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![call_id.clone(), expected_output.to_owned()],
+                response: text_response("static permission allowed"),
+            },
+        ]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
+                server.base_url(),
+                data_directory.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "apply static native permission"])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert!(output.status.success(), "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "static permission allowed\n",
+            "{name}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                    .args(["sessions", "list"])
+                    .current_dir(&project_root)
+                    .env("AGENS_CONFIG_HOME", &config_home)
+                    .output()
+                    .expect("sessions command should execute")
+                    .stdout,
+            ),
+            "ID\tEVENTS\n1\t10 event(s)\n",
+            "{name}"
+        );
+
+        server.join();
+    }
+}
+
+#[test]
+fn production_binary_static_glob_denies_native_list_and_search_without_execution() {
+    for (name, tool, path, arguments, rule) in [
+        (
+            "list",
+            "native::list",
+            "denied-list",
+            r#"{"path":"denied-list"}"#,
+            "list(denied-*)",
+        ),
+        (
+            "search",
+            "native::search",
+            "denied-search",
+            r#"{"path":"denied-search","query":"needle"}"#,
+            "search(denied-*)",
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-static-deny-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        let fixture_directory = project_root.join(path);
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        std::fs::create_dir_all(&fixture_directory).expect("fixture directory should exist");
+        let protected = fixture_directory.join("protected.txt");
+        std::fs::write(&protected, "must remain unchanged").expect("fixture file should exist");
+
+        let call_id = format!("call_denied_{name}");
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![tool.to_owned()],
+                response: native_tool_call_response(&call_id, tool, arguments),
+            },
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![
+                    call_id,
+                    "\"output\":\"Tool execution failed\"".to_owned(),
+                ],
+                response: text_response("static permission denied"),
+            },
+        ]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [{rule:?}]\n",
+                server.base_url(),
+                data_directory.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "deny static native permission"])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert!(output.status.success(), "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "static permission denied\n",
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
+            "must remain unchanged",
+            "{name}"
+        );
+
+        server.join();
+    }
+}
+
+#[test]
+fn production_binary_requires_permission_for_unrelated_static_list_and_search_targets() {
+    for (name, tool, path, arguments, rule) in [
+        (
+            "list",
+            "native::list",
+            "unrelated-list",
+            r#"{"path":"unrelated-list"}"#,
+            "list(allowed-list)",
+        ),
+        (
+            "search",
+            "native::search",
+            "unrelated-search",
+            r#"{"path":"unrelated-search","query":"needle"}"#,
+            "search(allowed-search)",
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-static-ask-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        let fixture_directory = project_root.join(path);
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        std::fs::create_dir_all(&fixture_directory).expect("fixture directory should exist");
+        let protected = fixture_directory.join("protected.txt");
+        std::fs::write(&protected, "must not be read").expect("fixture file should exist");
+
+        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+            required_body_fragments: vec![tool.to_owned()],
+            response: native_tool_call_response("call_ask", tool, arguments),
+        }]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [{rule:?}]\n",
+                server.base_url(),
+                data_directory.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "request unrelated native permission"])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "error: permission: permission approval is required\n",
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
+            "must not be read",
+            "{name}"
+        );
+        assert_no_saved_sessions(&project_root, &config_home);
+
+        server.join();
+    }
+}
+
+#[test]
 fn production_binary_denies_native_read_without_side_effect_and_continues_safely() {
     let temporary = TemporaryDirectory::new("production-native-deny");
     let project_root = temporary.path().join("project");

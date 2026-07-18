@@ -202,7 +202,7 @@ fn permission_rule_extraction_accepts_documented_tool_grammar_and_safe_unicode_t
     let document = parse_toml_document(
         r#"
             [permissions]
-            allow = ["read(資料/**/*.txt)", "read(file[0-9].txt)", "engram_mem_save(**)", "bash(git status *)"]
+            allow = ["read(資料/**/*.txt)", "read(file[0-9].txt)", "list(directory)", "search(directory/**)", "engram_mem_save(**)", "bash(git status *)"]
         "#,
     )
     .expect("fixture should parse");
@@ -210,8 +210,10 @@ fn permission_rule_extraction_accepts_documented_tool_grammar_and_safe_unicode_t
     let rules = extract_permission_rules(&document, &toml::Table::new())
         .expect("documented rules with safe Unicode targets should extract");
 
-    assert_eq!(rules.len(), 4);
+    assert_eq!(rules.len(), 6);
     assert_eq!(rules[0].target_pattern.as_deref(), Some("資料/**/*.txt"));
+    assert_eq!(rules[2].tool_pattern, "list");
+    assert_eq!(rules[3].tool_pattern, "search");
 }
 
 #[test]

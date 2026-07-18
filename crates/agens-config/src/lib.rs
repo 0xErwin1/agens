@@ -396,8 +396,10 @@ fn parse_permission_rule(value: &str) -> Option<(String, Option<String>)> {
 }
 
 fn is_grounded_tool_name(pattern: &str) -> bool {
-    matches!(pattern, "bash" | "read" | "edit" | "write" | "webfetch")
-        || is_mcp_qualified_tool_name(pattern)
+    matches!(
+        pattern,
+        "bash" | "read" | "edit" | "write" | "list" | "search" | "webfetch"
+    ) || is_mcp_qualified_tool_name(pattern)
 }
 
 fn is_mcp_qualified_tool_name(pattern: &str) -> bool {

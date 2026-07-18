@@ -914,6 +914,8 @@ fn native_tool_name(name: &str) -> Result<&'static str, CliError> {
     match name {
         "read" => Ok("native::read"),
         "write" | "edit" => Ok("native::write"),
+        "list" => Ok("native::list"),
+        "search" => Ok("native::search"),
         "bash" => Ok("native::bash"),
         _ => Err(CliError::configuration(
             "permission configuration is invalid",
