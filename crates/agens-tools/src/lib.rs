@@ -1278,6 +1278,7 @@ impl std::error::Error for McpTransportError {}
 
 pub struct McpOperationContext {
     cancellation: Arc<AtomicBool>,
+    headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Instant,
 }
 
@@ -1369,6 +1370,7 @@ impl ToolExecutionContext {
                 .as_ref()
                 .map(Arc::clone)
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(self.is_cancelled()))),
+            headless_cancellation: self.headless_cancellation.clone(),
             deadline: self.deadline,
         }
     }
@@ -1378,12 +1380,17 @@ impl McpOperationContext {
     pub fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
         Self {
             cancellation,
+            headless_cancellation: None,
             deadline: Instant::now() + timeout,
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.load(Ordering::Acquire)
+            || self
+                .headless_cancellation
+                .as_ref()
+                .is_some_and(HeadlessTurnCancellationAdapter::is_cancelled)
     }
 
     pub fn is_expired(&self) -> bool {

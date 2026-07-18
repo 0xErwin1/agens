@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
@@ -12,16 +13,17 @@ use agens_config::{
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest,
-    PermissionRule, PermissionSession, run_headless_turn,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+    PermissionSession, run_headless_turn,
 };
 use agens_providers::{
     ChatGptAuthState, OpenAiFunctionTool, OpenAiResponsesProvider, load_chatgpt_auth_state,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
-    McpStdioTransport, McpStdioTransportConfig, NativeToolCatalog, NativeTools,
-    ToolExecutionContext,
+    AuthorizedToolCall, DispatchTool, McpInitialize, McpLimits, McpRegistry, McpStdioTransport,
+    McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools, RemoteToolMetadata,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
@@ -674,16 +676,7 @@ fn run_openai_api_chat(
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let native_tools = NativeTools::open(project_root)
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
-    let native_catalog = NativeToolCatalog::new(native_tools);
-    let provider_tools = NativeToolCatalog::metadata()
-        .into_iter()
-        .map(|tool| {
-            OpenAiFunctionTool::new(tool.qualified_name, tool.description, tool.input_schema)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let (provider_tools, tool_runtime) = production_tool_runtime(bootstrap, project_root)?;
     let project = project_root.display().to_string();
     let policy = permission_policy(bootstrap.permission_rules(), &project, request.mode)?;
     let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
@@ -696,7 +689,7 @@ fn run_openai_api_chat(
     } else {
         PermissionSession::new()
     };
-    let pending = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
         api_key,
         bootstrap.provider_base_url(),
@@ -714,10 +707,11 @@ fn run_openai_api_chat(
         grants,
         session,
         project,
-        std::sync::Arc::clone(&pending),
+        Arc::clone(&tool_runtime),
+        Arc::clone(&pending),
     );
     let mut resolver = ProductionPermissionResolver;
-    let mut dispatcher = ProductionToolDispatcher::new(native_catalog, pending);
+    let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot = block_on_headless_turn(run_headless_turn(
         &mut provider,
         &mut gate,
@@ -746,6 +740,165 @@ fn run_openai_api_chat(
     }
 }
 
+fn production_tool_runtime(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+        NativeTools::open(project_root)
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+    )));
+    let mcp_registry = Arc::new(Mutex::new(load_configured_mcp_registry(
+        bootstrap,
+        project_root,
+    )));
+    let remote_tools = mcp_registry
+        .lock()
+        .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+        .tools()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut dispatcher = ToolDispatcher::new();
+    let mut provider_tools = Vec::new();
+
+    for metadata in NativeToolCatalog::metadata() {
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                metadata.qualified_name.clone(),
+                metadata.description,
+                metadata.input_schema,
+            )
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                metadata.qualified_name.clone(),
+                metadata.access,
+                RegisteredNativeTool {
+                    name: metadata.qualified_name,
+                    catalog: Arc::clone(&native_catalog),
+                },
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    for metadata in remote_tools {
+        provider_tools.push(remote_function_tool(&metadata)?);
+        dispatcher
+            .register_mcp(
+                &metadata,
+                RegisteredMcpTool {
+                    name: metadata.qualified_name.clone(),
+                    registry: Arc::clone(&mcp_registry),
+                },
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
+}
+
+fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
+    let mut registry = McpRegistry::new();
+    let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let initialize = McpInitialize::new("2025-06-18", serde_json::json!({}), "agens", "0.1.0");
+
+    for server in &bootstrap.mcp_servers {
+        let Ok(transport) = McpStdioTransport::spawn(McpStdioTransportConfig {
+            command: server.command.clone(),
+            args: server.args.clone(),
+            environment: server.environment.clone(),
+            project_root: project_root.to_path_buf(),
+        }) else {
+            continue;
+        };
+        let timeout = std::time::Duration::from_millis(server.timeout_ms);
+        let Ok(timeouts) = McpTimeouts::new(timeout, timeout, timeout) else {
+            continue;
+        };
+
+        let _ = registry.load_server(
+            &server.name,
+            transport,
+            &initialize,
+            timeouts,
+            McpLimits::default(),
+            Arc::clone(&cancellation),
+        );
+    }
+
+    registry
+}
+
+fn remote_function_tool(metadata: &RemoteToolMetadata) -> Result<OpenAiFunctionTool, CliError> {
+    OpenAiFunctionTool::new(
+        metadata.qualified_name.clone(),
+        metadata
+            .description
+            .clone()
+            .unwrap_or_else(|| "MCP tool".to_owned()),
+        metadata.input_schema.clone(),
+    )
+    .map_err(|_| CliError::configuration("MCP tool metadata is invalid"))
+}
+
+struct RegisteredNativeTool {
+    name: String,
+    catalog: Arc<Mutex<NativeToolCatalog>>,
+}
+
+impl DispatchTool for RegisteredNativeTool {
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String, agens_core::Error> {
+        let field = if self.name == "native::bash" {
+            "command"
+        } else {
+            "path"
+        };
+        arguments
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| agens_core::Error::Tool("native tool arguments are invalid".into()))
+    }
+
+    fn execute(
+        &mut self,
+        context: &ToolExecutionContext,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, agens_core::Error> {
+        self.catalog
+            .lock()
+            .map_err(|_| agens_core::Error::Tool("native tool catalog is unavailable".into()))?
+            .execute(&self.name, arguments, context)
+    }
+}
+
+struct RegisteredMcpTool {
+    name: String,
+    registry: Arc<Mutex<McpRegistry>>,
+}
+
+impl DispatchTool for RegisteredMcpTool {
+    fn permission_target(&self, _: &serde_json::Value) -> Result<String, agens_core::Error> {
+        Ok(self.name.clone())
+    }
+
+    fn execute(
+        &mut self,
+        context: &ToolExecutionContext,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, agens_core::Error> {
+        self.registry
+            .lock()
+            .map_err(|_| agens_core::Error::Tool("MCP tool registry is unavailable".into()))?
+            .call_tool(&self.name, arguments, context)
+    }
+}
+
 fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), CliError> {
     if cancellation.is_cancelled() {
         return Err(CliError::runtime(HeadlessTurnError::Cancelled));
@@ -756,18 +909,21 @@ fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), Cl
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct AllowedNativeCall {
     name: String,
     input: String,
+    handle: AuthorizedToolCall,
 }
+
+type SharedToolDispatcher = Arc<Mutex<ToolDispatcher>>;
 
 struct ProductionPermissionGate {
     policy: PermissionPolicy,
     grants: Vec<agens_core::ProjectPermissionGrant>,
     session: PermissionSession,
     project: String,
-    allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+    dispatcher: SharedToolDispatcher,
+    allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
 }
 
 impl ProductionPermissionGate {
@@ -776,13 +932,15 @@ impl ProductionPermissionGate {
         grants: Vec<agens_core::ProjectPermissionGrant>,
         session: PermissionSession,
         project: String,
-        allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+        dispatcher: SharedToolDispatcher,
+        allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
     ) -> Self {
         Self {
             policy,
             grants,
             session,
             project,
+            dispatcher,
             allowed,
         }
     }
@@ -795,11 +953,25 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
-        let request = native_permission_request(&self.project, call);
-        let decision =
-            request.map(|request| self.policy.evaluate(&request, &self.grants, &self.session));
-        let result = match decision {
-            Ok(PermissionDecision::Allow) => self
+        let result = match self
+            .dispatcher
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Permission)
+            .and_then(|dispatcher| {
+                dispatcher
+                    .evaluate(
+                        &self.policy,
+                        &self.grants,
+                        &self.session,
+                        ToolDispatchRequest::new(
+                            &self.project,
+                            &call.name,
+                            parse_tool_input(call)?,
+                        ),
+                    )
+                    .map_err(|_| HeadlessTurnPortError::Permission)
+            }) {
+            Ok(ToolEvaluationOutcome::Authorized(handle)) => self
                 .allowed
                 .lock()
                 .map_err(|_| HeadlessTurnPortError::Permission)
@@ -809,12 +981,14 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                         AllowedNativeCall {
                             name: call.name.clone(),
                             input: call.input.clone(),
+                            handle,
                         },
                     );
                     PermissionDecision::Allow
                 }),
-            Ok(decision) => Ok(decision),
-            Err(()) => Ok(PermissionDecision::Deny),
+            Ok(ToolEvaluationOutcome::Denied) => Ok(PermissionDecision::Deny),
+            Ok(ToolEvaluationOutcome::PromptRequired(_)) => Ok(PermissionDecision::Ask),
+            Err(error) => Err(error),
         };
         std::future::ready(result)
     }
@@ -834,16 +1008,19 @@ impl HeadlessPermissionResolver for ProductionPermissionResolver {
 }
 
 struct ProductionToolDispatcher {
-    catalog: NativeToolCatalog,
-    allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+    dispatcher: SharedToolDispatcher,
+    allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
 }
 
 impl ProductionToolDispatcher {
     fn new(
-        catalog: NativeToolCatalog,
-        allowed: std::sync::Arc<std::sync::Mutex<BTreeMap<String, AllowedNativeCall>>>,
+        dispatcher: SharedToolDispatcher,
+        allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
     ) -> Self {
-        Self { catalog, allowed }
+        Self {
+            dispatcher,
+            allowed,
+        }
     }
 }
 
@@ -863,17 +1040,23 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
             if allowed.name != call.name || allowed.input != call.input {
                 return Err(HeadlessTurnPortError::Tool);
             }
-            let arguments =
-                serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Tool)?;
-            self.catalog
+            self.dispatcher
+                .lock()
+                .map_err(|_| HeadlessTurnPortError::Tool)?
                 .execute(
-                    &call.name,
-                    arguments,
+                    allowed.handle,
                     &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
                 )
-                .map(|output| HeadlessToolOutput {
-                    content: output.content,
-                    is_error: output.is_error,
+                .map(|output| {
+                    let content = if output.is_error {
+                        "tool execution failed".to_owned()
+                    } else {
+                        output.content
+                    };
+                    HeadlessToolOutput {
+                        content,
+                        is_error: output.is_error,
+                    }
                 })
                 .map_err(|_| HeadlessTurnPortError::Tool)
         });
@@ -923,25 +1106,8 @@ fn native_tool_name(name: &str) -> Result<&'static str, CliError> {
     }
 }
 
-fn native_permission_request(
-    project: &str,
-    call: &HeadlessToolCall,
-) -> Result<PermissionRequest, ()> {
-    let access = NativeToolCatalog::metadata()
-        .into_iter()
-        .find(|tool| tool.qualified_name == call.name)
-        .map(|tool| tool.access)
-        .ok_or(())?;
-    let input = serde_json::from_str::<serde_json::Value>(&call.input).map_err(|_| ())?;
-    let target = match call.name.as_str() {
-        "native::read" | "native::write" | "native::list" | "native::search" => {
-            input.get("path").and_then(serde_json::Value::as_str)
-        }
-        "native::bash" => input.get("command").and_then(serde_json::Value::as_str),
-        _ => None,
-    }
-    .ok_or(())?;
-    Ok(PermissionRequest::new(project, &call.name, target, access))
+fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {
+    serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Permission)
 }
 
 fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> Result<T, CliError> {

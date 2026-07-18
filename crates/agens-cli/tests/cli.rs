@@ -1543,6 +1543,214 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
     server.join();
 }
 
+#[test]
+fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persists() {
+    let temporary = TemporaryDirectory::new("production-mcp-composition");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "native::read".to_owned(),
+                "files::first".to_owned(),
+                "files::second".to_owned(),
+            ],
+            response: native_tool_call_response("call_mcp", "files::first", r#"{}"#),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_mcp\"".to_owned(),
+                "tool succeeded".to_owned(),
+            ],
+            response: text_response("MCP tool completed"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
+            server.base_url(),
+            data_directory.display(),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "chat",
+            "--dangerously-allow-all",
+            "call the configured MCP tool",
+        ])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "MCP tool completed\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!diagnostics.contains("SENTINEL_MCP_PROTOCOL"));
+    assert!(!diagnostics.contains("SENTINEL_MCP_STDERR"));
+    assert_eq!(
+        String::from_utf8_lossy(
+            &Command::new(env!("CARGO_BIN_EXE_agens"))
+                .args(["sessions", "list"])
+                .current_dir(&project_root)
+                .env("AGENS_CONFIG_HOME", &config_home)
+                .output()
+                .expect("sessions command should execute")
+                .stdout,
+        ),
+        "ID\tEVENTS\n1\t10 event(s)\n"
+    );
+
+    server.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn production_binary_cancels_configured_mcp_call_without_continuing_or_persisting() {
+    let temporary = TemporaryDirectory::new("production-mcp-cancel");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let call_ready = temporary.path().join("mcp-call-ready");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["files::first".to_owned()],
+        response: native_tool_call_response("call_mcp_cancel", "files::first", r#"{}"#),
+    }]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-sleep\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            call_ready.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "chat",
+            "--dangerously-allow-all",
+            "cancel configured MCP tool",
+        ])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("production binary should start");
+    wait_for_path(&call_ready, Duration::from_secs(2));
+
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("SIGINT command should execute")
+            .success()
+    );
+    let output = wait_for_child_output(child, Duration::from_secs(2));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: cancelled: headless turn was cancelled\n"
+    );
+    assert_no_saved_sessions(&project_root, &config_home);
+
+    server.join();
+}
+
+#[test]
+fn production_binary_sanitizes_mcp_environment_stderr_and_error_output() {
+    let temporary = TemporaryDirectory::new("production-mcp-secrets");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["files::first".to_owned()],
+            response: native_tool_call_response("call_mcp_error", "files::first", r#"{}"#),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_mcp_error\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+            ],
+            response: text_response("MCP failure handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-error\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_TOOL_ERROR_SECRET = \"SENTINEL_MCP_REMOTE_BODY\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
+            server.base_url(),
+            data_directory.display(),
+            env!("CARGO_BIN_EXE_fake-mcp-child"),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "--dangerously-allow-all", "run failing MCP tool"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "MCP failure handled\n"
+    );
+    for secret in [
+        "SENTINEL_OPENAI_API_KEY",
+        "SENTINEL_MCP_REMOTE_BODY",
+        "SENTINEL_MCP_STDERR",
+    ] {
+        assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
+    }
+    let snapshot = SessionStore::open(&data_directory)
+        .expect("session store should open")
+        .load_completed_turn_for_resume(1)
+        .expect("completed session should be readable");
+    assert!(!format!("{snapshot:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
+
+    server.join();
+}
+
 struct LocalProvider {
     iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
 }

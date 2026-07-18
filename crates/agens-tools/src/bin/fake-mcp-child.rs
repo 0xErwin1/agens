@@ -81,8 +81,13 @@ fn main() {
         if mode == "stderr-flood" {
             let _ = io::stderr().write_all(&vec![b'x'; 128 * 1024]);
         }
+        if let Some(secret) = std::env::var_os("FAKE_MCP_STDERR_SECRET") {
+            let _ = writeln!(io::stderr(), "{secret:?}");
+        }
         if mode == "malformed" {
-            let _ = writeln!(stdout, "not-json");
+            let frame =
+                std::env::var("FAKE_MCP_PROTOCOL_SECRET").unwrap_or_else(|_| "not-json".into());
+            let _ = writeln!(stdout, "{frame}");
             let _ = stdout.flush();
             continue;
         }
@@ -112,15 +117,24 @@ fn main() {
                     .and_then(Value::as_str)
                     .is_none() =>
             {
-                json!({"jsonrpc":"2.0","id":response_id,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}],"nextCursor":"next"}})
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"tools":[{"name":"first","description":"Read the fake MCP fixture","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}],"nextCursor":"next"}})
             }
             Some("tools/list") => {
-                json!({"jsonrpc":"2.0","id":response_id,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}]}})
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"tools":[{"name":"second","description":"Write the fake MCP fixture","inputSchema":{"type":"object"}}]}})
             }
             Some("tools/call") if mode == "call-error" => {
-                json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":"tool failed"}],"isError":true}})
+                let text = std::env::var("FAKE_MCP_TOOL_ERROR_SECRET")
+                    .unwrap_or_else(|_| "tool failed".into());
+                json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":text}],"isError":true}})
             }
             Some("tools/call") => {
+                if let Some(path) = std::env::var_os("FAKE_MCP_CALL_READY") {
+                    std::fs::write(path, "called")
+                        .expect("fake MCP call readiness should be recorded");
+                }
+                if mode == "call-sleep" {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
                 json!({"jsonrpc":"2.0","id":response_id,"result":{"content":[{"type":"text","text":"tool succeeded"}]}})
             }
             _ => continue,
