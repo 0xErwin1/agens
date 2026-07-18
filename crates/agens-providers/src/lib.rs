@@ -24,8 +24,9 @@ const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
-const MAX_CHATGPT_REPLAY_ITEMS: usize = 256;
+const MAX_CHATGPT_REPLAY_ITEMS: usize = 512;
 const MAX_CHATGPT_REPLAY_ITEM_BYTES: usize = 64 * 1024;
+const MAX_CHATGPT_REPLAY_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_OAUTH_URL: &str = "https://auth.openai.com/oauth/token";
@@ -608,12 +609,17 @@ impl TurnProvider for ChatGptResponsesProvider {
                 pending_calls,
                 event_cursor,
             } => {
+                if self.continuation_rounds >= MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
+                    return Err(HeadlessTurnPortError::Provider);
+                }
                 let Some(new_events) = events.get(event_cursor..) else {
                     return Err(HeadlessTurnPortError::Provider);
                 };
                 let outputs = correlated_tool_outputs(&pending_calls, new_events)
                     .map_err(|()| HeadlessTurnPortError::Provider)?;
                 replay_history.extend(outputs);
+                validate_chatgpt_replay_history(&replay_history)
+                    .map_err(|()| HeadlessTurnPortError::Provider)?;
                 (self.request_payload(replay_history.clone()), replay_history)
             }
             ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
@@ -669,11 +675,12 @@ impl TurnProvider for ChatGptResponsesProvider {
 
         let mut replay_history = replay_history;
         replay_history.extend(response.replay_items);
-        if response.pending_calls.is_empty() {
-            self.state = ChatGptContinuationState::Completed;
-        } else if self.continuation_rounds == MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
+        if validate_chatgpt_replay_history(&replay_history).is_err() {
             self.state = ChatGptContinuationState::Failed;
             return Err(HeadlessTurnPortError::Provider);
+        }
+        if response.pending_calls.is_empty() {
+            self.state = ChatGptContinuationState::Completed;
         } else {
             self.continuation_rounds += 1;
             self.state = ChatGptContinuationState::AwaitingToolOutputs {
@@ -897,6 +904,26 @@ fn correlated_tool_outputs(
             }))
         })
         .collect()
+}
+
+fn validate_chatgpt_replay_history(history: &[Value]) -> Result<(), ()> {
+    if history.len() > MAX_CHATGPT_REPLAY_ITEMS {
+        return Err(());
+    }
+
+    let mut bytes = 0_usize;
+    for item in history {
+        let item_bytes = serde_json::to_vec(item).map_err(|_| ())?;
+        if item_bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES {
+            return Err(());
+        }
+        bytes = bytes.checked_add(item_bytes.len()).ok_or(())?;
+        if bytes > MAX_CHATGPT_REPLAY_HISTORY_BYTES {
+            return Err(());
+        }
+    }
+
+    Ok(())
 }
 
 fn bounded_tool_output(content: &str) -> String {
@@ -1173,6 +1200,8 @@ struct OpenAiResponseDecoder {
     function_call_order: Vec<String>,
     completed_calls: BTreeMap<String, PendingToolCall>,
     replay_items: Vec<Value>,
+    replay_item_positions: BTreeMap<String, usize>,
+    completed_function_output_item_ids: BTreeSet<String>,
     require_encrypted_reasoning: bool,
     completed: bool,
 }
@@ -1268,10 +1297,35 @@ impl OpenAiResponseDecoder {
     fn process_output_item(&mut self, event: &Value) -> Result<(), Error> {
         let item = required_object(event, "item")?;
 
-        if required_string(item, "type")? != "reasoning" {
-            return Ok(());
+        match required_string(item, "type")? {
+            "reasoning" => self.process_reasoning_item(item)?,
+            "message" => {
+                required_nonempty_string(item, "id")?;
+                required_string(item, "role")?;
+                required_array(item, "content")?;
+                if self.require_encrypted_reasoning {
+                    self.push_replay_item(item.clone())?;
+                }
+            }
+            "function_call" => {
+                let id = required_nonempty_string(item, "id")?;
+                required_nonempty_string(item, "call_id")?;
+                required_string(item, "name")?;
+                required_string(item, "arguments")?;
+                if self.require_encrypted_reasoning {
+                    self.replace_completed_function_call_replay_item(id, item.clone())?;
+                }
+            }
+            _ if self.require_encrypted_reasoning => {
+                return Err(protocol_error("unsupported replay output item"));
+            }
+            _ => {}
         }
 
+        Ok(())
+    }
+
+    fn process_reasoning_item(&mut self, item: &Value) -> Result<(), Error> {
         let summaries = required_array(item, "summary")?;
 
         for summary in summaries {
@@ -1283,14 +1337,9 @@ impl OpenAiResponseDecoder {
         }
 
         if self.require_encrypted_reasoning {
-            let id = required_nonempty_string(item, "id")?;
-            let encrypted_content = required_nonempty_string(item, "encrypted_content")?;
-            self.push_replay_item(serde_json::json!({
-                "type": "reasoning",
-                "id": id,
-                "summary": summaries,
-                "encrypted_content": encrypted_content,
-            }))?;
+            required_nonempty_string(item, "id")?;
+            required_nonempty_string(item, "encrypted_content")?;
+            self.push_replay_item(item.clone())?;
         }
 
         Ok(())
@@ -1386,13 +1435,42 @@ impl OpenAiResponseDecoder {
     }
 
     fn push_replay_item(&mut self, item: Value) -> Result<(), Error> {
-        if self.replay_items.len() == MAX_CHATGPT_REPLAY_ITEMS
+        let id = required_nonempty_string(&item, "id")?.to_owned();
+        if self.replay_item_positions.contains_key(&id)
+            || self.replay_items.len() == MAX_CHATGPT_REPLAY_ITEMS
             || serde_json::to_vec(&item)
                 .map_or(true, |bytes| bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES)
         {
             return Err(protocol_error("replay output exceeds provider bounds"));
         }
+        self.replay_item_positions
+            .insert(id, self.replay_items.len());
         self.replay_items.push(item);
+        Ok(())
+    }
+
+    fn replace_completed_function_call_replay_item(
+        &mut self,
+        id: &str,
+        item: Value,
+    ) -> Result<(), Error> {
+        let Some(position) = self.replay_item_positions.get(id).copied() else {
+            return Err(protocol_error(
+                "completed function call item was not started",
+            ));
+        };
+        if !self
+            .completed_function_output_item_ids
+            .insert(id.to_owned())
+        {
+            return Err(protocol_error("duplicate replay output item"));
+        }
+        if serde_json::to_vec(&item)
+            .map_or(true, |bytes| bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES)
+        {
+            return Err(protocol_error("replay output exceeds provider bounds"));
+        }
+        self.replay_items[position] = item;
         Ok(())
     }
 }

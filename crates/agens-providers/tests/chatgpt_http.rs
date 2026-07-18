@@ -1129,6 +1129,441 @@ fn subscription_tool_replay_rejects_duplicate_outputs_before_another_http_reques
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
+#[test]
+fn subscription_tool_replay_keeps_completed_message_reasoning_and_calls_in_three_round_order() {
+    let directory = temporary_directory("tool-replay-three-rounds");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(tool_round_sse(
+            &[
+                json!({
+                    "type": "message",
+                    "id": "item_message_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I will check both cities."}],
+                }),
+                json!({
+                    "type": "reasoning",
+                    "id": "item_reasoning_1",
+                    "summary": [{"type": "summary_text", "text": "checking cities"}],
+                    "encrypted_content": "encrypted-reasoning-1",
+                }),
+            ],
+            &[
+                ("item_call_1", "call_1", "weather", r#"{"city":"Paris"}"#),
+                ("item_call_2", "call_2", "weather", r#"{"city":"Rome"}"#),
+            ],
+        )),
+        ScriptedResponse::Sse(tool_round_sse(
+            &[json!({
+                "type": "message",
+                "id": "item_message_2",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "One more check."}],
+            })],
+            &[("item_call_3", "call_3", "weather", r#"{"city":"Berlin"}"#)],
+        )),
+        ScriptedResponse::Sse(completed_text_sse("done")),
+    ]);
+    let mut provider = subscription_provider(&credentials, &server);
+    let cancellation = HeadlessTurnCancellation::new();
+
+    assert!(matches!(
+        run_with_events(&mut provider, &[], cancellation.clone()),
+        Ok(parts) if parts.iter().filter(|part| matches!(part, MessagePart::ToolCall { .. })).count() == 2
+    ));
+    assert!(matches!(
+        run_with_events(
+            &mut provider,
+            &[
+                tool_result("call_2", "Rome is sunny", false),
+                tool_result("call_1", "Paris is rainy", false),
+            ],
+            cancellation.clone(),
+        ),
+        Ok(parts) if parts.iter().any(|part| matches!(part, MessagePart::ToolCall { id, .. } if id == "call_3"))
+    ));
+    assert_eq!(
+        run_with_events(
+            &mut provider,
+            &[
+                tool_result("call_2", "Rome is sunny", false),
+                tool_result("call_1", "Paris is rainy", false),
+                tool_result("call_3", "Berlin is cloudy", false),
+            ],
+            cancellation,
+        ),
+        Ok(vec![MessagePart::Text("done".to_owned())])
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].body["input"],
+        json!([
+            {"role":"user","content":[{"type":"input_text","text":"test input"}]},
+            {"type":"message","id":"item_message_1","role":"assistant","content":[{"type":"output_text","text":"I will check both cities."}]},
+            {"type":"reasoning","id":"item_reasoning_1","summary":[{"type":"summary_text","text":"checking cities"}],"encrypted_content":"encrypted-reasoning-1"},
+            {"type":"function_call","id":"item_call_1","call_id":"call_1","name":"weather","arguments":"{\"city\":\"Paris\"}"},
+            {"type":"function_call","id":"item_call_2","call_id":"call_2","name":"weather","arguments":"{\"city\":\"Rome\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"Paris is rainy"},
+            {"type":"function_call_output","call_id":"call_2","output":"Rome is sunny"},
+        ])
+    );
+    assert_eq!(requests[2].body["input"][7]["id"], "item_message_2");
+    assert_eq!(requests[2].body["input"][8]["call_id"], "call_3");
+    assert_eq!(
+        requests[2].body["input"][9],
+        json!({"type":"function_call_output","call_id":"call_3","output":"Berlin is cloudy"})
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body["store"] == false)
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body.get("previous_response_id").is_none())
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_tool_replay_replaces_added_function_call_with_its_completed_wire_item_once() {
+    let directory = temporary_directory("completed-function-call");
+    let credentials = write_credentials(&directory);
+    let completed_call = json!({
+        "type":"function_call",
+        "id":"item_call_1",
+        "call_id":"call_1",
+        "name":"weather",
+        "arguments":"{\"city\":\"Paris\"}",
+        "status":"completed",
+    });
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {{\"type\":\"response.completed\"}}\n\n",
+            json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item_call_1","call_id":"call_1","name":"weather","arguments":""}}),
+            json!({"type":"response.function_call_arguments.done","item_id":"item_call_1","arguments":"{\"city\":\"Paris\"}"}),
+            json!({"type":"response.output_item.done","item":completed_call}),
+        )),
+        ScriptedResponse::Sse(completed_text_sse("done")),
+    ]);
+    let mut provider = subscription_provider(&credentials, &server);
+
+    assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    assert!(
+        run_with_events(
+            &mut provider,
+            &[tool_result("call_1", "sunny", false)],
+            HeadlessTurnCancellation::new(),
+        )
+        .is_ok()
+    );
+
+    let requests = server.join();
+    let input = requests[1].body["input"]
+        .as_array()
+        .expect("input should be an array");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item["id"] == "item_call_1")
+            .count(),
+        1
+    );
+    assert_eq!(input[1]["status"], "completed");
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_tool_replay_rejects_missing_foreign_duplicate_and_truncated_results_before_http() {
+    for (name, initial_events, continuation_events) in [
+        ("missing", Vec::new(), Vec::new()),
+        (
+            "foreign",
+            Vec::new(),
+            vec![tool_result("foreign", "no", false)],
+        ),
+        (
+            "duplicate",
+            Vec::new(),
+            vec![
+                tool_result("call_1", "first", false),
+                tool_result("call_1", "second", false),
+            ],
+        ),
+        (
+            "truncated",
+            vec![tool_result("earlier", "ignored", false)],
+            Vec::new(),
+        ),
+    ] {
+        let directory = temporary_directory(name);
+        let credentials = write_credentials(&directory);
+        let server = ScriptedServer::start(vec![ScriptedResponse::Sse(tool_call_sse(
+            "item_call_1",
+            "call_1",
+            "weather",
+            r#"{"city":"Paris"}"#,
+        ))]);
+        let mut provider = subscription_provider(&credentials, &server);
+
+        assert!(
+            run_with_events(
+                &mut provider,
+                &initial_events,
+                HeadlessTurnCancellation::new(),
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            run_with_events(
+                &mut provider,
+                &continuation_events,
+                HeadlessTurnCancellation::new(),
+            ),
+            Err(HeadlessTurnPortError::Provider),
+        );
+        assert_eq!(
+            run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+            Err(HeadlessTurnPortError::Provider),
+        );
+        assert_eq!(
+            server.join().len(),
+            1,
+            "{name} must not issue a continuation"
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[test]
+fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_retrying() {
+    for (name, responses, expected_requests) in [
+        (
+            "replayed-id",
+            vec![
+                ScriptedResponse::Sse(tool_round_sse(
+                    &[
+                        json!({"type":"message","id":"item_message","role":"assistant","content":[]}),
+                    ],
+                    &[("item_call_1", "call_1", "weather", "{}")],
+                )),
+                ScriptedResponse::Sse(tool_round_sse(
+                    &[
+                        json!({"type":"message","id":"item_message","role":"assistant","content":[]}),
+                    ],
+                    &[("item_call_2", "call_2", "weather", "{}")],
+                )),
+            ],
+            2,
+        ),
+        (
+            "missing-encrypted-reasoning",
+            vec![ScriptedResponse::Sse(output_item_sse(json!({
+                "type":"reasoning",
+                "id":"item_reasoning",
+                "summary":[],
+            })))],
+            1,
+        ),
+        (
+            "unsupported-item",
+            vec![ScriptedResponse::Sse(output_item_sse(json!({
+                "type":"computer_call",
+                "id":"item_computer",
+            })))],
+            1,
+        ),
+    ] {
+        let directory = temporary_directory(name);
+        let credentials = write_credentials(&directory);
+        let server = ScriptedServer::start(responses);
+        let mut provider = subscription_provider(&credentials, &server);
+
+        if name == "replayed-id" {
+            assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+            assert_eq!(
+                run_with_events(
+                    &mut provider,
+                    &[tool_result("call_1", "first", false)],
+                    HeadlessTurnCancellation::new(),
+                ),
+                Err(HeadlessTurnPortError::Provider),
+            );
+        } else {
+            assert_eq!(
+                run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+                Err(HeadlessTurnPortError::Provider),
+            );
+        }
+        assert_eq!(
+            run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+            Err(HeadlessTurnPortError::Provider),
+        );
+        assert_eq!(
+            server.join().len(),
+            expected_requests,
+            "{name} request count"
+        );
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[test]
+fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
+ {
+    let directory = temporary_directory("error-output");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(tool_call_sse("item_call_1", "call_1", "weather", "{}")),
+        ScriptedResponse::Sse(completed_text_sse("done")),
+    ]);
+    let mut provider = subscription_provider(&credentials, &server);
+    assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    assert!(
+        run_with_events(
+            &mut provider,
+            &[tool_result("call_1", "secret=must-not-leak", true)],
+            HeadlessTurnCancellation::new(),
+        )
+        .is_ok()
+    );
+    let requests = server.join();
+    assert_eq!(
+        requests[1].body["input"][3]["output"],
+        "Tool execution failed"
+    );
+    assert!(
+        !requests[1]
+            .body
+            .to_string()
+            .contains("secret=must-not-leak")
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+
+    let oversized_items = (0..=512)
+        .map(|index| json!({"type":"message","id":format!("item_{index}"),"role":"assistant","content":[]}))
+        .collect::<Vec<_>>();
+    assert_replay_response_rejection(
+        "item-bound",
+        tool_round_sse(&oversized_items, &[("item_call", "call", "weather", "{}")]),
+    );
+
+    let large_content = "x".repeat(65_000);
+    let history_items = (0..65)
+        .map(|index| {
+            json!({
+                "type":"message",
+                "id":format!("history_{index}"),
+                "role":"assistant",
+                "content":[{"type":"output_text","text":large_content}],
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_replay_response_rejection(
+        "history-bound",
+        tool_round_sse(&history_items, &[("item_call", "call", "weather", "{}")]),
+    );
+
+    let directory = temporary_directory("round-bound");
+    let credentials = write_credentials(&directory);
+    let responses = (0..128)
+        .map(|index| {
+            ScriptedResponse::Sse(tool_round_sse(
+                &[],
+                &[(
+                    &format!("item_call_{index}"),
+                    &format!("call_{index}"),
+                    "weather",
+                    "{}",
+                )],
+            ))
+        })
+        .collect::<Vec<_>>();
+    let server = ScriptedServer::start(responses);
+    let mut provider = subscription_provider(&credentials, &server);
+    let mut events = Vec::new();
+    assert!(run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok());
+    for index in 0..127 {
+        events.push(tool_result(&format!("call_{index}"), "ok", false));
+        assert!(run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok());
+    }
+    events.push(tool_result("call_127", "ok", false));
+    assert_eq!(
+        run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider),
+    );
+    assert_eq!(server.join().len(), 128);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_tool_replay_cancellation_and_timeout_stop_second_and_third_rounds() {
+    for (round, cancellation_mode) in [(2, false), (2, true), (3, false), (3, true)] {
+        let directory = temporary_directory(&format!("stop-round-{round}-{cancellation_mode}"));
+        let credentials = write_credentials(&directory);
+        let mut responses = vec![ScriptedResponse::Sse(tool_call_sse(
+            "item_call_1",
+            "call_1",
+            "weather",
+            "{}",
+        ))];
+        if round == 3 {
+            responses.push(ScriptedResponse::Sse(tool_round_sse(
+                &[],
+                &[("item_call_2", "call_2", "weather", "{}")],
+            )));
+        }
+        responses.push(ScriptedResponse::WaitForClientClose);
+        let server = ScriptedServer::start(responses);
+        let mut provider = subscription_provider(&credentials, &server);
+
+        assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+        let mut events = vec![tool_result("call_1", "first", false)];
+        if round == 3 {
+            assert!(
+                run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok()
+            );
+            events.push(tool_result("call_2", "second", false));
+        }
+
+        let cancellation = if cancellation_mode {
+            HeadlessTurnCancellation::new()
+        } else {
+            HeadlessTurnCancellation::with_deadline(Duration::from_millis(25))
+        };
+        let canceller = cancellation_mode.then(|| {
+            let cancellation = cancellation.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(25));
+                cancellation.cancel();
+            })
+        });
+        let expected = if cancellation_mode {
+            HeadlessTurnPortError::Cancelled
+        } else {
+            HeadlessTurnPortError::TimedOut
+        };
+
+        assert_eq!(
+            run_with_events(&mut provider, &events, cancellation),
+            Err(expected),
+        );
+        assert_eq!(
+            run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
+            Err(HeadlessTurnPortError::Provider),
+        );
+        if let Some(canceller) = canceller {
+            canceller.join().expect("canceller should finish");
+        }
+        assert_eq!(server.join().len(), round);
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
 fn provider(credentials: &Path, base_url: &str) -> ChatGptResponsesProvider {
     ChatGptResponsesProvider::from_credentials_with_timeout(
         credentials,
@@ -1139,6 +1574,46 @@ fn provider(credentials: &Path, base_url: &str) -> ChatGptResponsesProvider {
         Duration::from_secs(1),
     )
     .expect("provider should be configured")
+}
+
+fn subscription_provider(credentials: &Path, server: &ScriptedServer) -> ChatGptResponsesProvider {
+    ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+        credentials,
+        Some(&server.responses_base_url()),
+        Some(&server.oauth_url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Vec::new(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+}
+
+fn assert_replay_response_rejection(name: &str, response: String) {
+    let directory = temporary_directory(name);
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Sse(response)]);
+    let mut provider = subscription_provider(&credentials, &server);
+
+    assert_eq!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider),
+    );
+    assert_eq!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider),
+    );
+    assert_eq!(server.join().len(), 1, "{name} must not retry");
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+fn tool_result(call_id: &str, content: &str, is_error: bool) -> agens_core::TurnEvent {
+    agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: call_id.to_owned(),
+        content: content.to_owned(),
+        is_error,
+    })
 }
 
 fn run(
@@ -1277,6 +1752,40 @@ fn tool_call_sse(item_id: &str, call_id: &str, name: &str, arguments: &str) -> S
 
     format!(
         "data: {reasoning}\n\ndata: {added}\n\ndata: {done}\n\ndata: {{\"type\":\"response.completed\"}}\n\n"
+    )
+}
+
+fn tool_round_sse(items: &[Value], calls: &[(&str, &str, &str, &str)]) -> String {
+    let mut events = items
+        .iter()
+        .map(|item| json!({"type": "response.output_item.done", "item": item}).to_string())
+        .collect::<Vec<_>>();
+
+    for (item_id, call_id, name, arguments) in calls {
+        events.push(json!({
+            "type": "response.output_item.added",
+            "item": {"type": "function_call", "id": item_id, "call_id": call_id, "name": name, "arguments": ""},
+        }).to_string());
+        events.push(
+            json!({
+                "type": "response.function_call_arguments.done",
+                "item_id": item_id,
+                "arguments": arguments,
+            })
+            .to_string(),
+        );
+    }
+    events.push(json!({"type": "response.completed"}).to_string());
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+fn output_item_sse(item: Value) -> String {
+    format!(
+        "data: {}\n\ndata: {{\"type\":\"response.completed\"}}\n\n",
+        json!({"type":"response.output_item.done","item":item}),
     )
 }
 
@@ -1437,6 +1946,7 @@ enum ScriptedResponse {
     Json(u16, String),
     Raw(u16, String),
     Sse(String),
+    WaitForClientClose,
 }
 
 struct ScriptedServer {
@@ -1462,6 +1972,7 @@ impl ScriptedServer {
                     ScriptedResponse::Json(status, body) => write_json(&mut stream, status, &body),
                     ScriptedResponse::Raw(status, body) => write_raw(&mut stream, status, &body),
                     ScriptedResponse::Sse(events) => write_sse(&mut stream, &events),
+                    ScriptedResponse::WaitForClientClose => wait_for_client_close(&stream),
                 }
             }
             requests
