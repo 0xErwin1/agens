@@ -231,6 +231,41 @@ fn registers_negotiated_paginated_tools_with_conservative_access() {
 }
 
 #[test]
+fn registry_retains_callable_clients_after_metadata_enumeration() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let transport = LocalTransport::with_responses([
+        Ok(initialized()),
+        Ok(page(vec![tool("status", Some(true))], None)),
+        Ok(McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text("ready".into())],
+            is_error: false,
+        })),
+    ]);
+    let mut registry = McpRegistry::new();
+    assert_eq!(
+        registry.load_server(
+            "server",
+            transport,
+            &initialize(),
+            timeouts(),
+            limits(),
+            cancellation,
+        ),
+        McpServerReport::loaded("server", 1)
+    );
+    assert_eq!(
+        registry
+            .call_tool(
+                "server::status",
+                json!({}),
+                &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::success("ready")
+    );
+}
+
+#[test]
 fn rejects_invalid_schema_negotiation_and_pagination_without_registry_mutation() {
     let cancellation = Arc::new(AtomicBool::new(false));
     let cases = [

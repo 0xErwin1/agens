@@ -8,7 +8,7 @@ use std::{
     process::{Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -1281,6 +1281,79 @@ pub struct McpOperationContext {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionStatus {
+    Cancelled,
+    TimedOut,
+}
+
+impl fmt::Display for ToolExecutionStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("tool execution cancelled"),
+            Self::TimedOut => formatter.write_str("tool execution timed out"),
+        }
+    }
+}
+
+/// Shared cancellation and absolute-deadline contract for every callable tool.
+#[derive(Clone, Debug)]
+pub struct ToolExecutionContext {
+    cancellation: Arc<AtomicBool>,
+    deadline: Instant,
+}
+
+impl ToolExecutionContext {
+    pub fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
+        Self::with_deadline(cancellation, Instant::now() + timeout)
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)), timeout)
+    }
+
+    pub fn with_deadline(cancellation: Arc<AtomicBool>, deadline: Instant) -> Self {
+        Self {
+            cancellation,
+            deadline,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.load(Ordering::Acquire)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    pub fn check(&self) -> Result<(), ToolExecutionStatus> {
+        if self.is_cancelled() {
+            return Err(ToolExecutionStatus::Cancelled);
+        }
+        if self.is_expired() {
+            return Err(ToolExecutionStatus::TimedOut);
+        }
+        Ok(())
+    }
+
+    pub fn remaining(&self) -> Result<Duration, ToolExecutionStatus> {
+        self.check()?;
+        Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn mcp_context(&self) -> McpOperationContext {
+        McpOperationContext {
+            cancellation: Arc::clone(&self.cancellation),
+            deadline: self.deadline,
+        }
+    }
+
+    fn cancellation(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+}
+
 impl McpOperationContext {
     pub fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
         Self {
@@ -1441,6 +1514,7 @@ impl McpServerReport {
 #[derive(Default)]
 pub struct McpRegistry {
     tools: BTreeMap<String, RemoteToolMetadata>,
+    clients: BTreeMap<String, Box<dyn McpCallable>>,
 }
 
 impl McpRegistry {
@@ -1460,7 +1534,7 @@ impl McpRegistry {
         self.tools.get(qualified_name)
     }
 
-    pub fn load_server<T: McpTransport>(
+    pub fn load_server<T: McpTransport + 'static>(
         &mut self,
         server_name: &str,
         transport: T,
@@ -1469,7 +1543,7 @@ impl McpRegistry {
         limits: McpLimits,
         cancellation: Arc<AtomicBool>,
     ) -> McpServerReport {
-        match load_server_metadata(
+        match load_server_client(
             server_name,
             transport,
             initialize.clone(),
@@ -1477,7 +1551,7 @@ impl McpRegistry {
             limits,
             cancellation,
         ) {
-            Ok(metadata)
+            Ok((metadata, client))
                 if !metadata
                     .iter()
                     .any(|tool| self.tools.contains_key(&tool.qualified_name))
@@ -1487,6 +1561,7 @@ impl McpRegistry {
                 for tool in metadata {
                     self.tools.insert(tool.qualified_name.clone(), tool);
                 }
+                self.clients.insert(server_name.into(), Box::new(client));
                 McpServerReport::loaded(server_name, tool_count)
             }
             Ok(_) => McpServerReport::Failed {
@@ -1508,73 +1583,69 @@ impl McpRegistry {
         limits: McpLimits,
         cancellation: Arc<AtomicBool>,
     ) -> Vec<McpServerReport> {
-        let mut workers = servers
+        servers
             .into_iter()
-            .enumerate()
-            .map(|(index, (name, transport))| {
-                let initialize = initialize.clone();
-                let cancellation = Arc::clone(&cancellation);
-                thread::spawn(move || {
-                    (
-                        index,
-                        name.clone(),
-                        load_server_metadata(
-                            &name,
-                            transport,
-                            initialize,
-                            timeouts,
-                            limits,
-                            cancellation,
-                        ),
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut results = workers
-            .drain(..)
-            .map(|worker| {
-                worker
-                    .join()
-                    .expect("cooperative MCP worker must not panic")
-            })
-            .collect::<Vec<_>>();
-        results.sort_by_key(|(index, _, _)| *index);
-        results
-            .into_iter()
-            .map(|(_, name, result)| match result {
-                Ok(metadata)
-                    if !metadata
-                        .iter()
-                        .any(|tool| self.tools.contains_key(&tool.qualified_name))
-                        && !has_duplicate_qualified_name(&metadata) =>
-                {
-                    let tool_count = metadata.len();
-                    for tool in metadata {
-                        self.tools.insert(tool.qualified_name.clone(), tool);
-                    }
-                    McpServerReport::loaded(name, tool_count)
-                }
-                Ok(_) => McpServerReport::Failed {
-                    server_name: name,
-                    message: "mcp protocol error: duplicate qualified MCP tool name".into(),
-                },
-                Err(error) => McpServerReport::Failed {
-                    server_name: name,
-                    message: error.to_string(),
-                },
+            .map(|(name, transport)| {
+                self.load_server(
+                    &name,
+                    transport,
+                    initialize,
+                    timeouts,
+                    limits,
+                    Arc::clone(&cancellation),
+                )
             })
             .collect()
     }
+
+    pub fn call_tool(
+        &mut self,
+        qualified_name: &str,
+        arguments: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, Error> {
+        let metadata = self
+            .tools
+            .get(qualified_name)
+            .ok_or_else(|| Error::Tool("unknown MCP tool".into()))?;
+        let client = self
+            .clients
+            .get_mut(&metadata.server_name)
+            .ok_or_else(|| Error::Tool("unavailable MCP tool".into()))?;
+        client.call(&metadata.tool_name, arguments, context)
+    }
 }
 
-fn load_server_metadata<T: McpTransport>(
+trait McpCallable: Send {
+    fn call(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, Error>;
+}
+
+impl<T: McpTransport> McpCallable for McpClient<T> {
+    fn call(
+        &mut self,
+        tool_name: &str,
+        arguments: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, Error> {
+        self.call_tool_with_context(tool_name, arguments, &context.mcp_context())
+            .map(sanitize_tool_output)
+            .or_else(|_| Ok(ToolOutput::failure("tool infrastructure failure")))
+    }
+}
+
+fn load_server_client<T: McpTransport>(
     server_name: &str,
     transport: T,
     initialize: McpInitialize,
     timeouts: McpTimeouts,
     limits: McpLimits,
     cancellation: Arc<AtomicBool>,
-) -> Result<Vec<RemoteToolMetadata>, McpTransportError> {
+) -> Result<(Vec<RemoteToolMetadata>, McpClient<T>), McpTransportError> {
     validate_server_name(server_name)?;
     let mut client = McpClient::new(transport, timeouts, limits);
     let result = client
@@ -1586,8 +1657,13 @@ fn load_server_metadata<T: McpTransport>(
                 .map(|tool| remote_tool_metadata(server_name, tool))
                 .collect()
         });
-    client.close();
-    result
+    match result {
+        Ok(metadata) => Ok((metadata, client)),
+        Err(error) => {
+            client.close();
+            Err(error)
+        }
+    }
 }
 
 pub struct McpClient<T: McpTransport> {
@@ -1694,6 +1770,35 @@ impl<T: McpTransport> McpClient<T> {
                 arguments,
             },
             &context,
+        )? {
+            McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
+            McpResponse::ProtocolError(error) => Ok(ToolOutput::failure(format!(
+                "mcp protocol error {}: {}",
+                error.code, error.message
+            ))),
+            _ => Err(McpTransportError::Protocol(
+                "expected tools/call result".into(),
+            )),
+        }
+    }
+
+    fn call_tool_with_context(
+        &mut self,
+        name: impl Into<String>,
+        arguments: Value,
+        context: &McpOperationContext,
+    ) -> Result<ToolOutput, McpTransportError> {
+        if !arguments.is_object() {
+            return Ok(ToolOutput::failure(
+                "mcp: tool arguments must be a JSON object",
+            ));
+        }
+        match self.request(
+            McpRequest::CallTool {
+                name: name.into(),
+                arguments,
+            },
+            context,
         )? {
             McpResponse::ToolCalled(result) => Ok(map_call_result(result)),
             McpResponse::ProtocolError(error) => Ok(ToolOutput::failure(format!(
@@ -1868,7 +1973,11 @@ pub struct ToolOutput {
 }
 
 pub trait DispatchTool: Send {
-    fn execute(&mut self, arguments: Value) -> Result<ToolOutput, Error>;
+    fn execute(
+        &mut self,
+        context: &ToolExecutionContext,
+        arguments: Value,
+    ) -> Result<ToolOutput, Error>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1914,8 +2023,29 @@ pub enum ToolDispatchOutcome {
     Executed(ToolOutput),
 }
 
+#[derive(Debug)]
+pub enum ToolEvaluationOutcome {
+    Denied,
+    PromptRequired(PermissionPromptContext),
+    Authorized(AuthorizedToolCall),
+}
+
+/// Opaque proof that a specific registered tool was authorized for one request.
+/// Its fields are deliberately private: callers cannot construct or alter a call.
+#[derive(Debug)]
+pub struct AuthorizedToolCall {
+    dispatcher_id: u64,
+    registration_version: u64,
+    qualified_tool_name: String,
+    projected_target: String,
+    access: ToolAccess,
+    arguments: Value,
+    arguments_digest: u64,
+}
+
 struct RegisteredDispatchTool {
     access: ToolAccess,
+    version: u64,
     tool: Box<dyn DispatchTool>,
 }
 
@@ -1923,11 +2053,18 @@ struct RegisteredDispatchTool {
 pub struct ToolDispatcher {
     native_tools: BTreeMap<String, RegisteredDispatchTool>,
     mcp_tools: BTreeMap<String, RegisteredDispatchTool>,
+    dispatcher_id: u64,
+    next_version: u64,
 }
 
 impl ToolDispatcher {
     pub fn new() -> Self {
-        Self::default()
+        static NEXT_DISPATCHER_ID: AtomicUsize = AtomicUsize::new(1);
+        Self {
+            dispatcher_id: NEXT_DISPATCHER_ID.fetch_add(1, Ordering::AcqRel) as u64,
+            next_version: 1,
+            ..Self::default()
+        }
     }
 
     pub fn register_native(
@@ -1938,7 +2075,8 @@ impl ToolDispatcher {
     ) -> Result<(), Error> {
         let name = name.into();
         self.ensure_available_name(&name)?;
-        Self::insert(&mut self.native_tools, name, access, tool);
+        let version = self.allocate_version();
+        Self::insert(&mut self.native_tools, name, access, version, tool);
         Ok(())
     }
 
@@ -1948,26 +2086,47 @@ impl ToolDispatcher {
         tool: impl DispatchTool + 'static,
     ) -> Result<(), Error> {
         self.ensure_available_name(&metadata.qualified_name)?;
+        let version = self.allocate_version();
         Self::insert(
             &mut self.mcp_tools,
             metadata.qualified_name.clone(),
             remote_tool_access(metadata.access),
+            version,
             tool,
         );
         Ok(())
     }
 
-    pub fn dispatch(
+    /// Replaces an existing native implementation while invalidating prior authorizations.
+    pub fn replace_native(
         &mut self,
+        name: impl Into<String>,
+        access: ToolAccess,
+        tool: impl DispatchTool + 'static,
+    ) {
+        let name = name.into();
+        let version = self.allocate_version();
+        self.native_tools.insert(
+            name,
+            RegisteredDispatchTool {
+                access,
+                version,
+                tool: Box::new(tool),
+            },
+        );
+    }
+
+    pub fn evaluate(
+        &self,
         policy: &PermissionPolicy,
         grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
         request: ToolDispatchRequest,
-    ) -> Result<ToolDispatchOutcome, Error> {
+    ) -> Result<ToolEvaluationOutcome, Error> {
         let registered = self
             .native_tools
-            .get_mut(&request.permission.tool)
-            .or_else(|| self.mcp_tools.get_mut(&request.permission.tool))
+            .get(&request.permission.tool)
+            .or_else(|| self.mcp_tools.get(&request.permission.tool))
             .ok_or_else(|| Error::Tool(format!("unknown tool: {}", request.permission.tool)))?;
         let mut permission = request.permission;
         permission.access = registered.access;
@@ -1978,14 +2137,57 @@ impl ToolDispatcher {
         };
 
         match policy.evaluate(&permission, grants, session) {
-            PermissionDecision::Deny => Ok(ToolDispatchOutcome::Denied),
-            PermissionDecision::Ask => Ok(ToolDispatchOutcome::PromptRequired(
+            PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),
+            PermissionDecision::Ask => Ok(ToolEvaluationOutcome::PromptRequired(
                 PermissionPromptContext::from_request(&permission),
             )),
-            PermissionDecision::Allow => registered
-                .tool
-                .execute(request.arguments)
-                .map(ToolDispatchOutcome::Executed),
+            PermissionDecision::Allow => {
+                Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
+                    dispatcher_id: self.dispatcher_id,
+                    registration_version: registered.version,
+                    qualified_tool_name: permission.tool,
+                    projected_target: permission.target,
+                    access: permission.access,
+                    arguments_digest: digest_arguments(&request.arguments),
+                    arguments: request.arguments,
+                }))
+            }
+        }
+    }
+
+    pub fn execute(
+        &mut self,
+        handle: AuthorizedToolCall,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, Error> {
+        if handle.dispatcher_id != self.dispatcher_id {
+            return Err(Error::Tool("invalid authorized tool call".into()));
+        }
+        if let Err(status) = context.check() {
+            return Ok(sanitized_execution_status(status));
+        }
+
+        let registered = self
+            .native_tools
+            .get_mut(&handle.qualified_tool_name)
+            .or_else(|| self.mcp_tools.get_mut(&handle.qualified_tool_name))
+            .ok_or_else(|| Error::Tool("stale authorized tool call".into()))?;
+        if registered.version != handle.registration_version
+            || registered.access != handle.access
+            || digest_arguments(&handle.arguments) != handle.arguments_digest
+            || handle.projected_target.is_empty() && handle.access == ToolAccess::Write
+        {
+            return Err(Error::Tool("stale authorized tool call".into()));
+        }
+
+        match registered.tool.execute(context, handle.arguments) {
+            Ok(output) => {
+                if let Err(status) = context.check() {
+                    return Ok(sanitized_execution_status(status));
+                }
+                Ok(sanitize_tool_output(output))
+            }
+            Err(_) => Ok(ToolOutput::failure("tool infrastructure failure")),
         }
     }
 
@@ -2004,16 +2206,47 @@ impl ToolDispatcher {
         registry: &mut BTreeMap<String, RegisteredDispatchTool>,
         name: String,
         access: ToolAccess,
+        version: u64,
         tool: impl DispatchTool + 'static,
     ) {
         registry.insert(
             name,
             RegisteredDispatchTool {
                 access,
+                version,
                 tool: Box::new(tool),
             },
         );
     }
+
+    fn allocate_version(&mut self) -> u64 {
+        let version = self.next_version;
+        self.next_version = self.next_version.saturating_add(1);
+        version
+    }
+}
+
+fn digest_arguments(arguments: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    arguments.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn sanitized_execution_status(status: ToolExecutionStatus) -> ToolOutput {
+    match status {
+        ToolExecutionStatus::Cancelled => ToolOutput::failure("tool execution cancelled"),
+        ToolExecutionStatus::TimedOut => ToolOutput::failure("tool execution timed out"),
+    }
+}
+
+fn sanitize_tool_output(mut output: ToolOutput) -> ToolOutput {
+    const MAX_MODEL_VISIBLE_OUTPUT: usize = 16 * 1024;
+    if output.content.len() > MAX_MODEL_VISIBLE_OUTPUT {
+        output.content.truncate(MAX_MODEL_VISIBLE_OUTPUT);
+        output.content.push_str("\n[output truncated]");
+    }
+    output
 }
 
 fn remote_tool_access(access: RemoteToolAccess) -> ToolAccess {
@@ -2470,6 +2703,117 @@ impl NativeTools {
         } else {
             Err(ToolOutput::failure("path: traversal is not allowed"))
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeToolMetadata {
+    pub qualified_name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub access: ToolAccess,
+}
+
+/// Canonical production catalog for the built-in project-confined tools.
+#[derive(Debug)]
+pub struct NativeToolCatalog {
+    tools: NativeTools,
+}
+
+impl NativeToolCatalog {
+    pub fn new(tools: NativeTools) -> Self {
+        Self { tools }
+    }
+
+    pub fn metadata() -> Vec<NativeToolMetadata> {
+        vec![
+            native_metadata(
+                "native::read",
+                "Read a UTF-8 file beneath the project root",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::write",
+                "Write a file beneath the project root",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::list",
+                "List a directory beneath the project root",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::search",
+                "Search text beneath the project root",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path","query"],"properties":{"path":{"type":"string"},"query":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::bash",
+                "Run a bounded shell command in the project root",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"}}}),
+            ),
+        ]
+    }
+
+    pub fn execute(
+        &self,
+        name: &str,
+        arguments: Value,
+        context: &ToolExecutionContext,
+    ) -> Result<ToolOutput, Error> {
+        if let Err(status) = context.check() {
+            return Ok(sanitized_execution_status(status));
+        }
+        let arguments = arguments
+            .as_object()
+            .ok_or_else(|| Error::Tool("native tool arguments must be an object".into()))?;
+        let string = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::Tool("native tool arguments are invalid".into()))
+        };
+        let output = match name {
+            "native::read" => self.tools.read_file(ReadFileInput::new(string("path")?))?,
+            "native::write" => self
+                .tools
+                .write_file(WriteFileInput::new(string("path")?, string("content")?))?,
+            "native::list" => self
+                .tools
+                .list_directory(ListDirectoryInput::new(string("path")?))?,
+            "native::search" => self
+                .tools
+                .search(SearchInput::new(string("path")?, string("query")?))?,
+            "native::bash" => self.tools.bash(
+                BashInput::new(string("command")?)
+                    .with_timeout(context.remaining().unwrap_or_default())
+                    .with_cancellation(context.cancellation()),
+            )?,
+            _ => return Err(Error::Tool("unknown native tool".into())),
+        };
+        if let Err(status) = context.check() {
+            return Ok(sanitized_execution_status(status));
+        }
+        Ok(sanitize_tool_output(output))
+    }
+}
+
+fn native_metadata(
+    qualified_name: &str,
+    description: &str,
+    access: ToolAccess,
+    input_schema: Value,
+) -> NativeToolMetadata {
+    NativeToolMetadata {
+        qualified_name: qualified_name.into(),
+        description: description.into(),
+        input_schema,
+        access,
     }
 }
 

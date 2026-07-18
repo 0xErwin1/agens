@@ -9,9 +9,10 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, ListDirectoryInput, NativeToolLimits, NativeTools, ReadFileInput, SearchInput,
-    ToolOutput, WriteFileInput,
+    BashInput, ListDirectoryInput, NativeToolCatalog, NativeToolLimits, NativeTools, ReadFileInput,
+    SearchInput, ToolExecutionContext, ToolOutput, WriteFileInput,
 };
+use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -310,4 +311,29 @@ fn final_symlink_replacement_never_redirects_a_write_outside_the_project() {
     flipper.join().unwrap();
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
+    let root = project_root();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let metadata = NativeToolCatalog::metadata();
+    assert_eq!(metadata.len(), 5);
+    assert!(metadata.iter().all(|tool| {
+        tool.qualified_name.starts_with("native::")
+            && tool.input_schema["type"] == "object"
+            && tool.input_schema["additionalProperties"] == false
+    }));
+
+    let cancellation = Arc::new(AtomicBool::new(true));
+    let output = catalog
+        .execute(
+            "native::bash",
+            json!({"command": "printf SECRET_SENTINEL"}),
+            &ToolExecutionContext::new(cancellation, Duration::from_secs(1)),
+        )
+        .unwrap();
+    assert_eq!(output, ToolOutput::failure("tool execution cancelled"));
+    assert!(!output.content.contains("SECRET_SENTINEL"));
+    fs::remove_dir_all(root).unwrap();
 }

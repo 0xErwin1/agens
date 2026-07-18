@@ -2,62 +2,50 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use agens_core::{
     Error, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
     PermissionRequest, PermissionRule, PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use agens_tools::{
-    DispatchTool, RemoteToolAccess, RemoteToolMetadata, ToolDispatchOutcome, ToolDispatchRequest,
-    ToolDispatcher, ToolOutput,
+    DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext,
+    ToolOutput,
 };
 use serde_json::json;
 
-struct CountingTool {
-    calls: Arc<AtomicUsize>,
-    result: Result<ToolOutput, Error>,
-}
+struct CountingTool(Arc<AtomicUsize>, Result<ToolOutput, Error>);
 
 impl DispatchTool for CountingTool {
-    fn execute(&mut self, _: serde_json::Value) -> Result<ToolOutput, Error> {
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        self.result.clone()
+    fn execute(
+        &mut self,
+        _: &ToolExecutionContext,
+        _: serde_json::Value,
+    ) -> Result<ToolOutput, Error> {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        self.1.clone()
     }
 }
 
-fn request(project: &str, tool: &str, target: &str, access: ToolAccess) -> ToolDispatchRequest {
+fn request(project: &str, tool: &str, target: &str) -> ToolDispatchRequest {
     ToolDispatchRequest::new(
-        PermissionRequest::new(project, tool, target, access),
-        json!({}),
+        PermissionRequest::new(project, tool, target, ToolAccess::Write),
+        json!({"secret": "SECRET_SENTINEL"}),
     )
 }
 
 #[test]
-fn deny_and_ask_do_not_execute_native_or_mcp_tools() {
-    let native_calls = Arc::new(AtomicUsize::new(0));
-    let mcp_calls = Arc::new(AtomicUsize::new(0));
+fn deny_and_ask_never_return_an_executable_capability() {
+    let calls = Arc::new(AtomicUsize::new(0));
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native(
             "native::edit",
             ToolAccess::Write,
-            CountingTool {
-                calls: Arc::clone(&native_calls),
-                result: Ok(ToolOutput::success("native")),
-            },
+            CountingTool(Arc::clone(&calls), Ok(ToolOutput::success("ran"))),
         )
         .unwrap();
-    dispatcher
-        .register_mcp(
-            &remote_metadata("server::write", RemoteToolAccess::Write),
-            CountingTool {
-                calls: Arc::clone(&mcp_calls),
-                result: Ok(ToolOutput::success("mcp")),
-            },
-        )
-        .unwrap();
-
-    let deny_policy = PermissionPolicy::new(
+    let deny = PermissionPolicy::new(
         PermissionMode::Edit,
         vec![PermissionRule::global(
             PermissionDecision::Deny,
@@ -65,253 +53,129 @@ fn deny_and_ask_do_not_execute_native_or_mcp_tools() {
             PermissionPattern::Any,
         )],
     );
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &deny_policy,
-                &[],
-                &PermissionSession::new(),
-                request("project-a", "native::edit", "src/lib.rs", ToolAccess::Write),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::Denied
-    );
-
-    let ask_policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &ask_policy,
-                &[],
-                &PermissionSession::new(),
-                request("project-a", "server::write", "remote", ToolAccess::Write),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::PromptRequired(agens_tools::PermissionPromptContext {
-            project_id: "project-a".into(),
-            qualified_tool_name: "server::write".into(),
-            target_identifier: "remote".into(),
-            access: ToolAccess::Write,
-            reason: "permission policy requires confirmation".into(),
-        })
-    );
-
-    assert_eq!(native_calls.load(Ordering::Acquire), 0);
-    assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        dispatcher.evaluate(
+            &deny,
+            &[],
+            &PermissionSession::new(),
+            request("p", "native::edit", "a")
+        ),
+        Ok(ToolEvaluationOutcome::Denied)
+    ));
+    assert!(matches!(
+        dispatcher.evaluate(
+            &PermissionPolicy::new(PermissionMode::Edit, vec![]),
+            &[],
+            &PermissionSession::new(),
+            request("p", "native::edit", "a")
+        ),
+        Ok(ToolEvaluationOutcome::PromptRequired(_))
+    ));
+    assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
 #[test]
-fn scoped_grants_and_session_bypass_dispatch_without_weakening_restrictions() {
+fn grant_authorizes_once_and_execution_receives_sanitized_infrastructure_failure() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native(
             "native::edit",
             ToolAccess::Write,
-            CountingTool {
-                calls: Arc::clone(&calls),
-                result: Ok(ToolOutput::failure("tool rejected input")),
-            },
+            CountingTool(
+                Arc::clone(&calls),
+                Err(Error::Extension("SECRET_SENTINEL stderr".into())),
+            ),
         )
         .unwrap();
-
-    let policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
     let grant = ProjectPermissionGrant::allow(
-        "project-a",
+        "p",
         PermissionPattern::Exact("native::edit".into()),
-        PermissionPattern::Exact("src/lib.rs".into()),
-    );
-
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &policy,
-                std::slice::from_ref(&grant),
-                &PermissionSession::new(),
-                request("project-a", "native::edit", "src/lib.rs", ToolAccess::Write),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::Executed(ToolOutput::failure("tool rejected input"))
-    );
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &policy,
-                &[grant],
-                &PermissionSession::new(),
-                request("project-b", "native::edit", "src/lib.rs", ToolAccess::Write),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::PromptRequired(agens_tools::PermissionPromptContext {
-            project_id: "project-b".into(),
-            qualified_tool_name: "native::edit".into(),
-            target_identifier: "src/lib.rs".into(),
-            access: ToolAccess::Write,
-            reason: "permission policy requires confirmation".into(),
-        })
-    );
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &policy,
-                &[],
-                &PermissionSession::with_temporary_bypass(),
-                request("project-b", "native::edit", "src/lib.rs", ToolAccess::Write),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::Executed(ToolOutput::failure("tool rejected input"))
-    );
-
-    let restricted_policy = PermissionPolicy::new(PermissionMode::Chat, Vec::new());
-    let restricted_grant = ProjectPermissionGrant::allow(
-        "project-a",
-        PermissionPattern::Exact("native::edit".into()),
-        PermissionPattern::Exact("src/lib.rs".into()),
-    );
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &restricted_policy,
-                &[restricted_grant],
-                &PermissionSession::with_temporary_bypass(),
-                request(
-                    "project-a",
-                    "native::edit",
-                    "src/lib.rs",
-                    ToolAccess::ReadOnly,
-                ),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::Denied
-    );
-
-    assert_eq!(calls.load(Ordering::Acquire), 2);
-}
-
-#[test]
-fn infrastructure_failures_remain_distinct_from_model_visible_tool_failures() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let mut dispatcher = ToolDispatcher::new();
-    dispatcher
-        .register_mcp(
-            &remote_metadata("server::status", RemoteToolAccess::ReadOnly),
-            CountingTool {
-                calls: Arc::clone(&calls),
-                result: Err(Error::Extension("transport unavailable".into())),
-            },
-        )
-        .unwrap();
-
-    let policy = PermissionPolicy::new(PermissionMode::Edit, Vec::new());
-    let grant = ProjectPermissionGrant::allow(
-        "project-a",
-        PermissionPattern::Exact("server::status".into()),
         PermissionPattern::Any,
     );
-
-    assert_eq!(
-        dispatcher.dispatch(
-            &policy,
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &PermissionPolicy::new(PermissionMode::Edit, vec![]),
             &[grant],
             &PermissionSession::new(),
-            request(
-                "project-a",
-                "server::status",
-                "remote",
-                ToolAccess::ReadOnly,
-            ),
-        ),
-        Err(Error::Extension("transport unavailable".into()))
+            request("p", "native::edit", "a"),
+        )
+        .unwrap()
+    else {
+        panic!("grant should authorize");
+    };
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1))
+            )
+            .unwrap(),
+        ToolOutput::failure("tool infrastructure failure")
     );
     assert_eq!(calls.load(Ordering::Acquire), 1);
 }
 
 #[test]
-fn missing_project_identity_cannot_consume_grants_and_prompt_context_excludes_arguments() {
-    let calls = Arc::new(AtomicUsize::new(0));
+fn temporary_bypass_does_not_override_chat_write_restrictions() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native(
             "native::edit",
             ToolAccess::Write,
-            CountingTool {
-                calls: Arc::clone(&calls),
-                result: Ok(ToolOutput::success("edited")),
-            },
+            CountingTool(
+                Arc::new(AtomicUsize::new(0)),
+                Ok(ToolOutput::success("ran")),
+            ),
         )
         .unwrap();
-
-    let grant = ProjectPermissionGrant::allow(
-        "",
-        PermissionPattern::Exact("native::edit".into()),
-        PermissionPattern::Exact("src/lib.rs".into()),
-    );
-    let request = ToolDispatchRequest::new(
-        PermissionRequest::new("", "native::edit", "src/lib.rs", ToolAccess::Write),
-        json!({"credential": "must-not-appear"}),
-    );
-
-    assert_eq!(
-        dispatcher.dispatch(
-            &PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
-            &[grant],
-            &PermissionSession::new(),
-            request,
+    assert!(matches!(
+        dispatcher.evaluate(
+            &PermissionPolicy::new(PermissionMode::Chat, vec![]),
+            &[],
+            &PermissionSession::with_temporary_bypass(),
+            request("p", "native::edit", "a")
         ),
-        Ok(ToolDispatchOutcome::PromptRequired(
-            agens_tools::PermissionPromptContext {
-                project_id: "".into(),
-                qualified_tool_name: "native::edit".into(),
-                target_identifier: "src/lib.rs".into(),
-                access: ToolAccess::Write,
-                reason: "permission policy requires confirmation".into(),
-            }
-        ))
-    );
-    assert_eq!(calls.load(Ordering::Acquire), 0);
+        Ok(ToolEvaluationOutcome::Denied)
+    ));
 }
 
 #[test]
-fn mcp_registration_uses_conservative_remote_metadata_access() {
-    let calls = Arc::new(AtomicUsize::new(0));
+fn missing_project_cannot_consume_a_grant() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
-        .register_mcp(
-            &remote_metadata("server::unspecified", RemoteToolAccess::Write),
-            CountingTool {
-                calls: Arc::clone(&calls),
-                result: Ok(ToolOutput::success("ran")),
-            },
+        .register_native(
+            "native::edit",
+            ToolAccess::Write,
+            CountingTool(
+                Arc::new(AtomicUsize::new(0)),
+                Ok(ToolOutput::success("ran")),
+            ),
         )
         .unwrap();
-
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                &PermissionPolicy::new(PermissionMode::Chat, Vec::new()),
-                &[],
-                &PermissionSession::new(),
-                request(
-                    "project-a",
-                    "server::unspecified",
-                    "remote",
-                    ToolAccess::ReadOnly,
-                ),
-            )
-            .unwrap(),
-        ToolDispatchOutcome::Denied
-    );
-    assert_eq!(calls.load(Ordering::Acquire), 0);
+    let grant = ProjectPermissionGrant::allow("", PermissionPattern::Any, PermissionPattern::Any);
+    assert!(matches!(
+        dispatcher.evaluate(
+            &PermissionPolicy::new(PermissionMode::Edit, vec![]),
+            &[grant],
+            &PermissionSession::new(),
+            request("", "native::edit", "a")
+        ),
+        Ok(ToolEvaluationOutcome::PromptRequired(_))
+    ));
 }
 
-fn remote_metadata(qualified_name: &str, access: RemoteToolAccess) -> RemoteToolMetadata {
-    let (server_name, tool_name) = qualified_name.split_once("::").unwrap();
-    RemoteToolMetadata {
-        qualified_name: qualified_name.into(),
-        server_name: server_name.into(),
-        tool_name: tool_name.into(),
-        description: None,
-        input_schema: json!({"type": "object"}),
-        access,
-    }
+#[test]
+fn unknown_tools_are_rejected_before_policy_evaluation() {
+    assert!(
+        ToolDispatcher::new()
+            .evaluate(
+                &PermissionPolicy::new(PermissionMode::Edit, vec![]),
+                &[],
+                &PermissionSession::new(),
+                request("p", "missing", "a")
+            )
+            .is_err()
+    );
 }
