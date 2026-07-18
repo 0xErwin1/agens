@@ -141,15 +141,17 @@ fn stdio_transport_returns_promptly_when_a_child_does_not_read_stdin() {
 }
 
 #[test]
-fn stdio_transport_cancels_a_blocked_stdin_write_promptly() {
+fn stdio_transport_cancels_an_observably_blocked_stdin_write_promptly() {
     let cancellation = Arc::new(AtomicBool::new(false));
-    let (mut transport, _temporary) = no_read_transport();
+    let (mut transport, blocked_path, _temporary) = blocked_stdin_transport();
     let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_secs(1));
     let (sender, receiver) = mpsc::sync_channel(1);
     let signal = Arc::clone(&cancellation);
+    let (blocked_sender, blocked_receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        thread::sleep(Duration::from_millis(10));
+        wait_for_path(&blocked_path);
         signal.store(true, Ordering::Release);
+        let _ = blocked_sender.send(());
     });
     thread::spawn(move || {
         let result = transport.execute(
@@ -162,6 +164,11 @@ fn stdio_transport_cancels_a_blocked_stdin_write_promptly() {
         let _ = sender.send(result);
     });
 
+    assert_eq!(
+        blocked_receiver.recv_timeout(Duration::from_millis(250)),
+        Ok(()),
+        "child must confirm the stdin pipe filled before cancellation"
+    );
     assert_eq!(
         receiver.recv_timeout(Duration::from_millis(250)),
         Ok(Err(McpTransportError::Cancelled))
@@ -186,6 +193,31 @@ fn no_read_transport() -> (McpStdioTransport, TemporaryDirectory) {
     );
 
     (transport, temporary)
+}
+
+fn blocked_stdin_transport() -> (McpStdioTransport, PathBuf, TemporaryDirectory) {
+    let temporary = TemporaryDirectory::new("blocked-stdin");
+    let ready_path = temporary.path().join("ready");
+    let blocked_path = temporary.path().join("blocked");
+    let transport = McpStdioTransport::spawn(McpStdioTransportConfig {
+        command: PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child")),
+        args: vec![
+            "no-read-stdin".into(),
+            ready_path.display().to_string(),
+            blocked_path.display().to_string(),
+        ],
+        environment: BTreeMap::new(),
+        project_root: std::env::current_dir().unwrap(),
+    })
+    .unwrap();
+    wait_for_path(&ready_path);
+    assert_eq!(
+        std::fs::read_to_string(ready_path).unwrap().trim(),
+        "4096",
+        "child must shrink stdin so the writer blocks"
+    );
+
+    (transport, blocked_path, temporary)
 }
 
 fn wait_for_path(path: &std::path::Path) {

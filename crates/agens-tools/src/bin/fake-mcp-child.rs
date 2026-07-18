@@ -20,6 +20,21 @@ fn main() {
             pipe_size.to_string(),
         )
         .expect("no-read stdin child should signal readiness");
+        if let Some(blocked_path) = std::env::args().nth(3) {
+            #[cfg(unix)]
+            loop {
+                let mut buffered = 0;
+                let result =
+                    unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut buffered) };
+                assert_eq!(result, 0, "stdin pipe occupancy should be observable");
+                if buffered >= pipe_size {
+                    std::fs::write(blocked_path, "stdin pipe is full")
+                        .expect("no-read stdin child should signal a full pipe");
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_secs(5));
         return;
     }

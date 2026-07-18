@@ -62,14 +62,16 @@ fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy(
     let nested_directory = project_root.join("src/nested");
     let symlinked_directory = temporary.path().join("working-directory");
     let launch_record = temporary.path().join("launch-record");
+    let launch_complete = temporary.path().join("launch-complete");
     let config_path = config_home.join("config.toml");
     std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
     std::fs::create_dir_all(&nested_directory).expect("nested directory should exist");
     symlink(&nested_directory, &symlinked_directory)
         .expect("working directory symlink should exist");
     let script = format!(
-        "printf '%s|%s|%s' \"$PWD\" \"$1\" \"$MCP_SENTINEL\" > '{}' ; sleep 5",
-        launch_record.display()
+        "printf '%s|%s|%s' \"$PWD\" \"$1\" \"$MCP_SENTINEL\" > '{}' && : > '{}' && sleep 5",
+        launch_record.display(),
+        launch_complete.display(),
     );
     let dependencies = CliDependencies::for_test(
         symlinked_directory,
@@ -99,10 +101,10 @@ fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy(
     assert_eq!(transports[0].0, "files");
     assert_eq!(transports[0].2, std::time::Duration::from_millis(50));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while !launch_record.exists() {
+    while !launch_complete.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "configured MCP process should record its launch policy"
+            "configured MCP process should complete its launch record"
         );
         thread::sleep(std::time::Duration::from_millis(2));
     }
