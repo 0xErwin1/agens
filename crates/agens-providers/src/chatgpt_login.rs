@@ -1,8 +1,11 @@
-use std::fs::{self, File, OpenOptions};
+use std::ffi::CString;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
@@ -221,46 +224,7 @@ pub fn upsert_chatgpt_credentials(
         return Err(LoginError::Authentication("token response is incomplete"));
     }
 
-    let parent = secure_credentials_parent(path)?;
-    let lock_path = parent.join(".auth.json.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lock_path)
-        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
-    lock.lock_exclusive()
-        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
-    if lock
-        .metadata()
-        .map(|metadata| metadata.nlink() != 1)
-        .unwrap_or(true)
-    {
-        return Err(LoginError::Authentication(
-            "credentials file is unavailable",
-        ));
-    }
-    let mut root = match fs::read(path) {
-        Ok(contents) => serde_json::from_slice(&contents)
-            .map_err(|_| LoginError::Authentication("credentials file is invalid"))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Object(Map::new()),
-        Err(_) => {
-            return Err(LoginError::Authentication(
-                "credentials file is unavailable",
-            ));
-        }
-    };
-    let root_object = root
-        .as_object_mut()
-        .ok_or(LoginError::Authentication("credentials file is invalid"))?;
-    let entry = root_object
-        .entry("openai-chatgpt".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    let entry = entry
-        .as_object_mut()
-        .ok_or(LoginError::Authentication("credentials file is invalid"))?;
+    let mut entry = Map::new();
     entry.insert(
         "access_token".to_owned(),
         Value::String(credentials.access_token.clone()),
@@ -277,13 +241,78 @@ pub fn upsert_chatgpt_credentials(
         "expires_at".to_owned(),
         Value::String(credentials.expires_at.clone()),
     );
-    entry.remove("id_token");
-
-    write_credentials_atomically(
+    upsert_provider_entry_inner(
         path,
-        &serde_json::to_vec(&root)
-            .map_err(|_| LoginError::Authentication("credentials could not be encoded"))?,
+        "openai-chatgpt",
+        Value::Object(entry),
+        &["id_token"],
+        None,
     )
+}
+
+/// Merges one provider object into auth.json without losing independently written providers.
+pub fn upsert_provider_entry(path: &Path, provider: &str, entry: Value) -> Result<(), LoginError> {
+    upsert_provider_entry_inner(path, provider, entry, &[], None)
+}
+
+/// Like [`upsert_provider_entry`], but aborts while waiting for the process lock.
+pub fn upsert_provider_entry_with_deadline(
+    path: &Path,
+    provider: &str,
+    entry: Value,
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+) -> Result<(), LoginError> {
+    upsert_provider_entry_inner(path, provider, entry, &[], Some((cancellation, deadline)))
+}
+
+fn upsert_provider_entry_inner(
+    path: &Path,
+    provider: &str,
+    entry: Value,
+    remove: &[&str],
+    wait: Option<(&LoginCancellation, Instant)>,
+) -> Result<(), LoginError> {
+    if provider.is_empty() || !matches!(entry, Value::Object(_)) {
+        return Err(LoginError::Authentication("credentials file is invalid"));
+    }
+    let (parent, name) = open_secure_parent(path)?;
+    let lock = open_file_at(
+        &parent,
+        b".auth.json.lock",
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+        0o600,
+    )
+    .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    acquire_lock(&lock, wait)?;
+    if lock
+        .metadata()
+        .map(|metadata| metadata.nlink() != 1)
+        .unwrap_or(true)
+    {
+        return Err(LoginError::Authentication(
+            "credentials file is unavailable",
+        ));
+    }
+    let mut root = read_credentials_at(&parent, &name)?;
+    let root_object = root
+        .as_object_mut()
+        .ok_or(LoginError::Authentication("credentials file is invalid"))?;
+    let target = root_object
+        .entry(provider.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let target = target
+        .as_object_mut()
+        .ok_or(LoginError::Authentication("credentials file is invalid"))?;
+    for (key, value) in entry.as_object().expect("validated object") {
+        target.insert(key.clone(), value.clone());
+    }
+    for key in remove {
+        target.remove(*key);
+    }
+    let contents = serde_json::to_vec(&root)
+        .map_err(|_| LoginError::Authentication("credentials could not be encoded"))?;
+    write_credentials_atomically_at(&parent, &name, &contents)
 }
 
 fn secure_random_bytes(length: usize) -> Result<Vec<u8>, LoginError> {
@@ -694,75 +723,378 @@ fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
         return None;
     }
     let payload = serde_json::from_slice::<Value>(&bytes).ok()?;
-    payload.as_object()?.get(claim).cloned()
-}
-
-fn secure_credentials_parent(path: &Path) -> Result<&Path, LoginError> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .ok_or(LoginError::Authentication("credentials path is invalid"))?;
-    if !parent.exists() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|_| {
-                LoginError::Authentication("credentials directory could not be created")
-            })?;
+    let value = payload.as_object()?.get(claim)?;
+    match claim {
+        ACCOUNT_ID_CLAIM => value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(|value| Value::String(value.to_owned())),
+        "exp" => value.as_i64().filter(|value| *value >= 0).map(Value::from),
+        _ => Some(value.clone()),
     }
-    let metadata = fs::symlink_metadata(parent)
-        .map_err(|_| LoginError::Authentication("credentials directory could not be secured"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(LoginError::Authentication(
-            "credentials directory could not be secured",
-        ));
-    }
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|_| LoginError::Authentication("credentials directory could not be secured"))?;
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (metadata.file_type().is_symlink() || metadata.nlink() != 1 || !metadata.is_file())
-    {
-        return Err(LoginError::Authentication(
-            "credentials file is unavailable",
-        ));
-    }
-    Ok(parent)
 }
 
 fn format_expiry(expiry: SystemTime) -> Option<String> {
     OffsetDateTime::from(expiry).format(&Rfc3339).ok()
 }
 
-fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), LoginError> {
-    let parent = secure_credentials_parent(path)?;
-    let temporary = parent.join(format!(
+fn open_secure_parent(path: &Path) -> Result<(File, Vec<u8>), LoginError> {
+    let name = path
+        .file_name()
+        .filter(|name| !name.as_bytes().is_empty())
+        .ok_or(LoginError::Authentication("credentials path is invalid"))?
+        .as_bytes()
+        .to_vec();
+    let parent = path
+        .parent()
+        .ok_or(LoginError::Authentication("credentials path is invalid"))?;
+    let mut directory = if parent.is_absolute() {
+        File::open("/")
+    } else {
+        File::open(".")
+    }
+    .map_err(|_| LoginError::Authentication("credentials directory could not be secured"))?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory =
+                    open_or_create_directory_at(&directory, name.as_bytes()).map_err(|_| {
+                        LoginError::Authentication("credentials directory could not be secured")
+                    })?
+            }
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(LoginError::Authentication("credentials path is invalid"));
+            }
+        }
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } != 0 {
+        return Err(LoginError::Authentication(
+            "credentials directory could not be secured",
+        ));
+    }
+    Ok((directory, name))
+}
+
+fn open_or_create_directory_at(parent: &File, name: &[u8]) -> std::io::Result<File> {
+    match open_file_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    ) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = c_name(name)?;
+            let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            open_file_at(
+                parent,
+                name.as_bytes(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                0,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_file_at(
+    parent: &File,
+    name: &[u8],
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<File> {
+    let name = c_name(name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_CLOEXEC,
+            mode,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+fn c_name(name: &[u8]) -> std::io::Result<CString> {
+    CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL path"))
+}
+
+fn acquire_lock(
+    lock: &File,
+    wait: Option<(&LoginCancellation, Instant)>,
+) -> Result<(), LoginError> {
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => {
+                return Err(LoginError::Authentication(
+                    "credentials file is unavailable",
+                ));
+            }
+        }
+        if let Some((cancellation, deadline)) = wait {
+            if cancellation.is_cancelled() {
+                return Err(LoginError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(LoginError::TimedOut);
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn read_credentials_at(parent: &File, name: &[u8]) -> Result<Value, LoginError> {
+    let mut file = match open_file_at(parent, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Value::Object(Map::new()));
+        }
+        Err(_) => {
+            return Err(LoginError::Authentication(
+                "credentials file is unavailable",
+            ));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(LoginError::Authentication(
+            "credentials file is unavailable",
+        ));
+    }
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    serde_json::from_slice(&contents)
+        .map_err(|_| LoginError::Authentication("credentials file is invalid"))
+}
+
+fn write_credentials_atomically_at(
+    parent: &File,
+    name: &[u8],
+    contents: &[u8],
+) -> Result<(), LoginError> {
+    let temporary = format!(
         ".auth-login-{}-{}.json",
         std::process::id(),
         TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
+    let temporary = temporary.into_bytes();
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temporary)
-            .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
+        let mut file = open_file_at(
+            parent,
+            &temporary,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+            0o600,
+        )
+        .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
         file.write_all(contents)
             .and_then(|_| file.sync_all())
             .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
-        drop(file);
-        fs::rename(&temporary, path)
+        let source = c_name(&temporary)
             .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        let destination = c_name(name)
+            .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
+        if unsafe {
+            libc::renameat(
+                parent.as_raw_fd(),
+                source.as_ptr(),
+                parent.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(LoginError::Authentication(
+                "credentials could not be persisted",
+            ));
+        }
+        let final_file = open_file_at(parent, name, libc::O_RDONLY | libc::O_NOFOLLOW, 0)
             .map_err(|_| LoginError::Authentication("credentials file could not be secured"))?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        if final_file
+            .metadata()
+            .map(|metadata| !metadata.is_file() || metadata.nlink() != 1)
+            .unwrap_or(true)
+            || unsafe { libc::fchmod(final_file.as_raw_fd(), 0o600) } != 0
+        {
+            return Err(LoginError::Authentication(
+                "credentials file could not be secured",
+            ));
+        }
+        parent
+            .sync_all()
             .map_err(|_| LoginError::Authentication("credentials could not be persisted"))
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    if result.is_err()
+        && let Ok(temporary) = c_name(&temporary)
+    {
+        unsafe { libc::unlinkat(parent.as_raw_fd(), temporary.as_ptr(), 0) };
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jwt(header: &str, payload: &str, signature: &str) -> String {
+        format!(
+            "{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(payload),
+            signature
+        )
+    }
+
+    #[test]
+    fn jwt_claim_rejects_malformed_structure_without_echoing_tokens() {
+        let secret = "raw-secret-token";
+        let malformed = [
+            secret.to_owned(),
+            format!("{secret}.{secret}"),
+            format!("{secret}.{secret}.{secret}.extra"),
+            format!("not-base64.{}.signature", URL_SAFE_NO_PAD.encode("{}")),
+            jwt("[]", "{}", "signature"),
+            jwt(r#"{"alg":"none"}"#, "{}", "signature"),
+            jwt(r#"{"alg":"HS256"}"#, "{}", "signature"),
+            jwt(r#"{"alg":"RS256"}"#, "[]", "signature"),
+            jwt(r#"{"alg":"RS256"}"#, "{}", ""),
+        ];
+        for token in malformed {
+            assert!(jwt_claim(&token, ACCOUNT_ID_CLAIM).is_none());
+        }
+    }
+
+    #[test]
+    fn jwt_claim_accepts_only_valid_account_and_expiration_claim_types() {
+        let header = r#"{"alg":"RS256"}"#;
+        assert_eq!(
+            jwt_claim(
+                &jwt(
+                    header,
+                    r#"{"https://api.openai.com/auth.chatgpt_account_id":"account"}"#,
+                    "signature"
+                ),
+                ACCOUNT_ID_CLAIM
+            ),
+            Some(Value::String("account".to_owned()))
+        );
+        for payload in [
+            r#"{"https://api.openai.com/auth.chatgpt_account_id":""}"#,
+            r#"{"https://api.openai.com/auth.chatgpt_account_id":false}"#,
+            r#"{"exp":-1}"#,
+            r#"{"exp":"1"}"#,
+            r#"{"exp":18446744073709551615}"#,
+        ] {
+            let claim = if payload.contains("account") {
+                ACCOUNT_ID_CLAIM
+            } else {
+                "exp"
+            };
+            let value = jwt_claim(&jwt(header, payload, "signature"), claim);
+            assert!(value.is_none() || value.as_ref().is_some_and(Value::is_i64));
+        }
+        assert_eq!(
+            jwt_claim(&jwt(header, r#"{"exp":0}"#, "signature"), "exp"),
+            Some(Value::from(0))
+        );
+    }
+
+    #[test]
+    fn callback_parsers_reject_the_http_and_query_attack_matrix() {
+        assert!(
+            parse_http_request(b"GET /auth/callback HTTP/1.1\r\nHost: localhost:1455\r\n\r\n")
+                .is_some()
+        );
+        for request in [
+            b"POST /auth/callback HTTP/1.1\r\nHost: localhost:1455\r\n\r\n".as_slice(),
+            b"GET /auth/callback HTTP/1.0\r\nHost: localhost:1455\r\n\r\n".as_slice(),
+            b"GET /auth/callback HTTP/1.1\r\nHost: localhost:1455\r\nHost: localhost:1455\r\n\r\n"
+                .as_slice(),
+            b"GET /auth/callback HTTP/1.1\r\nHost: localhost:1455\r\nContent-Length: 1\r\n\r\n"
+                .as_slice(),
+            b"GET /auth/callback HTTP/1.1\r\nHost: \xff\r\n\r\n".as_slice(),
+        ] {
+            assert!(parse_http_request(request).is_none());
+        }
+        for query in [
+            "state=a&state=b",
+            "code=a&code=b",
+            "state=%",
+            "state=%ZZ",
+            "state=%FF",
+            "state=\u{80}",
+        ] {
+            assert!(parse_callback_query(query).is_none());
+        }
+        assert!(parse_callback_query("state=a&code=b").is_some());
+        assert!(valid_callback_host("localhost:1455", 1455));
+        assert!(!valid_callback_host("attacker.example", 1455));
+    }
+
+    #[test]
+    fn callback_accepts_fragmented_requests_and_closes_slow_incomplete_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let waiting = thread::spawn(move || {
+            wait_for_callback(
+                listener,
+                "expected-state",
+                Duration::from_millis(250),
+                &LoginCancellation::new(),
+            )
+        });
+        let mut client = TcpStream::connect(address).expect("client should connect");
+        client
+            .write_all(b"GET /auth/callback?state=expected-")
+            .expect("first fragment");
+        thread::sleep(Duration::from_millis(5));
+        client
+            .write_all(format!("state&code=code HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes())
+            .expect("second fragment");
+        assert_eq!(
+            waiting.join().expect("waiter should finish"),
+            Ok("code".to_owned())
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let address = listener.local_addr().expect("listener address");
+        let waiting = thread::spawn(move || {
+            wait_for_callback(
+                listener,
+                "expected-state",
+                Duration::from_millis(35),
+                &LoginCancellation::new(),
+            )
+        });
+        let mut slow = TcpStream::connect(address).expect("slow client should connect");
+        slow.write_all(b"GET /auth/callback?")
+            .expect("partial request");
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            waiting.join().expect("waiter should finish"),
+            Err(LoginError::TimedOut)
+        );
+        let mut byte = [0_u8; 1];
+        slow.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        assert_eq!(
+            slow.read(&mut byte)
+                .expect("closed callback should read EOF"),
+            0
+        );
+    }
 }

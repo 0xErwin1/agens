@@ -1,17 +1,23 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use agens_providers::chatgpt_login::{
     ChatGptCredentials, ChatGptLoginOptions, LoginCancellation, LoginError, authorization_url,
-    generate_pkce, generate_state, login, upsert_chatgpt_credentials,
+    generate_pkce, generate_state, login, upsert_chatgpt_credentials, upsert_provider_entry,
+    upsert_provider_entry_with_deadline,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use fs4::fs_std::FileExt;
 use serde_json::{Value, json};
 
 #[test]
@@ -60,6 +66,207 @@ fn authorization_url_uses_the_codex_pkce_contract_without_workspace_selection() 
         Some(&"true".to_owned())
     );
     assert!(!query.contains_key("allowed_workspace_id"));
+}
+
+#[test]
+fn provider_entry_upsert_preserves_existing_provider_entries() {
+    let directory = temporary_directory("provider-entry-merge");
+    let path = directory.join("auth.json");
+    fs::write(&path, r#"{"other":{"api_key":"preserve"}}"#).expect("credentials should be written");
+
+    upsert_provider_entry(&path, "second-provider", json!({"api_key":"second"}))
+        .expect("provider entry should be persisted");
+
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(&path).expect("credentials should be readable"))
+            .expect("credentials should remain JSON");
+    assert_eq!(persisted["other"]["api_key"], "preserve");
+    assert_eq!(persisted["second-provider"]["api_key"], "second");
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn provider_entry_upsert_cancels_or_times_out_while_the_credentials_lock_is_held() {
+    let directory = temporary_directory("lock-cancellation");
+    let path = directory.join("auth.json");
+    upsert_provider_entry(&path, "seed", json!({"value":"seed"})).expect("seed should persist");
+    let lock_path = directory.join(".auth.json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("lock should open");
+    assert!(lock.try_lock_exclusive().expect("lock should be available"));
+
+    for cancellation_first in [true, false, true, false] {
+        let cancellation = LoginCancellation::new();
+        if cancellation_first {
+            cancellation.cancel();
+        }
+        let started = Instant::now();
+        let result = upsert_provider_entry_with_deadline(
+            &path,
+            "blocked",
+            json!({"value":"must-not-persist"}),
+            &cancellation,
+            Instant::now() + Duration::from_millis(30),
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "lock wait did not stop promptly"
+        );
+        assert_eq!(
+            result,
+            Err(if cancellation_first {
+                LoginError::Cancelled
+            } else {
+                LoginError::TimedOut
+            })
+        );
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&path).expect("credentials should be readable"))
+                .expect("credentials should remain JSON");
+        assert!(persisted.get("blocked").is_none());
+        assert!(
+            fs::read_dir(&directory)
+                .expect("directory should be readable")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".auth-login-"))
+        );
+    }
+    lock.unlock().expect("lock should unlock");
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_entry_upsert_refuses_symlinked_parent_without_touching_the_target() {
+    use std::os::unix::fs::symlink;
+
+    let directory = temporary_directory("symlinked-parent");
+    let outside = temporary_directory("symlinked-parent-outside");
+    let parent = directory.join("parent");
+    symlink(&outside, &parent).expect("parent symlink should be created");
+    let path = parent.join("auth.json");
+
+    let result = upsert_provider_entry(&path, "provider", json!({"api_key":"must-not-write"}));
+
+    assert!(matches!(result, Err(LoginError::Authentication(_))));
+    assert!(!outside.join("auth.json").exists());
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    fs::remove_dir_all(outside).expect("temporary directory should be removed");
+}
+
+#[test]
+fn provider_entry_upsert_merges_concurrent_processes_using_canonical_path_aliases() {
+    let directory = temporary_directory("process-merge");
+    let path = directory.join("auth.json");
+    let alias = directory.join(".").join("auth.json");
+    let children = [
+        spawn_upsert_child(&path, "first-provider", json!({"api_key":"first"})),
+        spawn_upsert_child(&alias, "second-provider", json!({"api_key":"second"})),
+        spawn_upsert_child(&path, "openai-chatgpt", json!({"access_token":"access"})),
+        spawn_upsert_child(&alias, "openai-chatgpt", json!({"refresh_token":"refresh"})),
+    ];
+    for mut child in children {
+        assert!(
+            child.wait().expect("child should wait").success(),
+            "child upsert should succeed"
+        );
+    }
+
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(&path).expect("credentials should be readable"))
+            .expect("credentials should remain JSON");
+    assert_eq!(persisted["first-provider"]["api_key"], "first");
+    assert_eq!(persisted["second-provider"]["api_key"], "second");
+    assert_eq!(persisted["openai-chatgpt"]["access_token"], "access");
+    assert_eq!(persisted["openai-chatgpt"]["refresh_token"], "refresh");
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o077, 0);
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn provider_entry_upsert_reacquires_the_os_lock_after_a_holder_crashes() {
+    let directory = temporary_directory("holder-crash");
+    let path = directory.join("auth.json");
+    upsert_provider_entry(&path, "seed", json!({"value":"seed"})).expect("seed should persist");
+    let ready = directory.join("holder-ready");
+    let mut holder = Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg("provider_entry_upsert_child_process")
+        .env("AGENS_LOGIN_CHILD_ACTION", "hold-lock")
+        .env("AGENS_LOGIN_CHILD_PATH", &path)
+        .env("AGENS_LOGIN_CHILD_READY", &ready)
+        .spawn()
+        .expect("holder should start");
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(ready.exists(), "holder never acquired the lock");
+    holder.kill().expect("holder should be killable");
+    holder.wait().expect("holder should exit");
+
+    upsert_provider_entry(&path, "after-crash", json!({"value":"persisted"}))
+        .expect("OS must release the killed holder's lock");
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(&path).expect("credentials should be readable"))
+            .expect("credentials should remain JSON");
+    assert_eq!(persisted["after-crash"]["value"], "persisted");
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn provider_entry_upsert_child_process() {
+    let action = match std::env::var("AGENS_LOGIN_CHILD_ACTION") {
+        Ok(action) => action,
+        Err(_) => return,
+    };
+    let path = PathBuf::from(std::env::var("AGENS_LOGIN_CHILD_PATH").expect("child path"));
+    if action == "upsert" {
+        let provider = std::env::var("AGENS_LOGIN_CHILD_PROVIDER").expect("child provider");
+        let entry: Value =
+            serde_json::from_str(&std::env::var("AGENS_LOGIN_CHILD_ENTRY").expect("child entry"))
+                .expect("entry JSON");
+        upsert_provider_entry(&path, &provider, entry).expect("child upsert should succeed");
+        return;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.parent().expect("parent").join(".auth.json.lock"))
+        .expect("lock should open");
+    assert!(lock.try_lock_exclusive().expect("lock should be available"));
+    fs::write(
+        std::env::var("AGENS_LOGIN_CHILD_READY").expect("ready path"),
+        "ready",
+    )
+    .expect("ready marker");
+    thread::sleep(Duration::from_secs(10));
+}
+
+fn spawn_upsert_child(path: &std::path::Path, provider: &str, entry: Value) -> std::process::Child {
+    Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg("provider_entry_upsert_child_process")
+        .env("AGENS_LOGIN_CHILD_ACTION", "upsert")
+        .env("AGENS_LOGIN_CHILD_PATH", path)
+        .env("AGENS_LOGIN_CHILD_PROVIDER", provider)
+        .env(
+            "AGENS_LOGIN_CHILD_ENTRY",
+            serde_json::to_string(&entry).expect("entry should encode"),
+        )
+        .spawn()
+        .expect("child should start")
 }
 
 #[test]
