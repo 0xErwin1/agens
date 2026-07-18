@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
-    PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
+    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
+    MessagePart, PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
 };
 
 #[derive(Default)]
@@ -362,4 +362,157 @@ fn expired_deadline_is_a_distinct_failure_and_never_persists_a_partial_turn() {
 
     assert_eq!(result, Err(agens_core::HeadlessTurnError::TimedOut));
     assert!(repository.snapshots.is_empty());
+}
+
+#[test]
+fn unresolved_permission_ask_fails_closed_without_exposing_tool_input() {
+    let secret_input = "credential=do-not-expose";
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![MessagePart::ToolCall {
+            id: "permission-needed".into(),
+            name: "read".into(),
+            input: secret_input.into(),
+        }])],
+    };
+    let mut repository = Repository::default();
+
+    let result = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Ask],
+        },
+        &mut PermissionResolver {
+            decisions: vec![PermissionDecision::Ask],
+        },
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ));
+
+    assert_eq!(result, Err(HeadlessTurnError::PermissionRequired));
+    assert!(
+        !HeadlessTurnError::PermissionRequired
+            .to_string()
+            .contains(secret_input)
+    );
+    assert!(provider.iterations.is_empty());
+    assert!(repository.snapshots.is_empty());
+}
+
+#[test]
+fn denied_permissions_emit_sanitized_tool_results_and_continue_without_dispatch() {
+    for (gate_decision, resolver_decision) in [
+        (PermissionDecision::Deny, None),
+        (PermissionDecision::Ask, Some(PermissionDecision::Deny)),
+    ] {
+        let mut provider = Provider {
+            iterations: vec![
+                Ok(vec![MessagePart::ToolCall {
+                    id: "denied".into(),
+                    name: "read".into(),
+                    input: "credential=do-not-expose".into(),
+                }]),
+                Ok(vec![MessagePart::Text("complete".into())]),
+            ],
+        };
+        let mut repository = Repository::default();
+        let mut resolver = PermissionResolver {
+            decisions: resolver_decision.into_iter().collect(),
+        };
+
+        let snapshot = block_on_ready(run_headless_turn(
+            &mut provider,
+            &mut PermissionGate {
+                decisions: vec![gate_decision],
+            },
+            &mut resolver,
+            &mut ToolDispatcher::default(),
+            &mut repository,
+            &HeadlessTurnCancellation::new(),
+        ))
+        .expect("denied tool call should let the provider continue");
+
+        assert!(provider.iterations.is_empty());
+        assert_eq!(repository.snapshots, vec![snapshot.clone()]);
+        assert!(
+            snapshot
+                .events()
+                .contains(&TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id: "denied".into(),
+                    content: "permission denied".into(),
+                    is_error: true,
+                }))
+        );
+    }
+}
+
+#[test]
+fn permission_port_errors_remain_distinct_from_unresolved_asks() {
+    for resolver_error in [false, true] {
+        let mut provider = Provider {
+            iterations: vec![Ok(vec![MessagePart::ToolCall {
+                id: "permission-error".into(),
+                name: "read".into(),
+                input: "file.txt".into(),
+            }])],
+        };
+        let mut repository = Repository::default();
+        let mut gate = PermissionGate {
+            decisions: vec![PermissionDecision::Ask],
+        };
+        let mut resolver = PermissionResolver {
+            decisions: vec![PermissionDecision::Allow],
+        };
+
+        let result = if resolver_error {
+            struct FailingResolver;
+
+            impl HeadlessPermissionResolver for FailingResolver {
+                fn resolve(
+                    &mut self,
+                    _call: &HeadlessToolCall,
+                    _cancellation: &HeadlessTurnCancellation,
+                ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+                {
+                    ready(Err(HeadlessTurnPortError::Permission))
+                }
+            }
+
+            let mut failing_resolver = FailingResolver;
+            block_on_ready(run_headless_turn(
+                &mut provider,
+                &mut gate,
+                &mut failing_resolver,
+                &mut ToolDispatcher::default(),
+                &mut repository,
+                &HeadlessTurnCancellation::new(),
+            ))
+        } else {
+            struct FailingGate;
+
+            impl HeadlessPermissionGate for FailingGate {
+                fn evaluate(
+                    &mut self,
+                    _call: &HeadlessToolCall,
+                    _cancellation: &HeadlessTurnCancellation,
+                ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+                {
+                    ready(Err(HeadlessTurnPortError::Permission))
+                }
+            }
+
+            let mut failing_gate = FailingGate;
+            block_on_ready(run_headless_turn(
+                &mut provider,
+                &mut failing_gate,
+                &mut resolver,
+                &mut ToolDispatcher::default(),
+                &mut repository,
+                &HeadlessTurnCancellation::new(),
+            ))
+        };
+
+        assert_eq!(result, Err(HeadlessTurnError::Permission));
+        assert!(repository.snapshots.is_empty());
+    }
 }

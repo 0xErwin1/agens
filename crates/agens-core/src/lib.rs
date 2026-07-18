@@ -669,6 +669,7 @@ pub enum HeadlessTurnError {
     TimedOut,
     Provider,
     Permission,
+    PermissionRequired,
     Tool,
     Store,
     State,
@@ -681,6 +682,7 @@ impl fmt::Display for HeadlessTurnError {
             Self::TimedOut => "turn timed out",
             Self::Provider => "provider operation failed",
             Self::Permission => "permission operation failed",
+            Self::PermissionRequired => "permission required",
             Self::Tool => "tool operation failed",
             Self::Store => "completed turn could not be saved",
             Self::State => "invalid headless turn state",
@@ -766,7 +768,7 @@ pub async fn run_headless_turn(
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
                     })?,
                 PermissionDecision::Deny => HeadlessToolOutput::failure("permission denied"),
-                PermissionDecision::Ask => return Err(fail_state(&mut coordinator)),
+                PermissionDecision::Ask => return Err(permission_required(&mut coordinator)),
             };
             check_cancelled(&mut coordinator, cancellation)?;
 
@@ -852,6 +854,13 @@ fn finish_port_error(
 fn fail_state(coordinator: &mut TurnCoordinator) -> HeadlessTurnError {
     let _ = coordinator.fail();
     HeadlessTurnError::State
+}
+
+fn permission_required(coordinator: &mut TurnCoordinator) -> HeadlessTurnError {
+    coordinator
+        .fail()
+        .map(|()| HeadlessTurnError::PermissionRequired)
+        .unwrap_or(HeadlessTurnError::State)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
