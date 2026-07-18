@@ -304,6 +304,26 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
 }
 
 #[test]
+fn authentication_port_failures_are_typed_failed_and_never_persist_partial_turns() {
+    let mut provider = Provider {
+        iterations: vec![Err(HeadlessTurnPortError::Authentication)],
+    };
+    let mut repository = Repository::default();
+
+    let result = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut PermissionGate::default(),
+        &mut PermissionResolver::default(),
+        &mut ToolDispatcher::default(),
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ));
+
+    assert_eq!(result, Err(HeadlessTurnError::Authentication));
+    assert!(repository.snapshots.is_empty());
+}
+
+#[test]
 fn cancellation_reaches_an_in_flight_provider_and_suppresses_persistence() {
     let started = Arc::new(AtomicBool::new(false));
     let cancellation = HeadlessTurnCancellation::new();

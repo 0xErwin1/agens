@@ -563,6 +563,7 @@ impl HeadlessToolOutput {
 pub enum HeadlessTurnPortError {
     Cancelled,
     TimedOut,
+    Authentication,
     Provider,
     Permission,
     Tool,
@@ -667,6 +668,7 @@ impl HeadlessTurnCancellation {
 pub enum HeadlessTurnError {
     Cancelled,
     TimedOut,
+    Authentication,
     Provider,
     Permission,
     PermissionRequired,
@@ -680,6 +682,7 @@ impl fmt::Display for HeadlessTurnError {
         let message = match self {
             Self::Cancelled => "turn cancelled",
             Self::TimedOut => "turn timed out",
+            Self::Authentication => "authentication required",
             Self::Provider => "provider operation failed",
             Self::Permission => "permission operation failed",
             Self::PermissionRequired => "permission required",
@@ -841,6 +844,13 @@ fn finish_port_error(
         return coordinator
             .fail()
             .map(|()| HeadlessTurnError::TimedOut)
+            .unwrap_or(HeadlessTurnError::State);
+    }
+
+    if error == HeadlessTurnPortError::Authentication {
+        return coordinator
+            .fail()
+            .map(|()| HeadlessTurnError::Authentication)
             .unwrap_or(HeadlessTurnError::State);
     }
 
