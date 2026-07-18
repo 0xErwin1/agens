@@ -1501,6 +1501,93 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
 }
 
 #[test]
+fn subscription_tool_replay_rejects_an_oversized_item_without_retaining_or_replaying_it() {
+    let secret_sentinel = "secret=oversized-replay-item-must-not-leak";
+    let oversized_item = replay_message_item(&format!("{secret_sentinel}{}", "x".repeat(70_000)));
+    assert!(
+        serde_json::to_vec(&oversized_item)
+            .expect("oversized replay item should serialize")
+            .len()
+            > 64 * 1024
+    );
+
+    let directory = temporary_directory("oversized-replay-item");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Sse(tool_round_sse(
+        &[oversized_item],
+        &[("item_call", "call", "weather", "{}")],
+    ))]);
+    let mut provider = subscription_provider(&credentials, &server);
+
+    let error = run_with_events(&mut provider, &[], HeadlessTurnCancellation::new())
+        .expect_err("oversized replay item should fail before a continuation request");
+    assert_eq!(error, HeadlessTurnPortError::Provider);
+    assert!(!format!("{error:?}").contains(secret_sentinel));
+
+    assert_eq!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider),
+    );
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+
+    let boundary_item = replay_message_item(
+        &"x".repeat(
+            64 * 1024
+                - serde_json::to_vec(&replay_message_item(""))
+                    .expect("empty replay item should serialize")
+                    .len(),
+        ),
+    );
+    assert_eq!(
+        serde_json::to_vec(&boundary_item)
+            .expect("boundary replay item should serialize")
+            .len(),
+        64 * 1024
+    );
+
+    let directory = temporary_directory("replay-item-boundary");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(tool_round_sse(
+            &[boundary_item],
+            &[("item_call", "call", "weather", "{}")],
+        )),
+        ScriptedResponse::Sse(completed_text_sse("done")),
+    ]);
+    let mut provider = subscription_provider(&credentials, &server);
+
+    assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    assert!(
+        run_with_events(
+            &mut provider,
+            &[tool_result("call", "ok", false)],
+            HeadlessTurnCancellation::new(),
+        )
+        .is_ok()
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::to_vec(&requests[1].body["input"][1])
+            .expect("replayed boundary item should serialize")
+            .len(),
+        64 * 1024
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+fn replay_message_item(content: &str) -> Value {
+    json!({
+        "type":"message",
+        "id":"item_message",
+        "role":"assistant",
+        "content":[{"type":"output_text","text":content}],
+    })
+}
+
+#[test]
 fn subscription_tool_replay_cancellation_and_timeout_stop_second_and_third_rounds() {
     for (round, cancellation_mode) in [(2, false), (2, true), (3, false), (3, true)] {
         let directory = temporary_directory(&format!("stop-round-{round}-{cancellation_mode}"));
