@@ -24,6 +24,8 @@ const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
+const MAX_CHATGPT_REPLAY_ITEMS: usize = 256;
+const MAX_CHATGPT_REPLAY_ITEM_BYTES: usize = 64 * 1024;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CHATGPT_OAUTH_URL: &str = "https://auth.openai.com/oauth/token";
@@ -79,12 +81,28 @@ pub struct ChatGptResponsesProvider {
     input: String,
     session_id: String,
     client: reqwest::Client,
-    completed: bool,
+    tools: Vec<OpenAiFunctionTool>,
+    state: ChatGptContinuationState,
+    seen_item_ids: BTreeSet<String>,
+    seen_call_ids: BTreeSet<String>,
+    seen_replay_item_ids: BTreeSet<String>,
+    continuation_rounds: usize,
 }
 
 enum ChatGptResponseError {
     Authentication(u16),
     Other(HeadlessTurnPortError),
+}
+
+enum ChatGptContinuationState {
+    Initial,
+    AwaitingToolOutputs {
+        replay_history: Vec<Value>,
+        pending_calls: Vec<PendingToolCall>,
+        event_cursor: usize,
+    },
+    Completed,
+    Failed,
 }
 
 struct RefreshFileLock {
@@ -262,7 +280,7 @@ impl OpenAiResponsesProvider {
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        decode_http_response_stream(response, cancellation).await
+        decode_http_response_stream(response, cancellation, false).await
     }
 }
 
@@ -312,6 +330,29 @@ impl ChatGptResponsesProvider {
         input: String,
         request_timeout: Duration,
     ) -> Result<Self, Error> {
+        Self::from_credentials_with_tools_and_timeout_and_auth_url(
+            credentials_path,
+            base_url,
+            oauth_url,
+            model,
+            instructions,
+            input,
+            Vec::new(),
+            request_timeout,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_credentials_with_tools_and_timeout_and_auth_url(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        oauth_url: Option<&str>,
+        model: String,
+        instructions: String,
+        input: String,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
         if model.trim().is_empty() || instructions.trim().is_empty() || input.trim().is_empty() {
             return Err(auth_error("request configuration is incomplete"));
         }
@@ -347,12 +388,18 @@ impl ChatGptResponsesProvider {
                 .connect_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
-            completed: false,
+            tools,
+            state: ChatGptContinuationState::Initial,
+            seen_item_ids: BTreeSet::new(),
+            seen_call_ids: BTreeSet::new(),
+            seen_replay_item_ids: BTreeSet::new(),
+            continuation_rounds: 0,
         })
     }
 
     async fn request_response(
         &self,
+        payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, ChatGptResponseError> {
         let request = self
@@ -364,7 +411,7 @@ impl ChatGptResponsesProvider {
             .header("originator", CHATGPT_ORIGINATOR)
             .header("User-Agent", AGENS_USER_AGENT)
             .header("session-id", &self.session_id)
-            .json(&self.request_payload())
+            .json(&payload)
             .build()
             .map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::Provider))?;
         let response = tokio::select! {
@@ -391,7 +438,7 @@ impl ChatGptResponsesProvider {
             _ => {}
         }
 
-        decode_http_response_stream(response, cancellation)
+        decode_http_response_stream(response, cancellation, true)
             .await
             .map_err(ChatGptResponseError::Other)
     }
@@ -514,29 +561,34 @@ impl ChatGptResponsesProvider {
         Ok(())
     }
 
-    fn request_payload(&self) -> Value {
-        serde_json::json!({
+    fn request_payload(&self, input: Vec<Value>) -> Value {
+        let mut payload = serde_json::json!({
             "model": self.model,
             "instructions": self.instructions,
-            "input": [{
-                "role": "user",
-                "content": [{"type": "input_text", "text": self.input}],
-            }],
-            "tools": [],
+            "input": input,
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
             "reasoning": {"summary": "auto"},
-        })
+        });
+        payload["tools"] = function_tools_json(&self.tools);
+        payload
+    }
+
+    fn initial_input(&self) -> Vec<Value> {
+        vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "input_text", "text": self.input}],
+        })]
     }
 }
 
 impl TurnProvider for ChatGptResponsesProvider {
     async fn next_parts(
         &mut self,
-        _events: &[TurnEvent],
+        events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
         if cancellation.is_cancelled() {
@@ -545,40 +597,91 @@ impl TurnProvider for ChatGptResponsesProvider {
         if cancellation.is_expired() {
             return Err(HeadlessTurnPortError::TimedOut);
         }
-        if self.completed {
-            return Err(HeadlessTurnPortError::Provider);
-        }
+        let state = std::mem::replace(&mut self.state, ChatGptContinuationState::Failed);
+        let (payload, replay_history) = match state {
+            ChatGptContinuationState::Initial => {
+                let replay_history = self.initial_input();
+                (self.request_payload(replay_history.clone()), replay_history)
+            }
+            ChatGptContinuationState::AwaitingToolOutputs {
+                mut replay_history,
+                pending_calls,
+                event_cursor,
+            } => {
+                let Some(new_events) = events.get(event_cursor..) else {
+                    return Err(HeadlessTurnPortError::Provider);
+                };
+                let outputs = correlated_tool_outputs(&pending_calls, new_events)
+                    .map_err(|()| HeadlessTurnPortError::Provider)?;
+                replay_history.extend(outputs);
+                (self.request_payload(replay_history.clone()), replay_history)
+            }
+            ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+        };
 
         self.refresh_if_needed(cancellation).await?;
-        let response = match self.request_response(cancellation).await {
+        let response = match self.request_response(payload, cancellation).await {
             Ok(response) => response,
             Err(ChatGptResponseError::Authentication(403)) => {
+                self.state = ChatGptContinuationState::Failed;
                 return Err(HeadlessTurnPortError::Authentication);
             }
             Err(ChatGptResponseError::Authentication(401)) => {
                 self.refresh_or_adopt(cancellation).await?;
-                match self.request_response(cancellation).await {
+                match self
+                    .request_response(self.request_payload(replay_history.clone()), cancellation)
+                    .await
+                {
                     Ok(response) => response,
                     Err(ChatGptResponseError::Authentication(_)) => {
+                        self.state = ChatGptContinuationState::Failed;
                         return Err(HeadlessTurnPortError::Authentication);
                     }
-                    Err(ChatGptResponseError::Other(error)) => return Err(error),
+                    Err(ChatGptResponseError::Other(error)) => {
+                        self.state = ChatGptContinuationState::Failed;
+                        return Err(error);
+                    }
                 }
             }
             Err(ChatGptResponseError::Authentication(_)) => {
+                self.state = ChatGptContinuationState::Failed;
                 return Err(HeadlessTurnPortError::Authentication);
             }
-            Err(ChatGptResponseError::Other(error)) => return Err(error),
+            Err(ChatGptResponseError::Other(error)) => {
+                self.state = ChatGptContinuationState::Failed;
+                return Err(error);
+            }
         };
-        if response
-            .parts
-            .iter()
-            .any(|part| !matches!(part, MessagePart::Text(_)))
+        if response.pending_calls.iter().any(|call| {
+            !self.seen_item_ids.insert(call.item_id.clone())
+                || !self.seen_call_ids.insert(call.call_id.clone())
+        }) || response.replay_items.iter().any(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !self.seen_replay_item_ids.insert(id.to_owned()))
+        }) || replay_history.len() + response.replay_items.len() > MAX_CHATGPT_REPLAY_ITEMS
         {
+            self.state = ChatGptContinuationState::Failed;
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        self.completed = true;
+        let mut replay_history = replay_history;
+        replay_history.extend(response.replay_items);
+        if response.pending_calls.is_empty() {
+            self.state = ChatGptContinuationState::Completed;
+        } else if self.continuation_rounds == MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
+            self.state = ChatGptContinuationState::Failed;
+            return Err(HeadlessTurnPortError::Provider);
+        } else {
+            self.continuation_rounds += 1;
+            self.state = ChatGptContinuationState::AwaitingToolOutputs {
+                replay_history,
+                pending_calls: response.pending_calls,
+                event_cursor: events.len(),
+            };
+        }
         Ok(response.parts)
     }
 }
@@ -747,6 +850,55 @@ fn continuation_payload(
     Ok(payload)
 }
 
+fn correlated_tool_outputs(
+    pending_calls: &[PendingToolCall],
+    events: &[TurnEvent],
+) -> Result<Vec<Value>, ()> {
+    let mut outputs = BTreeMap::new();
+
+    for event in events {
+        let TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        }) = event
+        else {
+            continue;
+        };
+
+        if !pending_calls
+            .iter()
+            .any(|call| call.call_id == *tool_call_id)
+            || outputs.contains_key(tool_call_id)
+        {
+            return Err(());
+        }
+
+        let output = if *is_error {
+            "Tool execution failed".to_owned()
+        } else {
+            bounded_tool_output(content)
+        };
+        outputs.insert(tool_call_id, output);
+    }
+
+    if outputs.len() != pending_calls.len() {
+        return Err(());
+    }
+
+    pending_calls
+        .iter()
+        .map(|call| {
+            let output = outputs.remove(&call.call_id).ok_or(())?;
+            Ok(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output,
+            }))
+        })
+        .collect()
+}
+
 fn bounded_tool_output(content: &str) -> String {
     content.chars().take(MAX_TOOL_OUTPUT_BYTES).collect()
 }
@@ -754,8 +906,9 @@ fn bounded_tool_output(content: &str) -> String {
 async fn decode_http_response_stream(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
+    require_encrypted_reasoning: bool,
 ) -> Result<DecodedResponse, HeadlessTurnPortError> {
-    let mut decoder = OpenAiResponseDecoder::default();
+    let mut decoder = OpenAiResponseDecoder::new(require_encrypted_reasoning);
     let mut frame = Vec::new();
 
     loop {
@@ -1019,6 +1172,8 @@ struct OpenAiResponseDecoder {
     seen_call_ids: BTreeMap<String, ()>,
     function_call_order: Vec<String>,
     completed_calls: BTreeMap<String, PendingToolCall>,
+    replay_items: Vec<Value>,
+    require_encrypted_reasoning: bool,
     completed: bool,
 }
 
@@ -1026,6 +1181,7 @@ struct DecodedResponse {
     parts: Vec<MessagePart>,
     response_id: Option<String>,
     pending_calls: Vec<PendingToolCall>,
+    replay_items: Vec<Value>,
 }
 
 struct FunctionCall {
@@ -1035,6 +1191,13 @@ struct FunctionCall {
 }
 
 impl OpenAiResponseDecoder {
+    fn new(require_encrypted_reasoning: bool) -> Self {
+        Self {
+            require_encrypted_reasoning,
+            ..Self::default()
+        }
+    }
+
     fn process(&mut self, event_json: &str) -> Result<(), Error> {
         let event: Value =
             serde_json::from_str(event_json).map_err(|_| protocol_error("invalid event JSON"))?;
@@ -1079,6 +1242,7 @@ impl OpenAiResponseDecoder {
             .iter()
             .any(|part| matches!(part, MessagePart::ToolCall { .. }))
             && self.response_id.is_none()
+            && !self.require_encrypted_reasoning
         {
             return Err(protocol_error("tool calls require a response ID"));
         }
@@ -1097,6 +1261,7 @@ impl OpenAiResponseDecoder {
             parts: self.parts,
             response_id: self.response_id,
             pending_calls,
+            replay_items: self.replay_items,
         })
     }
 
@@ -1115,6 +1280,17 @@ impl OpenAiResponseDecoder {
                     required_string(summary, "text")?.to_owned(),
                 ));
             }
+        }
+
+        if self.require_encrypted_reasoning {
+            let id = required_nonempty_string(item, "id")?;
+            let encrypted_content = required_nonempty_string(item, "encrypted_content")?;
+            self.push_replay_item(serde_json::json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": summaries,
+                "encrypted_content": encrypted_content,
+            }))?;
         }
 
         Ok(())
@@ -1193,12 +1369,30 @@ impl OpenAiResponseDecoder {
                 call_id: call.call_id.clone(),
             },
         );
+        self.push_replay_item(serde_json::json!({
+            "type": "function_call",
+            "id": id,
+            "call_id": call.call_id.clone(),
+            "name": call.name.clone(),
+            "arguments": call.arguments.clone(),
+        }))?;
         self.parts.push(MessagePart::ToolCall {
             id: call.call_id,
             name: call.name,
             input: call.arguments,
         });
 
+        Ok(())
+    }
+
+    fn push_replay_item(&mut self, item: Value) -> Result<(), Error> {
+        if self.replay_items.len() == MAX_CHATGPT_REPLAY_ITEMS
+            || serde_json::to_vec(&item)
+                .map_or(true, |bytes| bytes.len() > MAX_CHATGPT_REPLAY_ITEM_BYTES)
+        {
+            return Err(protocol_error("replay output exceeds provider bounds"));
+        }
+        self.replay_items.push(item);
         Ok(())
     }
 }

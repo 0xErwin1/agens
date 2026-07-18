@@ -992,6 +992,143 @@ fn subscription_refresh_recovers_after_lock_holder_crash_without_stale_sidecar_d
     }
 }
 
+#[test]
+fn subscription_tool_replay_replays_reasoning_calls_outputs_and_tools_without_response_id() {
+    let directory = temporary_directory("tool-replay");
+    let credentials = write_credentials(&directory);
+    let tool = agens_providers::OpenAiFunctionTool::new(
+        "weather",
+        "Looks up weather",
+        json!({"type":"object","properties":{"city":{"type":"string"}}}),
+    )
+    .expect("tool should be valid");
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(tool_call_sse(
+            "item_call_1",
+            "call_1",
+            "weather",
+            r#"{"city":"Paris"}"#,
+        )),
+        ScriptedResponse::Sse(completed_text_sse("done")),
+    ]);
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.responses_base_url()),
+            Some(&server.oauth_url()),
+            "test-model".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            vec![tool],
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured");
+
+    assert_eq!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Ok(vec![
+            MessagePart::Reasoning("checking weather".to_owned()),
+            MessagePart::ToolCall {
+                id: "call_1".to_owned(),
+                name: "weather".to_owned(),
+                input: r#"{"city":"Paris"}"#.to_owned(),
+            },
+        ])
+    );
+    assert_eq!(
+        run_with_events(
+            &mut provider,
+            &[agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call_1".to_owned(),
+                content: "sunny".to_owned(),
+                is_error: false,
+            })],
+            HeadlessTurnCancellation::new(),
+        ),
+        Ok(vec![MessagePart::Text("done".to_owned())])
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].body["store"], false);
+    assert!(requests[0].body.get("previous_response_id").is_none());
+    assert_eq!(requests[1].body["store"], false);
+    assert!(requests[1].body.get("previous_response_id").is_none());
+    assert_eq!(requests[1].body["tools"], requests[0].body["tools"]);
+    assert_eq!(
+        requests[1].body["input"],
+        json!([
+            {"role":"user","content":[{"type":"input_text","text":"test input"}]},
+            {
+                "type":"reasoning",
+                "id":"item_reasoning_1",
+                "summary":[{"type":"summary_text","text":"checking weather"}],
+                "encrypted_content":"encrypted-reasoning-1"
+            },
+            {
+                "type":"function_call",
+                "id":"item_call_1",
+                "call_id":"call_1",
+                "name":"weather",
+                "arguments":"{\"city\":\"Paris\"}"
+            },
+            {"type":"function_call_output","call_id":"call_1","output":"sunny"}
+        ])
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_tool_replay_rejects_duplicate_outputs_before_another_http_request() {
+    let directory = temporary_directory("tool-replay-duplicate");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Sse(tool_call_sse(
+        "item_call_1",
+        "call_1",
+        "weather",
+        r#"{"city":"Paris"}"#,
+    ))]);
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.responses_base_url()),
+            Some(&server.oauth_url()),
+            "test-model".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured");
+    let result = MessagePart::ToolResult {
+        tool_call_id: "call_1".to_owned(),
+        content: "sunny".to_owned(),
+        is_error: false,
+    };
+
+    assert!(matches!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Ok(parts) if parts.iter().any(|part| matches!(part, MessagePart::ToolCall { .. }))
+    ));
+    assert_eq!(
+        run_with_events(
+            &mut provider,
+            &[
+                agens_core::TurnEvent::ToolResult(result.clone()),
+                agens_core::TurnEvent::ToolResult(result),
+            ],
+            HeadlessTurnCancellation::new(),
+        ),
+        Err(HeadlessTurnPortError::Provider)
+    );
+    assert_eq!(
+        run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider)
+    );
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
 fn provider(credentials: &Path, base_url: &str) -> ChatGptResponsesProvider {
     ChatGptResponsesProvider::from_credentials_with_timeout(
         credentials,
@@ -1015,6 +1152,20 @@ fn run(
         .expect("runtime should build");
 
     runtime.block_on(provider.next_parts(&[], &cancellation))
+}
+
+fn run_with_events(
+    provider: &mut ChatGptResponsesProvider,
+    events: &[agens_core::TurnEvent],
+    cancellation: HeadlessTurnCancellation,
+) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("runtime should build");
+
+    runtime.block_on(provider.next_parts(events, &cancellation))
 }
 
 fn write_credentials(directory: &Path) -> PathBuf {
@@ -1095,6 +1246,37 @@ fn completed_text_sse(text: &str) -> String {
     format!(
         "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
 data: {{\"type\":\"response.completed\"}}\n\n"
+    )
+}
+
+fn tool_call_sse(item_id: &str, call_id: &str, name: &str, arguments: &str) -> String {
+    let reasoning = json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "id": "item_reasoning_1",
+            "summary": [{"type": "summary_text", "text": "checking weather"}],
+            "encrypted_content": "encrypted-reasoning-1",
+        },
+    });
+    let added = json!({
+        "type": "response.output_item.added",
+        "item": {
+            "type": "function_call",
+            "id": item_id,
+            "call_id": call_id,
+            "name": name,
+            "arguments": "",
+        },
+    });
+    let done = json!({
+        "type": "response.function_call_arguments.done",
+        "item_id": item_id,
+        "arguments": arguments,
+    });
+
+    format!(
+        "data: {reasoning}\n\ndata: {added}\n\ndata: {done}\n\ndata: {{\"type\":\"response.completed\"}}\n\n"
     )
 }
 
