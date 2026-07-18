@@ -8,6 +8,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +25,9 @@ pub const ISSUER: &str = "https://auth.openai.com";
 pub const AUTHORIZATION_ENDPOINT: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const DEVICE_USER_CODE_ENDPOINT: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+pub const DEVICE_TOKEN_ENDPOINT: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 pub const CALLBACK_PORTS: [u16; 2] = [1455, 1457];
 pub const SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
@@ -33,6 +37,12 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const CALLBACK_READ_SLICE: Duration = Duration::from_millis(25);
 const CALLBACK_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const DEVICE_CALLBACK_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const MAX_DEVICE_FIELD_BYTES: usize = 4096;
+const MAX_DEVICE_POLL_INTERVAL_SECONDS: f64 = 60.0;
+const DEVICE_WAIT_SLICE: Duration = Duration::from_millis(5);
+const DEVICE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -54,6 +64,24 @@ pub struct ChatGptCredentials {
     pub refresh_token: String,
     pub account_id: String,
     pub expires_at: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ChatGptDeviceCodeLogin {
+    pub verification_url: String,
+    pub user_code: String,
+    pub credentials: ChatGptCredentials,
+}
+
+impl std::fmt::Debug for ChatGptDeviceCodeLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatGptDeviceCodeLogin")
+            .field("verification_url", &self.verification_url)
+            .field("user_code", &self.user_code)
+            .field("credentials", &self.credentials)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ChatGptCredentials {
@@ -145,6 +173,44 @@ impl ChatGptLoginOptions {
     }
 }
 
+#[derive(Clone)]
+pub struct ChatGptDeviceCodeLoginOptions {
+    pub user_code_endpoint: String,
+    pub device_token_endpoint: String,
+    pub token_endpoint: String,
+    pub timeout: Duration,
+}
+
+impl ChatGptDeviceCodeLoginOptions {
+    pub fn new() -> Self {
+        Self {
+            user_code_endpoint: DEVICE_USER_CODE_ENDPOINT.to_owned(),
+            device_token_endpoint: DEVICE_TOKEN_ENDPOINT.to_owned(),
+            token_endpoint: TOKEN_ENDPOINT.to_owned(),
+            timeout: LOGIN_TIMEOUT,
+        }
+    }
+
+    pub fn for_test(
+        user_code_endpoint: &str,
+        device_token_endpoint: &str,
+        token_endpoint: &str,
+    ) -> Self {
+        Self {
+            user_code_endpoint: user_code_endpoint.to_owned(),
+            device_token_endpoint: device_token_endpoint.to_owned(),
+            token_endpoint: token_endpoint.to_owned(),
+            timeout: LOGIN_TIMEOUT,
+        }
+    }
+}
+
+impl Default for ChatGptDeviceCodeLoginOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn generate_pkce(
     random_bytes: &dyn Fn(usize) -> Result<Vec<u8>, LoginError>,
 ) -> Result<Pkce, LoginError> {
@@ -210,6 +276,43 @@ pub fn login(
         &redirect_uri,
         &pkce.verifier,
     )
+}
+
+pub fn device_code_login(
+    options: ChatGptDeviceCodeLoginOptions,
+    cancellation: LoginCancellation,
+) -> Result<ChatGptDeviceCodeLogin, LoginError> {
+    let deadline = Instant::now() + options.timeout.min(LOGIN_TIMEOUT);
+    let device = device_user_code_request(&options.user_code_endpoint, &cancellation, deadline)?;
+    let (device_auth_id, user_code, interval) = parse_device_user_code(&device)?;
+
+    loop {
+        check_login_stop(&cancellation, deadline)?;
+        let response = device_token_request(
+            &options.device_token_endpoint,
+            &device_auth_id,
+            &user_code,
+            &cancellation,
+            deadline,
+        )?;
+        if let Some(token) = response {
+            let (authorization_code, _code_challenge, code_verifier) = parse_device_token(&token)?;
+            let credentials = exchange_code_cancellable(
+                &options.token_endpoint,
+                &authorization_code,
+                DEVICE_CALLBACK_URI,
+                &code_verifier,
+                &cancellation,
+                deadline,
+            )?;
+            return Ok(ChatGptDeviceCodeLogin {
+                verification_url: DEVICE_VERIFICATION_URL.to_owned(),
+                user_code,
+                credentials,
+            });
+        }
+        sleep_with_cancellation(interval, &cancellation, deadline)?;
+    }
 }
 
 pub fn upsert_chatgpt_credentials(
@@ -669,9 +772,13 @@ fn exchange_code(
     let token = response
         .json::<Value>()
         .map_err(|_| LoginError::Authentication("token response is invalid"))?;
-    let id_token = required_token(&token, "id_token")?;
-    let access_token = required_token(&token, "access_token")?;
-    let refresh_token = required_token(&token, "refresh_token")?;
+    credentials_from_token(&token)
+}
+
+fn credentials_from_token(token: &Value) -> Result<ChatGptCredentials, LoginError> {
+    let id_token = required_token(token, "id_token")?;
+    let access_token = required_token(token, "access_token")?;
+    let refresh_token = required_token(token, "refresh_token")?;
     let account_id = jwt_claim(id_token, ACCOUNT_ID_CLAIM)
         .as_ref()
         .and_then(Value::as_str)
@@ -691,6 +798,191 @@ fn exchange_code(
         account_id,
         expires_at,
     })
+}
+
+fn device_user_code_request(
+    endpoint: &str,
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+) -> Result<Value, LoginError> {
+    let endpoint = endpoint.to_owned();
+    let response = cancellable_request(cancellation, deadline, move || {
+        reqwest::blocking::Client::builder()
+            .timeout(DEVICE_HTTP_TIMEOUT)
+            .build()
+            .expect("the fixed device HTTP client configuration is valid")
+            .post(endpoint)
+            .json(&serde_json::json!({ "client_id": CLIENT_ID }))
+            .send()
+            .map(|response| (response.status().as_u16(), response.json::<Value>().ok()))
+    })?;
+    match response {
+        (404, _) => Err(LoginError::Authentication("Authentication unavailable")),
+        (status, Some(body)) if (200..300).contains(&status) => Ok(body),
+        _ => Err(LoginError::Authentication("device authorization failed")),
+    }
+}
+
+fn device_token_request(
+    endpoint: &str,
+    device_auth_id: &str,
+    user_code: &str,
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+) -> Result<Option<Value>, LoginError> {
+    let endpoint = endpoint.to_owned();
+    let device_auth_id = device_auth_id.to_owned();
+    let user_code = user_code.to_owned();
+    let response = cancellable_request(cancellation, deadline, move || {
+        reqwest::blocking::Client::builder()
+            .timeout(DEVICE_HTTP_TIMEOUT)
+            .build()
+            .expect("the fixed device HTTP client configuration is valid")
+            .post(endpoint)
+            .json(&serde_json::json!({
+                "device_auth_id": device_auth_id,
+                "user_code": user_code,
+            }))
+            .send()
+            .map(|response| (response.status().as_u16(), response.json::<Value>().ok()))
+    })?;
+    match response {
+        (403 | 404, _) => Ok(None),
+        (status, Some(body)) if (200..300).contains(&status) => Ok(Some(body)),
+        _ => Err(LoginError::Authentication("device authorization failed")),
+    }
+}
+
+fn parse_device_user_code(value: &Value) -> Result<(String, String, Duration), LoginError> {
+    let device_auth_id = bounded_device_string(value, "device_auth_id")?;
+    let user_code = value
+        .get("user_code")
+        .or_else(|| value.get("usercode"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_DEVICE_FIELD_BYTES)
+        .ok_or(LoginError::Authentication(
+            "device authorization response is invalid",
+        ))?
+        .to_owned();
+    let interval = value
+        .get("interval")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() <= 32)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| {
+            value.is_finite() && *value > 0.0 && *value <= MAX_DEVICE_POLL_INTERVAL_SECONDS
+        })
+        .map(Duration::from_secs_f64)
+        .ok_or(LoginError::Authentication(
+            "device authorization response is invalid",
+        ))?;
+    Ok((device_auth_id, user_code, interval))
+}
+
+fn parse_device_token(value: &Value) -> Result<(String, String, String), LoginError> {
+    Ok((
+        bounded_device_string(value, "authorization_code")?,
+        bounded_device_string(value, "code_challenge")?,
+        bounded_device_string(value, "code_verifier")?,
+    ))
+}
+
+fn bounded_device_string(value: &Value, field: &str) -> Result<String, LoginError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= MAX_DEVICE_FIELD_BYTES)
+        .map(str::to_owned)
+        .ok_or(LoginError::Authentication(
+            "device authorization response is invalid",
+        ))
+}
+
+fn exchange_code_cancellable(
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+) -> Result<ChatGptCredentials, LoginError> {
+    let token_endpoint = token_endpoint.to_owned();
+    let code = code.to_owned();
+    let redirect_uri = redirect_uri.to_owned();
+    let verifier = verifier.to_owned();
+    let response = cancellable_request(cancellation, deadline, move || {
+        reqwest::blocking::Client::builder()
+            .timeout(DEVICE_HTTP_TIMEOUT)
+            .build()
+            .expect("the fixed device HTTP client configuration is valid")
+            .post(token_endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("client_id", CLIENT_ID),
+                ("code_verifier", verifier.as_str()),
+            ])
+            .send()
+            .map(|response| {
+                (
+                    response.status().is_success(),
+                    response.json::<Value>().ok(),
+                )
+            })
+    })?;
+    let (success, Some(token)) = response else {
+        return Err(LoginError::Authentication("token exchange failed"));
+    };
+    if !success {
+        return Err(LoginError::Authentication("token exchange failed"));
+    }
+    credentials_from_token(&token)
+}
+
+fn cancellable_request<T: Send + 'static>(
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+    request: impl FnOnce() -> Result<T, reqwest::Error> + Send + 'static,
+) -> Result<T, LoginError> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(request().map_err(|_| ()));
+    });
+    loop {
+        check_login_stop(cancellation, deadline)?;
+        match receiver.recv_timeout(DEVICE_WAIT_SLICE) {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
+                return Err(LoginError::Authentication("device authorization failed"));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn sleep_with_cancellation(
+    interval: Duration,
+    cancellation: &LoginCancellation,
+    deadline: Instant,
+) -> Result<(), LoginError> {
+    let until = Instant::now() + interval;
+    while Instant::now() < until {
+        check_login_stop(cancellation, deadline)?;
+        thread::sleep(DEVICE_WAIT_SLICE.min(until.saturating_duration_since(Instant::now())));
+    }
+    check_login_stop(cancellation, deadline)
+}
+
+fn check_login_stop(cancellation: &LoginCancellation, deadline: Instant) -> Result<(), LoginError> {
+    if cancellation.is_cancelled() {
+        return Err(LoginError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(LoginError::TimedOut);
+    }
+    Ok(())
 }
 
 fn required_token<'a>(token: &'a Value, field: &str) -> Result<&'a str, LoginError> {
