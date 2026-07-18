@@ -857,10 +857,21 @@ fn production_binary_denies_native_read_without_side_effect_and_continues_safely
 #[test]
 fn production_binary_returns_permission_required_without_dispatching_an_unresolved_native_call() {
     let temporary = TemporaryDirectory::new("production-native-ask");
+    let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
     let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
-    let server = NativeToolCallOpenAiMockServer::start();
+    let protected = project_root.join("SENTINEL_UNRESOLVED_ASK.txt");
+    std::fs::write(&protected, "must not be read").expect("protected fixture should exist");
+    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["native::read".to_owned()],
+        response: native_tool_call_response(
+            "call_ask",
+            "native::read",
+            r#"{"path":"SENTINEL_UNRESOLVED_ASK.txt"}"#,
+        ),
+    }]);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -873,6 +884,7 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
 
     let output = Command::new(env!("CARGO_BIN_EXE_agens"))
         .args(["chat", "request native tool"])
+        .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
         .output()
@@ -884,6 +896,18 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
         String::from_utf8_lossy(&output.stderr),
         "error: permission: permission approval is required\n"
     );
+    assert_eq!(
+        std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
+        "must not be read"
+    );
+    assert!(
+        !format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .contains("SENTINEL_UNRESOLVED_ASK")
+    );
     let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
         .args(["sessions", "list"])
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -894,6 +918,280 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
         String::from_utf8_lossy(&sessions.stdout),
         "No saved sessions.\n"
     );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass() {
+    let temporary = TemporaryDirectory::new("production-chat-write-deny");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let protected = project_root.join("SENTINEL_CHAT_WRITE.txt");
+    let server = BoundedScriptedOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::write".to_owned()],
+            response: native_tool_call_response(
+                "call_chat_write",
+                "native::write",
+                r#"{"path":"SENTINEL_CHAT_WRITE.txt","content":"must not be written"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_chat_write\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+            ],
+            response: text_response("chat mode denial handled"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "chat",
+            "--mode",
+            "chat",
+            "--dangerously-allow-all",
+            "attempt a native write",
+        ])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "chat mode denial handled\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(!protected.exists(), "chat mode must block native writes");
+
+    server.join();
+}
+
+#[test]
+fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_before_dispatch() {
+    for (name, response) in [
+        (
+            "duplicate",
+            sse_response(&[
+                r#"{"type":"response.created","response":{"id":"response_duplicate"}}"#,
+                r#"{"type":"response.output_item.added","item":{"id":"item_one","type":"function_call","call_id":"call_duplicate","name":"native::write","arguments":""}}"#,
+                r#"{"type":"response.output_item.added","item":{"id":"item_two","type":"function_call","call_id":"call_duplicate","name":"native::write","arguments":""}}"#,
+            ]),
+        ),
+        (
+            "mismatched",
+            sse_response(&[
+                r#"{"type":"response.created","response":{"id":"response_mismatched"}}"#,
+                r#"{"type":"response.output_item.added","item":{"id":"item_expected","type":"function_call","call_id":"call_mismatched","name":"native::write","arguments":""}}"#,
+                r#"{"type":"response.function_call_arguments.done","item_id":"item_other","arguments":"{\"path\":\"should-not-exist\",\"content\":\"must not be written\"}"}"#,
+            ]),
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-{name}-call-id"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        let side_effect = project_root.join("should-not-exist");
+        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::write".to_owned()],
+            response,
+        }]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                server.base_url(),
+                data_directory.display(),
+            ),
+        )
+        .expect("config should be written");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args([
+                "chat",
+                "--dangerously-allow-all",
+                "reject malformed tool call",
+            ])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "error: provider: provider request failed\n",
+            "{name}"
+        );
+        assert!(!side_effect.exists(), "{name} call must not dispatch");
+        assert_no_saved_sessions(&project_root, &config_home);
+
+        server.join();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn production_binary_cancellation_kills_native_bash_descendants_without_continuing_or_persisting() {
+    let temporary = TemporaryDirectory::new("production-native-bash-cancel");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let process_marker = temporary.path().join("processes");
+    let ready_marker = temporary.path().join("ready");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let command = format!(
+        "bash -c 'sleep 30 & descendant=$!; printf \"%s %s\\n\" \"$$\" \"$descendant\" > \"$1\"; : > \"$2\"; wait' bash {:?} {:?} & wait",
+        process_marker, ready_marker
+    );
+    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["native::bash".to_owned()],
+        response: native_tool_call_response(
+            "call_bash_cancel",
+            "native::bash",
+            &format!(r#"{{"command":{command:?}}}"#),
+        ),
+    }]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "chat",
+            "--dangerously-allow-all",
+            "run the long native bash command",
+        ])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("production binary should start");
+    wait_for_path(&ready_marker, Duration::from_secs(2));
+
+    let signal_status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("SIGINT command should execute");
+    assert!(signal_status.success(), "SIGINT delivery should succeed");
+
+    let output = wait_for_child_output(child, Duration::from_secs(2));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: cancelled: headless turn was cancelled\n"
+    );
+
+    let process_ids = std::fs::read_to_string(&process_marker)
+        .expect("native bash should record its child and descendant process IDs")
+        .split_whitespace()
+        .map(|process_id| {
+            process_id
+                .parse::<u32>()
+                .expect("process ID should be numeric")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(process_ids.len(), 2);
+    for process_id in process_ids {
+        wait_for_process_exit(process_id, Duration::from_secs(2));
+    }
+    assert_no_saved_sessions(&project_root, &config_home);
+
+    server.join();
+}
+
+#[test]
+fn production_binary_rejects_replayed_native_call_id_without_second_execution() {
+    let temporary = TemporaryDirectory::new("production-native-call-integrity");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let side_effect = project_root.join("execution-count");
+    let initial_call = native_tool_call_response(
+        "call_once",
+        "native::write",
+        r#"{"path":"execution-count","content":"first execution"}"#,
+    );
+    let replayed_call = native_tool_call_response(
+        "call_once",
+        "native::write",
+        r#"{"path":"execution-count","content":"second execution"}"#,
+    );
+    let server = BoundedScriptedOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::write".to_owned()],
+            response: initial_call,
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_once\"".to_owned(),
+                "wrote execution-count".to_owned(),
+            ],
+            response: replayed_call,
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"write(execution-count)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "execute exactly once"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: provider: provider request failed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&side_effect)
+            .expect("only the first authorized call should execute"),
+        "first execution"
+    );
+    assert_no_saved_sessions(&project_root, &config_home);
 
     server.join();
 }
@@ -1100,17 +1398,17 @@ struct OpenAiMockServer {
     worker: thread::JoinHandle<()>,
 }
 
-struct NativeToolCallOpenAiMockServer {
-    address: std::net::SocketAddr,
-    worker: thread::JoinHandle<()>,
-}
-
 struct ScriptedOpenAiResponse {
     required_body_fragments: Vec<String>,
     response: String,
 }
 
 struct ScriptedNativeOpenAiMockServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<()>,
+}
+
+struct BoundedScriptedOpenAiMockServer {
     address: std::net::SocketAddr,
     worker: thread::JoinHandle<()>,
 }
@@ -1151,20 +1449,44 @@ impl ScriptedNativeOpenAiMockServer {
     }
 }
 
-impl NativeToolCallOpenAiMockServer {
-    fn start() -> Self {
+impl BoundedScriptedOpenAiMockServer {
+    fn start(responses: Vec<ScriptedOpenAiResponse>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
         let address = listener
             .local_addr()
             .expect("mock server should have an address");
         let worker = thread::spawn(move || {
-            let (mut stream, _) = listener
-                .accept()
-                .expect("mock server should accept a request");
-            read_openai_request(&stream);
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"item_1\",\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"native::read\",\"arguments\":\"\"}}\n\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"item_1\",\"arguments\":\"{\\\"path\\\":\\\"notes.md\\\"}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"response_1\"}}\n\n")
-                .expect("tool call response should be written");
+            for scripted in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("mock server should accept a request");
+                let body = read_openai_request_body(&stream);
+                for fragment in scripted.required_body_fragments {
+                    assert!(
+                        body.contains(&fragment),
+                        "request body should contain {fragment:?}: {body}"
+                    );
+                }
+                stream
+                    .write_all(scripted.response.as_bytes())
+                    .expect("scripted response should be written");
+            }
+
+            listener
+                .set_nonblocking(true)
+                .expect("mock server should enable bounded probe mode");
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        panic!("unexpected provider continuation request");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock server probe failed: {error}"),
+                }
+            }
         });
 
         Self { address, worker }
@@ -1381,4 +1703,83 @@ fn text_response(text: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":{text:?}}}\n\ndata: {{\"type\":\"response.completed\"}}\n\n"
     )
+}
+
+fn sse_response(events: &[&str]) -> String {
+    let body = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+}
+
+fn wait_for_path(path: &std::path::Path, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_child_output(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> std::process::Output {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if child
+            .try_wait()
+            .expect("production binary status should remain observable")
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .expect("production binary output should remain readable");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for production binary cancellation"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_exit(process_id: u32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let status = Command::new("kill")
+            .args(["-0", &process_id.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("process probe should execute");
+        if !status.success() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {process_id} survived cancellation"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_no_saved_sessions(project_root: &std::path::Path, config_home: &std::path::Path) {
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .current_dir(project_root)
+        .env("AGENS_CONFIG_HOME", config_home)
+        .output()
+        .expect("sessions command should execute");
+
+    assert!(sessions.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "No saved sessions.\n"
+    );
 }
