@@ -14,10 +14,11 @@ use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-    PermissionSession, run_headless_turn,
+    PermissionSession, TurnProvider, run_headless_turn,
 };
 use agens_providers::{
-    ChatGptAuthState, OpenAiFunctionTool, OpenAiResponsesProvider, load_chatgpt_auth_state,
+    ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
+    load_chatgpt_auth_state,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
@@ -166,19 +167,46 @@ impl CliError {
     }
 
     fn runtime(error: HeadlessTurnError) -> Self {
-        let (category, message) = match error {
-            HeadlessTurnError::Cancelled => ("cancelled", "headless turn was cancelled"),
-            HeadlessTurnError::TimedOut => ("timeout", "headless turn timed out"),
-            HeadlessTurnError::Provider => ("provider", "provider request failed"),
-            HeadlessTurnError::Permission => ("permission", "permission evaluation failed"),
-            HeadlessTurnError::PermissionRequired => {
-                ("permission", "permission approval is required")
+        let (status, category, message) = match error {
+            HeadlessTurnError::Cancelled => (
+                ExitStatus::Failure,
+                "cancelled",
+                "headless turn was cancelled",
+            ),
+            HeadlessTurnError::TimedOut => {
+                (ExitStatus::Failure, "timeout", "headless turn timed out")
             }
-            HeadlessTurnError::Tool => ("tool", "tool execution failed"),
-            HeadlessTurnError::Store => ("store", "completed turn could not be saved"),
-            HeadlessTurnError::State => ("runtime", "headless turn entered an invalid state"),
+            HeadlessTurnError::Authentication => (
+                ExitStatus::Authentication,
+                "auth",
+                "ChatGPT credentials are unavailable or invalid",
+            ),
+            HeadlessTurnError::Provider => {
+                (ExitStatus::Failure, "provider", "provider request failed")
+            }
+            HeadlessTurnError::Permission => (
+                ExitStatus::Failure,
+                "permission",
+                "permission evaluation failed",
+            ),
+            HeadlessTurnError::PermissionRequired => (
+                ExitStatus::Failure,
+                "permission",
+                "permission approval is required",
+            ),
+            HeadlessTurnError::Tool => (ExitStatus::Failure, "tool", "tool execution failed"),
+            HeadlessTurnError::Store => (
+                ExitStatus::Failure,
+                "store",
+                "completed turn could not be saved",
+            ),
+            HeadlessTurnError::State => (
+                ExitStatus::Failure,
+                "runtime",
+                "headless turn entered an invalid state",
+            ),
         };
-        Self::new(ExitStatus::Failure, category, message)
+        Self::new(status, category, message)
     }
 
     fn new(status: ExitStatus, category: &'static str, message: impl Into<String>) -> Self {
@@ -652,23 +680,71 @@ fn run_production_headless_chat(
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     match bootstrap.provider_type() {
-        Some("openai-api") => run_openai_api_chat(request, bootstrap, cancellation),
-        Some("openai-chatgpt") => Err(CliError::authentication(
-            "ChatGPT subscription authentication is unavailable for headless chat",
-        )),
+        Some("openai-api") => {
+            let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+                CliError::authentication("OpenAI API authentication is unavailable")
+            })?;
+            run_production_headless_chat_with_provider(
+                request,
+                bootstrap,
+                cancellation,
+                move |model, prompt, tools| {
+                    OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
+                        api_key,
+                        bootstrap.provider_base_url(),
+                        model,
+                        prompt,
+                        tools,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .map_err(|_| {
+                        CliError::authentication("OpenAI API authentication is unavailable")
+                    })
+                },
+            )
+        }
+        Some("openai-chatgpt") => {
+            let credentials_path = bootstrap.paths.credentials.clone();
+            let instructions = request
+                .system_prompt
+                .clone()
+                .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned());
+            run_production_headless_chat_with_provider(
+                request,
+                bootstrap,
+                cancellation,
+                move |model, prompt, tools| {
+                    ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+                        &credentials_path,
+                        bootstrap.provider_base_url(),
+                        None,
+                        model,
+                        instructions,
+                        prompt,
+                        tools,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .map_err(|_| {
+                        CliError::authentication("ChatGPT credentials are unavailable or invalid")
+                    })
+                },
+            )
+        }
         _ => Err(CliError::configuration(
-            "headless chat requires provider.type = \"openai-api\"",
+            "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
         )),
     }
 }
 
-fn run_openai_api_chat(
+fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
-) -> Result<String, CliError> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
+    build_provider: impl FnOnce(String, String, Vec<OpenAiFunctionTool>) -> Result<P, CliError>,
+) -> Result<String, CliError>
+where
+    P: TurnProvider,
+{
     let model = request
         .model
         .or_else(|| bootstrap.model().map(ToOwned::to_owned))
@@ -690,15 +766,7 @@ fn run_openai_api_chat(
         PermissionSession::new()
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
-        api_key,
-        bootstrap.provider_base_url(),
-        model,
-        request.prompt,
-        provider_tools,
-        std::time::Duration::from_secs(120),
-    )
-    .map_err(|_| CliError::authentication("OpenAI API authentication is unavailable"))?;
+    let mut provider = build_provider(model, request.prompt, provider_tools)?;
     cancellation_result(cancellation)?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;

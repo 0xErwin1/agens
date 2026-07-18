@@ -634,6 +634,320 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
 }
 
 #[test]
+fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_the_turn() {
+    let temporary = TemporaryDirectory::new("production-chatgpt");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec![
+            "\"store\":false".to_owned(),
+            "\"model\":\"test-model\"".to_owned(),
+        ],
+        response: text_response("Hello from ChatGPT"),
+    }]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"SENTINEL_CHATGPT_REFRESH","account_id":"account_123","expires_at":"2030-01-01T00:00:00Z"}}"#,
+    )
+    .expect("ChatGPT credentials should be written");
+
+    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "hello from subscription"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("production binary should list sessions");
+
+    assert!(chat.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&chat.stdout),
+        "Hello from ChatGPT\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "ID\tEVENTS\n1\t4 event(s)\n"
+    );
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&chat.stdout),
+        String::from_utf8_lossy(&chat.stderr)
+    );
+    assert!(!diagnostics.contains("SENTINEL_CHATGPT_REFRESH"));
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &["SENTINEL_CHATGPT_REFRESH"],
+    );
+
+    server.join();
+}
+
+#[test]
+fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credentials() {
+    for (name, credentials) in [
+        ("missing", None),
+        ("malformed", Some("SENTINEL_MALFORMED_CREDENTIALS")),
+        (
+            "incomplete",
+            Some(r#"{"openai-chatgpt":{"access_token":"SENTINEL_INCOMPLETE_ACCESS"}}"#),
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
+        let config_home = temporary.path().join("config");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        std::fs::write(
+            config_home.join("config.toml"),
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\n",
+        )
+        .expect("config should be written");
+        if let Some(credentials) = credentials {
+            std::fs::write(config_home.join("auth.json"), credentials)
+                .expect("credential fixture should be written");
+        }
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "reject invalid credentials"])
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env_remove("OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), Some(4), "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "error: auth: ChatGPT credentials are unavailable or invalid\n",
+            "{name}"
+        );
+        assert!(!format!("{output:?}").contains("SENTINEL"), "{name}");
+    }
+}
+
+#[test]
+fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
+    for (name, status, expected_exit, expected_stderr) in [
+        (
+            "forbidden",
+            "HTTP/1.1 403 Forbidden",
+            Some(4),
+            "error: auth: ChatGPT credentials are unavailable or invalid\n",
+        ),
+        (
+            "server failure",
+            "HTTP/1.1 500 Internal Server Error",
+            Some(1),
+            "error: provider: provider request failed\n",
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
+        let config_home = temporary.path().join("config");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+            required_body_fragments: vec!["\"store\":false".to_owned()],
+            response: format!(
+                "{status}\r\nX-Remote-Secret: SENTINEL_CHATGPT_REMOTE\r\nContent-Length: 28\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY"
+            ),
+        }]);
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n",
+                server.base_url(),
+            ),
+        )
+        .expect("config should be written");
+        write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_ACCESS");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args(["chat", "handle remote failure"])
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env_remove("OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert_eq!(output.status.code(), expected_exit, "{name}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            expected_stderr,
+            "{name}"
+        );
+        for secret in [
+            "SENTINEL_CHATGPT_ACCESS",
+            "SENTINEL_CHATGPT_REFRESH",
+            "SENTINEL_CHATGPT_REMOTE",
+            "SENTINEL_CHATGPT_ERROR_BODY",
+        ] {
+            assert!(!format!("{output:?}").contains(secret), "{name}: {secret}");
+        }
+
+        server.join();
+    }
+}
+
+#[test]
+fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
+    for (name, tool, arguments, setup, expected_output) in [
+        (
+            "native",
+            "native::read",
+            r#"{"path":"notes.md"}"#,
+            "[permissions]\nallow = [\"read(notes.md)\"]\n",
+            "native subscription completed",
+        ),
+        (
+            "MCP",
+            "files::first",
+            "{}",
+            "[mcp.files]\ntransport = \"stdio\"\ncommand = \"{fake_mcp}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
+            "MCP subscription completed",
+        ),
+    ] {
+        let temporary = TemporaryDirectory::new(&format!("production-chatgpt-tool-{name}"));
+        let project_root = temporary.path().join("project");
+        let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
+        std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+        std::fs::create_dir_all(&config_home).expect("config directory should exist");
+        std::fs::write(project_root.join("notes.md"), "subscription native content")
+            .expect("native fixture should exist");
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![tool.to_owned(), "\"store\":false".to_owned()],
+                response: native_tool_call_response("call_chatgpt_tool", tool, arguments),
+            },
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![
+                    "\"call_id\":\"call_chatgpt_tool\"".to_owned(),
+                    "\"store\":false".to_owned(),
+                    "!previous_response_id".to_owned(),
+                ],
+                response: text_response(expected_output),
+            },
+        ]);
+        let setup = setup.replace("{fake_mcp}", env!("CARGO_BIN_EXE_fake-mcp-child"));
+        std::fs::write(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n{setup}",
+                server.base_url(),
+                data_directory.display(),
+            ),
+        )
+        .expect("config should be written");
+        write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_TOOL_ACCESS");
+
+        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+            .args([
+                "chat",
+                "--dangerously-allow-all",
+                "call a subscription tool",
+            ])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env_remove("OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert!(output.status.success(), "{name}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{expected_output}\n"),
+            "{name}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(
+                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                    .args(["sessions", "list"])
+                    .current_dir(&project_root)
+                    .env("AGENS_CONFIG_HOME", &config_home)
+                    .output()
+                    .expect("sessions command should execute")
+                    .stdout,
+            ),
+            "ID\tEVENTS\n1\t10 event(s)\n",
+            "{name}"
+        );
+        assert_sqlite_has_no_sentinels(
+            &data_directory.join("rust-sessions.db"),
+            &["SENTINEL_CHATGPT_TOOL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
+        );
+
+        server.join();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
+    let temporary = TemporaryDirectory::new("production-chatgpt-cancellation");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let mut server = StalledOpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+    write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_CANCEL_ACCESS");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["chat", "cancel subscription request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("production binary should start");
+    server.wait_for_request();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("SIGINT delivery should execute")
+            .success()
+    );
+    let output = child
+        .wait_with_output()
+        .expect("production binary should exit after cancellation");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: cancelled: headless turn was cancelled\n"
+    );
+    assert_no_saved_sessions(temporary.path(), &config_home);
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &["SENTINEL_CHATGPT_CANCEL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
+    );
+
+    server.join();
+}
+
+#[test]
 fn production_binary_executes_allowed_native_read_then_continues_and_persists() {
     let temporary = TemporaryDirectory::new("production-native-read");
     let project_root = temporary.path().join("project");
@@ -2382,6 +2696,16 @@ fn block_on_ready<T>(future: impl std::future::Future<Output = T>) -> T {
         std::task::Poll::Ready(value) => value,
         std::task::Poll::Pending => panic!("local test ports must complete immediately"),
     }
+}
+
+fn write_chatgpt_credentials(config_home: &std::path::Path, access_token: &str) {
+    std::fs::write(
+        config_home.join("auth.json"),
+        format!(
+            r#"{{"openai-chatgpt":{{"access_token":{access_token:?},"refresh_token":"SENTINEL_CHATGPT_REFRESH","account_id":"account_123","expires_at":"2030-01-01T00:00:00Z"}}}}"#
+        ),
+    )
+    .expect("ChatGPT credentials should be written");
 }
 
 struct TemporaryDirectory {
