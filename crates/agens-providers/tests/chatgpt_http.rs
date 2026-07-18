@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Barrier, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -168,6 +168,336 @@ fn subscription_constructor_rejects_incomplete_existing_credentials_without_an_a
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
+#[test]
+fn subscription_transport_proactively_refreshes_before_the_responses_request() {
+    let directory = temporary_directory("proactive-refresh");
+    let credentials = directory.join("auth.json");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-old-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("credentials should be written");
+    let mut responses = LocalServer::start(ServerBehavior::Sse(completed_text_sse("refreshed")));
+    let response_request = responses.take_observed_request();
+    let oauth = OAuthServer::start(
+        200,
+        r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"synthetic-rotated-refresh","id_token":"ignored"}"#,
+    );
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&responses.base_url()),
+        Some(&oauth.url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("refreshed".to_owned())])
+    );
+
+    let oauth_request = oauth.join();
+    assert_eq!(oauth_request.path, "/oauth/token");
+    assert_eq!(
+        oauth_request.body,
+        json!({
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "grant_type": "refresh_token",
+            "refresh_token": "synthetic-old-refresh",
+        })
+    );
+    assert_eq!(
+        response_request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("responses request should be observed")
+            .header("authorization"),
+        Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(&credentials).expect("credentials should persist")
+        )
+        .expect("credentials should remain JSON")["openai-chatgpt"]["account_id"],
+        "account_123"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &fs::read(&credentials).expect("credentials should persist")
+        )
+        .expect("credentials should remain JSON")["openai-chatgpt"]["refresh_token"],
+        "synthetic-rotated-refresh"
+    );
+
+    responses.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_refreshes_once_after_401_then_retries_responses_once() {
+    let directory = temporary_directory("401-refresh");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Status(401),
+        ScriptedResponse::Json(
+            200,
+            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
+        ),
+        ScriptedResponse::Sse(completed_text_sse("recovered")),
+    ]);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&server.responses_base_url()),
+        Some(&server.oauth_url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("recovered".to_owned())])
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].path, "/oauth/token");
+    assert_eq!(requests[2].path, "/backend-api/codex/responses");
+    assert_eq!(requests[1].body["refresh_token"], "synthetic-refresh");
+    assert_eq!(
+        requests[2].header("authorization"),
+        Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+    );
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_reloads_a_rotated_access_token_after_401_without_refreshing() {
+    let directory = temporary_directory("401-reload");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Status(401),
+        ScriptedResponse::Sse(completed_text_sse("reloaded")),
+    ]);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&server.responses_base_url()),
+        Some(&server.oauth_url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("rotated credentials should be written");
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("reloaded".to_owned())])
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path == "/backend-api/codex/responses")
+    );
+    assert_eq!(
+        requests[1].header("authorization"),
+        Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_stops_after_a_second_401() {
+    let directory = temporary_directory("second-401");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Status(401),
+        ScriptedResponse::Json(
+            200,
+            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
+        ),
+        ScriptedResponse::Status(401),
+    ]);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&server.responses_base_url()),
+        Some(&server.oauth_url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Authentication)
+    );
+    assert_eq!(server.join().len(), 3);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_classifies_refresh_failures_without_retrying_responses() {
+    for (status, body, expected) in [
+        (
+            400,
+            r#"{"error":{"code":"refresh_token_expired"}}"#,
+            HeadlessTurnPortError::Authentication,
+        ),
+        (
+            500,
+            r#"{"error":{"code":"temporary_failure"}}"#,
+            HeadlessTurnPortError::Provider,
+        ),
+        (
+            200,
+            r#"{"refresh_token":"rotated-only"}"#,
+            HeadlessTurnPortError::Authentication,
+        ),
+    ] {
+        let directory = temporary_directory("refresh-failure");
+        let credentials = directory.join("auth.json");
+        fs::write(
+            &credentials,
+            r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+        )
+        .expect("credentials should be written");
+        let server = ScriptedServer::start(vec![ScriptedResponse::Json(status, body.to_owned())]);
+        let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+            &credentials,
+            Some(&server.responses_base_url()),
+            Some(&server.oauth_url()),
+            "test-model".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured");
+
+        assert_eq!(
+            run(&mut provider, HeadlessTurnCancellation::new()),
+            Err(expected)
+        );
+        assert_eq!(server.join().len(), 1);
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[test]
+fn concurrent_subscription_providers_coalesce_one_proactive_refresh() {
+    let directory = temporary_directory("concurrent-refresh");
+    let credentials = directory.join("auth.json");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("credentials should be written");
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Json(
+            200,
+            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
+        ),
+        ScriptedResponse::Sse(completed_text_sse("one")),
+        ScriptedResponse::Sse(completed_text_sse("two")),
+    ]);
+    let barrier = std::sync::Arc::new(Barrier::new(3));
+    let handles = (0..2)
+        .map(|_| {
+            let credentials = credentials.clone();
+            let responses_base_url = server.responses_base_url();
+            let oauth_url = server.oauth_url();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                let mut provider =
+                    ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+                        &credentials,
+                        Some(&responses_base_url),
+                        Some(&oauth_url),
+                        "test-model".to_owned(),
+                        "test instructions".to_owned(),
+                        "test input".to_owned(),
+                        Duration::from_secs(1),
+                    )
+                    .expect("provider should be configured");
+                barrier.wait();
+                run(&mut provider, HeadlessTurnCancellation::new())
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+
+    for handle in handles {
+        let result = handle.join().expect("provider thread should finish");
+        assert!(matches!(result.as_deref(), Ok([MessagePart::Text(_)])));
+    }
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/oauth/token")
+            .count(),
+        1
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_returns_cancelled_while_waiting_for_refresh() {
+    let directory = temporary_directory("refresh-cancel");
+    let credentials = directory.join("auth.json");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("credentials should be written");
+    let mut oauth = LocalServer::start(ServerBehavior::WaitForClientClose);
+    let request = oauth.take_observed_request();
+    let oauth_url = format!("http://{}/oauth/token", oauth.address);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some("http://127.0.0.1:1/backend-api/codex"),
+        Some(&oauth_url),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+    let cancellation = HeadlessTurnCancellation::new();
+    let canceller = cancellation.clone();
+    let thread = thread::spawn(move || {
+        request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refresh request should be observed");
+        canceller.cancel();
+    });
+
+    assert_eq!(
+        run(&mut provider, cancellation),
+        Err(HeadlessTurnPortError::Cancelled)
+    );
+    thread.join().expect("cancellation thread should finish");
+    oauth.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
 fn provider(credentials: &Path, base_url: &str) -> ChatGptResponsesProvider {
     ChatGptResponsesProvider::from_credentials_with_timeout(
         credentials,
@@ -245,6 +575,95 @@ struct LocalServer {
     address: std::net::SocketAddr,
     observed_request: Option<mpsc::Receiver<ObservedRequest>>,
     worker: thread::JoinHandle<()>,
+}
+
+struct OAuthServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<ObservedRequest>,
+}
+
+impl OAuthServer {
+    fn start(status: u16, body: &'static str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("OAuth server should bind");
+        let address = listener
+            .local_addr()
+            .expect("OAuth server address should be available");
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener
+                .accept()
+                .expect("OAuth server should accept a request");
+            let request = read_request(&stream);
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("OAuth response should be written");
+            request
+        });
+
+        Self { address, worker }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/oauth/token", self.address)
+    }
+
+    fn join(self) -> ObservedRequest {
+        self.worker.join().expect("OAuth server should finish")
+    }
+}
+
+enum ScriptedResponse {
+    Status(u16),
+    Json(u16, String),
+    Sse(String),
+}
+
+struct ScriptedServer {
+    address: std::net::SocketAddr,
+    worker: thread::JoinHandle<Vec<ObservedRequest>>,
+}
+
+impl ScriptedServer {
+    fn start(responses: Vec<ScriptedResponse>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("scripted server should bind");
+        let address = listener
+            .local_addr()
+            .expect("scripted server address should be available");
+        let worker = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("scripted server should accept a request");
+                requests.push(read_request(&stream));
+                match response {
+                    ScriptedResponse::Status(status) => write_status(&mut stream, status),
+                    ScriptedResponse::Json(status, body) => write_json(&mut stream, status, &body),
+                    ScriptedResponse::Sse(events) => write_sse(&mut stream, &events),
+                }
+            }
+            requests
+        });
+
+        Self { address, worker }
+    }
+
+    fn responses_base_url(&self) -> String {
+        format!("http://{}/backend-api/codex", self.address)
+    }
+
+    fn oauth_url(&self) -> String {
+        format!("http://{}/oauth/token", self.address)
+    }
+
+    fn join(self) -> Vec<ObservedRequest> {
+        self.worker.join().expect("scripted server should finish")
+    }
 }
 
 impl LocalServer {
@@ -357,6 +776,18 @@ fn write_sse(stream: &mut TcpStream, events: &str) {
     stream
         .write_all(events.as_bytes())
         .expect("SSE body should be written");
+}
+
+fn write_json(stream: &mut TcpStream, status: u16, body: &str) {
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .expect("JSON response should be written");
 }
 
 fn wait_for_client_close(stream: &TcpStream) {

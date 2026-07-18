@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use agens_core::{
@@ -25,9 +25,13 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_CHATGPT_OAUTH_URL: &str = "https://auth.openai.com/oauth/token";
+const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
 const AGENS_USER_AGENT: &str = concat!("Agens/", env!("CARGO_PKG_VERSION"));
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static CHATGPT_REFRESH_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+    OnceLock::new();
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -68,13 +72,20 @@ pub struct OpenAiResponsesProvider {
 pub struct ChatGptResponsesProvider {
     access_token: String,
     account_id: String,
+    credentials_path: PathBuf,
     base_url: String,
+    oauth_url: String,
     model: String,
     instructions: String,
     input: String,
     session_id: String,
     client: reqwest::Client,
     completed: bool,
+}
+
+enum ChatGptResponseError {
+    Authentication(u16),
+    Other(HeadlessTurnPortError),
 }
 
 enum ContinuationState {
@@ -278,14 +289,28 @@ impl ChatGptResponsesProvider {
         input: String,
         request_timeout: Duration,
     ) -> Result<Self, Error> {
+        Self::from_credentials_with_timeout_and_auth_url(
+            credentials_path,
+            base_url,
+            None,
+            model,
+            instructions,
+            input,
+            request_timeout,
+        )
+    }
+
+    pub fn from_credentials_with_timeout_and_auth_url(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        oauth_url: Option<&str>,
+        model: String,
+        instructions: String,
+        input: String,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
         if model.trim().is_empty() || instructions.trim().is_empty() || input.trim().is_empty() {
             return Err(auth_error("request configuration is incomplete"));
-        }
-
-        if load_chatgpt_auth_state(credentials_path, SystemTime::now())?
-            == ChatGptAuthState::RefreshRequired
-        {
-            return Err(auth_error("credentials require refresh"));
         }
 
         let credentials = read_credentials(credentials_path)?;
@@ -298,10 +323,15 @@ impl ChatGptResponsesProvider {
         Ok(Self {
             access_token,
             account_id,
+            credentials_path: credentials_path.to_path_buf(),
             base_url: base_url
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or(DEFAULT_CHATGPT_BASE_URL)
                 .trim_end_matches('/')
+                .to_owned(),
+            oauth_url: oauth_url
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(DEFAULT_CHATGPT_OAUTH_URL)
                 .to_owned(),
             model,
             instructions,
@@ -321,7 +351,7 @@ impl ChatGptResponsesProvider {
     async fn request_response(
         &self,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<DecodedResponse, HeadlessTurnPortError> {
+    ) -> Result<DecodedResponse, ChatGptResponseError> {
         let request = self
             .client
             .post(format!("{}/responses", self.base_url))
@@ -333,6 +363,86 @@ impl ChatGptResponsesProvider {
             .header("session-id", &self.session_id)
             .json(&self.request_payload())
             .build()
+            .map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::Provider))?;
+        let response = tokio::select! {
+            response = self.client.execute(request) => {
+                stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
+                response.map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::Provider))?
+            }
+            stop = wait_for_stop(cancellation) => return Err(ChatGptResponseError::Other(stop)),
+        };
+
+        stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
+        match response.status().as_u16() {
+            401 | 403 => {
+                return Err(ChatGptResponseError::Authentication(
+                    response.status().as_u16(),
+                ));
+            }
+            400 | 429 | 500..=599 => {
+                return Err(ChatGptResponseError::Other(HeadlessTurnPortError::Provider));
+            }
+            _ if !response.status().is_success() => {
+                return Err(ChatGptResponseError::Other(HeadlessTurnPortError::Provider));
+            }
+            _ => {}
+        }
+
+        decode_http_response_stream(response, cancellation)
+            .await
+            .map_err(ChatGptResponseError::Other)
+    }
+
+    async fn refresh_if_needed(
+        &mut self,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<(), HeadlessTurnPortError> {
+        stop_before_mapping(cancellation)?;
+        if load_chatgpt_auth_state(&self.credentials_path, SystemTime::now())
+            .map_err(|_| HeadlessTurnPortError::Authentication)?
+            == ChatGptAuthState::RefreshRequired
+        {
+            self.refresh_or_adopt(cancellation).await?;
+        }
+        stop_before_mapping(cancellation)
+    }
+
+    async fn refresh_or_adopt(
+        &mut self,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<(), HeadlessTurnPortError> {
+        let lock = refresh_lock(&self.credentials_path)?;
+        let _guard = tokio::select! {
+            guard = lock.lock() => guard,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+
+        stop_before_mapping(cancellation)?;
+        let credentials = read_credentials(&self.credentials_path)
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let entry =
+            chatgpt_entry(&credentials).map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let access_token = required_credential_string(entry, "access_token")
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let account_id = required_credential_string(entry, "account_id")
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+
+        if account_id == self.account_id && access_token != self.access_token {
+            self.access_token = access_token.to_owned();
+            return stop_before_mapping(cancellation);
+        }
+
+        let refresh_token = required_credential_string(entry, "refresh_token")
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let request = self
+            .client
+            .post(&self.oauth_url)
+            .json(&serde_json::json!({
+                "client_id": CHATGPT_OAUTH_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }))
+            .build()
             .map_err(|_| HeadlessTurnPortError::Provider)?;
         let response = tokio::select! {
             response = self.client.execute(request) => {
@@ -343,14 +453,48 @@ impl ChatGptResponsesProvider {
         };
 
         stop_before_mapping(cancellation)?;
-        match response.status().as_u16() {
-            401 | 403 => return Err(HeadlessTurnPortError::Authentication),
-            400 | 429 | 500..=599 => return Err(HeadlessTurnPortError::Provider),
-            _ if !response.status().is_success() => return Err(HeadlessTurnPortError::Provider),
-            _ => {}
+        if response.status().as_u16() == 401 {
+            return Err(HeadlessTurnPortError::Authentication);
         }
 
-        decode_http_response_stream(response, cancellation).await
+        let status = response.status();
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        stop_before_mapping(cancellation)?;
+        if !status.is_success() {
+            return Err(if is_permanent_refresh_failure(&body) {
+                HeadlessTurnPortError::Authentication
+            } else {
+                HeadlessTurnPortError::Provider
+            });
+        }
+
+        let access_token = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(HeadlessTurnPortError::Authentication)?;
+        let expires_at = jwt_expiry(access_token)
+            .map(timestamp_to_rfc3339)
+            .ok_or(HeadlessTurnPortError::Authentication)?;
+        let refresh_token = body
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+
+        persist_chatgpt_refresh(
+            &self.credentials_path,
+            access_token,
+            refresh_token,
+            &expires_at,
+        )
+        .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        stop_before_mapping(cancellation)?;
+
+        self.access_token = access_token.to_owned();
+        Ok(())
     }
 
     fn request_payload(&self) -> Value {
@@ -388,7 +532,27 @@ impl TurnProvider for ChatGptResponsesProvider {
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        let response = self.request_response(cancellation).await?;
+        self.refresh_if_needed(cancellation).await?;
+        let response = match self.request_response(cancellation).await {
+            Ok(response) => response,
+            Err(ChatGptResponseError::Authentication(403)) => {
+                return Err(HeadlessTurnPortError::Authentication);
+            }
+            Err(ChatGptResponseError::Authentication(401)) => {
+                self.refresh_or_adopt(cancellation).await?;
+                match self.request_response(cancellation).await {
+                    Ok(response) => response,
+                    Err(ChatGptResponseError::Authentication(_)) => {
+                        return Err(HeadlessTurnPortError::Authentication);
+                    }
+                    Err(ChatGptResponseError::Other(error)) => return Err(error),
+                }
+            }
+            Err(ChatGptResponseError::Authentication(_)) => {
+                return Err(HeadlessTurnPortError::Authentication);
+            }
+            Err(ChatGptResponseError::Other(error)) => return Err(error),
+        };
         if response
             .parts
             .iter()
@@ -1202,6 +1366,19 @@ fn parse_rfc3339_timestamp(value: &str) -> Option<SystemTime> {
     OffsetDateTime::parse(value, &Rfc3339).ok().map(Into::into)
 }
 
+fn timestamp_to_rfc3339(timestamp: SystemTime) -> String {
+    let timestamp = OffsetDateTime::from(timestamp);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        timestamp.year(),
+        timestamp.month() as u8,
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute(),
+        timestamp.second()
+    )
+}
+
 fn jwt_expiry(token: &str) -> Option<SystemTime> {
     let payload = token.split('.').nth(1)?;
     let mut value = 0_u32;
@@ -1231,6 +1408,30 @@ fn jwt_expiry(token: &str) -> Option<SystemTime> {
         .get("exp")?
         .as_i64()?;
     (seconds >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(seconds as u64))
+}
+
+fn refresh_lock(path: &Path) -> Result<Arc<tokio::sync::Mutex<()>>, HeadlessTurnPortError> {
+    let locks = CHATGPT_REFRESH_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks.lock().map_err(|_| HeadlessTurnPortError::Provider)?;
+    Ok(locks
+        .entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
+
+fn is_permanent_refresh_failure(body: &Value) -> bool {
+    let error = body
+        .get("error")
+        .and_then(|error| match error {
+            Value::String(value) => Some(value.as_str()),
+            Value::Object(_) => error.get("code").and_then(Value::as_str),
+            _ => None,
+        })
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["expired", "reused", "invalidated"]
+        .iter()
+        .any(|needle| error.contains(needle))
 }
 
 fn auth_error(detail: &str) -> Error {
