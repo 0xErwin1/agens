@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -82,6 +82,33 @@ fn pkce_and_state_are_unpadded_url_safe_and_derived_from_injected_randomness() {
 }
 
 #[test]
+fn credential_and_pkce_debug_output_redact_all_secret_material() {
+    let pkce = agens_providers::chatgpt_login::Pkce {
+        verifier: "secret-verifier".to_owned(),
+        challenge: "public-challenge".to_owned(),
+    };
+    let credentials = ChatGptCredentials {
+        access_token: "secret-access-token".to_owned(),
+        refresh_token: "secret-refresh-token".to_owned(),
+        account_id: "account_123".to_owned(),
+        expires_at: "2030-01-01T00:00:00Z".to_owned(),
+    };
+
+    let pkce_debug = format!("{pkce:?}");
+    let credentials_debug = format!("{credentials:?}");
+
+    for secret in [
+        "secret-verifier",
+        "secret-access-token",
+        "secret-refresh-token",
+    ] {
+        assert!(!pkce_debug.contains(secret));
+        assert!(!credentials_debug.contains(secret));
+    }
+    assert!(!pkce_debug.contains("public-challenge"));
+}
+
+#[test]
 fn opener_failure_still_publishes_the_authorization_url() {
     let published = Arc::new(Mutex::new(Vec::new()));
     let publication = published.clone();
@@ -151,7 +178,7 @@ fn login_accepts_only_the_expected_callback_then_exchanges_exact_form_and_extrac
             let mut callback = TcpStream::connect(authority)?;
             write!(
                 callback,
-                "GET /auth/callback?state={state}&code=authorization-code HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                "GET /auth/callback?state={state}&code=authorization-code HTTP/1.1\r\nHost: {authority}\r\n\r\n"
             )?;
             Ok(())
         }),
@@ -225,7 +252,7 @@ fn callback_state_error_and_missing_code_are_sanitized_authentication_failures()
                 let mut stream = TcpStream::connect(authority)?;
                 write!(
                     stream,
-                    "GET /auth/callback?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                    "GET /auth/callback?{query} HTTP/1.1\r\nHost: {authority}\r\n\r\n"
                 )?;
                 Ok(())
             }),
@@ -256,6 +283,89 @@ fn login_times_out_without_a_callback() {
         login(options, LoginCancellation::new()),
         Err(LoginError::TimedOut)
     );
+}
+
+#[test]
+fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts() {
+    for query_and_host in [
+        (
+            "state={state}&state=duplicate&code=authorization-code",
+            "localhost",
+        ),
+        (
+            "state={state}&code=authorization-code&code=duplicate",
+            "localhost",
+        ),
+        (
+            "state={state}&error=access_denied&error_description=duplicate",
+            "localhost",
+        ),
+        ("state=%FF&code=authorization-code", "localhost"),
+        ("state={state}&code=authorization-code", "attacker.example"),
+    ] {
+        let (query, host) = query_and_host;
+        let (status_send, status_receive) = mpsc::channel();
+        let options = ChatGptLoginOptions {
+            callback_ports: vec![0],
+            timeout: Duration::from_secs(1),
+            open_browser: Arc::new(move |url| {
+                let url = url::Url::parse(url).expect("authorization URL should parse");
+                let redirect = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "redirect_uri")
+                    .expect("redirect URI")
+                    .1
+                    .into_owned();
+                let state = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .expect("state")
+                    .1
+                    .into_owned();
+                let authority = redirect
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .expect("authority");
+                let mut callback = TcpStream::connect(authority)?;
+                let query = query.replace("{state}", &state);
+                let host = if host == "localhost" { authority } else { host };
+                write!(
+                    callback,
+                    "GET /auth/callback?{query} HTTP/1.1\r\nHost: {host}\r\n\r\n"
+                )?;
+                let status_send = status_send.clone();
+                thread::spawn(move || {
+                    let _ = callback.set_read_timeout(Some(Duration::from_secs(1)));
+                    let mut response = [0_u8; 128];
+                    let mut status = String::new();
+                    while !status.contains("\r\n") {
+                        let Ok(read) = callback.read(&mut response) else {
+                            break;
+                        };
+                        if read == 0 {
+                            break;
+                        }
+                        status.push_str(&String::from_utf8_lossy(&response[..read]));
+                    }
+                    let _ = status_send.send(status);
+                });
+                Ok(())
+            }),
+            ..ChatGptLoginOptions::for_test(
+                "http://127.0.0.1:1/authorize",
+                "http://127.0.0.1:1/token",
+            )
+        };
+
+        let error = login(options, LoginCancellation::new()).expect_err("callback must fail");
+
+        assert!(matches!(error, LoginError::Authentication(_)));
+        let status = status_receive
+            .recv_timeout(Duration::from_secs(1))
+            .expect("callback response");
+        assert!(status.starts_with("HTTP/1.1 400"), "response: {status:?}");
+    }
 }
 
 #[cfg(unix)]
@@ -341,9 +451,41 @@ fn upsert_creates_missing_auth_json_and_private_parent_directory() {
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
+#[cfg(unix)]
+#[test]
+fn upsert_fails_closed_for_symlinked_or_hardlinked_auth_files() {
+    use std::os::unix::fs::symlink;
+
+    let directory = temporary_directory("unsafe-auth-path");
+    let target = directory.join("target.json");
+    let symlinked = directory.join("symlinked.json");
+    let hardlinked = directory.join("hardlinked.json");
+    fs::write(&target, r#"{"other":{"preserve":true}}"#).expect("target should be written");
+    symlink(&target, &symlinked).expect("symlink should be created");
+    fs::hard_link(&target, &hardlinked).expect("hardlink should be created");
+    let credentials = ChatGptCredentials {
+        access_token: "access-token".to_owned(),
+        refresh_token: "refresh-token".to_owned(),
+        account_id: "account_123".to_owned(),
+        expires_at: "2030-01-01T00:00:00Z".to_owned(),
+    };
+
+    for path in [&symlinked, &hardlinked] {
+        let error =
+            upsert_chatgpt_credentials(path, &credentials).expect_err("unsafe path must fail");
+        assert!(matches!(error, LoginError::Authentication(_)));
+    }
+    assert_eq!(
+        fs::read_to_string(&target).expect("target remains readable"),
+        r#"{"other":{"preserve":true}}"#
+    );
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
 fn jwt(payload: Value) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
     format!(
-        "header.{}.signature",
+        "{header}.{}.signature",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload should encode"))
     )
 }

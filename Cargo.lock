@@ -41,6 +41,7 @@ dependencies = [
  "agens-core",
  "base64",
  "fs4",
+ "libc",
  "reqwest",
  "serde_json",
  "sha2",

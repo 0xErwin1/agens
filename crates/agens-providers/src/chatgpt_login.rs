@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use fs4::fs_std::FileExt;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -26,22 +27,36 @@ pub const SCOPES: &str =
 pub const ORIGINATOR: &str = "codex_cli_rs";
 const CALLBACK_PATH: &str = "/auth/callback";
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
+const CALLBACK_READ_SLICE: Duration = Duration::from_millis(25);
+const CALLBACK_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Pkce { redacted: true }")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChatGptCredentials {
     pub access_token: String,
     pub refresh_token: String,
     pub account_id: String,
     pub expires_at: String,
+}
+
+impl std::fmt::Debug for ChatGptCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ChatGptCredentials { redacted: true }")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +221,27 @@ pub fn upsert_chatgpt_credentials(
         return Err(LoginError::Authentication("token response is incomplete"));
     }
 
+    let parent = secure_credentials_parent(path)?;
+    let lock_path = parent.join(".auth.json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    lock.lock_exclusive()
+        .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    if lock
+        .metadata()
+        .map(|metadata| metadata.nlink() != 1)
+        .unwrap_or(true)
+    {
+        return Err(LoginError::Authentication(
+            "credentials file is unavailable",
+        ));
+    }
     let mut root = match fs::read(path) {
         Ok(contents) => serde_json::from_slice(&contents)
             .map_err(|_| LoginError::Authentication("credentials file is invalid"))?,
@@ -319,7 +355,13 @@ fn wait_for_callback(
                 stream
                     .set_nonblocking(false)
                     .map_err(|_| LoginError::Authentication("loopback callback failed"))?;
-                if let Some(result) = handle_callback(&mut stream, state) {
+                if let Some(result) = handle_callback(
+                    &mut stream,
+                    state,
+                    listener.local_addr().ok(),
+                    started + timeout,
+                    cancellation,
+                ) {
                     return result;
                 }
             }
@@ -334,45 +376,73 @@ fn wait_for_callback(
 fn handle_callback(
     stream: &mut TcpStream,
     expected_state: &str,
+    callback_address: Option<SocketAddr>,
+    deadline: Instant,
+    cancellation: &LoginCancellation,
 ) -> Option<Result<String, LoginError>> {
-    let mut request = vec![0; MAX_REQUEST_BYTES + 1];
-    let read = stream.read(&mut request).ok()?;
-    if read > MAX_REQUEST_BYTES {
+    let request = match read_callback_request(stream, deadline, cancellation) {
+        Ok(Some(request)) => request,
+        Ok(None) => return None,
+        Err(()) => {
+            write_response(stream, 400, "Login failed");
+            return Some(Err(LoginError::Authentication(
+                "callback request is invalid",
+            )));
+        }
+    };
+    let callback_address = match callback_address {
+        Some(address) => address,
+        None => {
+            write_response(stream, 400, "Login failed");
+            return Some(Err(LoginError::Authentication(
+                "callback request is invalid",
+            )));
+        }
+    };
+    let (target, host) = match parse_http_request(&request) {
+        Some(request) => request,
+        None => {
+            write_response(stream, 400, "Login failed");
+            return Some(Err(LoginError::Authentication(
+                "callback request is invalid",
+            )));
+        }
+    };
+    if !valid_callback_host(host, callback_address.port()) {
         write_response(stream, 400, "Login failed");
         return Some(Err(LoginError::Authentication(
             "callback request is invalid",
         )));
     }
-    let request = std::str::from_utf8(&request[..read]).ok()?;
-    let target = request.split_whitespace().nth(1)?;
-    let url = Url::parse(&format!("http://localhost{target}")).ok()?;
-    if url.path() != CALLBACK_PATH {
+    let (path, raw_query) = match target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (target, ""),
+    };
+    if path != CALLBACK_PATH {
         write_response(stream, 404, "Not found");
         return None;
     }
-    let query = url
-        .query_pairs()
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect::<Vec<_>>();
-    let actual_state = query
-        .iter()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.as_str())
-        .unwrap_or_default();
+    let query = match parse_callback_query(raw_query) {
+        Some(query) => query,
+        None => {
+            write_response(stream, 400, "Login failed");
+            return Some(Err(LoginError::Authentication(
+                "callback request is invalid",
+            )));
+        }
+    };
+    let actual_state = query.state.as_deref().unwrap_or_default();
     if !constant_time_equal(actual_state.as_bytes(), expected_state.as_bytes()) {
         write_response(stream, 400, "Login failed");
         return Some(Err(LoginError::Authentication(
             "callback state did not match",
         )));
     }
-    if query.iter().any(|(key, _)| key == "error") {
+    if query.error.is_some() {
         write_response(stream, 400, "Login failed");
         return Some(Err(LoginError::Authentication("authorization was denied")));
     }
-    let code = query
-        .iter()
-        .find(|(key, value)| key == "code" && !value.is_empty())
-        .map(|(_, value)| value.clone());
+    let code = query.code.filter(|code| !code.is_empty());
     match code {
         Some(code) => {
             write_response(stream, 200, "Login complete");
@@ -382,6 +452,149 @@ fn handle_callback(
             write_response(stream, 400, "Login failed");
             Some(Err(LoginError::Authentication("callback code is missing")))
         }
+    }
+}
+
+struct CallbackQuery {
+    state: Option<String>,
+    code: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+fn read_callback_request(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    cancellation: &LoginCancellation,
+) -> Result<Option<Vec<u8>>, ()> {
+    let client_deadline = deadline.min(Instant::now() + CALLBACK_CLIENT_TIMEOUT);
+    let mut request = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        if cancellation.is_cancelled() || Instant::now() >= client_deadline {
+            return Ok(None);
+        }
+        let remaining = client_deadline.saturating_duration_since(Instant::now());
+        stream
+            .set_read_timeout(Some(remaining.min(CALLBACK_READ_SLICE)))
+            .map_err(|_| ())?;
+        match stream.read(&mut buffer) {
+            Ok(0) => return Err(()),
+            Ok(read) => {
+                if request.len() + read > MAX_REQUEST_BYTES {
+                    return Err(());
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return Ok(Some(request));
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+fn parse_http_request(request: &[u8]) -> Option<(&str, &str)> {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?;
+    let header = std::str::from_utf8(&request[..header_end]).ok()?;
+    let mut lines = header.split("\r\n");
+    let request_line = lines.next()?;
+    let mut fields = request_line.split(' ');
+    if fields.next()? != "GET"
+        || fields.next()?.is_empty()
+        || fields.next()? != "HTTP/1.1"
+        || fields.next().is_some()
+    {
+        return None;
+    }
+    let target = request_line.split(' ').nth(1)?;
+    if !target.starts_with('/') || !target.is_ascii() {
+        return None;
+    }
+    let mut host = None;
+    for line in lines {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("host") && host.replace(value.trim()).is_some() {
+            return None;
+        }
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            return None;
+        }
+    }
+    Some((target, host?))
+}
+
+fn valid_callback_host(host: &str, port: u16) -> bool {
+    host == format!("localhost:{port}") || host == format!("127.0.0.1:{port}")
+}
+
+fn parse_callback_query(raw_query: &str) -> Option<CallbackQuery> {
+    let mut query = CallbackQuery {
+        state: None,
+        code: None,
+        error: None,
+        error_description: None,
+    };
+    for pair in raw_query.split('&') {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = strict_query_decode(raw_key)?;
+        let value = strict_query_decode(raw_value)?;
+        let target = match key.as_str() {
+            "state" => &mut query.state,
+            "code" => &mut query.code,
+            "error" => &mut query.error,
+            "error_description" => &mut query.error_description,
+            _ => continue,
+        };
+        if target.replace(value).is_some() {
+            return None;
+        }
+    }
+    Some(query)
+}
+
+fn strict_query_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let high = *bytes.get(index + 1)?;
+                let low = *bytes.get(index + 2)?;
+                decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte if byte.is_ascii() => {
+                decoded.push(byte);
+                index += 1;
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -460,19 +673,31 @@ fn required_token<'a>(token: &'a Value, field: &str) -> Result<&'a str, LoginErr
 }
 
 fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
+    let mut segments = token.split('.');
+    let header = segments.next()?;
+    let payload = segments.next()?;
+    let signature = segments.next()?;
+    if segments.next().is_some()
+        || header.len() > 1024
+        || payload.len() > 8192
+        || signature.is_empty()
+    {
+        return None;
+    }
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).ok()?).ok()?;
+    let algorithm = header.get("alg")?.as_str()?;
+    if !matches!(algorithm, "RS256" | "ES256" | "PS256") {
+        return None;
+    }
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()?
-        .get(claim)
-        .cloned()
+    if bytes.len() > 6 * 1024 {
+        return None;
+    }
+    let payload = serde_json::from_slice::<Value>(&bytes).ok()?;
+    payload.as_object()?.get(claim).cloned()
 }
 
-fn format_expiry(expiry: SystemTime) -> Option<String> {
-    OffsetDateTime::from(expiry).format(&Rfc3339).ok()
-}
-
-fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), LoginError> {
+fn secure_credentials_parent(path: &Path) -> Result<&Path, LoginError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -486,8 +711,31 @@ fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), Logi
                 LoginError::Authentication("credentials directory could not be created")
             })?;
     }
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|_| LoginError::Authentication("credentials directory could not be secured"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LoginError::Authentication(
+            "credentials directory could not be secured",
+        ));
+    }
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .map_err(|_| LoginError::Authentication("credentials directory could not be secured"))?;
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || metadata.nlink() != 1 || !metadata.is_file())
+    {
+        return Err(LoginError::Authentication(
+            "credentials file is unavailable",
+        ));
+    }
+    Ok(parent)
+}
+
+fn format_expiry(expiry: SystemTime) -> Option<String> {
+    OffsetDateTime::from(expiry).format(&Rfc3339).ok()
+}
+
+fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), LoginError> {
+    let parent = secure_credentials_parent(path)?;
     let temporary = parent.join(format!(
         ".auth-login-{}-{}.json",
         std::process::id(),
@@ -498,6 +746,7 @@ fn write_credentials_atomically(path: &Path, contents: &[u8]) -> Result<(), Logi
             .write(true)
             .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&temporary)
             .map_err(|_| LoginError::Authentication("credentials could not be persisted"))?;
         file.write_all(contents)
