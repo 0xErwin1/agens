@@ -85,7 +85,7 @@ fn extracts_ordered_global_and_project_permission_rules() {
     let project = parse_toml_document(
         r#"
             [permissions]
-            allow = ["mcp::files::read(path/*.txt)"]
+            allow = ["engram_mem_save(path/*.txt)"]
             deny = ["write(secrets/*)"]
         "#,
     )
@@ -103,7 +103,7 @@ fn extracts_ordered_global_and_project_permission_rules() {
     assert_eq!(rules[1].target_pattern.as_deref(), Some("git status *"));
     assert_eq!(rules[2].decision, ConfigPermissionDecision::Deny);
     assert_eq!(rules[3].scope, ConfigPermissionScope::Project);
-    assert_eq!(rules[3].tool_pattern, "mcp::files::read");
+    assert_eq!(rules[3].tool_pattern, "engram_mem_save");
     assert_eq!(rules[3].target_pattern.as_deref(), Some("path/*.txt"));
     assert_eq!(rules[4].decision, ConfigPermissionDecision::Deny);
 }
@@ -195,4 +195,95 @@ fn permission_rule_extraction_rejects_conflicts_and_semantically_invalid_documen
             .to_string(),
         "invalid configuration field permissions.unknown"
     );
+}
+
+#[test]
+fn permission_rule_extraction_accepts_documented_tool_grammar_and_safe_unicode_targets() {
+    let document = parse_toml_document(
+        r#"
+            [permissions]
+            allow = ["read(資料/**/*.txt)", "read(file[0-9].txt)", "engram_mem_save(**)", "bash(git status *)"]
+        "#,
+    )
+    .expect("fixture should parse");
+
+    let rules = extract_permission_rules(&document, &toml::Table::new())
+        .expect("documented rules with safe Unicode targets should extract");
+
+    assert_eq!(rules.len(), 4);
+    assert_eq!(rules[0].target_pattern.as_deref(), Some("資料/**/*.txt"));
+}
+
+#[test]
+fn permission_rule_extraction_rejects_ungrounded_tools_and_invalid_target_globs() {
+    let cases = [
+        ("mcp separator alias", "mcp::files::read(**)"),
+        ("uppercase alias", "Bash(**)"),
+        ("unicode confusable", "rеad(**)"),
+        ("extra namespace separator", "engram__mem_save(**)"),
+        ("unclosed class", "read([)"),
+        ("unmatched class close", "read(file])"),
+        ("trailing escape", "read(file\\)"),
+    ];
+
+    for (name, rule) in cases {
+        let document = parse_toml_document(&format!("[permissions]\nallow = [{rule:?}]"))
+            .expect("fixture should be syntactically valid TOML");
+
+        let error = extract_permission_rules(&document, &toml::Table::new()).expect_err(name);
+
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration field permissions.allow[0]"
+        );
+        assert!(!error.to_string().contains(rule));
+    }
+}
+
+#[test]
+fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules() {
+    let unsafe_targets = ["..∕secret", "..／secret", "..⁄secret", "..＼secret"];
+
+    for target in unsafe_targets {
+        let document = parse_toml_document(&format!("[permissions]\nallow = [\"read({target})\"]"))
+            .expect("fixture should be syntactically valid TOML");
+
+        assert_eq!(
+            extract_permission_rules(&document, &toml::Table::new())
+                .expect_err("Unicode traversal separator must fail")
+                .to_string(),
+            "invalid configuration field permissions.allow[0]"
+        );
+    }
+
+    let conflicts = [
+        (
+            "same-decision duplicate",
+            "allow = [\"read(secret)\", \"read(secret)\"]",
+        ),
+        (
+            "catch-all conflict",
+            "allow = [\"read(**)\"]\ndeny = [\"read(secret)\"]",
+        ),
+        (
+            "prefix conflict",
+            "allow = [\"read(dir/**)\"]\ndeny = [\"read(dir/secret)\"]",
+        ),
+        (
+            "exact glob duplicate",
+            "allow = [\"read(secret)\", \"read(s*)\"]",
+        ),
+    ];
+
+    for (name, fields) in conflicts {
+        let document = parse_toml_document(&format!("[permissions]\n{fields}"))
+            .expect("fixture should be syntactically valid TOML");
+
+        let error = extract_permission_rules(&document, &toml::Table::new()).expect_err(name);
+
+        assert!(
+            error.to_string() == "invalid configuration field permissions.allow[1]"
+                || error.to_string() == "invalid configuration field permissions.deny[0]"
+        );
+    }
 }

@@ -349,9 +349,7 @@ fn extract_scoped_permission_rules(
                 .ok_or_else(|| invalid_indexed_field("permissions", field, index))?;
 
             if rules[scope_start..].iter().any(|rule| {
-                rule.tool_pattern == tool_pattern
-                    && rule.target_pattern == target_pattern
-                    && rule.decision != decision
+                permission_rules_overlap(rule, &tool_pattern, target_pattern.as_deref())
             }) {
                 return Err(invalid_indexed_field("permissions", field, index));
             }
@@ -388,8 +386,10 @@ fn parse_permission_rule(value: &str) -> Option<(String, Option<String>)> {
         None => return None,
     };
 
-    if !is_safe_tool_pattern(tool_pattern)
-        || target_pattern.as_deref().is_some_and(has_traversal_segment)
+    if !is_grounded_tool_name(tool_pattern)
+        || target_pattern
+            .as_deref()
+            .is_some_and(|target| !is_safe_target_pattern(target))
     {
         return None;
     }
@@ -397,19 +397,228 @@ fn parse_permission_rule(value: &str) -> Option<(String, Option<String>)> {
     Some((tool_pattern.to_owned(), target_pattern))
 }
 
-fn is_safe_tool_pattern(pattern: &str) -> bool {
+fn is_grounded_tool_name(pattern: &str) -> bool {
+    matches!(pattern, "bash" | "read" | "edit" | "write" | "webfetch")
+        || is_mcp_qualified_tool_name(pattern)
+}
+
+fn is_mcp_qualified_tool_name(pattern: &str) -> bool {
+    let Some((server_name, tool_name)) = pattern.split_once('_') else {
+        return false;
+    };
+
+    is_ascii_identifier(server_name) && is_ascii_identifier(tool_name)
+}
+
+fn is_ascii_identifier(value: &str) -> bool {
+    let mut characters = value.bytes();
+
+    matches!(characters.next(), Some(b'a'..=b'z'))
+        && characters.all(|character| matches!(character, b'a'..=b'z' | b'0'..=b'9' | b'_'))
+}
+
+fn is_safe_target_pattern(pattern: &str) -> bool {
     !pattern.is_empty()
-        && pattern.split("::").all(|segment| {
-            segment == "*"
-                || (!segment.is_empty()
-                    && segment.chars().all(|character| {
-                        character.is_alphanumeric() || matches!(character, '_' | '-')
-                    }))
+        && !pattern.chars().any(is_separator_confusable)
+        && !pattern.split('/').any(|segment| segment == "..")
+        && has_valid_glob_syntax(pattern)
+}
+
+fn is_separator_confusable(character: char) -> bool {
+    matches!(
+        character,
+        '\\' | '\u{2044}' | '\u{2215}' | '\u{ff0f}' | '\u{ff3c}'
+    )
+}
+
+fn has_valid_glob_syntax(pattern: &str) -> bool {
+    let mut in_class = false;
+    let mut class_content = false;
+
+    for character in pattern.chars() {
+        match character {
+            '\\' => return false,
+            '[' if !in_class => {
+                in_class = true;
+                class_content = false;
+            }
+            '[' => return false,
+            ']' if in_class && class_content => {
+                in_class = false;
+                class_content = false;
+            }
+            ']' => return false,
+            _ if in_class => class_content = true,
+            _ => {}
+        }
+    }
+
+    !in_class
+        && pattern.split('[').skip(1).all(|part| {
+            part.split_once(']')
+                .is_none_or(|(class, _)| is_valid_character_class(class))
         })
 }
 
-fn has_traversal_segment(pattern: &str) -> bool {
-    pattern.split(['/', '\\']).any(|segment| segment == "..")
+fn is_valid_character_class(class: &str) -> bool {
+    let characters = class.chars().collect::<Vec<_>>();
+    let content_start = usize::from(matches!(characters.first(), Some('!' | '^')));
+
+    characters.len() > content_start
+        && characters[content_start..]
+            .iter()
+            .enumerate()
+            .all(|(index, character)| {
+                *character != '-' || index > 0 && index + 1 < characters.len() - content_start
+            })
+}
+
+fn permission_rules_overlap(
+    existing: &ConfigPermissionRule,
+    tool_pattern: &str,
+    target_pattern: Option<&str>,
+) -> bool {
+    if existing.tool_pattern != tool_pattern {
+        return false;
+    }
+
+    target_patterns_overlap(existing.target_pattern.as_deref(), target_pattern)
+}
+
+fn target_patterns_overlap(left: Option<&str>, right: Option<&str>) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return true;
+    };
+
+    if left == right || left == "**" || right == "**" {
+        return true;
+    }
+
+    if is_doublestar_prefix(left, right) || is_doublestar_prefix(right, left) {
+        return true;
+    }
+
+    match (
+        contains_glob_metacharacter(left),
+        contains_glob_metacharacter(right),
+    ) {
+        (false, false) => false,
+        (true, false) => glob_matches(left, right),
+        (false, true) => glob_matches(right, left),
+        (true, true) => !glob_patterns_proven_disjoint(left, right),
+    }
+}
+
+fn is_doublestar_prefix(pattern: &str, candidate: &str) -> bool {
+    let Some(prefix) = pattern.strip_suffix("/**") else {
+        return false;
+    };
+
+    candidate == prefix
+        || candidate
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn contains_glob_metacharacter(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+fn glob_patterns_proven_disjoint(left: &str, right: &str) -> bool {
+    let left_prefix = literal_glob_prefix(left);
+    let right_prefix = literal_glob_prefix(right);
+
+    !left_prefix.starts_with(right_prefix) && !right_prefix.starts_with(left_prefix)
+}
+
+fn literal_glob_prefix(pattern: &str) -> &str {
+    let prefix_length = pattern
+        .char_indices()
+        .find_map(|(index, character)| matches!(character, '*' | '?' | '[').then_some(index))
+        .unwrap_or(pattern.len());
+
+    &pattern[..prefix_length]
+}
+
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    glob_matches_from(
+        &pattern.chars().collect::<Vec<_>>(),
+        &candidate.chars().collect::<Vec<_>>(),
+        0,
+        0,
+    )
+}
+
+fn glob_matches_from(
+    pattern: &[char],
+    candidate: &[char],
+    pattern_index: usize,
+    candidate_index: usize,
+) -> bool {
+    match pattern.get(pattern_index) {
+        None => candidate_index == candidate.len(),
+        Some('*') => {
+            let crosses_segments = pattern.get(pattern_index + 1) == Some(&'*');
+            let next_index = pattern_index + usize::from(crosses_segments) + 1;
+            let maximum = if crosses_segments {
+                candidate.len()
+            } else {
+                candidate[candidate_index..]
+                    .iter()
+                    .position(|character| *character == '/')
+                    .map_or(candidate.len(), |offset| candidate_index + offset)
+            };
+
+            (candidate_index..=maximum).any(|next_candidate| {
+                glob_matches_from(pattern, candidate, next_index, next_candidate)
+            })
+        }
+        Some('?') => {
+            candidate_index < candidate.len()
+                && candidate[candidate_index] != '/'
+                && glob_matches_from(pattern, candidate, pattern_index + 1, candidate_index + 1)
+        }
+        Some('[') => {
+            let Some(class_end) = pattern[pattern_index + 1..]
+                .iter()
+                .position(|character| *character == ']')
+                .map(|offset| pattern_index + offset + 1)
+            else {
+                return false;
+            };
+            let class = &pattern[pattern_index + 1..class_end];
+
+            candidate_index < candidate.len()
+                && candidate[candidate_index] != '/'
+                && glob_class_matches(class, candidate[candidate_index])
+                && glob_matches_from(pattern, candidate, class_end + 1, candidate_index + 1)
+        }
+        Some(character) => {
+            candidate.get(candidate_index) == Some(character)
+                && glob_matches_from(pattern, candidate, pattern_index + 1, candidate_index + 1)
+        }
+    }
+}
+
+fn glob_class_matches(class: &[char], candidate: char) -> bool {
+    let (negated, characters) = match class.first() {
+        Some('!' | '^') => (true, &class[1..]),
+        _ => (false, class),
+    };
+    let mut index = 0;
+    let mut matched = false;
+
+    while index < characters.len() {
+        if index + 2 < characters.len() && characters[index + 1] == '-' {
+            matched |= characters[index] <= candidate && candidate <= characters[index + 2];
+            index += 3;
+        } else {
+            matched |= characters[index] == candidate;
+            index += 1;
+        }
+    }
+
+    matched != negated
 }
 
 fn reject_unknown_fields(
