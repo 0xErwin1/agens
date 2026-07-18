@@ -1,3 +1,5 @@
+pub mod chatgpt_login;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
