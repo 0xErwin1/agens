@@ -8,6 +8,21 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_secs(5));
         return;
     }
+    if mode == "no-read-stdin" {
+        #[cfg(unix)]
+        let pipe_size = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETPIPE_SZ, 4096) };
+        #[cfg(not(unix))]
+        let pipe_size = 4096;
+        std::fs::write(
+            std::env::args()
+                .nth(2)
+                .expect("no-read stdin readiness path should be supplied"),
+            pipe_size.to_string(),
+        )
+        .expect("no-read stdin child should signal readiness");
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        return;
+    }
 
     let descendant_pid_path = std::env::args().nth(2);
     let stdin = io::stdin();
@@ -58,6 +73,11 @@ fn main() {
         }
         if mode == "oversize" {
             let _ = writeln!(stdout, "{}", "x".repeat(1024 * 1024 + 1));
+            let _ = stdout.flush();
+            continue;
+        }
+        if mode == "unterminated-oversize" {
+            let _ = stdout.write_all(&vec![b'x'; 1024 * 1024 + 1]);
             let _ = stdout.flush();
             continue;
         }

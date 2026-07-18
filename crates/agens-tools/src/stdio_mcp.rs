@@ -57,12 +57,17 @@ impl McpStdioTransportConfig {
 
 struct Process {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+}
+
+struct WriteRequest {
+    frame: Vec<u8>,
+    response: mpsc::SyncSender<Result<(), McpTransportError>>,
 }
 
 pub struct McpStdioTransport {
     process: Arc<Mutex<Option<Process>>>,
+    writer: mpsc::SyncSender<WriteRequest>,
     process_id: AtomicU32,
     next_id: AtomicU64,
 }
@@ -98,12 +103,14 @@ impl McpStdioTransport {
             .ok_or_else(|| McpTransportError::Transport("MCP stderr pipe is unavailable".into()))?;
         drain_stderr(stderr);
         let process_id = child.id();
+        let (writer, requests) = mpsc::sync_channel(1);
+        start_writer(stdin, requests);
         Ok(Self {
             process: Arc::new(Mutex::new(Some(Process {
                 child,
-                stdin: BufWriter::new(stdin),
                 stdout: BufReader::new(stdout),
             }))),
+            writer,
             next_id: AtomicU64::new(1),
             process_id: AtomicU32::new(process_id),
         })
@@ -165,20 +172,15 @@ impl McpStdioTransport {
                 "MCP request frame exceeds limit".into(),
             ));
         }
-        let mut process = self
-            .process
-            .lock()
-            .map_err(|_| McpTransportError::Transport("MCP process lock is unavailable".into()))?;
-        let process = process
-            .as_mut()
-            .ok_or_else(|| McpTransportError::Transport("MCP process is closed".into()))?;
         context.check()?;
-        process
-            .stdin
-            .write_all(&encoded)
-            .and_then(|_| process.stdin.write_all(b"\n"))
-            .and_then(|_| process.stdin.flush())
-            .map_err(|_| McpTransportError::Transport("MCP process stdin failed".into()))
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.writer
+            .send(WriteRequest {
+                frame: encoded,
+                response: sender,
+            })
+            .map_err(|_| McpTransportError::Transport("MCP process stdin is unavailable".into()))?;
+        wait_for_write(receiver, context, self)
     }
 
     fn terminate(&self) -> Result<(), McpTransportError> {
@@ -269,23 +271,84 @@ fn read_frame(process: Arc<Mutex<Option<Process>>>) -> Result<Value, McpTranspor
     let process = process
         .as_mut()
         .ok_or_else(|| McpTransportError::Transport("MCP process is closed".into()))?;
-    let mut frame = Vec::new();
-    let count = process
-        .stdout
-        .read_until(b'\n', &mut frame)
-        .map_err(|_| McpTransportError::Transport("MCP stdout failed".into()))?;
-    if count == 0 {
+    let mut frame = Vec::with_capacity(MAX_FRAME_BYTES);
+    let mut received = false;
+    loop {
+        let (count, complete) = {
+            let buffer = process
+                .stdout
+                .fill_buf()
+                .map_err(|_| McpTransportError::Transport("MCP stdout failed".into()))?;
+            if buffer.is_empty() {
+                break;
+            }
+            let count = buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(buffer.len(), |position| position + 1);
+            if frame.len() + count > MAX_FRAME_BYTES {
+                return Err(McpTransportError::Protocol(
+                    "MCP stdout frame exceeds limit".into(),
+                ));
+            }
+            frame.extend_from_slice(&buffer[..count]);
+            (count, buffer[count - 1] == b'\n')
+        };
+        process.stdout.consume(count);
+        received = true;
+        if complete {
+            break;
+        }
+    }
+    if !received {
         return Err(McpTransportError::Transport(
             "MCP process ended before a response".into(),
         ));
     }
-    if frame.len() > MAX_FRAME_BYTES {
-        return Err(McpTransportError::Protocol(
-            "MCP stdout frame exceeds limit".into(),
-        ));
-    }
     serde_json::from_slice(&frame)
         .map_err(|_| McpTransportError::Protocol("MCP stdout frame is malformed".into()))
+}
+
+fn start_writer(stdin: ChildStdin, requests: mpsc::Receiver<WriteRequest>) {
+    thread::spawn(move || {
+        let mut stdin = BufWriter::new(stdin);
+        for request in requests {
+            let result = stdin
+                .write_all(&request.frame)
+                .and_then(|_| stdin.write_all(b"\n"))
+                .and_then(|_| stdin.flush())
+                .map_err(|_| McpTransportError::Transport("MCP process stdin failed".into()));
+            let _ = request.response.send(result);
+        }
+    });
+}
+
+fn wait_for_write(
+    receiver: mpsc::Receiver<Result<(), McpTransportError>>,
+    context: &McpOperationContext,
+    transport: &McpStdioTransport,
+) -> Result<(), McpTransportError> {
+    loop {
+        match receiver.recv_timeout(POLL_INTERVAL) {
+            Ok(result) => {
+                if result.is_err() {
+                    let _ = transport.terminate();
+                }
+                return result;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(primary) = context.check() {
+                    let _ = transport.terminate();
+                    return Err(primary);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(McpTransportError::Transport(
+                    "MCP stdin worker stopped".into(),
+                ));
+            }
+        }
+    }
 }
 
 fn parse_response(value: Value, expected_id: u64) -> Result<McpResponse, McpTransportError> {

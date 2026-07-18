@@ -1,4 +1,8 @@
-use agens_config::{mcp_stdio_servers, parse_toml_document, validate_toml_document};
+use agens_config::{
+    McpServerConfig, mcp_stdio_servers, parse_toml_document, validate_toml_document,
+};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[test]
 fn parses_a_valid_toml_document() {
@@ -46,4 +50,23 @@ fn extracts_only_safe_configured_stdio_mcp_servers() {
         parse_toml_document("[mcp.bad]\ntransport = \"stdio\"\ncommand = \" \"\ntimeout_ms = 0")
             .unwrap();
     assert!(mcp_stdio_servers(&unsafe_server).is_err());
+}
+
+#[test]
+fn mcp_server_config_debug_redacts_environment_values_and_arguments() {
+    let config = McpServerConfig {
+        name: "files".into(),
+        command: PathBuf::from("server"),
+        args: vec!["--token".into(), "SENTINEL_ARGUMENT_SECRET".into()],
+        environment: BTreeMap::from([("API_TOKEN".into(), "SENTINEL_ENV_SECRET".into())]),
+        timeout_ms: 50,
+    };
+
+    let debug = format!("{config:?}");
+
+    assert!(debug.contains("API_TOKEN"));
+    assert!(debug.contains("args_count: 2"));
+    assert!(debug.contains("environment_count: 1"));
+    assert!(!debug.contains("SENTINEL_ARGUMENT_SECRET"));
+    assert!(!debug.contains("SENTINEL_ENV_SECRET"));
 }

@@ -477,6 +477,7 @@ pub struct Bootstrap {
     provider_type: Option<String>,
     provider_base_url: Option<String>,
     data_directory: PathBuf,
+    project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
 }
 
@@ -503,8 +504,11 @@ impl Bootstrap {
 
     pub fn mcp_transports(
         &self,
-        project_root: &Path,
     ) -> Result<Vec<(String, McpStdioTransport, std::time::Duration)>, CliError> {
+        let project_root = self
+            .project_root
+            .as_deref()
+            .ok_or_else(|| CliError::configuration("MCP project root is unavailable"))?;
         self.mcp_servers
             .iter()
             .map(|server| {
@@ -530,7 +534,8 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     let home_directory = (dependencies.home_directory)();
     let environment = (dependencies.environment)();
     let project_root = discover_project_root(&current_directory);
-    let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
+    let config_root = project_root.as_deref().unwrap_or(&current_directory);
+    let paths = resolve_paths(config_root, home_directory.as_deref(), &environment);
     let (global, global_loaded) = load_toml(&paths.global_config, "global", dependencies)?;
     let (project, project_loaded) = load_toml(&paths.project_config, "project", dependencies)?;
     let document = merge_toml_documents(global, project);
@@ -543,6 +548,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         provider_type: string_value(&document, &["provider", "type"]),
         provider_base_url: string_value(&document, &["provider", "base_url"]),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
+        project_root,
         mcp_servers,
         paths,
         global_loaded,
@@ -685,19 +691,18 @@ fn load_toml(
     Ok((document, true))
 }
 
-fn discover_project_root(current_directory: &Path) -> PathBuf {
-    let mut current =
-        fs::canonicalize(current_directory).unwrap_or_else(|_| current_directory.to_path_buf());
+fn discover_project_root(current_directory: &Path) -> Option<PathBuf> {
+    let mut current = fs::canonicalize(current_directory).ok()?;
 
     loop {
         if current.join(".git").exists() {
-            return current;
+            return Some(current);
         }
 
         let parent = current.parent().map(Path::to_path_buf);
         match parent {
             Some(parent) if parent != current => current = parent,
-            _ => return current_directory.to_path_buf(),
+            _ => return None,
         }
     }
 }

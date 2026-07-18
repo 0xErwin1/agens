@@ -54,18 +54,25 @@ fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
 #[cfg(unix)]
 #[test]
 fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy() {
+    use std::os::unix::fs::symlink;
+
     let temporary = TemporaryDirectory::new("mcp-transport-factory");
     let config_home = temporary.path().join("config");
     let project_root = temporary.path().join("project");
+    let nested_directory = project_root.join("src/nested");
+    let symlinked_directory = temporary.path().join("working-directory");
     let launch_record = temporary.path().join("launch-record");
     let config_path = config_home.join("config.toml");
-    std::fs::create_dir_all(&project_root).expect("project root should exist");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
+    std::fs::create_dir_all(&nested_directory).expect("nested directory should exist");
+    symlink(&nested_directory, &symlinked_directory)
+        .expect("working directory symlink should exist");
     let script = format!(
         "printf '%s|%s|%s' \"$PWD\" \"$1\" \"$MCP_SENTINEL\" > '{}' ; sleep 5",
         launch_record.display()
     );
     let dependencies = CliDependencies::for_test(
-        project_root.clone(),
+        symlinked_directory,
         Some(temporary.path().join("home")),
         BTreeMap::from([
             (
@@ -85,7 +92,7 @@ fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy(
 
     let bootstrap = bootstrap(&dependencies).expect("validated config should bootstrap");
     let mut transports = bootstrap
-        .mcp_transports(&project_root)
+        .mcp_transports()
         .expect("factory should create stdio transport");
 
     assert_eq!(transports.len(), 1);
@@ -113,6 +120,31 @@ fn bootstrap_factory_builds_configured_stdio_transport_with_fixed_launch_policy(
             std::time::Duration::from_secs(1),
         ))
         .expect("factory transport should close without dispatching chat");
+}
+
+#[test]
+fn bootstrap_factory_rejects_an_unusable_project_root() {
+    let temporary = TemporaryDirectory::new("mcp-transport-outside-root");
+    let config_home = temporary.path().join("config");
+    let outside_directory = temporary.path().join("outside");
+    std::fs::create_dir_all(&outside_directory).expect("outside directory should exist");
+    let dependencies = CliDependencies::for_test(
+        outside_directory,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            "[mcp.files]\ntransport = \"stdio\"\ncommand = \"server\"\ntimeout_ms = 50\n"
+                .to_owned(),
+        )]),
+    );
+
+    let bootstrap = bootstrap(&dependencies).expect("config should remain valid");
+
+    assert!(bootstrap.mcp_transports().is_err());
 }
 
 #[test]

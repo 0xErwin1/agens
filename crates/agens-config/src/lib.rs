@@ -8,13 +8,30 @@ pub struct ConfigPaths {
     pub project_config: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub environment: BTreeMap<String, String>,
     pub timeout_ms: u64,
+}
+
+impl fmt::Debug for McpServerConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args_count", &self.args.len())
+            .field(
+                "environment_keys",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .field("environment_count", &self.environment.len())
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 pub fn mcp_stdio_servers(

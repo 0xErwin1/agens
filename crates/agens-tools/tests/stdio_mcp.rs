@@ -4,14 +4,15 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use agens_tools::{
-    McpClient, McpInitialize, McpLimits, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
-    McpTransportError,
+    McpClient, McpInitialize, McpLimits, McpOperationContext, McpRequest, McpStdioTransport,
+    McpStdioTransportConfig, McpTimeouts, McpTransport, McpTransportError,
 };
 use serde_json::json;
 
@@ -92,6 +93,107 @@ fn stdio_transport_keeps_protocol_transport_deadline_and_cancellation_failures_d
         cancelled.call_tool("x", json!({}), &cancellation),
         Err(McpTransportError::Cancelled)
     );
+}
+
+#[test]
+fn stdio_transport_rejects_an_unterminated_oversized_stdout_frame() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut transport = transport("unterminated-oversize");
+    let context = McpOperationContext::new(cancellation, Duration::from_secs(1));
+
+    let result = transport.execute(
+        McpRequest::CallTool {
+            name: "x".into(),
+            arguments: json!({}),
+        },
+        &context,
+    );
+
+    assert_eq!(
+        result,
+        Err(McpTransportError::Protocol(
+            "MCP stdout frame exceeds limit".into()
+        ))
+    );
+}
+
+#[test]
+fn stdio_transport_returns_promptly_when_a_child_does_not_read_stdin() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let (mut transport, _temporary) = no_read_transport();
+    let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_millis(100));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = transport.execute(
+            McpRequest::CallTool {
+                name: "x".repeat(512 * 1024),
+                arguments: json!({}),
+            },
+            &context,
+        );
+        let _ = sender.send(result);
+    });
+
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_millis(250)),
+        Ok(Err(McpTransportError::TimedOut))
+    );
+}
+
+#[test]
+fn stdio_transport_cancels_a_blocked_stdin_write_promptly() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let (mut transport, _temporary) = no_read_transport();
+    let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_secs(1));
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let signal = Arc::clone(&cancellation);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(10));
+        signal.store(true, Ordering::Release);
+    });
+    thread::spawn(move || {
+        let result = transport.execute(
+            McpRequest::CallTool {
+                name: "x".repeat(512 * 1024),
+                arguments: json!({}),
+            },
+            &context,
+        );
+        let _ = sender.send(result);
+    });
+
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_millis(250)),
+        Ok(Err(McpTransportError::Cancelled))
+    );
+}
+
+fn no_read_transport() -> (McpStdioTransport, TemporaryDirectory) {
+    let temporary = TemporaryDirectory::new("no-read-stdin");
+    let ready_path = temporary.path().join("ready");
+    let transport = McpStdioTransport::spawn(McpStdioTransportConfig {
+        command: PathBuf::from(env!("CARGO_BIN_EXE_fake-mcp-child")),
+        args: vec!["no-read-stdin".into(), ready_path.display().to_string()],
+        environment: BTreeMap::new(),
+        project_root: std::env::current_dir().unwrap(),
+    })
+    .unwrap();
+    wait_for_path(&ready_path);
+    assert_eq!(
+        std::fs::read_to_string(ready_path).unwrap().trim(),
+        "4096",
+        "child must shrink stdin so the writer blocks"
+    );
+
+    (transport, temporary)
+}
+
+fn wait_for_path(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "child should signal readiness");
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 #[test]
