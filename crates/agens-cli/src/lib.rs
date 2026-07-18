@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,10 @@ use agens_core::{
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
     PermissionSession, TurnProvider, run_headless_turn,
+};
+use agens_providers::chatgpt_login::{
+    ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
+    device_code_login_with_progress, login, remove_provider_entry, upsert_chatgpt_credentials,
 };
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
@@ -37,6 +42,7 @@ type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
 type TuiLauncher = Box<dyn Fn(&Bootstrap) -> Result<String, CliError>>;
+type AuthLogin = Box<dyn Fn(&Path, bool) -> Result<String, CliError>>;
 
 pub struct CliDependencies {
     current_directory: CurrentDirectory,
@@ -45,6 +51,7 @@ pub struct CliDependencies {
     read_file: ConfigReader,
     headless_chat: HeadlessChat,
     tui_launcher: TuiLauncher,
+    auth_login: AuthLogin,
 }
 
 impl CliDependencies {
@@ -67,6 +74,7 @@ impl CliDependencies {
             }),
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            auth_login: Box::new(run_production_auth_login),
         }
     }
 
@@ -83,6 +91,7 @@ impl CliDependencies {
             read_file: Box::new(move |path| Ok(files.get(path).cloned())),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            auth_login: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
 
@@ -104,6 +113,14 @@ impl CliDependencies {
         launcher: impl Fn(&Bootstrap) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.tui_launcher = Box::new(launcher);
+        self
+    }
+
+    pub fn with_auth_login(
+        mut self,
+        login: impl Fn(&Path, bool) -> Result<String, CliError> + 'static,
+    ) -> Self {
+        self.auth_login = Box::new(login);
         self
     }
 }
@@ -409,13 +426,74 @@ fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<Stri
             };
             Ok(format!("ChatGPT authentication: {status}\n"))
         }
-        [command] if command == "login" => Err(CliError::unavailable(UNAVAILABLE_MESSAGE)),
+        [command] if command == "login" => run_auth_login(dependencies, false),
+        [command, flag] if command == "login" && flag == "--device-auth" => {
+            run_auth_login(dependencies, true)
+        }
         [command, subcommand, ..] if command == "login" && subcommand == "api-key" => {
             Err(CliError::unavailable(UNAVAILABLE_MESSAGE))
         }
-        [command, ..] if command == "logout" => Err(CliError::unavailable(UNAVAILABLE_MESSAGE)),
+        [command, provider] if command == "logout" => {
+            let bootstrap = bootstrap(dependencies)?;
+            let removed =
+                remove_provider_entry(&bootstrap.paths.credentials, provider).map_err(|_| {
+                    CliError::authentication("ChatGPT credentials are unavailable or invalid")
+                })?;
+            if removed {
+                Ok(format!("Logged out of {provider}.\n"))
+            } else {
+                Ok(format!("No credentials stored for {provider}.\n"))
+            }
+        }
         _ => Err(CliError::usage("auth requires status, login, or logout")),
     }
+}
+
+fn run_auth_login(dependencies: &CliDependencies, device_auth: bool) -> Result<String, CliError> {
+    let bootstrap = bootstrap(dependencies)?;
+    let mut output = (dependencies.auth_login)(&bootstrap.paths.credentials, device_auth)?;
+    output.push_str("Logged in to ChatGPT.\n");
+    Ok(output)
+}
+
+fn run_production_auth_login(path: &Path, device_auth: bool) -> Result<String, CliError> {
+    let credentials = if device_auth {
+        device_code_login_with_progress(
+            ChatGptDeviceCodeLoginOptions::default(),
+            LoginCancellation::new(),
+            move |verification_url, user_code| {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "Open {} and enter code {}.",
+                    verification_url,
+                    user_code
+                );
+                let _ = std::io::stdout().flush();
+            },
+        )
+        .map(|result| result.credentials)
+    } else {
+        login(
+            ChatGptLoginOptions::new(
+                Arc::new(|url| {
+                    std::process::Command::new("xdg-open")
+                        .arg(url)
+                        .spawn()
+                        .map(|_| ())
+                }),
+                Arc::new(|url| {
+                    let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");
+                    let _ = std::io::stdout().flush();
+                }),
+            ),
+            LoginCancellation::new(),
+        )
+    }
+    .map_err(|_| CliError::authentication("ChatGPT login failed"))?;
+
+    upsert_chatgpt_credentials(path, &credentials)
+        .map_err(|_| CliError::authentication("ChatGPT credentials could not be saved"))?;
+    Ok(String::new())
 }
 
 fn run_chat(

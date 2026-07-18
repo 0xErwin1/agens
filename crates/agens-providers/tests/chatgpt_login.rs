@@ -12,8 +12,9 @@ use std::os::unix::fs::MetadataExt;
 
 use agens_providers::chatgpt_login::{
     ChatGptCredentials, ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
-    LoginError, authorization_url, device_code_login, generate_pkce, generate_state, login,
-    upsert_chatgpt_credentials, upsert_provider_entry, upsert_provider_entry_with_deadline,
+    LoginError, authorization_url, device_code_login, device_code_login_with_progress,
+    generate_pkce, generate_state, login, upsert_chatgpt_credentials, upsert_provider_entry,
+    upsert_provider_entry_with_deadline,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -153,9 +154,19 @@ fn device_code_login_uses_exact_json_requests_and_validates_the_server_pkce_pair
         );
     });
 
-    let result = device_code_login(
+    let published_code = Arc::new(Mutex::new(None));
+    let result = device_code_login_with_progress(
         ChatGptDeviceCodeLoginOptions::for_test(&device_endpoint, &poll_endpoint, &oauth_endpoint),
         LoginCancellation::new(),
+        {
+            let published_code = Arc::clone(&published_code);
+            move |verification_url, user_code| {
+                *published_code
+                    .lock()
+                    .expect("published device code lock should be available") =
+                    Some((verification_url.to_owned(), user_code.to_owned()));
+            }
+        },
     )
     .expect("device login should succeed");
 
@@ -165,6 +176,15 @@ fn device_code_login_uses_exact_json_requests_and_validates_the_server_pkce_pair
     );
     assert_eq!(result.user_code, "ABCD-EFGH");
     assert_eq!(result.credentials.account_id, "account_123");
+    assert_eq!(
+        *published_code
+            .lock()
+            .expect("published device code lock should be available"),
+        Some((
+            "https://auth.openai.com/codex/device".to_owned(),
+            "ABCD-EFGH".to_owned()
+        ))
+    );
     device_server.join().expect("device server should finish");
     poll_server.join().expect("poll server should finish");
     oauth_server.join().expect("OAuth server should finish");

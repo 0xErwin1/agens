@@ -286,9 +286,18 @@ pub fn device_code_login(
     options: ChatGptDeviceCodeLoginOptions,
     cancellation: LoginCancellation,
 ) -> Result<ChatGptDeviceCodeLogin, LoginError> {
+    device_code_login_with_progress(options, cancellation, |_, _| {})
+}
+
+pub fn device_code_login_with_progress(
+    options: ChatGptDeviceCodeLoginOptions,
+    cancellation: LoginCancellation,
+    publish: impl FnOnce(&str, &str),
+) -> Result<ChatGptDeviceCodeLogin, LoginError> {
     let deadline = Instant::now() + options.timeout.min(LOGIN_TIMEOUT);
     let device = device_user_code_request(&options.user_code_endpoint, &cancellation, deadline)?;
     let (device_auth_id, user_code, interval) = parse_device_user_code(&device)?;
+    publish(DEVICE_VERIFICATION_URL, &user_code);
 
     loop {
         check_login_stop(&cancellation, deadline)?;
@@ -372,6 +381,45 @@ pub fn upsert_provider_entry_with_deadline(
     deadline: Instant,
 ) -> Result<(), LoginError> {
     upsert_provider_entry_inner(path, provider, entry, &[], Some((cancellation, deadline)))
+}
+
+/// Removes one provider entry from auth.json without changing other providers.
+pub fn remove_provider_entry(path: &Path, provider: &str) -> Result<bool, LoginError> {
+    if provider.is_empty() {
+        return Err(LoginError::Authentication("credentials file is invalid"));
+    }
+
+    let (parent, name) = open_secure_parent(path)?;
+    let lock = open_file_at(
+        &parent,
+        b".auth.json.lock",
+        libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW,
+        0o600,
+    )
+    .map_err(|_| LoginError::Authentication("credentials file is unavailable"))?;
+    acquire_lock(&lock, None)?;
+    if lock
+        .metadata()
+        .map(|metadata| metadata.nlink() != 1)
+        .unwrap_or(true)
+    {
+        return Err(LoginError::Authentication(
+            "credentials file is unavailable",
+        ));
+    }
+
+    let mut root = read_credentials_at(&parent, &name)?;
+    let root_object = root
+        .as_object_mut()
+        .ok_or(LoginError::Authentication("credentials file is invalid"))?;
+    if root_object.remove(provider).is_none() {
+        return Ok(false);
+    }
+
+    let contents = serde_json::to_vec(&root)
+        .map_err(|_| LoginError::Authentication("credentials could not be encoded"))?;
+    write_credentials_atomically_at(&parent, &name, &contents)?;
+    Ok(true)
 }
 
 fn upsert_provider_entry_inner(

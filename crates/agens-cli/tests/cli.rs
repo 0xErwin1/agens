@@ -283,6 +283,81 @@ fn auth_status_uses_the_compatible_credentials_path_without_exposing_tokens() {
 }
 
 #[test]
+fn auth_login_selects_browser_or_device_flow_and_uses_the_compatible_credentials_path() {
+    let temporary = TemporaryDirectory::new("auth-login");
+    let config_home = temporary.path().join("config");
+    let credentials_path = config_home.join("auth.json");
+    let selected_flows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::new(),
+    )
+    .with_auth_login({
+        let selected_flows = std::sync::Arc::clone(&selected_flows);
+        move |path, device_auth| {
+            selected_flows
+                .lock()
+                .expect("flow recording lock should be available")
+                .push(device_auth);
+            assert_eq!(path, credentials_path);
+            Ok(String::new())
+        }
+    });
+
+    let browser = execute(["auth", "login"], &dependencies);
+    let device = execute(["auth", "login", "--device-auth"], &dependencies);
+
+    assert_eq!(browser.status, ExitStatus::Success);
+    assert_eq!(browser.stdout, "Logged in to ChatGPT.\n");
+    assert_eq!(device.status, ExitStatus::Success);
+    assert_eq!(device.stdout, "Logged in to ChatGPT.\n");
+    assert_eq!(
+        *selected_flows
+            .lock()
+            .expect("flow recording lock should be available"),
+        vec![false, true]
+    );
+}
+
+#[test]
+fn auth_logout_removes_only_chatgpt_credentials_and_reports_absence() {
+    let temporary = TemporaryDirectory::new("auth-logout");
+    let config_home = temporary.path().join("config");
+    std::fs::create_dir_all(&config_home).expect("config directory should be created");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-chatgpt":{"access_token":"secret-access","refresh_token":"secret-refresh","account_id":"account_123","expires_at":"2099-01-01T00:00:00Z"},"other":{"api_key":"preserved"}}"#,
+    )
+    .expect("credentials should be written");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::new(),
+    );
+
+    let removed = execute(["auth", "logout", "openai-chatgpt"], &dependencies);
+    let absent = execute(["auth", "logout", "openai-chatgpt"], &dependencies);
+    let credentials = std::fs::read_to_string(config_home.join("auth.json"))
+        .expect("remaining credentials should be readable");
+
+    assert_eq!(removed.status, ExitStatus::Success);
+    assert_eq!(removed.stdout, "Logged out of openai-chatgpt.\n");
+    assert_eq!(absent.status, ExitStatus::Success);
+    assert_eq!(absent.stdout, "No credentials stored for openai-chatgpt.\n");
+    assert!(credentials.contains(r#""other":{"api_key":"preserved"}"#));
+    assert!(!credentials.contains("secret-"));
+}
+
+#[test]
 fn sessions_list_uses_configured_data_directory_and_reports_empty_store() {
     let temporary = TemporaryDirectory::new("sessions-list");
     let config_home = temporary.path().join("config");
