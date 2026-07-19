@@ -896,7 +896,10 @@ async fn run_headless_turn_with_iteration_limit(
                 .accept_tool_result(&call.id, output.content, output.is_error)
                 .map_err(|_| fail_state(&mut coordinator))?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
-            check_cancelled(&mut coordinator, cancellation)?;
+            if let Err(error) = check_cancelled(&mut coordinator, cancellation) {
+                flush_progress(&coordinator, progress, &mut progress_cursor);
+                return Err(error);
+            }
         }
     }
 }

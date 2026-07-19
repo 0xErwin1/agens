@@ -2473,7 +2473,7 @@ fn root_help() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agens_core::TurnState;
+    use agens_core::{CompletedTurnRepository, CompletedTurnSnapshot, TurnProvider, TurnState};
 
     mod model_registry {
         use super::*;
@@ -2671,6 +2671,325 @@ mod tests {
 
         assert!(prompt.contains("Target: [redacted]"));
         assert!(!prompt.contains("SENTINEL_JSON"));
+    }
+
+    struct BatchProvider {
+        iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
+    }
+
+    impl TurnProvider for BatchProvider {
+        fn next_parts(
+            &mut self,
+            _: &[TurnEvent],
+            _: &HeadlessTurnCancellation,
+        ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+        {
+            std::future::ready(self.iterations.remove(0))
+        }
+    }
+
+    #[derive(Default)]
+    struct BatchRepository;
+
+    impl CompletedTurnRepository for BatchRepository {
+        fn persist_completed_turn(
+            &mut self,
+            _: CompletedTurnSnapshot,
+        ) -> impl std::future::Future<Output = Result<(), agens_core::CompletedTurnStoreError>> + Send
+        {
+            std::future::ready(Ok(()))
+        }
+    }
+
+    struct RecordingPrompt {
+        answers: Vec<PermissionPromptAnswer>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PermissionPrompter for RecordingPrompt {
+        fn prompt(
+            &mut self,
+            context: &PermissionPromptContext,
+        ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+            self.calls
+                .lock()
+                .expect("prompt calls should be available")
+                .push(context.target_identifier.clone());
+            Ok(self.answers.remove(0))
+        }
+    }
+
+    struct BatchTool {
+        calls: Arc<Mutex<Vec<String>>>,
+        cancellation: Option<HeadlessTurnCancellation>,
+    }
+
+    impl DispatchTool for BatchTool {
+        fn permission_target(
+            &self,
+            arguments: &serde_json::Value,
+        ) -> Result<String, agens_core::Error> {
+            arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| agens_core::Error::Tool("missing path".into()))
+        }
+
+        fn execute(
+            &mut self,
+            _: &ToolExecutionContext,
+            arguments: serde_json::Value,
+        ) -> Result<ToolOutput, agens_core::Error> {
+            let path = self.permission_target(&arguments)?;
+            self.calls
+                .lock()
+                .expect("tool calls should be available")
+                .push(path.clone());
+            if let Some(cancellation) = &self.cancellation {
+                cancellation.cancel();
+            }
+            Ok(ToolOutput::success(format!("executed {path}")))
+        }
+    }
+
+    fn batch_call(id: &str, path: &str) -> MessagePart {
+        MessagePart::ToolCall {
+            id: id.into(),
+            name: "native::read".into(),
+            input: format!(r#"{{"path":"{path}"}}"#),
+        }
+    }
+
+    fn batch_policy() -> PermissionPolicy {
+        PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::read".into()),
+                PermissionPattern::Any,
+            )],
+        )
+    }
+
+    struct BatchOutcome {
+        result: Result<CompletedTurnSnapshot, HeadlessTurnError>,
+        prompts: Vec<String>,
+        executions: Vec<String>,
+        progress: Vec<TurnEvent>,
+    }
+
+    fn run_ready<T>(
+        future: impl std::future::Future<Output = Result<T, HeadlessTurnError>>,
+    ) -> Result<T, HeadlessTurnError> {
+        let mut future = std::pin::pin!(future);
+        let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+        match future.as_mut().poll(context) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => panic!("batch ports must complete synchronously"),
+        }
+    }
+
+    fn run_production_batch(
+        directory_name: &str,
+        answers: Vec<PermissionPromptAnswer>,
+        calls: Vec<MessagePart>,
+        cancellation: Option<HeadlessTurnCancellation>,
+    ) -> BatchOutcome {
+        let directory =
+            std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        dispatcher
+            .lock()
+            .expect("dispatcher should be available")
+            .register_native(
+                "native::read",
+                agens_core::ToolAccess::ReadOnly,
+                BatchTool {
+                    calls: Arc::clone(&executions),
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .expect("batch tool should register");
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let pending_prompts = Arc::new(Mutex::new(BTreeMap::new()));
+        let policy = batch_policy();
+        let mut gate = ProductionPermissionGate::new(
+            policy.clone(),
+            Arc::clone(&grants),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::clone(&pending_prompts),
+        );
+        let mut resolver = ProductionPermissionResolver::new(
+            RecordingPrompt {
+                answers,
+                calls: Arc::clone(&prompts),
+            },
+            PermissionGrantStore::open(&directory).expect("grant store should open"),
+            grants,
+            pending_prompts,
+            ProductionPromptAuthorization {
+                policy,
+                session: PermissionSession::new(),
+                project: "project".into(),
+                dispatcher: Arc::clone(&dispatcher),
+                allowed: Arc::clone(&allowed),
+            },
+        );
+        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+        let mut provider = BatchProvider {
+            iterations: vec![Ok(calls), Ok(vec![MessagePart::Text("complete".into())])],
+        };
+        let progress_events = Arc::new(Mutex::new(Vec::new()));
+        let progress: TurnProgressSink = {
+            let progress_events = Arc::clone(&progress_events);
+            Arc::new(move |event| progress_events.lock().unwrap().push(event))
+        };
+        let cancellation = cancellation.unwrap_or_default();
+        let result = run_ready(agens_core::run_headless_turn_with_progress(
+            &mut provider,
+            &mut gate,
+            &mut resolver,
+            &mut tool_dispatcher,
+            &mut BatchRepository,
+            &cancellation,
+            Some(&progress),
+        ));
+        std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+
+        BatchOutcome {
+            result,
+            prompts: prompts.lock().unwrap().clone(),
+            executions: executions.lock().unwrap().clone(),
+            progress: progress_events.lock().unwrap().clone(),
+        }
+    }
+
+    #[test]
+    fn production_allow_always_remembers_a_matching_call_within_one_batch() {
+        let outcome = run_production_batch(
+            "batch-allow-always",
+            vec![PermissionPromptAnswer::AllowAlways],
+            vec![
+                batch_call("first", "notes.md"),
+                batch_call("later", "notes.md"),
+            ],
+            None,
+        );
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.prompts, ["notes.md"]);
+        assert_eq!(outcome.executions, ["notes.md", "notes.md"]);
+    }
+
+    #[test]
+    fn production_deny_always_denies_later_matching_calls_without_execution() {
+        let outcome = run_production_batch(
+            "batch-deny-always",
+            vec![PermissionPromptAnswer::DenyAlways],
+            vec![
+                batch_call("first", "notes.md"),
+                batch_call("later", "notes.md"),
+            ],
+            None,
+        );
+
+        let snapshot = outcome
+            .result
+            .expect("denied calls should let the turn complete");
+        assert_eq!(outcome.prompts, ["notes.md"]);
+        assert!(outcome.executions.is_empty());
+        assert_eq!(
+            snapshot
+                .events()
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        tool_call_id,
+                        is_error,
+                        ..
+                    }) => {
+                        Some((tool_call_id.as_str(), *is_error))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [("first", true), ("later", true)]
+        );
+    }
+
+    #[test]
+    fn production_batch_prompts_each_distinct_ask_individually() {
+        let outcome = run_production_batch(
+            "batch-distinct-prompts",
+            vec![
+                PermissionPromptAnswer::AllowOnce,
+                PermissionPromptAnswer::DenyOnce,
+            ],
+            vec![
+                batch_call("first", "first.md"),
+                batch_call("second", "second.md"),
+            ],
+            None,
+        );
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.prompts, ["first.md", "second.md"]);
+        assert_eq!(outcome.executions, ["first.md"]);
+    }
+
+    #[test]
+    fn production_batch_progress_has_boundaries_and_cancellation_never_completes() {
+        let cancellation = HeadlessTurnCancellation::new();
+        let outcome = run_production_batch(
+            "batch-cancellation-progress",
+            vec![
+                PermissionPromptAnswer::AllowOnce,
+                PermissionPromptAnswer::AllowOnce,
+            ],
+            vec![
+                batch_call("first", "first.md"),
+                batch_call("second", "second.md"),
+            ],
+            Some(cancellation),
+        );
+
+        assert_eq!(outcome.result, Err(HeadlessTurnError::Cancelled));
+        assert_eq!(outcome.executions, ["first.md"]);
+        assert_eq!(
+            outcome.progress,
+            vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(batch_call("first", "first.md")),
+                TurnEvent::ProviderPart(batch_call("second", "second.md")),
+                TurnEvent::StateChanged(TurnState::Dispatching),
+                TurnEvent::ToolCallRequested {
+                    id: "first".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"first.md"}"#.into(),
+                },
+                TurnEvent::ToolCallRequested {
+                    id: "second".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"second.md"}"#.into(),
+                },
+                TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id: "first".into(),
+                    content: "tool execution failed".into(),
+                    is_error: true,
+                }),
+                TurnEvent::StateChanged(TurnState::Cancelled),
+            ]
+        );
     }
 
     #[test]
