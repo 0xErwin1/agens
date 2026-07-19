@@ -2421,6 +2421,23 @@ impl WriteFileInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditFileInput {
+    path: PathBuf,
+    old: String,
+    new: String,
+}
+
+impl EditFileInput {
+    pub fn new(path: impl Into<PathBuf>, old: impl Into<String>, new: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            old: old.into(),
+            new: new.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListDirectoryInput {
     path: PathBuf,
 }
@@ -2563,6 +2580,10 @@ impl NativeTools {
         self.write_file_with_context(input, None)
     }
 
+    pub fn edit_file(&self, input: EditFileInput) -> Result<ToolOutput, Error> {
+        self.edit_file_with_context(input, None)
+    }
+
     fn write_file_with_context(
         &self,
         input: WriteFileInput,
@@ -2592,6 +2613,38 @@ impl NativeTools {
             ))),
             Err(output) => Ok(output),
         }
+    }
+
+    fn edit_file_with_context(
+        &self,
+        input: EditFileInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
+        if let Err(output) = self.validate_relative(&input.path) {
+            return Ok(output);
+        }
+        if input.old.is_empty() {
+            return Ok(ToolOutput::failure("edit: old text is required"));
+        }
+        if input.old == input.new {
+            return Ok(ToolOutput::failure("edit: old and new text must differ"));
+        }
+
+        #[cfg(unix)]
+        let result = edit_file_confined(
+            &self.project_root_dir,
+            &input.path,
+            &input.old,
+            &input.new,
+            context,
+        );
+
+        #[cfg(not(unix))]
+        let result = Err(ToolOutput::failure(
+            "edit: secure confined edits are unavailable on this platform",
+        ));
+
+        Ok(result.unwrap_or_else(|output| output))
     }
 
     pub fn list_directory(&self, input: ListDirectoryInput) -> Result<ToolOutput, Error> {
@@ -2889,6 +2942,12 @@ impl NativeToolCatalog {
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["path","content"],"properties":{"path":{"type":"string"},"content":{"type":"string"}}}),
             ),
             native_metadata(
+                "native::edit",
+                "Replace exactly one text match beneath the project root",
+                ToolAccess::Write,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path","old","new"],"properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}}}),
+            ),
+            native_metadata(
                 "native::list",
                 "List a directory beneath the project root",
                 ToolAccess::ReadOnly,
@@ -2942,6 +3001,10 @@ impl NativeToolCatalog {
             }
             "native::write" => self.tools.write_file_with_context(
                 WriteFileInput::new(string("path")?, string("content")?),
+                Some(context),
+            )?,
+            "native::edit" => self.tools.edit_file_with_context(
+                EditFileInput::new(string("path")?, string("old")?, string("new")?),
                 Some(context),
             )?,
             "native::list" => self
@@ -3128,6 +3191,170 @@ fn write_file_confined(
         }
     }
     result
+}
+
+#[cfg(unix)]
+fn edit_file_confined(
+    project_root: &fs::File,
+    path: &Path,
+    old: &str,
+    new: &str,
+    context: Option<&ToolExecutionContext>,
+) -> Result<ToolOutput, ToolOutput> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (directory, file_name) = open_confined_parent(project_root, path, false, "edit")?;
+    let mut file = open_confined_file(&directory, &file_name, "edit")?;
+    let metadata = checked_regular_file(&file, "edit")?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(ToolOutput::failure("edit: file exceeds 1048576 byte limit"));
+    }
+
+    let mut original = String::new();
+    file.read_to_string(&mut original)
+        .map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
+    let Some(match_offset) = original.find(old) else {
+        return Err(ToolOutput::failure("edit: old text was not found"));
+    };
+    let next_start = match_offset + original[match_offset..].chars().next().unwrap().len_utf8();
+    if original[next_start..].contains(old) {
+        return Err(ToolOutput::failure(
+            "edit: old text matched multiple locations",
+        ));
+    }
+
+    let replacement = original.replacen(old, new, 1);
+    let original_identity = (metadata.dev(), metadata.ino());
+    let diff = unified_edit_diff(path, &original, &replacement, old, new, match_offset);
+    write_edit_temp(
+        &directory,
+        &file_name,
+        replacement.as_bytes(),
+        original_identity,
+        context,
+    )?;
+    Ok(ToolOutput::success(diff))
+}
+
+#[cfg(unix)]
+fn write_edit_temp(
+    directory: &fs::File,
+    file_name: &std::ffi::CString,
+    content: &[u8],
+    expected: (u64, u64),
+    context: Option<&ToolExecutionContext>,
+) -> Result<(), ToolOutput> {
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
+    let temp_name = CString::new(format!(
+        ".agens-edit-{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+    .expect("generated temporary name has no null byte");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(ToolOutput::failure(format!(
+            "edit: cannot create temporary file: {}",
+            io::Error::last_os_error()
+        )));
+    }
+
+    let mut temp = unsafe { fs::File::from_raw_fd(descriptor) };
+    let result = (|| {
+        temp.write_all(content)
+            .map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
+        temp.sync_all()
+            .map_err(|error| ToolOutput::failure(format!("edit: {error}")))?;
+        if context.is_some_and(ToolExecutionContext::is_cancelled) {
+            return Err(ToolOutput::failure("tool execution cancelled"));
+        }
+        let target = open_confined_file(directory, file_name, "edit")?;
+        if file_identity(&checked_regular_file(&target, "edit")?) != expected {
+            return Err(ToolOutput::failure("edit: target changed during edit"));
+        }
+        if context.is_some_and(ToolExecutionContext::is_cancelled) {
+            return Err(ToolOutput::failure("tool execution cancelled"));
+        }
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                file_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(ToolOutput::failure(format!(
+                "edit: cannot commit temporary file: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        directory
+            .sync_all()
+            .map_err(|error| ToolOutput::failure(format!("edit: {error}")))
+    })();
+    if result.is_err() {
+        unsafe { libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0) };
+    }
+    result
+}
+
+#[cfg(unix)]
+fn unified_edit_diff(
+    path: &Path,
+    original: &str,
+    replacement: &str,
+    old: &str,
+    new: &str,
+    match_offset: usize,
+) -> String {
+    const CONTEXT_LINES: usize = 3;
+    let old_lines: Vec<_> = original.lines().collect();
+    let new_lines: Vec<_> = replacement.lines().collect();
+    let changed = original[..match_offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let old_end =
+        (changed + old.bytes().filter(|byte| *byte == b'\n').count() + 1).min(old_lines.len());
+    let new_end =
+        (changed + new.bytes().filter(|byte| *byte == b'\n').count() + 1).min(new_lines.len());
+    let start = changed.saturating_sub(CONTEXT_LINES);
+    let old_tail_end = old_end.saturating_add(CONTEXT_LINES).min(old_lines.len());
+    let new_tail_end = new_end.saturating_add(CONTEXT_LINES).min(new_lines.len());
+    let mut diff = format!(
+        "--- {}\n+++ {}\n@@ -{},{} +{},{} @@\n",
+        path.display(),
+        path.display(),
+        start + 1,
+        old_tail_end - start,
+        start + 1,
+        new_tail_end - start
+    );
+    for line in &old_lines[start..changed] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    for line in &old_lines[changed..old_end] {
+        diff.push_str(&format!("-{line}\n"));
+    }
+    for line in &new_lines[changed..new_end] {
+        diff.push_str(&format!("+{line}\n"));
+    }
+    for line in &new_lines[new_end..new_tail_end] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    diff
 }
 
 #[cfg(unix)]

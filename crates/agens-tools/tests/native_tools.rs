@@ -9,8 +9,8 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, ListDirectoryInput, NativeToolCatalog, NativeToolLimits, NativeTools, ReadFileInput,
-    SearchInput, ToolExecutionContext, ToolOutput, WriteFileInput,
+    BashInput, EditFileInput, ListDirectoryInput, NativeToolCatalog, NativeToolLimits, NativeTools,
+    ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput, WriteFileInput,
 };
 use serde_json::json;
 
@@ -274,6 +274,134 @@ fn confined_read_write_creates_parents_and_reads_one_based_ranges() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn exact_edit_replaces_one_match_and_returns_a_unified_diff() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools
+            .edit_file(EditFileInput::new("notes.txt", "two", "TWO"))
+            .unwrap(),
+        ToolOutput::success(
+            "--- notes.txt\n+++ notes.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "one\nTWO\nthree\n"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn exact_edit_rejects_invalid_matches_without_changing_the_target() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "repeat repeat").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    for (old, new) in [("missing", "value"), ("repeat", "value"), ("same", "same")] {
+        if old == "same" {
+            fs::write(root.join("notes.txt"), "same").unwrap();
+        }
+        assert!(
+            tools
+                .edit_file(EditFileInput::new("notes.txt", old, new))
+                .unwrap()
+                .is_error
+        );
+    }
+    assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "same");
+
+    fs::write(root.join("notes.txt"), "aaa").unwrap();
+    assert!(
+        tools
+            .edit_file(EditFileInput::new("notes.txt", "aa", "b"))
+            .unwrap()
+            .is_error
+    );
+    assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "aaa");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn exact_edit_fails_closed_for_nonregular_and_linked_targets() {
+    use std::os::unix::fs::symlink;
+
+    let root = project_root();
+    let outside = project_root();
+    fs::write(outside.join("outside.txt"), "old").unwrap();
+    symlink(outside.join("outside.txt"), root.join("linked.txt")).unwrap();
+    fs::create_dir(root.join("directory.txt")).unwrap();
+    fs::write(root.join("original.txt"), "old").unwrap();
+    fs::hard_link(root.join("original.txt"), root.join("hard-linked.txt")).unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    for path in ["linked.txt", "directory.txt", "original.txt"] {
+        assert!(
+            tools
+                .edit_file(EditFileInput::new(path, "old", "new"))
+                .unwrap()
+                .is_error
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(outside.join("outside.txt")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("original.txt")).unwrap(),
+        "old"
+    );
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn catalog_dispatches_the_separate_edit_schema() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "before").unwrap();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let metadata = NativeToolCatalog::metadata();
+    let edit = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::edit")
+        .expect("edit metadata");
+    assert_eq!(edit.input_schema["required"], json!(["path", "old", "new"]));
+
+    assert_eq!(
+        catalog
+            .execute(
+                "native::edit",
+                json!({"path": "notes.txt", "old": "before", "new": "after"}),
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::success("--- notes.txt\n+++ notes.txt\n@@ -1,1 +1,1 @@\n-before\n+after\n")
+    );
+    assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after");
+
+    let cancelled = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        catalog
+            .execute(
+                "native::edit",
+                json!({"path": "notes.txt", "old": "after", "new": "cancelled"}),
+                &ToolExecutionContext::new(cancelled, Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::failure("tool execution cancelled")
+    );
+    assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn confined_read_write_fails_closed_for_symlinks_and_hardlinks() {
@@ -396,7 +524,7 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
     let root = project_root();
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
-    assert_eq!(metadata.len(), 5);
+    assert_eq!(metadata.len(), 6);
     assert!(metadata.iter().all(|tool| {
         tool.qualified_name.starts_with("native::")
             && tool.input_schema["type"] == "object"
