@@ -1208,11 +1208,13 @@ impl PermissionTarget {
             | Self::Mcp(value) => value,
         };
 
-        value
-            .char_indices()
-            .take_while(|(index, _)| *index < MAX_PERMISSION_TARGET_BYTES)
-            .map(|(_, character)| character)
-            .collect()
+        let mut end = value.len().min(MAX_PERMISSION_TARGET_BYTES);
+
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+
+        value[..end].to_owned()
     }
 }
 
@@ -1326,10 +1328,13 @@ impl PermissionSession {
 pub enum SafetyPredicate {
     WorktreeEscape,
     ChatWrite,
-    GlobalDeny {
-        tool: PermissionPattern,
-        target: PermissionPattern,
-    },
+    GlobalDeny(Box<GlobalDenyPredicate>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobalDenyPredicate {
+    pub tool: PermissionPattern,
+    pub target: PermissionPattern,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1381,8 +1386,9 @@ impl PermissionPolicy {
                 || matches!(predicate, SafetyPredicate::ChatWrite)
                     && self.mode == PermissionMode::Chat
                     && request.access == ToolAccess::Write
-                || matches!(predicate, SafetyPredicate::GlobalDeny { tool, target }
-                    if tool.matches(&request.tool) && target.matches(&request.target))
+                || matches!(predicate, SafetyPredicate::GlobalDeny(global_deny)
+                    if global_deny.tool.matches(&request.tool)
+                        && global_deny.target.matches(&request.target))
         }) {
             return PermissionDecision::Deny;
         }

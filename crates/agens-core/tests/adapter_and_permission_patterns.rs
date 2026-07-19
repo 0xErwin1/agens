@@ -239,6 +239,30 @@ fn permission_targets_project_paths_commands_urls_and_tool_inputs_to_the_shared_
 }
 
 #[test]
+fn multibyte_target_projection_keeps_configured_denies_effective_under_bypass() {
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::Exact("read".into()),
+            PermissionPattern::glob("a*").expect("glob should be valid"),
+        )],
+    );
+
+    for suffix in ['€', '😀'] {
+        let target = format!("{}{}", "a".repeat(MAX_PERMISSION_TARGET_BYTES - 1), suffix);
+        let request = PermissionRequest::new("project", "read", target, ToolAccess::ReadOnly);
+
+        assert!(request.target.len() <= MAX_PERMISSION_TARGET_BYTES);
+        assert_eq!(
+            policy.evaluate(&request, &[], &PermissionSession::with_temporary_bypass(),),
+            PermissionDecision::Deny,
+            "a configured Deny must not become bypassable Ask for {suffix:?}",
+        );
+    }
+}
+
+#[test]
 fn safety_predicates_precede_rules_and_bypass() {
     let tool = PermissionPattern::Exact("write".into());
     let target = PermissionPattern::Any;
