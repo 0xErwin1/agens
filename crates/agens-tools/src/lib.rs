@@ -1312,6 +1312,7 @@ pub enum McpResponse {
 pub enum McpTransportError {
     Cancelled,
     TimedOut,
+    RetriesExhausted,
     Protocol(String),
     Transport(String),
 }
@@ -1321,6 +1322,7 @@ impl fmt::Display for McpTransportError {
         match self {
             Self::Cancelled => formatter.write_str("mcp operation cancelled"),
             Self::TimedOut => formatter.write_str("mcp operation timed out"),
+            Self::RetriesExhausted => formatter.write_str("mcp HTTP retries exhausted"),
             Self::Protocol(message) => write!(formatter, "mcp protocol error: {message}"),
             Self::Transport(message) => write!(formatter, "mcp transport error: {message}"),
         }
@@ -1463,6 +1465,14 @@ impl McpOperationContext {
     pub fn remaining(&self) -> Result<Duration, McpTransportError> {
         self.check()?;
         Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub(crate) fn cancellation_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancellation)
+    }
+
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
     }
 }
 
@@ -1925,7 +1935,9 @@ fn mcp_call_error(error: McpTransportError) -> Error {
     match error {
         McpTransportError::Cancelled => Error::Cancelled,
         McpTransportError::TimedOut => Error::Tool("mcp operation timed out".into()),
-        McpTransportError::Protocol(_) | McpTransportError::Transport(_) => {
+        McpTransportError::RetriesExhausted
+        | McpTransportError::Protocol(_)
+        | McpTransportError::Transport(_) => {
             Error::Extension("mcp tool infrastructure failure".into())
         }
     }

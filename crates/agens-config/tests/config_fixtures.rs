@@ -120,6 +120,24 @@ fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
 }
 
 #[test]
+fn mcp_http_retries_default_to_zero_and_reject_values_above_eight() {
+    let mut document = parse_toml_document(
+        r#"[mcp.docs]
+transport = "http"
+url = "https://mcp.example.test/mcp""#,
+    )
+    .expect("MCP fixture should parse");
+    let servers = mcp_servers(&document).expect("omitted retries should be valid");
+    assert_eq!(servers[0].max_retries, 0);
+
+    document["mcp"]["docs"]
+        .as_table_mut()
+        .unwrap()
+        .insert("max_retries".into(), toml::Value::Integer(9));
+    assert!(mcp_servers(&document).is_err());
+}
+
+#[test]
 fn mcp_server_config_debug_redacts_environment_values_and_arguments() {
     let config = McpServerConfig {
         name: "files".into(),

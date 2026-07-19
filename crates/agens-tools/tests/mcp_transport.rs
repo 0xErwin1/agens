@@ -811,15 +811,117 @@ fn http_and_sse_transports_send_json_rpc_requests() {
         )
         .unwrap();
 
-        let response = transport
-            .execute(
-                McpRequest::Initialize(initialize()),
-                &McpOperationContext::new(cancellation, Duration::from_secs(1)),
-            )
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let response = runtime
+            .block_on(async {
+                transport.execute(
+                    McpRequest::Initialize(initialize()),
+                    &McpOperationContext::new(cancellation, Duration::from_secs(1)),
+                )
+            })
             .unwrap();
 
         assert_eq!(response, initialized());
         server.join().unwrap();
         assert_eq!(attempts.load(Ordering::Acquire), expected_requests);
     }
+}
+
+#[test]
+fn http_transport_retries_only_transient_statuses_and_reports_exhaustion() {
+    for (status, reason, retries) in [
+        (408, "Request Timeout", true),
+        (429, "Too Many Requests", true),
+        (500, "Internal Server Error", true),
+        (400, "Bad Request", false),
+        (401, "Unauthorized", false),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let expected_attempts = usize::from(retries) + 1;
+        let server = thread::spawn(move || {
+            for _ in 0..expected_attempts {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                server_attempts.fetch_add(1, Ordering::AcqRel);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            }
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let mut transport =
+            McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+
+        let result = transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(cancellation, Duration::from_secs(1)),
+        );
+
+        if retries {
+            assert_eq!(result, Err(McpTransportError::RetriesExhausted));
+        } else {
+            assert!(
+                matches!(result, Err(McpTransportError::Transport(_))),
+                "unexpected result: {result:?}"
+            );
+        }
+        server.join().unwrap();
+        assert_eq!(attempts.load(Ordering::Acquire), expected_attempts);
+    }
+}
+
+#[test]
+fn http_transport_rejects_responses_larger_than_one_mib() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let body = vec![b'x'; 1024 * 1024 + 1];
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+    });
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(cancellation, Duration::from_secs(1)),
+    );
+
+    assert_eq!(
+        result,
+        Err(McpTransportError::Protocol(
+            "MCP HTTP response exceeds limit".into()
+        ))
+    );
+    server.join().unwrap();
 }

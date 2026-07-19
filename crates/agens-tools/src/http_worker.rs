@@ -33,6 +33,8 @@ pub enum HttpWorkerError {
     Startup,
     Panicked,
     Shutdown,
+    Transport,
+    ResponseTooLarge,
 }
 pub trait HttpWorkerOperation: Send + 'static {
     fn start(&mut self) -> Result<(), HttpWorkerError>;
@@ -188,6 +190,7 @@ fn run_worker(
     let startup = catch_unwind(AssertUnwindSafe(|| {
         operation.start()?;
         tokio::runtime::Builder::new_current_thread()
+            .enable_io()
             .enable_time()
             .build()
             .map_err(|_| HttpWorkerError::Startup)

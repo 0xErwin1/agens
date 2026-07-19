@@ -180,6 +180,7 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                 .get("max_retries")
                 .and_then(toml::Value::as_integer)
                 .and_then(|retries| u32::try_from(retries).ok())
+                .filter(|retries| *retries <= 8)
                 .ok_or_else(|| invalid_field(&path, "max_retries"))
                 .or_else(|_| {
                     if server.contains_key("max_retries") {
