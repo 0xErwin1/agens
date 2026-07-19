@@ -14,7 +14,9 @@ dependencies = [
  "agens-tui",
  "libc",
  "rusqlite",
+ "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
 ]

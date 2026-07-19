@@ -1,0 +1,13 @@
+{
+  "source": "https://models.dev",
+  "revision": "2026-07-10",
+  "models": [
+    { "id": "gpt-4o", "name": "GPT-4o", "context": 128000, "input_price": 2.5, "output_price": 10, "supported": true },
+    { "id": "gpt-4o-mini", "name": "GPT-4o mini", "context": 128000, "input_price": 0.15, "output_price": 0.6, "supported": true },
+    { "id": "gpt-4.1", "name": "GPT-4.1", "context": 1047576, "input_price": 2, "output_price": 8, "supported": true },
+    { "id": "gpt-4.1-mini", "name": "GPT-4.1 mini", "context": 1047576, "input_price": 0.4, "output_price": 1.6, "supported": true },
+    { "id": "gpt-4.1-nano", "name": "GPT-4.1 nano", "context": 1047576, "input_price": 0.1, "output_price": 0.4, "supported": true },
+    { "id": "o3", "name": "o3", "context": 200000, "input_price": 2, "output_price": 8, "supported": true },
+    { "id": "o4-mini", "name": "o4-mini", "context": 200000, "input_price": 1.1, "output_price": 4.4, "supported": true }
+  ]
+}

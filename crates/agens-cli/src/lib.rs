@@ -36,6 +36,8 @@ use agens_tools::{
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
+mod model_registry;
+
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
@@ -731,7 +733,9 @@ fn run_models(arguments: &[String]) -> Result<String, CliError> {
 
     match arguments {
         [command] if is_help(command) => Ok("Usage: agens models\n".to_owned()),
-        [] => Err(CliError::unavailable(UNAVAILABLE_MESSAGE)),
+        [] => model_registry::bundled_openai_models()
+            .map(|models| model_registry::format_models(&models))
+            .map_err(|_| CliError::unavailable("model registry is unavailable")),
         _ => Err(CliError::usage("models does not accept arguments")),
     }
 }
@@ -2069,6 +2073,111 @@ fn root_help() -> String {
 mod tests {
     use super::*;
     use agens_core::TurnState;
+
+    mod model_registry {
+        use super::*;
+
+        #[test]
+        fn parses_tolerant_snapshot_filters_and_sorts_models() {
+            let snapshot = br#"{
+                "source": "https://models.dev",
+                "revision": "test",
+                "models": [
+                    {"id":"z-model","name":"Z","context":4,"input_price":1.5,"output_price":2.5,"supported":true,"future":true},
+                    {"id":"a-model","supported":true},
+                    {"id":"unsupported","supported":false},
+                    {"name":"missing-id","supported":true}
+                ]
+            }"#;
+
+            let models = crate::model_registry::parse_models(snapshot).expect("snapshot parses");
+
+            assert_eq!(models.len(), 2);
+            assert_eq!(models[0].id, "a-model");
+            assert_eq!(models[0].name, None);
+            assert_eq!(models[0].context, None);
+            assert_eq!(models[0].input_price, None);
+            assert_eq!(models[0].output_price, None);
+            assert_eq!(models[1].id, "z-model");
+        }
+
+        #[test]
+        fn validates_bundled_snapshot_checksum_and_schema() {
+            let models =
+                crate::model_registry::bundled_openai_models().expect("bundled snapshot is valid");
+
+            assert_eq!(
+                crate::model_registry::bundled_snapshot_checksum(),
+                "75086c4979636664367c3031c023b20479fb66296b197fe612b2b624696b5984"
+            );
+            assert_eq!(
+                models.first().map(|model| model.id.as_str()),
+                Some("gpt-4.1")
+            );
+            assert_eq!(
+                models.last().map(|model| model.id.as_str()),
+                Some("o4-mini")
+            );
+        }
+
+        #[test]
+        fn rejects_snapshot_schema_without_a_model_collection() {
+            let result = crate::model_registry::parse_models(
+                br#"{"source":"https://models.dev","revision":"test"}"#,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn formats_four_columns_and_an_explicit_empty_result() {
+            let output = crate::model_registry::format_models(&[
+                crate::model_registry::ModelMetadata {
+                    id: "missing".to_owned(),
+                    name: None,
+                    context: None,
+                    input_price: None,
+                    output_price: Some(0.6),
+                },
+                crate::model_registry::ModelMetadata {
+                    id: "known".to_owned(),
+                    name: Some("Known".to_owned()),
+                    context: Some(128000),
+                    input_price: Some(2.5),
+                    output_price: Some(10.0),
+                },
+            ]);
+
+            assert_eq!(
+                output,
+                "ID\tNAME\tCONTEXT\tPRICE\nmissing\t-\t-\t-/$0.60\nknown\tKnown\t128000\t$2.50/$10.00\n"
+            );
+            assert_eq!(
+                crate::model_registry::format_models(&[]),
+                "No supported models.\n"
+            );
+        }
+
+        #[test]
+        fn models_command_uses_the_bundled_registry() {
+            let result = execute_strings(
+                vec!["models".to_owned()],
+                &CliDependencies::for_test(
+                    PathBuf::from("/workspace"),
+                    None,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                ),
+                &HeadlessTurnCancellation::new(),
+            );
+
+            assert_eq!(result.status, ExitStatus::Success);
+            assert_eq!(
+                result.stdout,
+                "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
+            );
+        }
+    }
 
     #[test]
     fn resumed_tui_session_adds_restored_context_to_the_next_prompt() {
