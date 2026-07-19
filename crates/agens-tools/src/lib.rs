@@ -37,8 +37,7 @@ use std::os::unix::process::CommandExt;
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
-const MAX_PROCESS_OUTPUT_METADATA: usize = 128;
-const MAX_CAPTURED_PROCESS_BYTES: usize = MAX_PROCESS_OUTPUT - MAX_PROCESS_OUTPUT_METADATA;
+const MAX_CAPTURED_PROCESS_BYTES: usize = MAX_PROCESS_OUTPUT - 128;
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
@@ -4421,31 +4420,101 @@ impl CappedOutput {
     }
 
     fn render(&self, exit_status: &str, detail: Option<&str>) -> String {
-        let mut output = String::from("[stdout]\n");
-        append_bash_stream(&mut output, &self.stdout);
+        let stdout = lossy_bash_stream(&self.stdout);
+        let stderr = lossy_bash_stream(&self.stderr);
+        let detail = detail
+            .map(|detail| format!("[{detail}]\n"))
+            .unwrap_or_default();
+        let exit_status = format!("[exit status: {exit_status}]\n");
+        let labels = "[stdout]\n[stderr]\n";
+        let marker = "[bash output truncated]\n";
+        let mut truncated = self.truncated;
+
+        if !truncated
+            && labels.len() + stdout.len() + stderr.len() + detail.len() + exit_status.len()
+                > MAX_PROCESS_OUTPUT
+        {
+            truncated = true;
+        }
+
+        let metadata_len =
+            labels.len() + detail.len() + exit_status.len() + usize::from(truncated) * marker.len();
+        let stream_budget = MAX_PROCESS_OUTPUT.saturating_sub(metadata_len);
+        let (stdout, stderr, streams_truncated) =
+            allocate_bash_streams(stdout, stderr, stream_budget);
+        truncated |= streams_truncated;
+
+        let mut output = String::with_capacity(MAX_PROCESS_OUTPUT);
+        output.push_str("[stdout]\n");
+        output.push_str(&stdout);
         output.push_str("[stderr]\n");
-        append_bash_stream(&mut output, &self.stderr);
-        if self.truncated {
-            output.push_str("[bash output truncated]\n");
+        output.push_str(&stderr);
+        if truncated {
+            output.push_str(marker);
         }
-        if let Some(detail) = detail {
-            output.push_str(&format!("[{detail}]\n"));
+        if !detail.is_empty() {
+            output.push_str(&detail);
         }
-        output.push_str(&format!("[exit status: {exit_status}]\n"));
-        output.truncate(output.floor_char_boundary(MAX_PROCESS_OUTPUT));
+        output.push_str(&exit_status);
+        debug_assert!(output.len() <= MAX_PROCESS_OUTPUT);
         output
     }
 }
 
-fn append_bash_stream(output: &mut String, bytes: &[u8]) {
+fn lossy_bash_stream(bytes: &[u8]) -> String {
     if bytes.is_empty() {
-        return;
+        return String::new();
     }
 
-    output.push_str(&String::from_utf8_lossy(bytes));
+    let mut output = String::from_utf8_lossy(bytes).into_owned();
     if !output.ends_with('\n') {
         output.push('\n');
     }
+    output
+}
+
+fn allocate_bash_streams(
+    stdout: String,
+    stderr: String,
+    stream_budget: usize,
+) -> (String, String, bool) {
+    let stdout_minimum = bash_stream_minimum_bytes(&stdout);
+    let stderr_minimum = bash_stream_minimum_bytes(&stderr);
+    let remaining = stream_budget.saturating_sub(stdout_minimum + stderr_minimum);
+    let half = remaining / 2;
+    let stdout_budget = stdout_minimum + (stdout.len() - stdout_minimum).min(half);
+    let stderr_budget = stderr_minimum + (stderr.len() - stderr_minimum).min(half);
+    let remaining = stream_budget - stdout_budget - stderr_budget;
+    let stdout_budget = stdout_budget + (stdout.len() - stdout_budget).min(remaining);
+    let truncated = stdout_budget < stdout.len() || stderr_budget < stderr.len();
+    let stdout = truncate_bash_stream(&stdout, stdout_budget);
+    let stderr = truncate_bash_stream(&stderr, stderr_budget);
+
+    (stdout, stderr, truncated)
+}
+
+fn bash_stream_minimum_bytes(stream: &str) -> usize {
+    match stream.chars().next() {
+        None => 0,
+        Some('\n') => 1,
+        Some(character) => character.len_utf8() + 1,
+    }
+}
+
+fn truncate_bash_stream(stream: &str, budget: usize) -> String {
+    if stream.len() <= budget {
+        return stream.to_owned();
+    }
+
+    let mut end = stream.floor_char_boundary(budget);
+    if stream[..end].ends_with('\n') {
+        return stream[..end].to_owned();
+    }
+
+    end = stream.floor_char_boundary(end.saturating_sub(1));
+    let mut truncated = stream[..end].to_owned();
+    truncated.push('\n');
+    truncated
 }
 
 fn render_bash_result(

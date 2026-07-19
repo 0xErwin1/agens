@@ -238,6 +238,23 @@ fn bash_combines_streams_with_a_deterministic_total_budget() {
 }
 
 #[test]
+fn bash_reserves_metadata_and_both_streams_after_lossy_utf8_expansion() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let command = "printf '\\377%.0s' {1..40000}; printf '\\376%.0s' {1..40000} >&2";
+    let output = tools.bash(BashInput::new(command)).unwrap();
+
+    assert!(!output.is_error);
+    assert!(output.content.starts_with("[stdout]\n\u{fffd}"));
+    assert!(output.content.contains("\n[stderr]\n\u{fffd}"));
+    assert!(output.content.contains("[bash output truncated]\n"));
+    assert!(output.content.ends_with("[exit status: 0]\n"));
+    assert!(output.content.len() <= 64 * 1024);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn catalog_preserves_the_bounded_bash_result_without_generic_truncation() {
     let root = project_root();
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
