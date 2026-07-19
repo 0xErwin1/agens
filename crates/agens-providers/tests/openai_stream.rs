@@ -152,6 +152,93 @@ fn rejects_invalid_resumed_message_history() {
 }
 
 #[test]
+fn rejects_incomplete_or_invalid_resumed_tool_history() {
+    let valid_call = || Message {
+        role: Role::Assistant,
+        parts: vec![MessagePart::ToolCall {
+            id: "call_weather".to_owned(),
+            name: "lookup_weather".to_owned(),
+            input: r#"{"city":"Paris"}"#.to_owned(),
+        }],
+    };
+    let valid_result = || Message {
+        role: Role::Tool,
+        parts: vec![MessagePart::ToolResult {
+            tool_call_id: "call_weather".to_owned(),
+            content: "sunny".to_owned(),
+            is_error: false,
+        }],
+    };
+
+    let cases = [
+        ("duplicate call ID", vec![valid_call(), valid_call()]),
+        (
+            "duplicate result ID",
+            vec![
+                valid_call(),
+                valid_result(),
+                Message {
+                    role: Role::Tool,
+                    parts: vec![MessagePart::ToolResult {
+                        tool_call_id: "call_weather".to_owned(),
+                        content: "still sunny".to_owned(),
+                        is_error: false,
+                    }],
+                },
+            ],
+        ),
+        (
+            "system reasoning part",
+            vec![Message {
+                role: Role::System,
+                parts: vec![MessagePart::Reasoning("hidden work".to_owned())],
+            }],
+        ),
+        (
+            "assistant result part",
+            vec![Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call_weather".to_owned(),
+                    content: "sunny".to_owned(),
+                    is_error: false,
+                }],
+            }],
+        ),
+        (
+            "tool text part",
+            vec![Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::Text("sunny".to_owned())],
+            }],
+        ),
+        (
+            "malformed tool JSON",
+            vec![Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "call_weather".to_owned(),
+                    name: "lookup_weather".to_owned(),
+                    input: "not json".to_owned(),
+                }],
+            }],
+        ),
+        ("orphan call", vec![valid_call()]),
+        ("orphan result", vec![valid_result()]),
+    ];
+
+    for (case, messages) in cases {
+        assert_eq!(
+            encode_openai_response_request_with_messages("gpt-5.6", &messages, &[]),
+            Err(Error::Provider(
+                "OpenAI request error: resumed history is invalid".to_owned()
+            )),
+            "{case} should fail closed"
+        );
+    }
+}
+
+#[test]
 fn function_tools_require_a_nonempty_name_description_and_object_root_schema() {
     for (name, description, parameters) in [
         ("", "Looks up weather.", json!({"type": "object"})),

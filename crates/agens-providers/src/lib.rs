@@ -1343,6 +1343,10 @@ pub fn encode_openai_response_request_with_messages(
         }
     }
 
+    if calls != results {
+        return Err(invalid_resumed_history());
+    }
+
     let mut request = serde_json::json!({
         "model": model,
         "input": input,
