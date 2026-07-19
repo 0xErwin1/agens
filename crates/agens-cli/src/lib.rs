@@ -31,8 +31,8 @@ use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
     AuthorizedToolCall, DispatchTool, McpHttpTransport, McpInitialize, McpLimits, McpRegistry,
     McpStdioTransport, McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools,
-    RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    PermissionPromptContext, RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher,
+    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
@@ -1350,12 +1350,14 @@ where
     let grants = grant_store
         .grants_for_project(&project)
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
+    let grants = Arc::new(Mutex::new(grants));
     let session = if request.dangerously_allow_all {
         PermissionSession::with_temporary_bypass()
     } else {
         PermissionSession::new()
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let mut provider = build_provider(model, request.prompt, provider_tools)?;
     if let Some(progress) = progress {
         provider = provider.with_progress_sink(Arc::clone(progress));
@@ -1365,13 +1367,15 @@ where
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let mut gate = ProductionPermissionGate::new(
         policy,
-        grants,
+        Arc::clone(&grants),
         session,
         project,
         Arc::clone(&tool_runtime),
         Arc::clone(&pending),
+        Arc::clone(&prompts),
     );
-    let mut resolver = ProductionPermissionResolver;
+    let mut resolver =
+        ProductionPermissionResolver::new(TtyPermissionPrompter, grant_store, grants, prompts);
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot = match request.max_iterations.or(bootstrap.max_iterations) {
         Some(max_iterations) => {
@@ -1619,24 +1623,28 @@ struct AllowedNativeCall {
 }
 
 type SharedToolDispatcher = Arc<Mutex<ToolDispatcher>>;
+type SharedProjectPermissionGrants = Arc<Mutex<Vec<agens_core::ProjectPermissionGrant>>>;
+type PendingPermissionPrompts = Arc<Mutex<BTreeMap<String, PermissionPromptContext>>>;
 
 struct ProductionPermissionGate {
     policy: PermissionPolicy,
-    grants: Vec<agens_core::ProjectPermissionGrant>,
+    grants: SharedProjectPermissionGrants,
     session: PermissionSession,
     project: String,
     dispatcher: SharedToolDispatcher,
     allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
+    prompts: PendingPermissionPrompts,
 }
 
 impl ProductionPermissionGate {
     fn new(
         policy: PermissionPolicy,
-        grants: Vec<agens_core::ProjectPermissionGrant>,
+        grants: SharedProjectPermissionGrants,
         session: PermissionSession,
         project: String,
         dispatcher: SharedToolDispatcher,
         allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
+        prompts: PendingPermissionPrompts,
     ) -> Self {
         Self {
             policy,
@@ -1645,6 +1653,7 @@ impl ProductionPermissionGate {
             project,
             dispatcher,
             allowed,
+            prompts,
         }
     }
 }
@@ -1656,57 +1665,182 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
-        let result = match self
-            .dispatcher
+        let result = self
+            .grants
             .lock()
             .map_err(|_| HeadlessTurnPortError::Permission)
-            .and_then(|dispatcher| {
-                dispatcher
-                    .evaluate(
-                        &self.policy,
-                        &self.grants,
-                        &self.session,
-                        ToolDispatchRequest::new(
-                            &self.project,
-                            &call.name,
-                            parse_tool_input(call)?,
-                        ),
-                    )
+            .and_then(|grants| {
+                self.dispatcher
+                    .lock()
                     .map_err(|_| HeadlessTurnPortError::Permission)
-            }) {
-            Ok(ToolEvaluationOutcome::Authorized(handle)) => self
-                .allowed
-                .lock()
-                .map_err(|_| HeadlessTurnPortError::Permission)
-                .map(|mut allowed| {
-                    allowed.insert(
-                        call.id.clone(),
-                        AllowedNativeCall {
-                            name: call.name.clone(),
-                            input: call.input.clone(),
-                            handle,
-                        },
-                    );
-                    PermissionDecision::Allow
-                }),
-            Ok(ToolEvaluationOutcome::Denied) => Ok(PermissionDecision::Deny),
-            Ok(ToolEvaluationOutcome::PromptRequired(_)) => Ok(PermissionDecision::Ask),
-            Err(error) => Err(error),
-        };
+                    .and_then(|dispatcher| {
+                        dispatcher
+                            .evaluate(
+                                &self.policy,
+                                &grants,
+                                &self.session,
+                                ToolDispatchRequest::new(
+                                    &self.project,
+                                    &call.name,
+                                    parse_tool_input(call)?,
+                                ),
+                            )
+                            .map_err(|_| HeadlessTurnPortError::Permission)
+                    })
+            })
+            .and_then(|outcome| match outcome {
+                ToolEvaluationOutcome::Authorized(handle) => self
+                    .allowed
+                    .lock()
+                    .map_err(|_| HeadlessTurnPortError::Permission)
+                    .map(|mut allowed| {
+                        allowed.insert(
+                            call.id.clone(),
+                            AllowedNativeCall {
+                                name: call.name.clone(),
+                                input: call.input.clone(),
+                                handle,
+                            },
+                        );
+                        PermissionDecision::Allow
+                    }),
+                ToolEvaluationOutcome::Denied => Ok(PermissionDecision::Deny),
+                ToolEvaluationOutcome::PromptRequired(context) => self
+                    .prompts
+                    .lock()
+                    .map_err(|_| HeadlessTurnPortError::Permission)
+                    .map(|mut prompts| {
+                        prompts.insert(call.id.clone(), context);
+                        PermissionDecision::Ask
+                    }),
+            });
         std::future::ready(result)
     }
 }
 
-struct ProductionPermissionResolver;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermissionPromptAnswer {
+    AllowOnce,
+    AllowAlways,
+    DenyOnce,
+    DenyAlways,
+    Cancel,
+}
 
-impl HeadlessPermissionResolver for ProductionPermissionResolver {
+trait PermissionPrompter: Send {
+    fn prompt(
+        &mut self,
+        context: &PermissionPromptContext,
+    ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError>;
+}
+
+struct TtyPermissionPrompter;
+
+impl PermissionPrompter for TtyPermissionPrompter {
+    fn prompt(
+        &mut self,
+        context: &PermissionPromptContext,
+    ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+        if !std::io::stdin().is_terminal() {
+            return Ok(PermissionPromptAnswer::DenyOnce);
+        }
+
+        eprint!("{}", render_permission_prompt(context));
+        std::io::stderr()
+            .flush()
+            .map_err(|_| HeadlessTurnPortError::Permission)?;
+
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|_| HeadlessTurnPortError::Permission)?;
+
+        Ok(parse_permission_prompt_answer(&answer).unwrap_or(PermissionPromptAnswer::DenyOnce))
+    }
+}
+
+struct ProductionPermissionResolver<P> {
+    prompt: P,
+    grant_store: PermissionGrantStore,
+    grants: SharedProjectPermissionGrants,
+    prompts: PendingPermissionPrompts,
+}
+
+impl<P> ProductionPermissionResolver<P> {
+    fn new(
+        prompt: P,
+        grant_store: PermissionGrantStore,
+        grants: SharedProjectPermissionGrants,
+        prompts: PendingPermissionPrompts,
+    ) -> Self {
+        Self {
+            prompt,
+            grant_store,
+            grants,
+            prompts,
+        }
+    }
+}
+
+impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionResolver<P> {
     fn resolve(
         &mut self,
-        _call: &HeadlessToolCall,
-        _cancellation: &HeadlessTurnCancellation,
+        call: &HeadlessToolCall,
+        cancellation: &HeadlessTurnCancellation,
     ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
     {
-        std::future::ready(Ok(PermissionDecision::Ask))
+        let result = (|| {
+            if cancellation.is_cancelled() {
+                return Err(HeadlessTurnPortError::Cancelled);
+            }
+            if cancellation.is_expired() {
+                return Err(HeadlessTurnPortError::TimedOut);
+            }
+
+            let context = self
+                .prompts
+                .lock()
+                .map_err(|_| HeadlessTurnPortError::Permission)?
+                .remove(&call.id)
+                .ok_or(HeadlessTurnPortError::Permission)?;
+            let answer = self.prompt.prompt(&context)?;
+
+            if cancellation.is_cancelled() || answer == PermissionPromptAnswer::Cancel {
+                return Err(HeadlessTurnPortError::Cancelled);
+            }
+            if cancellation.is_expired() {
+                return Err(HeadlessTurnPortError::TimedOut);
+            }
+
+            let decision = match answer {
+                PermissionPromptAnswer::AllowOnce => PermissionDecision::Allow,
+                PermissionPromptAnswer::DenyOnce => PermissionDecision::Deny,
+                PermissionPromptAnswer::AllowAlways | PermissionPromptAnswer::DenyAlways => {
+                    let decision = if answer == PermissionPromptAnswer::AllowAlways {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
+                    };
+                    let grant = agens_core::ProjectPermissionGrant::new(
+                        context.project_id,
+                        decision,
+                        PermissionPattern::Exact(context.qualified_tool_name),
+                        PermissionPattern::Exact(context.target_identifier),
+                    );
+                    self.grant_store
+                        .append_grants(std::slice::from_ref(&grant))
+                        .map_err(|_| HeadlessTurnPortError::Permission)?;
+                    self.grants
+                        .lock()
+                        .map_err(|_| HeadlessTurnPortError::Permission)?
+                        .push(grant);
+                    decision
+                }
+                PermissionPromptAnswer::Cancel => unreachable!(),
+            };
+            Ok(decision)
+        })();
+        std::future::ready(result)
     }
 }
 
@@ -1828,6 +1962,70 @@ fn configured_tool_name(name: &str) -> Result<String, CliError> {
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {
     serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Permission)
+}
+
+fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAnswer> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "a" | "allow-once" | "allow once" => Some(PermissionPromptAnswer::AllowOnce),
+        "always" | "allow-always" | "allow always" => Some(PermissionPromptAnswer::AllowAlways),
+        "d" | "deny-once" | "deny once" => Some(PermissionPromptAnswer::DenyOnce),
+        "deny-always" | "deny always" => Some(PermissionPromptAnswer::DenyAlways),
+        "c" | "cancel" => Some(PermissionPromptAnswer::Cancel),
+        _ => None,
+    }
+}
+
+fn render_permission_prompt(context: &PermissionPromptContext) -> String {
+    format!(
+        "Permission required for {} ({:?})\nTarget: {}\n[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
+        context.qualified_tool_name,
+        context.access,
+        sanitize_permission_target(&context.qualified_tool_name, &context.target_identifier),
+    )
+}
+
+fn sanitize_permission_target(tool: &str, target: &str) -> String {
+    if tool == "native::bash" {
+        return "[command redacted]".into();
+    }
+
+    if let Some((scheme, remainder)) = target.split_once("://") {
+        let (authority, path) = remainder.split_once('/').unwrap_or((remainder, ""));
+        let authority = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
+        let query = if query.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", redact_query_values(query))
+        };
+        return format!("{scheme}://{authority}/{path}{query}");
+    }
+
+    if contains_sensitive_marker(target) {
+        return "[redacted]".into();
+    }
+
+    target.to_owned()
+}
+
+fn contains_sensitive_marker(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    ["api_key", "authorization", "password", "secret", "token"]
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+fn redact_query_values(query: &str) -> String {
+    query
+        .split('&')
+        .map(|pair| {
+            pair.split_once('=')
+                .map_or_else(|| pair.to_owned(), |(key, _)| format!("{key}=[redacted]"))
+        })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> Result<T, CliError> {
@@ -2223,5 +2421,136 @@ mod tests {
         });
 
         assert_eq!(request.system_prompt, None);
+    }
+
+    #[test]
+    fn permission_prompt_answers_preserve_choices_and_redact_sensitive_targets() {
+        for (input, expected) in [
+            ("a", PermissionPromptAnswer::AllowOnce),
+            ("always", PermissionPromptAnswer::AllowAlways),
+            ("d", PermissionPromptAnswer::DenyOnce),
+            ("deny-always", PermissionPromptAnswer::DenyAlways),
+            ("cancel", PermissionPromptAnswer::Cancel),
+        ] {
+            assert_eq!(parse_permission_prompt_answer(input), Some(expected));
+        }
+        assert_eq!(parse_permission_prompt_answer("unknown"), None);
+
+        let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
+            project_id: "project".into(),
+            qualified_tool_name: "native::webfetch".into(),
+            target_identifier:
+                "https://user:SENTINEL_URL_SECRET@example.test/path?token=SENTINEL_TOKEN".into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: "permission policy requires confirmation".into(),
+        });
+
+        assert!(prompt.contains("native::webfetch"));
+        assert!(prompt.contains("https://example.test/path?token=[redacted]"));
+        assert!(!prompt.contains("SENTINEL_URL_SECRET"));
+        assert!(!prompt.contains("SENTINEL_TOKEN"));
+    }
+
+    #[test]
+    fn permission_resolver_persists_only_always_answers_and_cancels_without_a_decision() {
+        struct FixedPrompt(PermissionPromptAnswer);
+
+        impl PermissionPrompter for FixedPrompt {
+            fn prompt(
+                &mut self,
+                _: &PermissionPromptContext,
+            ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+                Ok(self.0)
+            }
+        }
+
+        fn resolve_ready(
+            resolver: &mut impl HeadlessPermissionResolver,
+            call: &HeadlessToolCall,
+        ) -> Result<PermissionDecision, HeadlessTurnPortError> {
+            let cancellation = HeadlessTurnCancellation::new();
+            let mut future = std::pin::pin!(resolver.resolve(call, &cancellation));
+            let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+            match future.as_mut().poll(context) {
+                std::task::Poll::Ready(result) => result,
+                std::task::Poll::Pending => {
+                    panic!("production resolver must complete synchronously")
+                }
+            }
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("agens-permission-resolver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+        let call = HeadlessToolCall {
+            id: "call".into(),
+            name: "native::read".into(),
+            input: r#"{"path":"notes.md"}"#.into(),
+        };
+        let context = PermissionPromptContext {
+            project_id: "project".into(),
+            qualified_tool_name: "native::read".into(),
+            target_identifier: "notes.md".into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: "permission policy requires confirmation".into(),
+        };
+
+        for (answer, expected, persisted) in [
+            (
+                PermissionPromptAnswer::AllowOnce,
+                Ok(PermissionDecision::Allow),
+                0,
+            ),
+            (
+                PermissionPromptAnswer::DenyOnce,
+                Ok(PermissionDecision::Deny),
+                0,
+            ),
+            (
+                PermissionPromptAnswer::AllowAlways,
+                Ok(PermissionDecision::Allow),
+                1,
+            ),
+            (
+                PermissionPromptAnswer::DenyAlways,
+                Ok(PermissionDecision::Deny),
+                2,
+            ),
+            (
+                PermissionPromptAnswer::Cancel,
+                Err(HeadlessTurnPortError::Cancelled),
+                2,
+            ),
+        ] {
+            prompts
+                .lock()
+                .expect("prompt lock should be available")
+                .insert(call.id.clone(), context.clone());
+            let store = PermissionGrantStore::open(&directory).expect("grant store should open");
+            let mut resolver = ProductionPermissionResolver::new(
+                FixedPrompt(answer),
+                store,
+                Arc::clone(&grants),
+                Arc::clone(&prompts),
+            );
+
+            assert_eq!(resolve_ready(&mut resolver, &call), expected);
+            assert_eq!(
+                grants.lock().expect("grant lock should be available").len(),
+                persisted
+            );
+        }
+
+        let stored = PermissionGrantStore::open(&directory)
+            .expect("grant store should reopen")
+            .grants_for_project("project")
+            .expect("project grants should load");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].decision, PermissionDecision::Allow);
+        assert_eq!(stored[1].decision, PermissionDecision::Deny);
+        std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
     }
 }
