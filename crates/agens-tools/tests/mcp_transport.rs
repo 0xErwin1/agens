@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
     McpCallResult, McpClient, McpContentBlock, McpHttpTransport, McpInitialize,
     McpInitializeResult, McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest,
@@ -188,6 +189,35 @@ fn tool(name: &str, read_only: Option<bool>) -> McpToolDefinition {
 
 fn page(tools: Vec<McpToolDefinition>, next_cursor: Option<&str>) -> McpResponse {
     McpResponse::ToolsListed(McpToolsPage::new(tools, next_cursor.map(str::to_owned)))
+}
+
+fn accept_http_request(listener: &TcpListener) -> (TcpStream, String) {
+    let (stream, _) = listener.accept().unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut headers = String::new();
+
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        headers.push_str(&line);
+        if line == "\r\n" {
+            return (stream, headers);
+        }
+    }
+}
+
+fn respond(stream: &mut TcpStream, status: &str, body: &[u8], extra_headers: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra_headers}\r\n",
+        body.len()
+    )
+    .unwrap();
+    stream.write_all(body).unwrap();
+}
+
+fn initialized_body() -> Vec<u8> {
+    br#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}}"#.to_vec()
 }
 
 #[test]
@@ -923,5 +953,174 @@ fn http_transport_rejects_responses_larger_than_one_mib() {
             "MCP HTTP response exceeds limit".into()
         ))
     );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_cancels_a_live_headless_turn_after_request_admission() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (admitted, admission) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let (_stream, _) = accept_http_request(&listener);
+        admitted.send(()).unwrap();
+        thread::sleep(Duration::from_secs(1));
+    });
+    let cancellation = HeadlessTurnCancellation::with_deadline(Duration::from_secs(2));
+    let context = McpOperationContext::from_headless_adapter(cancellation.adapter_view());
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (result_sender, result_receiver) = mpsc::sync_channel(1);
+
+    thread::spawn(move || {
+        result_sender
+            .send(runtime.block_on(async {
+                transport.execute(McpRequest::Initialize(initialize()), &context)
+            }))
+            .unwrap();
+    });
+    admission.recv_timeout(Duration::from_secs(1)).unwrap();
+    cancellation.cancel();
+
+    assert_eq!(
+        result_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap(),
+        Err(McpTransportError::Cancelled)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_shares_one_deadline_across_retries_and_retries_network_failures() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_http_request(&listener);
+        respond(&mut first, "500 Internal Server Error", b"", "");
+        let (_second, _) = accept_http_request(&listener);
+        thread::sleep(Duration::from_secs(1));
+    });
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+    let start = Instant::now();
+
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(cancellation, Duration::from_millis(50)),
+        ),
+        Err(McpTransportError::TimedOut)
+    );
+    assert!(start.elapsed() < Duration::from_millis(250));
+    server.join().unwrap();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+        ),
+        Err(McpTransportError::RetriesExhausted)
+    );
+}
+
+#[test]
+fn http_transport_never_retries_protocol_errors_and_accepts_exactly_one_mib() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_http_request(&listener);
+        respond(&mut stream, "200 OK", b"not json", "");
+        thread::sleep(Duration::from_millis(100));
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 1).unwrap();
+    assert!(matches!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+        ),
+        Err(McpTransportError::Protocol(_))
+    ));
+    server.join().unwrap();
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_http_request(&listener);
+        let mut body = initialized_body();
+        body.extend(std::iter::repeat_n(b' ', 1024 * 1024 - body.len()));
+        respond(
+            &mut stream,
+            "200 OK",
+            &body,
+            "Content-Type: application/json\r\n",
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+        ),
+        Ok(initialized())
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_refuses_redirects_without_leaking_sensitive_headers() {
+    let redirect = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let redirect_address = redirect.local_addr().unwrap();
+    let origin = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, headers) = accept_http_request(&origin);
+        assert!(headers.contains("authorization: SENTINEL_SECRET\r\n"));
+        respond(
+            &mut stream,
+            "302 Found",
+            b"",
+            &format!("Location: http://{redirect_address}/other\r\n"),
+        );
+        thread::sleep(Duration::from_millis(100));
+        redirect.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(redirect.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    });
+    let mut transport = McpHttpTransport::new(
+        format!("http://{origin_address}/mcp"),
+        [("authorization".into(), "SENTINEL_SECRET".into())].into(),
+        1,
+    )
+    .unwrap();
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+    );
+
+    assert_eq!(
+        result,
+        Err(McpTransportError::Transport(
+            "MCP HTTP redirect refused".into()
+        ))
+    );
+    assert!(!result.unwrap_err().to_string().contains("SENTINEL_SECRET"));
     server.join().unwrap();
 }

@@ -13,6 +13,7 @@ use std::{
 };
 pub type HttpWorkerFuture =
     Pin<Box<dyn Future<Output = Result<HttpResponse, HttpWorkerError>> + Send>>;
+pub type HttpWorkerCancellationProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpRequest {
     pub method: String,
@@ -43,7 +44,7 @@ pub trait HttpWorkerOperation: Send + 'static {
 }
 struct Command {
     request: HttpRequest,
-    cancellation: Arc<AtomicBool>,
+    cancellation: HttpWorkerCancellationProbe,
     deadline: Instant,
     result: SyncSender<Result<HttpResponse, HttpWorkerError>>,
 }
@@ -102,7 +103,7 @@ impl HttpWorker {
     pub fn request(
         &self,
         request: HttpRequest,
-        cancellation: Arc<AtomicBool>,
+        cancellation: HttpWorkerCancellationProbe,
         deadline: Instant,
     ) -> Result<HttpResponse, HttpWorkerError> {
         if self.state.closing.load(Ordering::Acquire) {
@@ -248,7 +249,7 @@ fn run_worker(
 }
 async fn run_request(
     future: HttpWorkerFuture,
-    cancellation: &AtomicBool,
+    cancellation: &HttpWorkerCancellationProbe,
     deadline: Instant,
     state: &WorkerState,
 ) -> Result<HttpResponse, HttpWorkerError> {
@@ -258,7 +259,7 @@ async fn run_request(
         tokio::select! {
             result = &mut future => return result,
             _ = ticker.tick() => {
-                if cancellation.load(Ordering::Acquire) {
+                if cancellation() {
                     return Err(HttpWorkerError::Cancelled);
                 }
                 if Instant::now() >= deadline {
@@ -352,14 +353,22 @@ mod tests {
             let active_worker = Arc::clone(&worker);
             let active_cancellation = Arc::clone(&cancellation);
             let active = thread::spawn(move || {
-                active_worker.request(request(), active_cancellation, deadline)
+                active_worker.request(
+                    request(),
+                    Arc::new(move || active_cancellation.load(Ordering::Acquire)),
+                    deadline,
+                )
             });
             started_receiver
                 .recv_timeout(Duration::from_millis(250))
                 .unwrap();
             let (other_cancellation, other_deadline) = context(Duration::from_secs(1));
             assert_eq!(
-                worker.request(request(), other_cancellation, other_deadline),
+                worker.request(
+                    request(),
+                    Arc::new(move || other_cancellation.load(Ordering::Acquire)),
+                    other_deadline
+                ),
                 Err(HttpWorkerError::Busy)
             );
             if cancel {
@@ -422,7 +431,11 @@ mod tests {
         let (worker, _) = worker(1, Behavior::Panic, None);
         let (cancellation, deadline) = context(Duration::from_secs(1));
         assert_eq!(
-            worker.request(request(), cancellation, deadline),
+            worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline
+            ),
             Err(HttpWorkerError::Panicked)
         );
     }
@@ -435,7 +448,11 @@ mod tests {
             .unwrap();
         let result = runtime.block_on(async {
             let (cancellation, deadline) = context(Duration::from_secs(1));
-            response_worker.request(request(), cancellation, deadline)
+            response_worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline,
+            )
         });
         assert_eq!(result, Ok(response()));
         response_worker.close().unwrap();
@@ -454,8 +471,13 @@ mod tests {
 
         let (cancellation, deadline) = context(Duration::from_secs(1));
         let active_worker = Arc::clone(&worker);
-        let active =
-            thread::spawn(move || active_worker.request(request(), cancellation, deadline));
+        let active = thread::spawn(move || {
+            active_worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline,
+            )
+        });
         started_receiver
             .recv_timeout(Duration::from_millis(250))
             .unwrap();
@@ -465,7 +487,11 @@ mod tests {
         let queued_worker = Arc::clone(&worker);
         let queued = thread::spawn(move || {
             let (cancellation, deadline) = context(Duration::from_secs(1));
-            queued_worker.request(request(), cancellation, deadline)
+            queued_worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline,
+            )
         });
         queued_receiver
             .recv_timeout(Duration::from_millis(250))
@@ -476,7 +502,11 @@ mod tests {
         assert_eq!(queued.join().unwrap(), Err(HttpWorkerError::Shutdown));
         let (cancellation, deadline) = context(Duration::from_secs(1));
         assert_eq!(
-            worker.request(request(), cancellation, deadline),
+            worker.request(
+                request(),
+                Arc::new(move || cancellation.load(Ordering::Acquire)),
+                deadline
+            ),
             Err(HttpWorkerError::Shutdown)
         );
         assert_eq!(closes.load(Ordering::Acquire), 1);

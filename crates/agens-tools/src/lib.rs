@@ -1332,7 +1332,7 @@ impl fmt::Display for McpTransportError {
 impl std::error::Error for McpTransportError {}
 
 pub struct McpOperationContext {
-    cancellation: Arc<AtomicBool>,
+    cancellation: Option<Arc<AtomicBool>>,
     headless_cancellation: Option<HeadlessTurnCancellationAdapter>,
     deadline: Instant,
 }
@@ -1420,11 +1420,7 @@ impl ToolExecutionContext {
 
     fn mcp_context(&self) -> McpOperationContext {
         McpOperationContext {
-            cancellation: self
-                .cancellation
-                .as_ref()
-                .map(Arc::clone)
-                .unwrap_or_else(|| Arc::new(AtomicBool::new(self.is_cancelled()))),
+            cancellation: self.cancellation.as_ref().map(Arc::clone),
             headless_cancellation: self.headless_cancellation.clone(),
             deadline: self.deadline,
         }
@@ -1434,14 +1430,16 @@ impl ToolExecutionContext {
 impl McpOperationContext {
     pub fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
         Self {
-            cancellation,
+            cancellation: Some(cancellation),
             headless_cancellation: None,
             deadline: Instant::now() + timeout,
         }
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.load(Ordering::Acquire)
+        self.cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
             || self
                 .headless_cancellation
                 .as_ref()
@@ -1467,8 +1465,28 @@ impl McpOperationContext {
         Ok(self.deadline.saturating_duration_since(Instant::now()))
     }
 
-    pub(crate) fn cancellation_handle(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancellation)
+    pub fn from_headless_adapter(cancellation: HeadlessTurnCancellationAdapter) -> Self {
+        let deadline = cancellation
+            .deadline()
+            .unwrap_or_else(|| Instant::now() + DEFAULT_BASH_TIMEOUT);
+        Self {
+            cancellation: None,
+            headless_cancellation: Some(cancellation),
+            deadline,
+        }
+    }
+
+    pub(crate) fn cancellation_probe(&self) -> crate::http_worker::HttpWorkerCancellationProbe {
+        let cancellation = self.cancellation.as_ref().map(Arc::clone);
+        let headless_cancellation = self.headless_cancellation.clone();
+        Arc::new(move || {
+            cancellation
+                .as_ref()
+                .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+                || headless_cancellation
+                    .as_ref()
+                    .is_some_and(HeadlessTurnCancellationAdapter::is_cancelled)
+        })
     }
 
     pub(crate) fn deadline(&self) -> Instant {
@@ -2100,7 +2118,7 @@ impl<T: McpTransport> McpClient<T> {
             ));
         }
         let context = McpOperationContext {
-            cancellation: Arc::clone(&context.cancellation),
+            cancellation: context.cancellation.as_ref().map(Arc::clone),
             headless_cancellation: context.headless_cancellation.clone(),
             deadline: context.deadline.min(Instant::now() + self.timeouts.call),
         };

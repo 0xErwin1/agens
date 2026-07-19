@@ -91,7 +91,7 @@ impl McpHttpTransport {
                     headers: self.headers.clone(),
                     body: body.clone(),
                 },
-                context.cancellation_handle(),
+                context.cancellation_probe(),
                 context.deadline(),
             );
             let response = match response {
