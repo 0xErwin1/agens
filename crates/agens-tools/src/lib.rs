@@ -27,12 +27,17 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visi
 use serde_json::Value;
 
 mod agents;
+mod capabilities;
 mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
 mod stdio_mcp;
 
-pub use agents::{AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentShadow};
+pub use agents::{
+    AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
+    AgentShadow,
+};
+pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 
@@ -2535,6 +2540,21 @@ impl ToolDispatcher {
 
     pub fn canonical_identity(&self, alias: &str) -> Option<&ToolIdentity> {
         self.aliases.get(alias)
+    }
+
+    pub(crate) fn capability_snapshot(&self) -> capabilities::CapabilitySnapshot {
+        capabilities::CapabilitySnapshot {
+            identities: self
+                .tools
+                .keys()
+                .map(|identity| identity.0.clone())
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .map(|(alias, identity)| (alias.clone(), identity.0.clone()))
+                .collect(),
+        }
     }
 
     pub fn evaluate(

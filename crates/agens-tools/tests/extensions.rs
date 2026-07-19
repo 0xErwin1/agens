@@ -4,11 +4,16 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agens_core::{AgentDefinition, AgentMode};
+use agens_core::{
+    AgentDefinition, AgentMode, Error, PermissionDecision, PermissionPattern, PermissionRule,
+    ToolAccess,
+};
 use agens_tools::{
-    AgentCatalog,
+    AgentCatalog, AgentModelValidationError, AgentModelValidator, DispatchTool,
+    EffectiveCapabilitySet, ToolDispatcher, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
+use serde_json::Value;
 
 #[test]
 fn parses_scalar_and_list_frontmatter_without_changing_the_body() {
@@ -296,6 +301,140 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
     assert_eq!(model.system_prompt, "body");
     assert_eq!(model.permission_rules.len(), 1);
     assert_eq!(discovery.diagnostics().len(), 4);
+}
+
+#[test]
+fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        global.join("allowed.md"),
+        "---\nname: allowed\ndescription: allowed\nmode: primary\nmodel: supported\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(global.join("rejected.md"), "---\nname: rejected\ndescription: rejected\nmode: primary\nmodel: unsupported\n---\nbody\n").unwrap();
+
+    let discovery =
+        AgentCatalog::discover_with_model_validator(&[], &global, &project, &SupportedModels)
+            .unwrap();
+
+    assert!(discovery.catalog().agent("allowed").is_some());
+    assert!(discovery.catalog().agent("rejected").is_none());
+    assert_eq!(
+        discovery.diagnostics()[0].message(),
+        "agent model is unavailable"
+    );
+}
+
+#[test]
+fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::files_write", ToolAccess::Write, InertTool)
+        .unwrap();
+    let agent = agent_with_rules(vec![
+        PermissionRule::global(
+            PermissionDecision::Deny,
+            PermissionPattern::Exact("files_read".into()),
+            PermissionPattern::Any,
+        ),
+        PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::files_read".into()),
+            PermissionPattern::Any,
+        ),
+        PermissionRule::project(
+            "other",
+            PermissionDecision::Allow,
+            PermissionPattern::glob("*").unwrap(),
+            PermissionPattern::glob("project/*").unwrap(),
+        ),
+        PermissionRule::project(
+            "project",
+            PermissionDecision::Ask,
+            PermissionPattern::glob("*").unwrap(),
+            PermissionPattern::glob("project/*").unwrap(),
+        ),
+    ]);
+
+    let set = EffectiveCapabilitySet::from_agent(&agent, "project", &dispatcher);
+
+    assert_eq!(set.descriptors().len(), 2);
+    assert_eq!(set.descriptors()[0].decision(), PermissionDecision::Allow);
+    assert_eq!(set.descriptors()[1].decision(), PermissionDecision::Ask);
+    assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
+    assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
+}
+
+#[test]
+fn effective_capability_expansion_detects_only_declared_broadenings() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+    let deny = capability_set(&dispatcher, PermissionDecision::Deny);
+    let ask = capability_set(&dispatcher, PermissionDecision::Ask);
+    let allow = capability_set(&dispatcher, PermissionDecision::Allow);
+    let empty =
+        EffectiveCapabilitySet::from_agent(&agent_with_rules(vec![]), "project", &dispatcher);
+
+    assert!(allow.is_expansion_from(&ask));
+    assert!(allow.is_expansion_from(&deny));
+    assert!(empty.is_expansion_from(&deny));
+    assert!(!ask.is_expansion_from(&allow));
+    assert!(!deny.is_expansion_from(&ask));
+    assert!(!deny.is_expansion_from(&empty));
+}
+
+struct SupportedModels;
+
+impl AgentModelValidator for SupportedModels {
+    fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError> {
+        (model == "supported")
+            .then_some(())
+            .ok_or(AgentModelValidationError::Unavailable)
+    }
+}
+
+struct InertTool;
+
+impl DispatchTool for InertTool {
+    fn execute(&mut self, _: &ToolExecutionContext, _: Value) -> Result<ToolOutput, Error> {
+        Ok(ToolOutput::success("unused"))
+    }
+}
+
+fn agent_with_rules(permission_rules: Vec<PermissionRule>) -> AgentDefinition {
+    AgentDefinition {
+        name: "agent".into(),
+        description: "agent".into(),
+        mode: AgentMode::Primary,
+        model: None,
+        system_prompt: "body".into(),
+        permission_rules,
+        skills: vec![],
+    }
+}
+
+fn capability_set(
+    dispatcher: &ToolDispatcher,
+    decision: PermissionDecision,
+) -> EffectiveCapabilitySet {
+    EffectiveCapabilitySet::from_agent(
+        &agent_with_rules(vec![PermissionRule::global(
+            decision,
+            PermissionPattern::Exact("native::files_read".into()),
+            PermissionPattern::Any,
+        )]),
+        "project",
+        dispatcher,
+    )
 }
 
 fn write_agent(root: &std::path::Path, name: &str, description: &str, mode: &str) {

@@ -9,6 +9,23 @@ use agens_core::{
 
 use crate::markdown::{self, FrontmatterValue, MarkdownDocument};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentModelValidationError {
+    Unavailable,
+}
+
+pub trait AgentModelValidator {
+    fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError>;
+}
+
+struct AllowAllModels;
+
+impl AgentModelValidator for AllowAllModels {
+    fn validate_model(&self, _: &str) -> Result<(), AgentModelValidationError> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentCatalog {
     agents: Vec<AgentDefinition>,
@@ -22,10 +39,19 @@ impl AgentCatalog {
         global_root: &Path,
         project_root: &Path,
     ) -> Result<AgentDiscovery, String> {
+        Self::discover_with_model_validator(built_ins, global_root, project_root, &AllowAllModels)
+    }
+
+    pub fn discover_with_model_validator(
+        built_ins: &[AgentDefinition],
+        global_root: &Path,
+        project_root: &Path,
+        validator: &dyn AgentModelValidator,
+    ) -> Result<AgentDiscovery, String> {
         let mut discovery = AgentDiscovery::default();
-        load_built_ins(built_ins, &mut discovery);
-        load_root(global_root, &mut discovery)?;
-        load_root(project_root, &mut discovery)?;
+        load_built_ins(built_ins, validator, &mut discovery);
+        load_root(global_root, validator, &mut discovery)?;
+        load_root(project_root, validator, &mut discovery)?;
         Ok(discovery)
     }
 
@@ -110,14 +136,24 @@ impl AgentShadow {
     }
 }
 
-fn load_built_ins(built_ins: &[AgentDefinition], discovery: &mut AgentDiscovery) {
+fn load_built_ins(
+    built_ins: &[AgentDefinition],
+    validator: &dyn AgentModelValidator,
+    discovery: &mut AgentDiscovery,
+) {
     let mut names = BTreeMap::<String, usize>::new();
     for agent in built_ins {
         *names.entry(agent.name.clone()).or_default() += 1;
     }
     for agent in built_ins {
         let source = PathBuf::from(format!("<built-in:{}>", agent.name));
-        if names[&agent.name] != 1 || agent.validate().is_err() {
+        if names[&agent.name] != 1
+            || agent.validate().is_err()
+            || agent
+                .model
+                .as_deref()
+                .is_some_and(|model| validator.validate_model(model).is_err())
+        {
             discovery
                 .diagnostics
                 .push(diagnostic(source, "invalid or duplicate built-in agent"));
@@ -127,7 +163,11 @@ fn load_built_ins(built_ins: &[AgentDefinition], discovery: &mut AgentDiscovery)
     }
 }
 
-fn load_root(root: &Path, discovery: &mut AgentDiscovery) -> Result<(), String> {
+fn load_root(
+    root: &Path,
+    validator: &dyn AgentModelValidator,
+    discovery: &mut AgentDiscovery,
+) -> Result<(), String> {
     if std::fs::symlink_metadata(root)
         .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
     {
@@ -155,7 +195,7 @@ fn load_root(root: &Path, discovery: &mut AgentDiscovery) -> Result<(), String> 
     let mut accepted = 0;
     let mut definition_limit_reported = false;
     for (_, document) in candidates {
-        match parse_agent(&document) {
+        match parse_agent(&document, validator) {
             Ok(agent) => {
                 if accepted == markdown::MAX_MARKDOWN_DEFINITIONS {
                     if !definition_limit_reported {
@@ -187,7 +227,10 @@ fn load_root(root: &Path, discovery: &mut AgentDiscovery) -> Result<(), String> 
     Ok(())
 }
 
-fn parse_agent(document: &MarkdownDocument) -> Result<AgentDefinition, String> {
+fn parse_agent(
+    document: &MarkdownDocument,
+    validator: &dyn AgentModelValidator,
+) -> Result<AgentDefinition, String> {
     let field = |name| {
         document
             .parsed()
@@ -230,6 +273,11 @@ fn parse_agent(document: &MarkdownDocument) -> Result<AgentDefinition, String> {
     agent
         .validate()
         .map_err(|error| format!("invalid agent definition: {error:?}"))?;
+    if let Some(model) = agent.model.as_deref() {
+        validator
+            .validate_model(model)
+            .map_err(|_| "agent model is unavailable")?;
+    }
     Ok(agent)
 }
 
