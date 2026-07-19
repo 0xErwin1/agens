@@ -832,12 +832,7 @@ fn credentials_from_token(token: &Value) -> Result<ChatGptCredentials, LoginErro
     let id_token = required_token(token, "id_token")?;
     let access_token = required_token(token, "access_token")?;
     let refresh_token = required_token(token, "refresh_token")?;
-    let account_id = jwt_claim(id_token, ACCOUNT_ID_CLAIM)
-        .as_ref()
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or(LoginError::Authentication("token response is invalid"))?
-        .to_owned();
+    let account_id = account_id_from_id_token(id_token)?;
     let expires_at = jwt_claim(access_token, "exp")
         .as_ref()
         .and_then(Value::as_i64)
@@ -851,6 +846,33 @@ fn credentials_from_token(token: &Value) -> Result<ChatGptCredentials, LoginErro
         account_id,
         expires_at,
     })
+}
+
+pub fn account_id_from_id_token(id_token: &str) -> Result<String, LoginError> {
+    let claims =
+        jwt_payload(id_token).ok_or(LoginError::Authentication("token response is invalid"))?;
+    let account_id = claims
+        .get("chatgpt_account_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            claims
+                .get(ACCOUNT_ID_CLAIM)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            claims
+                .get("organizations")
+                .and_then(Value::as_array)
+                .and_then(|organizations| organizations.first())
+                .and_then(|organization| organization.get("id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or(LoginError::Authentication("token response is invalid"))?;
+
+    Ok(account_id.to_owned())
 }
 
 fn device_user_code_request(
@@ -1104,6 +1126,19 @@ fn required_token<'a>(token: &'a Value, field: &str) -> Result<&'a str, LoginErr
 }
 
 fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
+    let payload = jwt_payload(token)?;
+    let value = payload.get(claim)?;
+    match claim {
+        ACCOUNT_ID_CLAIM => value
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .map(|value| Value::String(value.to_owned())),
+        "exp" => value.as_i64().filter(|value| *value >= 0).map(Value::from),
+        _ => Some(value.clone()),
+    }
+}
+
+fn jwt_payload(token: &str) -> Option<Map<String, Value>> {
     let mut segments = token.split('.');
     let header = segments.next()?;
     let payload = segments.next()?;
@@ -1125,15 +1160,7 @@ fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
         return None;
     }
     let payload = serde_json::from_slice::<Value>(&bytes).ok()?;
-    let value = payload.as_object()?.get(claim)?;
-    match claim {
-        ACCOUNT_ID_CLAIM => value
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(|value| Value::String(value.to_owned())),
-        "exp" => value.as_i64().filter(|value| *value >= 0).map(Value::from),
-        _ => Some(value.clone()),
-    }
+    payload.as_object().cloned()
 }
 
 fn format_expiry(expiry: SystemTime) -> Option<String> {

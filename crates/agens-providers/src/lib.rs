@@ -554,11 +554,17 @@ impl ChatGptResponsesProvider {
             .get("refresh_token")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
+        let id_token = match body.get("id_token") {
+            Some(Value::String(id_token)) => Some(id_token.as_str()),
+            Some(_) => return Err(HeadlessTurnPortError::Authentication),
+            None => None,
+        };
 
-        persist_chatgpt_refresh(
+        persist_chatgpt_refresh_with_id_token(
             &self.credentials_path,
             access_token,
             refresh_token,
+            id_token,
             &expires_at,
         )
         .map_err(|_| HeadlessTurnPortError::Authentication)?;
@@ -1100,6 +1106,22 @@ pub fn persist_chatgpt_refresh(
     refresh_token: Option<&str>,
     expires_at: &str,
 ) -> Result<(), Error> {
+    persist_chatgpt_refresh_with_id_token(
+        credentials_path,
+        access_token,
+        refresh_token,
+        None,
+        expires_at,
+    )
+}
+
+pub fn persist_chatgpt_refresh_with_id_token(
+    credentials_path: &Path,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    id_token: Option<&str>,
+    expires_at: &str,
+) -> Result<(), Error> {
     if access_token.is_empty() || refresh_token.is_some_and(str::is_empty) {
         return Err(auth_error("refreshed credentials are incomplete"));
     }
@@ -1107,6 +1129,11 @@ pub fn persist_chatgpt_refresh(
     if parse_rfc3339_timestamp(expires_at).is_none() {
         return Err(auth_error("refreshed credentials are invalid"));
     }
+
+    let refreshed_account_id = id_token
+        .map(chatgpt_login::account_id_from_id_token)
+        .transpose()
+        .map_err(|_| auth_error("refreshed credentials are invalid"))?;
 
     let mut credentials = read_credentials(credentials_path)?;
     let entry = chatgpt_entry_mut(&mut credentials)?;
@@ -1134,6 +1161,10 @@ pub fn persist_chatgpt_refresh(
             "refresh_token".to_owned(),
             Value::String(refresh_token.to_owned()),
         );
+    }
+
+    if let Some(account_id) = refreshed_account_id {
+        entry.insert("account_id".to_owned(), Value::String(account_id));
     }
 
     let contents = serde_json::to_vec(&credentials)

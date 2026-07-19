@@ -12,10 +12,11 @@ use std::os::unix::fs::MetadataExt;
 
 use agens_providers::chatgpt_login::{
     ChatGptCredentials, ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
-    LoginError, authorization_url, device_code_login, device_code_login_with_progress,
-    generate_pkce, generate_state, login, upsert_chatgpt_credentials, upsert_provider_entry,
-    upsert_provider_entry_with_deadline,
+    LoginError, account_id_from_id_token, authorization_url, device_code_login,
+    device_code_login_with_progress, generate_pkce, generate_state, login,
+    upsert_chatgpt_credentials, upsert_provider_entry, upsert_provider_entry_with_deadline,
 };
+use agens_providers::persist_chatgpt_refresh_with_id_token;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fs4::fs_std::FileExt;
@@ -67,6 +68,113 @@ fn authorization_url_uses_the_codex_pkce_contract_without_workspace_selection() 
         Some(&"true".to_owned())
     );
     assert!(!query.contains_key("allowed_workspace_id"));
+}
+
+#[test]
+fn account_id_from_id_token_uses_the_documented_claim_order() {
+    let all_claims = jwt(json!({
+        "chatgpt_account_id": "top-level",
+        "https://api.openai.com/auth.chatgpt_account_id": "namespaced",
+        "organizations": [{"id": "organization"}],
+    }));
+    let namespaced_and_organization = jwt(json!({
+        "https://api.openai.com/auth.chatgpt_account_id": "namespaced",
+        "organizations": [{"id": "organization"}],
+    }));
+    let organization_only = jwt(json!({"organizations": [{"id": "organization"}]}));
+
+    assert_eq!(
+        account_id_from_id_token(&all_claims),
+        Ok("top-level".to_owned())
+    );
+    assert_eq!(
+        account_id_from_id_token(&namespaced_and_organization),
+        Ok("namespaced".to_owned())
+    );
+    assert_eq!(
+        account_id_from_id_token(&organization_only),
+        Ok("organization".to_owned())
+    );
+}
+
+#[test]
+fn account_id_from_id_token_rejects_unusable_tokens_without_echoing_them() {
+    for token in [
+        "private-not-a-jwt".to_owned(),
+        jwt(json!({"chatgpt_account_id": ""})),
+        jwt(json!({"organizations": [{}]})),
+    ] {
+        let error = account_id_from_id_token(&token)
+            .expect_err("an ID token without a usable account claim must fail")
+            .to_string();
+
+        assert_eq!(
+            error,
+            "ChatGPT authentication required: token response is invalid"
+        );
+        assert!(!error.contains(&token));
+    }
+}
+
+#[test]
+fn account_id_refresh_derives_new_id_or_retains_the_stored_id_without_an_id_token() {
+    let directory = temporary_directory("account-id-refresh");
+    let path = directory.join("auth.json");
+    fs::write(
+        &path,
+        r#"{"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"stored-account","expires_at":"2026-07-17T11:00:00Z"}}"#,
+    )
+    .expect("credentials should be written");
+    let original = fs::read(&path).expect("credentials should be readable");
+
+    let error = persist_chatgpt_refresh_with_id_token(
+        &path,
+        "new-access",
+        Some("new-refresh"),
+        Some("private-malformed-id-token"),
+        "2026-07-17T13:00:00Z",
+    )
+    .expect_err("a malformed refresh ID token must fail before persistence");
+    assert_eq!(
+        error.to_string(),
+        "auth: ChatGPT authentication required: refreshed credentials are invalid"
+    );
+    assert!(!error.to_string().contains("private-malformed-id-token"));
+    assert_eq!(
+        fs::read(&path).expect("credentials should remain readable"),
+        original
+    );
+
+    let new_id_token = jwt(json!({"organizations": [{"id": "refreshed-account"}]}));
+    persist_chatgpt_refresh_with_id_token(
+        &path,
+        "new-access",
+        Some("new-refresh"),
+        Some(&new_id_token),
+        "2026-07-17T13:00:00Z",
+    )
+    .expect("a refresh ID token should replace the account ID");
+
+    persist_chatgpt_refresh_with_id_token(
+        &path,
+        "newer-access",
+        None,
+        None,
+        "2026-07-17T14:00:00Z",
+    )
+    .expect("a refresh without an ID token should preserve the account ID");
+
+    let persisted: Value =
+        serde_json::from_slice(&fs::read(&path).expect("credentials should be readable"))
+            .expect("credentials should remain JSON");
+    assert_eq!(
+        persisted["openai-chatgpt"]["account_id"],
+        "refreshed-account"
+    );
+    assert_eq!(persisted["openai-chatgpt"]["access_token"], "newer-access");
+    assert_eq!(persisted["openai-chatgpt"]["refresh_token"], "new-refresh");
+
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
 #[test]
