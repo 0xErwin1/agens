@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Install Nix
-        uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342
 
       - name: Run canonical gate
         run: nix develop --no-pure-eval -c just verify
