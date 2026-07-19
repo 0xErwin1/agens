@@ -1594,6 +1594,21 @@ impl McpServerReport {
 pub struct McpRegistry {
     tools: BTreeMap<String, RemoteToolMetadata>,
     clients: BTreeMap<String, Box<dyn McpCallable>>,
+    configured: BTreeMap<String, ConfiguredMcpServer>,
+    diagnostics: BTreeMap<String, McpServerDiagnostic>,
+    attempted: std::collections::BTreeSet<String>,
+    closed: bool,
+}
+
+pub struct McpServerDiagnostic {
+    pub server_name: String,
+    pub message: String,
+}
+
+struct ConfiguredMcpServer {
+    factory: Box<dyn FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send>,
+    timeouts: McpTimeouts,
+    limits: McpLimits,
 }
 
 impl McpRegistry {
@@ -1617,6 +1632,75 @@ impl McpRegistry {
         self.tools.values().collect()
     }
 
+    pub fn diagnostics(&self) -> Vec<&McpServerDiagnostic> {
+        self.diagnostics.values().collect()
+    }
+
+    pub fn configure_server<F>(
+        &mut self,
+        server_name: &str,
+        factory: F,
+        timeouts: McpTimeouts,
+        limits: McpLimits,
+    ) -> Result<(), McpTransportError>
+    where
+        F: FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send + 'static,
+    {
+        validate_server_name(server_name)?;
+        self.configured.insert(
+            server_name.into(),
+            ConfiguredMcpServer {
+                factory: Box::new(factory),
+                timeouts,
+                limits,
+            },
+        );
+        self.attempted.remove(server_name);
+        Ok(())
+    }
+
+    pub fn discover_server(&mut self, server_name: &str) -> McpServerReport {
+        if self.closed {
+            return self.failed(server_name);
+        }
+        if self.attempted.contains(server_name) {
+            if let Some(diagnostic) = self.diagnostics.get(server_name) {
+                return McpServerReport::Failed {
+                    server_name: diagnostic.server_name.clone(),
+                    message: diagnostic.message.clone(),
+                };
+            }
+            return McpServerReport::loaded(
+                server_name,
+                self.tools
+                    .values()
+                    .filter(|tool| tool.server_name == server_name)
+                    .count(),
+            );
+        }
+        self.attempted.insert(server_name.into());
+        self.discover_or_reload(server_name)
+    }
+
+    pub fn reload_server(&mut self, server_name: &str) -> McpServerReport {
+        if self.closed {
+            return self.failed(server_name);
+        }
+        self.attempted.insert(server_name.into());
+        self.discover_or_reload(server_name)
+    }
+
+    pub fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.tools.clear();
+        for (_, mut client) in std::mem::take(&mut self.clients) {
+            client.close();
+        }
+    }
+
     pub fn load_server<T: McpTransport + 'static>(
         &mut self,
         server_name: &str,
@@ -1626,7 +1710,7 @@ impl McpRegistry {
         limits: McpLimits,
         cancellation: Arc<AtomicBool>,
     ) -> McpServerReport {
-        match load_server_client(
+        let report = match load_server_client(
             server_name,
             transport,
             initialize.clone(),
@@ -1644,7 +1728,7 @@ impl McpRegistry {
                     client.close();
                     return McpServerReport::Failed {
                         server_name: server_name.into(),
-                        message: "mcp server load failed".into(),
+                        message: "mcp server load failed; reload to retry".into(),
                     };
                 }
 
@@ -1664,7 +1748,9 @@ impl McpRegistry {
                 server_name: server_name.into(),
                 message: sanitized_mcp_load_error(&error).into(),
             },
-        }
+        };
+        self.record_report(&report);
+        report
     }
 
     pub fn load_servers<T: McpTransport + 'static>(
@@ -1696,15 +1782,87 @@ impl McpRegistry {
         arguments: Value,
         context: &ToolExecutionContext,
     ) -> Result<ToolOutput, Error> {
+        if !self.tools.contains_key(qualified_name)
+            && let Some((server_name, _)) = qualified_name.split_once("::")
+            && self.configured.contains_key(server_name)
+        {
+            let _ = self.discover_server(server_name);
+        }
         let metadata = self
             .tools
             .get(qualified_name)
+            .cloned()
             .ok_or_else(|| Error::Tool("unknown MCP tool".into()))?;
         let client = self
             .clients
             .get_mut(&metadata.server_name)
             .ok_or_else(|| Error::Tool("unavailable MCP tool".into()))?;
         client.call(&metadata.tool_name, arguments, context)
+    }
+
+    fn discover_or_reload(&mut self, server_name: &str) -> McpServerReport {
+        let Some(configured) = self.configured.get_mut(server_name) else {
+            return self.failed(server_name);
+        };
+        let timeouts = configured.timeouts;
+        let limits = configured.limits;
+        let transport = (configured.factory)();
+        let report = match transport {
+            Ok(transport) => self.load_server(
+                server_name,
+                transport,
+                &McpInitialize::new(
+                    "2025-06-18",
+                    Value::Object(Default::default()),
+                    "agens",
+                    "0.1.0",
+                ),
+                timeouts,
+                limits,
+                Arc::new(AtomicBool::new(false)),
+            ),
+            Err(error) => McpServerReport::Failed {
+                server_name: server_name.into(),
+                message: sanitized_mcp_load_error(&error).into(),
+            },
+        };
+        self.record_report(&report);
+        report
+    }
+
+    fn failed(&mut self, server_name: &str) -> McpServerReport {
+        let report = McpServerReport::Failed {
+            server_name: server_name.into(),
+            message: "mcp server is unavailable".into(),
+        };
+        self.record_report(&report);
+        report
+    }
+
+    fn record_report(&mut self, report: &McpServerReport) {
+        match report {
+            McpServerReport::Loaded { server_name, .. } => {
+                self.diagnostics.remove(server_name);
+            }
+            McpServerReport::Failed {
+                server_name,
+                message,
+            } => {
+                self.diagnostics.insert(
+                    server_name.clone(),
+                    McpServerDiagnostic {
+                        server_name: server_name.clone(),
+                        message: message.clone(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+impl Drop for McpRegistry {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -1717,6 +1875,28 @@ trait McpCallable: Send {
     ) -> Result<ToolOutput, Error>;
 
     fn close(&mut self);
+}
+
+impl McpTransport for Box<dyn McpTransport> {
+    fn execute(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<McpResponse, McpTransportError> {
+        (**self).execute(request, context)
+    }
+
+    fn notify(
+        &mut self,
+        request: McpRequest,
+        context: &McpOperationContext,
+    ) -> Result<(), McpTransportError> {
+        (**self).notify(request, context)
+    }
+
+    fn close(&mut self, context: &McpOperationContext) -> Result<(), McpTransportError> {
+        (**self).close(context)
+    }
 }
 
 impl<T: McpTransport> McpCallable for McpClient<T> {
@@ -1746,7 +1926,7 @@ fn mcp_call_error(error: McpTransportError) -> Error {
 }
 
 fn sanitized_mcp_load_error(_: &McpTransportError) -> &'static str {
-    "mcp server load failed"
+    "mcp server load failed; reload to retry"
 }
 
 fn load_server_client<T: McpTransport>(

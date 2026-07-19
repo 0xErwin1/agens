@@ -29,10 +29,10 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
-    AuthorizedToolCall, DispatchTool, McpHttpTransport, McpInitialize, McpLimits, McpRegistry,
-    McpStdioTransport, McpStdioTransportConfig, McpTimeouts, NativeToolCatalog, NativeTools,
-    PermissionPromptContext, RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher,
-    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    AuthorizedToolCall, DispatchTool, McpHttpTransport, McpLimits, McpRegistry, McpStdioTransport,
+    McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
+    NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
@@ -1502,8 +1502,6 @@ fn production_tool_runtime(
 
 fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
     let mut registry = McpRegistry::new();
-    let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let initialize = McpInitialize::new("2025-06-18", serde_json::json!({}), "agens", "0.1.0");
 
     for server in &bootstrap.mcp_servers {
         if server.disabled {
@@ -1514,52 +1512,45 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
             continue;
         };
 
-        match server.transport {
-            McpTransport::Stdio => {
-                let Ok(transport) = McpStdioTransport::spawn(McpStdioTransportConfig {
-                    command: server
-                        .command
-                        .clone()
-                        .expect("stdio MCP commands are validated"),
-                    args: server.args.clone(),
-                    environment: server.environment.clone(),
-                    project_root: server
-                        .cwd
-                        .clone()
-                        .unwrap_or_else(|| project_root.to_path_buf()),
-                }) else {
-                    continue;
-                };
-                let _ = registry.load_server(
-                    &server.name,
-                    transport,
-                    &initialize,
-                    timeouts,
-                    McpLimits::default(),
-                    Arc::clone(&cancellation),
-                );
-            }
-            McpTransport::Http | McpTransport::Sse => {
-                let Ok(transport) = McpHttpTransport::new(
-                    server.url.clone().expect("HTTP MCP URLs are validated"),
-                    server.headers.clone(),
-                    server.max_retries,
-                ) else {
-                    continue;
-                };
-                let _ = registry.load_server(
-                    &server.name,
-                    transport,
-                    &initialize,
-                    timeouts,
-                    McpLimits::default(),
-                    Arc::clone(&cancellation),
-                );
-            }
-        }
+        let server = server.clone();
+        let name = server.name.clone();
+        let project_root = project_root.to_path_buf();
+        let _ = registry.configure_server(
+            &name,
+            move || configured_mcp_transport(&server, &project_root),
+            timeouts,
+            McpLimits::default(),
+        );
     }
 
     registry
+}
+
+fn configured_mcp_transport(
+    server: &agens_config::McpServerConfig,
+    project_root: &Path,
+) -> Result<Box<dyn McpTransportPort>, McpTransportError> {
+    match server.transport {
+        McpTransport::Stdio => McpStdioTransport::spawn(McpStdioTransportConfig {
+            command: server
+                .command
+                .clone()
+                .expect("stdio MCP commands are validated"),
+            args: server.args.clone(),
+            environment: server.environment.clone(),
+            project_root: server
+                .cwd
+                .clone()
+                .unwrap_or_else(|| project_root.to_path_buf()),
+        })
+        .map(|transport| Box::new(transport) as Box<dyn McpTransportPort>),
+        McpTransport::Http | McpTransport::Sse => McpHttpTransport::new(
+            server.url.clone().expect("HTTP MCP URLs are validated"),
+            server.headers.clone(),
+            server.max_retries,
+        )
+        .map(|transport| Box::new(transport) as Box<dyn McpTransportPort>),
+    }
 }
 
 fn native_model_tool_name(qualified_name: &str) -> Result<String, CliError> {

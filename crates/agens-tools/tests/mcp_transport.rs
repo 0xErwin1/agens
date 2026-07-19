@@ -451,6 +451,93 @@ fn registry_enumerates_metadata_and_atomically_replaces_a_reloaded_server() {
 }
 
 #[test]
+fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let first_closed = Arc::new(AtomicBool::new(false));
+    let first_closed_factory = Arc::clone(&first_closed);
+    let replacement_closed = Arc::new(AtomicBool::new(false));
+    let replacement_closed_factory = Arc::clone(&replacement_closed);
+    let attempts_factory = Arc::clone(&attempts);
+    let mut registry = McpRegistry::new();
+
+    registry
+        .configure_server(
+            "files",
+            move || match attempts_factory.fetch_add(1, Ordering::AcqRel) {
+                0 => {
+                    let transport = LocalTransport {
+                        responses: Arc::new(Mutex::new(
+                            [
+                                Ok(initialized()),
+                                Ok(page(vec![tool("old", Some(true))], None)),
+                            ]
+                            .into(),
+                        )),
+                        requests: Arc::new(Mutex::new(Vec::new())),
+                        closed: Arc::clone(&first_closed_factory),
+                        cancelled: Arc::new(AtomicUsize::new(0)),
+                        delay: Duration::ZERO,
+                    };
+                    Ok(Box::new(transport) as Box<dyn McpTransport>)
+                }
+                1 => Err(McpTransportError::Transport(
+                    "SENTINEL_SECRET reload failed".into(),
+                )),
+                _ => Ok(Box::new(LocalTransport {
+                    responses: Arc::new(Mutex::new(
+                        [
+                            Ok(initialized()),
+                            Ok(page(vec![tool("new", Some(true))], None)),
+                        ]
+                        .into(),
+                    )),
+                    requests: Arc::new(Mutex::new(Vec::new())),
+                    closed: Arc::clone(&replacement_closed_factory),
+                    cancelled: Arc::new(AtomicUsize::new(0)),
+                    delay: Duration::ZERO,
+                }) as Box<dyn McpTransport>),
+            },
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+
+    assert_eq!(attempts.load(Ordering::Acquire), 0);
+    assert!(registry.tools().is_empty());
+    assert_eq!(
+        registry.discover_server("files"),
+        McpServerReport::loaded("files", 1)
+    );
+    assert_eq!(attempts.load(Ordering::Acquire), 1);
+    assert!(registry.tool("files::old").is_some());
+
+    assert!(registry.reload_server("files").is_failed());
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
+    assert!(registry.tool("files::old").is_some());
+    assert_eq!(registry.diagnostics().len(), 1);
+    assert!(
+        !registry.diagnostics()[0]
+            .message
+            .contains("SENTINEL_SECRET")
+    );
+    assert!(registry.discover_server("files").is_failed());
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
+
+    assert_eq!(
+        registry.reload_server("files"),
+        McpServerReport::loaded("files", 1)
+    );
+    assert_eq!(attempts.load(Ordering::Acquire), 3);
+    assert!(registry.tool("files::old").is_none());
+    assert!(registry.tool("files::new").is_some());
+    assert!(first_closed.load(Ordering::Acquire));
+
+    registry.close();
+    registry.close();
+    assert!(replacement_closed.load(Ordering::Acquire));
+}
+
+#[test]
 fn timeout_and_cancellation_preserve_primary_result_despite_cleanup_error_and_suppress_late_success()
  {
     #[derive(Clone)]
