@@ -1644,6 +1644,14 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
             "ID\tEVENTS\n1\t10 event(s)\n",
             "{name}"
         );
+        assert!(
+            PermissionGrantStore::open(&data_directory)
+                .expect("grant store should open")
+                .grants_for_project(&project_root.display().to_string())
+                .expect("project grants should load")
+                .is_empty(),
+            "{name}: non-TTY denial must not persist a grant"
+        );
 
         server.join();
     }
@@ -1727,7 +1735,7 @@ fn production_binary_static_glob_denies_native_list_and_search_without_execution
 }
 
 #[test]
-fn production_binary_requires_permission_for_unrelated_static_list_and_search_targets() {
+fn production_binary_denies_unrelated_static_list_and_search_targets_and_continues() {
     for (name, tool, path, arguments, rule) in [
         (
             "list",
@@ -1755,10 +1763,19 @@ fn production_binary_requires_permission_for_unrelated_static_list_and_search_ta
         let protected = fixture_directory.join("protected.txt");
         std::fs::write(&protected, "must not be read").expect("fixture file should exist");
 
-        let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
-            required_body_fragments: vec![tool.to_owned()],
-            response: native_tool_call_response("call_ask", tool, arguments),
-        }]);
+        let server = ScriptedNativeOpenAiMockServer::start(vec![
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![tool.to_owned()],
+                response: native_tool_call_response("call_ask", tool, arguments),
+            },
+            ScriptedOpenAiResponse {
+                required_body_fragments: vec![
+                    "\"call_id\":\"call_ask\"".to_owned(),
+                    "\"output\":\"Tool execution failed\"".to_owned(),
+                ],
+                response: text_response("static ask denial handled"),
+            },
+        ]);
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -1777,19 +1794,31 @@ fn production_binary_requires_permission_for_unrelated_static_list_and_search_ta
             .output()
             .expect("production binary should execute");
 
-        assert_eq!(output.status.code(), Some(1), "{name}");
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
+        assert!(output.status.success(), "{name}");
         assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            "error: permission: permission approval is required\n",
+            String::from_utf8_lossy(&output.stdout),
+            "static ask denial handled\n",
             "{name}"
         );
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
         assert_eq!(
             std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
             "must not be read",
             "{name}"
         );
-        assert_no_saved_sessions(&project_root, &config_home);
+        assert_eq!(
+            String::from_utf8_lossy(
+                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                    .args(["sessions", "list"])
+                    .current_dir(&project_root)
+                    .env("AGENS_CONFIG_HOME", &config_home)
+                    .output()
+                    .expect("sessions command should execute")
+                    .stdout,
+            ),
+            "ID\tEVENTS\n1\t10 event(s)\n",
+            "{name}"
+        );
 
         server.join();
     }
@@ -1864,7 +1893,7 @@ fn production_binary_denies_native_read_without_side_effect_and_continues_safely
 }
 
 #[test]
-fn production_binary_returns_permission_required_without_dispatching_an_unresolved_native_call() {
+fn production_binary_denies_unresolved_native_call_without_dispatching_and_continues() {
     let temporary = TemporaryDirectory::new("production-native-ask");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -1873,14 +1902,24 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
     let protected = project_root.join("SENTINEL_UNRESOLVED_ASK.txt");
     std::fs::write(&protected, "must not be read").expect("protected fixture should exist");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
-        required_body_fragments: vec!["native::read".to_owned()],
-        response: native_tool_call_response(
-            "call_ask",
-            "native::read",
-            r#"{"path":"SENTINEL_UNRESOLVED_ASK.txt"}"#,
-        ),
-    }]);
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::read".to_owned()],
+            response: native_tool_call_response(
+                "call_ask",
+                "native::read",
+                r#"{"path":"SENTINEL_UNRESOLVED_ASK.txt"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"call_ask\"".to_owned(),
+                "\"output\":\"Tool execution failed\"".to_owned(),
+                "!SENTINEL_UNRESOLVED_ASK".to_owned(),
+            ],
+            response: text_response("native ask denial handled"),
+        },
+    ]);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -1899,12 +1938,12 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
         .output()
         .expect("production binary should execute");
 
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert!(output.status.success());
     assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: permission: permission approval is required\n"
+        String::from_utf8_lossy(&output.stdout),
+        "native ask denial handled\n"
     );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert_eq!(
         std::fs::read_to_string(&protected).expect("protected fixture should remain readable"),
         "must not be read"
@@ -1925,7 +1964,15 @@ fn production_binary_returns_permission_required_without_dispatching_an_unresolv
     assert!(sessions.status.success());
     assert_eq!(
         String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
+        "ID\tEVENTS\n1\t10 event(s)\n"
+    );
+    assert!(
+        PermissionGrantStore::open(&data_directory)
+            .expect("grant store should open")
+            .grants_for_project(&project_root.display().to_string())
+            .expect("project grants should load")
+            .is_empty(),
+        "non-TTY denial must not persist a grant"
     );
 
     server.join();
@@ -2821,15 +2868,15 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
             true,
         ),
         (
-            "write unresolved ask",
+            "write non-TTY ask denial",
             "files::second",
             None,
             r#"{}"#,
             vec![],
-            Some(1),
-            "",
+            Some(0),
+            "MCP permission handled\n",
             false,
-            false,
+            true,
         ),
         (
             "explicit deny",
