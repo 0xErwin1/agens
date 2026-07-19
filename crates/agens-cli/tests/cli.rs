@@ -324,6 +324,29 @@ fn command_boundaries_invoke_injected_headless_and_tui_services_without_network(
 }
 
 #[test]
+fn models_lists_the_bundled_snapshot_deterministically() {
+    let dependencies = CliDependencies::for_test(
+        PathBuf::from("/project"),
+        Some(PathBuf::from("/home/user")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+
+    let first = execute(["models"], &dependencies);
+    let second = execute(["models"], &dependencies);
+
+    assert_eq!(first.status, ExitStatus::Success);
+    assert_eq!(
+        first.stdout,
+        "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
+    );
+    assert_eq!(first.stderr, "");
+    assert_eq!(second.status, ExitStatus::Success);
+    assert_eq!(second.stdout, first.stdout);
+    assert_eq!(second.stderr, "");
+}
+
+#[test]
 fn unavailable_surfaces_fail_explicitly_without_claiming_success() {
     let dependencies = CliDependencies::for_test(
         PathBuf::from("/project"),
@@ -333,7 +356,6 @@ fn unavailable_surfaces_fail_explicitly_without_claiming_success() {
     );
 
     for arguments in [
-        ["models"].as_slice(),
         ["auth", "login"].as_slice(),
         ["sessions", "rm", "1"].as_slice(),
     ] {
