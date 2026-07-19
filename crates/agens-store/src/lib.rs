@@ -229,6 +229,7 @@ impl SessionStore {
                         SessionStoreError::operation("copy backup", &temporary_path, error)
                     })?;
             }
+            migration_fault("after-backup-step", &self.database_path)?;
             drop(destination);
             fs::File::open(&temporary_path)
                 .and_then(|file| file.sync_all())
@@ -247,6 +248,7 @@ impl SessionStore {
                     error,
                 ));
             }
+            migration_fault("after-backup-install", &self.database_path)?;
             let verification =
                 Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(|error| {
@@ -303,6 +305,7 @@ impl SessionStore {
                 .map_err(|error| {
                     SessionStoreError::operation("finalize backup", &backup_path, error)
                 })?;
+            migration_fault("after-backup-finalize", &self.database_path)?;
             fs::File::open(
                 self.database_path
                     .parent()
@@ -312,6 +315,7 @@ impl SessionStore {
             .map_err(|error| {
                 SessionStoreError::operation("fsync backup parent", &backup_path, error)
             })?;
+            migration_fault("after-backup-parent-fsync", &self.database_path)?;
 
             return Ok(backup_path);
         }
@@ -1078,17 +1082,37 @@ fn migrate_v1_on_open(
     create_legacy_archive_schema(&transaction, database_path)?;
     copy_legacy_turns(&transaction, database_path)?;
     copy_legacy_turn_events(&transaction, database_path)?;
+    migration_fault("during-mutation", database_path)?;
     validate_legacy_archive(&transaction, database_path)?;
     finalize_v2_migration(&transaction, database_path)?;
+    migration_fault("before-commit", database_path)?;
     transaction.commit().map_err(|error| {
         SessionStoreError::operation("commit v1 migration", database_path, error)
     })?;
+    migration_fault("after-commit-before-reopen", database_path)?;
 
     let reopened = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| {
             SessionStoreError::operation("reopen v2 migration", database_path, error)
         })?;
     validate_legacy_archive(&reopened, database_path)
+}
+
+fn migration_fault(point: &str, database_path: &Path) -> Result<(), SessionStoreError> {
+    let fault_path = PathBuf::from(format!("{}.migration-fault", database_path.display()));
+    let injected = fs::read_to_string(&fault_path)
+        .map(|value| value.trim() == point)
+        .unwrap_or(false);
+
+    if injected {
+        return Err(SessionStoreError::operation(
+            "inject migration fault",
+            database_path,
+            point,
+        ));
+    }
+
+    Ok(())
 }
 
 fn create_legacy_archive_schema(

@@ -14,6 +14,25 @@ use rusqlite::{Connection, OpenFlags};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
+struct MigrationFaultGuard {
+    path: std::path::PathBuf,
+}
+
+impl MigrationFaultGuard {
+    fn set(database: &std::path::Path, point: &str) -> Self {
+        let path = std::path::PathBuf::from(format!("{}.migration-fault", database.display()));
+        fs::write(&path, point).unwrap();
+
+        Self { path }
+    }
+}
+
+impl Drop for MigrationFaultGuard {
+    fn drop(&mut self) {
+        fs::remove_file(&self.path).unwrap();
+    }
+}
+
 fn data_directory() -> std::path::PathBuf {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
@@ -548,6 +567,98 @@ fn rejects_tampered_v1_before_destructive_finalization() {
         0
     );
     assert!(!directory.join("rust-sessions.db.v1.bak").exists());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn migration_faults_preserve_v1_or_recover_only_a_committed_v2() {
+    for (point, commits) in [
+        ("after-backup-step", false),
+        ("after-backup-finalize", false),
+        ("after-backup-install", false),
+        ("after-backup-parent-fsync", false),
+        ("during-mutation", false),
+        ("before-commit", false),
+        ("after-commit-before-reopen", true),
+    ] {
+        let directory = data_directory();
+        create_populated_wal_v1_fixture(&directory);
+        let database = directory.join("rust-sessions.db");
+        let source =
+            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let expected = v1_contents(&source);
+        drop(source);
+
+        let fault = MigrationFaultGuard::set(&database, point);
+        assert!(
+            SessionStore::open(&directory).is_err(),
+            "{point} must fail closed"
+        );
+        drop(fault);
+
+        let inspected = Connection::open(&database).unwrap();
+        let version = inspected
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        if commits {
+            assert_eq!(version, 2, "{point} may expose only a committed v2");
+            assert_eq!(archive_contents(&inspected), expected);
+            assert!(
+                inspected
+                    .query_row("SELECT count(*) FROM completed_turns", [], |row| row
+                        .get::<_, i64>(0))
+                    .is_err()
+            );
+        } else {
+            assert_eq!(version, 1, "{point} must roll back to v1");
+            assert_eq!(v1_contents(&inspected), expected);
+            assert_eq!(
+                inspected
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE name IN ('legacy_turns', 'legacy_turn_events')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+        drop(inspected);
+
+        let retried = SessionStore::open(&directory).unwrap();
+        let recovered = Connection::open(retried.database_path()).unwrap();
+        assert_eq!(
+            archive_contents(&recovered),
+            expected,
+            "{point} retry content"
+        );
+        drop(recovered);
+        drop(retried);
+        assert!(!directory.join("rust-sessions.db.v1.bak.2").exists());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn migration_retry_uses_a_new_backup_suffix_without_clobbering_collision() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+    let existing_backup = directory.join("rust-sessions.db.v1.bak");
+    fs::write(&existing_backup, "do not replace").unwrap();
+
+    let fault = MigrationFaultGuard::set(&directory.join("rust-sessions.db"), "before-commit");
+    assert!(SessionStore::open(&directory).is_err());
+    drop(fault);
+
+    SessionStore::open(&directory).unwrap();
+    assert_eq!(fs::read(&existing_backup).unwrap(), b"do not replace");
+    assert!(directory.join("rust-sessions.db.v1.bak.1").exists());
+    assert!(directory.join("rust-sessions.db.v1.bak.2").exists());
+
+    SessionStore::open(&directory).unwrap();
+    assert!(!directory.join("rust-sessions.db.v1.bak.3").exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
