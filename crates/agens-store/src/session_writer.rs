@@ -1,9 +1,200 @@
-use agens_core::{CompletedSessionTurn, MessagePart, Role, SessionMetadata};
-use rusqlite::{Transaction, TransactionBehavior, params};
+use agens_core::{CompletedSessionTurn, Message, MessagePart, Role, SessionMetadata};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{SessionStore, SessionStoreError};
 
+type PersistedPart = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSession {
+    pub metadata: SessionMetadata,
+    pub messages: Vec<Message>,
+}
+
 impl SessionStore {
+    pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable
+                 FROM sessions WHERE resumable = 1 ORDER BY updated_at DESC, id DESC",
+            )
+            .map_err(|error| SessionStoreError::operation("prepare session list", &self.database_path, error))?;
+        let sessions = statement
+            .query_map([], session_metadata)
+            .map_err(|error| {
+                SessionStoreError::operation("query session list", &self.database_path, error)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                SessionStoreError::operation("read session list", &self.database_path, error)
+            })?;
+
+        Ok(sessions)
+    }
+
+    pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {
+        let metadata = self
+            .connection
+            .query_row(
+                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable
+                 FROM sessions WHERE id = ?1 AND resumable = 1",
+                [id],
+                session_metadata,
+            )
+            .optional()
+            .map_err(|error| SessionStoreError::operation("load session", &self.database_path, error))?;
+        let Some(metadata) = metadata else {
+            let legacy = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM legacy_turns WHERE id = ?1)",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| {
+                    SessionStoreError::operation("check session", &self.database_path, error)
+                })?;
+            let reason = if legacy {
+                format!("legacy session {id} is non-resumable")
+            } else {
+                format!("unknown session {id}")
+            };
+            return Err(SessionStoreError::operation(
+                "load session",
+                &self.database_path,
+                reason,
+            ));
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error
+             FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id
+                 AND messages.sequence = message_parts.message_sequence
+             WHERE messages.session_id = ?1 ORDER BY messages.sequence, message_parts.sequence",
+        ).map_err(|error| SessionStoreError::operation("prepare session messages", &self.database_path, error))?;
+        let rows = statement
+            .query_map([id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<bool>>(8)?,
+                ))
+            })
+            .map_err(|error| {
+                SessionStoreError::operation("query session messages", &self.database_path, error)
+            })?;
+        let mut messages = Vec::new();
+        let mut sequence = None;
+        for row in rows {
+            let (message_sequence, role, kind, text, call_id, name, input, content, is_error) = row
+                .map_err(|error| {
+                    SessionStoreError::operation(
+                        "read session messages",
+                        &self.database_path,
+                        error,
+                    )
+                })?;
+            if sequence != Some(message_sequence) {
+                messages.push(Message {
+                    role: decode_role(&role, &self.database_path)?,
+                    parts: Vec::new(),
+                });
+                sequence = Some(message_sequence);
+            }
+            messages
+                .last_mut()
+                .expect("message inserted for part")
+                .parts
+                .push(decode_part(
+                    &kind,
+                    (text, call_id, name, input, content, is_error),
+                    &self.database_path,
+                )?);
+        }
+
+        Ok(StoredSession { metadata, messages })
+    }
+
+    pub fn update_session(&mut self, metadata: &SessionMetadata) -> Result<(), SessionStoreError> {
+        metadata.validate().map_err(|error| {
+            SessionStoreError::operation(
+                "validate session metadata",
+                &self.database_path,
+                format!("{error:?}"),
+            )
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation("start session update", &self.database_path, error)
+            })?;
+        let count = i64::try_from(metadata.completed_turn_count).map_err(|error| {
+            SessionStoreError::operation("validate session metadata", &self.database_path, error)
+        })?;
+        if transaction
+            .execute(
+                "UPDATE sessions SET title = ?1, active_agent = ?2, updated_at = ?3
+             WHERE id = ?4 AND project = ?5 AND created_at = ?6
+               AND completed_turn_count = ?7 AND resumable = ?8",
+                params![
+                    metadata.title,
+                    metadata.active_agent,
+                    metadata.updated_at,
+                    metadata.id,
+                    metadata.project,
+                    metadata.created_at,
+                    count,
+                    metadata.resumable
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("update session", &self.database_path, error)
+            })?
+            != 1
+        {
+            return Err(SessionStoreError::operation(
+                "update session",
+                &self.database_path,
+                "session metadata changed",
+            ));
+        }
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("commit session update", &self.database_path, error)
+        })
+    }
+
+    pub fn delete_session(&mut self, id: i64) -> Result<(), SessionStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation("start session delete", &self.database_path, error)
+            })?;
+        transaction
+            .execute("DELETE FROM sessions WHERE id = ?1", [id])
+            .and_then(|_| transaction.execute("DELETE FROM legacy_turns WHERE id = ?1", [id]))
+            .map_err(|error| {
+                SessionStoreError::operation("delete session", &self.database_path, error)
+            })?;
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("commit session delete", &self.database_path, error)
+        })
+    }
+
     pub fn persist_completed_session_turn(
         &mut self,
         metadata: &SessionMetadata,
@@ -167,4 +358,61 @@ fn encode_role(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }
+}
+
+fn session_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
+    let completed_turn_count = row.get::<_, i64>(6)?;
+
+    Ok(SessionMetadata {
+        id: row.get(0)?,
+        project: row.get(1)?,
+        title: row.get(2)?,
+        active_agent: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        completed_turn_count: u64::try_from(completed_turn_count)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, completed_turn_count))?,
+        resumable: row.get(7)?,
+    })
+}
+
+fn decode_role(role: &str, database_path: &std::path::Path) -> Result<Role, SessionStoreError> {
+    match role {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        _ => Err(SessionStoreError::operation(
+            "decode session message",
+            database_path,
+            "invalid role",
+        )),
+    }
+}
+
+fn decode_part(
+    kind: &str,
+    (text, call_id, name, input, content, is_error): PersistedPart,
+    database_path: &std::path::Path,
+) -> Result<MessagePart, SessionStoreError> {
+    let part = match kind {
+        "text" => text.map(MessagePart::Text),
+        "reasoning" => text.map(MessagePart::Reasoning),
+        "tool_call" => match (call_id, name, input) {
+            (Some(id), Some(name), Some(input)) => Some(MessagePart::ToolCall { id, name, input }),
+            _ => None,
+        },
+        "tool_result" => match (call_id, content, is_error) {
+            (Some(tool_call_id), Some(content), Some(is_error)) => Some(MessagePart::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            }),
+            _ => None,
+        },
+        _ => None,
+    };
+    part.ok_or_else(|| {
+        SessionStoreError::operation("decode session message part", database_path, "invalid part")
+    })
 }

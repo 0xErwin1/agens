@@ -364,3 +364,124 @@ fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
 
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn session_store_crud_round_trips_normalized_context() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 10,
+        project: "project".into(),
+        title: "original".into(),
+        active_agent: "primary".into(),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let messages = vec![
+        Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text("system".into())],
+        },
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("user".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::Reasoning("reasoning".into()),
+                MessagePart::ToolCall {
+                    id: "call".into(),
+                    name: "search".into(),
+                    input: r#"{"z":2,"a":1}"#.into(),
+                },
+            ],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "call".into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+        },
+    ];
+    let mut store = SessionStore::open(&directory).unwrap();
+    store
+        .persist_completed_session_turn(&metadata, &turn(messages.clone()))
+        .unwrap();
+    let updated = SessionMetadata {
+        title: "renamed".into(),
+        active_agent: "reviewer".into(),
+        updated_at: 30,
+        completed_turn_count: 1,
+        resumable: true,
+        ..metadata
+    };
+
+    store.update_session(&updated).unwrap();
+    assert_eq!(store.list_sessions().unwrap(), vec![updated.clone()]);
+    let mut expected_messages = messages;
+    let MessagePart::ToolCall { input, .. } = &mut expected_messages[2].parts[1] else {
+        panic!("expected tool call");
+    };
+    *input = r#"{"a":1,"z":2}"#.into();
+    assert_eq!(
+        store.load_session_for_resume(10).unwrap(),
+        agens_store::StoredSession {
+            metadata: updated.clone(),
+            messages: expected_messages,
+        }
+    );
+    drop(store);
+
+    let reopened = SessionStore::open(&directory).unwrap();
+    assert_eq!(reopened.list_sessions().unwrap(), vec![updated]);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn session_store_rejects_legacy_resume_and_delete_is_idempotent() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    Connection::open(store.database_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO legacy_turns(id, status, reason, source_event_count) VALUES (11, 'non_resumable', 'legacy', 0)",
+            [],
+        )
+        .unwrap();
+    assert!(store.load_session_for_resume(11).is_err());
+
+    let metadata = SessionMetadata {
+        id: 12,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    store
+        .persist_completed_session_turn(
+            &metadata,
+            &turn(vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("user".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("assistant".into())],
+                },
+            ]),
+        )
+        .unwrap();
+
+    store.delete_session(12).unwrap();
+    store.delete_session(12).unwrap();
+    assert!(store.list_sessions().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
