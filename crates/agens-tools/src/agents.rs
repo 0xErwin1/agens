@@ -133,7 +133,8 @@ fn load_root(root: &Path, discovery: &mut AgentDiscovery) -> Result<(), String> 
     {
         return Ok(());
     }
-    let root = markdown::load_root(root)?;
+    let root =
+        markdown::load_root_with_definition_limit(root, markdown::MAX_MARKDOWN_ROOT_ENTRIES)?;
     discovery.diagnostics.extend(
         root.diagnostics
             .into_iter()
@@ -151,9 +152,22 @@ fn load_root(root: &Path, discovery: &mut AgentDiscovery) -> Result<(), String> 
             ));
         }
     }
+    let mut accepted = 0;
+    let mut definition_limit_reported = false;
     for (_, document) in candidates {
         match parse_agent(&document) {
             Ok(agent) => {
+                if accepted == markdown::MAX_MARKDOWN_DEFINITIONS {
+                    if !definition_limit_reported {
+                        discovery.diagnostics.push(diagnostic(
+                            document.source().into(),
+                            "accepted agent definition limit exceeded",
+                        ));
+                        definition_limit_reported = true;
+                    }
+                    continue;
+                }
+                accepted += 1;
                 if let Some(previous) = discovery
                     .catalog
                     .insert(agent.clone(), document.source().into())

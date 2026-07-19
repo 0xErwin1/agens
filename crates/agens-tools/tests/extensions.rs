@@ -214,6 +214,48 @@ fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
 }
 
 #[test]
+fn isolates_semantically_invalid_agents_without_consuming_the_catalog_limit() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+
+    for index in 0..markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("invalid-{index:03}");
+        fs::write(
+            global.join(format!("{name}.md")),
+            format!("---\nname: {name}\nmode: primary\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    for index in 0..markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("valid-{index:03}");
+        write_agent(&global, &name, "valid", "primary");
+    }
+    write_agent(&global, "z-overflow", "overflow", "primary");
+    fs::write(
+        global.join("zz-invalid.md"),
+        "---\nname: zz-invalid\ndescription: invalid\nmode: unsupported\n---\nbody\n",
+    )
+    .unwrap();
+
+    let discovery = AgentCatalog::discover(&[], &global, &project).unwrap();
+
+    assert_eq!(discovery.catalog().primary_or_all().count(), 128);
+    assert!(discovery.catalog().agent("valid-127").is_some());
+    assert_eq!(discovery.diagnostics().len(), 130);
+    assert_eq!(
+        discovery.diagnostics()[128].message(),
+        "accepted agent definition limit exceeded"
+    );
+    assert_eq!(
+        discovery.diagnostics().last().unwrap().message(),
+        "agent mode must be primary, subagent, or all"
+    );
+}
+
+#[test]
 fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
     let temporary = TemporaryDirectory::new();
     let global = temporary.path.join("global");

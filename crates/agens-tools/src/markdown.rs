@@ -117,6 +117,13 @@ pub fn parse(contents: &str) -> Result<ParsedMarkdown, String> {
 }
 
 pub fn load_root(root: &Path) -> Result<MarkdownRoot, String> {
+    load_root_with_definition_limit(root, MAX_MARKDOWN_DEFINITIONS)
+}
+
+pub(crate) fn load_root_with_definition_limit(
+    root: &Path,
+    definition_limit: usize,
+) -> Result<MarkdownRoot, String> {
     let root_metadata =
         fs::symlink_metadata(root).map_err(|error| format!("cannot inspect root: {error}"))?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
@@ -137,13 +144,14 @@ pub fn load_root(root: &Path) -> Result<MarkdownRoot, String> {
             .push(diagnostic(&root, "root entry limit exceeded"));
     }
     let mut definition_limit_reported = false;
+    let definition_limit = definition_limit.min(MAX_MARKDOWN_ROOT_ENTRIES);
     for entry in entries.into_iter().take(MAX_MARKDOWN_ROOT_ENTRIES) {
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "md") {
             continue;
         }
         match load_file(&root, &path) {
-            Ok(document) if result.documents.len() < MAX_MARKDOWN_DEFINITIONS => {
+            Ok(document) if result.documents.len() < definition_limit => {
                 result.documents.push(document);
             }
             Ok(_) if !definition_limit_reported => {
