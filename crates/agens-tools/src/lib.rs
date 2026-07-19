@@ -19,6 +19,8 @@ use agens_core::{
     Error, HeadlessTurnCancellationAdapter, PermissionDecision, PermissionPolicy,
     PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use regex::RegexBuilder;
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
@@ -2500,6 +2502,53 @@ impl SearchInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrepInput {
+    pattern: String,
+    path: Option<PathBuf>,
+    file_glob: Option<String>,
+    case_insensitive: bool,
+}
+
+impl GrepInput {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            path: None,
+            file_glob: None,
+            case_insensitive: false,
+        }
+    }
+
+    pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_file_glob(mut self, file_glob: impl Into<String>) -> Self {
+        self.file_glob = Some(file_glob.into());
+        self
+    }
+
+    pub fn with_case_insensitive(mut self, case_insensitive: bool) -> Self {
+        self.case_insensitive = case_insensitive;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GlobInput {
+    pattern: String,
+}
+
+impl GlobInput {
+    pub fn new(pattern: impl Into<String>) -> Self {
+        Self {
+            pattern: pattern.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeToolLimits {
     pub max_list_entries: usize,
     pub max_search_entries: usize,
@@ -2734,7 +2783,7 @@ impl NativeTools {
         }
 
         let mut results = Vec::new();
-        let mut budget = SearchBudget::new(&self.limits);
+        let mut budget = SearchBudget::new(&self.limits, "search");
         if let Err(output) =
             self.search_directory(&path, &input.query, 0, &mut budget, &mut results)
         {
@@ -2742,6 +2791,129 @@ impl NativeTools {
         }
 
         Ok(ToolOutput::success(results.join("")))
+    }
+
+    pub fn grep(&self, input: GrepInput) -> Result<ToolOutput, Error> {
+        if input.pattern.is_empty() {
+            return Ok(ToolOutput::failure("grep: pattern is required"));
+        }
+        let regex = match RegexBuilder::new(&input.pattern)
+            .case_insensitive(input.case_insensitive)
+            .build()
+        {
+            Ok(regex) => regex,
+            Err(_) => return Ok(ToolOutput::failure("grep: invalid regex")),
+        };
+        let file_glob = match input.file_glob.as_deref() {
+            Some(pattern) => match build_glob_set(pattern, "grep") {
+                Ok(glob) => Some(glob),
+                Err(output) => return Ok(output),
+            },
+            None => None,
+        };
+        let directory = match input.path {
+            Some(path) => match self.resolve_existing(&path) {
+                Ok(path) => path,
+                Err(output) => return Ok(output),
+            },
+            None => self.project_root.clone(),
+        };
+        if !directory.is_dir() {
+            return Ok(ToolOutput::failure("grep: path is not a directory"));
+        }
+
+        let mut files = Vec::new();
+        let mut budget = SearchBudget::new(&self.limits, "grep");
+        if let Err(output) = self.collect_tool_files(&directory, 0, &mut budget, &mut files) {
+            return Ok(output);
+        }
+
+        let mut results = Vec::new();
+        for path in files {
+            if let Err(output) = budget.check_deadline() {
+                return Ok(output);
+            }
+            let relative = path
+                .strip_prefix(&self.project_root)
+                .map_err(|_| Error::Tool("path: outside project root".into()))?;
+            if file_glob
+                .as_ref()
+                .is_some_and(|glob| !glob.is_match(relative))
+            {
+                continue;
+            }
+            if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES) {
+                continue;
+            }
+            let content = match fs::read(&path) {
+                Ok(content) if !content.contains(&0) => content,
+                Ok(_) => continue,
+                Err(error) => return Ok(ToolOutput::failure(format!("grep: {error}"))),
+            };
+            let content = match std::str::from_utf8(&content) {
+                Ok(content) => content,
+                Err(_) => continue,
+            };
+            for (line, text) in content.lines().enumerate() {
+                if let Err(output) = budget.check_deadline() {
+                    return Ok(output);
+                }
+                if regex.is_match(text) {
+                    if results.len() == self.limits.max_search_results {
+                        results.push(format!(
+                            "[grep output truncated after {} results]\n",
+                            self.limits.max_search_results
+                        ));
+                        return Ok(ToolOutput::success(results.join("")));
+                    }
+                    results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
+                }
+            }
+        }
+
+        Ok(ToolOutput::success(results.join("")))
+    }
+
+    pub fn glob(&self, input: GlobInput) -> Result<ToolOutput, Error> {
+        if input.pattern.is_empty() {
+            return Ok(ToolOutput::failure("glob: pattern is required"));
+        }
+        let pattern = match build_glob_set(&input.pattern, "glob") {
+            Ok(pattern) => pattern,
+            Err(output) => return Ok(output),
+        };
+        let mut files = Vec::new();
+        let mut budget = SearchBudget::new(&self.limits, "glob");
+        if let Err(output) = self.collect_tool_files(&self.project_root, 0, &mut budget, &mut files)
+        {
+            return Ok(output);
+        }
+
+        let mut matches = files
+            .into_iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.project_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .filter(|path| pattern.is_match(path))
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        matches.sort();
+        let truncated = matches.len() > self.limits.max_list_entries;
+        matches.truncate(self.limits.max_list_entries);
+
+        let mut output = matches.join("\n");
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        if truncated {
+            output.push_str(&format!(
+                "[glob output truncated after {} entries]\n",
+                self.limits.max_list_entries
+            ));
+        }
+        Ok(ToolOutput::success(output))
     }
 
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
@@ -2926,6 +3098,51 @@ impl NativeTools {
         Ok(())
     }
 
+    fn collect_tool_files(
+        &self,
+        directory: &Path,
+        depth: usize,
+        budget: &mut SearchBudget,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<(), ToolOutput> {
+        let directory_entries = fs::read_dir(directory)
+            .map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
+        let mut entries = Vec::new();
+        for entry in directory_entries {
+            budget.consume_entry()?;
+            let entry =
+                entry.map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            budget.check_deadline()?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            if metadata.is_dir() {
+                let next_depth = depth + 1;
+                if next_depth > self.limits.max_search_depth {
+                    return Err(ToolOutput::failure(format!(
+                        "{}: traversal depth limit of {} exceeded",
+                        budget.tool, self.limits.max_search_depth
+                    )));
+                }
+                self.collect_tool_files(&path, next_depth, budget, files)?;
+            } else if metadata.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
     fn validate_relative(&self, path: &Path) -> Result<(), ToolOutput> {
         if path.as_os_str().is_empty() || path.is_absolute() {
             return Err(ToolOutput::failure(
@@ -2996,6 +3213,18 @@ impl NativeToolCatalog {
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["path","query"],"properties":{"path":{"type":"string"},"query":{"type":"string"}}}),
             ),
             native_metadata(
+                "native::grep",
+                "Search project files with a regular expression",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["pattern"],"properties":{"pattern":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string"},"case_insensitive":{"type":"boolean"}}}),
+            ),
+            native_metadata(
+                "native::glob",
+                "List project files matching a doublestar glob",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["pattern"],"properties":{"pattern":{"type":"string"}}}),
+            ),
+            native_metadata(
                 "native::bash",
                 "Run a bounded shell command in the project root",
                 ToolAccess::Write,
@@ -3049,6 +3278,22 @@ impl NativeToolCatalog {
             "native::search" => self
                 .tools
                 .search(SearchInput::new(string("path")?, string("query")?))?,
+            "native::grep" => {
+                let mut input = GrepInput::new(string("pattern")?);
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    input = input.with_path(path);
+                }
+                if let Some(glob) = arguments.get("glob").and_then(Value::as_str) {
+                    input = input.with_file_glob(glob);
+                }
+                if let Some(case_insensitive) =
+                    arguments.get("case_insensitive").and_then(Value::as_bool)
+                {
+                    input = input.with_case_insensitive(case_insensitive);
+                }
+                self.tools.grep(input)?
+            }
+            "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
             "native::bash" => self.tools.bash(
                 BashInput::new(string("command")?)
                     .with_timeout(context.remaining().unwrap_or_default())
@@ -3091,24 +3336,39 @@ fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
     Ok(())
 }
 
+fn build_glob_set(pattern: &str, tool: &str) -> Result<GlobSet, ToolOutput> {
+    let glob = Glob::new(pattern)
+        .map_err(|_| ToolOutput::failure(format!("{tool}: invalid glob pattern")))?;
+    let mut builder = GlobSetBuilder::new();
+    builder.add(glob);
+    builder
+        .build()
+        .map_err(|_| ToolOutput::failure(format!("{tool}: invalid glob pattern")))
+}
+
 struct SearchBudget {
     deadline: Instant,
     entries_seen: usize,
     max_entries: usize,
+    tool: &'static str,
 }
 
 impl SearchBudget {
-    fn new(limits: &NativeToolLimits) -> Self {
+    fn new(limits: &NativeToolLimits, tool: &'static str) -> Self {
         Self {
             deadline: Instant::now() + limits.operation_timeout,
             entries_seen: 0,
             max_entries: limits.max_search_entries,
+            tool,
         }
     }
 
     fn check_deadline(&self) -> Result<(), ToolOutput> {
         if Instant::now() >= self.deadline {
-            return Err(ToolOutput::failure("search: operation timed out"));
+            return Err(ToolOutput::failure(format!(
+                "{}: operation timed out",
+                self.tool
+            )));
         }
 
         Ok(())
@@ -3118,8 +3378,8 @@ impl SearchBudget {
         self.check_deadline()?;
         if self.entries_seen == self.max_entries {
             return Err(ToolOutput::failure(format!(
-                "search: entry limit of {} exceeded",
-                self.max_entries
+                "{}: entry limit of {} exceeded",
+                self.tool, self.max_entries
             )));
         }
 

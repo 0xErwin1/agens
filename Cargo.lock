@@ -66,7 +66,9 @@ version = "0.1.0"
 dependencies = [
  "agens-config",
  "agens-core",
+ "globset",
  "libc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

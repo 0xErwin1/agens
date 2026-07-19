@@ -9,8 +9,9 @@ use std::{
 };
 
 use agens_tools::{
-    BashInput, EditFileInput, ListDirectoryInput, NativeToolCatalog, NativeToolLimits, NativeTools,
-    ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput, WriteFileInput,
+    BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
+    NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
+    WriteFileInput,
 };
 use serde_json::json;
 
@@ -524,7 +525,7 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
     let root = project_root();
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
-    assert_eq!(metadata.len(), 6);
+    assert_eq!(metadata.len(), 8);
     assert!(metadata.iter().all(|tool| {
         tool.qualified_name.starts_with("native::")
             && tool.input_schema["type"] == "object"
@@ -546,5 +547,101 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
         .unwrap();
     assert_eq!(output, ToolOutput::failure("tool execution cancelled"));
     assert!(!output.content.contains("SECRET_SENTINEL"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn grep_uses_regex_filters_and_skips_binary_and_git_files() {
+    let root = project_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join(".git")).unwrap();
+    fs::write(root.join("src/main.rs"), "Needle\nneedle\n").unwrap();
+    fs::write(root.join("notes.txt"), "needle\n").unwrap();
+    fs::write(root.join(".git/config"), "needle\n").unwrap();
+    fs::write(root.join("binary.dat"), b"needle\0ignored").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools
+            .grep(
+                GrepInput::new("^needle$")
+                    .with_path(".")
+                    .with_file_glob("**/*.rs")
+                    .with_case_insensitive(true),
+            )
+            .unwrap(),
+        ToolOutput::success("src/main.rs:1:Needle\nsrc/main.rs:2:needle\n")
+    );
+    assert_eq!(
+        tools.grep(GrepInput::new("[")).unwrap(),
+        ToolOutput::failure("grep: invalid regex")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glob_lists_relative_doublestar_matches_and_reports_truncation() {
+    let root = project_root();
+    fs::create_dir_all(root.join("src/nested")).unwrap();
+    fs::write(root.join("src/main.rs"), "main").unwrap();
+    fs::write(root.join("src/nested/lib.rs"), "lib").unwrap();
+    let tools = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            max_list_entries: 1,
+            max_search_entries: 10,
+            max_search_results: 10,
+            max_search_depth: 32,
+            operation_timeout: Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.rs")).unwrap(),
+        ToolOutput::success("src/main.rs\n[glob output truncated after 1 entries]\n")
+    );
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.toml")).unwrap(),
+        ToolOutput::success("")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "needle\n").unwrap();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let metadata = NativeToolCatalog::metadata();
+
+    assert_eq!(metadata.len(), 8);
+    let grep = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::grep")
+        .expect("grep metadata");
+    assert_eq!(grep.input_schema["required"], json!(["pattern"]));
+    let glob = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::glob")
+        .expect("glob metadata");
+    assert_eq!(glob.input_schema["required"], json!(["pattern"]));
+
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+    assert_eq!(
+        catalog
+            .execute("native::grep", json!({"pattern": "needle"}), &context)
+            .unwrap(),
+        ToolOutput::success("notes.txt:1:needle\n")
+    );
+    assert_eq!(
+        catalog
+            .execute("native::glob", json!({"pattern": "**/*.txt"}), &context)
+            .unwrap(),
+        ToolOutput::success("notes.txt\n")
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
