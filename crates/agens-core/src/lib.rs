@@ -40,6 +40,160 @@ pub enum MessagePart {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMessage(Message);
+impl SessionMessage {
+    pub fn as_message(&self) -> &Message {
+        &self.0
+    }
+
+    pub fn into_message(self) -> Message {
+        self.0
+    }
+}
+
+impl TryFrom<Message> for SessionMessage {
+    type Error = SessionMessageError;
+
+    fn try_from(message: Message) -> Result<Self, Self::Error> {
+        if message.parts.is_empty() {
+            return Err(SessionMessageError::EmptyParts);
+        }
+
+        for part in &message.parts {
+            validate_session_message_part(message.role, part)?;
+        }
+
+        Ok(Self(message))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionMessageError {
+    EmptyParts,
+    EmptyPart,
+    PartNotAllowed { role: Role },
+}
+
+fn validate_session_message_part(
+    role: Role,
+    part: &MessagePart,
+) -> Result<(), SessionMessageError> {
+    let allowed = match role {
+        Role::System | Role::User => matches!(part, MessagePart::Text(_)),
+        Role::Assistant => matches!(
+            part,
+            MessagePart::Text(_) | MessagePart::Reasoning(_) | MessagePart::ToolCall { .. }
+        ),
+        Role::Tool => matches!(part, MessagePart::ToolResult { .. }),
+    };
+
+    if !allowed {
+        return Err(SessionMessageError::PartNotAllowed { role });
+    }
+
+    let nonempty = match part {
+        MessagePart::Text(text) | MessagePart::Reasoning(text) => !text.is_empty(),
+        MessagePart::ToolCall { id, name, input } => {
+            !id.is_empty() && !name.is_empty() && !input.is_empty()
+        }
+        MessagePart::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        } => !tool_call_id.is_empty() && !content.is_empty(),
+    };
+
+    nonempty.then_some(()).ok_or(SessionMessageError::EmptyPart)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedSessionTurn {
+    messages: Vec<Message>,
+}
+
+impl CompletedSessionTurn {
+    pub fn new(
+        user: SessionMessage,
+        system_reminder: Option<SessionMessage>,
+        assistants: Vec<SessionMessage>,
+        tools: Vec<SessionMessage>,
+    ) -> Result<Self, CompletedSessionTurnError> {
+        if user.as_message().role != Role::User
+            || system_reminder
+                .as_ref()
+                .is_some_and(|message| message.as_message().role != Role::System)
+            || assistants
+                .iter()
+                .any(|message| message.as_message().role != Role::Assistant)
+            || tools
+                .iter()
+                .any(|message| message.as_message().role != Role::Tool)
+        {
+            return Err(CompletedSessionTurnError::InvalidMessageOrder);
+        }
+
+        let mut messages = system_reminder
+            .into_iter()
+            .map(SessionMessage::into_message)
+            .collect::<Vec<_>>();
+        messages.push(user.into_message());
+        messages.extend(assistants.into_iter().map(SessionMessage::into_message));
+        messages.extend(tools.into_iter().map(SessionMessage::into_message));
+
+        Ok(Self { messages })
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletedSessionTurnError {
+    InvalidMessageOrder,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub id: i64,
+    pub project: String,
+    pub title: String,
+    pub active_agent: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_turn_count: u64,
+    pub resumable: bool,
+}
+
+impl SessionMetadata {
+    pub fn validate(&self) -> Result<(), SessionMetadataError> {
+        if self.id <= 0 {
+            return Err(SessionMetadataError::InvalidId);
+        }
+
+        if self.project.is_empty() {
+            return Err(SessionMetadataError::EmptyProject);
+        }
+
+        if !is_catalog_name(&self.active_agent) {
+            return Err(SessionMetadataError::InvalidActiveAgent);
+        }
+
+        (self.resumable == (self.completed_turn_count > 0))
+            .then_some(())
+            .ok_or(SessionMetadataError::InvalidResumability)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionMetadataError {
+    InvalidId,
+    EmptyProject,
+    InvalidActiveAgent,
+    InvalidResumability,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnState {
     Idle,
@@ -1277,6 +1431,98 @@ impl PermissionRule {
 
         project_matches && self.tool.matches(&request.tool) && self.target.matches(&request.target)
     }
+}
+
+pub const MAX_AGENT_NAME_CHARS: usize = 64;
+pub const MAX_AGENT_DESCRIPTION_CHARS: usize = 1024;
+pub const MAX_AGENT_SKILLS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentMode {
+    Primary,
+    Subagent,
+    All,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub description: String,
+    pub mode: AgentMode,
+    pub model: Option<String>,
+    pub system_prompt: String,
+    pub permission_rules: Vec<PermissionRule>,
+    pub skills: Vec<String>,
+}
+
+impl AgentDefinition {
+    pub fn validate(&self) -> Result<(), AgentDefinitionError> {
+        if !is_catalog_name(&self.name) {
+            return Err(AgentDefinitionError::InvalidName);
+        }
+
+        if !is_bounded_description(&self.description) {
+            return Err(AgentDefinitionError::InvalidDescription);
+        }
+
+        if self.system_prompt.is_empty() {
+            return Err(AgentDefinitionError::EmptySystemPrompt);
+        }
+
+        if self.skills.len() > MAX_AGENT_SKILLS {
+            return Err(AgentDefinitionError::TooManySkills);
+        }
+
+        let mut seen_skills = std::collections::BTreeSet::new();
+        if self
+            .skills
+            .iter()
+            .any(|skill| !is_catalog_name(skill) || !seen_skills.insert(skill))
+        {
+            return Err(AgentDefinitionError::DuplicateSkill);
+        }
+
+        self.permission_rules
+            .iter()
+            .all(has_bounded_permission_patterns)
+            .then_some(())
+            .ok_or(AgentDefinitionError::InvalidPermissionRule)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentDefinitionError {
+    InvalidName,
+    InvalidDescription,
+    EmptySystemPrompt,
+    TooManySkills,
+    DuplicateSkill,
+    InvalidPermissionRule,
+}
+
+pub fn is_catalog_name(value: &str) -> bool {
+    let length = value.chars().count();
+    (1..=MAX_AGENT_NAME_CHARS).contains(&length)
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn is_bounded_description(value: &str) -> bool {
+    let length = value.chars().count();
+    (1..=MAX_AGENT_DESCRIPTION_CHARS).contains(&length) && !value.chars().any(char::is_control)
+}
+
+fn has_bounded_permission_patterns(rule: &PermissionRule) -> bool {
+    fn is_valid_exact(pattern: &PermissionPattern, limit: usize) -> bool {
+        !matches!(pattern, PermissionPattern::Exact(value) if value.is_empty() || value.len() > limit)
+    }
+
+    is_valid_exact(&rule.tool, MAX_PERMISSION_GLOB_PATTERN_BYTES)
+        && is_valid_exact(&rule.target, MAX_PERMISSION_TARGET_BYTES)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
