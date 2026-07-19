@@ -113,33 +113,28 @@ pub struct CompletedSessionTurn {
 }
 
 impl CompletedSessionTurn {
-    pub fn new(
-        user: SessionMessage,
-        system_reminder: Option<SessionMessage>,
-        assistants: Vec<SessionMessage>,
-        tools: Vec<SessionMessage>,
-    ) -> Result<Self, CompletedSessionTurnError> {
-        if user.as_message().role != Role::User
-            || system_reminder
-                .as_ref()
-                .is_some_and(|message| message.as_message().role != Role::System)
-            || assistants
-                .iter()
-                .any(|message| message.as_message().role != Role::Assistant)
-            || tools
-                .iter()
-                .any(|message| message.as_message().role != Role::Tool)
-        {
-            return Err(CompletedSessionTurnError::InvalidMessageOrder);
-        }
-
-        let mut messages = system_reminder
+    pub fn new(messages: Vec<SessionMessage>) -> Result<Self, CompletedSessionTurnError> {
+        let messages = messages
             .into_iter()
             .map(SessionMessage::into_message)
             .collect::<Vec<_>>();
-        messages.push(user.into_message());
-        messages.extend(assistants.into_iter().map(SessionMessage::into_message));
-        messages.extend(tools.into_iter().map(SessionMessage::into_message));
+
+        let user_index = usize::from(matches!(
+            messages.first(),
+            Some(Message {
+                role: Role::System,
+                ..
+            })
+        ));
+        if messages
+            .get(user_index)
+            .is_none_or(|message| message.role != Role::User)
+            || messages[user_index + 1..]
+                .iter()
+                .any(|message| !matches!(message.role, Role::Assistant | Role::Tool))
+        {
+            return Err(CompletedSessionTurnError::InvalidMessageOrder);
+        }
 
         Ok(Self { messages })
     }
