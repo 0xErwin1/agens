@@ -730,6 +730,52 @@ const LEGACY_TURN_EVENTS_INDEXES: [ExpectedIndexSignature; 2] = [
         false,
     ),
 ];
+const NORMALIZED_SESSION_SCHEMA: &str = "
+    CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY,
+        project TEXT NOT NULL CHECK(project <> ''),
+        title TEXT NOT NULL,
+        active_agent TEXT NOT NULL CHECK(active_agent <> ''),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_turn_count >= 0),
+        resumable INTEGER NOT NULL DEFAULT 0 CHECK(resumable IN(0, 1)),
+        CHECK(resumable = (completed_turn_count > 0))
+    );
+    CREATE TABLE turns (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        completed_at INTEGER NOT NULL,
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE messages (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        turn_sequence INTEGER NOT NULL CHECK(turn_sequence > 0),
+        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool')),
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id, turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE CASCADE
+    );
+    CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL))
+    );
+    CREATE INDEX sessions_list ON sessions(resumable, updated_at DESC, id DESC);
+    CREATE INDEX messages_turn_order ON messages(session_id, turn_sequence, sequence);
+    CREATE INDEX parts_message_order ON message_parts(session_id, message_sequence, sequence);
+";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStoreError {
@@ -798,7 +844,7 @@ impl SessionStore {
                 migrate_v1_on_open(&mut store.connection, &store.database_path)?;
                 return Ok(store);
             }
-            2 => validate_legacy_archive(&connection, &database_path)?,
+            2 => validate_v2_schema(&connection, &database_path)?,
             unsupported => {
                 return Err(SessionStoreError::operation(
                     "check schema version",
@@ -1095,7 +1141,7 @@ fn migrate_v1_on_open(
         .map_err(|error| {
             SessionStoreError::operation("reopen v2 migration", database_path, error)
         })?;
-    validate_legacy_archive(&reopened, database_path)
+    validate_v2_schema(&reopened, database_path)
 }
 
 fn migration_fault(point: &str, database_path: &Path) -> Result<(), SessionStoreError> {
@@ -1293,14 +1339,66 @@ fn finalize_v2_migration(
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     transaction
-        .execute_batch(
-            "DROP TABLE completed_turn_events;
-             DROP TABLE completed_turns;
-             PRAGMA user_version = 2;",
-        )
+        .execute_batch(&format!(
+            "{NORMALIZED_SESSION_SCHEMA}
+                 DROP TABLE completed_turn_events;
+              DROP TABLE completed_turns;
+              PRAGMA user_version = 2;"
+        ))
         .map_err(|error| {
             SessionStoreError::operation("finalize v1 migration", database_path, error)
-        })
+        })?;
+
+    validate_v2_schema(transaction, database_path)
+}
+
+fn validate_v2_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_legacy_archive(connection, database_path)?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT sql FROM sqlite_schema
+             WHERE type IN ('table', 'index')
+               AND name IN ('sessions', 'turns', 'messages', 'message_parts',
+                            'sessions_list', 'messages_turn_order', 'parts_message_order')",
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("validate v2 schema", database_path, error)
+        })?;
+    let mut actual = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| SessionStoreError::operation("validate v2 schema", database_path, error))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| {
+            SessionStoreError::operation("validate v2 schema", database_path, error)
+        })?;
+    let mut expected = NORMALIZED_SESSION_SCHEMA
+        .split(';')
+        .filter(|statement| statement.trim_start().starts_with("CREATE"))
+        .map(normalize_schema_statement)
+        .collect::<Vec<_>>();
+    actual
+        .iter_mut()
+        .for_each(|statement| *statement = normalize_schema_statement(statement));
+    actual.sort();
+    expected.sort();
+
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(SessionStoreError::operation(
+            "validate v2 schema",
+            database_path,
+            "incompatible normalized session schema",
+        ))
+    }
+}
+
+fn normalize_schema_statement(statement: &str) -> String {
+    statement.split_whitespace().collect()
 }
 
 fn table_matches(

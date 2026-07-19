@@ -338,6 +338,45 @@ fn opens_populated_wal_v1_as_v2_smoke() {
 }
 
 #[test]
+fn normalized_v2_schema() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(store.database_path()).unwrap();
+    let schema = connection
+        .prepare(
+            "SELECT sql FROM sqlite_schema
+             WHERE type IN ('table', 'index')
+               AND name IN ('sessions', 'turns', 'messages', 'message_parts',
+                            'sessions_list', 'messages_turn_order', 'parts_message_order')
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+        .join(" ");
+
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(schema.contains("CREATE TABLE sessions"));
+    assert!(schema.contains("CREATE TABLE turns"));
+    assert!(schema.contains("CREATE TABLE messages"));
+    assert!(schema.contains("CREATE TABLE message_parts"));
+    assert!(schema.contains("CREATE INDEX sessions_list"));
+    assert!(schema.contains("CREATE INDEX messages_turn_order"));
+    assert!(schema.contains("CREATE INDEX parts_message_order"));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn migration_preserves_v1_losslessly() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
@@ -415,7 +454,7 @@ fn migration_preserves_v1_losslessly() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        4
     );
 
     fs::remove_dir_all(directory).unwrap();
