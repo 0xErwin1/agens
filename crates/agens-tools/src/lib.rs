@@ -56,6 +56,12 @@ const DEFAULT_MAX_SUBAGENT_OUTPUT_CHARS: usize = 64 * 1024;
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_secs(30);
 const SUBAGENT_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+#[cfg(unix)]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(unix)]
+static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 static SUBAGENT_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 thread_local! {
@@ -2382,11 +2388,20 @@ impl ToolOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadFileInput {
     path: PathBuf,
+    range: Option<(usize, usize)>,
 }
 
 impl ReadFileInput {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            range: None,
+        }
+    }
+
+    pub fn with_range(mut self, offset: usize, limit: usize) -> Self {
+        self.range = Some((offset, limit));
+        self
     }
 }
 
@@ -2521,31 +2536,38 @@ impl NativeTools {
     }
 
     pub fn read_file(&self, input: ReadFileInput) -> Result<ToolOutput, Error> {
-        let path = match self.resolve_existing(&input.path) {
-            Ok(path) => path,
-            Err(output) => return Ok(output),
-        };
-
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) => return Ok(ToolOutput::failure(format!("read: {error}"))),
-        };
-
-        if !metadata.is_file() {
-            return Ok(ToolOutput::failure("read: path is not a file"));
+        if let Err(output) = self.validate_relative(&input.path) {
+            return Ok(output);
+        }
+        if input
+            .range
+            .is_some_and(|(offset, limit)| offset == 0 || limit == 0)
+        {
+            return Ok(ToolOutput::failure(
+                "read: offset and limit must be greater than zero",
+            ));
         }
 
-        if metadata.len() > MAX_FILE_BYTES {
-            return Ok(ToolOutput::failure("read: file exceeds 1048576 byte limit"));
-        }
+        #[cfg(unix)]
+        let result = read_file_confined(&self.project_root_dir, &input);
 
-        match fs::read_to_string(path) {
-            Ok(content) => Ok(ToolOutput::success(content)),
-            Err(error) => Ok(ToolOutput::failure(format!("read: {error}"))),
-        }
+        #[cfg(not(unix))]
+        let result = Err(ToolOutput::failure(
+            "read: secure confined reads are unavailable on this platform",
+        ));
+
+        Ok(result.unwrap_or_else(|output| output))
     }
 
     pub fn write_file(&self, input: WriteFileInput) -> Result<ToolOutput, Error> {
+        self.write_file_with_context(input, None)
+    }
+
+    fn write_file_with_context(
+        &self,
+        input: WriteFileInput,
+        context: Option<&ToolExecutionContext>,
+    ) -> Result<ToolOutput, Error> {
         if let Err(output) = self.validate_relative(&input.path) {
             return Ok(output);
         }
@@ -2555,6 +2577,7 @@ impl NativeTools {
             &self.project_root_dir,
             &input.path,
             input.content.as_bytes(),
+            context,
         );
 
         #[cfg(not(unix))]
@@ -2857,7 +2880,7 @@ impl NativeToolCatalog {
                 "native::read",
                 "Read a UTF-8 file beneath the project root",
                 ToolAccess::ReadOnly,
-                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"}}}),
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}}}),
             ),
             native_metadata(
                 "native::write",
@@ -2905,10 +2928,22 @@ impl NativeToolCatalog {
                 .ok_or_else(|| Error::Tool("native tool arguments are invalid".into()))
         };
         let output = match name {
-            "native::read" => self.tools.read_file(ReadFileInput::new(string("path")?))?,
-            "native::write" => self
-                .tools
-                .write_file(WriteFileInput::new(string("path")?, string("content")?))?,
+            "native::read" => {
+                let mut input = ReadFileInput::new(string("path")?);
+                if let (Some(offset), Some(limit)) = (
+                    arguments.get("offset").and_then(Value::as_u64),
+                    arguments.get("limit").and_then(Value::as_u64),
+                ) {
+                    input = input.with_range(offset as usize, limit as usize);
+                } else if arguments.contains_key("offset") || arguments.contains_key("limit") {
+                    return Err(Error::Tool("native tool arguments are invalid".into()));
+                }
+                self.tools.read_file(input)?
+            }
+            "native::write" => self.tools.write_file_with_context(
+                WriteFileInput::new(string("path")?, string("content")?),
+                Some(context),
+            )?,
             "native::list" => self
                 .tools
                 .list_directory(ListDirectoryInput::new(string("path")?))?,
@@ -2995,11 +3030,113 @@ impl SearchBudget {
 }
 
 #[cfg(unix)]
+fn read_file_confined(
+    project_root: &fs::File,
+    input: &ReadFileInput,
+) -> Result<ToolOutput, ToolOutput> {
+    let (directory, file_name) = open_confined_parent(project_root, &input.path, false, "read")?;
+    let mut file = open_confined_file(&directory, &file_name, "read")?;
+    let metadata = checked_regular_file(&file, "read")?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(ToolOutput::failure("read: file exceeds 1048576 byte limit"));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| ToolOutput::failure(format!("read: {error}")))?;
+    Ok(ToolOutput::success(read_range(&content, input.range)))
+}
+
+#[cfg(unix)]
+fn read_range(content: &str, range: Option<(usize, usize)>) -> String {
+    let (offset, limit) = range.unwrap_or((1, usize::MAX));
+    content
+        .split_inclusive('\n')
+        .skip(offset - 1)
+        .take(limit)
+        .collect()
+}
+
+#[cfg(unix)]
 fn write_file_confined(
     project_root: &fs::File,
     path: &Path,
     content: &[u8],
+    context: Option<&ToolExecutionContext>,
 ) -> Result<(), ToolOutput> {
+    use std::{
+        ffi::CString,
+        os::fd::{AsRawFd, FromRawFd},
+    };
+
+    let (directory, file_name) = open_confined_parent(project_root, path, true, "write")?;
+    let existing = match open_confined_file(&directory, &file_name, "write") {
+        Ok(file) => Some(file_identity(&checked_regular_file(&file, "write")?)),
+        Err(output) if output.content.contains("No such file") => None,
+        Err(output) => return Err(output),
+    };
+    let temp_name = CString::new(format!(
+        ".agens-write-{}-{}",
+        std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+    .expect("generated temporary name has no null byte");
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(ToolOutput::failure(format!(
+            "write: cannot create temporary file: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let mut temp = unsafe { fs::File::from_raw_fd(descriptor) };
+    let result = (|| {
+        temp.write_all(content)
+            .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+        temp.sync_all()
+            .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
+        if context.is_some_and(ToolExecutionContext::is_cancelled) {
+            return Err(ToolOutput::failure("tool execution cancelled"));
+        }
+        recheck_write_target(&directory, &file_name, existing)?;
+        let renamed = unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temp_name.as_ptr(),
+                directory.as_raw_fd(),
+                file_name.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err(ToolOutput::failure(format!(
+                "write: cannot commit temporary file: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        directory
+            .sync_all()
+            .map_err(|error| ToolOutput::failure(format!("write: {error}")))
+    })();
+    if result.is_err() {
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0);
+        }
+    }
+    result
+}
+
+#[cfg(unix)]
+fn open_confined_parent(
+    project_root: &fs::File,
+    path: &Path,
+    create: bool,
+    operation: &str,
+) -> Result<(fs::File, std::ffi::CString), ToolOutput> {
     use std::{
         ffi::CString,
         os::{
@@ -3010,78 +3147,121 @@ fn write_file_confined(
 
     let file_name = path
         .file_name()
-        .ok_or_else(|| ToolOutput::failure("write: path must name a file"))?;
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        .ok_or_else(|| ToolOutput::failure(format!("{operation}: path must name a file")))?;
+    let file_name = CString::new(file_name.as_bytes())
+        .map_err(|_| ToolOutput::failure(format!("{operation}: invalid path component")))?;
     let mut directory = project_root
         .try_clone()
-        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
-
-    // Each component is opened beneath an already-open directory descriptor, so renames and
-    // symlink substitutions cannot redirect the final open outside the canonical root.
-    for component in parent.components() {
+        .map_err(|error| ToolOutput::failure(format!("{operation}: {error}")))?;
+    for component in path.parent().unwrap_or_else(|| Path::new("")).components() {
         let Component::Normal(component) = component else {
             continue;
         };
         let component = CString::new(component.as_bytes())
-            .map_err(|_| ToolOutput::failure("write: invalid path component"))?;
-        let descriptor = unsafe {
+            .map_err(|_| ToolOutput::failure(format!("{operation}: invalid path component")))?;
+        let mut descriptor = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
                 component.as_ptr(),
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
+        if descriptor < 0 && create && io::Error::last_os_error().kind() == io::ErrorKind::NotFound
+        {
+            let created =
+                unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o755) };
+            if created != 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                return Err(ToolOutput::failure(format!(
+                    "{operation}: cannot create parent directory: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            descriptor = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    component.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
         if descriptor < 0 {
-            let error = io::Error::last_os_error();
-            return Err(write_open_error(error, true));
+            return Err(confined_open_error(operation, io::Error::last_os_error()));
         }
         directory = unsafe { fs::File::from_raw_fd(descriptor) };
     }
+    Ok((directory, file_name))
+}
 
-    let file_name = CString::new(file_name.as_bytes())
-        .map_err(|_| ToolOutput::failure("write: invalid path component"))?;
+#[cfg(unix)]
+fn open_confined_file(
+    directory: &fs::File,
+    file_name: &std::ffi::CString,
+    operation: &str,
+) -> Result<fs::File, ToolOutput> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     let descriptor = unsafe {
         libc::openat(
             directory.as_raw_fd(),
             file_name.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-            0o666,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
         )
     };
     if descriptor < 0 {
-        return Err(write_open_error(io::Error::last_os_error(), false));
+        return Err(confined_open_error(operation, io::Error::last_os_error()));
     }
-
-    let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
-    let metadata = file
-        .metadata()
-        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
-    if !metadata.is_file() {
-        return Err(ToolOutput::failure("write: path is not a regular file"));
-    }
-    use std::os::unix::fs::MetadataExt;
-    if metadata.nlink() > 1 {
-        return Err(ToolOutput::failure("write: path has multiple hard links"));
-    }
-
-    file.set_len(0)
-        .map_err(|error| ToolOutput::failure(format!("write: {error}")))?;
-    file.write_all(content)
-        .map_err(|error| ToolOutput::failure(format!("write: {error}")))
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
 }
 
 #[cfg(unix)]
-fn write_open_error(error: io::Error, parent: bool) -> ToolOutput {
-    if error.raw_os_error() == Some(libc::ELOOP)
-        || (parent && error.kind() == io::ErrorKind::NotADirectory)
-    {
+fn confined_open_error(operation: &str, error: io::Error) -> ToolOutput {
+    if error.raw_os_error() == Some(libc::ELOOP) || error.kind() == io::ErrorKind::NotADirectory {
         return ToolOutput::failure("path: outside project root");
     }
-    if parent && error.kind() == io::ErrorKind::NotFound {
-        return ToolOutput::failure("write: parent directory does not exist");
-    }
+    ToolOutput::failure(format!("{operation}: {error}"))
+}
 
-    ToolOutput::failure(format!("write: {error}"))
+#[cfg(unix)]
+fn checked_regular_file(file: &fs::File, operation: &str) -> Result<fs::Metadata, ToolOutput> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolOutput::failure(format!("{operation}: {error}")))?;
+    if !metadata.is_file() {
+        return Err(ToolOutput::failure(format!(
+            "{operation}: path is not a regular file"
+        )));
+    }
+    if metadata.nlink() != 1 {
+        return Err(ToolOutput::failure(format!(
+            "{operation}: path has multiple hard links"
+        )));
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(unix)]
+fn recheck_write_target(
+    directory: &fs::File,
+    file_name: &std::ffi::CString,
+    existing: Option<(u64, u64)>,
+) -> Result<(), ToolOutput> {
+    match (existing, open_confined_file(directory, file_name, "write")) {
+        (Some(expected), Ok(file))
+            if file_identity(&checked_regular_file(&file, "write")?) == expected =>
+        {
+            Ok(())
+        }
+        (Some(_), Ok(_)) => Err(ToolOutput::failure("write: target changed during write")),
+        (Some(_), Err(output)) => Err(output),
+        (None, Err(output)) if output.content.contains("No such file") => Ok(()),
+        (None, _) => Err(ToolOutput::failure("write: target changed during write")),
+    }
 }
 
 #[derive(Default)]

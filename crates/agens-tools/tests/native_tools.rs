@@ -115,12 +115,11 @@ fn writes_lists_and_searches_only_within_the_project() {
 fn rejects_invalid_typed_inputs_before_running_tools() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
-
     assert_eq!(
         tools
             .write_file(WriteFileInput::new("missing/file.txt", "content"))
             .unwrap(),
-        ToolOutput::failure("write: parent directory does not exist")
+        ToolOutput::success("wrote missing/file.txt")
     );
     assert_eq!(
         tools
@@ -250,6 +249,72 @@ fn reads_a_project_relative_file() {
 }
 
 #[test]
+fn confined_read_write_creates_parents_and_reads_one_based_ranges() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools
+            .write_file(WriteFileInput::new("nested/notes.txt", "one\ntwo\nthree\n"))
+            .unwrap(),
+        ToolOutput::success("wrote nested/notes.txt")
+    );
+    assert_eq!(
+        tools
+            .read_file(ReadFileInput::new("nested/notes.txt").with_range(2, 1))
+            .unwrap(),
+        ToolOutput::success("two\n")
+    );
+    assert_eq!(
+        tools
+            .read_file(ReadFileInput::new("nested/notes.txt").with_range(3, 8))
+            .unwrap(),
+        ToolOutput::success("three\n")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn confined_read_write_fails_closed_for_symlinks_and_hardlinks() {
+    use std::os::unix::fs::symlink;
+
+    let root = project_root();
+    let outside = project_root();
+    let outside_target = outside.join("target.txt");
+    fs::write(&outside_target, "outside").unwrap();
+    symlink(&outside_target, root.join("symlink.txt")).unwrap();
+    fs::write(root.join("original.txt"), "original").unwrap();
+    fs::hard_link(root.join("original.txt"), root.join("linked.txt")).unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+    assert!(
+        tools
+            .write_file(WriteFileInput::new("symlink.txt", "changed"))
+            .unwrap()
+            .is_error
+    );
+    assert!(
+        tools
+            .write_file(WriteFileInput::new("original.txt", "changed"))
+            .unwrap()
+            .is_error
+    );
+    assert!(
+        tools
+            .read_file(ReadFileInput::new("original.txt"))
+            .unwrap()
+            .is_error
+    );
+    assert_eq!(fs::read_to_string(&outside_target).unwrap(), "outside");
+    assert_eq!(
+        fs::read_to_string(root.join("original.txt")).unwrap(),
+        "original"
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
 fn list_and_search_fail_when_configured_work_budgets_are_exhausted() {
     let root = project_root();
     let limits = NativeToolLimits {
@@ -337,7 +402,12 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
             && tool.input_schema["type"] == "object"
             && tool.input_schema["additionalProperties"] == false
     }));
-
+    let read = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::read")
+        .unwrap();
+    assert_eq!(read.input_schema["properties"]["offset"]["minimum"], 1);
+    assert_eq!(read.input_schema["properties"]["limit"]["minimum"], 1);
     let cancellation = Arc::new(AtomicBool::new(true));
     let output = catalog
         .execute(
