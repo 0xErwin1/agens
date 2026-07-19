@@ -186,7 +186,7 @@ fn subscription_transport_proactively_refreshes_before_the_responses_request() {
     let response_request = responses.take_observed_request();
     let oauth = OAuthServer::start(
         200,
-        r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"synthetic-rotated-refresh","id_token":"ignored"}"#,
+        r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"synthetic-rotated-refresh","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50X3JvdGF0ZWQifQ.signature"}"#,
     );
     let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
         &credentials,
@@ -214,19 +214,23 @@ fn subscription_transport_proactively_refreshes_before_the_responses_request() {
             "refresh_token": "synthetic-old-refresh",
         })
     );
+    let responses_request = response_request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("responses request should be observed");
     assert_eq!(
-        response_request
-            .recv_timeout(Duration::from_secs(1))
-            .expect("responses request should be observed")
-            .header("authorization"),
+        responses_request.header("authorization"),
         Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+    );
+    assert_eq!(
+        responses_request.header("chatgpt-account-id"),
+        Some("account_rotated")
     );
     assert_eq!(
         serde_json::from_slice::<Value>(
             &fs::read(&credentials).expect("credentials should persist")
         )
         .expect("credentials should remain JSON")["openai-chatgpt"]["account_id"],
-        "account_123"
+        "account_rotated"
     );
     assert_eq!(
         serde_json::from_slice::<Value>(
@@ -277,6 +281,10 @@ fn subscription_transport_refreshes_once_after_401_then_retries_responses_once()
     assert_eq!(
         requests[2].header("authorization"),
         Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+    );
+    assert_eq!(
+        requests[2].header("chatgpt-account-id"),
+        Some("account_123")
     );
     let persisted = serde_json::from_slice::<Value>(
         &fs::read(&credentials).expect("credentials should persist"),

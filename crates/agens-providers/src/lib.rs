@@ -559,6 +559,10 @@ impl ChatGptResponsesProvider {
             Some(_) => return Err(HeadlessTurnPortError::Authentication),
             None => None,
         };
+        let refreshed_account_id = id_token
+            .map(chatgpt_login::account_id_from_id_token)
+            .transpose()
+            .map_err(|_| HeadlessTurnPortError::Authentication)?;
 
         persist_chatgpt_refresh_with_id_token(
             &self.credentials_path,
@@ -571,6 +575,9 @@ impl ChatGptResponsesProvider {
         stop_before_mapping(cancellation)?;
 
         self.access_token = access_token.to_owned();
+        if let Some(account_id) = refreshed_account_id {
+            self.account_id = account_id;
+        }
         Ok(())
     }
 
