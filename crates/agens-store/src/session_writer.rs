@@ -16,7 +16,6 @@ impl SessionStore {
                 format!("{error:?}"),
             )
         })?;
-        validate_text_turn(turn, &self.database_path)?;
         let expected_turn_count =
             i64::try_from(metadata.completed_turn_count).map_err(|error| {
                 SessionStoreError::operation(
@@ -71,16 +70,17 @@ impl SessionStore {
             let message_sequence = first_message_sequence + message_offset as i64;
             transaction.execute(
                 "INSERT INTO messages (session_id, sequence, turn_sequence, role) VALUES (?1, ?2, ?3, ?4)",
-                params![metadata.id, message_sequence, turn_sequence, role_name(message.role)],
+                params![metadata.id, message_sequence, turn_sequence, encode_role(message.role)],
             ).map_err(|error| SessionStoreError::operation("create message", &self.database_path, error))?;
             for (part_sequence, part) in message.parts.iter().enumerate() {
-                let MessagePart::Text(text) = part else {
-                    unreachable!("validated text turn")
-                };
-                transaction.execute(
-                    "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, text) VALUES (?1, ?2, ?3, 'text', ?4)",
-                    params![metadata.id, message_sequence, part_sequence as i64, text],
-                ).map_err(|error| SessionStoreError::operation("create message part", &self.database_path, error))?;
+                insert_message_part(
+                    &transaction,
+                    &self.database_path,
+                    metadata.id,
+                    message_sequence,
+                    part_sequence as i64,
+                    part,
+                )?;
             }
         }
         transaction.commit().map_err(|error| {
@@ -89,23 +89,59 @@ impl SessionStore {
     }
 }
 
-fn validate_text_turn(
-    turn: &CompletedSessionTurn,
-    path: &std::path::Path,
+fn insert_message_part(
+    transaction: &Transaction<'_>,
+    database_path: &std::path::Path,
+    session_id: i64,
+    message_sequence: i64,
+    sequence: i64,
+    part: &MessagePart,
 ) -> Result<(), SessionStoreError> {
-    if turn.messages().iter().all(|message| {
-        message
-            .parts
-            .iter()
-            .all(|part| matches!(part, MessagePart::Text(_)))
-    }) {
-        Ok(())
-    } else {
-        Err(SessionStoreError::operation(
-            "validate session turn",
-            path,
-            "text-only writer does not support this message part",
-        ))
+    let result = match part {
+        MessagePart::Text(text) => transaction.execute(
+            "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, text) VALUES (?1, ?2, ?3, 'text', ?4)",
+            params![session_id, message_sequence, sequence, text],
+        ),
+        MessagePart::Reasoning(text) => transaction.execute(
+            "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, text) VALUES (?1, ?2, ?3, 'reasoning', ?4)",
+            params![session_id, message_sequence, sequence, text],
+        ),
+        MessagePart::ToolCall { id, name, input } => transaction.execute(
+            "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, call_id, name, input_json) VALUES (?1, ?2, ?3, 'tool_call', ?4, ?5, ?6)",
+            params![session_id, message_sequence, sequence, id, name, canonical_json(input, database_path)?],
+        ),
+        MessagePart::ToolResult { tool_call_id, content, is_error } => transaction.execute(
+            "INSERT INTO message_parts (session_id, message_sequence, sequence, kind, call_id, content, is_error) VALUES (?1, ?2, ?3, 'tool_result', ?4, ?5, ?6)",
+            params![session_id, message_sequence, sequence, tool_call_id, content, is_error],
+        ),
+    };
+    result.map_err(|error| {
+        SessionStoreError::operation("create message part", database_path, error)
+    })?;
+    Ok(())
+}
+
+fn canonical_json(
+    input: &str,
+    database_path: &std::path::Path,
+) -> Result<String, SessionStoreError> {
+    let mut value: serde_json::Value = serde_json::from_str(input).map_err(|error| {
+        SessionStoreError::operation("canonicalize tool input", database_path, error)
+    })?;
+    canonicalize_value(&mut value);
+    serde_json::to_string(&value).map_err(|error| {
+        SessionStoreError::operation("canonicalize tool input", database_path, error)
+    })
+}
+
+fn canonicalize_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => values.iter_mut().for_each(canonicalize_value),
+        serde_json::Value::Object(values) => {
+            values.values_mut().for_each(canonicalize_value);
+            values.sort_keys();
+        }
+        _ => {}
     }
 }
 
@@ -124,11 +160,11 @@ fn next_sequence(
         .map_err(|error| SessionStoreError::operation("allocate sequence", database_path, error))
 }
 
-fn role_name(role: Role) -> &'static str {
+fn encode_role(role: Role) -> &'static str {
     match role {
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
-        Role::Tool => unreachable!("validated text turn"),
+        Role::Tool => "tool",
     }
 }

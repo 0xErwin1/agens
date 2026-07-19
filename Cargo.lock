@@ -58,6 +58,7 @@ version = "0.1.0"
 dependencies = [
  "agens-core",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

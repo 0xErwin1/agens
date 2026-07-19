@@ -74,21 +74,25 @@ fn persists_text_completed_turn_and_reopens_in_order() {
         resumable: true,
         ..metadata.clone()
     };
-    let unsupported = turn(vec![
+    let invalid_json = turn(vec![
         Message {
             role: Role::User,
             parts: vec![MessagePart::Text("unsupported user".into())],
         },
         Message {
             role: Role::Assistant,
-            parts: vec![MessagePart::Reasoning("unsupported reasoning".into())],
+            parts: vec![MessagePart::ToolCall {
+                id: "call".into(),
+                name: "name".into(),
+                input: "not json".into(),
+            }],
         },
     ]);
 
     let mut store = SessionStore::open(&directory).unwrap();
     assert!(
         store
-            .persist_completed_session_turn(&metadata, &unsupported)
+            .persist_completed_session_turn(&metadata, &invalid_json)
             .is_err()
     );
     assert_eq!(
@@ -115,6 +119,127 @@ fn persists_text_completed_turn_and_reopens_in_order() {
         ("project".into(), "title".into(), "primary".into(), 10, 20, 2, true),
     );
     assert_eq!(connection.prepare("SELECT turn_sequence, role, text FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id AND messages.sequence = message_parts.message_sequence ORDER BY messages.sequence, message_parts.sequence").unwrap().query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap(), vec![(1, "system".into(), "system".into()), (1, "user".into(), "first user".into()), (1, "assistant".into(), "first assistant".into()), (2, "user".into(), "second user".into()), (2, "assistant".into(), "second assistant".into())]);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn persists_all_typed_parts_with_canonical_tool_json() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 8,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let turn = turn(vec![
+        Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text("system\n✓".into())],
+        },
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("user\0bytes".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::Text("answer".into()),
+                MessagePart::Reasoning("because\r\n✓".into()),
+                MessagePart::ToolCall {
+                    id: "call-1".into(),
+                    name: "search".into(),
+                    input: r#"{"z":[{"b":2,"a":1}],"a":true}"#.into(),
+                },
+            ],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "result\r\n✓".into(),
+                is_error: false,
+            }],
+        },
+    ]);
+
+    let mut store = SessionStore::open(&directory).unwrap();
+    store
+        .persist_completed_session_turn(&metadata, &turn)
+        .unwrap();
+    drop(store);
+
+    let connection = Connection::open(directory.join("rust-sessions.db")).unwrap();
+    let parts = connection.prepare("SELECT role, kind, text, call_id, name, input_json, content, is_error FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id AND messages.sequence = message_parts.message_sequence ORDER BY messages.sequence, message_parts.sequence").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(
+        parts,
+        vec![
+            (
+                "system".into(),
+                "text".into(),
+                Some("system\n✓".into()),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            (
+                "user".into(),
+                "text".into(),
+                Some("user\0bytes".into()),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            (
+                "assistant".into(),
+                "text".into(),
+                Some("answer".into()),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            (
+                "assistant".into(),
+                "reasoning".into(),
+                Some("because\r\n✓".into()),
+                None,
+                None,
+                None,
+                None,
+                None
+            ),
+            (
+                "assistant".into(),
+                "tool_call".into(),
+                None,
+                Some("call-1".into()),
+                Some("search".into()),
+                Some(r#"{"a":true,"z":[{"a":1,"b":2}]}"#.into()),
+                None,
+                None
+            ),
+            (
+                "tool".into(),
+                "tool_result".into(),
+                None,
+                Some("call-1".into()),
+                None,
+                None,
+                Some("result\r\n✓".into()),
+                Some(0)
+            ),
+        ]
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
