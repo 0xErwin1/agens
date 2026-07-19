@@ -201,6 +201,51 @@ fn archive_contents(connection: &Connection) -> V1Contents {
     V1Contents { turns, events }
 }
 
+fn table_signature(connection: &Connection, table: &str) -> Vec<(i64, String, String, i64, i64)> {
+    connection
+        .prepare(&format!("PRAGMA table_info('{table}')"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn foreign_key_signature(
+    connection: &Connection,
+    table: &str,
+) -> Vec<(String, String, String, String)> {
+    connection
+        .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+fn index_signature(connection: &Connection, table: &str) -> Vec<(String, i64, String)> {
+    connection
+        .prepare(&format!("PRAGMA index_list('{table}')"))
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
 fn exact_v1_manifest(connection: &Connection) -> String {
     let lines = connection
         .prepare(
@@ -353,6 +398,156 @@ fn migration_preserves_v1_losslessly() {
             .unwrap(),
         0
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn migration_validates_schema_and_reopen_contract() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+    let source = Connection::open_with_flags(
+        directory.join("rust-sessions.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let expected = v1_contents(&source);
+    drop(source);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let database = store.database_path();
+    drop(store);
+
+    let archive = Connection::open(&database).unwrap();
+    assert_eq!(
+        table_signature(&archive, "legacy_turns"),
+        vec![
+            (0, "id".into(), "INTEGER".into(), 0, 1),
+            (1, "status".into(), "TEXT".into(), 1, 0),
+            (2, "reason".into(), "TEXT".into(), 1, 0),
+            (3, "source_event_count".into(), "INTEGER".into(), 1, 0),
+        ]
+    );
+    assert_eq!(
+        table_signature(&archive, "legacy_turn_events"),
+        vec![
+            (0, "turn_id".into(), "INTEGER".into(), 1, 1),
+            (1, "sequence".into(), "INTEGER".into(), 1, 2),
+            (2, "kind".into(), "TEXT".into(), 1, 0),
+            (3, "state".into(), "TEXT".into(), 0, 0),
+            (4, "part_kind".into(), "TEXT".into(), 0, 0),
+            (5, "call_id".into(), "TEXT".into(), 0, 0),
+            (6, "name".into(), "TEXT".into(), 0, 0),
+            (7, "input".into(), "TEXT".into(), 0, 0),
+            (8, "content".into(), "TEXT".into(), 0, 0),
+            (9, "is_error".into(), "INTEGER".into(), 0, 0),
+        ]
+    );
+    assert_eq!(
+        foreign_key_signature(&archive, "legacy_turn_events"),
+        vec![(
+            "legacy_turns".into(),
+            "turn_id".into(),
+            "id".into(),
+            "CASCADE".into(),
+        )]
+    );
+    assert_eq!(
+        index_signature(&archive, "legacy_turn_events"),
+        vec![
+            ("legacy_turn_events_turn_sequence".into(), 1, "c".into(),),
+            (
+                "sqlite_autoindex_legacy_turn_events_1".into(),
+                1,
+                "pk".into(),
+            ),
+        ]
+    );
+    assert_eq!(archive_contents(&archive), expected);
+    assert_eq!(
+        archive
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'
+                 AND name IN ('completed_turns', 'completed_turn_events')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        archive
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        archive
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    drop(archive);
+
+    SessionStore::open(&directory).unwrap();
+    assert!(!directory.join("rust-sessions.db.v1.bak.1").exists());
+
+    let tampered = Connection::open(&database).unwrap();
+    tampered
+        .execute_batch(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+             SET sql = replace(sql, 'ON DELETE CASCADE', 'ON DELETE NO ACTION')
+             WHERE type = 'table' AND name = 'legacy_turn_events';
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+    drop(tampered);
+
+    assert!(SessionStore::open(&directory).is_err());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn rejects_tampered_v1_before_destructive_finalization() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+    let database = directory.join("rust-sessions.db");
+    let tampered = Connection::open(&database).unwrap();
+    tampered
+        .execute_batch(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema
+             SET sql = replace(sql, 'FOREIGN KEY (turn_id) REFERENCES completed_turns(id)',
+                               'FOREIGN KEY (turn_id) REFERENCES completed_turns(id) ON DELETE CASCADE')
+             WHERE type = 'table' AND name = 'completed_turn_events';
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+    drop(tampered);
+
+    assert!(SessionStore::open(&directory).is_err());
+
+    let source = Connection::open(&database).unwrap();
+    assert_eq!(
+        source
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(v1_contents(&source).turns, vec![7, 8, 11, 13]);
+    assert_eq!(
+        source
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'legacy_turns'",
+                [],
+                |row| { row.get::<_, i64>(0) }
+            )
+            .unwrap(),
+        0
+    );
+    assert!(!directory.join("rust-sessions.db.v1.bak").exists());
 
     fs::remove_dir_all(directory).unwrap();
 }

@@ -698,6 +698,34 @@ const COMPLETED_TURN_EVENTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
     ExpectedIndexColumnSignature::new(0, 0, "turn_id"),
     ExpectedIndexColumnSignature::new(1, 1, "sequence"),
 ];
+const LEGACY_TURNS_COLUMNS: [ExpectedColumnSignature; 4] = [
+    ExpectedColumnSignature::new(0, "id", "INTEGER", false, None, 1),
+    ExpectedColumnSignature::new(1, "status", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(2, "reason", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(3, "source_event_count", "INTEGER", true, None, 0),
+];
+const LEGACY_TURN_EVENTS_COLUMNS: [ExpectedColumnSignature; 10] = [
+    ExpectedColumnSignature::new(0, "turn_id", "INTEGER", true, None, 1),
+    ExpectedColumnSignature::new(1, "sequence", "INTEGER", true, None, 2),
+    ExpectedColumnSignature::new(2, "kind", "TEXT", true, None, 0),
+    ExpectedColumnSignature::new(3, "state", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(4, "part_kind", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(5, "call_id", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(6, "name", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(7, "input", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(8, "content", "TEXT", false, None, 0),
+    ExpectedColumnSignature::new(9, "is_error", "INTEGER", false, None, 0),
+];
+const LEGACY_TURN_EVENTS_INDEXES: [ExpectedIndexSignature; 2] = [
+    ExpectedIndexSignature::new(0, "legacy_turn_events_turn_sequence", true, "c", false),
+    ExpectedIndexSignature::new(
+        1,
+        "sqlite_autoindex_legacy_turn_events_1",
+        true,
+        "pk",
+        false,
+    ),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionStoreError {
@@ -1135,40 +1163,103 @@ fn validate_legacy_archive(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
-    let source_tables_present: bool = connection
+    let source_table_count: i64 = connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-             WHERE type = 'table' AND name = 'completed_turns')",
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table' AND name IN ('completed_turns', 'completed_turn_events')",
             [],
             |row| row.get(0),
         )
         .map_err(|error| {
             SessionStoreError::operation("validate legacy archive", database_path, error)
         })?;
-    let counts_query = if source_tables_present {
-        "SELECT (SELECT count(*) FROM legacy_turns) = (SELECT count(*) FROM completed_turns)
-                AND (SELECT count(*) FROM legacy_turn_events) =
-                    (SELECT count(*) FROM completed_turn_events)"
+    if source_table_count != 0 && source_table_count != 2 {
+        return Err(SessionStoreError::operation(
+            "validate legacy archive",
+            database_path,
+            "incomplete legacy source schema",
+        ));
+    }
+
+    let schema_matches = table_matches(connection, "legacy_turns", &LEGACY_TURNS_COLUMNS)
+        .and_then(|turns_match| {
+            table_matches(
+                connection,
+                "legacy_turn_events",
+                &LEGACY_TURN_EVENTS_COLUMNS,
+            )
+            .map(|events_match| turns_match && events_match)
+        })
+        .and_then(|tables_match| {
+            legacy_turn_events_foreign_key_matches(connection)
+                .map(|foreign_key_matches| tables_match && foreign_key_matches)
+        })
+        .and_then(|foreign_keys_match| {
+            legacy_turn_events_indexes_match(connection)
+                .map(|indexes_match| foreign_keys_match && indexes_match)
+        })
+        .map_err(|error| {
+            SessionStoreError::operation("validate legacy archive", database_path, error)
+        })?;
+    if !schema_matches {
+        return Err(SessionStoreError::operation(
+            "validate legacy archive",
+            database_path,
+            "incompatible legacy archive schema",
+        ));
+    }
+
+    let validation_query = if source_table_count == 2 {
+        "SELECT NOT EXISTS(
+             SELECT id FROM completed_turns EXCEPT SELECT id FROM legacy_turns
+         ) AND NOT EXISTS(
+             SELECT id FROM legacy_turns EXCEPT SELECT id FROM completed_turns
+         ) AND NOT EXISTS(
+             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+             FROM completed_turn_events
+             EXCEPT
+             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+             FROM legacy_turn_events
+         ) AND NOT EXISTS(
+             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+             FROM legacy_turn_events
+             EXCEPT
+             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+             FROM completed_turn_events
+         ) AND NOT EXISTS(
+             SELECT turns.id, count(events.turn_id)
+             FROM completed_turns turns
+             LEFT JOIN completed_turn_events events ON events.turn_id = turns.id
+             GROUP BY turns.id
+             EXCEPT
+             SELECT id, source_event_count FROM legacy_turns
+         ) AND NOT EXISTS(
+             SELECT 1 FROM legacy_turns
+             WHERE status != 'non_resumable'
+                OR reason != 'v1 lacks session/user/project/title/agent/timestamps'
+         )"
     } else {
         "SELECT NOT EXISTS(
              SELECT 1 FROM legacy_turns turns
-             WHERE turns.source_event_count !=
-                 (SELECT count(*) FROM legacy_turn_events WHERE turn_id = turns.id)
+             WHERE turns.status != 'non_resumable'
+                OR turns.reason != 'v1 lacks session/user/project/title/agent/timestamps'
+                OR turns.source_event_count !=
+                    (SELECT count(*) FROM legacy_turn_events WHERE turn_id = turns.id)
          )"
     };
-    let counts_match: bool = connection
-        .query_row(counts_query, [], |row| row.get(0))
+    let archive_matches: bool = connection
+        .query_row(validation_query, [], |row| row.get(0))
         .map_err(|error| {
             SessionStoreError::operation("validate legacy archive", database_path, error)
         })?;
 
-    if counts_match {
+    if archive_matches {
         Ok(())
     } else {
         Err(SessionStoreError::operation(
             "validate legacy archive",
             database_path,
-            "legacy archive counts do not match",
+            "legacy archive does not match the v1 source",
         ))
     }
 }
@@ -1252,8 +1343,49 @@ fn completed_turn_events_foreign_key_matches(connection: &Connection) -> rusqlit
     ))
 }
 
+fn legacy_turn_events_foreign_key_matches(connection: &Connection) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare("PRAGMA foreign_key_list('legacy_turn_events')")?;
+    let keys = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(matches!(
+        keys.as_slice(),
+        [(0, 0, table, from, to, on_update, on_delete, matching)]
+            if table == "legacy_turns"
+                && from == "turn_id"
+                && to == "id"
+                && on_update == "NO ACTION"
+                && on_delete == "CASCADE"
+                && matching == "NONE"
+    ))
+}
+
 fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare("PRAGMA index_list('completed_turn_events')")?;
+    indexes_match(
+        connection,
+        "completed_turn_events",
+        &COMPLETED_TURN_EVENTS_INDEXES,
+    )
+}
+
+fn indexes_match(
+    connection: &Connection,
+    table: &str,
+    expected_indexes: &[ExpectedIndexSignature],
+) -> rusqlite::Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA index_list('{table}')"))?;
     let indexes = statement
         .query_map([], |row| {
             Ok((
@@ -1266,8 +1398,8 @@ fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Res
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    if indexes.len() != COMPLETED_TURN_EVENTS_INDEXES.len()
-        || !indexes.iter().zip(COMPLETED_TURN_EVENTS_INDEXES).all(
+    if indexes.len() != expected_indexes.len()
+        || !indexes.iter().zip(expected_indexes).all(
             |((sequence, name, unique, origin, partial), expected)| {
                 *sequence == expected.sequence
                     && name == expected.name
@@ -1280,7 +1412,7 @@ fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Res
         return Ok(false);
     }
 
-    for index in COMPLETED_TURN_EVENTS_INDEXES {
+    for index in expected_indexes {
         let mut statement = connection.prepare(&format!("PRAGMA index_info('{}')", index.name))?;
         let columns = statement
             .query_map([], |row| {
@@ -1306,6 +1438,14 @@ fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Res
     }
 
     Ok(true)
+}
+
+fn legacy_turn_events_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
+    indexes_match(
+        connection,
+        "legacy_turn_events",
+        &LEGACY_TURN_EVENTS_INDEXES,
+    )
 }
 
 fn completed_turns_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
