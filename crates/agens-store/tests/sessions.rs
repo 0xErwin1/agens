@@ -99,9 +99,13 @@ fn create_populated_wal_v1_fixture(directory: &std::path::Path) {
     );
     connection
         .execute_batch(
-            "INSERT INTO completed_turns(id) VALUES(7);
-             INSERT INTO completed_turn_events VALUES
-                (7, 1, 'provider_part', NULL, 'text', NULL, NULL, NULL, 'WAL content', NULL);",
+            "INSERT INTO completed_turns(id) VALUES(7), (8), (11), (13);
+              INSERT INTO completed_turn_events VALUES
+                 (7, 1, 'state_changed', 'requesting', NULL, NULL, NULL, NULL, NULL, NULL),
+                 (7, 2, 'provider_part', NULL, 'text', NULL, NULL, NULL, 'WAL content', NULL),
+                 (7, 3, 'provider_part', NULL, 'tool_call', 'call-1', 'tool', '{\"key\":true}', NULL, NULL),
+                 (11, 1, 'tool_result', NULL, NULL, 'call-1', NULL, NULL, 'result\nwith punctuation: !?', 0),
+                 (11, 2, 'tool_result', NULL, NULL, 'call-2', NULL, NULL, 'error', 1);",
         )
         .unwrap();
 }
@@ -138,6 +142,42 @@ fn v1_contents(connection: &Connection) -> V1Contents {
             "SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content,
                     is_error
              FROM completed_turn_events ORDER BY turn_id, sequence",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    V1Contents { turns, events }
+}
+
+fn archive_contents(connection: &Connection) -> V1Contents {
+    let turns = connection
+        .prepare("SELECT id FROM legacy_turns ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let events = connection
+        .prepare(
+            "SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content,
+                    is_error
+             FROM legacy_turn_events ORDER BY turn_id, sequence",
         )
         .unwrap()
         .query_map([], |row| {
@@ -210,7 +250,7 @@ fn opens_populated_wal_v1_as_v2_smoke() {
             .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
-        1
+        4
     );
     assert!(
         connection
@@ -229,6 +269,90 @@ fn opens_populated_wal_v1_as_v2_smoke() {
 
     SessionStore::open(&directory).unwrap();
     assert!(!directory.join("rust-sessions.db.v1.bak.1").exists());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn migration_preserves_v1_losslessly() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+    let database = directory.join("rust-sessions.db");
+    let source = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let expected = v1_contents(&source);
+    drop(source);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let archive = Connection::open(store.database_path()).unwrap();
+
+    assert_eq!(archive_contents(&archive), expected);
+    assert_eq!(
+        archive
+            .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        archive
+            .query_row("SELECT count(*) FROM legacy_turn_events", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        archive
+            .prepare("SELECT id, status, reason, source_event_count FROM legacy_turns ORDER BY id",)
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap(),
+        vec![
+            (
+                7,
+                "non_resumable".into(),
+                "v1 lacks session/user/project/title/agent/timestamps".into(),
+                3
+            ),
+            (
+                8,
+                "non_resumable".into(),
+                "v1 lacks session/user/project/title/agent/timestamps".into(),
+                0
+            ),
+            (
+                11,
+                "non_resumable".into(),
+                "v1 lacks session/user/project/title/agent/timestamps".into(),
+                2
+            ),
+            (
+                13,
+                "non_resumable".into(),
+                "v1 lacks session/user/project/title/agent/timestamps".into(),
+                0
+            ),
+        ]
+    );
+    assert_eq!(
+        archive
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'
+                 AND name IN ('sessions', 'turns', 'messages', 'message_parts')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
