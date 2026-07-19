@@ -141,6 +141,214 @@ pub struct Skill {
     source: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDefinition {
+    name: String,
+    description: String,
+    template: String,
+}
+
+impl CommandDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        template: impl Into<String>,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        markdown::canonical_filename(&name)?;
+
+        let description = description.into().trim().to_owned();
+        if description.is_empty() {
+            return Err("command description is required".into());
+        }
+
+        let template = template.into().trim().to_owned();
+        if template.is_empty() {
+            return Err("command markdown body is required".into());
+        }
+
+        Ok(Self {
+            name,
+            description,
+            template,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn expand(&self, arguments: &str) -> String {
+        self.template.replace("$ARGUMENTS", arguments.trim())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommandCatalog {
+    commands: Vec<CommandDefinition>,
+    positions: BTreeMap<String, usize>,
+}
+
+impl CommandCatalog {
+    pub fn discover(
+        built_ins: &[CommandDefinition],
+        global_root: impl AsRef<Path>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<CommandDiscovery, String> {
+        let global_root = global_root.as_ref();
+        let project_root = project_root.as_ref();
+        let global = load_command_root(global_root)?;
+        let project = load_command_root(project_root)?;
+        let mut catalog = Self::default();
+        let mut diagnostics = global.diagnostics;
+        let mut shadowed = Vec::new();
+
+        for command in built_ins {
+            catalog.insert(command.clone());
+        }
+        for command in global.commands {
+            if catalog.command(command.name()).is_some() {
+                shadowed.push(command.name.clone());
+            }
+            catalog.insert(command);
+        }
+
+        diagnostics.extend(project.diagnostics);
+        for command in project.commands {
+            if catalog.command(command.name()).is_some() {
+                shadowed.push(command.name.clone());
+            }
+            catalog.insert(command);
+        }
+
+        Ok(CommandDiscovery {
+            catalog,
+            diagnostics,
+            shadowed,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    pub fn command(&self, name: &str) -> Option<&CommandDefinition> {
+        self.positions
+            .get(name)
+            .map(|position| &self.commands[*position])
+    }
+
+    fn insert(&mut self, command: CommandDefinition) {
+        if let Some(position) = self.positions.get(command.name()).copied() {
+            self.commands[position] = command;
+            return;
+        }
+
+        self.positions
+            .insert(command.name.clone(), self.commands.len());
+        self.commands.push(command);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDiscovery {
+    catalog: CommandCatalog,
+    diagnostics: Vec<CommandDiagnostic>,
+    shadowed: Vec<String>,
+}
+
+impl CommandDiscovery {
+    pub fn catalog(&self) -> &CommandCatalog {
+        &self.catalog
+    }
+
+    pub fn diagnostics(&self) -> &[CommandDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn shadowed(&self) -> &[String] {
+        &self.shadowed
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandDiagnostic {
+    path: PathBuf,
+    message: String,
+}
+
+impl CommandDiagnostic {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+#[derive(Default)]
+struct CommandRootLoad {
+    commands: Vec<CommandDefinition>,
+    diagnostics: Vec<CommandDiagnostic>,
+}
+
+fn load_command_root(root: &Path) -> Result<CommandRootLoad, String> {
+    if matches!(fs::symlink_metadata(root), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+        return Ok(CommandRootLoad::default());
+    }
+
+    let root = markdown::load_root(root)?;
+    let mut commands = Vec::new();
+    let mut diagnostics = root
+        .diagnostics
+        .into_iter()
+        .map(|diagnostic| CommandDiagnostic {
+            path: diagnostic.path().to_owned(),
+            message: diagnostic.message().to_owned(),
+        })
+        .collect::<Vec<_>>();
+
+    for document in root.documents {
+        let description = document
+            .parsed()
+            .field("description")
+            .and_then(|field| match field {
+                markdown::FrontmatterValue::Scalar(value) => Some(value),
+                markdown::FrontmatterValue::List(_) => None,
+            });
+        match description {
+            Some(description) => {
+                match CommandDefinition::new(document.name(), description, document.parsed().body())
+                {
+                    Ok(command) => commands.push(command),
+                    Err(message) => diagnostics.push(CommandDiagnostic {
+                        path: document.source().to_owned(),
+                        message,
+                    }),
+                }
+            }
+            None => diagnostics.push(CommandDiagnostic {
+                path: document.source().to_owned(),
+                message: "command description is required".into(),
+            }),
+        }
+    }
+
+    Ok(CommandRootLoad {
+        commands,
+        diagnostics,
+    })
+}
+
 impl Skill {
     pub fn name(&self) -> &str {
         &self.name

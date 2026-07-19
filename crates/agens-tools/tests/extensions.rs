@@ -9,8 +9,9 @@ use agens_core::{
     ToolAccess,
 };
 use agens_tools::{
-    AgentCatalog, AgentModelValidationError, AgentModelValidator, DispatchTool,
-    EffectiveCapabilitySet, ToolDispatcher, ToolExecutionContext, ToolOutput,
+    AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
+    CommandDefinition, DispatchTool, EffectiveCapabilitySet, ToolDispatcher, ToolExecutionContext,
+    ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -216,6 +217,98 @@ fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
     assert_eq!(discovery.catalog().subagents().count(), 1);
     assert_eq!(discovery.shadowed().len(), 2);
     assert_eq!(discovery.diagnostics().len(), 1);
+}
+
+#[test]
+fn discovers_commands_with_precedence_isolated_diagnostics_and_trimmed_arguments() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    write_command(&global, "shared", "global", "run $ARGUMENTS now");
+    write_command(&project, "shared", "project", "project:$ARGUMENTS");
+    fs::write(
+        project.join("broken.md"),
+        "---\nname: {bad: value}\n---\nbody\n",
+    )
+    .unwrap();
+
+    let built_in = CommandDefinition::new("shared", "built-in", "built-in:$ARGUMENTS").unwrap();
+    let discovery = CommandCatalog::discover(&[built_in], &global, &project).unwrap();
+
+    assert_eq!(
+        discovery.catalog().command("shared").unwrap().description(),
+        "project"
+    );
+    assert_eq!(
+        discovery
+            .catalog()
+            .command("shared")
+            .unwrap()
+            .expand("  hello  "),
+        "project:hello"
+    );
+    assert_eq!(discovery.shadowed().len(), 2);
+    assert_eq!(discovery.diagnostics().len(), 1);
+}
+
+#[test]
+fn command_catalog_accepts_missing_roots_and_preserves_literal_templates() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("missing-global");
+    let project = temporary.path.join("missing-project");
+    let command = CommandDefinition::new("literal", "literal", "$ARGUMENTS + $ARGUMENTS").unwrap();
+
+    let discovery = CommandCatalog::discover(&[command], &global, &project).unwrap();
+
+    assert_eq!(discovery.catalog().len(), 1);
+    assert_eq!(
+        discovery
+            .catalog()
+            .command("literal")
+            .unwrap()
+            .expand(" value "),
+        "value + value"
+    );
+    assert!(discovery.diagnostics().is_empty());
+}
+
+#[test]
+fn command_catalog_enforces_the_shared_definition_limit_deterministically() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    fs::create_dir_all(&global).unwrap();
+
+    for index in 0..=markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("command-{index:03}");
+        write_command(&global, &name, "description", "body");
+    }
+
+    let discovery = CommandCatalog::discover(&[], &global, temporary.path.join("missing")).unwrap();
+
+    assert_eq!(
+        discovery.catalog().len(),
+        markdown::MAX_MARKDOWN_DEFINITIONS
+    );
+    assert_eq!(discovery.diagnostics().len(), 1);
+    assert_eq!(
+        discovery.diagnostics()[0].message(),
+        "accepted definition limit exceeded"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn command_catalog_rejects_a_symbolic_link_root() {
+    let temporary = TemporaryDirectory::new();
+    let outside = temporary.path.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    write_command(&outside, "outside", "outside", "outside");
+    let global = temporary.path.join("global");
+    std::os::unix::fs::symlink(&outside, &global).unwrap();
+
+    assert!(CommandCatalog::discover(&[], &global, temporary.path.join("missing")).is_err());
 }
 
 #[test]
@@ -571,6 +664,14 @@ fn capability_set(
 
 fn write_agent(root: &std::path::Path, name: &str, description: &str, mode: &str) {
     fs::write(root.join(format!("{name}.md")), format!("---\nname: {name}\ndescription: {description}\nmode: {mode}\npermissions: []\n---\nbody\n")).unwrap();
+}
+
+fn write_command(root: &std::path::Path, name: &str, description: &str, body: &str) {
+    fs::write(
+        root.join(format!("{name}.md")),
+        format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+    )
+    .unwrap();
 }
 
 struct TemporaryDirectory {
