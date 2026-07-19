@@ -62,6 +62,42 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(unix)]
 static TEMP_FILE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditTestHookPoint {
+    BeforeTargetRecheck,
+    BeforeRename,
+}
+
+#[cfg(all(test, unix))]
+type EditTestHook = Box<dyn FnOnce(&fs::File, &std::ffi::CString) + Send>;
+
+#[cfg(all(test, unix))]
+static EDIT_TEST_HOOK: Mutex<Option<(EditTestHookPoint, EditTestHook)>> = Mutex::new(None);
+
+#[cfg(all(test, unix))]
+fn set_edit_test_hook(
+    point: EditTestHookPoint,
+    hook: impl FnOnce(&fs::File, &std::ffi::CString) + Send + 'static,
+) {
+    *EDIT_TEST_HOOK.lock().unwrap() = Some((point, Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
+fn run_edit_test_hook(
+    point: EditTestHookPoint,
+    directory: &fs::File,
+    temp_name: &std::ffi::CString,
+) {
+    let hook = {
+        let mut hook = EDIT_TEST_HOOK.lock().unwrap();
+        hook.take_if(|(expected, _)| *expected == point)
+    };
+    if let Some((_, hook)) = hook {
+        hook(directory, temp_name);
+    }
+}
+
 static SUBAGENT_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 thread_local! {
@@ -3279,10 +3315,18 @@ fn write_edit_temp(
         if context.is_some_and(ToolExecutionContext::is_cancelled) {
             return Err(ToolOutput::failure("tool execution cancelled"));
         }
+        #[cfg(test)]
+        run_edit_test_hook(
+            EditTestHookPoint::BeforeTargetRecheck,
+            directory,
+            &temp_name,
+        );
         let target = open_confined_file(directory, file_name, "edit")?;
         if file_identity(&checked_regular_file(&target, "edit")?) != expected {
             return Err(ToolOutput::failure("edit: target changed during edit"));
         }
+        #[cfg(test)]
+        run_edit_test_hook(EditTestHookPoint::BeforeRename, directory, &temp_name);
         if context.is_some_and(ToolExecutionContext::is_cancelled) {
             return Err(ToolOutput::failure("tool execution cancelled"));
         }
@@ -3355,6 +3399,102 @@ fn unified_edit_diff(
         diff.push_str(&format!(" {line}\n"));
     }
     diff
+}
+
+#[cfg(all(test, unix))]
+mod native_tool_tests {
+    use super::*;
+    use std::{
+        os::unix::fs::symlink,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    fn project_root() -> PathBuf {
+        let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("agens-tools-unit-{}-{suffix}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn temp_name(sequence: usize) -> PathBuf {
+        PathBuf::from(format!(".agens-edit-{}-{sequence}", std::process::id()))
+    }
+
+    #[test]
+    fn exact_edit_rejects_deterministic_races_and_cleans_up() {
+        let root = project_root();
+        let outside = project_root();
+        let target = root.join("notes.txt");
+        let outside_target = outside.join("outside.txt");
+        fs::write(&target, "old").unwrap();
+        fs::write(&outside_target, "outside").unwrap();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let collision = temp_name(TEMP_FILE_SEQUENCE.load(Ordering::Relaxed));
+        symlink(&outside_target, root.join(&collision)).unwrap();
+        assert!(
+            tools
+                .edit_file(EditFileInput::new("notes.txt", "old", "new"))
+                .unwrap()
+                .is_error
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(fs::read_to_string(&outside_target).unwrap(), "outside");
+        assert!(
+            fs::symlink_metadata(root.join(&collision))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::remove_file(root.join(&collision)).unwrap();
+
+        let replacement = root.join("replacement.txt");
+        fs::write(&replacement, "swapped").unwrap();
+        let swapped_target = target.clone();
+        set_edit_test_hook(EditTestHookPoint::BeforeTargetRecheck, move |_, _| {
+            fs::rename(&replacement, &swapped_target).unwrap();
+        });
+        let swap_temp = temp_name(TEMP_FILE_SEQUENCE.load(Ordering::Relaxed));
+        assert_eq!(
+            tools
+                .edit_file(EditFileInput::new("notes.txt", "old", "new"))
+                .unwrap(),
+            ToolOutput::failure("edit: target changed during edit")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "swapped"
+        );
+        assert!(!root.join(swap_temp).exists());
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        set_edit_test_hook(EditTestHookPoint::BeforeRename, move |_, _| {
+            cancellation.store(true, Ordering::Release);
+        });
+        let cancellation_temp = temp_name(TEMP_FILE_SEQUENCE.load(Ordering::Relaxed));
+        assert_eq!(
+            NativeToolCatalog::new(tools)
+                .execute(
+                    "native::edit",
+                    serde_json::json!({"path": "notes.txt", "old": "swapped", "new": "new"}),
+                    &ToolExecutionContext::new(cancelled, Duration::from_secs(1)),
+                )
+                .unwrap(),
+            ToolOutput::failure("tool execution cancelled")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "swapped"
+        );
+        assert!(!root.join(cancellation_temp).exists());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
 }
 
 #[cfg(unix)]
