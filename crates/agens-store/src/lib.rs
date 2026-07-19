@@ -11,6 +11,8 @@ use agens_core::{
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
+mod session_writer;
+
 const PERMISSIONS_DATABASE: &str = "rust-permissions.db";
 const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
