@@ -542,6 +542,147 @@ fn progressively_discloses_only_bounded_confined_skill_content() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn lazy_reads_remain_in_the_discovered_root_after_root_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    let outside = temporary.path.join("outside");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: original skill\n---\noriginal instructions\n",
+    );
+    fs::create_dir_all(root.join("research/references")).expect("references directory");
+    fs::write(
+        root.join("research/references/guide.md"),
+        "original reference",
+    )
+    .expect("original reference");
+    write_skill(
+        &outside,
+        "research",
+        "---\nname: research\ndescription: outside skill\n---\noutside instructions\n",
+    );
+    fs::create_dir_all(outside.join("research/references")).expect("outside references directory");
+    fs::write(
+        outside.join("research/references/guide.md"),
+        "outside reference",
+    )
+    .expect("outside reference");
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+
+    fs::rename(&root, temporary.path.join("former-root")).expect("replace root");
+    symlink(&outside, &root).expect("redirect root");
+
+    assert_eq!(skill.load_instructions().unwrap(), "original instructions");
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "guide.md")
+            .unwrap(),
+        "original reference"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_reads_remain_in_the_discovered_root_after_ancestor_replacement() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let parent = temporary.path.join("parent");
+    let root = parent.join("root");
+    let outside_parent = temporary.path.join("outside-parent");
+    let outside_root = outside_parent.join("root");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: original skill\n---\noriginal instructions\n",
+    );
+    write_skill(
+        &outside_root,
+        "research",
+        "---\nname: research\ndescription: outside skill\n---\noutside instructions\n",
+    );
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+
+    fs::rename(&parent, temporary.path.join("former-parent")).expect("replace ancestor");
+    symlink(&outside_parent, &parent).expect("redirect ancestor");
+
+    assert_eq!(skill.load_instructions().unwrap(), "original instructions");
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_manifest_reads_reject_post_discovery_hardlinks() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: research skill\n---\ninstructions\n",
+    );
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+    let manifest = root.join("research/SKILL.md");
+    let linked_manifest = temporary.path.join("linked-skill.md");
+    fs::write(&linked_manifest, "linked manifest").expect("linked manifest source");
+    fs::remove_file(&manifest).expect("remove manifest");
+    fs::hard_link(&linked_manifest, &manifest).expect("hardlink manifest");
+
+    assert_eq!(
+        skill.load_instructions().unwrap_err(),
+        "manifest must be a single-link regular file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lazy_resource_reads_reject_post_discovery_hardlinks_and_nonregular_files() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: research skill\n---\ninstructions\n",
+    );
+    let references = root.join("research/references");
+    fs::create_dir_all(&references).expect("references directory");
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+    let linked_source = temporary.path.join("linked-resource.md");
+    fs::write(&linked_source, "linked resource").expect("linked resource source");
+    fs::hard_link(&linked_source, references.join("linked.md")).expect("hardlink resource");
+    let fifo = references.join("stream");
+    let fifo = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "linked.md")
+            .unwrap_err(),
+        "skill resource must be a regular non-symbolic-link file"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "stream")
+            .unwrap_err(),
+        "skill resource must be a regular non-symbolic-link file"
+    );
+}
+
 fn write_skill(root: &Path, directory: &str, contents: &str) {
     let skill_directory = root.join(directory);
     fs::create_dir_all(&skill_directory).expect("skill directory");

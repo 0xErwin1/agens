@@ -134,13 +134,25 @@ fn install_subagent_panic_hook() {
     });
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Skill {
     name: String,
     description: String,
     source: PathBuf,
     directory: PathBuf,
+    directory_descriptor: Arc<fs::File>,
 }
+
+impl PartialEq for Skill {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.source == other.source
+            && self.directory == other.directory
+    }
+}
+
+impl Eq for Skill {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkillResourceClass {
@@ -389,37 +401,42 @@ impl Skill {
     }
 
     pub fn load_instructions(&self) -> Result<String, String> {
-        let directory = open_skill_root(&self.directory)
-            .map_err(|error| format!("cannot open skill instructions: {error}"))?;
-        let mut manifest =
-            open_manifest(&directory)?.ok_or("skill instructions are unavailable")?;
+        let mut manifest = open_manifest(&self.directory_descriptor)?
+            .ok_or("skill instructions are unavailable")?;
+        let metadata = manifest
+            .metadata()
+            .map_err(|error| format!("cannot inspect opened manifest: {error}"))?;
+        ensure_single_link_regular_file(&metadata, "manifest must be a single-link regular file")?;
         let contents = read_bounded_utf8(&mut manifest, MAX_SKILL_MANIFEST_BYTES)?;
 
-        parse_skill_manifest(&self.source, &self.directory, &contents)?;
+        parse_skill_manifest(
+            &self.source,
+            &self.directory,
+            Arc::clone(&self.directory_descriptor),
+            &contents,
+        )?;
         split_skill_frontmatter(&contents).map(|(_, body)| body.trim().to_owned())
     }
 
     pub fn load_resource(&self, class: SkillResourceClass, name: &str) -> Result<String, String> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt;
-
         if !is_normal_filename(name) {
             return Err("skill resource name must be a single normal filename".into());
         }
 
-        let directory = open_skill_root(&self.directory)
-            .map_err(|error| format!("cannot open skill resource root: {error}"))?;
-        let class_directory =
-            open_child_directory(&directory, std::ffi::OsStr::new(class.directory()))?
-                .ok_or("skill resource class is unavailable")?;
+        let class_directory = open_child_directory(
+            &self.directory_descriptor,
+            std::ffi::OsStr::new(class.directory()),
+        )?
+        .ok_or("skill resource class is unavailable")?;
         let mut resource = open_child_file(&class_directory, std::ffi::OsStr::new(name))?
             .ok_or("skill resource is unavailable")?;
         let metadata = resource
             .metadata()
             .map_err(|error| format!("cannot inspect skill resource: {error}"))?;
-        if !metadata.is_file() || metadata.nlink() > 1 {
-            return Err("skill resource must be a regular non-symbolic-link file".into());
-        }
+        ensure_single_link_regular_file(
+            &metadata,
+            "skill resource must be a regular non-symbolic-link file",
+        )?;
         if metadata.len() > MAX_SKILL_RESOURCE_BYTES {
             return Err(format!(
                 "skill resource exceeds {MAX_SKILL_RESOURCE_BYTES} byte limit"
@@ -672,8 +689,6 @@ fn load_skill_manifest(
     root_directory: &fs::File,
     directory_name: &std::ffi::OsStr,
 ) -> Result<Option<Skill>, SkillDiagnostic> {
-    use std::os::unix::fs::MetadataExt;
-
     let directory = root.join(directory_name);
     let manifest = directory.join(SKILL_MANIFEST_NAME);
     let directory_descriptor = match open_child_directory(root_directory, directory_name) {
@@ -692,12 +707,8 @@ fn load_skill_manifest(
             format!("cannot inspect opened manifest: {error}"),
         )
     })?;
-    if !metadata.is_file() || metadata.nlink() > 1 {
-        return Err(skill_diagnostic(
-            &manifest,
-            "manifest must be a single-link regular file".into(),
-        ));
-    }
+    ensure_single_link_regular_file(&metadata, "manifest must be a single-link regular file")
+        .map_err(|message| skill_diagnostic(&manifest, message))?;
     if metadata.len() > MAX_SKILL_MANIFEST_BYTES {
         return Err(skill_diagnostic(
             &manifest,
@@ -707,12 +718,22 @@ fn load_skill_manifest(
 
     let contents = read_bounded_utf8(&mut manifest_descriptor, MAX_SKILL_MANIFEST_BYTES)
         .map_err(|message| skill_diagnostic(&manifest, message))?;
-    parse_skill_manifest(&manifest, &directory, &contents)
-        .map(Some)
-        .map_err(|message| skill_diagnostic(&manifest, message))
+    parse_skill_manifest(
+        &manifest,
+        &directory,
+        Arc::new(directory_descriptor),
+        &contents,
+    )
+    .map(Some)
+    .map_err(|message| skill_diagnostic(&manifest, message))
 }
 
-fn parse_skill_manifest(source: &Path, directory: &Path, contents: &str) -> Result<Skill, String> {
+fn parse_skill_manifest(
+    source: &Path,
+    directory: &Path,
+    directory_descriptor: Arc<fs::File>,
+    contents: &str,
+) -> Result<Skill, String> {
     let (frontmatter, body) = split_skill_frontmatter(contents)?;
     let fields: SkillFrontmatter = serde_yaml::from_str(frontmatter)
         .map_err(|error| format!("invalid frontmatter: {error}"))?;
@@ -729,6 +750,7 @@ fn parse_skill_manifest(source: &Path, directory: &Path, contents: &str) -> Resu
         description,
         source: source.to_path_buf(),
         directory: directory.to_path_buf(),
+        directory_descriptor,
     })
 }
 
@@ -1104,6 +1126,17 @@ fn open_child_file(
         return Err("skill resource must be a regular non-symbolic-link file".into());
     }
     Err(format!("cannot open skill resource: {error}"))
+}
+
+#[cfg(unix)]
+fn ensure_single_link_regular_file(metadata: &fs::Metadata, message: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(message.into());
+    }
+
+    Ok(())
 }
 
 fn is_normal_filename(name: &str) -> bool {
