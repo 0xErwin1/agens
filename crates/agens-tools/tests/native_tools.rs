@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::Error;
 use agens_tools::{
     BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
     NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
@@ -152,44 +153,63 @@ fn bash_uses_the_project_root_and_reports_tool_failures() {
         tools
             .bash(BashInput::new("pwd; cat project.txt").with_timeout(Duration::from_secs(1)))
             .unwrap(),
-        ToolOutput::success(format!("{}\nproject\n", root.display()))
+        ToolOutput::success(format!(
+            "[stdout]\n{}\nproject\n[stderr]\n[exit status: 0]\n",
+            root.display()
+        ))
     );
-    let failure = tools.bash(BashInput::new("exit 7")).unwrap();
-    assert!(failure.is_error);
-    assert!(failure.content.contains("exit status: 7"));
+    assert_eq!(
+        tools
+            .bash(BashInput::new("printf stdout; printf stderr >&2; exit 7"))
+            .unwrap(),
+        ToolOutput::failure("[stdout]\nstdout\n[stderr]\nstderr\n[exit status: 7]\n")
+    );
 
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn bash_does_not_expose_raw_stderr_to_model_output() {
+fn bash_labels_stderr_for_success_and_tool_failures() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
 
-    let failure = tools
-        .bash(BashInput::new("printf SECRET_SENTINEL >&2; exit 7"))
+    let success = tools
+        .bash(BashInput::new("printf success-stderr >&2"))
         .unwrap();
 
-    assert_eq!(failure, ToolOutput::failure("bash: exit status: 7"));
+    assert_eq!(
+        success,
+        ToolOutput::success("[stdout]\n[stderr]\nsuccess-stderr\n[exit status: 0]\n")
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn bash_bounds_timeout_and_captured_output() {
+fn bash_enforces_one_total_labeled_output_budget_and_reports_timeout() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
 
     let timeout = tools
         .bash(BashInput::new("sleep 1").with_timeout(Duration::from_millis(25)))
         .unwrap();
-    assert_eq!(timeout, ToolOutput::failure("bash: timed out after 25ms"));
+    assert_eq!(
+        timeout,
+        ToolOutput::failure(
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+        )
+    );
 
     let output = tools
-        .bash(BashInput::new("printf 'x%.0s' {1..70000}"))
+        .bash(BashInput::new(
+            "printf 'x%.0s' {1..40000}; printf 'y%.0s' {1..40000} >&2",
+        ))
         .unwrap();
     assert!(!output.is_error);
-    assert!(output.content.ends_with("\n[bash output truncated]\n"));
-    assert!(output.content.len() <= 64 * 1024 + "\n[bash output truncated]\n".len());
+    assert!(output.content.starts_with("[stdout]\n"));
+    assert!(output.content.contains("\n[stderr]\n"));
+    assert!(output.content.contains("[bash output truncated]\n"));
+    assert!(output.content.ends_with("[exit status: 0]\n"));
+    assert!(output.content.len() <= 64 * 1024);
 
     fs::remove_dir_all(root).unwrap();
 }
@@ -205,7 +225,10 @@ fn bash_does_not_wait_for_background_descendant_output() {
         .bash(BashInput::new("sleep 1 &").with_timeout(Duration::from_secs(2)))
         .unwrap();
 
-    assert_eq!(output, ToolOutput::success("(no output; exit status 0)"));
+    assert_eq!(
+        output,
+        ToolOutput::success("[stdout]\n[stderr]\n[exit status: 0]\n")
+    );
     assert!(started.elapsed() < Duration::from_millis(500));
     fs::remove_dir_all(root).unwrap();
 }
@@ -232,10 +255,81 @@ fn bash_cancellation_kills_its_process_group_and_descendants() {
     cancelled.store(true, Ordering::Release);
     let output = worker.join().unwrap().unwrap();
 
-    assert_eq!(output, ToolOutput::failure("bash: cancelled"));
+    assert_eq!(
+        output,
+        ToolOutput::failure("[stdout]\n[stderr]\n[bash: cancelled]\n[exit status: unavailable]\n")
+    );
     assert!(started.elapsed() < Duration::from_secs(2));
     thread::sleep(Duration::from_millis(1100));
     assert!(!marker.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_returns_turn_cancellation_as_a_runtime_error() {
+    let root = project_root();
+    let catalog = Arc::new(NativeToolCatalog::new(NativeTools::open(&root).unwrap()));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let request_catalog = Arc::clone(&catalog);
+    let request_cancellation = Arc::clone(&cancelled);
+    let request = thread::spawn(move || {
+        request_catalog.execute(
+            "native::bash",
+            json!({"command": "sleep 1"}),
+            &ToolExecutionContext::new(request_cancellation, Duration::from_secs(2)),
+        )
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    cancelled.store(true, Ordering::Release);
+
+    assert!(matches!(request.join().unwrap(), Err(Error::Cancelled)));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_reports_malformed_and_empty_bash_input_as_tool_errors() {
+    let root = project_root();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+
+    assert_eq!(
+        catalog
+            .execute("native::bash", json!({"command": 1}), &context)
+            .unwrap(),
+        ToolOutput::failure("bash: command must be a string")
+    );
+    assert_eq!(
+        catalog
+            .execute("native::bash", json!({"command": ""}), &context)
+            .unwrap(),
+        ToolOutput::failure("bash: command is required")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_validates_the_optional_bash_timeout_override() {
+    let root = project_root();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let metadata = NativeToolCatalog::metadata();
+    let bash = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::bash")
+        .expect("bash metadata");
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+
+    assert_eq!(bash.input_schema["properties"]["timeout_ms"]["minimum"], 1);
+    assert_eq!(
+        catalog
+            .execute(
+                "native::bash",
+                json!({"command": "exit 1", "timeout_ms": 0}),
+                &context,
+            )
+            .unwrap(),
+        ToolOutput::failure("bash: timeout must be greater than zero")
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
