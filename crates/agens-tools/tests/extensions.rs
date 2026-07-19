@@ -4,7 +4,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agens_tools::markdown::{self, FrontmatterValue, MarkdownRoot};
+use agens_core::{AgentDefinition, AgentMode};
+use agens_tools::{
+    AgentCatalog,
+    markdown::{self, FrontmatterValue, MarkdownRoot},
+};
 
 #[test]
 fn parses_scalar_and_list_frontmatter_without_changing_the_body() {
@@ -174,6 +178,86 @@ fn rejects_a_symbolic_link_root_even_when_it_points_outside_the_confinement() {
         markdown::load_root(&root),
         Err("markdown root must be a non-symbolic-link directory".into())
     );
+}
+
+#[test]
+fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    write_agent(&global, "shared", "global", "all");
+    write_agent(&global, "worker", "worker", "subagent");
+    write_agent(&project, "shared", "project", "primary");
+    fs::write(project.join("broken.md"), "---\nname: broken\n---\n").unwrap();
+
+    let built_in = AgentDefinition {
+        name: "shared".into(),
+        description: "built-in".into(),
+        mode: AgentMode::Primary,
+        model: None,
+        system_prompt: "built-in".into(),
+        permission_rules: vec![],
+        skills: vec![],
+    };
+    let discovery = AgentCatalog::discover(&[built_in], &global, &project).unwrap();
+
+    assert_eq!(
+        discovery.catalog().agent("shared").unwrap().description,
+        "project"
+    );
+    assert_eq!(discovery.catalog().primary_or_all().count(), 1);
+    assert_eq!(discovery.catalog().subagents().count(), 1);
+    assert_eq!(discovery.shadowed().len(), 2);
+    assert_eq!(discovery.diagnostics().len(), 1);
+}
+
+#[test]
+fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    write_agent(&global, "duplicate", "first", "primary");
+    fs::write(
+        global.join("duplicate-copy.md"),
+        "---\nname: duplicate\ndescription: second\nmode: primary\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(global.join("model.md"), "---\nname: model\ndescription: model\nmode: all\nmodel: unknown\nskills:\n  - skill\npermissions:\n  - allow native::read\n---\nbody\n").unwrap();
+    fs::write(
+        project.join("large.md"),
+        "x".repeat(markdown::MAX_MARKDOWN_FILE_BYTES + 1),
+    )
+    .unwrap();
+
+    let duplicate = AgentDefinition {
+        name: "duplicate".into(),
+        description: "built-in".into(),
+        mode: AgentMode::Primary,
+        model: None,
+        system_prompt: "built-in".into(),
+        permission_rules: vec![],
+        skills: vec![],
+    };
+    let discovery =
+        AgentCatalog::discover(&[duplicate.clone(), duplicate], &global, &project).unwrap();
+
+    assert_eq!(
+        discovery.catalog().agent("duplicate").unwrap().description,
+        "first"
+    );
+    let model = discovery.catalog().agent("model").unwrap();
+    assert_eq!(model.model.as_deref(), Some("unknown"));
+    assert_eq!(model.system_prompt, "body");
+    assert_eq!(model.permission_rules.len(), 1);
+    assert_eq!(discovery.diagnostics().len(), 4);
+}
+
+fn write_agent(root: &std::path::Path, name: &str, description: &str, mode: &str) {
+    fs::write(root.join(format!("{name}.md")), format!("---\nname: {name}\ndescription: {description}\nmode: {mode}\npermissions: []\n---\nbody\n")).unwrap();
 }
 
 struct TemporaryDirectory {

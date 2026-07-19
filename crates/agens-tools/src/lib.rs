@@ -26,11 +26,13 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde_json::Value;
 
+mod agents;
 mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
 mod stdio_mcp;
 
+pub use agents::{AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentShadow};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 
