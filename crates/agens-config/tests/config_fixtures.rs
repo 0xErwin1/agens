@@ -55,6 +55,17 @@ fn extracts_only_safe_configured_stdio_mcp_servers() {
 }
 
 #[test]
+fn parses_disabled_mcp_servers_without_requiring_a_transport_definition() {
+    let document = parse_toml_document("[mcp.unavailable]\ndisabled = true").unwrap();
+
+    let servers = mcp_servers(&document).expect("disabled server should be accepted");
+
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].name, "unavailable");
+    assert!(servers[0].disabled);
+}
+
+#[test]
 fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
     let document = parse_toml_document(
         r#"
@@ -112,6 +123,7 @@ fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
 fn mcp_server_config_debug_redacts_environment_values_and_arguments() {
     let config = McpServerConfig {
         name: "files".into(),
+        disabled: false,
         transport: McpTransport::Stdio,
         command: Some(PathBuf::from("server")),
         args: vec!["--token".into(), "SENTINEL_ARGUMENT_SECRET".into()],

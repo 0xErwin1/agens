@@ -9,8 +9,8 @@ use agens_core::{
     PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use agens_tools::{
-    DispatchTool, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext,
-    ToolOutput,
+    DispatchTool, RemoteToolAccess, RemoteToolMetadata, ToolDispatchRequest, ToolDispatcher,
+    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use serde_json::json;
 
@@ -179,4 +179,75 @@ fn unknown_tools_are_rejected_before_policy_evaluation() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn later_mcp_registration_wins_a_native_model_alias_collision() {
+    let native_calls = Arc::new(AtomicUsize::new(0));
+    let mcp_calls = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native(
+            "native::files_read",
+            ToolAccess::ReadOnly,
+            CountingTool(Arc::clone(&native_calls), Ok(ToolOutput::success("native"))),
+        )
+        .unwrap();
+    let metadata = RemoteToolMetadata {
+        qualified_name: "files::read".into(),
+        server_name: "files".into(),
+        tool_name: "read".into(),
+        description: None,
+        input_schema: json!({}),
+        access: RemoteToolAccess::ReadOnly,
+    };
+    dispatcher
+        .register_mcp(
+            &metadata,
+            CountingTool(Arc::clone(&mcp_calls), Ok(ToolOutput::success("mcp"))),
+        )
+        .unwrap();
+
+    let identity = dispatcher
+        .canonical_identity("files::read")
+        .expect("legacy alias must resolve")
+        .to_owned();
+    assert_eq!(dispatcher.canonical_identity("files_read"), Some(&identity));
+    assert_ne!(identity.as_str(), "files::read");
+
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("files::read".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &policy,
+            &[ProjectPermissionGrant::allow(
+                "project",
+                PermissionPattern::Exact("files_read".into()),
+                PermissionPattern::Any,
+            )],
+            &PermissionSession::new(),
+            request("project", "files_read", "target"),
+        )
+        .expect("the later MCP registration should own the model alias")
+    else {
+        panic!("read-only MCP tool should be authorized");
+    };
+
+    assert_eq!(
+        dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::success("mcp")
+    );
+    assert_eq!(native_calls.load(Ordering::Acquire), 0);
+    assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
 }

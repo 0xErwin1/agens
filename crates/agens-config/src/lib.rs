@@ -53,6 +53,7 @@ pub enum McpTransport {
 #[derive(Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
+    pub disabled: bool,
     pub transport: McpTransport,
     pub command: Option<PathBuf>,
     pub args: Vec<String>,
@@ -69,6 +70,7 @@ impl fmt::Debug for McpServerConfig {
         formatter
             .debug_struct("McpServerConfig")
             .field("name", &self.name)
+            .field("disabled", &self.disabled)
             .field("transport", &self.transport)
             .field("command", &self.command)
             .field("args_count", &self.args.len())
@@ -105,6 +107,28 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
         .map(|(name, value)| {
             let server = value.as_table().ok_or_else(|| invalid_field("mcp", name))?;
             let path = format!("mcp.{name}");
+            let disabled = server
+                .get("disabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false);
+            if name.is_empty() || name.contains("::") {
+                return Err(invalid_field("mcp", name));
+            }
+            if disabled && !server.contains_key("transport") {
+                return Ok(McpServerConfig {
+                    name: name.clone(),
+                    disabled,
+                    transport: McpTransport::Stdio,
+                    command: None,
+                    args: Vec::new(),
+                    environment: BTreeMap::new(),
+                    cwd: None,
+                    url: None,
+                    headers: BTreeMap::new(),
+                    max_retries: 0,
+                    timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+                });
+            }
             let transport = match server.get("transport").and_then(toml::Value::as_str) {
                 Some("stdio") => McpTransport::Stdio,
                 Some("http") => McpTransport::Http,
@@ -214,6 +238,7 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
             }
             Ok(McpServerConfig {
                 name: name.clone(),
+                disabled,
                 transport,
                 command: command.map(PathBuf::from),
                 args,
@@ -537,15 +562,14 @@ fn is_grounded_tool_name(pattern: &str) -> bool {
     matches!(
         pattern,
         "bash" | "read" | "edit" | "write" | "list" | "search" | "webfetch"
-    ) || is_mcp_qualified_tool_name(pattern)
+    ) || is_tool_alias(pattern)
 }
 
-fn is_mcp_qualified_tool_name(pattern: &str) -> bool {
-    let Some((server_name, tool_name)) = pattern.split_once('_') else {
-        return false;
-    };
-
-    is_ascii_identifier(server_name) && is_ascii_identifier(tool_name)
+fn is_tool_alias(pattern: &str) -> bool {
+    (is_ascii_identifier(pattern) && !pattern.contains("__"))
+        || pattern.split_once("::").is_some_and(|(source, tool)| {
+            is_ascii_identifier(source) && is_ascii_identifier(tool) && !tool.contains("::")
+        })
 }
 
 fn is_ascii_identifier(value: &str) -> bool {
@@ -842,6 +866,7 @@ fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
             &path,
             &[
                 "transport",
+                "disabled",
                 "command",
                 "args",
                 "env",
@@ -853,6 +878,7 @@ fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
             ],
         )?;
         validate_optional(server, "transport", &path, toml::Value::is_str)?;
+        validate_optional(server, "disabled", &path, toml::Value::is_bool)?;
         validate_optional(server, "command", &path, toml::Value::is_str)?;
         validate_optional(server, "args", &path, is_string_array)?;
         validate_optional(server, "env", &path, is_string_table)?;

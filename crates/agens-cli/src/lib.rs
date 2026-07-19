@@ -1160,7 +1160,7 @@ impl Bootstrap {
             .ok_or_else(|| CliError::configuration("MCP project root is unavailable"))?;
         self.mcp_servers
             .iter()
-            .filter(|server| server.transport == McpTransport::Stdio)
+            .filter(|server| !server.disabled && server.transport == McpTransport::Stdio)
             .map(|server| {
                 let transport = McpStdioTransport::spawn(McpStdioTransportConfig {
                     command: server
@@ -1344,7 +1344,12 @@ where
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     let (provider_tools, tool_runtime) = production_tool_runtime(bootstrap, project_root)?;
     let project = project_root.display().to_string();
-    let policy = permission_policy(bootstrap.permission_rules(), &project, request.mode)?;
+    let policy = permission_policy(
+        bootstrap.permission_rules(),
+        &project,
+        request.mode,
+        &tool_runtime,
+    )?;
     let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
     let grants = grant_store
@@ -1451,16 +1456,14 @@ fn production_tool_runtime(
         .cloned()
         .collect::<Vec<_>>();
     let mut dispatcher = ToolDispatcher::new();
-    let mut provider_tools = Vec::new();
+    let mut provider_tools = BTreeMap::new();
 
     for metadata in NativeToolCatalog::metadata() {
-        provider_tools.push(
-            OpenAiFunctionTool::new(
-                metadata.qualified_name.clone(),
-                metadata.description,
-                metadata.input_schema,
-            )
-            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+        let model_name = native_model_tool_name(&metadata.qualified_name)?;
+        provider_tools.insert(
+            model_name.clone(),
+            OpenAiFunctionTool::new(model_name, metadata.description, metadata.input_schema)
+                .map_err(|_| CliError::configuration("native tools are unavailable"))?,
         );
         dispatcher
             .register_native(
@@ -1475,7 +1478,11 @@ fn production_tool_runtime(
     }
 
     for metadata in remote_tools {
-        provider_tools.push(remote_function_tool(&metadata)?);
+        let model_name = mcp_model_tool_name(&metadata);
+        provider_tools.insert(
+            model_name.clone(),
+            remote_function_tool(&metadata, model_name)?,
+        );
         dispatcher
             .register_mcp(
                 &metadata,
@@ -1487,7 +1494,10 @@ fn production_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
-    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
+    Ok((
+        provider_tools.into_values().collect(),
+        Arc::new(Mutex::new(dispatcher)),
+    ))
 }
 
 fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
@@ -1496,6 +1506,9 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
     let initialize = McpInitialize::new("2025-06-18", serde_json::json!({}), "agens", "0.1.0");
 
     for server in &bootstrap.mcp_servers {
+        if server.disabled {
+            continue;
+        }
         let timeout = std::time::Duration::from_millis(server.timeout_ms);
         let Ok(timeouts) = McpTimeouts::new(timeout, timeout, timeout) else {
             continue;
@@ -1549,9 +1562,24 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
     registry
 }
 
-fn remote_function_tool(metadata: &RemoteToolMetadata) -> Result<OpenAiFunctionTool, CliError> {
+fn native_model_tool_name(qualified_name: &str) -> Result<String, CliError> {
+    qualified_name
+        .strip_prefix("native::")
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| CliError::configuration("native tool metadata is invalid"))
+}
+
+fn mcp_model_tool_name(metadata: &RemoteToolMetadata) -> String {
+    format!("{}_{}", metadata.server_name, metadata.tool_name)
+}
+
+fn remote_function_tool(
+    metadata: &RemoteToolMetadata,
+    model_name: String,
+) -> Result<OpenAiFunctionTool, CliError> {
     OpenAiFunctionTool::new(
-        metadata.qualified_name.clone(),
+        model_name,
         metadata
             .description
             .clone()
@@ -2002,6 +2030,7 @@ fn permission_policy(
     rules: &[ConfigPermissionRule],
     project: &str,
     mode: PermissionMode,
+    dispatcher: &SharedToolDispatcher,
 ) -> Result<PermissionPolicy, CliError> {
     let rules = rules
         .iter()
@@ -2010,7 +2039,13 @@ fn permission_policy(
                 ConfigPermissionDecision::Allow => PermissionDecision::Allow,
                 ConfigPermissionDecision::Deny => PermissionDecision::Deny,
             };
-            let tool = PermissionPattern::Exact(configured_tool_name(&rule.tool_pattern)?);
+            let configured = configured_tool_name(&rule.tool_pattern)?;
+            let tool = dispatcher
+                .lock()
+                .map_err(|_| CliError::configuration("tool catalog is invalid"))?
+                .canonical_identity(&configured)
+                .map(|identity| PermissionPattern::Exact(identity.as_str().to_owned()))
+                .ok_or_else(|| CliError::configuration("permission configuration is invalid"))?;
             let target = match &rule.target_pattern {
                 Some(pattern) => PermissionPattern::glob(pattern.clone())
                     .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
@@ -2034,15 +2069,7 @@ fn configured_tool_name(name: &str) -> Result<String, CliError> {
         "list" => Ok("native::list".to_owned()),
         "search" => Ok("native::search".to_owned()),
         "bash" => Ok("native::bash".to_owned()),
-        name if name.contains('_') => {
-            let (server, tool) = name
-                .split_once('_')
-                .expect("MCP permission name was validated by configuration parsing");
-            Ok(format!("{server}::{tool}"))
-        }
-        _ => Err(CliError::configuration(
-            "permission configuration is invalid",
-        )),
+        name => Ok(name.to_owned()),
     }
 }
 
@@ -2169,6 +2196,13 @@ fn expand_global_mcp(
             .iter_mut()
             .filter_map(|(_, value)| value.as_table_mut())
         {
+            if server
+                .get("disabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
             for field in ["command", "cwd", "url"] {
                 expand_mcp_string_field(server, field, environment)?;
             }

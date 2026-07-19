@@ -154,6 +154,36 @@ fn bootstrap_factory_rejects_an_unusable_project_root() {
 }
 
 #[test]
+fn disabled_global_mcp_server_is_not_expanded_or_started() {
+    let temporary = TemporaryDirectory::new("disabled-mcp-server");
+    let config_home = temporary.path().join("config");
+    let project_root = temporary.path().join("project");
+    let marker = temporary.path().join("must-not-exist");
+    std::fs::create_dir_all(project_root.join(".git")).expect("repository marker should exist");
+
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!(
+                "[mcp.disabled]\ndisabled = true\ncommand = \"$(touch {})\"\n",
+                marker.display(),
+            ),
+        )]),
+    );
+
+    let bootstrap = bootstrap(&dependencies).expect("disabled global server should be accepted");
+
+    assert!(bootstrap.mcp_transports().unwrap().is_empty());
+    assert!(!marker.exists());
+}
+
+#[test]
 fn global_mcp_command_and_environment_fields_expand_without_expanding_system_prompt() {
     let temporary = TemporaryDirectory::new("mcp-command-expansion");
     let config_home = temporary.path().join("config");
@@ -3270,9 +3300,10 @@ impl ScriptedNativeOpenAiMockServer {
                         );
                         continue;
                     }
+                    let visible = model_visible_fragment(&fragment);
                     assert!(
-                        body.contains(&fragment),
-                        "request body should contain {fragment:?}: {body}"
+                        body.contains(&visible),
+                        "request body should contain {visible:?}: {body}"
                     );
                 }
                 stream
@@ -3313,9 +3344,10 @@ impl BoundedScriptedOpenAiMockServer {
                         );
                         continue;
                     }
+                    let visible = model_visible_fragment(&fragment);
                     assert!(
-                        body.contains(&fragment),
-                        "request body should contain {fragment:?}: {body}"
+                        body.contains(&visible),
+                        "request body should contain {visible:?}: {body}"
                     );
                 }
                 stream
@@ -3350,6 +3382,16 @@ impl BoundedScriptedOpenAiMockServer {
     fn join(self) {
         self.worker.join().expect("mock server should finish");
     }
+}
+
+fn model_visible_fragment(fragment: &str) -> String {
+    if let Some(name) = fragment.strip_prefix("native::") {
+        return name.to_owned();
+    }
+    if let Some((server, tool)) = fragment.split_once("::") {
+        return format!("{server}_{tool}");
+    }
+    fragment.to_owned()
 }
 
 impl OpenAiMockServer {

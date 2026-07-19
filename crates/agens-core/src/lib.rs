@@ -1374,6 +1374,19 @@ impl PermissionPolicy {
         self.evaluate_with_session_grants(request, project_grants, &[], session)
     }
 
+    pub fn normalized_tool_aliases(&self, aliases: impl Fn(&str) -> Option<String>) -> Self {
+        let mut policy = self.clone();
+        for rule in &mut policy.static_rules {
+            normalize_tool_pattern(&mut rule.tool, &aliases);
+        }
+        for predicate in &mut policy.safety_predicates {
+            if let SafetyPredicate::GlobalDeny(deny) = predicate {
+                normalize_tool_pattern(&mut deny.tool, &aliases);
+            }
+        }
+        policy
+    }
+
     pub fn evaluate_with_session_grants(
         &self,
         request: &PermissionRequest,
@@ -1425,6 +1438,31 @@ impl PermissionPolicy {
         } else {
             decision
         }
+    }
+}
+
+pub fn normalize_project_permission_grants(
+    grants: &[ProjectPermissionGrant],
+    aliases: impl Fn(&str) -> Option<String>,
+) -> Vec<ProjectPermissionGrant> {
+    grants
+        .iter()
+        .cloned()
+        .map(|mut grant| {
+            normalize_tool_pattern(&mut grant.tool, &aliases);
+            grant
+        })
+        .collect()
+}
+
+fn normalize_tool_pattern(
+    pattern: &mut PermissionPattern,
+    aliases: &impl Fn(&str) -> Option<String>,
+) {
+    if let PermissionPattern::Exact(value) = pattern
+        && let Some(canonical) = aliases(value)
+    {
+        *value = canonical;
     }
 }
 

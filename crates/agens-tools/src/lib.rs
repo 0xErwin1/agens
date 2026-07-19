@@ -2168,11 +2168,32 @@ pub enum ToolEvaluationOutcome {
 pub struct AuthorizedToolCall {
     dispatcher_id: u64,
     registration_version: u64,
-    qualified_tool_name: String,
+    identity: ToolIdentity,
     projected_target: String,
     access: ToolAccess,
     arguments: Value,
     arguments_digest: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolIdentity(String);
+
+impl ToolIdentity {
+    fn native(name: &str) -> Self {
+        Self(format!("native:{}:{name}", name.len()))
+    }
+
+    fn mcp(server: &str, tool: &str) -> Self {
+        Self(format!(
+            "mcp:{}:{server}:{}:{tool}",
+            server.len(),
+            tool.len()
+        ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 struct RegisteredDispatchTool {
@@ -2182,8 +2203,8 @@ struct RegisteredDispatchTool {
 }
 
 pub struct ToolDispatcher {
-    native_tools: BTreeMap<String, RegisteredDispatchTool>,
-    mcp_tools: BTreeMap<String, RegisteredDispatchTool>,
+    tools: BTreeMap<ToolIdentity, RegisteredDispatchTool>,
+    aliases: BTreeMap<String, ToolIdentity>,
     dispatcher_id: u64,
     next_version: u64,
 }
@@ -2202,8 +2223,8 @@ impl ToolDispatcher {
         Self {
             dispatcher_id: *PROCESS_NONCE ^ NEXT_DISPATCHER_ID.fetch_add(1, Ordering::AcqRel),
             next_version: 1,
-            native_tools: BTreeMap::new(),
-            mcp_tools: BTreeMap::new(),
+            tools: BTreeMap::new(),
+            aliases: BTreeMap::new(),
         }
     }
 
@@ -2214,9 +2235,19 @@ impl ToolDispatcher {
         tool: impl DispatchTool + 'static,
     ) -> Result<(), Error> {
         let name = name.into();
-        self.ensure_available_name(&name)?;
+        let native_name = name
+            .strip_prefix("native::")
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| Error::Tool("native tool name is invalid".into()))?
+            .to_owned();
         let version = self.allocate_version();
-        Self::insert(&mut self.native_tools, name, access, version, tool);
+        self.insert(
+            ToolIdentity::native(&native_name),
+            [name, native_name],
+            access,
+            version,
+            tool,
+        );
         Ok(())
     }
 
@@ -2225,11 +2256,13 @@ impl ToolDispatcher {
         metadata: &RemoteToolMetadata,
         tool: impl DispatchTool + 'static,
     ) -> Result<(), Error> {
-        self.ensure_available_name(&metadata.qualified_name)?;
         let version = self.allocate_version();
-        Self::insert(
-            &mut self.mcp_tools,
-            metadata.qualified_name.clone(),
+        self.insert(
+            ToolIdentity::mcp(&metadata.server_name, &metadata.tool_name),
+            [
+                metadata.qualified_name.clone(),
+                format!("{}_{}", metadata.server_name, metadata.tool_name),
+            ],
             remote_tool_access(metadata.access),
             version,
             tool,
@@ -2245,15 +2278,25 @@ impl ToolDispatcher {
         tool: impl DispatchTool + 'static,
     ) {
         let name = name.into();
+        let Some(native_name) = name
+            .strip_prefix("native::")
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
         let version = self.allocate_version();
-        self.native_tools.insert(
-            name,
-            RegisteredDispatchTool {
-                access,
-                version,
-                tool: Box::new(tool),
-            },
+        self.insert(
+            ToolIdentity::native(&native_name),
+            [name, native_name],
+            access,
+            version,
+            tool,
         );
+    }
+
+    pub fn canonical_identity(&self, alias: &str) -> Option<&ToolIdentity> {
+        self.aliases.get(alias)
     }
 
     pub fn evaluate(
@@ -2263,21 +2306,30 @@ impl ToolDispatcher {
         session: &PermissionSession,
         request: ToolDispatchRequest,
     ) -> Result<ToolEvaluationOutcome, Error> {
-        let registered = self
-            .native_tools
+        let identity = self
+            .aliases
             .get(&request.qualified_tool_name)
-            .or_else(|| self.mcp_tools.get(&request.qualified_tool_name))
             .ok_or_else(|| Error::Tool("unknown tool".into()))?;
+        let registered = self
+            .tools
+            .get(identity)
+            .ok_or_else(|| Error::Tool("unknown tool".into()))?;
+        let policy = policy.normalized_tool_aliases(|name| {
+            self.aliases.get(name).map(|identity| identity.0.clone())
+        });
+        let grants = agens_core::normalize_project_permission_grants(grants, |name| {
+            self.aliases.get(name).map(|identity| identity.0.clone())
+        });
         let permission = PermissionRequest::new(
             request.project_id,
-            request.qualified_tool_name,
+            identity.0.clone(),
             registered.tool.permission_target(&request.arguments)?,
             registered.access,
         );
-        let grants = if permission.project.trim().is_empty() {
+        let grants: &[ProjectPermissionGrant] = if permission.project.trim().is_empty() {
             &[]
         } else {
-            grants
+            &grants
         };
 
         match policy.evaluate(&permission, grants, session) {
@@ -2289,7 +2341,7 @@ impl ToolDispatcher {
                 Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
                     dispatcher_id: self.dispatcher_id,
                     registration_version: registered.version,
-                    qualified_tool_name: permission.tool,
+                    identity: identity.clone(),
                     projected_target: permission.target,
                     access: permission.access,
                     arguments_digest: digest_arguments(&request.arguments),
@@ -2312,9 +2364,8 @@ impl ToolDispatcher {
         }
 
         let registered = self
-            .native_tools
-            .get_mut(&handle.qualified_tool_name)
-            .or_else(|| self.mcp_tools.get_mut(&handle.qualified_tool_name))
+            .tools
+            .get_mut(&handle.identity)
             .ok_or_else(|| Error::Tool("stale authorized tool call".into()))?;
         if registered.version != handle.registration_version
             || registered.access != handle.access
@@ -2336,26 +2387,23 @@ impl ToolDispatcher {
         }
     }
 
-    fn ensure_available_name(&self, name: &str) -> Result<(), Error> {
-        if name.is_empty()
-            || self.native_tools.contains_key(name)
-            || self.mcp_tools.contains_key(name)
-        {
-            return Err(Error::Tool("tool name must be unique and non-empty".into()));
-        }
-
-        Ok(())
-    }
-
     fn insert(
-        registry: &mut BTreeMap<String, RegisteredDispatchTool>,
-        name: String,
+        &mut self,
+        identity: ToolIdentity,
+        aliases: impl IntoIterator<Item = String>,
         access: ToolAccess,
         version: u64,
         tool: impl DispatchTool + 'static,
     ) {
-        registry.insert(
-            name,
+        self.aliases.retain(|_, current| current != &identity);
+        self.aliases.extend(
+            aliases
+                .into_iter()
+                .filter(|alias| !alias.is_empty())
+                .map(|alias| (alias, identity.clone())),
+        );
+        self.tools.insert(
+            identity,
             RegisteredDispatchTool {
                 access,
                 version,
