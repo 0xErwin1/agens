@@ -2656,6 +2656,7 @@ impl BashInput {
 pub struct NativeTools {
     project_root: PathBuf,
     limits: NativeToolLimits,
+    webfetch: Mutex<WebfetchState>,
     #[cfg(unix)]
     project_root_dir: fs::File,
 }
@@ -2683,6 +2684,7 @@ impl NativeTools {
                 .map_err(|error| Error::Tool(format!("cannot open project root: {error}")))?,
             project_root,
             limits,
+            webfetch: Mutex::new(WebfetchState::default()),
         })
     }
 
@@ -2978,6 +2980,16 @@ impl NativeTools {
             return Ok(ToolOutput::failure("webfetch: cancelled"));
         }
 
+        if !self.begin_webfetch() {
+            return Ok(ToolOutput::failure("webfetch: request busy"));
+        }
+
+        let result = self.webfetch_with_admission(input);
+        self.finish_webfetch();
+        result
+    }
+
+    fn webfetch_with_admission(&self, input: WebfetchInput) -> Result<ToolOutput, Error> {
         let mut url = match webfetch_url(&input.url) {
             Ok(url) => url,
             Err(output) => return Ok(output),
@@ -3013,13 +3025,9 @@ impl NativeTools {
                 .resolve_to_addrs(host, &addresses)
                 .build()
                 .map_err(|_| Error::Tool("webfetch client setup failed".into()))?;
-            let (sender, receiver) = mpsc::sync_channel(1);
-            let request_url = url.clone();
-            thread::spawn(move || {
-                let _ = sender.send(webfetch_request(client, request_url));
-            });
+            self.start_webfetch_request(client, url.clone());
             let response = loop {
-                match receiver.recv_timeout(PROCESS_POLL_INTERVAL) {
+                match self.wait_for_webfetch_request() {
                     Ok(Ok(response)) => break response,
                     Ok(Err(WebfetchRequestError::TimedOut)) => {
                         return Ok(ToolOutput::failure("webfetch: timed out"));
@@ -3081,6 +3089,65 @@ impl NativeTools {
             )));
         }
         unreachable!("redirect loop always returns")
+    }
+
+    fn begin_webfetch(&self) -> bool {
+        let mut state = self.webfetch.lock().expect("webfetch state lock poisoned");
+        if state.active || !state.reap_completed_worker() {
+            return false;
+        }
+        state.active = true;
+        true
+    }
+
+    fn finish_webfetch(&self) {
+        self.webfetch
+            .lock()
+            .expect("webfetch state lock poisoned")
+            .active = false;
+    }
+
+    fn start_webfetch_request(&self, client: reqwest::blocking::Client, url: reqwest::Url) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = thread::spawn(move || {
+            let _ = sender.send(webfetch_request(client, url));
+        });
+        self.webfetch
+            .lock()
+            .expect("webfetch state lock poisoned")
+            .worker = Some(WebfetchWorker { receiver, handle });
+    }
+
+    fn wait_for_webfetch_request(
+        &self,
+    ) -> Result<Result<WebfetchResponse, WebfetchRequestError>, mpsc::RecvTimeoutError> {
+        let result = self
+            .webfetch
+            .lock()
+            .expect("webfetch state lock poisoned")
+            .worker
+            .as_ref()
+            .expect("webfetch admission owns request worker")
+            .receiver
+            .recv_timeout(PROCESS_POLL_INTERVAL);
+
+        if result.is_ok() || matches!(&result, Err(mpsc::RecvTimeoutError::Disconnected)) {
+            self.join_webfetch_worker();
+        }
+
+        result
+    }
+
+    fn join_webfetch_worker(&self) {
+        if let Some(worker) = self
+            .webfetch
+            .lock()
+            .expect("webfetch state lock poisoned")
+            .worker
+            .take()
+        {
+            let _ = worker.handle.join();
+        }
     }
 
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
@@ -3328,6 +3395,20 @@ impl NativeTools {
     }
 }
 
+impl Drop for NativeTools {
+    fn drop(&mut self) {
+        let worker = self
+            .webfetch
+            .get_mut()
+            .expect("webfetch state lock poisoned")
+            .worker
+            .take();
+        if let Some(worker) = worker {
+            let _ = worker.handle.join();
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeToolMetadata {
     pub qualified_name: String,
@@ -3342,6 +3423,32 @@ struct WebfetchResponse {
     html: bool,
     bytes: Vec<u8>,
     truncated: bool,
+}
+
+#[derive(Debug)]
+struct WebfetchWorker {
+    receiver: mpsc::Receiver<Result<WebfetchResponse, WebfetchRequestError>>,
+    handle: thread::JoinHandle<()>,
+}
+
+#[derive(Debug, Default)]
+struct WebfetchState {
+    active: bool,
+    worker: Option<WebfetchWorker>,
+}
+
+impl WebfetchState {
+    fn reap_completed_worker(&mut self) -> bool {
+        let Some(worker) = self.worker.as_ref() else {
+            return true;
+        };
+        if matches!(worker.receiver.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+            return false;
+        }
+        let worker = self.worker.take().expect("webfetch worker must exist");
+        let _ = worker.handle.join();
+        true
+    }
 }
 
 enum WebfetchRequestError {

@@ -1018,9 +1018,10 @@ fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
             thread::sleep(Duration::from_millis(100));
         });
         let cancelled = Arc::clone(&cancellation);
-        let request_root = root.clone();
+        let catalog = Arc::new(NativeToolCatalog::new(NativeTools::open(&root).unwrap()));
+        let request_catalog = Arc::clone(&catalog);
         let request = thread::spawn(move || {
-            NativeToolCatalog::new(NativeTools::open(request_root).unwrap())
+            request_catalog
                 .execute(
                     "native::webfetch",
                     json!({"url": url}),
@@ -1036,7 +1037,76 @@ fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
         );
         assert!(started.elapsed() < Duration::from_millis(100));
         worker.join().unwrap();
+        drop(catalog);
     }
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn webfetch_bounds_cancelled_request_workers_and_reuses_the_admission_slot() {
+    let root = project_root();
+    let tools = Arc::new(NativeTools::open(&root).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://localhost:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = Arc::clone(&accepted);
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        server_accepted.fetch_add(1, Ordering::Release);
+        let mut request = [0; 4096];
+        first.read_exact(&mut request[..1]).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+            .unwrap();
+
+        let (mut second, _) = listener.accept().unwrap();
+        server_accepted.fetch_add(1, Ordering::Release);
+        second.read_exact(&mut request[..1]).unwrap();
+        second
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")
+            .unwrap();
+    });
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let request_tools = Arc::clone(&tools);
+    let request_url = url.clone();
+    let request_cancellation = Arc::clone(&cancellation);
+    let request = thread::spawn(move || {
+        request_tools
+            .webfetch(WebfetchInput::new(request_url).with_cancellation(request_cancellation))
+            .unwrap()
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while accepted.load(Ordering::Acquire) == 0 {
+        assert!(Instant::now() < deadline, "request worker did not start");
+        thread::sleep(Duration::from_millis(1));
+    }
+    cancellation.store(true, Ordering::Release);
+    assert_eq!(
+        request.join().unwrap(),
+        ToolOutput::failure("webfetch: cancelled")
+    );
+
+    for _ in 0..4 {
+        assert_eq!(
+            tools.webfetch(WebfetchInput::new(&url)).unwrap(),
+            ToolOutput::failure("webfetch: request busy")
+        );
+    }
+    assert_eq!(accepted.load(Ordering::Acquire), 1);
+
+    thread::sleep(Duration::from_millis(320));
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::success("second")
+    );
+    assert_eq!(accepted.load(Ordering::Acquire), 2);
+    server.join().unwrap();
+    drop(tools);
     fs::remove_dir_all(root).unwrap();
 }
