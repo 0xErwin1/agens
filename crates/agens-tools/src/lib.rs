@@ -27,6 +27,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visi
 use serde_json::Value;
 
 mod http_mcp;
+pub mod http_worker;
 mod stdio_mcp;
 
 pub use http_mcp::McpHttpTransport;
