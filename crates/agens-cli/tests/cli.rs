@@ -998,11 +998,14 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     let config_home = temporary.path().join("config");
     let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
-    let server = OpenAiMockServer::start();
+    let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["\"parallel_tool_calls\":false".to_owned()],
+        response: text_response("Hello from OpenAI"),
+    }]);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = false\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -1048,13 +1051,14 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
         required_body_fragments: vec![
             "\"store\":false".to_owned(),
             "\"model\":\"test-model\"".to_owned(),
+            "\"parallel_tool_calls\":true".to_owned(),
         ],
         response: text_response("Hello from ChatGPT"),
     }]);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[agent]\nparallel_tool_calls = true\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
         ),
@@ -3302,10 +3306,6 @@ impl BoundedScriptedOpenAiMockServer {
 }
 
 impl OpenAiMockServer {
-    fn start() -> Self {
-        Self::start_with_api_key("SENTINEL_OPENAI_API_KEY")
-    }
-
     fn start_with_api_key(api_key: &str) -> Self {
         let expected_authorization = format!("authorization: Bearer {api_key}\r\n");
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");

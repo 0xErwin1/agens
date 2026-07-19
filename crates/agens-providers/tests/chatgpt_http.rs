@@ -1030,7 +1030,8 @@ fn subscription_tool_replay_replays_reasoning_calls_outputs_and_tools_without_re
             vec![tool],
             Duration::from_secs(1),
         )
-        .expect("provider should be configured");
+        .expect("provider should be configured")
+        .with_parallel_tool_calls(false);
 
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
@@ -1058,6 +1059,11 @@ fn subscription_tool_replay_replays_reasoning_calls_outputs_and_tools_without_re
 
     let requests = server.join();
     assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body["parallel_tool_calls"] == false)
+    );
     assert_eq!(requests[0].body["store"], false);
     assert!(requests[0].body.get("previous_response_id").is_none());
     assert_eq!(requests[1].body["store"], false);

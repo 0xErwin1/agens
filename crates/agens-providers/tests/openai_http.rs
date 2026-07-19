@@ -189,6 +189,7 @@ fn tool_enabled_initial_request_uses_flat_function_tool_json() {
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
                 "strict": true,
             }],
+            "parallel_tool_calls": true,
             "stream": true,
         })
     );
@@ -229,7 +230,8 @@ fn sends_ordered_tool_outputs_in_a_second_responses_request() {
         vec![tool],
         Duration::from_secs(1),
     )
-    .expect("provider should be configured");
+    .expect("provider should be configured")
+    .with_parallel_tool_calls(false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -262,9 +264,12 @@ fn sends_ordered_tool_outputs_in_a_second_responses_request() {
         parts,
         vec![agens_core::MessagePart::Text("done".to_owned())]
     );
-    let _initial_body = observed_body
-        .recv_timeout(Duration::from_secs(1))
-        .expect("server should capture initial request");
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should capture initial request")["parallel_tool_calls"],
+        false
+    );
     assert_eq!(
         observed_body
             .recv_timeout(Duration::from_secs(1))
@@ -283,6 +288,7 @@ fn sends_ordered_tool_outputs_in_a_second_responses_request() {
                 "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
                 "strict": true,
             }],
+            "parallel_tool_calls": false,
             "stream": true,
         })
     );
@@ -334,6 +340,7 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
             "model": "test-model",
             "previous_response_id": "resp_first",
             "input": [{"type": "function_call_output", "call_id": "call_first", "output": "Tool execution failed"}],
+            "parallel_tool_calls": true,
             "stream": true,
         })
     );
@@ -345,6 +352,7 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
             "model": "test-model",
             "previous_response_id": "resp_second",
             "input": [{"type": "function_call_output", "call_id": "call_second", "output": "second result"}],
+            "parallel_tool_calls": true,
             "stream": true,
         })
     );

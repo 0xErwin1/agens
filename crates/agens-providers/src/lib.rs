@@ -64,6 +64,7 @@ pub struct OpenAiResponsesProvider {
     model: String,
     prompt: String,
     tools: Vec<OpenAiFunctionTool>,
+    parallel_tool_calls: bool,
     client: reqwest::Client,
     state: ContinuationState,
     seen_response_ids: BTreeSet<String>,
@@ -86,6 +87,7 @@ pub struct ChatGptResponsesProvider {
     session_id: String,
     client: reqwest::Client,
     tools: Vec<OpenAiFunctionTool>,
+    parallel_tool_calls: bool,
     state: ChatGptContinuationState,
     seen_item_ids: BTreeSet<String>,
     seen_call_ids: BTreeSet<String>,
@@ -247,6 +249,7 @@ impl OpenAiResponsesProvider {
             model,
             prompt,
             tools,
+            parallel_tool_calls: true,
             client: reqwest::Client::builder()
                 .connect_timeout(request_timeout)
                 .build()
@@ -258,6 +261,11 @@ impl OpenAiResponsesProvider {
             continuation_rounds: 0,
             progress: None,
         })
+    }
+
+    pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        self.parallel_tool_calls = parallel_tool_calls;
+        self
     }
 
     async fn request_response(
@@ -395,6 +403,7 @@ impl ChatGptResponsesProvider {
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
             tools,
+            parallel_tool_calls: true,
             state: ChatGptContinuationState::Initial,
             seen_item_ids: BTreeSet::new(),
             seen_call_ids: BTreeSet::new(),
@@ -402,6 +411,11 @@ impl ChatGptResponsesProvider {
             continuation_rounds: 0,
             progress: None,
         })
+    }
+
+    pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
+        self.parallel_tool_calls = parallel_tool_calls;
+        self
     }
 
     async fn request_response(
@@ -587,7 +601,7 @@ impl ChatGptResponsesProvider {
             "instructions": self.instructions,
             "input": input,
             "tool_choice": "auto",
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": self.parallel_tool_calls,
             "store": false,
             "stream": true,
             "include": ["reasoning.encrypted_content"],
@@ -758,6 +772,7 @@ impl TurnProvider for OpenAiResponsesProvider {
                 match continuation_payload(
                     &self.model,
                     &self.tools,
+                    self.parallel_tool_calls,
                     &previous_response_id,
                     &pending_calls,
                     events,
@@ -820,6 +835,7 @@ impl OpenAiResponsesProvider {
         let mut payload = serde_json::json!({
             "model": self.model,
             "input": [{ "role": "user", "content": self.prompt }],
+            "parallel_tool_calls": self.parallel_tool_calls,
             "stream": true,
         });
 
@@ -834,6 +850,7 @@ impl OpenAiResponsesProvider {
 fn continuation_payload(
     model: &str,
     tools: &[OpenAiFunctionTool],
+    parallel_tool_calls: bool,
     previous_response_id: &str,
     pending_calls: &[PendingToolCall],
     events: &[TurnEvent],
@@ -885,6 +902,7 @@ fn continuation_payload(
         "model": model,
         "previous_response_id": previous_response_id,
         "input": input,
+        "parallel_tool_calls": parallel_tool_calls,
         "stream": true,
     });
 

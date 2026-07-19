@@ -95,14 +95,16 @@ impl HeadlessPermissionResolver for PermissionResolver {
 #[derive(Default)]
 struct ToolDispatcher {
     outputs: Vec<Result<HeadlessToolOutput, HeadlessTurnPortError>>,
+    calls: Vec<String>,
 }
 
 impl HeadlessToolDispatcher for ToolDispatcher {
     fn dispatch(
         &mut self,
-        _call: HeadlessToolCall,
+        call: HeadlessToolCall,
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send {
+        self.calls.push(call.name);
         ready(self.outputs.remove(0))
     }
 }
@@ -213,6 +215,7 @@ fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
             Ok(HeadlessToolOutput::success("asked result")),
             Ok(HeadlessToolOutput::success("allowed result")),
         ],
+        ..ToolDispatcher::default()
     };
     let mut repository = Repository::default();
 
@@ -228,6 +231,7 @@ fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
 
     assert_eq!(repository.snapshots, vec![snapshot.clone()]);
     assert_eq!(provider.iterations.len(), 0);
+    assert_eq!(dispatcher.calls, ["read", "search"]);
     assert_eq!(snapshot.events().len(), 17);
     assert_eq!(
         snapshot.events()[10],
@@ -315,6 +319,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
         &mut PermissionResolver::default(),
         &mut ToolDispatcher {
             outputs: vec![Err(HeadlessTurnPortError::Tool)],
+            ..ToolDispatcher::default()
         },
         &mut tool_repository,
         &HeadlessTurnCancellation::new(),
@@ -597,6 +602,7 @@ fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
         &mut PermissionResolver::default(),
         &mut ToolDispatcher {
             outputs: vec![Ok(HeadlessToolOutput::success("read result"))],
+            ..ToolDispatcher::default()
         },
         &mut repository,
         &HeadlessTurnCancellation::new(),

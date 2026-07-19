@@ -1275,6 +1275,9 @@ fn run_production_headless_chat_with_progress(
                         tools,
                         std::time::Duration::from_secs(120),
                     )
+                    .map(|provider| {
+                        provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                    })
                     .map_err(|_| {
                         CliError::authentication("OpenAI API authentication is unavailable")
                     })
@@ -1304,6 +1307,9 @@ fn run_production_headless_chat_with_progress(
                         tools,
                         std::time::Duration::from_secs(120),
                     )
+                    .map(|provider| {
+                        provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                    })
                     .map_err(|_| {
                         CliError::authentication("ChatGPT credentials are unavailable or invalid")
                     })
