@@ -823,7 +823,7 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
 }
 
 #[test]
-fn migrates_persisted_completed_turns_to_a_non_resumable_archive_on_reopen() {
+fn fresh_v2_legacy_coexistence() {
     let directory = data_directory();
     let first = completed_snapshot("first");
     let second = completed_snapshot("second");
@@ -832,6 +832,27 @@ fn migrates_persisted_completed_turns_to_a_non_resumable_archive_on_reopen() {
         let mut store = SessionStore::open(&directory).unwrap();
         assert_eq!(store.database_path(), directory.join("rust-sessions.db"));
         assert!(!directory.join("rust-permissions.db").exists());
+        let database = Connection::open(store.database_path()).unwrap();
+        assert_eq!(
+            database
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            database
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            database
+                .query_row("SELECT count(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(database);
 
         block_on_ready(store.persist_completed_turn(first.clone())).unwrap();
         block_on_ready(store.persist_completed_turn(second.clone())).unwrap();
@@ -846,6 +867,7 @@ fn migrates_persisted_completed_turns_to_a_non_resumable_archive_on_reopen() {
     assert_eq!(stored_turns[1].snapshot, second);
 
     let reopened = SessionStore::open(&directory).unwrap();
+    assert_eq!(reopened.list_completed_turns().unwrap(), stored_turns);
     assert!(
         reopened
             .load_completed_turn_for_resume(stored_turns[1].id)
@@ -865,7 +887,7 @@ fn rolls_back_a_completed_turn_when_an_event_write_fails() {
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER reject_second_event
-             BEFORE INSERT ON completed_turn_events
+             BEFORE INSERT ON legacy_turn_events
              WHEN NEW.sequence = 1
              BEGIN
                  SELECT RAISE(ABORT, 'reject event');
@@ -1003,7 +1025,7 @@ fn round_trips_all_persisted_event_variants_losslessly() {
 
     block_on_ready(store.persist_completed_turn(snapshot.clone())).unwrap();
 
-    assert_eq!(store.load_completed_turn_for_resume(1).unwrap(), snapshot);
+    assert_eq!(store.list_completed_turns().unwrap()[0].snapshot, snapshot);
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -1124,13 +1146,13 @@ fn rejects_missing_or_cross_variant_persisted_event_fields() {
             Connection::open(store.database_path())
                 .unwrap()
                 .execute(
-                    &format!("UPDATE completed_turn_events SET {field} = NULL WHERE sequence = ?1"),
+                    &format!("UPDATE legacy_turn_events SET {field} = NULL WHERE sequence = ?1"),
                     [sequence],
                 )
                 .unwrap();
 
             assert!(
-                store.load_completed_turn_for_resume(1).is_err(),
+                store.list_completed_turns().is_err(),
                 "missing required {field} for sequence {sequence} must fail closed"
             );
             fs::remove_dir_all(directory).unwrap();
@@ -1151,15 +1173,13 @@ fn rejects_missing_or_cross_variant_persisted_event_fields() {
             Connection::open(store.database_path())
                 .unwrap()
                 .execute(
-                    &format!(
-                        "UPDATE completed_turn_events SET {field} = {value} WHERE sequence = ?1"
-                    ),
+                    &format!("UPDATE legacy_turn_events SET {field} = {value} WHERE sequence = ?1"),
                     [sequence],
                 )
                 .unwrap();
 
             assert!(
-                store.load_completed_turn_for_resume(1).is_err(),
+                store.list_completed_turns().is_err(),
                 "forbidden {field} for sequence {sequence} must fail closed"
             );
             fs::remove_dir_all(directory).unwrap();
@@ -1185,13 +1205,13 @@ fn rejects_unknown_persisted_event_tags_and_invalid_required_field_types() {
         Connection::open(store.database_path())
             .unwrap()
             .execute(
-                &format!("UPDATE completed_turn_events SET {assignment} WHERE sequence = ?1"),
+                &format!("UPDATE legacy_turn_events SET {assignment} WHERE sequence = ?1"),
                 [sequence],
             )
             .unwrap();
 
         assert!(
-            store.load_completed_turn_for_resume(1).is_err(),
+            store.list_completed_turns().is_err(),
             "corruption {assignment} must fail closed"
         );
         fs::remove_dir_all(directory).unwrap();

@@ -179,7 +179,7 @@ impl SessionStore {
         source.execute_batch("BEGIN").map_err(|error| {
             SessionStoreError::operation("snapshot backup source", &self.database_path, error)
         })?;
-        initialize_sessions_schema(&source, &self.database_path)?;
+        validate_v1_schema(&source, &self.database_path)?;
         let source_manifest = v1_manifest(&source).map_err(|error| {
             SessionStoreError::operation("read backup source", &self.database_path, error)
         })?;
@@ -672,7 +672,7 @@ fn decode_pattern(
 }
 
 const SESSIONS_DATABASE: &str = "rust-sessions.db";
-const SESSIONS_SCHEMA_VERSION: i64 = 1;
+const SESSIONS_SCHEMA_VERSION: i64 = 2;
 const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
     0, "id", "INTEGER", false, None, 1,
 )];
@@ -818,7 +818,7 @@ impl SessionStore {
         restrict_session_permissions(data_directory, 0o700)?;
 
         let database_path = data_directory.join(SESSIONS_DATABASE);
-        let connection = Connection::open(&database_path).map_err(|error| {
+        let mut connection = Connection::open(&database_path).map_err(|error| {
             SessionStoreError::operation("open database", &database_path, error)
         })?;
         restrict_session_permissions(&database_path, 0o600)?;
@@ -834,8 +834,16 @@ impl SessionStore {
             })?;
 
         match session_schema_version(&connection, &database_path)? {
-            0 => initialize_sessions_schema(&connection, &database_path)?,
+            0 => {
+                initialize_v2_schema(&mut connection, &database_path)?;
+                connection
+                    .pragma_update(None, "journal_mode", "WAL")
+                    .map_err(|error| {
+                        SessionStoreError::operation("enable WAL", &database_path, error)
+                    })?;
+            }
             1 => {
+                validate_v1_schema(&connection, &database_path)?;
                 let mut store = Self {
                     database_path: database_path.clone(),
                     connection,
@@ -867,7 +875,7 @@ impl SessionStore {
     pub fn list_completed_turns(&self) -> Result<Vec<StoredCompletedTurn>, SessionStoreError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM completed_turns ORDER BY id")
+            .prepare("SELECT id FROM legacy_turns ORDER BY id")
             .map_err(|error| {
                 SessionStoreError::operation(
                     "prepare completed turn list",
@@ -891,7 +899,7 @@ impl SessionStore {
 
         ids.into_iter()
             .map(|id| {
-                self.load_completed_turn_for_resume(id)
+                self.load_legacy_completed_turn(id)
                     .map(|snapshot| StoredCompletedTurn { id, snapshot })
             })
             .collect()
@@ -904,30 +912,41 @@ impl SessionStore {
         let exists = self
             .connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM completed_turns WHERE id = ?1)",
+                "SELECT EXISTS(SELECT 1 FROM legacy_turns WHERE id = ?1)",
                 [id],
                 |row| row.get::<_, bool>(0),
             )
             .map_err(|error| {
                 SessionStoreError::operation("check completed turn", &self.database_path, error)
             })?;
-        if !exists {
+        if exists {
             return Err(SessionStoreError::operation(
                 "load completed turn",
                 &self.database_path,
-                format!("unknown completed turn {id}"),
+                format!("legacy completed turn {id} is non-resumable"),
             ));
         }
 
+        Err(SessionStoreError::operation(
+            "load completed turn",
+            &self.database_path,
+            format!("unknown completed turn {id}"),
+        ))
+    }
+
+    fn load_legacy_completed_turn(
+        &self,
+        id: i64,
+    ) -> Result<CompletedTurnSnapshot, SessionStoreError> {
         let mut statement = self
             .connection
             .prepare(
                 "SELECT kind, state, part_kind, call_id, name, input, content, is_error
-             FROM completed_turn_events WHERE turn_id = ?1 ORDER BY sequence",
+             FROM legacy_turn_events WHERE turn_id = ?1 ORDER BY sequence",
             )
             .map_err(|error| {
                 SessionStoreError::operation(
-                    "prepare completed turn events",
+                    "prepare legacy completed turn events",
                     &self.database_path,
                     error,
                 )
@@ -947,7 +966,7 @@ impl SessionStore {
             })
             .map_err(|error| {
                 SessionStoreError::operation(
-                    "query completed turn events",
+                    "query legacy completed turn events",
                     &self.database_path,
                     error,
                 )
@@ -956,14 +975,14 @@ impl SessionStore {
             .map(|row| {
                 let fields = row.map_err(|error| {
                     SessionStoreError::operation(
-                        "read completed turn events",
+                        "read legacy completed turn events",
                         &self.database_path,
                         error,
                     )
                 })?;
                 decode_turn_event(fields).map_err(|error| {
                     SessionStoreError::operation(
-                        "decode completed turn events",
+                        "decode legacy completed turn events",
                         &self.database_path,
                         error,
                     )
@@ -993,21 +1012,36 @@ impl SessionStore {
                 SessionStoreError::operation("start transaction", &self.database_path, error)
             })?;
         transaction
-            .execute("INSERT INTO completed_turns DEFAULT VALUES", [])
+            .execute(
+                "INSERT INTO legacy_turns(id, status, reason, source_event_count)
+                 VALUES (NULL, 'non_resumable', 'v1 lacks session/user/project/title/agent/timestamps', 0)",
+                [],
+            )
             .map_err(|error| {
                 SessionStoreError::operation("create completed turn", &self.database_path, error)
             })?;
         let turn_id = transaction.last_insert_rowid();
 
         for (sequence, event) in snapshot.events().iter().enumerate() {
-            insert_turn_event(&transaction, turn_id, sequence as i64, event).map_err(|error| {
-                SessionStoreError::operation(
-                    "write completed turn event",
-                    &self.database_path,
-                    error,
-                )
-            })?;
+            insert_legacy_turn_event(&transaction, turn_id, sequence as i64, event).map_err(
+                |error| {
+                    SessionStoreError::operation(
+                        "write completed turn event",
+                        &self.database_path,
+                        error,
+                    )
+                },
+            )?;
         }
+
+        transaction
+            .execute(
+                "UPDATE legacy_turns SET source_event_count = ?1 WHERE id = ?2",
+                params![snapshot.events().len() as i64, turn_id],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("finalize completed turn", &self.database_path, error)
+            })?;
 
         transaction.commit().map_err(|error| {
             SessionStoreError::operation("commit transaction", &self.database_path, error)
@@ -1027,7 +1061,30 @@ impl CompletedTurnRepository for SessionStore {
     }
 }
 
-fn initialize_sessions_schema(
+fn initialize_v2_schema(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            SessionStoreError::operation("start v2 initialization", database_path, error)
+        })?;
+    create_legacy_archive_schema(&transaction, database_path)?;
+    transaction
+        .execute_batch(&format!(
+            "{NORMALIZED_SESSION_SCHEMA} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};"
+        ))
+        .map_err(|error| {
+            SessionStoreError::operation("initialize v2 schema", database_path, error)
+        })?;
+    validate_v2_schema(&transaction, database_path)?;
+    transaction.commit().map_err(|error| {
+        SessionStoreError::operation("commit v2 initialization", database_path, error)
+    })
+}
+
+fn validate_v1_schema(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
@@ -1037,41 +1094,12 @@ fn initialize_sessions_schema(
             SessionStoreError::operation("read schema version", database_path, error)
         })?;
 
-    match version {
-        0 => connection
-            .execute_batch(&format!(
-                "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS completed_turns (id INTEGER PRIMARY KEY);
-             CREATE TABLE IF NOT EXISTS completed_turn_events (
-                 turn_id INTEGER NOT NULL,
-                 sequence INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 state TEXT,
-                 part_kind TEXT,
-                 call_id TEXT,
-                 name TEXT,
-                 input TEXT,
-                 content TEXT,
-                 is_error INTEGER,
-                 PRIMARY KEY (turn_id, sequence),
-                 FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
-              );
-              CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-                  ON completed_turn_events(turn_id, sequence);
-              PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};
-              COMMIT;"
-            ))
-            .map_err(|error| {
-                SessionStoreError::operation("initialize schema", database_path, error)
-            })?,
-        SESSIONS_SCHEMA_VERSION => {}
-        unsupported => {
-            return Err(SessionStoreError::operation(
-                "check schema version",
-                database_path,
-                format!("unsupported schema version {unsupported}"),
-            ));
-        }
+    if version != 1 {
+        return Err(SessionStoreError::operation(
+            "check schema version",
+            database_path,
+            format!("unsupported schema version {version}"),
+        ));
     }
 
     let completed_turns_matches =
@@ -1607,7 +1635,7 @@ fn verify_v1_backup(
     let quick_check: String = backup
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .map_err(|error| SessionStoreError::operation("quick check backup", backup_path, error))?;
-    initialize_sessions_schema(backup, backup_path)?;
+    validate_v1_schema(backup, backup_path)?;
     let backup_manifest = v1_manifest(backup)
         .map_err(|error| SessionStoreError::operation("read backup", backup_path, error))?;
 
@@ -1622,7 +1650,7 @@ fn verify_v1_backup(
     Ok(backup_manifest)
 }
 
-fn insert_turn_event(
+fn insert_legacy_turn_event(
     transaction: &Transaction<'_>,
     turn_id: i64,
     sequence: i64,
@@ -1630,7 +1658,7 @@ fn insert_turn_event(
 ) -> rusqlite::Result<()> {
     let fields = encode_turn_event(event);
     transaction.execute(
-        "INSERT INTO completed_turn_events
+        "INSERT INTO legacy_turn_events
          (turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
