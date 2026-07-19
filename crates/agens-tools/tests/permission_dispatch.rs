@@ -251,3 +251,80 @@ fn later_mcp_registration_wins_a_native_model_alias_collision() {
     assert_eq!(native_calls.load(Ordering::Acquire), 0);
     assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
 }
+
+#[test]
+fn displaced_canonical_and_legacy_aliases_invalidate_old_handles() {
+    for (native_name, authorized_alias) in [
+        ("native::files_read", "files_read"),
+        ("native::files::read", "files::read"),
+    ] {
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let mcp_calls = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = ToolDispatcher::new();
+        dispatcher
+            .register_native(
+                native_name,
+                ToolAccess::ReadOnly,
+                CountingTool(Arc::clone(&native_calls), Ok(ToolOutput::success("native"))),
+            )
+            .unwrap();
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+        let ToolEvaluationOutcome::Authorized(stale_handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                request("project", authorized_alias, "target"),
+            )
+            .unwrap()
+        else {
+            panic!("native tool should authorize before replacement");
+        };
+
+        dispatcher
+            .register_mcp(
+                &RemoteToolMetadata {
+                    qualified_name: "files::read".into(),
+                    server_name: "files".into(),
+                    tool_name: "read".into(),
+                    description: None,
+                    input_schema: json!({}),
+                    access: RemoteToolAccess::ReadOnly,
+                },
+                CountingTool(Arc::clone(&mcp_calls), Ok(ToolOutput::success("mcp"))),
+            )
+            .unwrap();
+
+        assert!(
+            dispatcher
+                .execute(
+                    stale_handle,
+                    &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+                )
+                .is_err()
+        );
+        assert_eq!(native_calls.load(Ordering::Acquire), 0);
+
+        let ToolEvaluationOutcome::Authorized(new_handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::with_temporary_bypass(),
+                request("project", "files_read", "target"),
+            )
+            .unwrap()
+        else {
+            panic!("new MCP owner should authorize");
+        };
+        assert_eq!(
+            dispatcher
+                .execute(
+                    new_handle,
+                    &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+                )
+                .unwrap(),
+            ToolOutput::success("mcp")
+        );
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
+    }
+}

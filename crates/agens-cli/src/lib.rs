@@ -2755,4 +2755,157 @@ mod tests {
                 .expect("temporary grant directory should be removed");
         }
     }
+
+    #[test]
+    fn canonical_and_legacy_mcp_permission_aliases_resolve_after_reload() {
+        struct RuntimeTool;
+
+        impl DispatchTool for RuntimeTool {
+            fn execute(
+                &mut self,
+                _: &ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<ToolOutput, agens_core::Error> {
+                Ok(ToolOutput::success("executed"))
+            }
+        }
+
+        fn dispatcher() -> ToolDispatcher {
+            let mut dispatcher = ToolDispatcher::new();
+            dispatcher
+                .register_mcp(
+                    &RemoteToolMetadata {
+                        qualified_name: "files::read".into(),
+                        server_name: "files".into(),
+                        tool_name: "read".into(),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                        access: agens_tools::RemoteToolAccess::ReadOnly,
+                    },
+                    RuntimeTool,
+                )
+                .expect("MCP tool should register");
+            dispatcher
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("agens-canonical-grants-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let request = || {
+            ToolDispatchRequest::new(
+                "project",
+                "files_read",
+                serde_json::json!({"target": "notes.md"}),
+            )
+        };
+        let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+        let initial = dispatcher();
+        let ToolEvaluationOutcome::PromptRequired(context) = initial
+            .evaluate(&policy, &[], &PermissionSession::new(), request())
+            .expect("canonical model name should resolve")
+        else {
+            panic!("ungranted MCP call should require a prompt");
+        };
+        assert_ne!(context.qualified_tool_name, "files::read");
+        let canonical_name = context.qualified_tool_name.clone();
+
+        let canonical = agens_core::ProjectPermissionGrant::allow(
+            "project",
+            PermissionPattern::Exact(canonical_name.clone()),
+            PermissionPattern::Exact(context.target_identifier),
+        );
+        PermissionGrantStore::open(&directory)
+            .expect("grant store should open")
+            .append_grants(&[canonical])
+            .expect("canonical grant should save");
+        let grants = PermissionGrantStore::open(&directory)
+            .expect("grant store should reopen")
+            .grants_for_project("project")
+            .expect("canonical grant should reload");
+        assert_eq!(
+            grants[0].tool,
+            PermissionPattern::Exact(canonical_name),
+            "prompt grants must persist the canonical identity"
+        );
+        let mut reloaded = dispatcher();
+        let ToolEvaluationOutcome::Authorized(handle) = reloaded
+            .evaluate(&policy, &grants, &PermissionSession::new(), request())
+            .expect("canonical grant should resolve after reload")
+        else {
+            panic!("canonical grant should allow the model call");
+        };
+        assert_eq!(
+            reloaded
+                .execute(
+                    handle,
+                    &ToolExecutionContext::with_timeout(std::time::Duration::from_secs(1))
+                )
+                .expect("reloaded canonical grant should execute"),
+            ToolOutput::success("executed")
+        );
+
+        for decision in [PermissionDecision::Allow, PermissionDecision::Deny] {
+            let directory = directory.join(format!("legacy-{decision:?}"));
+            PermissionGrantStore::open(&directory)
+                .expect("grant store should open")
+                .append_grants(&[agens_core::ProjectPermissionGrant::new(
+                    "project",
+                    decision,
+                    PermissionPattern::Exact("files::read".into()),
+                    PermissionPattern::Exact("notes.md".into()),
+                )])
+                .expect("legacy grant should save");
+            let grants = PermissionGrantStore::open(&directory)
+                .expect("grant store should reopen")
+                .grants_for_project("project")
+                .expect("legacy grant should reload");
+            let outcome = dispatcher()
+                .evaluate(&policy, &grants, &PermissionSession::new(), request())
+                .expect("legacy grant should resolve through the model alias");
+            match decision {
+                PermissionDecision::Allow => {
+                    assert!(matches!(outcome, ToolEvaluationOutcome::Authorized(_)));
+                }
+                PermissionDecision::Deny => {
+                    assert!(matches!(outcome, ToolEvaluationOutcome::Denied));
+                }
+                PermissionDecision::Ask => unreachable!(),
+            }
+        }
+
+        for (configured_decision, expected_decision) in [
+            (ConfigPermissionDecision::Allow, PermissionDecision::Allow),
+            (ConfigPermissionDecision::Deny, PermissionDecision::Deny),
+        ] {
+            let runtime = Arc::new(Mutex::new(dispatcher()));
+            let policy = permission_policy(
+                &[ConfigPermissionRule {
+                    scope: ConfigPermissionScope::Global,
+                    decision: configured_decision,
+                    tool_pattern: "files::read".into(),
+                    target_pattern: None,
+                }],
+                "project",
+                PermissionMode::Edit,
+                &runtime,
+            )
+            .expect("legacy configuration should resolve to the canonical model tool");
+            let outcome = runtime
+                .lock()
+                .expect("dispatcher should remain available")
+                .evaluate(&policy, &[], &PermissionSession::new(), request())
+                .expect("canonical model call should evaluate");
+            match expected_decision {
+                PermissionDecision::Allow => {
+                    assert!(matches!(outcome, ToolEvaluationOutcome::Authorized(_)));
+                }
+                PermissionDecision::Deny => {
+                    assert!(matches!(outcome, ToolEvaluationOutcome::Denied));
+                }
+                PermissionDecision::Ask => unreachable!(),
+            }
+        }
+
+        std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+    }
 }

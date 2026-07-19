@@ -2395,13 +2395,27 @@ impl ToolDispatcher {
         version: u64,
         tool: impl DispatchTool + 'static,
     ) {
+        let aliases = aliases
+            .into_iter()
+            .filter(|alias| !alias.is_empty())
+            .collect::<Vec<_>>();
+        let displaced = aliases
+            .iter()
+            .filter_map(|alias| self.aliases.get(alias))
+            .filter(|current| *current != &identity)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for displaced_identity in displaced {
+            let replacement_version = self.allocate_version();
+            if let Some(displaced_tool) = self.tools.get_mut(&displaced_identity) {
+                displaced_tool.version = replacement_version;
+            }
+        }
+
         self.aliases.retain(|_, current| current != &identity);
-        self.aliases.extend(
-            aliases
-                .into_iter()
-                .filter(|alias| !alias.is_empty())
-                .map(|alias| (alias, identity.clone())),
-        );
+        self.aliases
+            .extend(aliases.into_iter().map(|alias| (alias, identity.clone())));
         self.tools.insert(
             identity,
             RegisteredDispatchTool {
