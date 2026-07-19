@@ -214,6 +214,92 @@ fn bash_enforces_one_total_labeled_output_budget_and_reports_timeout() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn bash_combines_streams_with_a_deterministic_total_budget() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let command = "printf 'x%.0s' {1..40000}; printf 'y%.0s' {1..40000} >&2";
+    let expected = tools.bash(BashInput::new(command)).unwrap();
+
+    assert!(!expected.is_error);
+    assert!(expected.content.contains("\n[stderr]\n"));
+    assert!(expected.content.contains("yyyy"));
+    assert!(expected.content.contains("[bash output truncated]\n"));
+    assert!(expected.content.ends_with("[exit status: 0]\n"));
+    assert!(expected.content.len() <= 64 * 1024);
+    assert_eq!(expected.content.matches('x').count(), 32_705);
+    assert_eq!(expected.content.matches('y').count(), 32_704);
+
+    for _ in 0..4 {
+        assert_eq!(tools.bash(BashInput::new(command)).unwrap(), expected);
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_preserves_the_bounded_bash_result_without_generic_truncation() {
+    let root = project_root();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let output = catalog
+        .execute(
+            "native::bash",
+            json!({"command": "printf 'x%.0s' {1..40000}; printf 'y%.0s' {1..40000} >&2"}),
+            &ToolExecutionContext::with_timeout(Duration::from_secs(2)),
+        )
+        .unwrap();
+
+    assert!(output.content.len() > 16 * 1024);
+    assert!(output.content.len() <= 64 * 1024);
+    assert!(output.content.contains("\n[stderr]\n"));
+    assert!(output.content.contains("yyyy"));
+    assert!(output.content.contains("[bash output truncated]\n"));
+    assert!(output.content.ends_with("[exit status: 0]\n"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn bash_inherits_environment_and_reports_sanitized_start_failures() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools
+            .bash(BashInput::new("test -n \"$PATH\" && printf inherited"))
+            .unwrap(),
+        ToolOutput::success("[stdout]\ninherited\n[stderr]\n[exit status: 0]\n")
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+    assert_eq!(
+        tools.bash(BashInput::new("printf should-not-run")).unwrap(),
+        ToolOutput::failure("bash: failed to start")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_timeout_kills_its_process_group_and_descendants() {
+    let root = project_root();
+    let marker = root.join("timeout-descendant-ran");
+    let tools = NativeTools::open(&root).unwrap();
+    let command = format!("(sleep 1; touch {}) & wait", marker.display());
+
+    assert_eq!(
+        tools
+            .bash(BashInput::new(command).with_timeout(Duration::from_millis(25)))
+            .unwrap(),
+        ToolOutput::failure(
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+        )
+    );
+    thread::sleep(Duration::from_millis(1100));
+    assert!(!marker.exists());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn bash_does_not_wait_for_background_descendant_output() {
@@ -330,6 +416,27 @@ fn catalog_validates_the_optional_bash_timeout_override() {
             .unwrap(),
         ToolOutput::failure("bash: timeout must be greater than zero")
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn catalog_applies_a_positive_bash_timeout_override() {
+    let root = project_root();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+
+    assert_eq!(
+        catalog
+            .execute(
+                "native::bash",
+                json!({"command": "sleep 1", "timeout_ms": 25}),
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::failure(
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+        )
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 

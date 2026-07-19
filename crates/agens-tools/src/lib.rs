@@ -1728,7 +1728,6 @@ impl<T: McpTransport> McpCallable for McpClient<T> {
         context: &ToolExecutionContext,
     ) -> Result<ToolOutput, Error> {
         self.call_tool_with_context(tool_name, arguments, &context.mcp_context())
-            .map(sanitize_tool_output)
             .map_err(mcp_call_error)
     }
 
@@ -2331,7 +2330,7 @@ impl ToolDispatcher {
                 if let Err(status) = context.check() {
                     return Ok(sanitized_execution_status(status));
                 }
-                Ok(sanitize_tool_output(output))
+                Ok(output)
             }
             Err(error) if terminal_mcp_error(&error) => Err(error),
             Err(_) => Ok(ToolOutput::failure("tool infrastructure failure")),
@@ -2385,20 +2384,6 @@ fn sanitized_execution_status(status: ToolExecutionStatus) -> ToolOutput {
         ToolExecutionStatus::Cancelled => ToolOutput::failure("tool execution cancelled"),
         ToolExecutionStatus::TimedOut => ToolOutput::failure("tool execution timed out"),
     }
-}
-
-fn sanitize_tool_output(mut output: ToolOutput) -> ToolOutput {
-    const MAX_MODEL_VISIBLE_OUTPUT: usize = 16 * 1024;
-    const TRUNCATION_NOTICE: &str = "\n[output truncated]";
-    if output.content.len() > MAX_MODEL_VISIBLE_OUTPUT {
-        let mut boundary = MAX_MODEL_VISIBLE_OUTPUT.saturating_sub(TRUNCATION_NOTICE.len());
-        while !output.content.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        output.content.truncate(boundary);
-        output.content.push_str(TRUNCATION_NOTICE);
-    }
-    output
 }
 
 impl Default for ToolDispatcher {
@@ -3163,7 +3148,6 @@ impl NativeTools {
             ));
         }
 
-        let output = Arc::new(Mutex::new(CappedOutput::default()));
         let mut command = Command::new("bash");
         command
             .arg("-c")
@@ -3187,8 +3171,8 @@ impl NativeTools {
             let _ = terminate_process_group(&mut child);
             return Ok(ToolOutput::failure("bash: output setup failed"));
         };
-        let stdout_reader = read_capped(stdout, ProcessStream::Stdout, Arc::clone(&output));
-        let stderr_reader = read_capped(stderr, ProcessStream::Stderr, Arc::clone(&output));
+        let stdout_reader = read_capped(stdout);
+        let stderr_reader = read_capped(stderr);
         let deadline = Instant::now() + input.timeout;
 
         let status = loop {
@@ -3201,11 +3185,13 @@ impl NativeTools {
                     .as_ref()
                     .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
             {
-                if terminate_process_group(&mut child).is_err()
-                    || wait_for_readers(stdout_reader, stderr_reader).is_err()
-                {
+                if terminate_process_group(&mut child).is_err() {
                     return Ok(ToolOutput::failure("bash: process cleanup failed"));
                 }
+                let output = match wait_for_readers(stdout_reader, stderr_reader) {
+                    Ok(output) => output,
+                    Err(_) => return Ok(ToolOutput::failure("bash: process cleanup failed")),
+                };
                 if input.execution_context.is_some() {
                     return Err(Error::Cancelled);
                 }
@@ -3217,11 +3203,13 @@ impl NativeTools {
             }
 
             if Instant::now() >= deadline {
-                if terminate_process_group(&mut child).is_err()
-                    || wait_for_readers(stdout_reader, stderr_reader).is_err()
-                {
+                if terminate_process_group(&mut child).is_err() {
                     return Ok(ToolOutput::failure("bash: process cleanup failed"));
                 }
+                let output = match wait_for_readers(stdout_reader, stderr_reader) {
+                    Ok(output) => output,
+                    Err(_) => return Ok(ToolOutput::failure("bash: process cleanup failed")),
+                };
                 return Ok(render_bash_result(
                     &output,
                     "unavailable",
@@ -3232,13 +3220,16 @@ impl NativeTools {
                 ));
             }
 
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|_| Error::Tool("bash: wait failed".into()))?
-            {
-                if kill_process_group(child.id()).is_err()
-                    || wait_for_readers(stdout_reader, stderr_reader).is_err()
-                {
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    let _ = terminate_process_group(&mut child);
+                    let _ = wait_for_readers(stdout_reader, stderr_reader);
+                    return Ok(ToolOutput::failure("bash: wait failed"));
+                }
+            };
+            if let Some(status) = status {
+                if kill_process_group(child.id()).is_err() {
                     return Ok(ToolOutput::failure("bash: process cleanup failed"));
                 }
                 break status;
@@ -3247,9 +3238,8 @@ impl NativeTools {
             thread::sleep(PROCESS_POLL_INTERVAL);
         };
 
-        if status.success() {
-            return Ok(render_bash_result(&output, &exit_code(status), None));
-        }
+        let output = wait_for_readers(stdout_reader, stderr_reader)
+            .map_err(|_| Error::Tool("bash: output reader failed".into()))?;
 
         Ok(render_bash_result(&output, &exit_code(status), None))
     }
@@ -3766,7 +3756,7 @@ impl NativeToolCatalog {
         if let Err(status) = context.check() {
             return Ok(sanitized_execution_status(status));
         }
-        Ok(sanitize_tool_output(output))
+        Ok(output)
     }
 }
 
@@ -4398,29 +4388,36 @@ fn recheck_write_target(
     }
 }
 
-#[derive(Default)]
 struct CappedOutput {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     truncated: bool,
 }
 
-#[derive(Clone, Copy)]
-enum ProcessStream {
-    Stdout,
-    Stderr,
+#[derive(Default)]
+struct StreamCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
 }
 
 impl CappedOutput {
-    fn append(&mut self, stream: ProcessStream, bytes: &[u8]) {
-        let remaining =
-            MAX_CAPTURED_PROCESS_BYTES.saturating_sub(self.stdout.len() + self.stderr.len());
-        let target = match stream {
-            ProcessStream::Stdout => &mut self.stdout,
-            ProcessStream::Stderr => &mut self.stderr,
-        };
-        target.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
-        self.truncated |= bytes.len() > remaining;
+    fn combine(stdout: StreamCapture, stderr: StreamCapture) -> Self {
+        let half = MAX_CAPTURED_PROCESS_BYTES / 2;
+        let stdout_reserved = stdout.bytes.len().min(half);
+        let stderr_reserved = stderr.bytes.len().min(half);
+        let mut remaining = MAX_CAPTURED_PROCESS_BYTES - stdout_reserved - stderr_reserved;
+        let stdout_len = stdout_reserved + (stdout.bytes.len() - stdout_reserved).min(remaining);
+        remaining -= stdout_len - stdout_reserved;
+        let stderr_len = stderr_reserved + (stderr.bytes.len() - stderr_reserved).min(remaining);
+
+        Self {
+            truncated: stdout.truncated
+                || stderr.truncated
+                || stdout.bytes.len() > stdout_len
+                || stderr.bytes.len() > stderr_len,
+            stdout: stdout.bytes[..stdout_len].to_vec(),
+            stderr: stderr.bytes[..stderr_len].to_vec(),
+        }
     }
 
     fn render(&self, exit_status: &str, detail: Option<&str>) -> String {
@@ -4452,17 +4449,11 @@ fn append_bash_stream(output: &mut String, bytes: &[u8]) {
 }
 
 fn render_bash_result(
-    output: &Arc<Mutex<CappedOutput>>,
+    output: &CappedOutput,
     exit_status: &str,
     detail: Option<&str>,
 ) -> ToolOutput {
-    let output = output
-        .lock()
-        .map(|output| output.render(exit_status, detail))
-        .unwrap_or_else(|_| {
-            "[stdout]\n[stderr]\n[bash: output collection failed]\n[exit status: unavailable]\n"
-                .into()
-        });
+    let output = output.render(exit_status, detail);
     if detail.is_some() || exit_status != "0" {
         ToolOutput::failure(output)
     } else {
@@ -4472,36 +4463,39 @@ fn render_bash_result(
 
 fn read_capped(
     mut reader: impl Read + Send + 'static,
-    stream: ProcessStream,
-    output: Arc<Mutex<CappedOutput>>,
-) -> thread::JoinHandle<Result<(), io::Error>> {
+) -> thread::JoinHandle<Result<StreamCapture, io::Error>> {
     thread::spawn(move || {
+        let mut output = StreamCapture::default();
         let mut buffer = [0; 8192];
         loop {
             let count = reader.read(&mut buffer)?;
             if count == 0 {
-                return Ok(());
+                return Ok(output);
             }
 
-            let mut output = output
-                .lock()
-                .map_err(|_| io::Error::other("output collector unavailable"))?;
-            output.append(stream, &buffer[..count]);
+            let remaining = MAX_CAPTURED_PROCESS_BYTES.saturating_sub(output.bytes.len());
+            output
+                .bytes
+                .extend_from_slice(&buffer[..count.min(remaining)]);
+            output.truncated |= count > remaining;
         }
     })
 }
 
 fn wait_for_readers(
-    stdout_reader: thread::JoinHandle<Result<(), io::Error>>,
-    stderr_reader: thread::JoinHandle<Result<(), io::Error>>,
-) -> Result<(), Error> {
-    for reader in [stdout_reader, stderr_reader] {
-        reader
-            .join()
-            .map_err(|_| Error::Tool("bash: output reader panicked".into()))?
-            .map_err(|error| Error::Tool(format!("bash: output reader failed: {error}")))?;
-    }
-    Ok(())
+    stdout_reader: thread::JoinHandle<Result<StreamCapture, io::Error>>,
+    stderr_reader: thread::JoinHandle<Result<StreamCapture, io::Error>>,
+) -> Result<CappedOutput, Error> {
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| Error::Tool("bash: output reader failed".into()))?
+        .map_err(|_| Error::Tool("bash: output reader failed".into()))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| Error::Tool("bash: output reader failed".into()))?
+        .map_err(|_| Error::Tool("bash: output reader failed".into()))?;
+
+    Ok(CappedOutput::combine(stdout, stderr))
 }
 
 fn terminate_process_group(child: &mut std::process::Child) -> Result<(), Error> {

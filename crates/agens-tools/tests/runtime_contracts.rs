@@ -131,7 +131,7 @@ fn default_dispatchers_reject_each_others_authorizations() {
 }
 
 #[test]
-fn model_output_truncation_preserves_utf8_and_the_byte_limit() {
+fn dispatcher_preserves_large_unicode_tool_output() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::read", ToolAccess::ReadOnly, UnicodeTool)
@@ -156,8 +156,7 @@ fn model_output_truncation_preserves_utf8_and_the_byte_limit() {
         )
         .unwrap();
     assert!(output.content.is_char_boundary(output.content.len()));
-    assert!(output.content.len() <= 16 * 1024);
-    assert!(output.content.ends_with("\n[output truncated]"));
+    assert_eq!(output.content, "界".repeat(10_000));
 }
 
 #[test]
