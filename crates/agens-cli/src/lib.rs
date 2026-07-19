@@ -1366,16 +1366,27 @@ where
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let mut gate = ProductionPermissionGate::new(
-        policy,
+        policy.clone(),
         Arc::clone(&grants),
         session,
-        project,
+        project.clone(),
         Arc::clone(&tool_runtime),
         Arc::clone(&pending),
         Arc::clone(&prompts),
     );
-    let mut resolver =
-        ProductionPermissionResolver::new(TtyPermissionPrompter, grant_store, grants, prompts);
+    let mut resolver = ProductionPermissionResolver::new(
+        TtyPermissionPrompter,
+        grant_store,
+        grants,
+        prompts,
+        ProductionPromptAuthorization {
+            policy,
+            session,
+            project,
+            dispatcher: Arc::clone(&tool_runtime),
+            allowed: Arc::clone(&pending),
+        },
+    );
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot = match request.max_iterations.or(bootstrap.max_iterations) {
         Some(max_iterations) => {
@@ -1764,6 +1775,15 @@ struct ProductionPermissionResolver<P> {
     grant_store: PermissionGrantStore,
     grants: SharedProjectPermissionGrants,
     prompts: PendingPermissionPrompts,
+    authorization: ProductionPromptAuthorization,
+}
+
+struct ProductionPromptAuthorization {
+    policy: PermissionPolicy,
+    session: PermissionSession,
+    project: String,
+    dispatcher: SharedToolDispatcher,
+    allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
 }
 
 impl<P> ProductionPermissionResolver<P> {
@@ -1772,12 +1792,67 @@ impl<P> ProductionPermissionResolver<P> {
         grant_store: PermissionGrantStore,
         grants: SharedProjectPermissionGrants,
         prompts: PendingPermissionPrompts,
+        authorization: ProductionPromptAuthorization,
     ) -> Self {
         Self {
             prompt,
             grant_store,
             grants,
             prompts,
+            authorization,
+        }
+    }
+
+    fn authorize_prompted_allow(
+        &self,
+        call: &HeadlessToolCall,
+        ephemeral_grant: Option<agens_core::ProjectPermissionGrant>,
+    ) -> Result<PermissionDecision, HeadlessTurnPortError> {
+        let mut grants = self
+            .grants
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Permission)?
+            .clone();
+        if let Some(grant) = ephemeral_grant {
+            grants.push(grant);
+        }
+
+        let outcome = self
+            .authorization
+            .dispatcher
+            .lock()
+            .map_err(|_| HeadlessTurnPortError::Permission)?
+            .evaluate(
+                &self.authorization.policy,
+                &grants,
+                &self.authorization.session,
+                ToolDispatchRequest::new(
+                    &self.authorization.project,
+                    &call.name,
+                    parse_tool_input(call)?,
+                ),
+            )
+            .map_err(|_| HeadlessTurnPortError::Permission)?;
+
+        match outcome {
+            ToolEvaluationOutcome::Authorized(handle) => self
+                .authorization
+                .allowed
+                .lock()
+                .map_err(|_| HeadlessTurnPortError::Permission)
+                .map(|mut allowed| {
+                    allowed.insert(
+                        call.id.clone(),
+                        AllowedNativeCall {
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                            handle,
+                        },
+                    );
+                    PermissionDecision::Allow
+                }),
+            ToolEvaluationOutcome::Denied => Ok(PermissionDecision::Deny),
+            ToolEvaluationOutcome::PromptRequired(_) => Err(HeadlessTurnPortError::Permission),
         }
     }
 }
@@ -1813,7 +1888,14 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
             }
 
             let decision = match answer {
-                PermissionPromptAnswer::AllowOnce => PermissionDecision::Allow,
+                PermissionPromptAnswer::AllowOnce => {
+                    let grant = agens_core::ProjectPermissionGrant::allow(
+                        context.project_id,
+                        PermissionPattern::Exact(context.qualified_tool_name),
+                        PermissionPattern::Exact(context.target_identifier),
+                    );
+                    self.authorize_prompted_allow(call, Some(grant))?
+                }
                 PermissionPromptAnswer::DenyOnce => PermissionDecision::Deny,
                 PermissionPromptAnswer::AllowAlways | PermissionPromptAnswer::DenyAlways => {
                     let decision = if answer == PermissionPromptAnswer::AllowAlways {
@@ -1834,7 +1916,11 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                         .lock()
                         .map_err(|_| HeadlessTurnPortError::Permission)?
                         .push(grant);
-                    decision
+                    if decision == PermissionDecision::Allow {
+                        self.authorize_prompted_allow(call, None)?
+                    } else {
+                        decision
+                    }
                 }
                 PermissionPromptAnswer::Cancel => unreachable!(),
             };
@@ -1989,18 +2075,17 @@ fn sanitize_permission_target(tool: &str, target: &str) -> String {
         return "[command redacted]".into();
     }
 
+    if serde_json::from_str::<serde_json::Value>(target).is_ok() {
+        return "[redacted]".into();
+    }
+
     if let Some((scheme, remainder)) = target.split_once("://") {
+        let remainder = remainder.split(['?', '#']).next().unwrap_or_default();
         let (authority, path) = remainder.split_once('/').unwrap_or((remainder, ""));
         let authority = authority
             .rsplit_once('@')
             .map_or(authority, |(_, host)| host);
-        let (path, query) = path.split_once('?').unwrap_or((path, ""));
-        let query = if query.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", redact_query_values(query))
-        };
-        return format!("{scheme}://{authority}/{path}{query}");
+        return format!("{scheme}://{authority}/{path}");
     }
 
     if contains_sensitive_marker(target) {
@@ -2015,17 +2100,6 @@ fn contains_sensitive_marker(value: &str) -> bool {
     ["api_key", "authorization", "password", "secret", "token"]
         .iter()
         .any(|marker| value.contains(marker))
-}
-
-fn redact_query_values(query: &str) -> String {
-    query
-        .split('&')
-        .map(|pair| {
-            pair.split_once('=')
-                .map_or_else(|| pair.to_owned(), |(key, _)| format!("{key}=[redacted]"))
-        })
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 fn block_on_headless_turn<T>(future: impl std::future::Future<Output = T>) -> Result<T, CliError> {
@@ -2446,13 +2520,38 @@ mod tests {
         });
 
         assert!(prompt.contains("native::webfetch"));
-        assert!(prompt.contains("https://example.test/path?token=[redacted]"));
+        assert!(prompt.contains("https://example.test/path"));
         assert!(!prompt.contains("SENTINEL_URL_SECRET"));
         assert!(!prompt.contains("SENTINEL_TOKEN"));
+
+        let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
+            project_id: "project".into(),
+            qualified_tool_name: "native::webfetch".into(),
+            target_identifier:
+                "https://user:SENTINEL_URL_SECRET@example.test?token=SENTINEL_TOKEN#fragment".into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: "permission policy requires confirmation".into(),
+        });
+
+        assert!(prompt.contains("https://example.test/"));
+        assert!(!prompt.contains("SENTINEL_URL_SECRET"));
+        assert!(!prompt.contains("SENTINEL_TOKEN"));
+        assert!(!prompt.contains("fragment"));
+
+        let prompt = render_permission_prompt(&agens_tools::PermissionPromptContext {
+            project_id: "project".into(),
+            qualified_tool_name: "native::webfetch".into(),
+            target_identifier: r#"{"url":"https://example.test","token":"SENTINEL_JSON"}"#.into(),
+            access: agens_core::ToolAccess::ReadOnly,
+            reason: "permission policy requires confirmation".into(),
+        });
+
+        assert!(prompt.contains("Target: [redacted]"));
+        assert!(!prompt.contains("SENTINEL_JSON"));
     }
 
     #[test]
-    fn permission_resolver_persists_only_always_answers_and_cancels_without_a_decision() {
+    fn production_prompt_decisions_authorize_only_allowed_calls() {
         struct FixedPrompt(PermissionPromptAnswer);
 
         impl PermissionPrompter for FixedPrompt {
@@ -2464,93 +2563,162 @@ mod tests {
             }
         }
 
-        fn resolve_ready(
-            resolver: &mut impl HeadlessPermissionResolver,
-            call: &HeadlessToolCall,
-        ) -> Result<PermissionDecision, HeadlessTurnPortError> {
-            let cancellation = HeadlessTurnCancellation::new();
-            let mut future = std::pin::pin!(resolver.resolve(call, &cancellation));
+        struct RecordingTool(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl DispatchTool for RecordingTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| agens_core::Error::Tool("missing path".into()))
+            }
+
+            fn execute(
+                &mut self,
+                _: &ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<ToolOutput, agens_core::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutput::success("executed"))
+            }
+        }
+
+        fn run_ready<T>(
+            future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
+        ) -> Result<T, HeadlessTurnPortError> {
+            let mut future = std::pin::pin!(future);
             let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
 
             match future.as_mut().poll(context) {
                 std::task::Poll::Ready(result) => result,
                 std::task::Poll::Pending => {
-                    panic!("production resolver must complete synchronously")
+                    panic!("production permission ports must complete synchronously")
                 }
             }
         }
 
-        let directory =
-            std::env::temp_dir().join(format!("agens-permission-resolver-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let grants = Arc::new(Mutex::new(Vec::new()));
-        let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-        let call = HeadlessToolCall {
-            id: "call".into(),
-            name: "native::read".into(),
-            input: r#"{"path":"notes.md"}"#.into(),
-        };
-        let context = PermissionPromptContext {
-            project_id: "project".into(),
-            qualified_tool_name: "native::read".into(),
-            target_identifier: "notes.md".into(),
-            access: agens_core::ToolAccess::ReadOnly,
-            reason: "permission policy requires confirmation".into(),
-        };
-
-        for (answer, expected, persisted) in [
-            (
-                PermissionPromptAnswer::AllowOnce,
-                Ok(PermissionDecision::Allow),
-                0,
-            ),
-            (
-                PermissionPromptAnswer::DenyOnce,
-                Ok(PermissionDecision::Deny),
-                0,
-            ),
-            (
-                PermissionPromptAnswer::AllowAlways,
-                Ok(PermissionDecision::Allow),
-                1,
-            ),
-            (
-                PermissionPromptAnswer::DenyAlways,
-                Ok(PermissionDecision::Deny),
-                2,
-            ),
-            (
-                PermissionPromptAnswer::Cancel,
-                Err(HeadlessTurnPortError::Cancelled),
-                2,
-            ),
+        for (answer, expected_executions, expected_grants) in [
+            (PermissionPromptAnswer::AllowOnce, 1, 0),
+            (PermissionPromptAnswer::AllowAlways, 2, 1),
+            (PermissionPromptAnswer::DenyOnce, 0, 0),
+            (PermissionPromptAnswer::DenyAlways, 0, 1),
+            (PermissionPromptAnswer::Cancel, 0, 0),
         ] {
-            prompts
+            let directory = std::env::temp_dir().join(format!(
+                "agens-production-permission-{}-{:?}",
+                std::process::id(),
+                answer
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+
+            let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+            dispatcher
                 .lock()
-                .expect("prompt lock should be available")
-                .insert(call.id.clone(), context.clone());
+                .expect("dispatcher lock should be available")
+                .register_native(
+                    "native::read",
+                    agens_core::ToolAccess::ReadOnly,
+                    RecordingTool(Arc::clone(&executions)),
+                )
+                .expect("recording tool should register");
+
+            let grants = Arc::new(Mutex::new(Vec::new()));
+            let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+            let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+            let policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Ask,
+                    PermissionPattern::Exact("native::read".into()),
+                    PermissionPattern::Exact("notes.md".into()),
+                )],
+            );
+            let call = HeadlessToolCall {
+                id: "current".into(),
+                name: "native::read".into(),
+                input: r#"{"path":"notes.md"}"#.into(),
+            };
+            let cancellation = HeadlessTurnCancellation::new();
+            let mut gate = ProductionPermissionGate::new(
+                policy.clone(),
+                Arc::clone(&grants),
+                PermissionSession::new(),
+                "project".into(),
+                Arc::clone(&dispatcher),
+                Arc::clone(&allowed),
+                Arc::clone(&prompts),
+            );
             let store = PermissionGrantStore::open(&directory).expect("grant store should open");
             let mut resolver = ProductionPermissionResolver::new(
                 FixedPrompt(answer),
                 store,
                 Arc::clone(&grants),
                 Arc::clone(&prompts),
+                ProductionPromptAuthorization {
+                    policy,
+                    session: PermissionSession::new(),
+                    project: "project".into(),
+                    dispatcher: Arc::clone(&dispatcher),
+                    allowed: Arc::clone(&allowed),
+                },
             );
+            let mut production_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
 
-            assert_eq!(resolve_ready(&mut resolver, &call), expected);
             assert_eq!(
-                grants.lock().expect("grant lock should be available").len(),
-                persisted
+                run_ready(gate.evaluate(&call, &cancellation)),
+                Ok(PermissionDecision::Ask)
             );
-        }
+            let decision = run_ready(resolver.resolve(&call, &cancellation));
 
-        let stored = PermissionGrantStore::open(&directory)
-            .expect("grant store should reopen")
-            .grants_for_project("project")
-            .expect("project grants should load");
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].decision, PermissionDecision::Allow);
-        assert_eq!(stored[1].decision, PermissionDecision::Deny);
-        std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+            match answer {
+                PermissionPromptAnswer::AllowOnce | PermissionPromptAnswer::AllowAlways => {
+                    assert_eq!(decision, Ok(PermissionDecision::Allow));
+                    assert_eq!(
+                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
+                        Ok(HeadlessToolOutput::success("executed"))
+                    );
+                    if answer == PermissionPromptAnswer::AllowAlways {
+                        let later_call = HeadlessToolCall {
+                            id: "later".into(),
+                            ..call.clone()
+                        };
+                        assert_eq!(
+                            run_ready(gate.evaluate(&later_call, &cancellation)),
+                            Ok(PermissionDecision::Allow)
+                        );
+                        assert_eq!(
+                            run_ready(production_dispatcher.dispatch(later_call, &cancellation)),
+                            Ok(HeadlessToolOutput::success("executed"))
+                        );
+                    }
+                }
+                PermissionPromptAnswer::DenyOnce | PermissionPromptAnswer::DenyAlways => {
+                    assert_eq!(decision, Ok(PermissionDecision::Deny));
+                }
+                PermissionPromptAnswer::Cancel => {
+                    assert_eq!(decision, Err(HeadlessTurnPortError::Cancelled));
+                }
+            }
+
+            assert_eq!(
+                executions.load(std::sync::atomic::Ordering::SeqCst),
+                expected_executions
+            );
+            assert_eq!(
+                PermissionGrantStore::open(&directory)
+                    .expect("grant store should reopen")
+                    .grants_for_project("project")
+                    .expect("project grants should load")
+                    .len(),
+                expected_grants
+            );
+            std::fs::remove_dir_all(&directory)
+                .expect("temporary grant directory should be removed");
+        }
     }
 }

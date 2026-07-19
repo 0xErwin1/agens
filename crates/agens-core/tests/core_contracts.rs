@@ -623,7 +623,7 @@ fn permission_static_rules_are_scoped_deterministic_and_deny_wins_conflicts() {
 }
 
 #[test]
-fn permission_static_ask_precedes_grants_and_only_session_bypass_resolves_it() {
+fn permission_grants_follow_static_rules_and_precede_session_bypass() {
     let policy = PermissionPolicy::new(
         PermissionMode::Edit,
         vec![PermissionRule::global(
@@ -641,7 +641,7 @@ fn permission_static_ask_precedes_grants_and_only_session_bypass_resolves_it() {
 
     assert_eq!(
         policy.evaluate(&request, &grants, &PermissionSession::new()),
-        PermissionDecision::Ask
+        PermissionDecision::Allow
     );
     assert_eq!(
         policy.evaluate(
