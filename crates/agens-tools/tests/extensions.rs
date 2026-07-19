@@ -392,6 +392,138 @@ fn effective_capability_expansion_detects_only_declared_broadenings() {
     assert!(!deny.is_expansion_from(&empty));
 }
 
+#[test]
+fn parsed_literal_aliases_resolve_while_globs_remain_distinct_descriptors() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    let project = temporary.path.join("project");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        global.join("agent.md"),
+        "---\nname: agent\ndescription: agent\nmode: primary\npermissions:\n  - deny files_read\n  - allow native::files_read\n  - ask native:*:files_*\n---\nbody\n",
+    )
+    .unwrap();
+
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::files_write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let discovery = AgentCatalog::discover(&[], &global, &project).unwrap();
+    let set = EffectiveCapabilitySet::from_agent(
+        discovery.catalog().agent("agent").unwrap(),
+        "project",
+        &dispatcher,
+    );
+
+    assert_eq!(set.descriptors().len(), 2);
+    assert_eq!(
+        set.descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.decision() == PermissionDecision::Allow)
+            .count(),
+        1
+    );
+    assert!(set.descriptors()[0].matches_identity("native:10:files_read"));
+    assert!(set.descriptors()[1].matches_identity("native:10:files_read"));
+    assert!(set.descriptors()[1].matches_identity("native:11:files_write"));
+}
+
+#[test]
+fn capability_descriptors_are_ordered_independently_of_rule_insertion() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+    dispatcher
+        .register_native("native::files_write", ToolAccess::Write, InertTool)
+        .unwrap();
+
+    let read = PermissionRule::global(
+        PermissionDecision::Allow,
+        PermissionPattern::Exact("files_read".into()),
+        PermissionPattern::Any,
+    );
+    let write = PermissionRule::global(
+        PermissionDecision::Deny,
+        PermissionPattern::Exact("files_write".into()),
+        PermissionPattern::Any,
+    );
+    let glob = PermissionRule::global(
+        PermissionDecision::Ask,
+        PermissionPattern::glob("native:*:files_*").unwrap(),
+        PermissionPattern::glob("project/*").unwrap(),
+    );
+
+    let forward = EffectiveCapabilitySet::from_agent(
+        &agent_with_rules(vec![read.clone(), write.clone(), glob.clone()]),
+        "project",
+        &dispatcher,
+    );
+    let reverse = EffectiveCapabilitySet::from_agent(
+        &agent_with_rules(vec![glob, write, read]),
+        "project",
+        &dispatcher,
+    );
+
+    assert_eq!(forward.descriptors(), reverse.descriptors());
+    assert_eq!(forward.descriptors().len(), 3);
+}
+
+#[test]
+fn capability_builder_input_excludes_safety_grants_and_bypass_layers() {
+    let builder: fn(&AgentDefinition, &str, &ToolDispatcher) -> EffectiveCapabilitySet =
+        EffectiveCapabilitySet::from_agent;
+    let dispatcher = ToolDispatcher::new();
+    let declared_policy = builder(&agent_with_rules(vec![]), "project", &dispatcher);
+
+    assert_eq!(declared_policy.descriptors(), &[]);
+}
+
+#[test]
+fn effective_capability_expansion_table_covers_all_decision_transitions() {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::files_read", ToolAccess::ReadOnly, InertTool)
+        .unwrap();
+
+    let empty =
+        EffectiveCapabilitySet::from_agent(&agent_with_rules(vec![]), "project", &dispatcher);
+    let decisions = [
+        PermissionDecision::Allow,
+        PermissionDecision::Ask,
+        PermissionDecision::Deny,
+    ];
+
+    for prior in decisions {
+        for candidate in decisions {
+            let expected = matches!(
+                (prior, candidate),
+                (PermissionDecision::Ask, PermissionDecision::Allow)
+                    | (
+                        PermissionDecision::Deny,
+                        PermissionDecision::Ask | PermissionDecision::Allow
+                    )
+            );
+            assert_eq!(
+                capability_set(&dispatcher, candidate)
+                    .is_expansion_from(&capability_set(&dispatcher, prior)),
+                expected,
+                "{prior:?} -> {candidate:?}"
+            );
+        }
+    }
+
+    assert!(capability_set(&dispatcher, PermissionDecision::Allow).is_expansion_from(&empty));
+    assert!(!empty.is_expansion_from(&capability_set(&dispatcher, PermissionDecision::Allow)));
+    assert!(empty.is_expansion_from(&capability_set(&dispatcher, PermissionDecision::Deny)));
+    assert!(!capability_set(&dispatcher, PermissionDecision::Deny).is_expansion_from(&empty));
+}
+
 struct SupportedModels;
 
 impl AgentModelValidator for SupportedModels {

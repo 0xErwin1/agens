@@ -110,16 +110,9 @@ fn rule_applies_to_project(rule: &PermissionRule, project: &str) -> bool {
 
 fn selector(pattern: &PermissionPattern, snapshot: &CapabilitySnapshot) -> Option<ToolSelector> {
     match pattern {
-        PermissionPattern::Exact(value) => {
-            let identity = snapshot
-                .aliases
-                .get(value)
-                .cloned()
-                .unwrap_or_else(|| value.clone());
-            snapshot
-                .identities
-                .contains(&identity)
-                .then_some(ToolSelector::Exact(identity))
+        PermissionPattern::Exact(value) => exact_selector(value, snapshot),
+        PermissionPattern::Glob(_) if pattern.glob_source().is_some_and(is_literal_glob) => {
+            exact_selector(pattern.glob_source().unwrap(), snapshot)
         }
         PermissionPattern::Any | PermissionPattern::Glob(_) => {
             let source = pattern.glob_source().unwrap_or("*").to_owned();
@@ -132,6 +125,22 @@ fn selector(pattern: &PermissionPattern, snapshot: &CapabilitySnapshot) -> Optio
             (!identities.is_empty()).then_some(ToolSelector::Pattern { source, identities })
         }
     }
+}
+
+fn exact_selector(value: &str, snapshot: &CapabilitySnapshot) -> Option<ToolSelector> {
+    let identity = snapshot
+        .aliases
+        .get(value)
+        .cloned()
+        .unwrap_or_else(|| value.into());
+    snapshot
+        .identities
+        .contains(&identity)
+        .then_some(ToolSelector::Exact(identity))
+}
+
+fn is_literal_glob(pattern: &str) -> bool {
+    !pattern.contains(['*', '?', '[', ']', '{', '}'])
 }
 
 fn target(pattern: &PermissionPattern) -> Option<String> {
