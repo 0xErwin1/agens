@@ -55,6 +55,8 @@ pub struct HttpWorker {
     state: Arc<WorkerState>,
     join: Mutex<Option<JoinHandle<()>>>,
     capacity: usize,
+    #[cfg(test)]
+    admission_notice: Mutex<Option<SyncSender<()>>>,
 }
 impl HttpWorker {
     pub fn start(
@@ -82,6 +84,8 @@ impl HttpWorker {
                 state,
                 join: Mutex::new(Some(join)),
                 capacity,
+                #[cfg(test)]
+                admission_notice: Mutex::new(None),
             }),
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -123,9 +127,13 @@ impl HttpWorker {
             self.state.admitted.fetch_sub(1, Ordering::AcqRel);
             return Err(self.disconnected_error());
         }
-        response
-            .recv()
-            .unwrap_or_else(|_| Err(self.disconnected_error()))
+        #[cfg(test)]
+        if let Ok(notice) = self.admission_notice.lock()
+            && let Some(notice) = notice.as_ref()
+        {
+            let _ = notice.send(());
+        }
+        Self::receive_response(&self.state, response)
     }
     pub fn close(&self) -> Result<(), HttpWorkerError> {
         self.state.closing.store(true, Ordering::Release);
@@ -148,6 +156,22 @@ impl HttpWorker {
         } else {
             HttpWorkerError::Shutdown
         }
+    }
+    fn receive_response(
+        state: &WorkerState,
+        response: Receiver<Result<HttpResponse, HttpWorkerError>>,
+    ) -> Result<HttpResponse, HttpWorkerError> {
+        response.recv().unwrap_or_else(|_| {
+            if state.panicked.load(Ordering::Acquire) {
+                Err(HttpWorkerError::Panicked)
+            } else {
+                Err(HttpWorkerError::Shutdown)
+            }
+        })
+    }
+    #[cfg(test)]
+    fn set_admission_notice_for_test(&self, notice: SyncSender<()>) {
+        *self.admission_notice.lock().unwrap() = Some(notice);
     }
 }
 impl Drop for HttpWorker {
@@ -251,6 +275,8 @@ mod tests {
         Pending,
         Respond,
         Panic,
+        StartupError,
+        StartupPanic,
     }
     struct Operation {
         behavior: Behavior,
@@ -259,7 +285,11 @@ mod tests {
     }
     impl HttpWorkerOperation for Operation {
         fn start(&mut self) -> Result<(), HttpWorkerError> {
-            Ok(())
+            match self.behavior {
+                Behavior::StartupError => Err(HttpWorkerError::Startup),
+                Behavior::StartupPanic => panic!("test startup panic"),
+                _ => Ok(()),
+            }
         }
         fn execute(&mut self, _: HttpRequest) -> HttpWorkerFuture {
             if let Some(started) = self.started.take() {
@@ -269,6 +299,7 @@ mod tests {
                 Behavior::Pending => Box::pin(std::future::pending()),
                 Behavior::Respond => Box::pin(std::future::ready(Ok(response()))),
                 Behavior::Panic => panic!("test worker panic"),
+                Behavior::StartupError | Behavior::StartupPanic => unreachable!(),
             }
         }
         fn close(&mut self) {
@@ -276,6 +307,7 @@ mod tests {
         }
     }
     fn worker(
+        capacity: usize,
         behavior: Behavior,
         started: Option<SyncSender<()>>,
     ) -> (HttpWorker, Arc<AtomicUsize>) {
@@ -285,7 +317,7 @@ mod tests {
             started,
             closes: Arc::clone(&closes),
         };
-        (HttpWorker::start(1, operation).unwrap(), closes)
+        (HttpWorker::start(capacity, operation).unwrap(), closes)
     }
     fn request() -> HttpRequest {
         HttpRequest {
@@ -311,7 +343,7 @@ mod tests {
             (Duration::from_millis(10), HttpWorkerError::TimedOut, false),
         ] {
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
-            let (worker, _) = worker(Behavior::Pending, Some(started_sender));
+            let (worker, _) = worker(1, Behavior::Pending, Some(started_sender));
             let worker = Arc::new(worker);
             let (cancellation, deadline) = context(timeout);
             let active_worker = Arc::clone(&worker);
@@ -336,16 +368,23 @@ mod tests {
     }
     #[test]
     fn reports_startup_and_operation_panics() {
-        let startup_failure = HttpWorker::start(
-            0,
-            Operation {
-                behavior: Behavior::Respond,
-                started: None,
-                closes: Arc::new(AtomicUsize::new(0)),
-            },
-        );
-        assert!(matches!(startup_failure, Err(HttpWorkerError::Startup)));
-        let (worker, _) = worker(Behavior::Panic, None);
+        for behavior in [Behavior::StartupError, Behavior::StartupPanic] {
+            let closes = Arc::new(AtomicUsize::new(0));
+            let result = HttpWorker::start(
+                1,
+                Operation {
+                    behavior,
+                    started: None,
+                    closes: Arc::clone(&closes),
+                },
+            );
+            assert!(matches!(
+                result,
+                Err(HttpWorkerError::Startup | HttpWorkerError::Panicked)
+            ));
+            assert_eq!(closes.load(Ordering::Acquire), 1);
+        }
+        let (worker, _) = worker(1, Behavior::Panic, None);
         let (cancellation, deadline) = context(Duration::from_secs(1));
         assert_eq!(
             worker.request(request(), cancellation, deadline),
@@ -354,7 +393,7 @@ mod tests {
     }
     #[test]
     fn close_drop_and_current_thread_call_are_safe() {
-        let (response_worker, closes) = worker(Behavior::Respond, None);
+        let (response_worker, closes) = worker(1, Behavior::Respond, None);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -367,8 +406,57 @@ mod tests {
         response_worker.close().unwrap();
         response_worker.close().unwrap();
         assert_eq!(closes.load(Ordering::Acquire), 1);
-        let (dropped_worker, dropped) = worker(Behavior::Respond, None);
+        let (dropped_worker, dropped) = worker(1, Behavior::Respond, None);
         drop(dropped_worker);
         assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn shutdown_rejects_active_queued_and_post_close_requests() {
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (worker, closes) = worker(2, Behavior::Pending, Some(started_sender));
+        let worker = Arc::new(worker);
+
+        let (cancellation, deadline) = context(Duration::from_secs(1));
+        let active_worker = Arc::clone(&worker);
+        let active =
+            thread::spawn(move || active_worker.request(request(), cancellation, deadline));
+        started_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+
+        let (queued_sender, queued_receiver) = mpsc::sync_channel(1);
+        worker.set_admission_notice_for_test(queued_sender);
+        let queued_worker = Arc::clone(&worker);
+        let queued = thread::spawn(move || {
+            let (cancellation, deadline) = context(Duration::from_secs(1));
+            queued_worker.request(request(), cancellation, deadline)
+        });
+        queued_receiver
+            .recv_timeout(Duration::from_millis(250))
+            .unwrap();
+
+        worker.close().unwrap();
+        assert_eq!(active.join().unwrap(), Err(HttpWorkerError::Shutdown));
+        assert_eq!(queued.join().unwrap(), Err(HttpWorkerError::Shutdown));
+        let (cancellation, deadline) = context(Duration::from_secs(1));
+        assert_eq!(
+            worker.request(request(), cancellation, deadline),
+            Err(HttpWorkerError::Shutdown)
+        );
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn disconnected_result_channel_maps_to_shutdown() {
+        let (worker, _) = worker(1, Behavior::Respond, None);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+
+        assert_eq!(
+            HttpWorker::receive_response(&worker.state, receiver),
+            Err(HttpWorkerError::Shutdown)
+        );
+        worker.close().unwrap();
     }
 }
