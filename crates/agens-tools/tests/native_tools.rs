@@ -611,6 +611,158 @@ fn glob_lists_relative_doublestar_matches_and_reports_truncation() {
 }
 
 #[test]
+fn grep_and_glob_reject_escape_patterns_and_skip_external_symlinks() {
+    let root = project_root();
+    let outside = project_root();
+    fs::write(outside.join("secret.txt"), "EXTERNAL_SENTINEL\n").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools
+            .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path("../"))
+            .unwrap(),
+        ToolOutput::failure("path: traversal is not allowed")
+    );
+    assert_eq!(
+        tools
+            .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path(&outside))
+            .unwrap(),
+        ToolOutput::failure("path: must be a non-empty relative path")
+    );
+
+    for pattern in ["../**", "/**", r"C:\\**", r"\\\\server\\share\\**"] {
+        assert_eq!(
+            tools
+                .grep(GrepInput::new("EXTERNAL_SENTINEL").with_file_glob(pattern))
+                .unwrap(),
+            ToolOutput::failure("grep: glob pattern must be relative")
+        );
+        assert_eq!(
+            tools.glob(GlobInput::new(pattern)).unwrap(),
+            ToolOutput::failure("glob: glob pattern must be relative")
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("escape.txt")).unwrap();
+        fs::create_dir(outside.join("nested")).unwrap();
+        std::os::unix::fs::symlink(outside.join("nested"), root.join("escape-directory")).unwrap();
+        assert_eq!(
+            tools
+                .grep(GrepInput::new("EXTERNAL_SENTINEL").with_path("escape-directory"))
+                .unwrap(),
+            ToolOutput::failure("path: outside project root")
+        );
+        assert_eq!(
+            tools.grep(GrepInput::new("EXTERNAL_SENTINEL")).unwrap(),
+            ToolOutput::success("")
+        );
+        assert_eq!(
+            tools.glob(GlobInput::new("**/*.txt")).unwrap(),
+            ToolOutput::success("")
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn grep_and_glob_enforce_exact_default_scan_result_depth_and_timeout_bounds() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    for index in 0..=10_000 {
+        fs::write(root.join(format!("entry-{index:05}.txt")), "needle\n").unwrap();
+    }
+
+    assert_eq!(
+        tools.grep(GrepInput::new("needle")).unwrap(),
+        ToolOutput::failure("grep: entry limit of 10000 exceeded")
+    );
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.txt")).unwrap(),
+        ToolOutput::failure("glob: entry limit of 10000 exceeded")
+    );
+
+    fs::remove_dir_all(&root).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("results.txt"), "needle\n".repeat(101)).unwrap();
+    assert_eq!(
+        tools.grep(GrepInput::new("needle")).unwrap(),
+        ToolOutput::success(format!(
+            "{}[grep output truncated after 100 results]\n",
+            (1..=100)
+                .map(|line| format!("results.txt:{line}:needle\n"))
+                .collect::<String>()
+        ))
+    );
+
+    let mut directory = root.clone();
+    for _ in 0..=32 {
+        directory.push("nested");
+        fs::create_dir(&directory).unwrap();
+    }
+    fs::write(directory.join("leaf.txt"), "needle\n").unwrap();
+    assert_eq!(
+        tools.grep(GrepInput::new("needle")).unwrap(),
+        ToolOutput::failure("grep: traversal depth limit of 32 exceeded")
+    );
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.txt")).unwrap(),
+        ToolOutput::failure("glob: traversal depth limit of 32 exceeded")
+    );
+
+    let timed_out = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            operation_timeout: Duration::from_nanos(1),
+            ..NativeToolLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        timed_out.grep(GrepInput::new("needle")).unwrap(),
+        ToolOutput::failure("grep: operation timed out")
+    );
+    assert_eq!(
+        timed_out.glob(GlobInput::new("**/*.txt")).unwrap(),
+        ToolOutput::failure("glob: operation timed out")
+    );
+
+    assert_eq!(
+        NativeToolLimits::default().operation_timeout,
+        Duration::from_secs(5)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glob_and_list_enforce_the_exact_default_entry_cap() {
+    let root = project_root();
+    for index in 0..=1_000 {
+        fs::write(root.join(format!("entry-{index:04}.txt")), "entry\n").unwrap();
+    }
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools.list_directory(ListDirectoryInput::new(".")).unwrap(),
+        ToolOutput::failure("list: entry limit of 1000 exceeded")
+    );
+
+    let output = tools.glob(GlobInput::new("**/*.txt")).unwrap();
+    assert!(!output.is_error);
+    assert_eq!(output.content.lines().count(), 1_001);
+    assert_eq!(
+        output.content.lines().last(),
+        Some("[glob output truncated after 1000 entries]")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
     let root = project_root();
     fs::write(root.join("notes.txt"), "needle\n").unwrap();

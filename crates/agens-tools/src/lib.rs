@@ -3337,6 +3337,8 @@ fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
 }
 
 fn build_glob_set(pattern: &str, tool: &str) -> Result<GlobSet, ToolOutput> {
+    validate_relative_glob_pattern(pattern, tool)?;
+
     let glob = Glob::new(pattern)
         .map_err(|_| ToolOutput::failure(format!("{tool}: invalid glob pattern")))?;
     let mut builder = GlobSetBuilder::new();
@@ -3344,6 +3346,32 @@ fn build_glob_set(pattern: &str, tool: &str) -> Result<GlobSet, ToolOutput> {
     builder
         .build()
         .map_err(|_| ToolOutput::failure(format!("{tool}: invalid glob pattern")))
+}
+
+fn validate_relative_glob_pattern(pattern: &str, tool: &str) -> Result<(), ToolOutput> {
+    let path = Path::new(pattern);
+    let has_windows_prefix = pattern.starts_with('\\')
+        || pattern.as_bytes().get(..3).is_some_and(|prefix| {
+            prefix[0].is_ascii_alphabetic()
+                && prefix[1] == b':'
+                && matches!(prefix[2], b'/' | b'\\')
+        });
+
+    if path.is_absolute()
+        || has_windows_prefix
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ToolOutput::failure(format!(
+            "{tool}: glob pattern must be relative"
+        )));
+    }
+
+    Ok(())
 }
 
 struct SearchBudget {
