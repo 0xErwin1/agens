@@ -851,6 +851,8 @@ async fn run_headless_turn_with_iteration_limit(
                 .map_err(|_| HeadlessTurnError::State);
         }
 
+        let mut preflight = Vec::with_capacity(tool_calls.len());
+
         for call in tool_calls {
             check_cancelled(&mut coordinator, cancellation)?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
@@ -872,6 +874,13 @@ async fn run_headless_turn_with_iteration_limit(
             .await?;
             check_cancelled(&mut coordinator, cancellation)?;
 
+            preflight.push((call, decision));
+        }
+
+        for (call, decision) in preflight {
+            check_cancelled(&mut coordinator, cancellation)?;
+            flush_progress(&coordinator, progress, &mut progress_cursor);
+
             let output = match decision {
                 PermissionDecision::Allow => dispatcher
                     .dispatch(call.clone(), cancellation)
@@ -882,12 +891,12 @@ async fn run_headless_turn_with_iteration_limit(
                 PermissionDecision::Deny => HeadlessToolOutput::failure("permission denied"),
                 PermissionDecision::Ask => return Err(permission_required(&mut coordinator)),
             };
-            check_cancelled(&mut coordinator, cancellation)?;
 
             coordinator
                 .accept_tool_result(&call.id, output.content, output.is_error)
                 .map_err(|_| fail_state(&mut coordinator))?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
+            check_cancelled(&mut coordinator, cancellation)?;
         }
     }
 }

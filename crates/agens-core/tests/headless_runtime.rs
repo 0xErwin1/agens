@@ -613,3 +613,256 @@ fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
     assert_eq!(provider.iterations.len(), 1);
     assert!(repository.snapshots.is_empty());
 }
+
+#[test]
+fn preflights_a_provider_batch_before_sequential_dispatch_and_continues_denials() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![
+                tool_call("allow", "read"),
+                tool_call("deny", "write"),
+                tool_call("after", "search"),
+            ]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = RecordingGate {
+        decisions: vec![
+            PermissionDecision::Ask,
+            PermissionDecision::Deny,
+            PermissionDecision::Allow,
+        ],
+        observed: Arc::clone(&observed),
+    };
+    let mut resolver = RecordingResolver {
+        decisions: vec![PermissionDecision::Allow],
+        observed: Arc::clone(&observed),
+    };
+    let mut dispatcher = RecordingDispatcher {
+        outputs: vec![
+            Ok(HeadlessToolOutput::success("read result")),
+            Ok(HeadlessToolOutput::success("search result")),
+        ],
+        observed: Arc::clone(&observed),
+        cancellation: None,
+    };
+    let mut repository = Repository::default();
+
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("the allowed calls should complete after the full preflight");
+
+    assert_eq!(
+        *observed.lock().unwrap(),
+        [
+            "gate:read",
+            "resolve:read",
+            "gate:write",
+            "gate:search",
+            "dispatch:read",
+            "dispatch:search",
+        ]
+    );
+    assert_eq!(
+        snapshot.events(),
+        repository.snapshots[0].events(),
+        "the completed batch must remain persistable"
+    );
+    assert!(
+        snapshot
+            .events()
+            .contains(&TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "deny".into(),
+                content: "permission denied".into(),
+                is_error: true,
+            }))
+    );
+}
+
+#[test]
+fn cancellation_during_preflight_runs_nothing_and_during_execution_keeps_completed_results() {
+    let preflight_cancellation = HeadlessTurnCancellation::new();
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![
+            tool_call("first", "read"),
+            tool_call("second", "search"),
+        ])],
+    };
+    let mut gate = CancellingGate {
+        decisions: vec![PermissionDecision::Allow, PermissionDecision::Allow],
+        cancellation: preflight_cancellation.clone(),
+        observed: Arc::clone(&observed),
+    };
+    let mut repository = Repository::default();
+
+    let preflight_result = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut PermissionResolver::default(),
+        &mut RecordingDispatcher {
+            outputs: Vec::new(),
+            observed: Arc::clone(&observed),
+            cancellation: None,
+        },
+        &mut repository,
+        &preflight_cancellation,
+    ));
+
+    assert_eq!(preflight_result, Err(HeadlessTurnError::Cancelled));
+    assert_eq!(*observed.lock().unwrap(), ["gate:read"]);
+    assert!(repository.snapshots.is_empty());
+
+    let execution_cancellation = HeadlessTurnCancellation::new();
+    let mut provider = Provider {
+        iterations: vec![Ok(vec![
+            tool_call("first", "read"),
+            tool_call("second", "search"),
+        ])],
+    };
+    let mut dispatcher = RecordingDispatcher {
+        outputs: vec![Ok(HeadlessToolOutput::success("first result"))],
+        observed: Arc::new(Mutex::new(Vec::new())),
+        cancellation: Some(execution_cancellation.clone()),
+    };
+    let mut repository = Repository::default();
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let progress_sink: TurnProgressSink = {
+        let progress = Arc::clone(&progress);
+        Arc::new(move |event| progress.lock().unwrap().push(event))
+    };
+
+    let execution_result = block_on_ready(run_headless_turn_with_progress(
+        &mut provider,
+        &mut PermissionGate {
+            decisions: vec![PermissionDecision::Allow, PermissionDecision::Allow],
+        },
+        &mut PermissionResolver::default(),
+        &mut dispatcher,
+        &mut repository,
+        &execution_cancellation,
+        Some(&progress_sink),
+    ));
+
+    assert_eq!(execution_result, Err(HeadlessTurnError::Cancelled));
+    assert_eq!(dispatcher.calls(), ["read"]);
+    assert!(repository.snapshots.is_empty());
+    assert!(
+        progress
+            .lock()
+            .unwrap()
+            .contains(&TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "first".into(),
+                content: "first result".into(),
+                is_error: false,
+            }))
+    );
+}
+
+fn tool_call(id: &str, name: &str) -> MessagePart {
+    MessagePart::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input: "{}".into(),
+    }
+}
+
+struct RecordingGate {
+    decisions: Vec<PermissionDecision>,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+impl HeadlessPermissionGate for RecordingGate {
+    fn evaluate(
+        &mut self,
+        call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(format!("gate:{}", call.name));
+        ready(Ok(self.decisions.remove(0)))
+    }
+}
+
+struct CancellingGate {
+    decisions: Vec<PermissionDecision>,
+    cancellation: HeadlessTurnCancellation,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+impl HeadlessPermissionGate for CancellingGate {
+    fn evaluate(
+        &mut self,
+        call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(format!("gate:{}", call.name));
+        self.cancellation.cancel();
+        ready(Ok(self.decisions.remove(0)))
+    }
+}
+
+struct RecordingResolver {
+    decisions: Vec<PermissionDecision>,
+    observed: Arc<Mutex<Vec<String>>>,
+}
+
+impl HeadlessPermissionResolver for RecordingResolver {
+    fn resolve(
+        &mut self,
+        call: &HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(format!("resolve:{}", call.name));
+        ready(Ok(self.decisions.remove(0)))
+    }
+}
+
+struct RecordingDispatcher {
+    outputs: Vec<Result<HeadlessToolOutput, HeadlessTurnPortError>>,
+    observed: Arc<Mutex<Vec<String>>>,
+    cancellation: Option<HeadlessTurnCancellation>,
+}
+
+impl RecordingDispatcher {
+    fn calls(&self) -> Vec<String> {
+        self.observed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event.strip_prefix("dispatch:").map(ToOwned::to_owned))
+            .collect()
+    }
+}
+
+impl HeadlessToolDispatcher for RecordingDispatcher {
+    fn dispatch(
+        &mut self,
+        call: HeadlessToolCall,
+        _cancellation: &HeadlessTurnCancellation,
+    ) -> impl Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send {
+        self.observed
+            .lock()
+            .unwrap()
+            .push(format!("dispatch:{}", call.name));
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+        ready(self.outputs.remove(0))
+    }
+}
