@@ -539,6 +539,16 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
         .unwrap();
     assert_eq!(read.input_schema["properties"]["offset"]["minimum"], 1);
     assert_eq!(read.input_schema["properties"]["limit"]["minimum"], 1);
+    let webfetch = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::webfetch")
+        .expect("webfetch metadata");
+    assert_eq!(webfetch.access, agens_core::ToolAccess::ReadOnly);
+    assert_eq!(webfetch.input_schema["required"], json!(["url"]));
+    assert_eq!(
+        webfetch.input_schema["properties"]["timeout_ms"]["minimum"],
+        1
+    );
     let cancellation = Arc::new(AtomicBool::new(true));
     let output = catalog
         .execute(
@@ -827,7 +837,7 @@ fn webfetch_rejects_unsafe_urls_and_honors_cancellation_before_network_access() 
 }
 
 fn webfetch_fixture(
-    response: String,
+    responses: Vec<String>,
     request: Arc<Mutex<String>>,
 ) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -836,22 +846,33 @@ fn webfetch_fixture(
         listener.local_addr().unwrap().port()
     );
     let worker = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut bytes = [0; 4096];
-        let read = stream.read(&mut bytes).unwrap();
-        *request.lock().unwrap() = String::from_utf8_lossy(&bytes[..read]).into_owned();
-        stream.write_all(response.as_bytes()).unwrap();
+        for response in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = [0; 4096];
+            let read = stream.read(&mut bytes).unwrap();
+            *request.lock().unwrap() = String::from_utf8_lossy(&bytes[..read]).into_owned();
+            stream.write_all(response.as_bytes()).unwrap();
+        }
     });
     (url, worker)
 }
 
 #[test]
-fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
+fn webfetch_enforces_redirects_response_contract_and_headers() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
     let request = Arc::new(Mutex::new(String::new()));
+    let previous_proxy = std::env::var_os("HTTP_PROXY");
+    unsafe { std::env::set_var("HTTP_PROXY", "http://127.0.0.1:1") };
     let (url, worker) = webfetch_fixture(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>visible</p><script>secret</script><style>hidden</style>text".into(),
+        vec![
+            "HTTP/1.1 302 Found\r\nLocation: /one\r\nContent-Length: 0\r\n\r\n".into(),
+            "HTTP/1.1 302 Found\r\nLocation: /two\r\nContent-Length: 0\r\n\r\n".into(),
+            "HTTP/1.1 302 Found\r\nLocation: /three\r\nContent-Length: 0\r\n\r\n".into(),
+            "HTTP/1.1 302 Found\r\nLocation: /four\r\nContent-Length: 0\r\n\r\n".into(),
+            "HTTP/1.1 302 Found\r\nLocation: /five\r\nContent-Length: 0\r\n\r\n".into(),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>visible</p><script>secret</script><style>hidden</style>text".into(),
+        ],
         Arc::clone(&request),
     );
 
@@ -862,12 +883,15 @@ fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
     worker.join().unwrap();
 
     let (url, worker) = webfetch_fixture(
-        "HTTP/1.1 302 Found\r\nLocation: http://[fe80::1]/\r\nContent-Length: 0\r\n\r\n".into(),
+        vec![
+            "HTTP/1.1 302 Found\r\nLocation: ftp://example.test/\r\nContent-Length: 0\r\n\r\n"
+                .into(),
+        ],
         Arc::new(Mutex::new(String::new())),
     );
     assert_eq!(
         tools.webfetch(WebfetchInput::new(url)).unwrap(),
-        ToolOutput::failure("webfetch: blocked network address")
+        ToolOutput::failure("webfetch: URL must use http or https")
     );
     worker.join().unwrap();
     let request = request.lock().unwrap();
@@ -876,9 +900,28 @@ fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
     assert!(!request.contains("authorization:"));
     assert!(!request.contains("cookie:"));
 
+    unsafe {
+        match previous_proxy {
+            Some(proxy) => std::env::set_var("HTTP_PROXY", proxy),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+    }
+
     let (url, worker) = webfetch_fixture(
-        "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n"
-            .into(),
+        vec!["HTTP/1.1 302 Found\r\nLocation: http://user:secret@example.test/\r\nContent-Length: 0\r\n\r\n".into()],
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::failure("webfetch: URL credentials are not allowed")
+    );
+    worker.join().unwrap();
+
+    let (url, worker) = webfetch_fixture(
+        vec![
+            "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n"
+                .into(),
+        ],
         Arc::new(Mutex::new(String::new())),
     );
     assert_eq!(
@@ -888,15 +931,36 @@ fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
     worker.join().unwrap();
 
     let (url, worker) = webfetch_fixture(
-        format!(
+        vec!["HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\nraw\0body".into()],
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::success("raw\0body")
+    );
+    worker.join().unwrap();
+
+    let (url, worker) = webfetch_fixture(
+        vec![format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{}",
             "x".repeat(100 * 1024 + 1)
-        ),
+        )],
         Arc::new(Mutex::new(String::new())),
     );
     let output = tools.webfetch(WebfetchInput::new(url)).unwrap();
     assert!(!output.is_error);
     assert!(output.content.ends_with("[webfetch output truncated]"));
+    assert!(output.content.len() <= 100 * 1024);
+    worker.join().unwrap();
+
+    let (url, worker) = webfetch_fixture(
+        vec!["HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nmissing".into()],
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::failure("webfetch: HTTP status 404 Not Found")
+    );
     worker.join().unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -915,6 +979,64 @@ fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
         ToolOutput::failure("webfetch: timed out")
     );
     worker.join().unwrap();
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn webfetch_rejects_six_redirects_and_cancels_delayed_headers_and_bodies() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let (url, worker) = webfetch_fixture(
+        vec!["HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".into(); 6],
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::failure("webfetch: redirect limit exceeded")
+    );
+    worker.join().unwrap();
+
+    for response in [
+        None,
+        Some("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\n"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        );
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read_exact(&mut request[..1]).unwrap();
+            if let Some(response) = response {
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
+        });
+        let cancelled = Arc::clone(&cancellation);
+        let request_root = root.clone();
+        let request = thread::spawn(move || {
+            NativeToolCatalog::new(NativeTools::open(request_root).unwrap())
+                .execute(
+                    "native::webfetch",
+                    json!({"url": url}),
+                    &ToolExecutionContext::new(cancelled, Duration::from_secs(2)),
+                )
+                .unwrap()
+        });
+        thread::sleep(Duration::from_millis(20));
+        cancellation.store(true, Ordering::Release);
+        assert_eq!(
+            request.join().unwrap(),
+            ToolOutput::failure("tool execution cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        worker.join().unwrap();
+    }
 
     fs::remove_dir_all(root).unwrap();
 }

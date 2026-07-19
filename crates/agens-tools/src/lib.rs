@@ -41,6 +41,7 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
 const MAX_WEBFETCH_REDIRECTS: usize = 5;
+const WEBFETCH_TRUNCATED_MARKER: &str = "\n[webfetch output truncated]";
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_MAX_LIST_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -2977,15 +2978,10 @@ impl NativeTools {
             return Ok(ToolOutput::failure("webfetch: cancelled"));
         }
 
-        let mut url = match reqwest::Url::parse(&input.url) {
-            Ok(url) if matches!(url.scheme(), "http" | "https") => url,
-            _ => return Ok(ToolOutput::failure("webfetch: URL must use http or https")),
+        let mut url = match webfetch_url(&input.url) {
+            Ok(url) => url,
+            Err(output) => return Ok(output),
         };
-        if !url.username().is_empty() || url.password().is_some() {
-            return Ok(ToolOutput::failure(
-                "webfetch: URL credentials are not allowed",
-            ));
-        }
 
         for redirects in 0..=MAX_WEBFETCH_REDIRECTS {
             if input.cancelled() {
@@ -3017,59 +3013,72 @@ impl NativeTools {
                 .resolve_to_addrs(host, &addresses)
                 .build()
                 .map_err(|_| Error::Tool("webfetch client setup failed".into()))?;
-            let response = match client.get(url.clone()).send() {
-                Ok(response) => response,
-                Err(_) if input.cancelled() => {
-                    return Ok(ToolOutput::failure("webfetch: cancelled"));
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let request_url = url.clone();
+            thread::spawn(move || {
+                let _ = sender.send(webfetch_request(client, request_url));
+            });
+            let response = loop {
+                match receiver.recv_timeout(PROCESS_POLL_INTERVAL) {
+                    Ok(Ok(response)) => break response,
+                    Ok(Err(WebfetchRequestError::TimedOut)) => {
+                        return Ok(ToolOutput::failure("webfetch: timed out"));
+                    }
+                    Ok(Err(WebfetchRequestError::Failed)) => {
+                        return Ok(ToolOutput::failure("webfetch: request failed"));
+                    }
+                    Ok(Err(WebfetchRequestError::ReadFailed)) => {
+                        return Ok(ToolOutput::failure("webfetch: response read failed"));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) if input.cancelled() => {
+                        return Ok(ToolOutput::failure("webfetch: cancelled"));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                        if input
+                            .execution_context
+                            .as_ref()
+                            .is_some_and(ToolExecutionContext::is_expired) =>
+                    {
+                        return Ok(ToolOutput::failure("webfetch: timed out"));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Ok(ToolOutput::failure("webfetch: request failed"));
+                    }
                 }
-                Err(error) if error.is_timeout() => {
-                    return Ok(ToolOutput::failure("webfetch: timed out"));
-                }
-                Err(_) => return Ok(ToolOutput::failure("webfetch: request failed")),
             };
-            if response.status().is_redirection() {
+            if response.status.is_redirection() {
                 if redirects == MAX_WEBFETCH_REDIRECTS {
                     return Ok(ToolOutput::failure("webfetch: redirect limit exceeded"));
                 }
-                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                let Some(location) = response.location else {
                     return Ok(ToolOutput::failure("webfetch: redirect has no location"));
                 };
-                url = match location
-                    .to_str()
-                    .ok()
-                    .and_then(|value| url.join(value).ok())
-                {
-                    Some(url) => url,
-                    None => return Ok(ToolOutput::failure("webfetch: invalid redirect location")),
+                url = match url.join(&location) {
+                    Ok(url) => match webfetch_url(url.as_str()) {
+                        Ok(url) => url,
+                        Err(output) => return Ok(output),
+                    },
+                    Err(_) => {
+                        return Ok(ToolOutput::failure("webfetch: invalid redirect location"));
+                    }
                 };
                 continue;
             }
-            if !response.status().is_success() {
+            if !response.status.is_success() {
                 return Ok(ToolOutput::failure(format!(
                     "webfetch: HTTP status {}",
-                    response.status()
+                    response.status
                 )));
             }
-            let html = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("text/html"));
-            let mut body = response.take(MAX_WEBFETCH_BYTES as u64 + 1);
-            let mut bytes = Vec::new();
-            if body.read_to_end(&mut bytes).is_err() {
-                return Ok(ToolOutput::failure("webfetch: response read failed"));
-            }
-            let truncated = bytes.len() > MAX_WEBFETCH_BYTES;
-            bytes.truncate(MAX_WEBFETCH_BYTES);
-            let mut content = String::from_utf8_lossy(&bytes).into_owned();
-            if html {
+            let mut content = String::from_utf8_lossy(&response.bytes).into_owned();
+            if response.html {
                 content = visible_html_text(&content);
             }
-            if truncated {
-                content.push_str("\n[webfetch output truncated]");
-            }
-            return Ok(ToolOutput::success(content));
+            return Ok(ToolOutput::success(truncate_webfetch_content(
+                content,
+                response.truncated,
+            )));
         }
         unreachable!("redirect loop always returns")
     }
@@ -3327,6 +3336,88 @@ pub struct NativeToolMetadata {
     pub access: ToolAccess,
 }
 
+struct WebfetchResponse {
+    status: reqwest::StatusCode,
+    location: Option<String>,
+    html: bool,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+enum WebfetchRequestError {
+    TimedOut,
+    Failed,
+    ReadFailed,
+}
+
+fn webfetch_url(value: &str) -> Result<reqwest::Url, ToolOutput> {
+    let url = match reqwest::Url::parse(value) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return Err(ToolOutput::failure("webfetch: URL must use http or https")),
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ToolOutput::failure(
+            "webfetch: URL credentials are not allowed",
+        ));
+    }
+    Ok(url)
+}
+
+fn webfetch_request(
+    client: reqwest::blocking::Client,
+    url: reqwest::Url,
+) -> Result<WebfetchResponse, WebfetchRequestError> {
+    let response = client.get(url).send().map_err(|error| {
+        if error.is_timeout() {
+            WebfetchRequestError::TimedOut
+        } else {
+            WebfetchRequestError::Failed
+        }
+    })?;
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let html = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    let mut bytes = Vec::new();
+    if status.is_success()
+        && response
+            .take(MAX_WEBFETCH_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+    {
+        return Err(WebfetchRequestError::ReadFailed);
+    }
+    let truncated = bytes.len() > MAX_WEBFETCH_BYTES;
+    bytes.truncate(MAX_WEBFETCH_BYTES);
+    Ok(WebfetchResponse {
+        status,
+        location,
+        html,
+        bytes,
+        truncated,
+    })
+}
+
+fn truncate_webfetch_content(mut content: String, truncated: bool) -> String {
+    if !truncated && content.len() <= MAX_WEBFETCH_BYTES {
+        return content;
+    }
+    let mut end = MAX_WEBFETCH_BYTES - WEBFETCH_TRUNCATED_MARKER.len();
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    content.truncate(end);
+    content.push_str(WEBFETCH_TRUNCATED_MARKER);
+    content
+}
+
 fn webfetch_addresses(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, ToolOutput> {
     let host = url
         .host_str()
@@ -3344,12 +3435,21 @@ fn webfetch_addresses(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, T
     let addresses = (host, port)
         .to_socket_addrs()
         .map_err(|_| ToolOutput::failure("webfetch: host resolution failed"))?
-        .filter(|address| !blocked_webfetch_address(address.ip()))
         .collect::<Vec<_>>();
+    let addresses = permitted_webfetch_addresses(addresses);
     if addresses.is_empty() {
         return Err(ToolOutput::failure("webfetch: blocked network address"));
     }
     Ok(addresses)
+}
+
+fn permitted_webfetch_addresses(
+    addresses: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    addresses
+        .into_iter()
+        .filter(|address| !blocked_webfetch_address(address.ip()))
+        .collect()
 }
 
 fn blocked_webfetch_address(address: IpAddr) -> bool {
@@ -4022,6 +4122,23 @@ mod native_tool_tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn webfetch_address_policy_covers_literals_and_resolved_addresses() {
+        assert_eq!(DEFAULT_WEBFETCH_TIMEOUT, Duration::from_secs(30));
+        for address in ["169.254.1.1", "100.100.100.200", "fe80::1", "fd00:ec2::254"] {
+            assert!(blocked_webfetch_address(address.parse().unwrap()));
+        }
+        for address in ["127.0.0.1", "10.0.0.1", "::1"] {
+            assert!(!blocked_webfetch_address(address.parse().unwrap()));
+        }
+        let resolved = permitted_webfetch_addresses([
+            "127.0.0.1:80".parse().unwrap(),
+            "169.254.1.1:80".parse().unwrap(),
+            "[fe80::1]:80".parse().unwrap(),
+        ]);
+        assert_eq!(resolved, vec!["127.0.0.1:80".parse().unwrap()]);
     }
 }
 
