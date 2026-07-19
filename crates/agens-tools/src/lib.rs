@@ -28,6 +28,7 @@ use serde_json::Value;
 
 mod http_mcp;
 pub mod http_worker;
+pub mod markdown;
 mod stdio_mcp;
 
 pub use http_mcp::{McpHttpTransport, McpSseTransport};

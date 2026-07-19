@@ -1,0 +1,105 @@
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use agens_tools::markdown::{self, FrontmatterValue, MarkdownRoot};
+
+#[test]
+fn parses_scalar_and_list_frontmatter_without_changing_the_body() {
+    let document =
+        markdown::parse("---\nname: example\nskills:\n  - read\n  - write\n---\n  body remains\n")
+            .expect("parse markdown");
+
+    assert_eq!(document.body(), "  body remains\n");
+    assert_eq!(
+        document.field("name"),
+        Some(&FrontmatterValue::Scalar("example".into()))
+    );
+    assert_eq!(
+        document.field("skills"),
+        Some(&FrontmatterValue::List(vec!["read".into(), "write".into()]))
+    );
+}
+
+#[test]
+fn rejects_malformed_frontmatter_and_unsafe_definition_names() {
+    assert!(markdown::parse("name: missing delimiters\n").is_err());
+    assert!(markdown::parse("---\nname: {not: text}\n---\nbody\n").is_err());
+    assert!(markdown::canonical_filename("bad--name").is_err());
+    assert!(markdown::canonical_filename("../escape").is_err());
+    assert_eq!(
+        markdown::canonical_filename("valid-name-2").unwrap(),
+        "valid-name-2.md"
+    );
+}
+
+#[test]
+fn bounds_and_confines_root_reads_with_isolated_diagnostics() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("valid.md"), "---\nname: valid\n---\nbody\n").unwrap();
+    fs::write(root.join("bad.md"), "---\nname: {bad: value}\n---\nbody\n").unwrap();
+    fs::write(
+        root.join("large.md"),
+        "x".repeat(markdown::MAX_MARKDOWN_FILE_BYTES + 1),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(temporary.path.join("outside.md"), root.join("escape.md")).unwrap();
+
+    let MarkdownRoot {
+        documents,
+        diagnostics,
+    } = markdown::load_root(&root).unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].name(), "valid");
+    assert_eq!(diagnostics.len(), if cfg!(unix) { 3 } else { 2 });
+}
+
+#[test]
+fn stops_at_root_and_accepted_definition_limits() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    fs::create_dir_all(&root).unwrap();
+    for index in 0..=markdown::MAX_MARKDOWN_ROOT_ENTRIES {
+        let name = format!("entry-{index:04}");
+        fs::write(
+            root.join(format!("{name}.md")),
+            format!("---\nname: {name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+
+    let MarkdownRoot {
+        documents,
+        diagnostics,
+    } = markdown::load_root(&root).unwrap();
+    assert_eq!(documents.len(), markdown::MAX_MARKDOWN_DEFINITIONS);
+    assert_eq!(diagnostics.len(), 2);
+}
+
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        let name = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("agens-extensions-{name}"));
+        fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
