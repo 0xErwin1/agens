@@ -15,8 +15,8 @@ use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
     McpCallResult, McpClient, McpContentBlock, McpHttpTransport, McpInitialize,
     McpInitializeResult, McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest,
-    McpResponse, McpServerReport, McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage,
-    McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
+    McpResponse, McpServerReport, McpSseTransport, McpTimeouts, McpToolAnnotations,
+    McpToolDefinition, McpToolsPage, McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
 };
 use serde_json::json;
 
@@ -858,6 +858,47 @@ fn http_and_sse_transports_send_json_rpc_requests() {
         server.join().unwrap();
         assert_eq!(attempts.load(Ordering::Acquire), expected_requests);
     }
+}
+
+#[test]
+fn legacy_sse_transport_discovers_the_message_endpoint_and_returns_json_rpc_responses() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut events, request) = accept_http_request(&listener);
+        assert_eq!(request.lines().next(), Some("GET /events HTTP/1.1"));
+        write!(
+            events,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n: keepalive\n\nevent: endpoint\ndata: /message\n\n"
+        )
+        .unwrap();
+        events.flush().unwrap();
+
+        let (mut message, request) = accept_http_request(&listener);
+        assert_eq!(request.lines().next(), Some("POST /message HTTP/1.1"));
+        respond(&mut message, "202 Accepted", b"", "");
+        let response = String::from_utf8(initialized_body()).unwrap();
+        let split = response.find(",\"id\"").unwrap();
+        write!(
+            events,
+            "event: message\ndata: {}\ndata: {}\n\n",
+            &response[..split + 1],
+            &response[split + 1..]
+        )
+        .unwrap();
+        events.flush().unwrap();
+    });
+    let mut transport =
+        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 0).unwrap();
+
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+        ),
+        Ok(initialized())
+    );
+    server.join().unwrap();
 }
 
 #[test]

@@ -29,9 +29,9 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
-    AuthorizedToolCall, DispatchTool, McpHttpTransport, McpLimits, McpRegistry, McpStdioTransport,
-    McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
-    NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata,
+    AuthorizedToolCall, DispatchTool, McpHttpTransport, McpLimits, McpRegistry, McpSseTransport,
+    McpStdioTransport, McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort,
+    McpTransportError, NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata,
     ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
@@ -1636,8 +1636,14 @@ fn configured_mcp_transport(
                 .unwrap_or_else(|| project_root.to_path_buf()),
         })
         .map(|transport| Box::new(transport) as Box<dyn McpTransportPort>),
-        McpTransport::Http | McpTransport::Sse => McpHttpTransport::new(
+        McpTransport::Http => McpHttpTransport::new(
             server.url.clone().expect("HTTP MCP URLs are validated"),
+            server.headers.clone(),
+            server.max_retries,
+        )
+        .map(|transport| Box::new(transport) as Box<dyn McpTransportPort>),
+        McpTransport::Sse => McpSseTransport::new(
+            server.url.clone().expect("SSE MCP URLs are validated"),
             server.headers.clone(),
             server.max_retries,
         )

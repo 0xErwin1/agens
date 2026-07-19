@@ -35,6 +35,7 @@ pub enum HttpWorkerError {
     Panicked,
     Shutdown,
     Transport,
+    Protocol,
     ResponseTooLarge,
 }
 pub trait HttpWorkerOperation: Send + 'static {

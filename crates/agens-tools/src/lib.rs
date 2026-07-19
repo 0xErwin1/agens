@@ -30,7 +30,7 @@ mod http_mcp;
 pub mod http_worker;
 mod stdio_mcp;
 
-pub use http_mcp::McpHttpTransport;
+pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 
 #[cfg(unix)]
