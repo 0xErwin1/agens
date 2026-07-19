@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agens_tools::SkillCatalog;
+use agens_tools::{SkillCatalog, SkillResourceClass};
 
 #[test]
 fn discovers_global_and_project_skills_with_project_shadowing() {
@@ -44,7 +44,8 @@ fn discovers_global_and_project_skills_with_project_shadowing() {
             .catalog()
             .skill("shared")
             .expect("project skill")
-            .body(),
+            .load_instructions()
+            .expect("load project instructions"),
         "project instructions"
     );
     assert!(discovery.catalog().skill("global-only").is_some());
@@ -90,7 +91,12 @@ fn isolates_invalid_and_ambiguous_skills_without_losing_valid_or_global_skills()
     assert!(discovery.catalog().skill("valid").is_some());
     assert!(discovery.catalog().skill("duplicate").is_none());
     assert_eq!(
-        discovery.catalog().skill("valid").unwrap().body(),
+        discovery
+            .catalog()
+            .skill("valid")
+            .unwrap()
+            .load_instructions()
+            .expect("load valid instructions"),
         "valid body"
     );
     assert_eq!(discovery.diagnostics().len(), 3);
@@ -458,6 +464,82 @@ fn rejects_symlinked_roots_and_manifests_while_loading_valid_siblings() {
     let root_link = temporary.path.join("root-link");
     symlink(&root, &root_link).expect("root symlink");
     assert!(SkillCatalog::discover(&root_link, temporary.path.join("missing")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn progressively_discloses_only_bounded_confined_skill_content() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    let outside = temporary.path.join("outside.txt");
+    fs::write(&outside, "outside root").expect("outside file");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: research skill\n---\nlevel two instructions\n",
+    );
+    let skill_root = root.join("research");
+    fs::create_dir_all(skill_root.join("references")).expect("references directory");
+    fs::create_dir_all(skill_root.join("scripts")).expect("scripts directory");
+    fs::create_dir_all(skill_root.join("assets")).expect("assets directory");
+    fs::write(
+        skill_root.join("references/guide.md"),
+        "level three reference",
+    )
+    .expect("reference");
+    fs::write(skill_root.join("scripts/run.sh"), "echo bounded").expect("script");
+    fs::write(skill_root.join("assets/data.txt"), "bounded asset").expect("asset");
+    symlink(&outside, skill_root.join("references/escape.md")).expect("resource symlink");
+    fs::write(
+        skill_root.join("references/large.md"),
+        "x".repeat(256 * 1024 + 1),
+    )
+    .expect("large reference");
+
+    let discovery =
+        SkillCatalog::discover(&root, temporary.path.join("missing")).expect("discover skills");
+    let skill = discovery.catalog().skill("research").expect("skill");
+
+    assert_eq!(skill.description(), "research skill");
+    assert_eq!(skill.load_instructions().unwrap(), "level two instructions");
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "guide.md")
+            .unwrap(),
+        "level three reference"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Script, "run.sh")
+            .unwrap(),
+        "echo bounded"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Asset, "data.txt")
+            .unwrap(),
+        "bounded asset"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "../outside.txt")
+            .unwrap_err(),
+        "skill resource name must be a single normal filename"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "escape.md")
+            .unwrap_err(),
+        "skill resource must be a regular non-symbolic-link file"
+    );
+    assert_eq!(
+        skill
+            .load_resource(SkillResourceClass::Reference, "large.md")
+            .unwrap_err(),
+        "skill resource exceeds 262144 byte limit"
+    );
 }
 
 fn write_skill(root: &Path, directory: &str, contents: &str) {

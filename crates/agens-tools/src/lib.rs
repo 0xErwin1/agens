@@ -64,6 +64,7 @@ const SKILL_MANIFEST_NAME: &str = "SKILL.md";
 const MAX_SKILL_DIRECTORIES_PER_ROOT: usize = 128;
 const MAX_SKILL_ROOT_ENTRIES: usize = 1_024;
 const MAX_SKILL_MANIFEST_BYTES: u64 = 256 * 1024;
+const MAX_SKILL_RESOURCE_BYTES: u64 = 256 * 1024;
 const MAX_SKILL_NAME_CHARS: usize = 64;
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 1_024;
 const DEFAULT_MAX_SUBAGENT_CONCURRENCY: usize = 4;
@@ -137,8 +138,25 @@ fn install_subagent_panic_hook() {
 pub struct Skill {
     name: String,
     description: String,
-    body: String,
     source: PathBuf,
+    directory: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillResourceClass {
+    Reference,
+    Script,
+    Asset,
+}
+
+impl SkillResourceClass {
+    const fn directory(self) -> &'static str {
+        match self {
+            Self::Reference => "references",
+            Self::Script => "scripts",
+            Self::Asset => "assets",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,8 +388,45 @@ impl Skill {
         &self.description
     }
 
-    pub fn body(&self) -> &str {
-        &self.body
+    pub fn load_instructions(&self) -> Result<String, String> {
+        let directory = open_skill_root(&self.directory)
+            .map_err(|error| format!("cannot open skill instructions: {error}"))?;
+        let mut manifest =
+            open_manifest(&directory)?.ok_or("skill instructions are unavailable")?;
+        let contents = read_bounded_utf8(&mut manifest, MAX_SKILL_MANIFEST_BYTES)?;
+
+        parse_skill_manifest(&self.source, &self.directory, &contents)?;
+        split_skill_frontmatter(&contents).map(|(_, body)| body.trim().to_owned())
+    }
+
+    pub fn load_resource(&self, class: SkillResourceClass, name: &str) -> Result<String, String> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        if !is_normal_filename(name) {
+            return Err("skill resource name must be a single normal filename".into());
+        }
+
+        let directory = open_skill_root(&self.directory)
+            .map_err(|error| format!("cannot open skill resource root: {error}"))?;
+        let class_directory =
+            open_child_directory(&directory, std::ffi::OsStr::new(class.directory()))?
+                .ok_or("skill resource class is unavailable")?;
+        let mut resource = open_child_file(&class_directory, std::ffi::OsStr::new(name))?
+            .ok_or("skill resource is unavailable")?;
+        let metadata = resource
+            .metadata()
+            .map_err(|error| format!("cannot inspect skill resource: {error}"))?;
+        if !metadata.is_file() || metadata.nlink() > 1 {
+            return Err("skill resource must be a regular non-symbolic-link file".into());
+        }
+        if metadata.len() > MAX_SKILL_RESOURCE_BYTES {
+            return Err(format!(
+                "skill resource exceeds {MAX_SKILL_RESOURCE_BYTES} byte limit"
+            ));
+        }
+
+        read_bounded_utf8(&mut resource, MAX_SKILL_RESOURCE_BYTES)
     }
 
     pub fn source(&self) -> &Path {
@@ -650,14 +705,14 @@ fn load_skill_manifest(
         ));
     }
 
-    let contents = read_bounded_utf8(&mut manifest_descriptor)
+    let contents = read_bounded_utf8(&mut manifest_descriptor, MAX_SKILL_MANIFEST_BYTES)
         .map_err(|message| skill_diagnostic(&manifest, message))?;
-    parse_skill_manifest(&manifest, &contents)
+    parse_skill_manifest(&manifest, &directory, &contents)
         .map(Some)
         .map_err(|message| skill_diagnostic(&manifest, message))
 }
 
-fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> {
+fn parse_skill_manifest(source: &Path, directory: &Path, contents: &str) -> Result<Skill, String> {
     let (frontmatter, body) = split_skill_frontmatter(contents)?;
     let fields: SkillFrontmatter = serde_yaml::from_str(frontmatter)
         .map_err(|error| format!("invalid frontmatter: {error}"))?;
@@ -665,16 +720,15 @@ fn parse_skill_manifest(source: &Path, contents: &str) -> Result<Skill, String> 
     let description = fields.description.trim().to_owned();
     validate_skill_name(&name)?;
     validate_skill_description(&description)?;
-    let body = body.trim().to_owned();
-    if body.is_empty() {
+    if body.trim().is_empty() {
         return Err("markdown body is required".into());
     }
 
     Ok(Skill {
         name,
         description,
-        body,
         source: source.to_path_buf(),
+        directory: directory.to_path_buf(),
     })
 }
 
@@ -1017,18 +1071,60 @@ fn open_manifest(directory: &fs::File) -> Result<Option<fs::File>, String> {
 }
 
 #[cfg(unix)]
-fn read_bounded_utf8(file: &mut fs::File) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    file.take(MAX_SKILL_MANIFEST_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("cannot read opened manifest: {error}"))?;
-    if bytes.len() > MAX_SKILL_MANIFEST_BYTES as usize {
-        return Err(format!(
-            "manifest exceeds {MAX_SKILL_MANIFEST_BYTES} byte limit"
-        ));
+fn open_child_file(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+) -> Result<Option<fs::File>, String> {
+    use std::{
+        ffi::CString,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|_| "skill resource name contains a null byte".to_string())?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor >= 0 {
+        return Ok(Some(unsafe { fs::File::from_raw_fd(descriptor) }));
     }
 
-    String::from_utf8(bytes).map_err(|error| format!("cannot read UTF-8 manifest: {error}"))
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+    }
+    if error.raw_os_error() == Some(libc::ELOOP) {
+        return Err("skill resource must be a regular non-symbolic-link file".into());
+    }
+    Err(format!("cannot open skill resource: {error}"))
+}
+
+fn is_normal_filename(name: &str) -> bool {
+    !name.is_empty()
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && Path::new(name).components().count() == 1
+}
+
+#[cfg(unix)]
+fn read_bounded_utf8(file: &mut fs::File, limit: u64) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read opened skill file: {error}"))?;
+    if bytes.len() > limit as usize {
+        return Err(format!("skill file exceeds {limit} byte limit"));
+    }
+
+    String::from_utf8(bytes).map_err(|error| format!("skill file is not UTF-8: {error}"))
 }
 
 fn skill_root_error(
@@ -1303,6 +1399,9 @@ impl<R: SubagentRunner> SubagentTool<R> {
         let Some(skill) = self.catalog.skill(&invocation.skill_name) else {
             return ToolOutput::failure("subagent: requested skill is unavailable");
         };
+        let Ok(instructions) = skill.load_instructions() else {
+            return ToolOutput::failure("subagent: requested skill is unavailable");
+        };
         if invocation.prompt.is_empty()
             || invocation
                 .prompt
@@ -1324,7 +1423,7 @@ impl<R: SubagentRunner> SubagentTool<R> {
         let request = SubagentTurnRequest {
             skill_name: skill.name.clone(),
             skill_description: skill.description.clone(),
-            instructions: skill.body.clone(),
+            instructions,
             prompt: invocation.prompt,
             context: invocation.context,
             capabilities: ChildCapabilityRegistry::isolated(),
