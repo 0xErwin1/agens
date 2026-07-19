@@ -902,6 +902,330 @@ fn legacy_sse_transport_discovers_the_message_endpoint_and_returns_json_rpc_resp
 }
 
 #[test]
+fn legacy_sse_transport_retries_transient_failures_with_one_deadline() {
+    for (status, reason) in [
+        ("408", "Request Timeout"),
+        ("429", "Too Many Requests"),
+        ("500", "Internal Server Error"),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut failed, _) = accept_http_request(&listener);
+            respond(&mut failed, &format!("{status} {reason}"), b"", "");
+            let (mut events, _) = accept_http_request(&listener);
+            write!(
+                events,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\n\n"
+            )
+            .unwrap();
+            events.flush().unwrap();
+            let (mut message, _) = accept_http_request(&listener);
+            respond(&mut message, "202 Accepted", b"", "");
+            write!(
+                events,
+                "event: message\ndata: {}\n\n",
+                String::from_utf8(initialized_body()).unwrap()
+            )
+            .unwrap();
+            events.flush().unwrap();
+        });
+        let mut transport =
+            McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1)
+                .unwrap();
+
+        assert_eq!(
+            transport.execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            ),
+            Ok(initialized()),
+            "{status} must retry once then accept the SSE response"
+        );
+        server.join().unwrap();
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut transport =
+        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1).unwrap();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+        ),
+        Err(McpTransportError::RetriesExhausted)
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut failed, _) = accept_http_request(&listener);
+        respond(&mut failed, "500 Internal Server Error", b"", "");
+        let (_events, _) = accept_http_request(&listener);
+        thread::sleep(Duration::from_secs(1));
+    });
+    let mut transport =
+        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_millis(50))
+        ),
+        Err(McpTransportError::TimedOut)
+    );
+    assert!(start.elapsed() < Duration::from_millis(250));
+    server.join().unwrap();
+}
+
+#[test]
+fn legacy_sse_transport_rejects_non_retryable_protocols_and_cross_origin_endpoints() {
+    for (response, expected) in [
+        (
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+            "MCP HTTP request failed with status 401",
+        ),
+        (
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            "MCP HTTP request failed with status 400",
+        ),
+        (
+            "HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n",
+            "MCP HTTP redirect refused",
+        ),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_http_request(&listener);
+            stream.write_all(response.as_bytes()).unwrap();
+            thread::sleep(Duration::from_millis(50));
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        });
+        let mut transport =
+            McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1)
+                .unwrap();
+        assert_eq!(
+            transport.execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            ),
+            Err(McpTransportError::Transport(expected.into()))
+        );
+        server.join().unwrap();
+    }
+
+    let remote = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let remote_address = remote.local_addr().unwrap();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut events, headers) = accept_http_request(&listener);
+        assert!(headers.contains("authorization: SENTINEL_SECRET\r\n"));
+        write!(events, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: http://{remote_address}/message\n\n").unwrap();
+        events.flush().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        remote.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(remote.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    });
+    let mut transport = McpSseTransport::new(
+        format!("http://{address}/events"),
+        [("authorization".into(), "SENTINEL_SECRET".into())].into(),
+        1,
+    )
+    .unwrap();
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+    );
+    assert_eq!(
+        result,
+        Err(McpTransportError::Protocol(
+            "MCP HTTP response is malformed".into()
+        ))
+    );
+    assert!(!result.unwrap_err().to_string().contains("SENTINEL_SECRET"));
+    server.join().unwrap();
+}
+
+#[test]
+fn legacy_sse_transport_bounds_framing_and_waits_interruptibly() {
+    for (body, expected) in [
+        (
+            "",
+            McpTransportError::Protocol("MCP HTTP response is malformed".into()),
+        ),
+        (
+            "event: unknown\ndata: value\n\n",
+            McpTransportError::Protocol("MCP HTTP response is malformed".into()),
+        ),
+        (
+            "event: message\ndata: not json\n\n",
+            McpTransportError::Protocol("MCP HTTP response is malformed".into()),
+        ),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = accept_http_request(&listener);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n{body}"
+            )
+            .unwrap();
+        });
+        let mut transport =
+            McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1)
+                .unwrap();
+        assert_eq!(
+            transport.execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            ),
+            Err(expected)
+        );
+        server.join().unwrap();
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_http_request(&listener);
+        let body = vec![b'x'; 1024 * 1024 + 1];
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\ndata: "
+        )
+        .unwrap();
+        stream.write_all(&body).unwrap();
+    });
+    let mut transport =
+        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 0).unwrap();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+        ),
+        Err(McpTransportError::Protocol(
+            "MCP SSE event exceeds limit".into()
+        ))
+    );
+    server.join().unwrap();
+
+    for (cancel, expected) in [
+        (true, McpTransportError::Cancelled),
+        (false, McpTransportError::TimedOut),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, ready) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (_stream, _) = accept_http_request(&listener);
+            started.send(()).unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context =
+            McpOperationContext::new(Arc::clone(&cancellation), Duration::from_millis(50));
+        let mut transport =
+            McpSseTransport::new(format!("http://{address}/events"), Default::default(), 0)
+                .unwrap();
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            result_sender
+                .send(transport.execute(McpRequest::Initialize(initialize()), &context))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        if cancel {
+            cancellation.store(true, Ordering::Release);
+        }
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_millis(250))
+                .unwrap(),
+            Err(expected)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn legacy_sse_transport_accepts_exact_limit_exhausts_retries_and_closes_on_current_runtime() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut events, _) = accept_http_request(&listener);
+        write!(events, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /message\n\n").unwrap();
+        events.flush().unwrap();
+        let (mut message, _) = accept_http_request(&listener);
+        respond(&mut message, "202 Accepted", b"", "");
+        let mut body = initialized_body();
+        body.extend(std::iter::repeat_n(b' ', 1024 * 1024 - body.len()));
+        write!(events, "event: message\ndata: ").unwrap();
+        events.write_all(&body).unwrap();
+        write!(events, "\n\n").unwrap();
+        events.flush().unwrap();
+    });
+    let mut transport =
+        McpSseTransport::new(format!("http://{address}/events"), Default::default(), 0).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    assert_eq!(
+        runtime.block_on(async {
+            transport.execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+            )
+        }),
+        Ok(initialized())
+    );
+    transport
+        .close(&McpOperationContext::new(
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+    drop(transport);
+    server.join().unwrap();
+
+    for (status, reason) in [
+        ("408", "Request Timeout"),
+        ("429", "Too Many Requests"),
+        ("500", "Internal Server Error"),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = accept_http_request(&listener);
+                respond(&mut stream, &format!("{status} {reason}"), b"", "");
+            }
+        });
+        let mut transport =
+            McpSseTransport::new(format!("http://{address}/events"), Default::default(), 1)
+                .unwrap();
+        assert_eq!(
+            transport.execute(
+                McpRequest::Initialize(initialize()),
+                &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
+            ),
+            Err(McpTransportError::RetriesExhausted)
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn http_transport_retries_only_transient_statuses_and_reports_exhaustion() {
     for (status, reason, retries) in [
         (408, "Request Timeout", true),

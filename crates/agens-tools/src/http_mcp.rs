@@ -435,7 +435,7 @@ impl HttpWorkerOperation for McpSseOperation {
                         return Err(HttpWorkerError::ResponseTooLarge);
                     }
                 }
-                if buffer.len().saturating_add(frame.bytes) > MAX_HTTP_BODY_BYTES {
+                if buffer.len() > MAX_HTTP_BODY_BYTES {
                     return Err(HttpWorkerError::ResponseTooLarge);
                 }
             }
