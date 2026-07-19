@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     fmt, fs,
     io::{self, Read, Write},
+    net::{IpAddr, ToSocketAddrs},
     panic::{self, AssertUnwindSafe, catch_unwind},
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
@@ -37,6 +38,9 @@ use std::os::unix::process::CommandExt;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_PROCESS_OUTPUT: usize = 64 * 1024;
 const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_WEBFETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_WEBFETCH_BYTES: usize = 100 * 1024;
+const MAX_WEBFETCH_REDIRECTS: usize = 5;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_MAX_LIST_ENTRIES: usize = 1_000;
 const DEFAULT_MAX_SEARCH_ENTRIES: usize = 10_000;
@@ -2540,6 +2544,50 @@ pub struct GlobInput {
     pattern: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct WebfetchInput {
+    url: String,
+    timeout: Duration,
+    cancellation: Option<Arc<AtomicBool>>,
+    execution_context: Option<ToolExecutionContext>,
+}
+
+impl WebfetchInput {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            timeout: DEFAULT_WEBFETCH_TIMEOUT,
+            cancellation: None,
+            execution_context: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    fn with_execution_context(mut self, context: ToolExecutionContext) -> Self {
+        self.execution_context = Some(context);
+        self
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+            || self
+                .execution_context
+                .as_ref()
+                .is_some_and(ToolExecutionContext::is_cancelled)
+    }
+}
+
 impl GlobInput {
     pub fn new(pattern: impl Into<String>) -> Self {
         Self {
@@ -2916,6 +2964,116 @@ impl NativeTools {
         Ok(ToolOutput::success(output))
     }
 
+    pub fn webfetch(&self, input: WebfetchInput) -> Result<ToolOutput, Error> {
+        if input.url.trim().is_empty() {
+            return Ok(ToolOutput::failure("webfetch: URL is required"));
+        }
+        if input.timeout.is_zero() {
+            return Ok(ToolOutput::failure(
+                "webfetch: timeout must be greater than zero",
+            ));
+        }
+        if input.cancelled() {
+            return Ok(ToolOutput::failure("webfetch: cancelled"));
+        }
+
+        let mut url = match reqwest::Url::parse(&input.url) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+            _ => return Ok(ToolOutput::failure("webfetch: URL must use http or https")),
+        };
+        if !url.username().is_empty() || url.password().is_some() {
+            return Ok(ToolOutput::failure(
+                "webfetch: URL credentials are not allowed",
+            ));
+        }
+
+        for redirects in 0..=MAX_WEBFETCH_REDIRECTS {
+            if input.cancelled() {
+                return Ok(ToolOutput::failure("webfetch: cancelled"));
+            }
+            let addresses = match webfetch_addresses(&url) {
+                Ok(addresses) => addresses,
+                Err(output) => return Ok(output),
+            };
+            let host = url.host_str().expect("validated URL host");
+            let timeout = match input.execution_context.as_ref() {
+                Some(context) => match context.remaining() {
+                    Ok(remaining) => remaining,
+                    Err(ToolExecutionStatus::Cancelled) => {
+                        return Ok(ToolOutput::failure("webfetch: cancelled"));
+                    }
+                    Err(ToolExecutionStatus::TimedOut) => {
+                        return Ok(ToolOutput::failure("webfetch: timed out"));
+                    }
+                },
+                None => input.timeout,
+            }
+            .min(input.timeout);
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(timeout)
+                .user_agent("agens-webfetch/1")
+                .resolve_to_addrs(host, &addresses)
+                .build()
+                .map_err(|_| Error::Tool("webfetch client setup failed".into()))?;
+            let response = match client.get(url.clone()).send() {
+                Ok(response) => response,
+                Err(_) if input.cancelled() => {
+                    return Ok(ToolOutput::failure("webfetch: cancelled"));
+                }
+                Err(error) if error.is_timeout() => {
+                    return Ok(ToolOutput::failure("webfetch: timed out"));
+                }
+                Err(_) => return Ok(ToolOutput::failure("webfetch: request failed")),
+            };
+            if response.status().is_redirection() {
+                if redirects == MAX_WEBFETCH_REDIRECTS {
+                    return Ok(ToolOutput::failure("webfetch: redirect limit exceeded"));
+                }
+                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                    return Ok(ToolOutput::failure("webfetch: redirect has no location"));
+                };
+                url = match location
+                    .to_str()
+                    .ok()
+                    .and_then(|value| url.join(value).ok())
+                {
+                    Some(url) => url,
+                    None => return Ok(ToolOutput::failure("webfetch: invalid redirect location")),
+                };
+                continue;
+            }
+            if !response.status().is_success() {
+                return Ok(ToolOutput::failure(format!(
+                    "webfetch: HTTP status {}",
+                    response.status()
+                )));
+            }
+            let html = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/html"));
+            let mut body = response.take(MAX_WEBFETCH_BYTES as u64 + 1);
+            let mut bytes = Vec::new();
+            if body.read_to_end(&mut bytes).is_err() {
+                return Ok(ToolOutput::failure("webfetch: response read failed"));
+            }
+            let truncated = bytes.len() > MAX_WEBFETCH_BYTES;
+            bytes.truncate(MAX_WEBFETCH_BYTES);
+            let mut content = String::from_utf8_lossy(&bytes).into_owned();
+            if html {
+                content = visible_html_text(&content);
+            }
+            if truncated {
+                content.push_str("\n[webfetch output truncated]");
+            }
+            return Ok(ToolOutput::success(content));
+        }
+        unreachable!("redirect loop always returns")
+    }
+
     pub fn bash(&self, input: BashInput) -> Result<ToolOutput, Error> {
         if input.command.trim().is_empty() {
             return Ok(ToolOutput::failure("bash: command is required"));
@@ -3169,6 +3327,72 @@ pub struct NativeToolMetadata {
     pub access: ToolAccess,
 }
 
+fn webfetch_addresses(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, ToolOutput> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ToolOutput::failure("webfetch: URL host is required"))?
+        .trim_matches(['[', ']']);
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ToolOutput::failure("webfetch: URL port is required"))?;
+    if let Ok(address) = host.parse::<IpAddr>() {
+        if blocked_webfetch_address(address) {
+            return Err(ToolOutput::failure("webfetch: blocked network address"));
+        }
+        return Ok(vec![std::net::SocketAddr::new(address, port)]);
+    }
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| ToolOutput::failure("webfetch: host resolution failed"))?
+        .filter(|address| !blocked_webfetch_address(address.ip()))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ToolOutput::failure("webfetch: blocked network address"));
+    }
+    Ok(addresses)
+}
+
+fn blocked_webfetch_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_link_local() || address.octets() == [100, 100, 100, 200],
+        IpAddr::V6(address) => {
+            address.is_unicast_link_local()
+                || address.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x254]
+        }
+    }
+}
+
+fn visible_html_text(html: &str) -> String {
+    let mut text = String::new();
+    let mut hidden = None;
+    for part in html.split('<') {
+        let Some((tag, rest)) = part.split_once('>') else {
+            if hidden.is_none() {
+                text.push_str(part);
+            }
+            continue;
+        };
+        let name = tag
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(name.as_str(), "script" | "style") {
+            hidden = if tag.trim_start().starts_with('/') {
+                None
+            } else {
+                Some(name)
+            };
+        }
+        if hidden.is_none() {
+            text.push_str(rest);
+            text.push(' ');
+        }
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Canonical production catalog for the built-in project-confined tools.
 #[derive(Debug)]
 pub struct NativeToolCatalog {
@@ -3229,6 +3453,12 @@ impl NativeToolCatalog {
                 "Run a bounded shell command in the project root",
                 ToolAccess::Write,
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"}}}),
+            ),
+            native_metadata(
+                "native::webfetch",
+                "Fetch an HTTP or HTTPS URL without credentials",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["url"],"properties":{"url":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}}}),
             ),
         ]
     }
@@ -3294,6 +3524,16 @@ impl NativeToolCatalog {
                 self.tools.grep(input)?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
+            "native::webfetch" => {
+                let mut input = WebfetchInput::new(string("url")?);
+                if let Some(timeout) = arguments.get("timeout_ms").and_then(Value::as_u64) {
+                    input = input.with_timeout(Duration::from_millis(timeout));
+                } else if arguments.contains_key("timeout_ms") {
+                    return Err(Error::Tool("native tool arguments are invalid".into()));
+                }
+                self.tools
+                    .webfetch(input.with_execution_context(context.clone()))?
+            }
             "native::bash" => self.tools.bash(
                 BashInput::new(string("command")?)
                     .with_timeout(context.remaining().unwrap_or_default())

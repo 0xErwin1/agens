@@ -1,7 +1,9 @@
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpListener,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -11,7 +13,7 @@ use std::{
 use agens_tools::{
     BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
     NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
-    WriteFileInput,
+    WebfetchInput, WriteFileInput,
 };
 use serde_json::json;
 
@@ -525,7 +527,7 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
     let root = project_root();
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
-    assert_eq!(metadata.len(), 8);
+    assert_eq!(metadata.len(), 9);
     assert!(metadata.iter().all(|tool| {
         tool.qualified_name.starts_with("native::")
             && tool.input_schema["type"] == "object"
@@ -769,7 +771,7 @@ fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
 
-    assert_eq!(metadata.len(), 8);
+    assert_eq!(metadata.len(), 9);
     let grep = metadata
         .iter()
         .find(|tool| tool.qualified_name == "native::grep")
@@ -794,6 +796,125 @@ fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
             .unwrap(),
         ToolOutput::success("notes.txt\n")
     );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn webfetch_rejects_unsafe_urls_and_honors_cancellation_before_network_access() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    for url in [
+        "",
+        "ftp://example.test",
+        "http://user:secret@example.test/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[fe80::1]/",
+    ] {
+        assert!(tools.webfetch(WebfetchInput::new(url)).unwrap().is_error);
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        tools
+            .webfetch(WebfetchInput::new("http://127.0.0.1/").with_cancellation(cancelled),)
+            .unwrap(),
+        ToolOutput::failure("webfetch: cancelled")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+fn webfetch_fixture(
+    response: String,
+    request: Arc<Mutex<String>>,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://localhost:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut bytes = [0; 4096];
+        let read = stream.read(&mut bytes).unwrap();
+        *request.lock().unwrap() = String::from_utf8_lossy(&bytes[..read]).into_owned();
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    (url, worker)
+}
+
+#[test]
+fn webfetch_extracts_html_caps_bodies_and_revalidates_redirects() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+    let request = Arc::new(Mutex::new(String::new()));
+    let (url, worker) = webfetch_fixture(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<p>visible</p><script>secret</script><style>hidden</style>text".into(),
+        Arc::clone(&request),
+    );
+
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::success("visible text")
+    );
+    worker.join().unwrap();
+
+    let (url, worker) = webfetch_fixture(
+        "HTTP/1.1 302 Found\r\nLocation: http://[fe80::1]/\r\nContent-Length: 0\r\n\r\n".into(),
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::failure("webfetch: blocked network address")
+    );
+    worker.join().unwrap();
+    let request = request.lock().unwrap();
+    let request = request.to_ascii_lowercase();
+    assert!(request.contains("user-agent: agens-webfetch/1"));
+    assert!(!request.contains("authorization:"));
+    assert!(!request.contains("cookie:"));
+
+    let (url, worker) = webfetch_fixture(
+        "HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/\r\nContent-Length: 0\r\n\r\n"
+            .into(),
+        Arc::new(Mutex::new(String::new())),
+    );
+    assert_eq!(
+        tools.webfetch(WebfetchInput::new(url)).unwrap(),
+        ToolOutput::failure("webfetch: blocked network address")
+    );
+    worker.join().unwrap();
+
+    let (url, worker) = webfetch_fixture(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{}",
+            "x".repeat(100 * 1024 + 1)
+        ),
+        Arc::new(Mutex::new(String::new())),
+    );
+    let output = tools.webfetch(WebfetchInput::new(url)).unwrap();
+    assert!(!output.is_error);
+    assert!(output.content.ends_with("[webfetch output truncated]"));
+    worker.join().unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/",
+        listener.local_addr().unwrap().port()
+    );
+    let worker = thread::spawn(move || {
+        let _stream = listener.accept().unwrap().0;
+        thread::sleep(Duration::from_millis(20));
+    });
+    assert_eq!(
+        tools
+            .webfetch(WebfetchInput::new(url).with_timeout(Duration::from_millis(1)))
+            .unwrap(),
+        ToolOutput::failure("webfetch: timed out")
+    );
+    worker.join().unwrap();
 
     fs::remove_dir_all(root).unwrap();
 }
