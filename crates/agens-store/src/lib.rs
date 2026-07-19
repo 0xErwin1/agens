@@ -252,26 +252,8 @@ impl SessionStore {
                     .map_err(|error| {
                         SessionStoreError::operation("reopen backup", &backup_path, error)
                     })?;
-            let quick_check: String = verification
-                .query_row("PRAGMA quick_check", [], |row| row.get(0))
-                .map_err(|error| {
-                    SessionStoreError::operation("quick check backup", &backup_path, error)
-                })?;
-            initialize_sessions_schema(&verification, &backup_path)?;
-            let backup_manifest = v1_manifest(&verification).map_err(|error| {
-                SessionStoreError::operation("read backup", &backup_path, error)
-            })?;
+            let backup_manifest = verify_v1_backup(&source_manifest, &verification, &backup_path)?;
             drop(verification);
-
-            if quick_check != "ok" || backup_manifest != source_manifest {
-                let _ = fs::remove_file(&backup_path);
-                let _ = fs::remove_file(&temporary_path);
-                return Err(SessionStoreError::operation(
-                    "verify backup",
-                    &backup_path,
-                    "backup does not match the v1 snapshot",
-                ));
-            }
 
             let mut manifest = match fs::OpenOptions::new()
                 .write(true)
@@ -1159,9 +1141,10 @@ fn v1_manifest(connection: &Connection) -> rusqlite::Result<String> {
     let mut statement = connection.prepare(
         "SELECT 'schema|' || type || '|' || name || '|' || quote(sql)
          FROM sqlite_schema WHERE type IN ('index', 'table') AND name LIKE 'completed_turn%'
-         UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
-         UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
-         UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
+          UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
+          UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
+          UNION ALL SELECT 'completed_turns|' || id FROM completed_turns
+          UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
              quote(kind) || '|' || quote(state) || '|' || quote(part_kind) || '|' ||
              quote(call_id) || '|' || quote(name) || '|' || quote(input) || '|' ||
              quote(content) || '|' || quote(is_error)
@@ -1172,6 +1155,29 @@ fn v1_manifest(connection: &Connection) -> rusqlite::Result<String> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(lines.join("\n"))
+}
+
+fn verify_v1_backup(
+    source_manifest: &str,
+    backup: &Connection,
+    backup_path: &Path,
+) -> Result<String, SessionStoreError> {
+    let quick_check: String = backup
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| SessionStoreError::operation("quick check backup", backup_path, error))?;
+    initialize_sessions_schema(backup, backup_path)?;
+    let backup_manifest = v1_manifest(backup)
+        .map_err(|error| SessionStoreError::operation("read backup", backup_path, error))?;
+
+    if quick_check != "ok" || backup_manifest != source_manifest {
+        return Err(SessionStoreError::operation(
+            "verify backup",
+            backup_path,
+            "backup does not match the v1 snapshot",
+        ));
+    }
+
+    Ok(backup_manifest)
 }
 
 fn insert_turn_event(
@@ -1478,4 +1484,62 @@ fn restrict_session_permissions(path: &Path, maximum_mode: u32) -> Result<(), Se
 #[cfg(not(unix))]
 fn restrict_session_permissions(_: &Path, _: u32) -> Result<(), SessionStoreError> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_v1_fixture(connection: &Connection) {
+        connection
+            .execute_batch(
+                "CREATE TABLE completed_turns (id INTEGER PRIMARY KEY);
+                 CREATE TABLE completed_turn_events (
+                     turn_id INTEGER NOT NULL,
+                     sequence INTEGER NOT NULL,
+                     kind TEXT NOT NULL,
+                     state TEXT,
+                     part_kind TEXT,
+                     call_id TEXT,
+                     name TEXT,
+                     input TEXT,
+                     content TEXT,
+                     is_error INTEGER,
+                     PRIMARY KEY (turn_id, sequence),
+                     FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
+                 );
+                 CREATE UNIQUE INDEX completed_turn_events_turn_sequence
+                 ON completed_turn_events(turn_id, sequence);
+                 PRAGMA user_version = 1;
+                 INSERT INTO completed_turns(id) VALUES(7), (8);
+                 INSERT INTO completed_turn_events
+                 VALUES(7, 1, 'provider_part', NULL, 'text', NULL, NULL, NULL,
+                        'original', NULL);",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_tampered_v1_backup_content_and_eventless_turn_id() {
+        let source = Connection::open_in_memory().unwrap();
+        let backup = Connection::open_in_memory().unwrap();
+        create_v1_fixture(&source);
+        create_v1_fixture(&backup);
+
+        let source_manifest = v1_manifest(&source).unwrap();
+        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_ok());
+
+        backup
+            .execute("UPDATE completed_turn_events SET content = 'tampered'", [])
+            .unwrap();
+        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_err());
+
+        backup
+            .execute("UPDATE completed_turn_events SET content = 'original'", [])
+            .unwrap();
+        backup
+            .execute("UPDATE completed_turns SET id = 9 WHERE id = 8", [])
+            .unwrap();
+        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_err());
+    }
 }

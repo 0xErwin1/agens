@@ -86,6 +86,84 @@ fn create_supported_session_schema(connection: &Connection, index_sql: &str) {
         .unwrap();
 }
 
+type V1Event = (
+    i64,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+#[derive(Debug, PartialEq)]
+struct V1Contents {
+    turns: Vec<i64>,
+    events: Vec<V1Event>,
+}
+
+fn v1_contents(connection: &Connection) -> V1Contents {
+    let turns = connection
+        .prepare("SELECT id FROM completed_turns ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let events = connection
+        .prepare(
+            "SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content,
+                    is_error
+             FROM completed_turn_events ORDER BY turn_id, sequence",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    V1Contents { turns, events }
+}
+
+fn exact_v1_manifest(connection: &Connection) -> String {
+    let lines = connection
+        .prepare(
+            "SELECT 'schema|' || type || '|' || name || '|' || quote(sql)
+             FROM sqlite_schema WHERE type IN ('index', 'table') AND name LIKE 'completed_turn%'
+             UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
+             UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
+             UNION ALL SELECT 'completed_turns|' || id FROM completed_turns
+             UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
+                 quote(kind) || '|' || quote(state) || '|' || quote(part_kind) || '|' ||
+                 quote(call_id) || '|' || quote(name) || '|' || quote(input) || '|' ||
+                 quote(content) || '|' || quote(is_error)
+             FROM completed_turn_events ORDER BY 1",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+
+    format!("version=1\nquick_check=ok\n{}\n", lines.join("\n"))
+}
+
 fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);
@@ -110,10 +188,16 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
     );
     writer
         .execute_batch(
-            "INSERT INTO completed_turns(id) VALUES(7);
+            "INSERT INTO completed_turns(id) VALUES(7), (8), (11);
              INSERT INTO completed_turn_events
-             VALUES(7, 3, 'provider_part', NULL, 'text', NULL, NULL, NULL,
-                    'WAL content', NULL);",
+              VALUES(7, 3, 'provider_part', NULL, 'text', NULL, NULL, NULL,
+                     'WAL content', NULL),
+                    (7, 4, 'provider_part', NULL, 'tool_call', 'call-1', 'tool', '{}',
+                     NULL, NULL),
+                    (11, 1, 'state_changed', 'completed', NULL, NULL, NULL, NULL,
+                     NULL, NULL),
+                    (11, 2, 'tool_result', NULL, NULL, 'call-2', NULL, NULL,
+                     'result', 0);",
         )
         .unwrap();
 
@@ -122,20 +206,62 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
     let manifest = fs::read_to_string(backup.with_extension("bak.manifest")).unwrap();
     let snapshot = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
-    assert_eq!(
-        snapshot
-            .query_row("SELECT content FROM completed_turn_events", [], |row| {
-                row.get::<_, String>(0)
-            })
-            .unwrap(),
-        "WAL content"
-    );
-    assert!(manifest.contains("version=1"));
-    assert!(manifest.contains(
-        "completed_turn_events|7|3|'provider_part'|NULL|'text'|NULL|NULL|NULL|'WAL content'|NULL"
-    ));
-    assert!(manifest.contains("completed_turn_events_turn_sequence"));
-    assert!(manifest.contains("quick_check=ok"));
+    let expected = V1Contents {
+        turns: vec![7, 8, 11],
+        events: vec![
+            (
+                7,
+                3,
+                "provider_part".into(),
+                None,
+                Some("text".into()),
+                None,
+                None,
+                None,
+                Some("WAL content".into()),
+                None,
+            ),
+            (
+                7,
+                4,
+                "provider_part".into(),
+                None,
+                Some("tool_call".into()),
+                Some("call-1".into()),
+                Some("tool".into()),
+                Some("{}".into()),
+                None,
+                None,
+            ),
+            (
+                11,
+                1,
+                "state_changed".into(),
+                Some("completed".into()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                11,
+                2,
+                "tool_result".into(),
+                None,
+                None,
+                Some("call-2".into()),
+                None,
+                None,
+                Some("result".into()),
+                Some(0),
+            ),
+        ],
+    };
+    assert_eq!(v1_contents(&writer), expected);
+    assert_eq!(v1_contents(&snapshot), expected);
+    assert_eq!(manifest, exact_v1_manifest(&writer));
     assert_eq!(
         Connection::open(&database)
             .unwrap()
@@ -144,7 +270,7 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
                 0
             ))
             .unwrap(),
-        1
+        4
     );
 
     fs::remove_dir_all(directory).unwrap();
