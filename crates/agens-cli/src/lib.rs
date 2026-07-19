@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,7 @@ use agens_core::{
 use agens_providers::chatgpt_login::{
     ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
     device_code_login_with_progress, login, remove_provider_entry, upsert_chatgpt_credentials,
+    upsert_provider_entry,
 };
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
@@ -436,26 +437,225 @@ fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<Stri
             };
             Ok(format!("ChatGPT authentication: {status}\n"))
         }
+        [command, provider] if command == "status" => {
+            let provider = CredentialProvider::parse(provider)?;
+            let bootstrap = bootstrap(dependencies)?;
+            provider_status(&bootstrap.paths.credentials, provider)
+        }
         [command] if command == "login" => run_auth_login(dependencies, false),
         [command, flag] if command == "login" && flag == "--device-auth" => {
             run_auth_login(dependencies, true)
         }
-        [command, subcommand, ..] if command == "login" && subcommand == "api-key" => {
-            Err(CliError::unavailable(UNAVAILABLE_MESSAGE))
+        [command, subcommand, provider, rest @ ..]
+            if command == "login" && subcommand == "api-key" =>
+        {
+            run_api_key_login(provider, rest, dependencies)
         }
         [command, provider] if command == "logout" => {
+            let provider = CredentialProvider::parse(provider)?;
             let bootstrap = bootstrap(dependencies)?;
             let removed =
-                remove_provider_entry(&bootstrap.paths.credentials, provider).map_err(|_| {
-                    CliError::authentication("ChatGPT credentials are unavailable or invalid")
-                })?;
+                remove_provider_entry(&bootstrap.paths.credentials, provider.identifier())
+                    .map_err(|_| {
+                        CliError::authentication("ChatGPT credentials are unavailable or invalid")
+                    })?;
             if removed {
-                Ok(format!("Logged out of {provider}.\n"))
+                Ok(format!("Logged out of {}.\n", provider.identifier()))
             } else {
-                Ok(format!("No credentials stored for {provider}.\n"))
+                Ok(format!(
+                    "No credentials stored for {}.\n",
+                    provider.identifier()
+                ))
             }
         }
         _ => Err(CliError::usage("auth requires status, login, or logout")),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CredentialProvider {
+    OpenAiApi,
+    OpenAiChatGpt,
+}
+
+impl CredentialProvider {
+    fn parse(value: &str) -> Result<Self, CliError> {
+        match value {
+            "openai-api" => Ok(Self::OpenAiApi),
+            "openai-chatgpt" => Ok(Self::OpenAiChatGpt),
+            _ => Err(CliError::usage("auth provider is unsupported")),
+        }
+    }
+
+    const fn identifier(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "openai-api",
+            Self::OpenAiChatGpt => "openai-chatgpt",
+        }
+    }
+}
+
+fn run_api_key_login(
+    provider: &str,
+    arguments: &[String],
+    dependencies: &CliDependencies,
+) -> Result<String, CliError> {
+    let provider = CredentialProvider::parse(provider)?;
+    if !matches!(provider, CredentialProvider::OpenAiApi) {
+        return Err(CliError::usage("API-key login supports only openai-api"));
+    }
+
+    let supplied_key = parse_api_key_flag(arguments)?;
+    let api_key = read_api_key(supplied_key.as_deref())?;
+    let bootstrap = bootstrap(dependencies)?;
+    upsert_provider_entry(
+        &bootstrap.paths.credentials,
+        provider.identifier(),
+        serde_json::json!({ "api_key": api_key }),
+    )
+    .map_err(|_| CliError::authentication("API-key credentials could not be saved"))?;
+
+    Ok(format!("Logged in to {}.\n", provider.identifier()))
+}
+
+fn parse_api_key_flag(arguments: &[String]) -> Result<Option<String>, CliError> {
+    match arguments {
+        [] => Ok(None),
+        [flag, value] if flag == "--api-key" => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(CliError::usage(
+                    "auth login api-key requires a non-empty API key",
+                ));
+            }
+            Ok(Some(value.to_owned()))
+        }
+        _ => Err(CliError::usage(
+            "auth login api-key accepts only an optional --api-key value",
+        )),
+    }
+}
+
+fn read_api_key(supplied_key: Option<&str>) -> Result<String, CliError> {
+    if std::io::stdin().is_terminal() {
+        if supplied_key.is_some() {
+            return Err(CliError::usage(
+                "auth login api-key does not accept --api-key from a terminal",
+            ));
+        }
+        return read_hidden_tty_api_key();
+    }
+
+    match supplied_key {
+        Some(key) => Ok(key.to_owned()),
+        None => read_stdin_api_key(),
+    }
+}
+
+#[cfg(unix)]
+fn read_hidden_tty_api_key() -> Result<String, CliError> {
+    struct EchoGuard(libc::termios);
+
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+            }
+        }
+    }
+
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) } != 0 {
+        return Err(CliError::authentication("API-key input is unavailable"));
+    }
+    let original = unsafe { original.assume_init() };
+    let _guard = EchoGuard(original);
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+        return Err(CliError::authentication("API-key input is unavailable"));
+    }
+
+    eprint!("API key: ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|_| CliError::authentication("API-key input is unavailable"))?;
+    eprintln!();
+    normalize_api_key_input(&input)
+}
+
+#[cfg(not(unix))]
+fn read_hidden_tty_api_key() -> Result<String, CliError> {
+    Err(CliError::authentication("API-key input is unavailable"))
+}
+
+fn read_stdin_api_key() -> Result<String, CliError> {
+    const MAX_API_KEY_INPUT_BYTES: u64 = 8192;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .take(MAX_API_KEY_INPUT_BYTES + 1)
+        .read_to_string(&mut input)
+        .map_err(|_| CliError::authentication("API-key input is unavailable"))?;
+    if input.len() as u64 > MAX_API_KEY_INPUT_BYTES {
+        return Err(CliError::usage("auth login api-key input is too long"));
+    }
+    normalize_api_key_input(&input)
+}
+
+fn normalize_api_key_input(input: &str) -> Result<String, CliError> {
+    let input = input
+        .strip_suffix("\r\n")
+        .or_else(|| input.strip_suffix('\n'))
+        .or_else(|| input.strip_suffix('\r'))
+        .unwrap_or(input);
+    if input.contains(['\n', '\r']) {
+        return Err(CliError::usage(
+            "auth login api-key requires exactly one input line",
+        ));
+    }
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(CliError::usage(
+            "auth login api-key requires a non-empty API key",
+        ));
+    }
+    Ok(input.to_owned())
+}
+
+fn provider_status(path: &Path, provider: CredentialProvider) -> Result<String, CliError> {
+    match provider {
+        CredentialProvider::OpenAiApi => {
+            let contents = fs::read_to_string(path).map_err(|_| {
+                CliError::authentication("OpenAI API credentials are unavailable or invalid")
+            })?;
+            let ready = serde_json::from_str::<serde_json::Value>(&contents)
+                .ok()
+                .and_then(|root| root.get(provider.identifier()).cloned())
+                .and_then(|entry| entry.get("api_key").cloned())
+                .and_then(|key| key.as_str().map(|key| !key.trim().is_empty()))
+                .unwrap_or(false);
+            if ready {
+                Ok("OpenAI API authentication: ready\n".to_owned())
+            } else {
+                Err(CliError::authentication(
+                    "OpenAI API credentials are unavailable or invalid",
+                ))
+            }
+        }
+        CredentialProvider::OpenAiChatGpt => {
+            let state =
+                load_chatgpt_auth_state(path, std::time::SystemTime::now()).map_err(|_| {
+                    CliError::authentication("ChatGPT credentials are unavailable or invalid")
+                })?;
+            let status = match state {
+                ChatGptAuthState::Ready => "ready",
+                ChatGptAuthState::RefreshRequired => "refresh required",
+            };
+            Ok(format!("ChatGPT authentication: {status}\n"))
+        }
     }
 }
 

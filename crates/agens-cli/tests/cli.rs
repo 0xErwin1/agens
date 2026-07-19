@@ -479,6 +479,182 @@ fn auth_logout_removes_only_chatgpt_credentials_and_reports_absence() {
     assert!(!credentials.contains("secret-"));
 }
 
+#[cfg(unix)]
+#[test]
+fn api_key_login_flag_updates_only_the_selected_provider_with_private_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = TemporaryDirectory::new("api-key-login-flag");
+    let config_home = temporary.path().join("config");
+    let credentials_path = config_home.join("auth.json");
+    let sentinel = "SENTINEL_API_KEY_FLAG";
+    std::fs::create_dir_all(&config_home).expect("config directory should be created");
+    std::fs::write(
+        &credentials_path,
+        r#"{"openai-chatgpt":{"access_token":"preserved-access","refresh_token":"preserved-refresh","account_id":"account_123","expires_at":"2099-01-01T00:00:00Z"},"other":{"api_key":"preserved"}}"#,
+    )
+    .expect("credentials should be written");
+
+    let login = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args([
+            "auth",
+            "login",
+            "api-key",
+            "openai-api",
+            "--api-key",
+            sentinel,
+        ])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("API-key login should execute");
+    let status = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["auth", "status", "openai-api"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("selected provider status should execute");
+    let logout = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["auth", "logout", "openai-api"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("selected provider logout should execute");
+    let credentials = std::fs::read_to_string(&credentials_path)
+        .expect("remaining credentials should be readable");
+
+    assert!(login.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&login.stdout),
+        "Logged in to openai-api.\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&login.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "OpenAI API authentication: ready\n"
+    );
+    assert!(logout.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&logout.stdout),
+        "Logged out of openai-api.\n"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&credentials)
+            .expect("remaining credentials should remain valid JSON"),
+        serde_json::json!({
+            "openai-chatgpt": {
+                "access_token": "preserved-access",
+                "refresh_token": "preserved-refresh",
+                "account_id": "account_123",
+                "expires_at": "2099-01-01T00:00:00Z"
+            },
+            "other": { "api_key": "preserved" }
+        })
+    );
+    assert_eq!(
+        std::fs::metadata(&credentials_path)
+            .expect("credential metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!format!("{login:?}{status:?}{logout:?}").contains(sentinel));
+}
+
+#[test]
+fn api_key_login_reads_one_non_tty_line_and_rejects_invalid_input_without_persistence() {
+    let temporary = TemporaryDirectory::new("api-key-login-stdin");
+    let config_home = temporary.path().join("config");
+    let credentials_path = config_home.join("auth.json");
+    let sentinel = "SENTINEL_API_KEY_STDIN";
+    std::fs::create_dir_all(&config_home).expect("config directory should be created");
+
+    let mut login = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["auth", "login", "api-key", "openai-api"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("API-key login should start");
+    login
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(format!("  {sentinel}  \n").as_bytes())
+        .expect("stdin should accept one key line");
+    let login = login
+        .wait_with_output()
+        .expect("API-key login should complete");
+
+    assert!(login.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&login.stdout),
+        "Logged in to openai-api.\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&login.stderr), "");
+    assert!(
+        std::fs::read_to_string(&credentials_path)
+            .expect("credentials should be readable")
+            .contains(&format!(r#""api_key":"{sentinel}""#))
+    );
+    assert!(!format!("{login:?}").contains(sentinel));
+
+    for (name, arguments, stdin) in [
+        (
+            "empty flag",
+            vec!["auth", "login", "api-key", "openai-api", "--api-key", "   "],
+            None,
+        ),
+        (
+            "multiple lines",
+            vec!["auth", "login", "api-key", "openai-api"],
+            Some("one\ntwo\n"),
+        ),
+        (
+            "empty stdin",
+            vec!["auth", "login", "api-key", "openai-api"],
+            Some("  \n"),
+        ),
+        (
+            "unsupported provider",
+            vec![
+                "auth",
+                "login",
+                "api-key",
+                "openai-chatgpt",
+                "--api-key",
+                sentinel,
+            ],
+            None,
+        ),
+    ] {
+        let isolated_home = temporary.path().join(name);
+        std::fs::create_dir_all(&isolated_home).expect("isolated config directory should exist");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+        command
+            .args(arguments)
+            .env("AGENS_CONFIG_HOME", &isolated_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("invalid login should start");
+        if let Some(stdin) = stdin {
+            child
+                .stdin
+                .take()
+                .expect("stdin should be piped")
+                .write_all(stdin.as_bytes())
+                .expect("stdin should accept invalid input");
+        }
+        let output = child
+            .wait_with_output()
+            .expect("invalid login should complete");
+
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(!isolated_home.join("auth.json").exists(), "{name}");
+        assert!(!format!("{output:?}").contains(sentinel), "{name}");
+    }
+}
+
 #[test]
 fn sessions_list_uses_configured_data_directory_and_reports_empty_store() {
     let temporary = TemporaryDirectory::new("sessions-list");
