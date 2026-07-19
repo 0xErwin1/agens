@@ -14,7 +14,7 @@ name = "agens"
 path = "src/main.rs"
 
 [[bin]]
-name = "fake-mcp-child"
+name = "agens-cli-fake-mcp-child"
 path = "../agens-tools/src/bin/fake-mcp-child.rs"
 
 [dependencies]

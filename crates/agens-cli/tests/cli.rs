@@ -1083,7 +1083,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
                 response: text_response(expected_output),
             },
         ]);
-        let setup = setup.replace("{fake_mcp}", env!("CARGO_BIN_EXE_fake-mcp-child"));
+        let setup = setup.replace("{fake_mcp}", env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"));
         std::fs::write(
             config_home.join("config.toml"),
             format!(
@@ -2187,9 +2187,9 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
             "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.broken]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"malformed\"]\ntimeout_ms = 1000\n[mcp.broken.env]\nFAKE_MCP_PROTOCOL_SECRET = \"SENTINEL_MCP_PROTOCOL\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n\n[mcp.crashed]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"crash\"]\ntimeout_ms = 1000\n[mcp.crashed.env]\nFAKE_MCP_TRANSPORT_SECRET = \"SENTINEL_MCP_TRANSPORT\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n",
             server.base_url(),
             data_directory.display(),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
         ),
     )
     .expect("config should be written");
@@ -2281,7 +2281,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
             "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-sleep\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
             call_ready.display(),
         ),
     )
@@ -2356,7 +2356,7 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
             "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"call-error\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_TOOL_ERROR_SECRET = \"SENTINEL_MCP_REMOTE_BODY\"\nFAKE_MCP_STDERR_SECRET = \"SENTINEL_MCP_STDERR\"\n",
             server.base_url(),
             data_directory.display(),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
         ),
     )
     .expect("config should be written");
@@ -2523,7 +2523,7 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
                 "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [{mode:?}]\ntimeout_ms = {timeout_ms}\n",
                 server.base_url(),
                 data_directory.display(),
-                env!("CARGO_BIN_EXE_fake-mcp-child"),
+                env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
             ),
         )
         .expect("config should be written");
@@ -2574,7 +2574,7 @@ fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
             "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\ndeny = [\"files_second(*)\"]\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
             server.base_url(),
             data_directory.display(),
-            env!("CARGO_BIN_EXE_fake-mcp-child"),
+            env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
             call_marker.display(),
         ),
     )
@@ -2712,7 +2712,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
                 "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n{permissions}\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
-                env!("CARGO_BIN_EXE_fake-mcp-child"),
+                env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
                 call_marker.display(),
             ),
         )
@@ -2835,7 +2835,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
                 "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"{}\"\nargs = [\"success\"]\ntimeout_ms = 1000\n[mcp.files.env]\nFAKE_MCP_CALL_READY = \"{}\"\n",
                 server.base_url(),
                 data_directory.display(),
-                env!("CARGO_BIN_EXE_fake-mcp-child"),
+                env!("CARGO_BIN_EXE_agens-cli-fake-mcp-child"),
                 call_marker.display(),
             ),
         )
