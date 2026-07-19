@@ -298,6 +298,40 @@ fn command_catalog_enforces_the_shared_definition_limit_deterministically() {
     );
 }
 
+#[test]
+fn command_catalog_counts_only_valid_definitions_before_reporting_overflow() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    fs::create_dir_all(&global).unwrap();
+
+    for index in 0..markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("invalid-{index:03}");
+        fs::write(
+            global.join(format!("{name}.md")),
+            format!("---\nname: {name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    for index in 0..markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("valid-{index:03}");
+        write_command(&global, &name, "valid", "body");
+    }
+    write_command(&global, "z-overflow", "overflow", "body");
+
+    let discovery = CommandCatalog::discover(&[], &global, temporary.path.join("missing")).unwrap();
+
+    assert_eq!(
+        discovery.catalog().len(),
+        markdown::MAX_MARKDOWN_DEFINITIONS
+    );
+    assert!(discovery.catalog().command("valid-127").is_some());
+    assert_eq!(discovery.diagnostics().len(), 129);
+    assert_eq!(
+        discovery.diagnostics()[128].message(),
+        "accepted definition limit exceeded"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn command_catalog_rejects_a_symbolic_link_root() {

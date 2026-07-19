@@ -306,7 +306,8 @@ fn load_command_root(root: &Path) -> Result<CommandRootLoad, String> {
         return Ok(CommandRootLoad::default());
     }
 
-    let root = markdown::load_root(root)?;
+    let root =
+        markdown::load_root_with_definition_limit(root, markdown::MAX_MARKDOWN_ROOT_ENTRIES)?;
     let mut commands = Vec::new();
     let mut diagnostics = root
         .diagnostics
@@ -317,6 +318,7 @@ fn load_command_root(root: &Path) -> Result<CommandRootLoad, String> {
         })
         .collect::<Vec<_>>();
 
+    let mut definition_limit_reported = false;
     for document in root.documents {
         let description = document
             .parsed()
@@ -329,7 +331,17 @@ fn load_command_root(root: &Path) -> Result<CommandRootLoad, String> {
             Some(description) => {
                 match CommandDefinition::new(document.name(), description, document.parsed().body())
                 {
-                    Ok(command) => commands.push(command),
+                    Ok(command) if commands.len() < markdown::MAX_MARKDOWN_DEFINITIONS => {
+                        commands.push(command);
+                    }
+                    Ok(_) if !definition_limit_reported => {
+                        diagnostics.push(CommandDiagnostic {
+                            path: document.source().to_owned(),
+                            message: "accepted definition limit exceeded".into(),
+                        });
+                        definition_limit_reported = true;
+                    }
+                    Ok(_) => {}
                     Err(message) => diagnostics.push(CommandDiagnostic {
                         path: document.source().to_owned(),
                         message,
