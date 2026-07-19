@@ -367,23 +367,55 @@ mod tests {
         }
     }
     #[test]
-    fn reports_startup_and_operation_panics() {
-        for behavior in [Behavior::StartupError, Behavior::StartupPanic] {
-            let closes = Arc::new(AtomicUsize::new(0));
-            let result = HttpWorker::start(
-                1,
-                Operation {
-                    behavior,
-                    started: None,
-                    closes: Arc::clone(&closes),
-                },
-            );
-            assert!(matches!(
-                result,
-                Err(HttpWorkerError::Startup | HttpWorkerError::Panicked)
-            ));
-            assert_eq!(closes.load(Ordering::Acquire), 1);
-        }
+    fn startup_error_returns_startup() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let result = HttpWorker::start(
+            1,
+            Operation {
+                behavior: Behavior::StartupError,
+                started: None,
+                closes: Arc::clone(&closes),
+            },
+        );
+
+        assert!(matches!(result, Err(HttpWorkerError::Startup)));
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn startup_panic_returns_panicked() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let result = HttpWorker::start(
+            1,
+            Operation {
+                behavior: Behavior::StartupPanic,
+                started: None,
+                closes: Arc::clone(&closes),
+            },
+        );
+
+        assert!(matches!(result, Err(HttpWorkerError::Panicked)));
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn zero_capacity_startup_returns_startup() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let result = HttpWorker::start(
+            0,
+            Operation {
+                behavior: Behavior::Respond,
+                started: None,
+                closes: Arc::clone(&closes),
+            },
+        );
+
+        assert!(matches!(result, Err(HttpWorkerError::Startup)));
+        assert_eq!(closes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn operation_panic_returns_panicked() {
         let (worker, _) = worker(1, Behavior::Panic, None);
         let (cancellation, deadline) = context(Duration::from_secs(1));
         assert_eq!(
