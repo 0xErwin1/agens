@@ -1600,6 +1600,7 @@ pub struct McpRegistry {
     closed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerDiagnostic {
     pub server_name: String,
     pub message: String,
@@ -1634,6 +1635,10 @@ impl McpRegistry {
 
     pub fn diagnostics(&self) -> Vec<&McpServerDiagnostic> {
         self.diagnostics.values().collect()
+    }
+
+    pub fn configured_server_names(&self) -> Vec<String> {
+        self.configured.keys().cloned().collect()
     }
 
     pub fn configure_server<F>(
@@ -2448,6 +2453,25 @@ impl ToolDispatcher {
             tool,
         );
         Ok(())
+    }
+
+    /// Removes a server's MCP registrations and invalidates their outstanding handles.
+    pub fn remove_mcp_server(&mut self, server_name: &str) {
+        let identities = self
+            .tools
+            .keys()
+            .filter(|identity| {
+                identity
+                    .0
+                    .starts_with(&format!("mcp:{}:{server_name}:", server_name.len()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for identity in identities {
+            self.aliases.retain(|_, current| current != &identity);
+            self.tools.remove(&identity);
+        }
     }
 
     /// Replaces an existing native implementation while invalidating prior authorizations.

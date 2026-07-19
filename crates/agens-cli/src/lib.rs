@@ -1448,13 +1448,6 @@ fn production_tool_runtime(
         bootstrap,
         project_root,
     )));
-    let remote_tools = mcp_registry
-        .lock()
-        .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
-        .tools()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
     let mut dispatcher = ToolDispatcher::new();
     let mut provider_tools = BTreeMap::new();
 
@@ -1477,27 +1470,126 @@ fn production_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
+    let mut runtime = ProductionMcpRuntime {
+        registry: mcp_registry,
+        dispatcher: Arc::new(Mutex::new(dispatcher)),
+    };
+    let remote_tools = runtime.discover_configured_tools()?;
+
     for metadata in remote_tools {
         let model_name = mcp_model_tool_name(&metadata);
         provider_tools.insert(
             model_name.clone(),
             remote_function_tool(&metadata, model_name)?,
         );
+    }
+
+    Ok((provider_tools.into_values().collect(), runtime.dispatcher))
+}
+
+struct ProductionMcpRuntime {
+    registry: Arc<Mutex<McpRegistry>>,
+    dispatcher: SharedToolDispatcher,
+}
+
+impl ProductionMcpRuntime {
+    fn discover_configured_tools(&mut self) -> Result<Vec<RemoteToolMetadata>, CliError> {
+        let servers = self
+            .registry
+            .lock()
+            .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+            .configured_server_names();
+
+        for server in servers {
+            let _ = self.discover_server(&server)?;
+        }
+
+        self.tools()
+    }
+
+    fn discover_server(&mut self, server: &str) -> Result<agens_tools::McpServerReport, CliError> {
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| CliError::configuration("MCP tools are unavailable"))?;
+        let report = registry.discover_server(server);
+        if !report.is_failed() {
+            synchronize_server_dispatcher(&mut dispatcher, &registry, &self.registry, server)?;
+        }
+        Ok(report)
+    }
+
+    #[allow(dead_code)]
+    fn reload_server(&mut self, server: &str) -> Result<agens_tools::McpServerReport, CliError> {
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| CliError::configuration("MCP tools are unavailable"))?;
+        let report = registry.reload_server(server);
+        if !report.is_failed() {
+            synchronize_server_dispatcher(&mut dispatcher, &registry, &self.registry, server)?;
+        }
+        Ok(report)
+    }
+
+    #[allow(dead_code)]
+    fn diagnostics(&self) -> Result<Vec<agens_tools::McpServerDiagnostic>, CliError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+            .diagnostics()
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
+    fn tools(&self) -> Result<Vec<RemoteToolMetadata>, CliError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
+            .tools()
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+}
+
+fn synchronize_server_dispatcher(
+    dispatcher: &mut ToolDispatcher,
+    registry: &McpRegistry,
+    shared_registry: &Arc<Mutex<McpRegistry>>,
+    server: &str,
+) -> Result<(), CliError> {
+    let tools = registry
+        .tools()
+        .into_iter()
+        .filter(|tool| tool.server_name == server)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    dispatcher.remove_mcp_server(server);
+    for metadata in tools {
         dispatcher
             .register_mcp(
                 &metadata,
                 RegisteredMcpTool {
                     name: metadata.qualified_name.clone(),
-                    registry: Arc::clone(&mcp_registry),
+                    registry: Arc::clone(shared_registry),
                 },
             )
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
-
-    Ok((
-        provider_tools.into_values().collect(),
-        Arc::new(Mutex::new(dispatcher)),
-    ))
+    Ok(())
 }
 
 fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
@@ -2898,5 +2990,144 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+    }
+
+    #[test]
+    fn production_mcp_runtime_reloads_dispatcher_and_retains_failed_generation() {
+        use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
+
+        struct TestTransport(VecDeque<agens_tools::McpResponse>);
+
+        impl McpTransportPort for TestTransport {
+            fn execute(
+                &mut self,
+                _: agens_tools::McpRequest,
+                _: &agens_tools::McpOperationContext,
+            ) -> Result<agens_tools::McpResponse, McpTransportError> {
+                Ok(self
+                    .0
+                    .pop_front()
+                    .expect("test transport response is configured"))
+            }
+
+            fn notify(
+                &mut self,
+                _: agens_tools::McpRequest,
+                _: &agens_tools::McpOperationContext,
+            ) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+
+            fn close(
+                &mut self,
+                _: &agens_tools::McpOperationContext,
+            ) -> Result<(), McpTransportError> {
+                Ok(())
+            }
+        }
+
+        fn transport(name: &str) -> TestTransport {
+            TestTransport(
+                [
+                    agens_tools::McpResponse::Initialized(agens_tools::McpInitializeResult::new(
+                        "2025-06-18",
+                        serde_json::json!({"tools": {}}),
+                    )),
+                    agens_tools::McpResponse::ToolsListed(agens_tools::McpToolsPage::new(
+                        vec![agens_tools::McpToolDefinition {
+                            name: name.into(),
+                            description: Some(name.into()),
+                            input_schema: serde_json::json!({"type": "object"}),
+                            annotations: agens_tools::McpToolAnnotations {
+                                read_only_hint: Some(true),
+                            },
+                        }],
+                        None,
+                    )),
+                ]
+                .into(),
+            )
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::clone(&attempts);
+        let registry = Arc::new(Mutex::new(McpRegistry::new()));
+        registry
+            .lock()
+            .unwrap()
+            .configure_server(
+                "files",
+                move || match attempt_counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
+                    0 => Ok(Box::new(transport("old"))),
+                    1 => Err(McpTransportError::Transport("SENTINEL_SECRET".into())),
+                    _ => Ok(Box::new(transport("new"))),
+                },
+                McpTimeouts::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                )
+                .unwrap(),
+                McpLimits::default(),
+            )
+            .unwrap();
+        let mut runtime = ProductionMcpRuntime {
+            registry,
+            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+        };
+
+        runtime.discover_server("files").unwrap();
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Any,
+                PermissionPattern::Any,
+            )],
+        );
+        let ToolEvaluationOutcome::Authorized(handle) = runtime
+            .dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", "files_old", serde_json::json!({})),
+            )
+            .unwrap()
+        else {
+            panic!("discovered MCP tool must be callable through the dispatcher");
+        };
+
+        assert!(runtime.reload_server("files").unwrap().is_failed());
+        assert!(
+            runtime
+                .diagnostics()
+                .unwrap()
+                .iter()
+                .all(|diagnostic| !diagnostic.message.contains("SENTINEL_SECRET"))
+        );
+        assert!(
+            runtime
+                .dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("files_old")
+                .is_some()
+        );
+
+        runtime.reload_server("files").unwrap();
+        let mut dispatcher = runtime.dispatcher.lock().unwrap();
+        assert!(dispatcher.canonical_identity("files_old").is_none());
+        assert!(dispatcher.canonical_identity("files_new").is_some());
+        assert!(
+            dispatcher
+                .execute(
+                    handle,
+                    &ToolExecutionContext::with_timeout(Duration::from_secs(1))
+                )
+                .is_err()
+        );
     }
 }

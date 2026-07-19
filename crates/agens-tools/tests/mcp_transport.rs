@@ -453,10 +453,10 @@ fn registry_enumerates_metadata_and_atomically_replaces_a_reloaded_server() {
 #[test]
 fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() {
     let attempts = Arc::new(AtomicUsize::new(0));
-    let first_closed = Arc::new(AtomicBool::new(false));
-    let first_closed_factory = Arc::clone(&first_closed);
-    let replacement_closed = Arc::new(AtomicBool::new(false));
-    let replacement_closed_factory = Arc::clone(&replacement_closed);
+    let first_close_count = Arc::new(AtomicUsize::new(0));
+    let first_close_count_factory = Arc::clone(&first_close_count);
+    let replacement_close_count = Arc::new(AtomicUsize::new(0));
+    let replacement_close_count_factory = Arc::clone(&replacement_close_count);
     let attempts_factory = Arc::clone(&attempts);
     let mut registry = McpRegistry::new();
 
@@ -470,12 +470,16 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                             [
                                 Ok(initialized()),
                                 Ok(page(vec![tool("old", Some(true))], None)),
+                                Ok(McpResponse::ToolCalled(McpCallResult {
+                                    content: vec![McpContentBlock::Text("old callable".into())],
+                                    is_error: false,
+                                })),
                             ]
                             .into(),
                         )),
                         requests: Arc::new(Mutex::new(Vec::new())),
-                        closed: Arc::clone(&first_closed_factory),
-                        cancelled: Arc::new(AtomicUsize::new(0)),
+                        closed: Arc::new(AtomicBool::new(false)),
+                        cancelled: Arc::clone(&first_close_count_factory),
                         delay: Duration::ZERO,
                     };
                     Ok(Box::new(transport) as Box<dyn McpTransport>)
@@ -492,8 +496,8 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
                         .into(),
                     )),
                     requests: Arc::new(Mutex::new(Vec::new())),
-                    closed: Arc::clone(&replacement_closed_factory),
-                    cancelled: Arc::new(AtomicUsize::new(0)),
+                    closed: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::clone(&replacement_close_count_factory),
                     delay: Duration::ZERO,
                 }) as Box<dyn McpTransport>),
             },
@@ -520,6 +524,16 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
             .message
             .contains("SENTINEL_SECRET")
     );
+    assert_eq!(
+        registry
+            .call_tool(
+                "files::old",
+                json!({}),
+                &agens_tools::ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+            )
+            .unwrap(),
+        ToolOutput::success("old callable")
+    );
     assert!(registry.discover_server("files").is_failed());
     assert_eq!(attempts.load(Ordering::Acquire), 2);
 
@@ -530,11 +544,10 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
     assert_eq!(attempts.load(Ordering::Acquire), 3);
     assert!(registry.tool("files::old").is_none());
     assert!(registry.tool("files::new").is_some());
-    assert!(first_closed.load(Ordering::Acquire));
+    assert_eq!(first_close_count.load(Ordering::Acquire), 1);
 
-    registry.close();
-    registry.close();
-    assert!(replacement_closed.load(Ordering::Acquire));
+    drop(registry);
+    assert_eq!(replacement_close_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
