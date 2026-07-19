@@ -4,7 +4,7 @@ use agens_core::{
     HeadlessTurnCancellation, MAX_PERMISSION_GLOB_SEGMENTS, MAX_PERMISSION_TARGET_BYTES,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPatternError,
     PermissionPolicy, PermissionRequest, PermissionRule, PermissionScope, PermissionSession,
-    ProjectPermissionGrant, ToolAccess,
+    PermissionTarget, ProjectPermissionGrant, ToolAccess,
 };
 
 #[test]
@@ -184,5 +184,78 @@ fn glob_rules_preserve_deny_mode_allow_grant_and_bypass_precedence() {
     assert_eq!(
         ask.evaluate(&request, &[], &PermissionSession::with_temporary_bypass()),
         PermissionDecision::Allow
+    );
+}
+
+#[test]
+fn permission_precedence_scans_config_grants_and_session_in_order() {
+    let request = PermissionRequest::new("project", "write", "src/lib.rs", ToolAccess::Write);
+    let tool = PermissionPattern::Exact("write".into());
+    let target = PermissionPattern::Exact("src/lib.rs".into());
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![
+            PermissionRule::global(PermissionDecision::Deny, tool.clone(), target.clone()),
+            PermissionRule::project(
+                "project",
+                PermissionDecision::Allow,
+                tool.clone(),
+                target.clone(),
+            ),
+        ],
+    );
+    let grants = [ProjectPermissionGrant::new(
+        "project",
+        PermissionDecision::Deny,
+        tool.clone(),
+        target.clone(),
+    )];
+    let session = [ProjectPermissionGrant::allow("project", tool, target)];
+
+    assert_eq!(
+        policy.evaluate_with_session_grants(&request, &grants, &session, &PermissionSession::new()),
+        PermissionDecision::Allow
+    );
+}
+
+#[test]
+fn permission_targets_project_paths_commands_urls_and_tool_inputs_to_the_shared_bound() {
+    for value in [
+        "x".repeat(MAX_PERMISSION_TARGET_BYTES + 1),
+        "é".repeat(MAX_PERMISSION_TARGET_BYTES),
+    ] {
+        let targets = [
+            PermissionTarget::path(&value),
+            PermissionTarget::command(&value),
+            PermissionTarget::url(&value),
+            PermissionTarget::native(&value),
+            PermissionTarget::mcp(&value),
+        ];
+
+        for target in targets {
+            assert!(target.project().len() <= MAX_PERMISSION_TARGET_BYTES);
+        }
+    }
+}
+
+#[test]
+fn safety_predicates_precede_rules_and_bypass() {
+    let tool = PermissionPattern::Exact("write".into());
+    let target = PermissionPattern::Any;
+    let policy = PermissionPolicy::with_safety_predicates(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            tool.clone(),
+            target.clone(),
+        )],
+        vec![agens_core::SafetyPredicate::WorktreeEscape],
+    );
+    let escaped = PermissionRequest::new("project", "write", "src/lib.rs", ToolAccess::Write)
+        .outside_worktree();
+
+    assert_eq!(
+        policy.evaluate(&escaped, &[], &PermissionSession::with_temporary_bypass()),
+        PermissionDecision::Deny
     );
 }

@@ -1129,6 +1129,7 @@ pub struct PermissionRequest {
     pub tool: String,
     pub target: String,
     pub access: ToolAccess,
+    outside_worktree: bool,
 }
 
 impl PermissionRequest {
@@ -1141,9 +1142,77 @@ impl PermissionRequest {
         Self {
             project: project.into(),
             tool: tool.into(),
-            target: target.into(),
+            target: PermissionTarget::native(target).project(),
             access,
+            outside_worktree: false,
         }
+    }
+
+    pub fn with_target(
+        project: impl Into<String>,
+        tool: impl Into<String>,
+        target: PermissionTarget,
+        access: ToolAccess,
+    ) -> Self {
+        Self {
+            project: project.into(),
+            tool: tool.into(),
+            target: target.project(),
+            access,
+            outside_worktree: false,
+        }
+    }
+
+    pub fn outside_worktree(mut self) -> Self {
+        self.outside_worktree = true;
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PermissionTarget {
+    Path(String),
+    Command(String),
+    Url(String),
+    Native(String),
+    Mcp(String),
+}
+
+impl PermissionTarget {
+    pub fn path(value: impl Into<String>) -> Self {
+        Self::Path(value.into())
+    }
+
+    pub fn command(value: impl Into<String>) -> Self {
+        Self::Command(value.into())
+    }
+
+    pub fn url(value: impl Into<String>) -> Self {
+        Self::Url(value.into())
+    }
+
+    pub fn native(value: impl Into<String>) -> Self {
+        Self::Native(value.into())
+    }
+
+    pub fn mcp(value: impl Into<String>) -> Self {
+        Self::Mcp(value.into())
+    }
+
+    pub fn project(self) -> String {
+        let value = match self {
+            Self::Path(value)
+            | Self::Command(value)
+            | Self::Url(value)
+            | Self::Native(value)
+            | Self::Mcp(value) => value,
+        };
+
+        value
+            .char_indices()
+            .take_while(|(index, _)| *index < MAX_PERMISSION_TARGET_BYTES)
+            .map(|(_, character)| character)
+            .collect()
     }
 }
 
@@ -1254,14 +1323,41 @@ impl PermissionSession {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SafetyPredicate {
+    WorktreeEscape,
+    ChatWrite,
+    GlobalDeny {
+        tool: PermissionPattern,
+        target: PermissionPattern,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionPolicy {
     mode: PermissionMode,
     static_rules: Vec<PermissionRule>,
+    safety_predicates: Vec<SafetyPredicate>,
 }
 
 impl PermissionPolicy {
     pub fn new(mode: PermissionMode, static_rules: Vec<PermissionRule>) -> Self {
-        Self { mode, static_rules }
+        Self::with_safety_predicates(
+            mode,
+            static_rules,
+            vec![SafetyPredicate::WorktreeEscape, SafetyPredicate::ChatWrite],
+        )
+    }
+
+    pub fn with_safety_predicates(
+        mode: PermissionMode,
+        static_rules: Vec<PermissionRule>,
+        safety_predicates: Vec<SafetyPredicate>,
+    ) -> Self {
+        Self {
+            mode,
+            static_rules,
+            safety_predicates,
+        }
     }
 
     pub fn evaluate(
@@ -1270,57 +1366,48 @@ impl PermissionPolicy {
         project_grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
     ) -> PermissionDecision {
-        // Global denials are evaluated outside ordinary conflicts so no later input can weaken them.
-        if self.matches_static(PermissionScope::Global, PermissionDecision::Deny, request) {
-            return PermissionDecision::Deny;
-        }
-
-        if self.mode == PermissionMode::Chat && request.access == ToolAccess::Write {
-            return PermissionDecision::Deny;
-        }
-
-        if let Some(decision) = self.static_decision(request) {
-            return Self::resolve_ask(decision, session);
-        }
-
-        if let Some(decision) = Self::grant_decision(project_grants, request) {
-            return Self::resolve_ask(decision, session);
-        }
-
-        Self::resolve_ask(PermissionDecision::Ask, session)
+        self.evaluate_with_session_grants(request, project_grants, &[], session)
     }
 
-    fn static_decision(&self, request: &PermissionRequest) -> Option<PermissionDecision> {
-        if self.matches_static(PermissionScope::Global, PermissionDecision::Deny, request)
-            || self.matches_static(PermissionScope::Project, PermissionDecision::Deny, request)
-        {
-            return Some(PermissionDecision::Deny);
-        }
-
-        if self.matches_static(PermissionScope::Global, PermissionDecision::Ask, request)
-            || self.matches_static(PermissionScope::Project, PermissionDecision::Ask, request)
-        {
-            return Some(PermissionDecision::Ask);
-        }
-
-        if self.matches_static(PermissionScope::Global, PermissionDecision::Allow, request)
-            || self.matches_static(PermissionScope::Project, PermissionDecision::Allow, request)
-        {
-            return Some(PermissionDecision::Allow);
-        }
-
-        None
-    }
-
-    fn matches_static(
+    pub fn evaluate_with_session_grants(
         &self,
-        scope: PermissionScope,
-        decision: PermissionDecision,
         request: &PermissionRequest,
-    ) -> bool {
-        self.static_rules
+        project_grants: &[ProjectPermissionGrant],
+        session_grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+    ) -> PermissionDecision {
+        if self.safety_predicates.iter().any(|predicate| {
+            matches!(predicate, SafetyPredicate::WorktreeEscape) && request.outside_worktree
+                || matches!(predicate, SafetyPredicate::ChatWrite)
+                    && self.mode == PermissionMode::Chat
+                    && request.access == ToolAccess::Write
+                || matches!(predicate, SafetyPredicate::GlobalDeny { tool, target }
+                    if tool.matches(&request.tool) && target.matches(&request.target))
+        }) {
+            return PermissionDecision::Deny;
+        }
+
+        let decision = self
+            .static_rules
             .iter()
-            .any(|rule| rule.scope == scope && rule.decision == decision && rule.matches(request))
+            .filter(|rule| rule.matches(request))
+            .map(|rule| rule.decision)
+            .chain(
+                project_grants
+                    .iter()
+                    .filter(|grant| grant.matches(request))
+                    .map(|grant| grant.decision),
+            )
+            .chain(
+                session_grants
+                    .iter()
+                    .filter(|grant| grant.matches(request))
+                    .map(|grant| grant.decision),
+            )
+            .last()
+            .unwrap_or(PermissionDecision::Ask);
+
+        Self::resolve_ask(decision, session)
     }
 
     fn resolve_ask(
@@ -1332,23 +1419,6 @@ impl PermissionPolicy {
         } else {
             decision
         }
-    }
-
-    fn grant_decision(
-        project_grants: &[ProjectPermissionGrant],
-        request: &PermissionRequest,
-    ) -> Option<PermissionDecision> {
-        if project_grants
-            .iter()
-            .any(|grant| grant.decision == PermissionDecision::Deny && grant.matches(request))
-        {
-            return Some(PermissionDecision::Deny);
-        }
-
-        project_grants
-            .iter()
-            .any(|grant| grant.decision == PermissionDecision::Allow && grant.matches(request))
-            .then_some(PermissionDecision::Allow)
     }
 }
 

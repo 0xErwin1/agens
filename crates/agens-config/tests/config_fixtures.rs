@@ -223,7 +223,7 @@ fn permission_rule_extraction_rejects_invalid_or_unsafe_entries_without_echoing_
 }
 
 #[test]
-fn permission_rule_extraction_rejects_conflicts_and_semantically_invalid_documents() {
+fn permission_rule_extraction_accepts_overlaps_and_rejects_semantically_invalid_documents() {
     let conflicting = parse_toml_document(
         r#"
             [permissions]
@@ -237,12 +237,11 @@ fn permission_rule_extraction_rejects_conflicts_and_semantically_invalid_documen
     let unknown = parse_toml_document("[permissions]\nunknown = [\"read\"]")
         .expect("unknown field fixture should parse");
 
-    assert_eq!(
-        extract_permission_rules(&conflicting, &toml::Table::new())
-            .expect_err("conflicting global rules must fail")
-            .to_string(),
-        "invalid configuration field permissions.deny[0]"
-    );
+    let rules = extract_permission_rules(&conflicting, &toml::Table::new())
+        .expect("overlapping global rules must preserve legacy allow then deny ordering");
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].decision, ConfigPermissionDecision::Allow);
+    assert_eq!(rules[1].decision, ConfigPermissionDecision::Deny);
     assert_eq!(
         extract_permission_rules(&wrong_type, &toml::Table::new())
             .expect_err("non-string permission entry must fail")
@@ -303,7 +302,7 @@ fn permission_rule_extraction_rejects_ungrounded_tools_and_invalid_target_globs(
 }
 
 #[test]
-fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules() {
+fn permission_rule_extraction_rejects_unicode_separators_and_accepts_overlapping_rules() {
     let unsafe_targets = [
         "..∕secret",
         "..／secret",
@@ -364,17 +363,14 @@ fn permission_rule_extraction_rejects_unicode_separators_and_overlapping_rules()
         let document = parse_toml_document(&format!("[permissions]\n{fields}"))
             .expect("fixture should be syntactically valid TOML");
 
-        let error = extract_permission_rules(&document, &toml::Table::new()).expect_err(name);
+        let rules = extract_permission_rules(&document, &toml::Table::new()).expect(name);
 
-        assert!(
-            error.to_string() == "invalid configuration field permissions.allow[1]"
-                || error.to_string() == "invalid configuration field permissions.deny[0]"
-        );
+        assert!(rules.len() >= 2);
     }
 }
 
 #[test]
-fn permission_rule_extraction_rejects_cross_scope_duplicates_and_keeps_distinct_rules() {
+fn permission_rule_extraction_preserves_cross_scope_duplicates_and_distinct_rules() {
     let global = parse_toml_document(
         r#"
             [permissions]
@@ -391,10 +387,8 @@ fn permission_rule_extraction_rejects_cross_scope_duplicates_and_keeps_distinct_
     .expect("project fixture should parse");
 
     assert_eq!(
-        extract_permission_rules(&global, &project)
-            .expect_err("cross-scope duplicate must fail")
-            .to_string(),
-        "invalid configuration field permissions.allow[0]"
+        extract_permission_rules(&global, &project).unwrap().len(),
+        2
     );
 
     let conflicting_project = parse_toml_document(
@@ -405,12 +399,9 @@ fn permission_rule_extraction_rejects_cross_scope_duplicates_and_keeps_distinct_
     )
     .expect("project fixture should parse");
 
-    assert_eq!(
-        extract_permission_rules(&global, &conflicting_project)
-            .expect_err("cross-scope conflict must fail")
-            .to_string(),
-        "invalid configuration field permissions.deny[0]"
-    );
+    let rules = extract_permission_rules(&global, &conflicting_project).unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[1].decision, ConfigPermissionDecision::Deny);
 
     let distinct_global = parse_toml_document(
         r#"

@@ -490,12 +490,6 @@ fn extract_scoped_permission_rules(
             let (tool_pattern, target_pattern) = parse_permission_rule(value)
                 .ok_or_else(|| invalid_indexed_field("permissions", field, index))?;
 
-            if rules.iter().any(|rule| {
-                permission_rules_overlap(rule, &tool_pattern, target_pattern.as_deref())
-            }) {
-                return Err(invalid_indexed_field("permissions", field, index));
-            }
-
             rules.push(ConfigPermissionRule {
                 scope,
                 decision,
@@ -630,31 +624,27 @@ fn is_valid_character_class(class: &str) -> bool {
             })
 }
 
+#[allow(dead_code)]
 fn permission_rules_overlap(
     existing: &ConfigPermissionRule,
     tool_pattern: &str,
     target_pattern: Option<&str>,
 ) -> bool {
-    if existing.tool_pattern != tool_pattern {
-        return false;
-    }
-
-    target_patterns_overlap(existing.target_pattern.as_deref(), target_pattern)
+    existing.tool_pattern == tool_pattern
+        && target_patterns_overlap(existing.target_pattern.as_deref(), target_pattern)
 }
 
+#[allow(dead_code)]
 fn target_patterns_overlap(left: Option<&str>, right: Option<&str>) -> bool {
     let (Some(left), Some(right)) = (left, right) else {
         return true;
     };
-
     if left == right || left == "**" || right == "**" {
         return true;
     }
-
     if is_doublestar_prefix(left, right) || is_doublestar_prefix(right, left) {
         return true;
     }
-
     match (
         contains_glob_metacharacter(left),
         contains_glob_metacharacter(right),
@@ -670,7 +660,6 @@ fn is_doublestar_prefix(pattern: &str, candidate: &str) -> bool {
     let Some(prefix) = pattern.strip_suffix("/**") else {
         return false;
     };
-
     candidate == prefix
         || candidate
             .strip_prefix(prefix)
@@ -684,7 +673,6 @@ fn contains_glob_metacharacter(pattern: &str) -> bool {
 fn glob_patterns_proven_disjoint(left: &str, right: &str) -> bool {
     let left_prefix = literal_glob_prefix(left);
     let right_prefix = literal_glob_prefix(right);
-
     !left_prefix.starts_with(right_prefix) && !right_prefix.starts_with(left_prefix)
 }
 
@@ -693,7 +681,6 @@ fn literal_glob_prefix(pattern: &str) -> &str {
         .char_indices()
         .find_map(|(index, character)| matches!(character, '*' | '?' | '[').then_some(index))
         .unwrap_or(pattern.len());
-
     &pattern[..prefix_length]
 }
 
@@ -716,7 +703,6 @@ fn glob_matches_from(
         None => candidate_index == candidate.len(),
         Some('*') => {
             let crosses_segments = pattern.get(pattern_index + 1) == Some(&'*');
-
             if crosses_segments && pattern.get(pattern_index + 2) == Some(&'/') {
                 return globstar_directory_matches(
                     pattern,
@@ -725,7 +711,6 @@ fn glob_matches_from(
                     candidate_index,
                 );
             }
-
             let next_index = pattern_index + usize::from(crosses_segments) + 1;
             let maximum = if crosses_segments {
                 candidate.len()
@@ -735,7 +720,6 @@ fn glob_matches_from(
                     .position(|character| *character == '/')
                     .map_or(candidate.len(), |offset| candidate_index + offset)
             };
-
             (candidate_index..=maximum).any(|next_candidate| {
                 glob_matches_from(pattern, candidate, next_index, next_candidate)
             })
@@ -754,7 +738,6 @@ fn glob_matches_from(
                 return false;
             };
             let class = &pattern[pattern_index + 1..class_end];
-
             candidate_index < candidate.len()
                 && candidate[candidate_index] != '/'
                 && glob_class_matches(class, candidate[candidate_index])
@@ -792,7 +775,6 @@ fn glob_class_matches(class: &[char], candidate: char) -> bool {
     };
     let mut index = 0;
     let mut matched = false;
-
     while index < characters.len() {
         if index + 2 < characters.len() && characters[index + 1] == '-' {
             matched |= characters[index] <= candidate && candidate <= characters[index + 2];
@@ -802,7 +784,6 @@ fn glob_class_matches(class: &[char], candidate: char) -> bool {
             index += 1;
         }
     }
-
     matched != negated
 }
 
