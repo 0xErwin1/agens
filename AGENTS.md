@@ -1,66 +1,68 @@
-# AGENTS.md — Agens
+# AGENTS.md - Agens
 
-Guidelines for AI agents and contributors working in this Rust codebase.
+Agens is a Rust coding-agent CLI. This file is the canonical execution guide for coding agents; detailed engineering rules live in `CODE_STYLE.md`, architecture in `ARCHITECTURE.md`, and contributor workflow in `CONTRIBUTING.md`.
 
-## Project overview
+## Ground rules
 
-Agens is a Rust CLI coding agent with providers, tools, MCP, skills, sub-agents, persistence, and a TUI.
+- Read the relevant code, tests, manifests, and canonical documents before changing behavior.
+- Do not invent APIs, flags, dependency behavior, or implementation status. Separate facts from inferences and state uncertainty.
+- Make the smallest complete change. Do not reformat, rename, or clean unrelated code.
+- Preserve user work and dirty files. Never discard changes that were not created for the active task.
+- Keep comments rare and limited to non-obvious constraints, invariants, or safety reasoning.
+- Never print, log, commit, or expose credentials, tokens, authorization headers, or secret-bearing command output.
+- Propagate or handle failures explicitly. Do not silently discard fallible results.
 
-Use these root documents as canonical references:
+## Environment and commands
 
-- `ARCHITECTURE.md` — package boundaries and dependency direction.
-- `CODE_STYLE.md` — Rust style, linting, testing, and error-handling conventions.
-- `CONTRIBUTING.md` — local setup and verification workflow.
-
-## Environment
-
-This project uses devenv through the Nix development shell. Prefer:
-
-```sh
-nix develop --no-pure-eval -c just verify
-```
-
-If you enter the shell interactively, use:
+Rust is the only implementation. Use the Nix development shell and the root `justfile` command surface:
 
 ```sh
 nix develop --no-pure-eval
 ```
 
-Rust is the only implementation. Binaries are written to `target/{debug,release}/agens`.
-
-## Canonical commands
-
 | Task | Command |
 |------|---------|
-| Format | `just fmt` |
 | Format check | `just fmt-check` |
 | Lint | `just lint` |
 | Test | `just test` |
 | Build | `just build` |
-| Config diagnostics | `just build && ./target/debug/agens config doctor` |
-| Verification | `just verify` |
-| Clean build output manually | `just clean` |
+| Bootstrap contracts | `just contracts` |
+| Supply-chain policy | `just deny` |
+| Full gate | `just verify` |
+| Manual cleanup | `just clean` |
 
-The Rust `target/` budget is 20 GiB. Gates never clean it automatically; cleanup is manual only with `just clean`.
+The canonical completion gate is:
 
-## Working principles
+```sh
+nix develop --no-pure-eval -c just verify
+```
 
-- Prefer small, boring, explicit code.
-- Do not invent APIs or behavior; read existing code and docs first.
-- Keep `crates/agens-cli` as the composition root; domain crates must not depend on it.
-- Keep `agens-tui` as a surface adapter over the shared runtime.
-- Keep hand-authored TOML configuration separate from SQLite-backed runtime state.
-- Keep comments rare and focused on non-obvious why.
-- Never log or print secrets.
+Build outputs are `target/{debug,release}/agens`. The `target/` budget is 20 GiB. Verification checks the budget before and after the gate and never cleans automatically; cleanup is manual only with `just clean`.
 
 ## Strict TDD
 
-For every non-trivial production change:
+For every non-trivial production or contract change:
 
-1. Write the failing test first.
-2. Capture the red result in the apply artifact.
-3. Implement the smallest change.
-4. Capture the green result.
-5. Run `nix develop --no-pure-eval -c just verify` before marking complete.
+1. Add or update the focused test or contract first.
+2. Run it and record the expected failure.
+3. Implement the smallest change that makes it pass.
+4. Re-run the focused test and relevant crate checks.
+5. Run the canonical full gate before declaring the change complete.
 
-Tests should live near the package they cover and prefer table-driven cases when behavior branches.
+Do not weaken assertions, lint levels, or error handling to manufacture a green result.
+
+## Architecture boundaries
+
+- `agens-cli` is the composition root and sole binary crate.
+- `agens-core` owns domain contracts and must not depend on adapters.
+- `agens-tui` is a terminal surface over the shared runtime, not a second runtime.
+- Providers, tools, stores, and configuration remain adapters around core contracts.
+- Hand-authored TOML configuration remains separate from SQLite runtime state.
+- Preserve the dependency graph documented in `ARCHITECTURE.md` and enforced by `tests/bootstrap/assert-workspace.sh`.
+
+## Change safety
+
+- Validate external input at filesystem, process, network, provider, MCP, and persistence boundaries.
+- Preserve cancellation and deadline propagation across blocking and async work.
+- Keep unsafe code confined to audited operating-system boundaries with explicit invariants; see `CODE_STYLE.md`.
+- Use check-only formatting during scoped or dirty-worktree work. Do not run a mutating workspace formatter unless all affected files are intentionally in scope.

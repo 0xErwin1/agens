@@ -3,6 +3,10 @@ name = "agens-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 globset = "0.4"

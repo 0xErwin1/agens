@@ -33,6 +33,7 @@
       perSystem = { pkgs, ... }: {
         devenv.shells.default = {
           packages = [
+            pkgs.cargo-deny
             pkgs.jq
             pkgs.just
           ];
@@ -43,7 +44,7 @@
           };
 
           enterShell = ''
-            echo "Agens dev shell (Rust, just)"
+            echo "Agens dev shell (Rust, just, cargo-deny)"
           '';
         };
 

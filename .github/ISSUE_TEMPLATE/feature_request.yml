@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose an Agens capability or focused improvement.
+title: "[feature] "
+labels: []
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or maintainer problem should be solved?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and how success can be verified.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Primary surface
+      options:
+        - Interactive TUI
+        - Headless chat
+        - Authentication
+        - Configuration
+        - Provider
+        - Native tools
+        - MCP
+        - Persistence
+        - Developer experience
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What existing workflow or smaller change could solve the problem?
+
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Constraints and risks
+      description: Note compatibility, security, cancellation, persistence, or platform concerns.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope confirmation
+      options:
+        - label: This request describes a problem and verifiable outcome, not only an implementation preference.
+          required: true

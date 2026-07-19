@@ -1,4 +1,4 @@
-# Local Pi runtime state
+# Local agent runtime state
 .agent/
 .codegraph/
 .logs/

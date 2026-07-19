@@ -1,212 +1,180 @@
 # Agens
 
-Agens is a Rust CLI coding agent with an interactive terminal UI, one-shot chat mode, provider integrations, guarded tool execution, and saved conversations.
+Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guarded project tools, MCP tool integration, and persisted completed turns.
 
-## What works today
+## Current capabilities
 
-- Interactive Rust TUI launched by bare `agens`.
-- One-shot prompt streaming with `agens chat`.
-- Provider support for:
-  - `openai-api`: OpenAI Chat Completions API with an API key.
-  - `openai-chatgpt`: ChatGPT/Codex subscription backend with OAuth login.
-- Model listing and live model selection.
-- Reasoning-effort selection for providers that support it.
-- Agent loop with tool calls.
-- Built-in tools:
-  - `read`, `write`, `edit` for worktree-confined filesystem access.
-  - `grep`, `glob` for worktree-confined search.
-  - `bash` for project-root shell commands.
-  - `webfetch` for one HTTP GET with SSRF protections and capped output.
-- Permission gate for tool calls. Read/search tools are allowed by default; mutating, shell, and web tools ask unless overridden.
-- Project instructions discovery from `AGENTS.md` and `CLAUDE.md`.
-- Session persistence and resume in the TUI.
-- Nix-first developer environment and `just` workflows.
+- Interactive TUI launched by bare `agens`.
+- One-shot agent turns through `agens chat <prompt>`.
+- OpenAI Responses API access with `provider.type = "openai-api"` and `OPENAI_API_KEY` or an existing `auth.json` entry.
+- ChatGPT subscription Responses access with OAuth login through `agens auth login`.
+- A cancellation-aware provider/tool loop with a 120-second top-level deadline.
+- Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
+- Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
+- MCP tools loaded from global configuration over stdio, streamable HTTP, or SSE transports.
+- Completed-turn and project-grant persistence in SQLite.
+- Nix-first development and one canonical verification gate.
 
-Still intentionally out of scope: packaging/release automation and editor protocol integrations.
+Agens exposes two runtime surfaces: the interactive TUI and headless `chat` command. The TUI uses the same provider, permission, tool, cancellation, and persistence runtime as headless chat.
 
 ## Quick start
 
-Enter the development shell and build the binary:
+Enter the development shell and build:
 
 ```sh
 nix develop --no-pure-eval
 just build
 ```
 
-Authenticate with one provider:
+For ChatGPT subscription authentication:
 
 ```sh
-# ChatGPT/Codex subscription OAuth login
 ./target/debug/agens auth login
-
-# or OpenAI API-key auth
-./target/debug/agens auth login api-key openai-api
+./target/debug/agens auth status
 ```
 
-Run the interactive UI:
+For OpenAI API authentication, set the key and select the provider in configuration:
+
+```sh
+export OPENAI_API_KEY="..."
+```
+
+```toml
+[provider]
+type = "openai-api"
+```
+
+Run the TUI or a one-shot prompt:
 
 ```sh
 ./target/debug/agens
-```
-
-Or send a one-shot prompt:
-
-```sh
 ./target/debug/agens chat "Explain this repository"
 ```
 
-## Commands
+## Command surface
 
-```sh
-./target/debug/agens --help
-./target/debug/agens auth login
-./target/debug/agens auth login api-key openai-api
-./target/debug/agens auth status
-./target/debug/agens auth logout <provider>
-./target/debug/agens config doctor
-./target/debug/agens models
-./target/debug/agens chat [prompt]
-./target/debug/agens --resume [session-id]
+```text
+agens [--resume [session-id]]
+agens auth <status|login|logout>
+agens chat [--model <id>] [--system <prompt>] [--max-iterations <n>] [--mode <chat|edit>] [--dangerously-allow-all] <prompt>
+agens config doctor
+agens sessions <list|show|rm>
+agens models
+agens --help
+agens --version
 ```
 
-Common flags on interactive and chat modes:
+`--dangerously-allow-all` temporarily bypasses tool confirmation for that turn. It is unsafe and should be limited to controlled environments.
 
-```sh
---model <id>                 override the configured model
---system <prompt>            override the configured system prompt
---max-iterations <n>         override the agent loop iteration limit
---dangerously-allow-all      auto-approve every tool call without prompting (unsafe)
-```
+The TUI accepts normal prompts and these slash commands:
 
-## Interactive UI
+- `/new` starts a fresh session context.
+- `/sessions` lists completed turns.
+- `/resume <id>` restores saved assistant text as context for the next prompt.
 
-Run `agens` with no subcommand to open the TUI.
-
-Slash commands:
-
-- `/new` or `/clear` — start a fresh conversation.
-- `/model` — choose a model from the provider catalog.
-- `/effort` — set reasoning effort.
-- `/sessions` — resume a saved conversation.
-- `/help` — show commands and shortcuts.
-- `/quit` — exit.
-
-Shortcuts:
-
-- `enter` — send.
-- `ctrl+c` — cancel a running turn, clear input, or quit from idle.
-- `ctrl+o` — expand/collapse tool output and thinking.
-- `ctrl+p` — toggle detailed token usage.
-- `pgup` / `pgdn` — scroll the conversation.
-- `esc` — close palette or deny a permission prompt.
-
-Type `@` in the prompt to open the project file picker; selected file references are expanded into the user message.
+Keyboard controls shown by the TUI include Enter to send, Shift+Enter for a newline, Ctrl+C to cancel or quit, Page Up/Page Down to scroll, and End to follow.
 
 ## Configuration
 
-Agens uses TOML files for hand-authored bootstrap configuration:
+Agens loads hand-authored TOML from:
 
-- Global: `~/.config/agens/config.toml`.
-- If `AGENS_CONFIG_HOME` is set: `$AGENS_CONFIG_HOME/config.toml`.
-- If `XDG_CONFIG_HOME` is set: `$XDG_CONFIG_HOME/agens/config.toml`.
-- Project: `<project-root>/.agens/config.toml`, where project root is the nearest `.git` ancestor or the current directory outside git.
+| Scope | Path |
+|-------|------|
+| Global override | `$AGENS_CONFIG_HOME/config.toml` |
+| XDG global | `$XDG_CONFIG_HOME/agens/config.toml` |
+| Default global | `~/.config/agens/config.toml` |
+| Project | `<project-root>/.agens/config.toml` |
 
-Project config overrides global config. Missing files are valid and load defaults.
+The project root is the nearest Git ancestor or the current directory outside a repository. Project values override global values. Missing files are valid.
 
-Example:
+A minimal configuration can select the provider, model, runtime limits, and permission policy:
 
 ```toml
-[options]
-# Enables debug-oriented behavior where supported.
-debug = false
-# Runtime data directory. Environment variables are expanded.
-data_dir = "$HOME/.local/share/agens"
-
 [provider]
-# Optional. Valid values: "openai-api" or "openai-chatgpt".
-# If omitted, Agens infers the provider from stored credentials, preferring
-# ChatGPT OAuth credentials over an OpenAI API key when both exist.
 type = "openai-chatgpt"
-# Optional. Defaults by provider: gpt-4.1 for openai-api, gpt-5.5 for openai-chatgpt.
 model = "gpt-5.5"
-# Optional provider base URL override. Environment variables are expanded.
-base_url = ""
 
 [agent]
-# Optional replacement for the built-in base system prompt.
-system_prompt = ""
-# Maximum model/tool loop iterations for one prompt. Must be >= 1.
-# CLI --max-iterations overrides this value; unset uses the internal default.
+system_prompt = "You are a careful coding agent."
 max_iterations = 60
-# Allow providers to emit independent tool calls in the same assistant turn.
-# Set false as a rollback knob if grouped tool calls cause provider issues.
-parallel_tool_calls = true
+
+[permissions]
+allow = ["read(**)", "list(**)", "search(**)"]
+deny = ["bash(rm *)"]
 ```
 
-Validate the loaded config with:
+The optional `[options].data_dir` changes the runtime-state directory. Environment expressions are supported by the configuration parser. MCP server definitions are global-only; project configuration cannot define them.
+
+Inspect resolved paths and validation status with:
 
 ```sh
 ./target/debug/agens config doctor
 ```
 
-## Credentials and sessions
+## Persistence and security
 
-Credentials are stored in `auth.json` under the same config home used for `config.toml`. The file stores provider entries keyed by provider id (`openai-api`, `openai-chatgpt`). CLI status output redacts secrets.
+Credentials live in `auth.json` under the selected config home. `OPENAI_API_KEY` takes precedence for the OpenAI API provider. ChatGPT OAuth writes only its own provider entry and preserves other entries.
 
-Sessions are stored in a SQLite database under:
+Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.local/share}/agens`:
 
-```text
-${XDG_DATA_HOME:-~/.local/share}/agens/sessions.db
-```
+- `rust-sessions.db` stores completed turn events.
+- `rust-permissions.db` stores project-scoped permission grants.
 
-Mutable runtime state belongs in the runtime store, not in TOML config.
+Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. Native filesystem operations are confined beneath the project root, and process tools remain permission-gated and bounded.
+
+Hand-authored TOML is configuration, not a runtime database. Do not store mutable sessions or grants in TOML.
+
+## Architecture
+
+The workspace contains seven crates:
+
+| Crate | Responsibility |
+|-------|----------------|
+| `agens-core` | Messages, turn state, cancellation, errors, permissions, and adapter ports |
+| `agens-config` | TOML validation, merging, expansion, paths, MCP definitions, and permission rules |
+| `agens-providers` | OpenAI and ChatGPT authentication and streaming adapters |
+| `agens-tools` | Native tools, permission dispatch, MCP transports, and reusable skill/sub-agent library contracts |
+| `agens-store` | SQLite completed turns and persisted project grants |
+| `agens-tui` | Terminal rendering and input over the shared runtime |
+| `agens-cli` | Command parsing, adapter wiring, and the `agens` binaries |
+
+`agens-cli` is the composition root. `agens-core` does not depend on adapters, and `agens-tui` is a surface adapter rather than a separate runtime. See `ARCHITECTURE.md` for the canonical dependency direction.
 
 ## Development
 
-This project uses devenv through the Nix development shell:
+Use the root `justfile` inside `nix develop --no-pure-eval`:
 
 ```sh
-nix develop --no-pure-eval
+just fmt-check    # check rustfmt without modifying files
+just lint         # Clippy for all workspace targets with warnings denied
+just test         # workspace tests
+just build        # build the workspace
+just contracts    # repository bootstrap and standards contracts
+just deny         # dependency advisories, licenses, bans, and sources
+just verify       # canonical complete gate
+just clean        # manual build-output cleanup
 ```
 
-Rust is the only product implementation. `just build` produces the development binary at `target/debug/agens`; release builds use `target/release/agens`.
+Build outputs are `target/{debug,release}/agens`. The directory has a 20 GiB budget. Verification checks the budget and never cleans automatically; cleanup is manual only with `just clean`.
 
-Canonical commands:
-
-```sh
-just fmt          # format the Rust workspace
-just fmt-check    # check Rust formatting
-just lint         # run Clippy with warnings denied
-just test         # run Rust workspace tests
-just build        # build target/debug/agens
-just verify       # Rust budget, format, lint, test, and build gate
-just clean        # remove Rust build output
-```
-
-Rust `target/` has a 20 GiB limit. Verification reports an overage but never deletes artifacts; cleanup is manual only with `just clean`.
-
-Before considering a code change complete, run:
+Before considering a change complete, run:
 
 ```sh
 nix develop --no-pure-eval -c just verify
 ```
 
-## Architecture
+## Known limitations
 
-The entrypoint is intentionally thin:
+- `agens models` is reserved in the command surface but currently reports that the capability is unavailable.
+- CLI-managed OpenAI API-key login is not implemented; use `OPENAI_API_KEY` or an existing `openai-api` entry in `auth.json`.
+- The production tool catalog currently wires native tools and configured MCP tools. Skill discovery and sub-agent contracts exist in `agens-tools` but are not exposed as production tools yet.
+- TUI model and reasoning-effort palettes are not implemented; use configuration or `agens chat --model` for model selection.
+- Packaging, release automation, and editor protocol integrations are not provided.
 
-```text
-crates/agens-cli -> agens-core, agens-config, agens-providers, agens-tools, agens-store, agens-tui
-```
+## Documentation
 
-Core package responsibilities are documented in `ARCHITECTURE.md`. Contributor workflow and style rules live in `CONTRIBUTING.md`, `CODE_STYLE.md`, and `AGENTS.md`.
-
-## TDD
-
-For non-trivial production changes:
-
-1. Write or update the failing test first.
-2. Capture the red result.
-3. Implement the smallest change.
-4. Capture the green result.
-5. Finish with `nix develop --no-pure-eval -c just verify`.
+- `ARCHITECTURE.md`: crate boundaries and runtime dependency direction.
+- `AGENTS.md`: concise execution rules for coding agents.
+- `CODE_STYLE.md`: Rust engineering, lint, security, and verification standards.
+- `CONTRIBUTING.md`: setup, TDD, review, dependency, and security workflow.
+- `CLAUDE.md`: thin pointer to the canonical documents.

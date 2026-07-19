@@ -16,6 +16,16 @@ test:
 build:
     cargo build --workspace --locked
 
+deny:
+    cargo deny check
+
+contracts:
+    tests/bootstrap/assert-workspace.sh
+    tests/bootstrap/docs-contract.sh
+    tests/bootstrap/target-budget.sh
+    tests/bootstrap/verify-contracts.sh
+    tests/bootstrap/standards-contract.sh
+
 target-size:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -34,10 +44,12 @@ target-clean:
 
 verify:
     just target-budget
+    just contracts
     just fmt-check
     just lint
     just test
     just build
+    just deny
     just target-budget
 
 clean:

@@ -25,12 +25,15 @@ assert_lines() {
 }
 
 assert_lines '' "$(dependencies verify)" "verify dependency graph"
-assert_lines $'just target-budget\njust fmt-check\njust lint\njust test\njust build\njust target-budget' "$(body verify)" "verify execution order"
+assert_lines $'just target-budget\njust contracts\njust fmt-check\njust lint\njust test\njust build\njust deny\njust target-budget' "$(body verify)" "verify execution order"
 
 assert_lines 'cargo fmt --all -- --check' "$(body fmt-check)" "Rust format check"
 assert_lines 'cargo clippy --workspace --all-targets --locked -- -D warnings' "$(body lint)" "Rust lint"
 assert_lines 'cargo test --workspace --all-targets --locked' "$(body test)" "Rust tests"
 assert_lines 'cargo build --workspace --locked' "$(body build)" "Rust build"
+assert_lines 'cargo deny check' "$(body deny)" "supply-chain check"
+
+assert_lines $'tests/bootstrap/assert-workspace.sh\ntests/bootstrap/docs-contract.sh\ntests/bootstrap/target-budget.sh\ntests/bootstrap/verify-contracts.sh\ntests/bootstrap/standards-contract.sh' "$(body contracts)" "bootstrap contracts"
 
 for gate in verify build; do
     if just --dry-run "$gate" | grep -Eq '(^|[[:space:]])(cargo clean|just target-clean|rm -rf target)($|[[:space:]])'; then

@@ -20,8 +20,16 @@ jq -e '
       "agens-tui"
     ]
   } as $expected
+  | (.packages | map(.name)) as $workspace_names
   | (.packages
-      | map({key: .name, value: (.dependencies | map(.name) | sort)})
+      | map({
+          key: .name,
+          value: (
+            .dependencies
+            | map(.name as $name | select($workspace_names | index($name)) | $name)
+            | sort
+          )
+        })
       | from_entries) as $actual
   | ($actual == $expected)
 ' <<<"$metadata" >/dev/null

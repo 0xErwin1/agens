@@ -1,0 +1,82 @@
+name: Bug report
+description: Report a reproducible Agens defect or regression.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Agens version
+      description: Output of `agens --version` or the source revision used.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, terminal, and Nix version when relevant.
+      placeholder: "Linux x86_64, WezTerm, Nix 2.x"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - Interactive TUI
+        - Headless chat
+        - Authentication
+        - Configuration
+        - Provider
+        - Native tool
+        - MCP tool or transport
+        - Session or permission persistence
+        - Development tooling
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide minimal, deterministic steps and sanitized configuration when needed.
+      placeholder: |
+        1. Run `...`.
+        2. Enter `...`.
+        3. Observe `...`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Relevant output
+      description: Redact credentials, tokens, authorization headers, paths containing secrets, and provider payloads.
+      render: shell
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues for the same behavior.
+          required: true
+        - label: I removed all secrets and sensitive data from this report.
+          required: true
