@@ -32,6 +32,20 @@ fn turn(messages: Vec<Message>) -> CompletedSessionTurn {
     .unwrap()
 }
 
+fn normalized_counts(connection: &Connection) -> (i64, i64, i64, i64) {
+    connection
+        .query_row(
+            "SELECT
+                 (SELECT count(*) FROM sessions),
+                 (SELECT count(*) FROM turns),
+                 (SELECT count(*) FROM messages),
+                 (SELECT count(*) FROM message_parts)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+}
+
 #[test]
 fn persists_text_completed_turn_and_reopens_in_order() {
     let directory = directory();
@@ -240,6 +254,113 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
             ),
         ]
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 9,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let invalid_json = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("user".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: "not json".into(),
+            }],
+        },
+    ]);
+    let completed = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("user".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: "{}".into(),
+            }],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+        },
+    ]);
+
+    let mut first = SessionStore::open(&directory).unwrap();
+    let mut stale = SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(first.database_path()).unwrap();
+
+    assert!(
+        first
+            .persist_completed_session_turn(&metadata, &invalid_json)
+            .is_err()
+    );
+    assert_eq!(normalized_counts(&connection), (0, 0, 0, 0));
+
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_tool_result
+             BEFORE INSERT ON message_parts
+             WHEN NEW.kind = 'tool_result'
+             BEGIN SELECT RAISE(ABORT, 'test transaction failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        first
+            .persist_completed_session_turn(&metadata, &completed)
+            .is_err()
+    );
+    assert_eq!(normalized_counts(&connection), (0, 0, 0, 0));
+
+    connection
+        .execute("DROP TRIGGER reject_tool_result", [])
+        .unwrap();
+    first
+        .persist_completed_session_turn(&metadata, &completed)
+        .unwrap();
+    assert!(
+        stale
+            .persist_completed_session_turn(&metadata, &completed)
+            .is_err()
+    );
+    drop(first);
+    drop(stale);
+
+    let reopened = SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(reopened.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT completed_turn_count, resumable FROM sessions WHERE id = 9",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap(),
+        (1, true)
+    );
+    assert_eq!(normalized_counts(&connection), (1, 1, 3, 3));
 
     fs::remove_dir_all(directory).unwrap();
 }
