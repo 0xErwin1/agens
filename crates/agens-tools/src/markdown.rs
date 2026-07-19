@@ -136,19 +136,23 @@ pub fn load_root(root: &Path) -> Result<MarkdownRoot, String> {
             .diagnostics
             .push(diagnostic(&root, "root entry limit exceeded"));
     }
+    let mut definition_limit_reported = false;
     for entry in entries.into_iter().take(MAX_MARKDOWN_ROOT_ENTRIES) {
-        if result.documents.len() == MAX_MARKDOWN_DEFINITIONS {
-            result
-                .diagnostics
-                .push(diagnostic(&root, "accepted definition limit exceeded"));
-            break;
-        }
         let path = entry.path();
         if path.extension().is_none_or(|extension| extension != "md") {
             continue;
         }
         match load_file(&root, &path) {
-            Ok(document) => result.documents.push(document),
+            Ok(document) if result.documents.len() < MAX_MARKDOWN_DEFINITIONS => {
+                result.documents.push(document);
+            }
+            Ok(_) if !definition_limit_reported => {
+                result
+                    .diagnostics
+                    .push(diagnostic(&root, "accepted definition limit exceeded"));
+                definition_limit_reported = true;
+            }
+            Ok(_) => {}
             Err(message) => result.diagnostics.push(diagnostic(&path, message)),
         }
     }

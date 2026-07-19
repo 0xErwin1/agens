@@ -82,6 +82,100 @@ fn stops_at_root_and_accepted_definition_limits() {
     assert_eq!(diagnostics.len(), 2);
 }
 
+#[test]
+fn accepts_exact_definition_limit_while_reporting_later_invalid_entries() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    for index in 0..markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("definition-{index:03}");
+        fs::write(
+            root.join(format!("{name}.md")),
+            format!("---\nname: {name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    fs::write(root.join("unrelated.txt"), "ignored").unwrap();
+    fs::write(
+        root.join("z-malformed.md"),
+        "---\nname: {not: text}\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(root.join("z-not-utf8.md"), [0xff, 0xfe]).unwrap();
+
+    let MarkdownRoot {
+        documents,
+        diagnostics,
+    } = markdown::load_root(&root).unwrap();
+
+    assert_eq!(documents.len(), markdown::MAX_MARKDOWN_DEFINITIONS);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message())
+            .collect::<Vec<_>>(),
+        vec![
+            "frontmatter field name must be a string or string list",
+            "file is not UTF-8: invalid utf-8 sequence of 1 bytes from index 0",
+        ]
+    );
+}
+
+#[test]
+fn rejects_extra_definitions_once_without_hiding_later_diagnostics() {
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    fs::create_dir_all(&root).unwrap();
+
+    for index in 0..=markdown::MAX_MARKDOWN_DEFINITIONS {
+        let name = format!("definition-{index:03}");
+        fs::write(
+            root.join(format!("{name}.md")),
+            format!("---\nname: {name}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    fs::write(root.join("z-invalid.md"), [0xff]).unwrap();
+
+    let MarkdownRoot {
+        documents,
+        diagnostics,
+    } = markdown::load_root(&root).unwrap();
+
+    assert_eq!(documents.len(), markdown::MAX_MARKDOWN_DEFINITIONS);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message())
+            .collect::<Vec<_>>(),
+        vec![
+            "accepted definition limit exceeded",
+            "file is not UTF-8: invalid utf-8 sequence of 1 bytes from index 0",
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_symbolic_link_root_even_when_it_points_outside_the_confinement() {
+    let temporary = TemporaryDirectory::new();
+    let outside = temporary.path.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        outside.join("outside.md"),
+        "---\nname: outside\n---\nbody\n",
+    )
+    .unwrap();
+    let root = temporary.path.join("root");
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+    assert_eq!(
+        markdown::load_root(&root),
+        Err("markdown root must be a non-symbolic-link directory".into())
+    );
+}
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
