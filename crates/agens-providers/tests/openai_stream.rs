@@ -1,7 +1,7 @@
 use agens_core::{Error, Message, MessagePart, Role};
 use agens_providers::{
     OpenAiFunctionTool, decode_openai_response_events, encode_openai_response_request,
-    encode_openai_response_request_with_tools,
+    encode_openai_response_request_with_messages, encode_openai_response_request_with_tools,
 };
 use serde_json::json;
 
@@ -69,6 +69,85 @@ fn encodes_validated_function_tools_as_flat_responses_api_definitions() {
     assert_eq!(
         request,
         r#"{"input":[{"content":"What is the weather in Paris?","role":"user"}],"model":"gpt-5.6","stream":true,"tools":[{"description":"Looks up the current weather for a city.","name":"lookup_weather","parameters":{"additionalProperties":false,"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":true,"type":"function"}]}"#
+    );
+}
+
+#[test]
+fn encodes_resumed_messages_in_order_with_mixed_parts() {
+    let messages = vec![
+        Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(
+                "Follow the active agent instructions.".to_owned(),
+            )],
+        },
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("What is the weather?".to_owned())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::Text("I will look it up.".to_owned()),
+                MessagePart::Reasoning("Use the weather tool.".to_owned()),
+                MessagePart::ToolCall {
+                    id: "call_weather".to_owned(),
+                    name: "lookup_weather".to_owned(),
+                    input: r#"{"city":"Paris"}"#.to_owned(),
+                },
+            ],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "call_weather".to_owned(),
+                content: "sunny".to_owned(),
+                is_error: false,
+            }],
+        },
+    ];
+
+    let request = encode_openai_response_request_with_messages("gpt-5.6", &messages, &[])
+        .expect("resumed history should encode");
+
+    assert_eq!(
+        request,
+        r#"{"input":[{"content":[{"text":"Follow the active agent instructions.","type":"input_text"}],"role":"system"},{"content":[{"text":"What is the weather?","type":"input_text"}],"role":"user"},{"content":[{"text":"I will look it up.","type":"output_text"}],"role":"assistant"},{"summary":[{"text":"Use the weather tool.","type":"summary_text"}],"type":"reasoning"},{"arguments":"{\"city\":\"Paris\"}","call_id":"call_weather","name":"lookup_weather","type":"function_call"},{"call_id":"call_weather","output":"sunny","type":"function_call_output"}],"model":"gpt-5.6","stream":true}"#
+    );
+}
+
+#[test]
+fn rejects_invalid_resumed_message_history() {
+    let unmatched_result = vec![Message {
+        role: Role::Tool,
+        parts: vec![MessagePart::ToolResult {
+            tool_call_id: "missing".to_owned(),
+            content: "no matching call".to_owned(),
+            is_error: true,
+        }],
+    }];
+
+    assert_eq!(
+        encode_openai_response_request_with_messages("gpt-5.6", &unmatched_result, &[]),
+        Err(Error::Provider(
+            "OpenAI request error: resumed history is invalid".to_owned()
+        ))
+    );
+
+    let malformed_tool_call = vec![Message {
+        role: Role::Assistant,
+        parts: vec![MessagePart::ToolCall {
+            id: "call_weather".to_owned(),
+            name: "lookup_weather".to_owned(),
+            input: "not json".to_owned(),
+        }],
+    }];
+
+    assert_eq!(
+        encode_openai_response_request_with_messages("gpt-5.6", &malformed_tool_call, &[]),
+        Err(Error::Provider(
+            "OpenAI request error: resumed history is invalid".to_owned()
+        ))
     );
 }
 

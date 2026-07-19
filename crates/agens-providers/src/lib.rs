@@ -1237,6 +1237,128 @@ pub fn encode_openai_response_request_with_tools(
     Ok(request.to_string())
 }
 
+pub fn encode_openai_response_request_with_messages(
+    model: &str,
+    messages: &[Message],
+    tools: &[OpenAiFunctionTool],
+) -> Result<String, Error> {
+    if model.trim().is_empty() || messages.is_empty() {
+        return Err(invalid_resumed_history());
+    }
+
+    let mut input = Vec::new();
+    let mut calls = BTreeSet::new();
+    let mut results = BTreeSet::new();
+
+    for message in messages {
+        match message.role {
+            Role::System | Role::User => {
+                let content = message
+                    .parts
+                    .iter()
+                    .map(|part| match part {
+                        MessagePart::Text(text) if !text.is_empty() => {
+                            Ok(serde_json::json!({ "type": "input_text", "text": text }))
+                        }
+                        _ => Err(invalid_resumed_history()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if content.is_empty() {
+                    return Err(invalid_resumed_history());
+                }
+                input.push(serde_json::json!({
+                    "role": match message.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        _ => unreachable!(),
+                    },
+                    "content": content,
+                }));
+            }
+            Role::Assistant => {
+                if message.parts.is_empty() {
+                    return Err(invalid_resumed_history());
+                }
+                for part in &message.parts {
+                    match part {
+                        MessagePart::Text(text) if !text.is_empty() => {
+                            input.push(serde_json::json!({
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": text }],
+                            }));
+                        }
+                        MessagePart::Reasoning(text) if !text.is_empty() => {
+                            input.push(serde_json::json!({
+                                "type": "reasoning",
+                                "summary": [{ "type": "summary_text", "text": text }],
+                            }));
+                        }
+                        MessagePart::ToolCall {
+                            id,
+                            name,
+                            input: arguments,
+                        } if !id.is_empty()
+                            && !name.is_empty()
+                            && serde_json::from_str::<Value>(arguments).is_ok()
+                            && calls.insert(id.clone()) =>
+                        {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": id,
+                                "name": name,
+                                "arguments": arguments,
+                            }));
+                        }
+                        _ => return Err(invalid_resumed_history()),
+                    }
+                }
+            }
+            Role::Tool => {
+                if message.parts.is_empty() {
+                    return Err(invalid_resumed_history());
+                }
+                for part in &message.parts {
+                    let MessagePart::ToolResult {
+                        tool_call_id,
+                        content,
+                        ..
+                    } = part
+                    else {
+                        return Err(invalid_resumed_history());
+                    };
+                    if tool_call_id.is_empty()
+                        || content.is_empty()
+                        || !calls.contains(tool_call_id)
+                        || !results.insert(tool_call_id.clone())
+                    {
+                        return Err(invalid_resumed_history());
+                    }
+                    input.push(serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": tool_call_id,
+                        "output": content,
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut request = serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+    });
+    if !tools.is_empty() {
+        request["tools"] = function_tools_json(tools);
+    }
+
+    Ok(request.to_string())
+}
+
+fn invalid_resumed_history() -> Error {
+    Error::Provider("OpenAI request error: resumed history is invalid".to_owned())
+}
+
 pub fn decode_openai_response_events<I, S>(events: I) -> Result<Vec<MessagePart>, Error>
 where
     I: IntoIterator<Item = S>,
