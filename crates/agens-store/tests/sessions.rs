@@ -10,7 +10,7 @@ use agens_core::{
     TurnState,
 };
 use agens_store::SessionStore;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -95,6 +95,89 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
         Poll::Ready(value) => value,
         Poll::Pending => panic!("test repository must complete immediately"),
     }
+}
+
+#[test]
+fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
+    let directory = data_directory();
+    let database = directory.join("rust-sessions.db");
+    let writer = Connection::open(&database).unwrap();
+    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+    create_supported_session_schema(
+        &writer,
+        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
+         ON completed_turn_events(turn_id, sequence);",
+    );
+    writer
+        .execute_batch(
+            "INSERT INTO completed_turns(id) VALUES(7);
+             INSERT INTO completed_turn_events
+             VALUES(7, 3, 'provider_part', NULL, 'text', NULL, NULL, NULL,
+                    'WAL content', NULL);",
+        )
+        .unwrap();
+
+    let store = SessionStore::open(&directory).unwrap();
+    let backup = store.create_verified_v1_backup().unwrap();
+    let manifest = fs::read_to_string(backup.with_extension("bak.manifest")).unwrap();
+    let snapshot = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+    assert_eq!(
+        snapshot
+            .query_row("SELECT content FROM completed_turn_events", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "WAL content"
+    );
+    assert!(manifest.contains("version=1"));
+    assert!(manifest.contains(
+        "completed_turn_events|7|3|'provider_part'|NULL|'text'|NULL|NULL|NULL|'WAL content'|NULL"
+    ));
+    assert!(manifest.contains("completed_turn_events_turn_sequence"));
+    assert!(manifest.contains("quick_check=ok"));
+    assert_eq!(
+        Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT count(*) FROM completed_turn_events", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        1
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
+    let directory = data_directory();
+    let database = directory.join("rust-sessions.db");
+    let connection = Connection::open(&database).unwrap();
+    create_supported_session_schema(
+        &connection,
+        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
+         ON completed_turn_events(turn_id, sequence);",
+    );
+    drop(connection);
+    fs::write(directory.join("rust-sessions.db.v1.bak"), "existing").unwrap();
+    fs::write(directory.join("rust-sessions.db.v1.bak.1.tmp"), "stale").unwrap();
+
+    let store = SessionStore::open(&directory).unwrap();
+    let backup = store.create_verified_v1_backup().unwrap();
+
+    assert_eq!(backup, directory.join("rust-sessions.db.v1.bak.2"));
+    assert_eq!(
+        fs::read(directory.join("rust-sessions.db.v1.bak")).unwrap(),
+        b"existing"
+    );
+    assert_eq!(
+        fs::read(directory.join("rust-sessions.db.v1.bak.1.tmp")).unwrap(),
+        b"stale"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

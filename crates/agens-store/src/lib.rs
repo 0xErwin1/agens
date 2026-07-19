@@ -1,5 +1,6 @@
 use std::{
     fmt, fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -7,7 +8,8 @@ use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, MessagePart,
     PermissionDecision, PermissionPattern, ProjectPermissionGrant, TurnEvent, TurnState,
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::backup::Backup;
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 const PERMISSIONS_DATABASE: &str = "rust-permissions.db";
 const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
@@ -160,7 +162,183 @@ impl PermissionGrantStore {
     pub fn database_path(&self) -> PathBuf {
         self.database_path.clone()
     }
+}
 
+impl SessionStore {
+    pub fn create_verified_v1_backup(&self) -> Result<PathBuf, SessionStoreError> {
+        let source =
+            Connection::open_with_flags(&self.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| {
+                    SessionStoreError::operation("open backup source", &self.database_path, error)
+                })?;
+        source
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| {
+                SessionStoreError::operation("configure backup source", &self.database_path, error)
+            })?;
+        source.execute_batch("BEGIN").map_err(|error| {
+            SessionStoreError::operation("snapshot backup source", &self.database_path, error)
+        })?;
+        initialize_sessions_schema(&source, &self.database_path)?;
+        let source_manifest = v1_manifest(&source).map_err(|error| {
+            SessionStoreError::operation("read backup source", &self.database_path, error)
+        })?;
+
+        for suffix in 0_u64.. {
+            let extension = if suffix == 0 {
+                "v1.bak".to_owned()
+            } else {
+                format!("v1.bak.{suffix}")
+            };
+            let backup_path =
+                PathBuf::from(format!("{}.{}", self.database_path.display(), extension));
+            let temporary_path = PathBuf::from(format!("{}.tmp", backup_path.display()));
+            let manifest_path = PathBuf::from(format!("{}.manifest", backup_path.display()));
+            let manifest_temporary_path = PathBuf::from(format!("{}.tmp", manifest_path.display()));
+
+            if backup_path.exists() || manifest_path.exists() {
+                continue;
+            }
+            let temporary = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(SessionStoreError::operation(
+                        "create backup temporary",
+                        &temporary_path,
+                        error,
+                    ));
+                }
+            };
+            drop(temporary);
+
+            let mut destination = Connection::open(&temporary_path).map_err(|error| {
+                SessionStoreError::operation("open backup destination", &temporary_path, error)
+            })?;
+            {
+                let backup = Backup::new(&source, &mut destination).map_err(|error| {
+                    SessionStoreError::operation("start backup", &temporary_path, error)
+                })?;
+                backup
+                    .run_to_completion(100, std::time::Duration::from_millis(10), None)
+                    .map_err(|error| {
+                        SessionStoreError::operation("copy backup", &temporary_path, error)
+                    })?;
+            }
+            drop(destination);
+            fs::File::open(&temporary_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    SessionStoreError::operation("fsync backup", &temporary_path, error)
+                })?;
+
+            if let Err(error) = fs::hard_link(&temporary_path, &backup_path) {
+                let _ = fs::remove_file(&temporary_path);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(SessionStoreError::operation(
+                    "install backup",
+                    &backup_path,
+                    error,
+                ));
+            }
+            let verification =
+                Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(|error| {
+                        SessionStoreError::operation("reopen backup", &backup_path, error)
+                    })?;
+            let quick_check: String = verification
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .map_err(|error| {
+                    SessionStoreError::operation("quick check backup", &backup_path, error)
+                })?;
+            initialize_sessions_schema(&verification, &backup_path)?;
+            let backup_manifest = v1_manifest(&verification).map_err(|error| {
+                SessionStoreError::operation("read backup", &backup_path, error)
+            })?;
+            drop(verification);
+
+            if quick_check != "ok" || backup_manifest != source_manifest {
+                let _ = fs::remove_file(&backup_path);
+                let _ = fs::remove_file(&temporary_path);
+                return Err(SessionStoreError::operation(
+                    "verify backup",
+                    &backup_path,
+                    "backup does not match the v1 snapshot",
+                ));
+            }
+
+            let mut manifest = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&manifest_temporary_path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let _ = fs::remove_file(&backup_path);
+                    let _ = fs::remove_file(&temporary_path);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(SessionStoreError::operation(
+                        "create manifest temporary",
+                        &manifest_temporary_path,
+                        error,
+                    ));
+                }
+            };
+            writeln!(manifest, "version=1\nquick_check=ok\n{backup_manifest}")
+                .and_then(|_| manifest.sync_all())
+                .map_err(|error| {
+                    SessionStoreError::operation(
+                        "write backup manifest",
+                        &manifest_temporary_path,
+                        error,
+                    )
+                })?;
+            drop(manifest);
+
+            if let Err(error) = fs::hard_link(&manifest_temporary_path, &manifest_path) {
+                let _ = fs::remove_file(&backup_path);
+                let _ = fs::remove_file(&temporary_path);
+                let _ = fs::remove_file(&manifest_temporary_path);
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    continue;
+                }
+                return Err(SessionStoreError::operation(
+                    "install backup manifest",
+                    &manifest_path,
+                    error,
+                ));
+            }
+            fs::remove_file(&temporary_path)
+                .and_then(|_| fs::remove_file(&manifest_temporary_path))
+                .map_err(|error| {
+                    SessionStoreError::operation("finalize backup", &backup_path, error)
+                })?;
+            fs::File::open(
+                self.database_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                SessionStoreError::operation("fsync backup parent", &backup_path, error)
+            })?;
+
+            return Ok(backup_path);
+        }
+
+        unreachable!("backup suffixes are unbounded")
+    }
+}
+
+impl PermissionGrantStore {
     pub fn append_grants(
         &mut self,
         grants: &[ProjectPermissionGrant],
@@ -975,6 +1153,25 @@ fn completed_turns_indexes_match(connection: &Connection) -> rusqlite::Result<bo
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(indexes.is_empty())
+}
+
+fn v1_manifest(connection: &Connection) -> rusqlite::Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT 'schema|' || type || '|' || name || '|' || quote(sql)
+         FROM sqlite_schema WHERE type IN ('index', 'table') AND name LIKE 'completed_turn%'
+         UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
+         UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
+         UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
+             quote(kind) || '|' || quote(state) || '|' || quote(part_kind) || '|' ||
+             quote(call_id) || '|' || quote(name) || '|' || quote(input) || '|' ||
+             quote(content) || '|' || quote(is_error)
+         FROM completed_turn_events ORDER BY 1",
+    )?;
+    let lines = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(lines.join("\n"))
 }
 
 fn insert_turn_event(

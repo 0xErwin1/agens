@@ -10,4 +10,4 @@ workspace = true
 
 [dependencies]
 agens-core = { path = "../agens-core" }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
