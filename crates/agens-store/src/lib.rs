@@ -754,7 +754,27 @@ impl SessionStore {
             .map_err(|error| {
                 SessionStoreError::operation("enable foreign keys", &database_path, error)
             })?;
-        initialize_sessions_schema(&connection, &database_path)?;
+
+        match session_schema_version(&connection, &database_path)? {
+            0 => initialize_sessions_schema(&connection, &database_path)?,
+            1 => {
+                let mut store = Self {
+                    database_path: database_path.clone(),
+                    connection,
+                };
+                store.create_verified_v1_backup()?;
+                migrate_v1_on_open(&mut store.connection, &store.database_path)?;
+                return Ok(store);
+            }
+            2 => validate_legacy_archive(&connection, &database_path)?,
+            unsupported => {
+                return Err(SessionStoreError::operation(
+                    "check schema version",
+                    &database_path,
+                    format!("unsupported schema version {unsupported}"),
+                ));
+            }
+        }
 
         Ok(Self {
             database_path,
@@ -1006,6 +1026,166 @@ fn initialize_sessions_schema(
     }
 
     Ok(())
+}
+
+fn session_schema_version(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<i64, SessionStoreError> {
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| SessionStoreError::operation("read schema version", database_path, error))
+}
+
+fn migrate_v1_on_open(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            SessionStoreError::operation("start v1 migration", database_path, error)
+        })?;
+
+    create_legacy_archive_schema(&transaction, database_path)?;
+    copy_legacy_turns(&transaction, database_path)?;
+    copy_legacy_turn_events(&transaction, database_path)?;
+    validate_legacy_archive(&transaction, database_path)?;
+    finalize_v2_migration(&transaction, database_path)?;
+    transaction.commit().map_err(|error| {
+        SessionStoreError::operation("commit v1 migration", database_path, error)
+    })?;
+
+    let reopened = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| {
+            SessionStoreError::operation("reopen v2 migration", database_path, error)
+        })?;
+    validate_legacy_archive(&reopened, database_path)
+}
+
+fn create_legacy_archive_schema(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE legacy_turns (
+                 id INTEGER PRIMARY KEY,
+                 status TEXT NOT NULL CHECK(status = 'non_resumable'),
+                 reason TEXT NOT NULL,
+                 source_event_count INTEGER NOT NULL CHECK(source_event_count >= 0)
+             );
+             CREATE TABLE legacy_turn_events (
+                 turn_id INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 state TEXT,
+                 part_kind TEXT,
+                 call_id TEXT,
+                 name TEXT,
+                 input TEXT,
+                 content TEXT,
+                 is_error INTEGER,
+                 PRIMARY KEY(turn_id, sequence),
+                 FOREIGN KEY(turn_id) REFERENCES legacy_turns(id) ON DELETE CASCADE
+             );
+             CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+                 ON legacy_turn_events(turn_id, sequence);",
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("create legacy archive", database_path, error)
+        })
+}
+
+fn copy_legacy_turns(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    transaction
+        .execute(
+            "INSERT INTO legacy_turns(id, status, reason, source_event_count)
+             SELECT turns.id, 'non_resumable',
+                    'v1 lacks session/user/project/title/agent/timestamps',
+                    count(events.turn_id)
+             FROM completed_turns turns
+             LEFT JOIN completed_turn_events events ON events.turn_id = turns.id
+             GROUP BY turns.id",
+            [],
+        )
+        .map_err(|error| SessionStoreError::operation("copy legacy turns", database_path, error))?;
+    Ok(())
+}
+
+fn copy_legacy_turn_events(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    transaction
+        .execute(
+            "INSERT INTO legacy_turn_events
+             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
+             FROM completed_turn_events ORDER BY turn_id, sequence",
+            [],
+        )
+        .map_err(|error| SessionStoreError::operation("copy legacy turn events", database_path, error))?;
+    Ok(())
+}
+
+fn validate_legacy_archive(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    let source_tables_present: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = 'completed_turns')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("validate legacy archive", database_path, error)
+        })?;
+    let counts_query = if source_tables_present {
+        "SELECT (SELECT count(*) FROM legacy_turns) = (SELECT count(*) FROM completed_turns)
+                AND (SELECT count(*) FROM legacy_turn_events) =
+                    (SELECT count(*) FROM completed_turn_events)"
+    } else {
+        "SELECT NOT EXISTS(
+             SELECT 1 FROM legacy_turns turns
+             WHERE turns.source_event_count !=
+                 (SELECT count(*) FROM legacy_turn_events WHERE turn_id = turns.id)
+         )"
+    };
+    let counts_match: bool = connection
+        .query_row(counts_query, [], |row| row.get(0))
+        .map_err(|error| {
+            SessionStoreError::operation("validate legacy archive", database_path, error)
+        })?;
+
+    if counts_match {
+        Ok(())
+    } else {
+        Err(SessionStoreError::operation(
+            "validate legacy archive",
+            database_path,
+            "legacy archive counts do not match",
+        ))
+    }
+}
+
+fn finalize_v2_migration(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    transaction
+        .execute_batch(
+            "DROP TABLE completed_turn_events;
+             DROP TABLE completed_turns;
+             PRAGMA user_version = 2;",
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("finalize v1 migration", database_path, error)
+        })
 }
 
 fn table_matches(

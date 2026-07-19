@@ -86,6 +86,26 @@ fn create_supported_session_schema(connection: &Connection, index_sql: &str) {
         .unwrap();
 }
 
+fn create_populated_wal_v1_fixture(directory: &std::path::Path) {
+    let database = directory.join("rust-sessions.db");
+    let connection = Connection::open(database).unwrap();
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    create_supported_session_schema(
+        &connection,
+        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
+         ON completed_turn_events(turn_id, sequence);",
+    );
+    connection
+        .execute_batch(
+            "INSERT INTO completed_turns(id) VALUES(7);
+             INSERT INTO completed_turn_events VALUES
+                (7, 1, 'provider_part', NULL, 'text', NULL, NULL, NULL, 'WAL content', NULL);",
+        )
+        .unwrap();
+}
+
 type V1Event = (
     i64,
     i64,
@@ -176,6 +196,44 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
+fn opens_populated_wal_v1_as_v2_smoke() {
+    let directory = data_directory();
+    create_populated_wal_v1_fixture(&directory);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let database = store.database_path();
+    let connection = Connection::open(&database).unwrap();
+
+    assert!(directory.join("rust-sessions.db.v1.bak").exists());
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(
+        connection
+            .query_row("SELECT count(*) FROM completed_turns", [], |row| row
+                .get::<_, i64>(0))
+            .is_err()
+    );
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    drop(connection);
+    drop(store);
+
+    SessionStore::open(&directory).unwrap();
+    assert!(!directory.join("rust-sessions.db.v1.bak.1").exists());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
     let directory = data_directory();
     let database = directory.join("rust-sessions.db");
@@ -201,8 +259,8 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
         )
         .unwrap();
 
-    let store = SessionStore::open(&directory).unwrap();
-    let backup = store.create_verified_v1_backup().unwrap();
+    SessionStore::open(&directory).unwrap();
+    let backup = directory.join("rust-sessions.db.v1.bak");
     let manifest = fs::read_to_string(backup.with_extension("bak.manifest")).unwrap();
     let snapshot = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
@@ -259,19 +317,8 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
             ),
         ],
     };
-    assert_eq!(v1_contents(&writer), expected);
     assert_eq!(v1_contents(&snapshot), expected);
-    assert_eq!(manifest, exact_v1_manifest(&writer));
-    assert_eq!(
-        Connection::open(&database)
-            .unwrap()
-            .query_row("SELECT count(*) FROM completed_turn_events", [], |row| row
-                .get::<_, i64>(
-                0
-            ))
-            .unwrap(),
-        4
-    );
+    assert_eq!(manifest, exact_v1_manifest(&snapshot));
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -290,8 +337,8 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
     fs::write(directory.join("rust-sessions.db.v1.bak"), "existing").unwrap();
     fs::write(directory.join("rust-sessions.db.v1.bak.1.tmp"), "stale").unwrap();
 
-    let store = SessionStore::open(&directory).unwrap();
-    let backup = store.create_verified_v1_backup().unwrap();
+    SessionStore::open(&directory).unwrap();
+    let backup = directory.join("rust-sessions.db.v1.bak.2");
 
     assert_eq!(backup, directory.join("rust-sessions.db.v1.bak.2"));
     assert_eq!(
@@ -307,7 +354,7 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
 }
 
 #[test]
-fn creates_lists_and_loads_completed_turns_in_persisted_order() {
+fn migrates_persisted_completed_turns_to_a_non_resumable_archive_on_reopen() {
     let directory = data_directory();
     let first = completed_snapshot("first");
     let second = completed_snapshot("second");
@@ -330,11 +377,10 @@ fn creates_lists_and_loads_completed_turns_in_persisted_order() {
     assert_eq!(stored_turns[1].snapshot, second);
 
     let reopened = SessionStore::open(&directory).unwrap();
-    assert_eq!(
+    assert!(
         reopened
             .load_completed_turn_for_resume(stored_turns[1].id)
-            .unwrap(),
-        second
+            .is_err()
     );
 
     fs::remove_dir_all(directory).unwrap();
