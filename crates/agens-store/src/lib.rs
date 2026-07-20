@@ -1025,7 +1025,13 @@ impl SessionStore {
             })?;
         let turn_id = transaction.last_insert_rowid();
 
-        for (sequence, event) in snapshot.events().iter().enumerate() {
+        let persisted_events = snapshot
+            .events()
+            .iter()
+            .filter(|event| persistable_turn_event(event))
+            .collect::<Vec<_>>();
+
+        for (sequence, event) in persisted_events.iter().enumerate() {
             insert_legacy_turn_event(&transaction, turn_id, sequence as i64, event).map_err(
                 |error| {
                     SessionStoreError::operation(
@@ -1040,7 +1046,7 @@ impl SessionStore {
         transaction
             .execute(
                 "UPDATE legacy_turns SET source_event_count = ?1 WHERE id = ?2",
-                params![snapshot.events().len() as i64, turn_id],
+                params![persisted_events.len() as i64, turn_id],
             )
             .map_err(|error| {
                 SessionStoreError::operation("finalize completed turn", &self.database_path, error)
@@ -1831,7 +1837,14 @@ fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
         TurnEvent::ToolResult(_) => {
             unreachable!("completed snapshots reject non-result tool events")
         }
+        TurnEvent::Usage(_) => {
+            unreachable!("presentation usage events are excluded from completed history")
+        }
     }
+}
+
+fn persistable_turn_event(event: &TurnEvent) -> bool {
+    !matches!(event, TurnEvent::Usage(_))
 }
 
 fn decode_turn_event(fields: PersistedTurnEvent) -> Result<TurnEvent, &'static str> {
@@ -1962,6 +1975,7 @@ fn restrict_session_permissions(_: &Path, _: u32) -> Result<(), SessionStoreErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agens_core::Usage;
 
     fn create_v1_fixture(connection: &Connection) {
         connection
@@ -2014,5 +2028,74 @@ mod tests {
             .execute("UPDATE completed_turns SET id = 9 WHERE id = 8", [])
             .unwrap();
         assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_err());
+    }
+
+    #[test]
+    fn ignores_usage_events_when_converting_completed_history() {
+        let events = [
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("before usage".into())),
+            TurnEvent::Usage(Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(3),
+                total_tokens: Some(8),
+                context_window: Some(16),
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("after usage".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ];
+
+        let persisted_events = events
+            .iter()
+            .filter(|event| persistable_turn_event(event))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            persisted_events,
+            vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(MessagePart::Text("before usage".into())),
+                TurnEvent::ProviderPart(MessagePart::Text("after usage".into())),
+                TurnEvent::StateChanged(TurnState::Completed),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_completed_event_order_after_ignoring_multiple_usage_events() {
+        let events = [
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::Usage(Usage::default()),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("first".into())),
+            TurnEvent::Usage(Usage {
+                input_tokens: None,
+                output_tokens: Some(0),
+                total_tokens: None,
+                context_window: None,
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("second".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ];
+
+        let persisted_events = events
+            .iter()
+            .filter(|event| persistable_turn_event(event))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            persisted_events,
+            vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(MessagePart::Text("first".into())),
+                TurnEvent::ProviderPart(MessagePart::Text("second".into())),
+                TurnEvent::StateChanged(TurnState::Completed),
+            ]
+        );
     }
 }
