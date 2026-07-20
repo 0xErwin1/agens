@@ -1,5 +1,7 @@
 //! Typed, lossless source projection for one visible conversation turn.
 
+use agens_core::{Message, MessagePart, Role};
+
 /// A source event accepted by the conversation projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
@@ -87,6 +89,28 @@ pub enum ConversationError {
     OrphanToolResult(String),
     DuplicateToolCall(String),
     DuplicateToolResult(String),
+    InvalidMessageOrder,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ConversationItem {
+    Info(String),
+    User(String),
+    Assistant(String),
+    Reasoning(String),
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: String,
+        batch: Option<usize>,
+    },
+    ToolResult {
+        call_id: String,
+        output: String,
+        is_error: bool,
+    },
+    Diff(Vec<DiffLine>),
+    Error(ActionableError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,13 +123,19 @@ pub struct Conversation {
     pub tool_batches: Vec<ToolBatch>,
     pub diffs: Vec<DiffLine>,
     pub errors: Vec<ActionableError>,
+    pub(super) items: Vec<ConversationItem>,
     last_was_tool_call: bool,
 }
 
 impl Conversation {
     pub fn new(user: impl Into<String>) -> Self {
+        let user = user.into();
         Self {
-            user: user.into(),
+            items: (!user.is_empty())
+                .then(|| ConversationItem::User(user.clone()))
+                .into_iter()
+                .collect(),
+            user,
             info: Vec::new(),
             live_markdown: String::new(),
             final_markdown: None,
@@ -116,14 +146,118 @@ impl Conversation {
             last_was_tool_call: false,
         }
     }
-
+    pub fn from_messages(messages: &[Message]) -> Result<Vec<Self>, ConversationError> {
+        let mut conversations = Vec::new();
+        let mut current: Option<Self> = None;
+        let mut pending_system = Vec::new();
+        for message in messages {
+            match message.role {
+                Role::System => {
+                    if let Some(conversation) = current.take() {
+                        conversations.push(conversation);
+                    }
+                    for part in &message.parts {
+                        let MessagePart::Text(text) = part else {
+                            return Err(ConversationError::InvalidMessageOrder);
+                        };
+                        pending_system.push(text.clone());
+                    }
+                }
+                Role::User => {
+                    if let Some(conversation) = current.take() {
+                        conversations.push(conversation);
+                    }
+                    let mut conversation = Self::new(String::new());
+                    for message in pending_system.drain(..) {
+                        conversation.apply(ConversationEvent::Info(message))?;
+                    }
+                    for part in &message.parts {
+                        let MessagePart::Text(text) = part else {
+                            return Err(ConversationError::InvalidMessageOrder);
+                        };
+                        conversation.user.push_str(text);
+                        let item = ConversationItem::User(text.clone());
+                        conversation.items.push(item);
+                    }
+                    current = Some(conversation);
+                }
+                Role::Assistant => {
+                    let conversation = current
+                        .as_mut()
+                        .ok_or(ConversationError::InvalidMessageOrder)?;
+                    for part in &message.parts {
+                        let event = match part {
+                            MessagePart::Text(text) => {
+                                ConversationEvent::MarkdownDelta(text.clone())
+                            }
+                            MessagePart::Reasoning(text) => {
+                                ConversationEvent::ReasoningDelta(text.clone())
+                            }
+                            MessagePart::ToolCall { id, name, input } => {
+                                ConversationEvent::ToolCall {
+                                    call_id: id.clone(),
+                                    name: name.clone(),
+                                    input: input.clone(),
+                                }
+                            }
+                            MessagePart::ToolResult { .. } => {
+                                return Err(ConversationError::InvalidMessageOrder);
+                            }
+                        };
+                        conversation.apply(event)?;
+                    }
+                }
+                Role::Tool => {
+                    let conversation = current
+                        .as_mut()
+                        .ok_or(ConversationError::InvalidMessageOrder)?;
+                    for part in &message.parts {
+                        let MessagePart::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error,
+                        } = part
+                        else {
+                            return Err(ConversationError::InvalidMessageOrder);
+                        };
+                        conversation.apply(ConversationEvent::ToolResult {
+                            call_id: tool_call_id.clone(),
+                            output: content.clone(),
+                            is_error: *is_error,
+                        })?;
+                    }
+                }
+            }
+        }
+        if !pending_system.is_empty() {
+            return Err(ConversationError::InvalidMessageOrder);
+        }
+        if let Some(conversation) = current {
+            conversations.push(conversation);
+        }
+        Ok(conversations)
+    }
     pub fn apply(&mut self, event: ConversationEvent) -> Result<(), ConversationError> {
         let is_tool_call = matches!(&event, ConversationEvent::ToolCall { .. });
         match event {
-            ConversationEvent::Info(message) => self.info.push(message),
-            ConversationEvent::MarkdownDelta(delta) => self.live_markdown.push_str(&delta),
-            ConversationEvent::MarkdownFinal(markdown) => self.final_markdown = Some(markdown),
-            ConversationEvent::ReasoningDelta(delta) => self.reasoning.push_str(&delta),
+            ConversationEvent::Info(message) => {
+                self.info.push(message.clone());
+                self.items.push(ConversationItem::Info(message));
+            }
+            ConversationEvent::MarkdownDelta(delta) => {
+                self.live_markdown.push_str(&delta);
+                push_text_item(&mut self.items, delta, false);
+            }
+            ConversationEvent::MarkdownFinal(markdown) => {
+                self.final_markdown = Some(markdown.clone());
+                self.items
+                    .retain(|item| !matches!(item, ConversationItem::Assistant(_)));
+                self.items.push(ConversationItem::Assistant(markdown));
+            }
+            ConversationEvent::ReasoningDelta(delta) => {
+                self.reasoning.push_str(&delta);
+                push_text_item(&mut self.items, delta, true);
+            }
             ConversationEvent::ToolCall {
                 call_id,
                 name,
@@ -132,19 +266,28 @@ impl Conversation {
                 if self.find_call(&call_id).is_some() {
                     return Err(ConversationError::DuplicateToolCall(call_id));
                 }
-                if !self.last_was_tool_call {
+                let batch = if !self.last_was_tool_call {
                     self.tool_batches.push(ToolBatch::default());
-                }
+                    Some(self.tool_batches.len())
+                } else {
+                    None
+                };
                 self.tool_batches
                     .last_mut()
                     .expect("tool batch was created")
                     .calls
                     .push(ToolCall {
-                        call_id,
-                        name,
-                        input,
+                        call_id: call_id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
                         result: None,
                     });
+                self.items.push(ConversationItem::ToolCall {
+                    call_id,
+                    name,
+                    input,
+                    batch,
+                });
             }
             ConversationEvent::ToolResult {
                 call_id,
@@ -157,17 +300,29 @@ impl Conversation {
                 if call.result.is_some() {
                     return Err(ConversationError::DuplicateToolResult(call_id));
                 }
-                call.result = Some(ToolResult { output, is_error });
+                call.result = Some(ToolResult {
+                    output: output.clone(),
+                    is_error,
+                });
+                self.items.push(ConversationItem::ToolResult {
+                    call_id,
+                    output,
+                    is_error,
+                });
             }
-            ConversationEvent::Diff(lines) => self.diffs.extend(lines),
-            ConversationEvent::Error { message, action } => self
-                .errors
-                .push(ActionableError::sanitized(message, action)),
+            ConversationEvent::Diff(lines) => {
+                self.diffs.extend(lines.clone());
+                self.items.push(ConversationItem::Diff(lines));
+            }
+            ConversationEvent::Error { message, action } => {
+                let error = ActionableError::sanitized(message, action);
+                self.errors.push(error.clone());
+                self.items.push(ConversationItem::Error(error));
+            }
         }
         self.last_was_tool_call = is_tool_call;
         Ok(())
     }
-
     fn find_call(&self, call_id: &str) -> Option<&ToolCall> {
         self.tool_batches
             .iter()
@@ -180,6 +335,14 @@ impl Conversation {
             .iter_mut()
             .flat_map(|batch| &mut batch.calls)
             .find(|call| call.call_id == call_id)
+    }
+}
+fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {
+    match (items.last_mut(), reasoning) {
+        (Some(ConversationItem::Reasoning(current)), true)
+        | (Some(ConversationItem::Assistant(current)), false) => current.push_str(&text),
+        (_, true) => items.push(ConversationItem::Reasoning(text)),
+        (_, false) => items.push(ConversationItem::Assistant(text)),
     }
 }
 

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use agens_core::{MessagePart, TurnEvent, Usage};
+use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
@@ -257,7 +257,7 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
         "first-result-sentinel",
         "first-answer-sentinel",
     ] {
-        assert!(history.contains(expected), "missing {expected:?} in {history:?}");
+        assert!(history.contains(expected), "missing {expected:?}");
     }
 
     tui.handle(Event::Key(Key::CtrlO));
@@ -268,6 +268,50 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
         collapsed.push_str(&rendered_text(&renderer));
     }
     assert!(collapsed.contains("output collapsed"));
+}
+
+#[test]
+fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 50)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    let message = |role, parts| Message { role, parts };
+    let text = |value: &str| vec![MessagePart::Text(value.into())];
+    let messages = vec![
+        message(Role::User, text("first user")),
+        message(
+            Role::Assistant,
+            vec![
+                MessagePart::Reasoning("first reasoning".into()),
+                MessagePart::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    input: "{}".into(),
+                },
+                MessagePart::Text("first answer".into()),
+            ],
+        ),
+        message(
+            Role::Tool,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "c1".into(),
+                content: "first result".into(),
+                is_error: false,
+            }],
+        ),
+        message(Role::System, text("persisted reminder")),
+        message(Role::User, text("second user")),
+        message(Role::Assistant, text("second answer")),
+    ];
+    tui.replace_history(&messages).unwrap();
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    let order = "first user|first reasoning|c1 read|first answer|first result|persisted reminder|second user|second answer";
+    let mut offset = 0;
+    for expected in order.split('|') {
+        let position = text[offset..].find(expected).expect(expected);
+        offset += position + expected.len();
+    }
 }
 
 #[test]

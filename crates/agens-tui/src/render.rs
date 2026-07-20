@@ -9,6 +9,7 @@ use ratatui::{
 
 use std::collections::BTreeSet;
 
+use crate::conversation::ConversationItem;
 use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 pub(super) fn conversation_lines(
@@ -18,48 +19,48 @@ pub(super) fn conversation_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    line(&mut lines, "USER", Color::Green, &conversation.user);
-    for info in &conversation.info {
-        line(&mut lines, "INFO", Color::Yellow, info);
-    }
-    markdown_lines(
-        &mut lines,
-        "ASSISTANT",
-        conversation
-            .final_markdown
-            .as_deref()
-            .unwrap_or(&conversation.live_markdown),
-    );
-    markdown_lines(&mut lines, "THINKING", &conversation.reasoning);
-
-    for (batch_index, batch) in conversation.tool_batches.iter().enumerate() {
-        line(
-            &mut lines,
-            "TOOLS",
-            Color::Magenta,
-            format!("batch {}", batch_index + 1),
-        );
-        for call in &batch.calls {
-            line(
-                &mut lines,
-                "TOOLS",
-                Color::Magenta,
-                format!("{} {}\n  input: {}", call.call_id, call.name, call.input),
-            );
-            if let Some(result) = &call.result {
-                let (result_state, duration) = tool_state(events, &call.call_id, result.is_error);
+    for item in &conversation.items {
+        match item {
+            ConversationItem::Info(text) => line(&mut lines, "INFO", Color::Yellow, text),
+            ConversationItem::User(text) => line(&mut lines, "USER", Color::Green, text),
+            ConversationItem::Assistant(text) => {
+                markdown_lines(&mut lines, "ASSISTANT", text);
+            }
+            ConversationItem::Reasoning(text) => markdown_lines(&mut lines, "THINKING", text),
+            ConversationItem::ToolCall {
+                call_id,
+                name,
+                input,
+                batch,
+            } => {
+                if let Some(batch) = batch {
+                    line(
+                        &mut lines,
+                        "TOOLS",
+                        Color::Magenta,
+                        format!("batch {batch}"),
+                    );
+                }
+                line(
+                    &mut lines,
+                    "TOOLS",
+                    Color::Magenta,
+                    format!("{call_id} {name}\n  input: {input}"),
+                );
+            }
+            ConversationItem::ToolResult {
+                call_id,
+                output,
+                is_error,
+            } => {
+                let (result_state, duration) = tool_state(events, call_id, *is_error);
                 line(
                     &mut lines,
                     "TOOLS",
                     result_color(result_state),
-                    format!(
-                        "{} {:?}{}",
-                        call.call_id,
-                        result_state,
-                        duration_label(duration)
-                    ),
+                    format!("{call_id} {result_state:?}{}", duration_label(duration)),
                 );
-                if collapsed_tool_outputs.contains(&call.call_id) {
+                if collapsed_tool_outputs.contains(call_id) {
                     line(
                         &mut lines,
                         "TOOLS",
@@ -67,23 +68,24 @@ pub(super) fn conversation_lines(
                         "output collapsed; expand to recover",
                     );
                 } else {
-                    markdown_lines(&mut lines, "OUTPUT", &result.output);
+                    markdown_lines(&mut lines, "OUTPUT", output);
                 }
             }
+            ConversationItem::Diff(diff) => {
+                for change in diff {
+                    diff_line(&mut lines, change.number, change.kind, &change.text);
+                }
+            }
+            ConversationItem::Error(error) => {
+                line(&mut lines, "ERROR", Color::Red, &error.message);
+                line(
+                    &mut lines,
+                    "ACTION",
+                    Color::Yellow,
+                    format!("Action: {}", error.action),
+                );
+            }
         }
-    }
-
-    for change in &conversation.diffs {
-        diff_line(&mut lines, change.number, change.kind, &change.text);
-    }
-    for error in &conversation.errors {
-        line(&mut lines, "ERROR", Color::Red, &error.message);
-        line(
-            &mut lines,
-            "ACTION",
-            Color::Yellow,
-            format!("Action: {}", error.action),
-        );
     }
     lines
 }

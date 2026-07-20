@@ -1188,7 +1188,15 @@ where
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) {
         match outcome {
             TuiProviderOutcome::Completed(output) => {
-                self.project_conversation(ConversationEvent::MarkdownFinal(output.clone()));
+                if self
+                    .conversation
+                    .as_ref()
+                    .is_some_and(|conversation| conversation.live_markdown.is_empty())
+                {
+                    self.project_conversation(ConversationEvent::MarkdownFinal(output.clone()));
+                } else if let Some(conversation) = self.conversation.as_mut() {
+                    conversation.final_markdown = Some(output.clone());
+                }
                 if !matches!(self.transcript.last(), Some(TranscriptEntry::Assistant(_))) {
                     self.transcript.push(TranscriptEntry::Assistant(output));
                 }
@@ -1216,6 +1224,24 @@ where
         self.conversation = None;
         self.collapsed_tool_outputs.clear();
         self.set_running(false);
+    }
+
+    pub fn replace_history(
+        &mut self,
+        messages: &[agens_core::Message],
+    ) -> Result<(), ConversationError> {
+        let conversations = Conversation::from_messages(messages)?;
+        self.transcript.clear();
+        self.completed_conversations = conversations;
+        self.conversation = None;
+        self.collapsed_tool_outputs.clear();
+        self.runtime_events.clear();
+        self.turn_duration = None;
+        self.latest_usage = None;
+        self.following_bottom = true;
+        self.scroll_offset = 0;
+        self.set_running(false);
+        Ok(())
     }
 
     /// Returns the visible conversation for composition and focused tests.
