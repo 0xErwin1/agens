@@ -2,7 +2,8 @@ use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PublishOutcome,
-    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
+    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome,
+    TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -496,6 +497,116 @@ fn normal_input_submits_the_composed_prompt() {
         Action::Submit("hi".into())
     );
     assert_eq!(tui.input(), "");
+}
+
+#[test]
+fn typed_submission_outcomes_start_only_explicit_provider_turns() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "/unknown".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    let Action::Submit(input) = tui.handle(Event::Key(Key::Enter)) else {
+        panic!("Enter should submit through the production action boundary");
+    };
+
+    assert_eq!(
+        tui.apply_submission_outcome(TuiSubmissionOutcome::LocalActionableError {
+            message: "Unknown command `/unknown`.".into(),
+            action: "Run /sessions to list the available local commands.".into(),
+        }),
+        None
+    );
+    assert_eq!(input, "/unknown");
+    assert_eq!(
+        tui.transcript(),
+        [TranscriptEntry::Error("Unknown command `/unknown`.".into())]
+    );
+    assert!(!tui.view().running);
+    assert_eq!(tui.view().conversation.unwrap().user, "");
+
+    assert_eq!(
+        tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+            prompt: "provider prompt".into(),
+        }),
+        Some("provider prompt".into())
+    );
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.transcript().last(),
+        Some(&TranscriptEntry::User("provider prompt".into()))
+    );
+}
+
+#[test]
+fn typed_reset_and_context_outcomes_update_visible_state_after_success() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("old prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("old answer".into())));
+
+    assert_eq!(
+        tui.apply_submission_outcome(TuiSubmissionOutcome::ResetSucceeded {
+            message: "Started a new session.".into(),
+            presentation: TuiPresentation::new("openai-api", "gpt-4.1", "new session"),
+        }),
+        None
+    );
+    assert_eq!(
+        tui.transcript(),
+        [TranscriptEntry::Info("Started a new session.".into())]
+    );
+    assert_eq!(tui.view().session, "new session");
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::ContextChanged {
+        message: "Resumed session 42.".into(),
+        presentation: TuiPresentation::new("openai-api", "o3", "session #42"),
+    });
+    assert_eq!(tui.view().provider_model, "openai-api / o3");
+    assert_eq!(tui.view().session, "session #42");
+    assert_eq!(
+        tui.transcript().last(),
+        Some(&TranscriptEntry::Info("Resumed session 42.".into()))
+    );
+}
+
+#[test]
+fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
+    let mut success = Tui::new(FakeEngine::default());
+    success.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        prompt: "request".into(),
+    });
+    success.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+    success.finish_provider_turn(TuiProviderOutcome::Completed("answer".into()));
+
+    assert_eq!(
+        success.transcript(),
+        [
+            TranscriptEntry::User("request".into()),
+            TranscriptEntry::Assistant("answer".into()),
+        ]
+    );
+    assert!(success.view().conversation.unwrap().errors.is_empty());
+
+    let mut failure = Tui::new(FakeEngine::default());
+    failure.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        prompt: "request".into(),
+    });
+    failure.finish_provider_turn(TuiProviderOutcome::Failed {
+        message: "provider: token=SENTINEL".into(),
+        action: "Check provider credentials and retry.".into(),
+    });
+
+    assert_eq!(
+        failure.transcript(),
+        [
+            TranscriptEntry::User("request".into()),
+            TranscriptEntry::Error("[redacted]".into()),
+        ]
+    );
+    let view = failure.view();
+    assert_eq!(view.turn_state, Some(TurnState::Failed));
+    assert_eq!(view.conversation.unwrap().errors.len(), 1);
+    assert_eq!(view.conversation.unwrap().errors[0].message, "[redacted]");
+    assert!(view.conversation.unwrap().final_markdown.is_none());
 }
 
 #[test]

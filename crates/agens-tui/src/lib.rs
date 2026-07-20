@@ -97,6 +97,54 @@ pub enum Action {
     Quit,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiPresentation {
+    provider: String,
+    model: String,
+    session: String,
+}
+
+impl TuiPresentation {
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        session: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            session: session.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiSubmissionOutcome {
+    ProviderTurn {
+        prompt: String,
+    },
+    LocalInfo(String),
+    LocalActionableError {
+        message: String,
+        action: String,
+    },
+    ResetSucceeded {
+        message: String,
+        presentation: TuiPresentation,
+    },
+    ContextChanged {
+        message: String,
+        presentation: TuiPresentation,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiProviderOutcome {
+    Completed(String),
+    Failed { message: String, action: String },
+    Cancelled { message: String, action: String },
+}
+
 /// A visible conversation entry in chronological order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptEntry {
@@ -679,25 +727,79 @@ where
 
     /// Records a completed runtime result without exposing provider internals.
     pub fn finish_submission(&mut self, result: Result<String, String>) {
-        let conversation_event = match &result {
-            Ok(output) => ConversationEvent::MarkdownFinal(output.clone()),
-            Err(error) => ConversationEvent::Error {
-                message: error.clone(),
+        let outcome = match result {
+            Ok(output) => TuiProviderOutcome::Completed(output),
+            Err(message) => TuiProviderOutcome::Failed {
+                message,
                 action: "Retry the request or inspect the runtime error.".into(),
             },
         };
-        self.project_conversation(conversation_event);
-        let entry = match result {
-            Ok(output) => TranscriptEntry::Assistant(output),
-            Err(error) => TranscriptEntry::Error(error),
-        };
-        self.transcript.push(entry);
-        self.set_running(false);
+        self.finish_provider_turn(outcome);
     }
 
     /// Adds a local session or lifecycle note to the visible conversation.
     pub fn add_info(&mut self, text: impl Into<String>) {
-        self.transcript.push(TranscriptEntry::Info(text.into()));
+        let text = text.into();
+        self.transcript.push(TranscriptEntry::Info(text.clone()));
+        self.project_conversation(ConversationEvent::Info(text));
+    }
+
+    pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
+        match outcome {
+            TuiSubmissionOutcome::ProviderTurn { prompt } => {
+                self.begin_submission(prompt.clone());
+                Some(prompt)
+            }
+            TuiSubmissionOutcome::LocalInfo(message) => {
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::LocalActionableError { message, action } => {
+                self.add_error(message, action);
+                None
+            }
+            TuiSubmissionOutcome::ResetSucceeded {
+                message,
+                presentation,
+            } => {
+                self.clear_transcript();
+                self.apply_presentation(presentation);
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::ContextChanged {
+                message,
+                presentation,
+            } => {
+                self.apply_presentation(presentation);
+                self.add_info(message);
+                None
+            }
+        }
+    }
+
+    pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) {
+        match outcome {
+            TuiProviderOutcome::Completed(output) => {
+                self.project_conversation(ConversationEvent::MarkdownFinal(output.clone()));
+                if !matches!(self.transcript.last(), Some(TranscriptEntry::Assistant(_))) {
+                    self.transcript.push(TranscriptEntry::Assistant(output));
+                }
+                self.set_running(false);
+            }
+            TuiProviderOutcome::Failed { message, action } => {
+                self.running = false;
+                self.turn_state = Some(TurnState::Failed);
+                self.active_tool = None;
+                self.add_error(message, action);
+            }
+            TuiProviderOutcome::Cancelled { message, action } => {
+                self.running = false;
+                self.turn_state = Some(TurnState::Cancelled);
+                self.active_tool = None;
+                self.add_error(message, action);
+            }
+        }
     }
 
     /// Clears the current visible conversation for a new session.
@@ -978,6 +1080,24 @@ where
                     action: "Inspect the runtime error and retry the request.".into(),
                 });
         }
+    }
+
+    fn add_error(&mut self, message: String, action: String) {
+        self.project_conversation(ConversationEvent::Error { message, action });
+        let message = self
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.errors.last())
+            .map_or_else(|| "Runtime request failed.".into(), |error| error.message.clone());
+        self.transcript.push(TranscriptEntry::Error(message));
+    }
+
+    fn apply_presentation(&mut self, presentation: TuiPresentation) {
+        self.set_presentation(
+            presentation.provider,
+            presentation.model,
+            presentation.session,
+        );
     }
 }
 

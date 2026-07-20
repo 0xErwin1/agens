@@ -3,6 +3,7 @@
 /// A source event accepted by the conversation projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
+    Info(String),
     MarkdownDelta(String),
     MarkdownFinal(String),
     ReasoningDelta(String),
@@ -91,6 +92,7 @@ pub enum ConversationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     pub user: String,
+    pub info: Vec<String>,
     pub live_markdown: String,
     pub final_markdown: Option<String>,
     pub reasoning: String,
@@ -104,6 +106,7 @@ impl Conversation {
     pub fn new(user: impl Into<String>) -> Self {
         Self {
             user: user.into(),
+            info: Vec::new(),
             live_markdown: String::new(),
             final_markdown: None,
             reasoning: String::new(),
@@ -117,6 +120,7 @@ impl Conversation {
     pub fn apply(&mut self, event: ConversationEvent) -> Result<(), ConversationError> {
         let is_tool_call = matches!(&event, ConversationEvent::ToolCall { .. });
         match event {
+            ConversationEvent::Info(message) => self.info.push(message),
             ConversationEvent::MarkdownDelta(delta) => self.live_markdown.push_str(&delta),
             ConversationEvent::MarkdownFinal(markdown) => self.final_markdown = Some(markdown),
             ConversationEvent::ReasoningDelta(delta) => self.reasoning.push_str(&delta),

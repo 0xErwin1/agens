@@ -19,6 +19,9 @@ pub(super) fn conversation_lines(
     let mut lines = Vec::new();
 
     line(&mut lines, "USER", Color::Green, &conversation.user);
+    for info in &conversation.info {
+        line(&mut lines, "INFO", Color::Yellow, info);
+    }
     markdown_lines(
         &mut lines,
         "ASSISTANT",
