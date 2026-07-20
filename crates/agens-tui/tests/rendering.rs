@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use agens_core::{MessagePart, TurnEvent, Usage};
 use agens_tui::{
-    ConversationEvent, DiffLine, DiffLineKind, Engine, Event, Key, RatatuiRenderer, Renderer,
-    ToolResultState, Tui, TuiRuntimeEvent,
+    ConversationEvent, DiffLine, DiffLineKind, Engine, Event, Key, PaletteEntry, PaletteEntryKind,
+    RatatuiRenderer, Renderer, ToolResultState, Tui, TuiRuntimeEvent,
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -258,6 +258,72 @@ fn renderer_clips_a_generic_dialog_inside_the_viewport() {
 
     assert!(text.contains("Details"), "{text:?}");
     assert!(text.contains("bounded dialog body"), "{text:?}");
+}
+
+#[test]
+fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation() {
+    let backend = TestBackend::new(34, 10);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.add_info("conversation sentinel");
+    tui.set_palette_entries(vec![
+        PaletteEntry::new(
+            "connect",
+            "Connect to ChatGPT",
+            "[--device-auth]",
+            PaletteEntryKind::BuiltIn,
+        ),
+        PaletteEntry::new(
+            "review",
+            "Review the patch",
+            "[scope]",
+            PaletteEntryKind::Command,
+        ),
+        PaletteEntry::new(
+            "resume",
+            "Resume a session",
+            "<id>",
+            PaletteEntryKind::BuiltIn,
+        ),
+    ]);
+
+    renderer.render(tui.view()).unwrap();
+    let composer_row_before = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .position(|cell| cell.symbol() == "C")
+        .unwrap()
+        / 34;
+
+    tui.handle(Event::Key(Key::Char('/')));
+    tui.handle(Event::Key(Key::Char('r')));
+    renderer.render(tui.view()).unwrap();
+    let palette = rendered_text(&renderer);
+
+    assert!(palette.contains("commands"), "{palette:?}");
+    assert!(palette.contains("/review"), "{palette:?}");
+    assert!(palette.contains("/resume"), "{palette:?}");
+    assert!(!palette.contains("/connect"), "{palette:?}");
+    let composer_row_after = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .position(|cell| cell.symbol() == "C")
+        .unwrap()
+        / 34;
+    assert_eq!(composer_row_after, composer_row_before);
+
+    tui.handle(Event::Key(Key::Escape));
+    renderer.render(tui.view()).unwrap();
+    assert!(tui.transcript().iter().any(
+        |entry| matches!(entry, agens_tui::TranscriptEntry::Info(text) if text == "conversation sentinel")
+    ));
 }
 
 #[test]

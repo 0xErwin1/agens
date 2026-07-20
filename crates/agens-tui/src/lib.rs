@@ -42,7 +42,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
@@ -82,6 +82,9 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    Up,
+    Down,
+    Tab,
 }
 
 /// The result of handling a single terminal event.
@@ -209,6 +212,71 @@ pub struct ViewState<'a> {
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
+    /// Slash palette metadata and current filtered selection.
+    pub palette: Option<PaletteView<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaletteEntryKind {
+    BuiltIn,
+    Command,
+    Skill,
+}
+
+impl PaletteEntryKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built-in",
+            Self::Command => "command",
+            Self::Skill => "skill",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaletteEntry {
+    name: String,
+    description: String,
+    argument_hint: String,
+    kind: PaletteEntryKind,
+}
+
+impl PaletteEntry {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        argument_hint: impl Into<String>,
+        kind: PaletteEntryKind,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            argument_hint: argument_hint.into(),
+            kind,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub fn argument_hint(&self) -> &str {
+        &self.argument_hint
+    }
+
+    pub const fn kind(&self) -> PaletteEntryKind {
+        self.kind
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PaletteView<'a> {
+    entries: &'a [PaletteEntry],
+    selected: usize,
 }
 
 /// Generic bounded dialog state for interactive surfaces that are introduced later.
@@ -351,6 +419,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_dialog(frame, area, dialog);
     }
 
+    if let Some(palette) = state.palette {
+        render_palette(frame, area, layout.composer, state.input, palette);
+    }
+
     let (line, column) = cursor_position(state.input, state.input_cursor);
     let cursor_y = layout
         .composer
@@ -365,6 +437,66 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if cursor_y < layout.composer.bottom() && cursor_x < layout.composer.right() {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn render_palette(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    composer: Rect,
+    input: &str,
+    palette: PaletteView<'_>,
+) {
+    let matches = palette_matches(palette.entries, input);
+    let content_rows = matches.len().max(1).min(6) as u16;
+    let height = content_rows.saturating_add(2).min(composer.y);
+    if height < 3 || area.width == 0 {
+        return;
+    }
+    let palette_area = Rect::new(area.x, composer.y - height, area.width, height);
+    let items = if matches.is_empty() {
+        vec![ListItem::new(" No matching commands")]
+    } else {
+        matches
+            .iter()
+            .map(|entry| {
+                ListItem::new(format!(
+                    " /{} {}  {}  [{}]",
+                    entry.name,
+                    entry.argument_hint,
+                    entry.description,
+                    entry.kind.label()
+                ))
+            })
+            .collect()
+    };
+    let mut state = ListState::default().with_selected(
+        (!matches.is_empty()).then_some(palette.selected.min(matches.len().saturating_sub(1))),
+    );
+
+    frame.render_widget(Clear, palette_area);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(Span::styled(
+                        " commands ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        palette_area,
+        &mut state,
+    );
 }
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
@@ -672,6 +804,9 @@ pub struct Tui<E> {
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
     dialog: Option<DialogView>,
+    palette_entries: Vec<PaletteEntry>,
+    palette_open: bool,
+    palette_selected: usize,
 }
 
 impl<E> Tui<E>
@@ -700,6 +835,9 @@ where
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
             dialog: None,
+            palette_entries: Vec::new(),
+            palette_open: false,
+            palette_selected: 0,
         }
     }
 
@@ -709,6 +847,7 @@ where
             Event::Resize { width, height } => {
                 self.size = (width, height);
                 self.quit_armed = false;
+                self.clamp_palette_selection();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
@@ -730,10 +869,16 @@ where
         &mut self.engine
     }
 
+    pub fn set_palette_entries(&mut self, entries: Vec<PaletteEntry>) {
+        self.palette_entries = entries;
+        self.clamp_palette_selection();
+    }
+
     /// Updates active-turn state after the composition layer starts or finishes a turn.
     pub fn set_running(&mut self, running: bool) {
         self.running = running;
         if running {
+            self.palette_open = false;
             self.quit_armed = false;
             self.turn_state = Some(TurnState::Requesting);
         } else if !matches!(
@@ -758,6 +903,7 @@ where
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
+        self.palette_open = false;
         let prompt = prompt.into();
         self.runtime_events.clear();
         self.turn_duration = None;
@@ -769,6 +915,7 @@ where
     }
 
     pub fn begin_route(&mut self) {
+        self.palette_open = false;
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
@@ -819,6 +966,7 @@ where
     }
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
+        self.palette_open = false;
         self.dialog = None;
         match outcome {
             TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
@@ -955,6 +1103,10 @@ where
             conversation: self.conversation.as_ref(),
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
             dialog: self.dialog.as_ref(),
+            palette: self.palette_open.then_some(PaletteView {
+                entries: &self.palette_entries,
+                selected: self.palette_selected,
+            }),
         }
     }
 
@@ -1042,6 +1194,11 @@ where
             Key::Char(character) => {
                 self.input.insert(self.input_cursor, character);
                 self.input_cursor += character.len_utf8();
+                if !self.running && self.input == "/" {
+                    self.palette_open = true;
+                    self.palette_selected = 0;
+                }
+                self.clamp_palette_selection();
                 Action::Render
             }
             Key::Backspace => {
@@ -1049,6 +1206,7 @@ where
                     self.input_cursor = previous.0;
                     self.input.remove(self.input_cursor);
                 }
+                self.clamp_palette_selection();
                 Action::Render
             }
             Key::ShiftEnter => {
@@ -1098,6 +1256,25 @@ where
                 }
                 Action::Render
             }
+            Key::Up if self.palette_open => {
+                let count = palette_matches(&self.palette_entries, &self.input).len();
+                if count > 0 {
+                    self.palette_selected = (self.palette_selected + count - 1) % count;
+                }
+                Action::Render
+            }
+            Key::Down if self.palette_open => {
+                let count = palette_matches(&self.palette_entries, &self.input).len();
+                if count > 0 {
+                    self.palette_selected = (self.palette_selected + 1) % count;
+                }
+                Action::Render
+            }
+            Key::Tab if self.palette_open => {
+                self.complete_palette_selection();
+                Action::Render
+            }
+            Key::Up | Key::Down | Key::Tab => Action::Render,
             Key::Enter if self.input.is_empty() => Action::Render,
             Key::Enter if self.running => {
                 self.transcript.push(TranscriptEntry::Info(
@@ -1106,8 +1283,16 @@ where
                 Action::Render
             }
             Key::Enter => {
+                if self.palette_open {
+                    self.complete_palette_selection();
+                }
+                self.palette_open = false;
                 self.input_cursor = 0;
                 Action::Submit(std::mem::take(&mut self.input))
+            }
+            Key::Escape if self.palette_open => {
+                self.palette_open = false;
+                Action::Render
             }
             Key::Escape if self.running => self.cancel_running(),
             Key::Escape => Action::Render,
@@ -1115,6 +1300,7 @@ where
             Key::CtrlC if !self.input.is_empty() => {
                 self.input.clear();
                 self.input_cursor = 0;
+                self.palette_open = false;
                 Action::Render
             }
             Key::CtrlC if self.quit_armed => Action::Quit,
@@ -1126,10 +1312,41 @@ where
     }
 
     fn cancel_running(&mut self) -> Action {
+        self.palette_open = false;
         self.engine.cancel();
         self.quit_armed = false;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
+    }
+
+    fn clamp_palette_selection(&mut self) {
+        if !self.palette_open {
+            return;
+        }
+        if !self.input.starts_with('/') {
+            self.palette_open = false;
+            return;
+        }
+        let count = palette_matches(&self.palette_entries, &self.input).len();
+        self.palette_selected = self.palette_selected.min(count.saturating_sub(1));
+    }
+
+    fn complete_palette_selection(&mut self) {
+        let matches = palette_matches(&self.palette_entries, &self.input);
+        let Some(entry) = matches.get(self.palette_selected) else {
+            return;
+        };
+        let invocation = self.input.strip_prefix('/').unwrap_or(&self.input);
+        let arguments = invocation
+            .find(char::is_whitespace)
+            .map_or("", |index| invocation[index..].trim());
+        self.input = if arguments.is_empty() {
+            format!("/{} ", entry.name)
+        } else {
+            format!("/{} {arguments}", entry.name)
+        };
+        self.input_cursor = self.input.len();
+        self.palette_selected = 0;
     }
 
     fn toggle_tool_output_expansion(&mut self) {
@@ -1193,6 +1410,19 @@ where
             presentation.session,
         );
     }
+}
+
+fn palette_matches<'a>(entries: &'a [PaletteEntry], input: &str) -> Vec<&'a PaletteEntry> {
+    let prefix = input
+        .strip_prefix('/')
+        .unwrap_or_default()
+        .split(char::is_whitespace)
+        .next()
+        .unwrap_or_default();
+    entries
+        .iter()
+        .filter(|entry| entry.name.starts_with(prefix))
+        .collect()
 }
 
 fn bounded_auth_text(value: &str, limit: usize) -> String {
@@ -1475,6 +1705,9 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
         (KeyCode::End, _) => Key::End,
         (KeyCode::PageUp, _) => Key::PageUp,
         (KeyCode::PageDown, _) => Key::PageDown,
+        (KeyCode::Up, _) => Key::Up,
+        (KeyCode::Down, _) => Key::Down,
+        (KeyCode::Tab, _) => Key::Tab,
         (KeyCode::Esc, _) => Key::Escape,
         _ => return None,
     };

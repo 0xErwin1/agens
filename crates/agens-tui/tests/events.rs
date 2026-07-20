@@ -1,9 +1,9 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
-    ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PublishOutcome,
-    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome,
-    TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
+    ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PaletteEntry,
+    PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
+    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -497,6 +497,71 @@ fn normal_input_submits_the_composed_prompt() {
         Action::Submit("hi".into())
     );
     assert_eq!(tui.input(), "");
+}
+
+#[test]
+fn slash_palette_filters_navigates_completes_and_submits_through_the_composer() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_palette_entries(vec![
+        PaletteEntry::new(
+            "connect",
+            "Connect an account",
+            "",
+            PaletteEntryKind::BuiltIn,
+        ),
+        PaletteEntry::new(
+            "review",
+            "Review changes",
+            "[scope]",
+            PaletteEntryKind::Command,
+        ),
+        PaletteEntry::new(
+            "resume",
+            "Resume a session",
+            "<id>",
+            PaletteEntryKind::BuiltIn,
+        ),
+    ]);
+
+    assert_eq!(tui.handle(Event::Key(Key::Char('/'))), Action::Render);
+    assert!(tui.view().palette.is_some());
+
+    tui.handle(Event::Key(Key::Char('r')));
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.input(), "/resume ");
+    assert!(tui.view().palette.is_some());
+
+    tui.handle(Event::Key(Key::Char('4')));
+    tui.handle(Event::Key(Key::Char('2')));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("/resume 42".into())
+    );
+    assert!(tui.view().palette.is_none());
+}
+
+#[test]
+fn slash_palette_uses_only_the_name_prefix_and_escape_preserves_composer_and_backend() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_palette_entries(vec![
+        PaletteEntry::new("resume", "Resume", "<id>", PaletteEntryKind::BuiltIn),
+        PaletteEntry::new("review", "Review", "[scope]", PaletteEntryKind::Skill),
+    ]);
+    for character in "/res 42".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    assert!(tui.view().palette.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.input(), "/res 42");
+    assert!(tui.view().palette.is_none());
+    assert_eq!(tui.engine().cancellations, 0);
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
 }
 
 #[test]
