@@ -438,6 +438,7 @@ impl ChatGptResponsesProvider {
             ),
             client: reqwest::Client::builder()
                 .connect_timeout(request_timeout)
+                .timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
             tools,
@@ -563,29 +564,35 @@ impl ChatGptResponsesProvider {
         let account_id = required_credential_string(entry, "account_id")
             .map_err(|_| HeadlessTurnPortError::Authentication)?;
 
-        if account_id != self.account_id {
-            return Err(HeadlessTurnPortError::Authentication);
-        }
-
         if access_token != self.access_token
             && load_chatgpt_auth_state(&self.credentials_path, SystemTime::now())
                 .map_err(|_| HeadlessTurnPortError::Authentication)?
                 == ChatGptAuthState::Ready
         {
             self.access_token = access_token.to_owned();
+            self.account_id = account_id.to_owned();
             return stop_before_mapping(cancellation);
+        }
+
+        if account_id != self.account_id {
+            return Err(HeadlessTurnPortError::Authentication);
         }
 
         let refresh_token = required_credential_string(entry, "refresh_token")
             .map_err(|_| HeadlessTurnPortError::Authentication)?;
+        let form = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_id", CHATGPT_OAUTH_CLIENT_ID)
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", refresh_token)
+            .finish();
         let request = self
             .client
             .post(&self.oauth_url)
-            .json(&serde_json::json!({
-                "client_id": CHATGPT_OAUTH_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }))
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(form)
             .build()
             .map_err(|_| HeadlessTurnPortError::Provider)?;
         let response = tokio::select! {
@@ -631,6 +638,12 @@ impl ChatGptResponsesProvider {
             .filter(|value| !value.is_empty())
             .ok_or(HeadlessTurnPortError::Authentication)?;
         let expires_at = jwt_expiry(access_token)
+            .or_else(|| {
+                body.get("expires_in")
+                    .and_then(Value::as_u64)
+                    .filter(|seconds| *seconds > 0)
+                    .and_then(|seconds| SystemTime::now().checked_add(Duration::from_secs(seconds)))
+            })
             .map(timestamp_to_rfc3339)
             .ok_or(HeadlessTurnPortError::Authentication)?;
         let refresh_token = body

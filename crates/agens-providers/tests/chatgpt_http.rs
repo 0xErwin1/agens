@@ -328,14 +328,14 @@ fn subscription_transport_proactively_refreshes_before_the_responses_request() {
     let credentials = directory.join("auth.json");
     fs::write(
         &credentials,
-        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-old-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic old+refresh/&=","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
     )
     .expect("credentials should be written");
     let mut responses = LocalServer::start(ServerBehavior::Sse(completed_text_sse("refreshed")));
     let response_request = responses.take_observed_request();
     let oauth = OAuthServer::start(
         200,
-        r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"synthetic-rotated-refresh","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50X3JvdGF0ZWQifQ.signature"}"#,
+        r#"{"access_token":"opaque-access-token","refresh_token":"synthetic-rotated-refresh","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50X3JvdGF0ZWQifQ.signature","expires_in":3600}"#,
     );
     let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
         &credentials,
@@ -356,19 +356,19 @@ fn subscription_transport_proactively_refreshes_before_the_responses_request() {
     let oauth_request = oauth.join();
     assert_eq!(oauth_request.path, "/oauth/token");
     assert_eq!(
-        oauth_request.body,
-        json!({
-            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-            "grant_type": "refresh_token",
-            "refresh_token": "synthetic-old-refresh",
-        })
+        oauth_request.header("content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(
+        oauth_request.raw_body,
+        "client_id=app_EMoamEEZ73f0CkXaXp7hrann&grant_type=refresh_token&refresh_token=synthetic+old%2Brefresh%2F%26%3D"
     );
     let responses_request = response_request
         .recv_timeout(Duration::from_secs(1))
         .expect("responses request should be observed");
     assert_eq!(
         responses_request.header("authorization"),
-        Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
+        Some("Bearer opaque-access-token")
     );
     assert_eq!(
         responses_request.header("chatgpt-account-id"),
@@ -388,6 +388,18 @@ fn subscription_transport_proactively_refreshes_before_the_responses_request() {
         .expect("credentials should remain JSON")["openai-chatgpt"]["refresh_token"],
         "synthetic-rotated-refresh"
     );
+    let persisted = serde_json::from_slice::<Value>(
+        &fs::read(&credentials).expect("credentials should persist"),
+    )
+    .expect("credentials should remain JSON");
+    let expires_at = time::OffsetDateTime::parse(
+        persisted["openai-chatgpt"]["expires_at"]
+            .as_str()
+            .expect("expiry should be persisted"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .expect("expiry should remain RFC 3339");
+    assert!(expires_at > time::OffsetDateTime::now_utc() + time::Duration::minutes(55));
 
     responses.join();
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
@@ -426,7 +438,7 @@ fn subscription_transport_refreshes_once_after_401_then_retries_responses_once()
     assert_eq!(requests[0].path, "/backend-api/codex/responses");
     assert_eq!(requests[1].path, "/oauth/token");
     assert_eq!(requests[2].path, "/backend-api/codex/responses");
-    assert_eq!(requests[1].body["refresh_token"], "synthetic-refresh");
+    assert!(requests[1].raw_body.contains("refresh_token=synthetic-refresh"));
     assert_eq!(
         requests[2].header("authorization"),
         Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
@@ -628,7 +640,7 @@ fn concurrent_subscription_providers_coalesce_one_proactive_refresh() {
     let server = ScriptedServer::start(vec![
         ScriptedResponse::Json(
             200,
-            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
+            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","id_token":"eyJhbGciOiJSUzI1NiJ9.eyJjaGF0Z3B0X2FjY291bnRfaWQiOiJhY2NvdW50X3JvdGF0ZWQifQ.signature"}"#.to_owned(),
         ),
         ScriptedResponse::Sse(completed_text_sse("one")),
         ScriptedResponse::Sse(completed_text_sse("two")),
@@ -672,6 +684,12 @@ fn concurrent_subscription_providers_coalesce_one_proactive_refresh() {
             .filter(|request| request.path == "/oauth/token")
             .count(),
         1
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/backend-api/codex/responses")
+            .all(|request| request.header("chatgpt-account-id") == Some("account_rotated"))
     );
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
@@ -953,6 +971,34 @@ fn subscription_transport_times_out_while_waiting_for_refresh() {
     request
         .recv_timeout(Duration::from_secs(1))
         .expect("refresh request should be observed");
+    oauth.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_refresh_honors_the_provider_request_timeout() {
+    let directory = temporary_directory("refresh-request-timeout");
+    let credentials = write_expired_credentials(&directory);
+    let oauth = LocalServer::start(ServerBehavior::WaitForClientClose);
+    let oauth_url = format!("http://{}/oauth/token", oauth.address);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some("http://127.0.0.1:1/backend-api/codex"),
+        Some(&oauth_url),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_millis(25),
+    )
+    .expect("provider should be configured");
+
+    let started = Instant::now();
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::Provider)
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+
     oauth.join();
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
@@ -2056,6 +2102,7 @@ struct ObservedRequest {
     path: String,
     headers: Vec<(String, String)>,
     body: Value,
+    raw_body: String,
 }
 
 impl ObservedRequest {
@@ -2335,7 +2382,8 @@ fn read_request(stream: &TcpStream) -> ObservedRequest {
     ObservedRequest {
         path,
         headers,
-        body: serde_json::from_slice(&body).expect("body should be JSON"),
+        body: serde_json::from_slice(&body).unwrap_or(Value::Null),
+        raw_body: String::from_utf8(body).expect("body should be UTF-8"),
     }
 }
 
