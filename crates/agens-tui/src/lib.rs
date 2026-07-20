@@ -2,10 +2,15 @@
 
 mod app;
 mod bridge;
+mod conversation;
 mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
+pub use conversation::{
+    ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
+    ToolBatch, ToolCall, ToolResult,
+};
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,

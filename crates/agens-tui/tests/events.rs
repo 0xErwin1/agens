@@ -1,7 +1,8 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
-    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Dialog, Effect, Engine, Event,
-    Key, PublishOutcome, RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
+    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
+    ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PublishOutcome,
+    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -17,6 +18,115 @@ struct FakeEngine {
 impl Engine for FakeEngine {
     fn cancel(&mut self) {
         self.cancellations += 1;
+    }
+}
+
+#[test]
+fn conversation_retains_complete_live_final_markdown_reasoning_diffs_and_errors() {
+    let mut conversation = Conversation::new("explain the change");
+    for event in [
+        ConversationEvent::MarkdownDelta("live ".into()),
+        ConversationEvent::MarkdownDelta("output".into()),
+        ConversationEvent::ReasoningDelta("inspect ".into()),
+        ConversationEvent::ReasoningDelta("events".into()),
+        ConversationEvent::MarkdownFinal("final output".into()),
+    ] {
+        conversation.apply(event).unwrap();
+    }
+    conversation
+        .apply(ConversationEvent::Diff(vec![DiffLine::new(
+            7,
+            DiffLineKind::Added,
+            "+ typed",
+        )]))
+        .unwrap();
+    conversation
+        .apply(ConversationEvent::Error {
+            message: "permission denied".into(),
+            action: "allow the required capability".into(),
+        })
+        .unwrap();
+
+    assert_eq!(conversation.user, "explain the change");
+    assert_eq!(conversation.live_markdown, "live output");
+    assert_eq!(conversation.final_markdown.as_deref(), Some("final output"));
+    assert_eq!(conversation.reasoning, "inspect events");
+    assert_eq!(conversation.diffs[0].number, 7);
+    assert_eq!(conversation.diffs[0].kind, DiffLineKind::Added);
+    assert_eq!(
+        conversation.errors[0].action,
+        "allow the required capability"
+    );
+}
+
+#[test]
+fn conversation_pairs_tool_results_by_call_id_and_keeps_contiguous_batches() {
+    let mut conversation = Conversation::new("inspect");
+    for event in [
+        tool_call("one"),
+        tool_call("two"),
+        tool_result("two", "files"),
+        tool_result("one", "contents"),
+        ConversationEvent::MarkdownDelta("done".into()),
+        tool_call("three"),
+    ] {
+        conversation.apply(event).unwrap();
+    }
+
+    assert_eq!(conversation.tool_batches.len(), 2);
+    assert_eq!(
+        conversation.tool_batches[0].calls[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .output,
+        "contents"
+    );
+    assert_eq!(
+        conversation.tool_batches[0].calls[1]
+            .result
+            .as_ref()
+            .unwrap()
+            .output,
+        "files"
+    );
+    assert_eq!(conversation.tool_batches[1].calls[0].call_id, "three");
+}
+
+#[test]
+fn conversation_rejects_orphan_and_duplicate_call_ids_visibly() {
+    let mut conversation = Conversation::new("inspect");
+    let orphan = conversation.apply(ConversationEvent::ToolResult {
+        call_id: "missing".into(),
+        output: "none".into(),
+        is_error: true,
+    });
+    assert_eq!(
+        orphan,
+        Err(ConversationError::OrphanToolResult("missing".into()))
+    );
+
+    conversation.apply(tool_call("call")).unwrap();
+    let duplicate = conversation.apply(tool_call("call"));
+    assert_eq!(
+        duplicate,
+        Err(ConversationError::DuplicateToolCall("call".into()))
+    );
+}
+
+fn tool_call(id: &str) -> ConversationEvent {
+    ConversationEvent::ToolCall {
+        call_id: id.into(),
+        name: id.into(),
+        input: id.into(),
+    }
+}
+
+fn tool_result(id: &str, output: &str) -> ConversationEvent {
+    ConversationEvent::ToolResult {
+        call_id: id.into(),
+        output: output.into(),
+        is_error: false,
     }
 }
 
