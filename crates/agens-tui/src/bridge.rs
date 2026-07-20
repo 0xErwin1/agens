@@ -7,6 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::{TurnState, Usage};
+
+use crate::DiffLine;
+
 const RETRY_QUANTUM: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug, Default)]
@@ -45,6 +49,37 @@ pub enum PublishOutcome {
     DeadlineExpired,
     Disconnected,
     Closed,
+}
+
+/// Typed observational data emitted by the CLI runtime for later TUI rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiRuntimeEvent {
+    TurnStarted,
+    TurnEnded {
+        status: TurnState,
+        duration: Option<Duration>,
+    },
+    Usage(Usage),
+    ToolStarted {
+        call_id: String,
+        name: String,
+        input: String,
+    },
+    ToolEnded {
+        call_id: String,
+        duration: Option<Duration>,
+        result: ToolResultState,
+    },
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolResultState {
+    Success,
+    Failure,
 }
 
 struct BridgeState {

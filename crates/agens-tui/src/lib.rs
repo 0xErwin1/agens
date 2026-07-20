@@ -6,7 +6,9 @@ mod conversation;
 mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
-pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
+pub use bridge::{
+    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiRuntimeEvent, UiEnvelope,
+};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
     ToolBatch, ToolCall, ToolResult,
@@ -498,6 +500,7 @@ pub struct Tui<E> {
     session: String,
     turn_state: Option<TurnState>,
     active_tool: Option<String>,
+    runtime_events: Vec<TuiRuntimeEvent>,
 }
 
 impl<E> Tui<E>
@@ -520,6 +523,7 @@ where
             session: "new session".to_owned(),
             turn_state: None,
             active_tool: None,
+            runtime_events: Vec::new(),
         }
     }
 
@@ -606,6 +610,15 @@ where
     /// Returns the visible conversation for composition and focused tests.
     pub fn transcript(&self) -> &[TranscriptEntry] {
         &self.transcript
+    }
+
+    /// Retains typed runtime metrics for the renderer without altering turn persistence.
+    pub fn apply_runtime_event(&mut self, event: TuiRuntimeEvent) {
+        self.runtime_events.push(event);
+    }
+
+    pub fn runtime_events(&self) -> &[TuiRuntimeEvent] {
+        &self.runtime_events
     }
 
     /// Returns an immutable snapshot for a renderer.
@@ -940,16 +953,26 @@ where
 pub fn run_with_default_progress_submit<E, F>(tui: &mut Tui<E>, submit: F) -> io::Result<()>
 where
     E: Engine + Send,
-    F: Fn(String, mpsc::Sender<TurnEvent>) -> Result<String, String> + Send + Sync + 'static,
+    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> Result<String, String>
+        + Send
+        + Sync
+        + 'static,
 {
     let submit = Arc::new(submit);
     let (sender, receiver) = mpsc::channel();
+    let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
     let terminal = ratatui::try_init()?;
     let _restore = RatatuiRestore;
     let mut renderer = RatatuiRenderer::new(terminal);
     renderer.render(tui.view())?;
 
     loop {
+        for _ in 0..32 {
+            let Ok(envelope) = metrics_receiver.try_recv() else {
+                break;
+            };
+            tui.apply_runtime_event(envelope.into_parts().1);
+        }
         for _ in 0..32 {
             let Ok(event) = receiver.try_recv() else {
                 break;
@@ -969,10 +992,11 @@ where
                 tui.begin_submission(prompt.clone());
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
+                let metrics = metrics_sender.clone();
                 thread::spawn(move || {
                     let progress = sender.clone();
                     let _ = sender.send(TurnEvent::StateChanged(TurnState::Requesting));
-                    let result = submit(prompt, progress);
+                    let result = submit(prompt, progress, metrics);
                     match result {
                         Ok(_) => {
                             let _ = sender.send(TurnEvent::StateChanged(TurnState::Completed));
