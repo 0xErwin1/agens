@@ -3,9 +3,11 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use agens_core::{
@@ -722,6 +724,151 @@ fn task_rejects_an_oversized_unicode_result() {
 }
 
 #[test]
+fn task_reports_exact_terminal_taxonomy_without_runner_details() {
+    for (runner, expected) in [
+        (
+            TerminalTaskRunner::Iterations,
+            "task: iteration limit reached",
+        ),
+        (TerminalTaskRunner::Provider, "task: provider failure"),
+        (TerminalTaskRunner::Child, "task: child execution failed"),
+        (TerminalTaskRunner::Panic, "task: child execution failed"),
+    ] {
+        let mut task = task_tool(runner);
+        assert_eq!(
+            task.execute(&task_context(), task_arguments()).unwrap(),
+            ToolOutput::failure(expected)
+        );
+    }
+}
+
+#[test]
+fn task_shares_four_permits_only_across_clones() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let task = task_tool(BlockingTaskRunner {
+        started: started_sender,
+        release: release_receiver,
+    });
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut calls = Vec::new();
+
+    for _ in 0..4 {
+        let mut clone = task.clone();
+        let cancellation = Arc::clone(&cancellation);
+        calls.push(thread::spawn(move || {
+            clone
+                .execute(
+                    &ToolExecutionContext::new(cancellation, Duration::from_secs(1)),
+                    task_arguments(),
+                )
+                .unwrap()
+        }));
+    }
+
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        task.clone()
+            .execute(&task_context(), task_arguments())
+            .unwrap(),
+        ToolOutput::failure("task: concurrent child limit reached")
+    );
+
+    let mut independent = task_tool(TerminalTaskRunner::Success);
+    assert_eq!(
+        independent
+            .execute(&task_context(), task_arguments())
+            .unwrap(),
+        ToolOutput::success("done")
+    );
+
+    for _ in 0..4 {
+        release_sender.send(()).unwrap();
+    }
+    for call in calls {
+        assert_eq!(call.join().unwrap(), ToolOutput::success("done"));
+    }
+}
+
+#[test]
+fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let task = task_tool(BlockingTaskRunner {
+        started: started_sender,
+        release: release_receiver,
+    });
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let mut clone = task.clone();
+    let worker_cancellation = Arc::clone(&cancellation);
+    let call = thread::spawn(move || {
+        clone
+            .execute(
+                &ToolExecutionContext::new(worker_cancellation, Duration::from_secs(1)),
+                task_arguments(),
+            )
+            .unwrap()
+    });
+
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    cancellation.store(true, Ordering::Release);
+    assert_eq!(call.join().unwrap(), ToolOutput::failure("task: cancelled"));
+
+    let mut clones = vec![task.clone(), task.clone(), task.clone()];
+    let mut callers = Vec::new();
+    for clone in &mut clones {
+        let mut clone = clone.clone();
+        callers.push(thread::spawn(move || {
+            clone.execute(&task_context(), task_arguments()).unwrap()
+        }));
+    }
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        task.clone()
+            .execute(&task_context(), task_arguments())
+            .unwrap(),
+        ToolOutput::failure("task: concurrent child limit reached")
+    );
+
+    for _ in 0..4 {
+        release_sender.send(()).unwrap();
+    }
+    for caller in callers {
+        assert_eq!(caller.join().unwrap(), ToolOutput::success("done"));
+    }
+}
+
+#[test]
+fn task_deadline_wins_over_a_noncooperative_worker() {
+    let (started_sender, started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let task = task_tool(BlockingTaskRunner {
+        started: started_sender,
+        release: release_receiver,
+    });
+    let mut clone = task.clone();
+    let call = thread::spawn(move || {
+        clone
+            .execute(
+                &ToolExecutionContext::with_timeout(Duration::from_millis(10)),
+                task_arguments(),
+            )
+            .unwrap()
+    });
+
+    started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(call.join().unwrap(), ToolOutput::failure("task: timed out"));
+    release_sender.send(()).unwrap();
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -999,6 +1146,83 @@ impl TaskRunner for OversizedTaskRunner {
             iterations: 1,
         })
     }
+}
+
+enum TerminalTaskRunner {
+    Success,
+    Iterations,
+    Provider,
+    Child,
+    Panic,
+}
+
+impl TaskRunner for TerminalTaskRunner {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        match self {
+            Self::Success => Ok(TaskTurnResult {
+                output: "done".into(),
+                iterations: 1,
+            }),
+            Self::Iterations => Ok(TaskTurnResult {
+                output: "ignored".into(),
+                iterations: 17,
+            }),
+            Self::Provider => Err(TaskRunnerError::ProviderFailure),
+            Self::Child => Err(TaskRunnerError::ChildFailure),
+            Self::Panic => panic!("secret panic payload"),
+        }
+    }
+}
+
+struct BlockingTaskRunner {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl TaskRunner for BlockingTaskRunner {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.started.send(()).unwrap();
+        self.release.recv().unwrap();
+        Ok(TaskTurnResult {
+            output: "done".into(),
+            iterations: 1,
+        })
+    }
+}
+
+fn task_tool<R: TaskRunner>(runner: R) -> TaskTool<R> {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let skills = temporary.path.join("skills");
+    fs::create_dir_all(&agents).unwrap();
+    fs::create_dir_all(&skills).unwrap();
+    write_agent(&agents, "worker", "worker agent", "subagent");
+    let missing = temporary.path.join("missing");
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let skills = SkillCatalog::discover(&skills, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    TaskTool::from_catalogs_with_model_validator(agents, skills, "parent-model", TaskModels, runner)
+}
+
+fn task_context() -> ToolExecutionContext {
+    ToolExecutionContext::with_timeout(Duration::from_secs(1))
+}
+
+fn task_arguments() -> Value {
+    serde_json::json!({"description":"test task"})
 }
 
 fn agent_with_rules(permission_rules: Vec<PermissionRule>) -> AgentDefinition {

@@ -124,11 +124,11 @@ fn run_edit_test_hook(
 static SUBAGENT_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 thread_local! {
-    static IS_SUBAGENT_WORKER: Cell<bool> = const { Cell::new(false) };
+    pub(crate) static IS_SUBAGENT_WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Suppress only worker panic payloads because they can contain provider secrets.
-fn install_subagent_panic_hook() {
+pub(crate) fn install_subagent_panic_hook() {
     SUBAGENT_PANIC_HOOK_INSTALLED.get_or_init(|| {
         let default_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| {

@@ -2010,12 +2010,20 @@ impl TaskRunner for ProductionTaskRunner {
             Arc::clone(&context.cancellation),
             Some(context.deadline),
         );
-        run_production_task(request, &self.bootstrap, &self.project_root, &cancellation)
-            .map(|output| TaskTurnResult {
+        run_production_task(request, &self.bootstrap, &self.project_root, &cancellation).map(
+            |output| TaskTurnResult {
                 output,
                 iterations: 1,
-            })
-            .map_err(|_| TaskRunnerError::ProviderFailure)
+            },
+        )
+    }
+}
+
+fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
+    match error {
+        HeadlessTurnError::Provider => TaskRunnerError::ProviderFailure,
+        HeadlessTurnError::MaxIterations => TaskRunnerError::IterationLimit,
+        _ => TaskRunnerError::ChildFailure,
     }
 }
 
@@ -2024,7 +2032,7 @@ fn run_production_task(
     bootstrap: &Bootstrap,
     project_root: &Path,
     cancellation: &HeadlessTurnCancellation,
-) -> Result<String, CliError> {
+) -> Result<String, TaskRunnerError> {
     let messages = vec![
         Message {
             role: Role::System,
@@ -2035,13 +2043,15 @@ fn run_production_task(
             parts: vec![MessagePart::Text(request.description().to_owned())],
         },
     ];
-    let (provider_tools, tool_runtime) = production_read_only_tool_runtime(project_root)?;
+    let (provider_tools, tool_runtime) = production_read_only_tool_runtime(project_root)
+        .map_err(|_| TaskRunnerError::ChildFailure)?;
 
     match bootstrap.provider_type() {
         Some("openai-api") => {
-            let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
-                CliError::authentication("OpenAI API authentication is unavailable")
-            })?;
+            let api_key = bootstrap
+                .openai_api_key
+                .clone()
+                .ok_or(TaskRunnerError::ChildFailure)?;
             let provider =
                 OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                     api_key,
@@ -2052,9 +2062,7 @@ fn run_production_task(
                     std::time::Duration::from_secs(120),
                 )
                 .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
-                .map_err(|_| {
-                    CliError::authentication("OpenAI API authentication is unavailable")
-                })?;
+                .map_err(|_| TaskRunnerError::ChildFailure)?;
             run_isolated_task_turn(provider, tool_runtime, project_root, cancellation)
         }
         Some("openai-chatgpt") => {
@@ -2069,12 +2077,10 @@ fn run_production_task(
                 std::time::Duration::from_secs(120),
             )
             .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
-            .map_err(|_| CliError::authentication("ChatGPT credentials are unavailable or invalid"))?;
+            .map_err(|_| TaskRunnerError::ChildFailure)?;
             run_isolated_task_turn(provider, tool_runtime, project_root, cancellation)
         }
-        _ => Err(CliError::configuration(
-            "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
-        )),
+        _ => Err(TaskRunnerError::ChildFailure),
     }
 }
 
@@ -2092,7 +2098,7 @@ fn run_isolated_task_turn<P>(
     tool_runtime: SharedToolDispatcher,
     project_root: &Path,
     cancellation: &HeadlessTurnCancellation,
-) -> Result<String, CliError>
+) -> Result<String, TaskRunnerError>
 where
     P: ProgressAwareProvider,
 {
@@ -2130,8 +2136,9 @@ where
         cancellation,
         16,
         None,
-    ))?
-    .map_err(CliError::runtime)?;
+    ))
+    .map_err(|_| TaskRunnerError::ChildFailure)?
+    .map_err(map_task_turn_error)?;
 
     Ok(snapshot
         .events()
@@ -3179,6 +3186,22 @@ mod tests {
         AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot,
         Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState,
     };
+
+    #[test]
+    fn production_task_error_mapping_reserves_provider_for_provider_failures() {
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::MaxIterations),
+            TaskRunnerError::IterationLimit
+        );
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::Provider),
+            TaskRunnerError::ProviderFailure
+        );
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::Tool),
+            TaskRunnerError::ChildFailure
+        );
+    }
 
     struct RotationTool;
 

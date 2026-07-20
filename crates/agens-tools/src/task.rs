@@ -12,7 +12,8 @@ use std::{
 };
 
 use crate::{
-    AgentCatalog, AgentModelValidator, DispatchTool, SkillCatalog, ToolExecutionContext, ToolOutput,
+    AgentCatalog, AgentModelValidator, DispatchTool, IS_SUBAGENT_WORKER, SkillCatalog,
+    ToolExecutionContext, ToolOutput, install_subagent_panic_hook,
 };
 
 const MAX_TASK_DESCRIPTION_CHARS: usize = 16_384;
@@ -175,6 +176,7 @@ pub struct TaskTurnResult {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskRunnerError {
     ProviderFailure,
+    IterationLimit,
     ChildFailure,
 }
 
@@ -366,6 +368,7 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
         thread::spawn(move || {
             let _permit = permit;
             let output = {
+                let _panic_hook = TaskPanicHookGuard::new();
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let mut runner = runner.lock().map_err(|_| TaskRunnerError::ChildFailure)?;
                     if let Some(output) = worker_context.terminal_output() {
@@ -425,7 +428,24 @@ fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolO
 fn task_error_output(error: TaskRunnerError) -> ToolOutput {
     match error {
         TaskRunnerError::ProviderFailure => ToolOutput::failure("task: provider failure"),
+        TaskRunnerError::IterationLimit => ToolOutput::failure("task: iteration limit reached"),
         TaskRunnerError::ChildFailure => ToolOutput::failure("task: child execution failed"),
+    }
+}
+
+struct TaskPanicHookGuard;
+
+impl TaskPanicHookGuard {
+    fn new() -> Self {
+        install_subagent_panic_hook();
+        IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(true));
+        Self
+    }
+}
+
+impl Drop for TaskPanicHookGuard {
+    fn drop(&mut self) {
+        IS_SUBAGENT_WORKER.with(|is_worker| is_worker.set(false));
     }
 }
 
