@@ -182,14 +182,11 @@ impl<R> TaskTool<R> {
         serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     }
 
-    fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
-        let agent = invocation
-            .agent
-            .as_deref()
+    fn resolve_agent(&self, requested: Option<&str>) -> Result<&AgentDefinition, ToolOutput> {
+        requested
             .and_then(|name| self.agents.agent(name))
             .or_else(|| {
-                invocation
-                    .agent
+                requested
                     .is_none()
                     .then(|| {
                         self.agents
@@ -200,7 +197,11 @@ impl<R> TaskTool<R> {
                     .flatten()
             })
             .filter(|agent| agent.mode == AgentMode::Subagent)
-            .ok_or_else(|| ToolOutput::failure("task: requested agent is unavailable"))?;
+            .ok_or_else(|| ToolOutput::failure("task: requested agent is unavailable"))
+    }
+
+    fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
+        let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
         let model = invocation
             .model
@@ -255,8 +256,8 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
     fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
         let invocation = TaskInvocation::from_value(arguments.clone())
             .map_err(|_| Error::Tool("task arguments are invalid".into()))?;
-        self.resolve(invocation)
-            .map(|request| request.agent_name)
+        self.resolve_agent(invocation.agent.as_deref())
+            .map(|agent| agent.name.clone())
             .map_err(|_| Error::Tool("task: requested agent is unavailable".into()))
     }
 

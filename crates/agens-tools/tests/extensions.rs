@@ -1,18 +1,22 @@
 use std::{
     fs,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use agens_core::{
-    AgentDefinition, AgentMode, Error, PermissionDecision, PermissionPattern, PermissionRule,
-    ToolAccess,
+    AgentDefinition, AgentMode, Error, PermissionDecision, PermissionMode, PermissionPattern,
+    PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskInvocation,
-    TaskRunner, TaskSkill, TaskTool, TaskTurnRequest, ToolDispatcher, ToolExecutionContext,
-    ToolOutput,
+    TaskRunner, TaskSkill, TaskTool, TaskTurnRequest, ToolDispatchRequest, ToolDispatcher,
+    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -580,6 +584,104 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
 }
 
 #[test]
+fn task_dispatcher_preserves_late_validation_errors_without_running_the_child() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let skills = temporary.path.join("skills");
+    fs::create_dir_all(&agents).unwrap();
+    fs::create_dir_all(skills.join("allowed")).unwrap();
+    write_agent(&agents, "worker", "worker agent", "subagent");
+    fs::write(
+        agents.join("missing.md"),
+        "---\nname: missing\ndescription: missing skill\nmode: subagent\nskills:\n  - absent\n---\nmissing instructions\n",
+    )
+    .unwrap();
+    fs::write(
+        skills.join("allowed/SKILL.md"),
+        "---\nname: allowed\ndescription: allowed skill\n---\nallowed instructions\n",
+    )
+    .unwrap();
+
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing-root"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let skills = SkillCatalog::discover(&skills, temporary.path.join("missing-root"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native(
+            "native::task",
+            ToolAccess::ReadOnly,
+            TaskTool::from_catalogs_with_model_validator(
+                agents,
+                skills,
+                "parent-model",
+                TaskModels,
+                CountingTaskRunner(Arc::clone(&calls)),
+            ),
+        )
+        .unwrap();
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+    let session = PermissionSession::with_temporary_bypass();
+    let context = ToolExecutionContext::with_timeout(std::time::Duration::from_secs(1));
+
+    for (arguments, expected) in [
+        (
+            serde_json::json!({"agent":"worker","model":"unavailable","description":"reject model"}),
+            "task: requested model is unavailable",
+        ),
+        (
+            serde_json::json!({"agent":"worker","skills":["unavailable"],"description":"reject disallowed skill"}),
+            "task: requested skill is unavailable",
+        ),
+        (
+            serde_json::json!({"agent":"missing","description":"reject missing skill"}),
+            "task: requested skill is unavailable",
+        ),
+    ] {
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &session,
+                ToolDispatchRequest::new("project", "native::task", arguments),
+            )
+            .unwrap()
+        else {
+            panic!("task call should be authorized before late validation");
+        };
+
+        assert_eq!(
+            dispatcher.execute(handle, &context).unwrap(),
+            ToolOutput::failure(expected)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    match dispatcher.evaluate(
+        &policy,
+        &[],
+        &session,
+        ToolDispatchRequest::new(
+            "project",
+            "native::task",
+            serde_json::json!({"agent":"unknown","description":"reject agent"}),
+        ),
+    ) {
+        Err(Error::Tool(message)) => {
+            assert_eq!(message, "task: requested agent is unavailable");
+        }
+        Err(error) => panic!("unexpected task error: {error}"),
+        Ok(_) => panic!("ineligible task agent should not be authorized"),
+    }
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -818,6 +920,15 @@ impl TaskRunner for RecordingTaskRunner {
                 .unwrap_or("none"),
             request.description()
         )))
+    }
+}
+
+struct CountingTaskRunner(Arc<AtomicUsize>);
+
+impl TaskRunner for CountingTaskRunner {
+    fn run(&mut self, _: TaskTurnRequest) -> Result<ToolOutput, Error> {
+        self.0.fetch_add(1, Ordering::AcqRel);
+        Ok(ToolOutput::success("unexpected child execution"))
     }
 }
 
