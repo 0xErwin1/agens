@@ -217,6 +217,24 @@ impl CliError {
             HeadlessTurnError::Provider => {
                 (ExitStatus::Failure, "provider", "provider request failed")
             }
+            HeadlessTurnError::ProviderRejected => (
+                ExitStatus::Failure,
+                "provider",
+                "ChatGPT request was rejected",
+            ),
+            HeadlessTurnError::ProviderRateLimited => (
+                ExitStatus::Failure,
+                "provider",
+                "ChatGPT request was rate limited",
+            ),
+            HeadlessTurnError::ProviderServer => {
+                (ExitStatus::Failure, "provider", "ChatGPT service failed")
+            }
+            HeadlessTurnError::ProviderProtocol => (
+                ExitStatus::Failure,
+                "provider",
+                "ChatGPT response protocol failed",
+            ),
             HeadlessTurnError::Permission => (
                 ExitStatus::Failure,
                 "permission",
@@ -2513,7 +2531,11 @@ fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
     match error {
         HeadlessTurnError::Cancelled => TaskRunnerError::Cancelled,
         HeadlessTurnError::TimedOut => TaskRunnerError::TimedOut,
-        HeadlessTurnError::Provider => TaskRunnerError::ProviderFailure,
+        HeadlessTurnError::Provider
+        | HeadlessTurnError::ProviderRejected
+        | HeadlessTurnError::ProviderRateLimited
+        | HeadlessTurnError::ProviderServer
+        | HeadlessTurnError::ProviderProtocol => TaskRunnerError::ProviderFailure,
         HeadlessTurnError::MaxIterations => TaskRunnerError::IterationLimit,
         _ => TaskRunnerError::ChildFailure,
     }
@@ -5051,6 +5073,10 @@ mod tests {
         let address = listener
             .local_addr()
             .expect("mock provider should have an address");
+        let expected_path = match provider_type {
+            "openai-chatgpt" => "POST /codex/responses HTTP/1.1\r\n",
+            _ => "POST /responses HTTP/1.1\r\n",
+        };
         let worker = std::thread::spawn(move || {
             use std::io::{BufRead, BufReader, Write};
 
@@ -5062,7 +5088,7 @@ mod tests {
             reader
                 .read_line(&mut request_line)
                 .expect("request line should be readable");
-            assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+            assert_eq!(request_line, expected_path);
 
             let mut content_length = None;
             loop {

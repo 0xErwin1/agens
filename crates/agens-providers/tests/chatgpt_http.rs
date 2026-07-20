@@ -227,20 +227,23 @@ fn usage_chatgpt_stream_publishes_partial_usage_without_counters() {
 
 #[test]
 fn subscription_transport_maps_auth_provider_and_semantic_stream_failures_without_secrets() {
-    for behavior in [
-        ServerBehavior::Status(401),
-        ServerBehavior::Status(403),
-        ServerBehavior::Status(400),
-        ServerBehavior::Status(429),
-        ServerBehavior::Status(500),
-        ServerBehavior::Sse("data: {\"type\":\"response.failed\"}\n\n".to_owned()),
-        ServerBehavior::Sse("data: {\"type\":\"response.incomplete\"}\n\n".to_owned()),
+    use HeadlessTurnPortError as Failure;
+
+    for (behavior, expected) in [
+        (ServerBehavior::Status(403), Failure::Authentication),
+        (ServerBehavior::Status(400), Failure::ProviderRejected),
+        (ServerBehavior::Status(418), Failure::ProviderRejected),
+        (ServerBehavior::Status(429), Failure::ProviderRateLimited),
+        (ServerBehavior::Status(500), Failure::ProviderServer),
+        (
+            ServerBehavior::Sse("data: {\"type\":\"response.failed\"}\n\n".to_owned()),
+            Failure::ProviderProtocol,
+        ),
+        (
+            ServerBehavior::Sse("data: {\"type\":\"response.incomplete\"}\n\n".to_owned()),
+            Failure::ProviderProtocol,
+        ),
     ] {
-        let expected = if matches!(behavior, ServerBehavior::Status(401 | 403)) {
-            HeadlessTurnPortError::Authentication
-        } else {
-            HeadlessTurnPortError::Provider
-        };
         let directory = temporary_directory("status");
         let credentials = write_credentials(&directory);
         let server = LocalServer::start(behavior);
@@ -252,6 +255,70 @@ fn subscription_transport_maps_auth_provider_and_semantic_stream_failures_withou
         let rendered = format!("{result:?}");
         assert!(!rendered.contains(SECRET_BODY_SENTINEL));
         assert!(!rendered.contains(SECRET_HEADER_SENTINEL));
+        server.join();
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[test]
+fn subscription_transport_sanitizes_structured_error_bodies() {
+    let directory = temporary_directory("structured-error");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Json(
+        400,
+        format!(
+            r#"{{"error":{{"type":"invalid_request_error","code":"invalid_request","message":"{SECRET_BODY_SENTINEL}"}}}}"#
+        ),
+    )]);
+    let mut provider = subscription_provider(&credentials, &server);
+
+    let result = run(&mut provider, HeadlessTurnCancellation::new());
+    assert_eq!(result, Err(HeadlessTurnPortError::ProviderRejected));
+    assert!(!format!("{result:?}").contains(SECRET_BODY_SENTINEL));
+
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_bounds_error_bodies_before_an_open_connection() {
+    let directory = temporary_directory("bounded-error");
+    let credentials = write_credentials(&directory);
+    let body = format!(r#"{{"error":{{"message":"{}"}}}}"#, "x".repeat(16 * 1024));
+    let server = LocalServer::start(ServerBehavior::ErrorThenWait(400, body));
+    let mut provider = provider(&credentials, &server.base_url());
+
+    assert_eq!(
+        run(
+            &mut provider,
+            HeadlessTurnCancellation::with_deadline(Duration::from_millis(100)),
+        ),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_accepts_terminal_variants_without_waiting_for_connection_close() {
+    for terminal in ["response.completed", "response.done"] {
+        let directory = temporary_directory("terminal-event");
+        let credentials = write_credentials(&directory);
+        let events = format!(
+            "data: [DONE]\n\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"done\"}}\n\ndata: {{\"type\":\"{terminal}\"}}\n\n"
+        );
+        let server = LocalServer::start(ServerBehavior::SseThenWait(events));
+        let mut provider = provider(&credentials, &server.base_url());
+
+        assert_eq!(
+            run(
+                &mut provider,
+                HeadlessTurnCancellation::with_deadline(Duration::from_millis(100))
+            ),
+            Ok(vec![MessagePart::Text("done".to_owned())])
+        );
+
         server.join();
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
@@ -438,7 +505,11 @@ fn subscription_transport_refreshes_once_after_401_then_retries_responses_once()
     assert_eq!(requests[0].path, "/backend-api/codex/responses");
     assert_eq!(requests[1].path, "/oauth/token");
     assert_eq!(requests[2].path, "/backend-api/codex/responses");
-    assert!(requests[1].raw_body.contains("refresh_token=synthetic-refresh"));
+    assert!(
+        requests[1]
+            .raw_body
+            .contains("refresh_token=synthetic-refresh")
+    );
     assert_eq!(
         requests[2].header("authorization"),
         Some("Bearer header.eyJleHAiOjE4OTM0NTYwMDB9.signature")
@@ -1605,7 +1676,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
         } else {
             assert_eq!(
                 run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-                Err(HeadlessTurnPortError::Provider),
+                Err(HeadlessTurnPortError::ProviderProtocol),
             );
         }
         assert_eq!(
@@ -1659,6 +1730,7 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     assert_replay_response_rejection(
         "item-bound",
         tool_round_sse(&oversized_items, &[("item_call", "call", "weather", "{}")]),
+        HeadlessTurnPortError::ProviderProtocol,
     );
 
     let large_content = "x".repeat(65_000);
@@ -1675,6 +1747,7 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     assert_replay_response_rejection(
         "history-bound",
         tool_round_sse(&history_items, &[("item_call", "call", "weather", "{}")]),
+        HeadlessTurnPortError::Provider,
     );
 
     let directory = temporary_directory("round-bound");
@@ -1730,7 +1803,7 @@ fn subscription_tool_replay_rejects_an_oversized_item_without_retaining_or_repla
 
     let error = run_with_events(&mut provider, &[], HeadlessTurnCancellation::new())
         .expect_err("oversized replay item should fail before a continuation request");
-    assert_eq!(error, HeadlessTurnPortError::Provider);
+    assert_eq!(error, HeadlessTurnPortError::ProviderProtocol);
     assert!(!format!("{error:?}").contains(secret_sentinel));
 
     assert_eq!(
@@ -1886,7 +1959,7 @@ fn subscription_provider(credentials: &Path, server: &ScriptedServer) -> ChatGpt
     .expect("provider should be configured")
 }
 
-fn assert_replay_response_rejection(name: &str, response: String) {
+fn assert_replay_response_rejection(name: &str, response: String, expected: HeadlessTurnPortError) {
     let directory = temporary_directory(name);
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![ScriptedResponse::Sse(response)]);
@@ -1894,7 +1967,7 @@ fn assert_replay_response_rejection(name: &str, response: String) {
 
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::Provider),
+        Err(expected),
     );
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
@@ -2094,7 +2167,9 @@ fn output_item_sse(item: Value) -> String {
 #[derive(Clone)]
 enum ServerBehavior {
     Status(u16),
+    ErrorThenWait(u16, String),
     Sse(String),
+    SseThenWait(String),
     WaitForClientClose,
 }
 
@@ -2312,7 +2387,22 @@ impl LocalServer {
 
             match behavior {
                 ServerBehavior::Status(status) => write_status(&mut stream, status),
+                ServerBehavior::ErrorThenWait(status, body) => {
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}"
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("error response should be written");
+                    wait_for_client_close(&stream);
+                }
                 ServerBehavior::Sse(events) => write_sse(&mut stream, &events),
+                ServerBehavior::SseThenWait(events) => {
+                    write_sse(&mut stream, &events);
+                    wait_for_client_close(&stream);
+                }
                 ServerBehavior::WaitForClientClose => wait_for_client_close(&stream),
             }
         });

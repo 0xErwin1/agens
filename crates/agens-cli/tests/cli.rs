@@ -1731,18 +1731,36 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
 #[test]
 fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
-    for (name, status, expected_exit, expected_stderr) in [
+    for (name, response, expected_exit, expected_stderr) in [
         (
             "forbidden",
-            "HTTP/1.1 403 Forbidden",
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
             Some(4),
             "error: auth: ChatGPT credentials are unavailable or invalid\n",
         ),
         (
-            "server failure",
-            "HTTP/1.1 500 Internal Server Error",
+            "rejected",
+            "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
-            "error: provider: provider request failed\n",
+            "error: provider: ChatGPT request was rejected\n",
+        ),
+        (
+            "rate limit",
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
+            Some(1),
+            "error: provider: ChatGPT request was rate limited\n",
+        ),
+        (
+            "server failure",
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
+            Some(1),
+            "error: provider: ChatGPT service failed\n",
+        ),
+        (
+            "protocol failure",
+            sse_response(&[r#"{"type":"response.incomplete","response":{"error":{"message":"SENTINEL_CHATGPT_ERROR_BODY"}}}"#]),
+            Some(1),
+            "error: provider: ChatGPT response protocol failed\n",
         ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
@@ -1750,9 +1768,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
         let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
             required_body_fragments: vec!["\"store\":false".to_owned()],
-            response: format!(
-                "{status}\r\nX-Remote-Secret: SENTINEL_CHATGPT_REMOTE\r\nContent-Length: 28\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY"
-            ),
+            response,
         }]);
         std::fs::write(
             config_home.join("config.toml"),
@@ -3808,7 +3824,10 @@ impl ScriptedNativeOpenAiMockServer {
                         let tools = payload["tools"]
                             .as_array()
                             .expect("production provider should advertise tools");
-                        assert!(!tools.is_empty(), "production provider should advertise tools");
+                        assert!(
+                            !tools.is_empty(),
+                            "production provider should advertise tools"
+                        );
                         for tool in tools {
                             assert_eq!(tool["type"], "function");
                             assert_eq!(tool["strict"], false, "tool was strict: {tool}");

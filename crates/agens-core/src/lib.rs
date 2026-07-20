@@ -765,6 +765,10 @@ pub enum HeadlessTurnPortError {
     TimedOut,
     Authentication,
     Provider,
+    ProviderRejected,
+    ProviderRateLimited,
+    ProviderServer,
+    ProviderProtocol,
     Permission,
     Tool,
     TaskTerminal(HeadlessTaskTerminal),
@@ -885,6 +889,10 @@ pub enum HeadlessTurnError {
     TimedOut,
     Authentication,
     Provider,
+    ProviderRejected,
+    ProviderRateLimited,
+    ProviderServer,
+    ProviderProtocol,
     Permission,
     PermissionRequired,
     Tool,
@@ -901,6 +909,10 @@ impl fmt::Display for HeadlessTurnError {
             Self::TimedOut => "turn timed out",
             Self::Authentication => "authentication required",
             Self::Provider => "provider operation failed",
+            Self::ProviderRejected => "provider rejected the request",
+            Self::ProviderRateLimited => "provider rate limited the request",
+            Self::ProviderServer => "provider service failed",
+            Self::ProviderProtocol => "provider response protocol failed",
             Self::Permission => "permission operation failed",
             Self::PermissionRequired => "permission required",
             Self::Tool => "tool operation failed",
@@ -1202,6 +1214,20 @@ fn finish_port_error(
         return coordinator
             .fail()
             .map(|()| HeadlessTurnError::Authentication)
+            .unwrap_or(HeadlessTurnError::State);
+    }
+
+    let provider_failure = match error {
+        HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
+        HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
+        HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
+        HeadlessTurnPortError::ProviderProtocol => Some(HeadlessTurnError::ProviderProtocol),
+        _ => None,
+    };
+    if let Some(provider_failure) = provider_failure {
+        return coordinator
+            .fail()
+            .map(|()| provider_failure)
             .unwrap_or(HeadlessTurnError::State);
     }
 

@@ -24,6 +24,7 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 128 * 1024;
+const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
 const MAX_CHATGPT_REPLAY_ITEMS: usize = 512;
@@ -100,7 +101,33 @@ pub struct ChatGptResponsesProvider {
 
 enum ChatGptResponseError {
     Authentication(u16),
+    Rejected,
+    RateLimited,
+    Server,
+    Protocol,
     Other(HeadlessTurnPortError),
+}
+
+#[derive(Clone, Copy)]
+enum SafeRemoteError {
+    InvalidRequest,
+    Authentication,
+    Permission,
+    RateLimit,
+    Server,
+}
+
+impl ChatGptResponseError {
+    fn into_port_error(self) -> HeadlessTurnPortError {
+        match self {
+            Self::Authentication(_) => HeadlessTurnPortError::Authentication,
+            Self::Rejected => HeadlessTurnPortError::ProviderRejected,
+            Self::RateLimited => HeadlessTurnPortError::ProviderRateLimited,
+            Self::Server => HeadlessTurnPortError::ProviderServer,
+            Self::Protocol => HeadlessTurnPortError::ProviderProtocol,
+            Self::Other(error) => error,
+        }
+    }
 }
 
 enum ChatGptContinuationState {
@@ -332,7 +359,15 @@ impl OpenAiResponsesProvider {
             return Err(HeadlessTurnPortError::Provider);
         }
 
-        decode_http_response_stream(response, cancellation, false, self.progress.as_ref()).await
+        decode_http_response_stream(
+            response,
+            cancellation,
+            false,
+            self.progress.as_ref(),
+            HeadlessTurnPortError::Provider,
+            false,
+        )
+        .await
     }
 }
 
@@ -514,24 +549,35 @@ impl ChatGptResponsesProvider {
         };
 
         stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
-        match response.status().as_u16() {
-            401 | 403 => {
-                return Err(ChatGptResponseError::Authentication(
-                    response.status().as_u16(),
-                ));
-            }
-            400 | 429 | 500..=599 => {
-                return Err(ChatGptResponseError::Other(HeadlessTurnPortError::Provider));
-            }
-            _ if !response.status().is_success() => {
-                return Err(ChatGptResponseError::Other(HeadlessTurnPortError::Provider));
-            }
-            _ => {}
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let _metadata = read_safe_chatgpt_error(response, cancellation)
+                .await
+                .map_err(ChatGptResponseError::Other)?;
+            return Err(match status {
+                401 | 403 => ChatGptResponseError::Authentication(status),
+                429 => ChatGptResponseError::RateLimited,
+                500..=599 => ChatGptResponseError::Server,
+                400..=499 => ChatGptResponseError::Rejected,
+                _ => ChatGptResponseError::Protocol,
+            });
         }
 
-        decode_http_response_stream(response, cancellation, true, self.progress.as_ref())
-            .await
-            .map_err(ChatGptResponseError::Other)
+        decode_http_response_stream(
+            response,
+            cancellation,
+            true,
+            self.progress.as_ref(),
+            HeadlessTurnPortError::ProviderProtocol,
+            true,
+        )
+        .await
+        .map_err(|error| match error {
+            HeadlessTurnPortError::Cancelled | HeadlessTurnPortError::TimedOut => {
+                ChatGptResponseError::Other(error)
+            }
+            _ => ChatGptResponseError::Protocol,
+        })
     }
 
     async fn refresh_if_needed(
@@ -764,6 +810,10 @@ impl TurnProvider for ChatGptResponsesProvider {
                         self.state = ChatGptContinuationState::Failed;
                         return Err(error);
                     }
+                    Err(error) => {
+                        self.state = ChatGptContinuationState::Failed;
+                        return Err(error.into_port_error());
+                    }
                 }
             }
             Err(ChatGptResponseError::Authentication(_)) => {
@@ -773,6 +823,10 @@ impl TurnProvider for ChatGptResponsesProvider {
             Err(ChatGptResponseError::Other(error)) => {
                 self.state = ChatGptContinuationState::Failed;
                 return Err(error);
+            }
+            Err(error) => {
+                self.state = ChatGptContinuationState::Failed;
+                return Err(error.into_port_error());
             }
         };
         if response.pending_calls.iter().any(|call| {
@@ -1083,6 +1137,8 @@ async fn decode_http_response_stream(
     cancellation: &HeadlessTurnCancellation,
     require_encrypted_reasoning: bool,
     progress: Option<&TurnProgressSink>,
+    protocol_failure: HeadlessTurnPortError,
+    finish_on_terminal: bool,
 ) -> Result<DecodedResponse, HeadlessTurnPortError> {
     let mut decoder = OpenAiResponseDecoder::new(require_encrypted_reasoning);
     let mut frame = Vec::new();
@@ -1091,27 +1147,29 @@ async fn decode_http_response_stream(
         let next_chunk = tokio::select! {
             chunk = response.chunk() => {
                 stop_before_mapping(cancellation)?;
-                chunk.map_err(|_| HeadlessTurnPortError::Provider)?
+                chunk.map_err(|_| protocol_failure)?
             }
             stop = wait_for_stop(cancellation) => return Err(stop),
         };
         let Some(chunk) = next_chunk else {
             let completed = decoder.finish();
             stop_before_mapping(cancellation)?;
-            return completed.map_err(|_| HeadlessTurnPortError::Provider);
+            return completed.map_err(|_| protocol_failure);
         };
 
         for byte in chunk {
             if byte == b'\n' {
                 let processed = process_sse_frame(&mut decoder, &mut frame, progress);
                 stop_before_mapping(cancellation)?;
-                processed.map_err(|_| HeadlessTurnPortError::Provider)?;
+                if finish_on_terminal && processed.map_err(|_| protocol_failure)? {
+                    return decoder.finish().map_err(|_| protocol_failure);
+                }
                 continue;
             }
 
             if frame.len() == MAX_SSE_FRAME_BYTES {
                 stop_before_mapping(cancellation)?;
-                return Err(HeadlessTurnPortError::Provider);
+                return Err(protocol_failure);
             }
             frame.push(byte);
         }
@@ -1124,7 +1182,7 @@ fn process_sse_frame(
     decoder: &mut OpenAiResponseDecoder,
     frame: &mut Vec<u8>,
     progress: Option<&TurnProgressSink>,
-) -> Result<(), ()> {
+) -> Result<bool, ()> {
     if frame.last() == Some(&b'\r') {
         frame.pop();
     }
@@ -1133,6 +1191,10 @@ fn process_sse_frame(
         .strip_prefix(b"data:")
         .map(|value| value.strip_prefix(b" ").unwrap_or(value));
     if let Some(data) = data.filter(|data| !data.is_empty()) {
+        if data == b"[DONE]" {
+            frame.clear();
+            return Ok(false);
+        }
         let event = std::str::from_utf8(data).map_err(|_| ())?;
         let start = decoder.parts.len();
         decoder.process(event).map_err(|_| ())?;
@@ -1145,8 +1207,56 @@ fn process_sse_frame(
             }
         }
     }
+    let completed = decoder.completed;
     frame.clear();
-    Ok(())
+    Ok(completed)
+}
+
+async fn read_safe_chatgpt_error(
+    mut response: reqwest::Response,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<Option<SafeRemoteError>, HeadlessTurnPortError> {
+    let mut body = Vec::new();
+    while body.len() < MAX_CHATGPT_ERROR_BODY_BYTES {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return Ok(None),
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_CHATGPT_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    stop_before_mapping(cancellation)?;
+
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return Ok(None);
+    };
+    let error = body.get("error").unwrap_or(&body);
+    Ok(["code", "type"]
+        .into_iter()
+        .filter_map(|field| error.get(field).and_then(Value::as_str))
+        .find_map(safe_remote_error))
+}
+
+fn safe_remote_error(value: &str) -> Option<SafeRemoteError> {
+    match value {
+        "invalid_request" | "invalid_request_error" | "context_length_exceeded" => {
+            Some(SafeRemoteError::InvalidRequest)
+        }
+        "authentication_error" | "invalid_api_key" => Some(SafeRemoteError::Authentication),
+        "permission_error" => Some(SafeRemoteError::Permission),
+        "rate_limit_error" | "rate_limit_exceeded" | "insufficient_quota" => {
+            Some(SafeRemoteError::RateLimit)
+        }
+        "server_error" => Some(SafeRemoteError::Server),
+        _ => None,
+    }
 }
 
 fn stop_before_mapping(
@@ -1595,10 +1705,13 @@ impl OpenAiResponseDecoder {
             "response.function_call_arguments.done" => self.finish_function_call(&event)?,
             "error" => return Err(upstream_error(&event)),
             "response.failed" => return Err(response_failed_error(&event)),
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 self.capture_response_id(&event)?;
                 self.usage = Some(usage_from_event(&event));
                 self.completed = true;
+            }
+            "response.incomplete" => {
+                return Err(protocol_error("upstream response was incomplete"));
             }
             _ => {}
         }
