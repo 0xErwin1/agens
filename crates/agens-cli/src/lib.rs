@@ -42,6 +42,8 @@ use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
 mod model_registry;
 
+pub use model_registry::TuiModelSelector;
+
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
@@ -274,6 +276,7 @@ pub struct HeadlessChatRequest {
     pub max_iterations: Option<usize>,
     pub mode: PermissionMode,
     pub dangerously_allow_all: bool,
+    request_config: agens_core::RequestConfig,
     session: Option<SessionMetadata>,
     active_agent: Option<String>,
     effective_capabilities: Option<EffectiveCapabilitySet>,
@@ -843,6 +846,7 @@ struct TuiSessionContext {
     messages: Vec<Message>,
     active_agent: Option<ActiveAgentRuntime>,
     pending_system_reminder: Option<String>,
+    selection: Option<TuiModelSelector>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveAgentRuntime {
@@ -961,6 +965,7 @@ impl TuiSessionContext {
             messages,
             active_agent: Some(active_agent),
             pending_system_reminder: None,
+            selection: None,
         }
     }
 
@@ -993,6 +998,10 @@ impl TuiSessionContext {
                 .get_or_insert_with(|| agent.system_prompt.clone());
             request.active_agent = Some(agent.name.clone());
             request.effective_capabilities = Some(agent.capabilities.clone());
+        }
+        if let Some(selection) = &self.selection {
+            request.model = Some(selection.model().to_owned());
+            request.request_config = selection.request_config().clone();
         }
         request.pending_system_reminder = self.pending_system_reminder.clone();
 
@@ -1095,6 +1104,12 @@ fn run_tui_prompt(
         command if command.starts_with("/agent ") => {
             rotate_tui_agent(bootstrap, &command[7..], session)
         }
+        command if command == "/model" || command.starts_with("/model ") => {
+            select_tui_model(bootstrap, command, session)
+        }
+        command if command == "/effort" || command.starts_with("/effort ") => {
+            select_tui_effort(bootstrap, command, session)
+        }
         prompt => {
             let request = session
                 .lock()
@@ -1109,6 +1124,7 @@ fn run_tui_prompt(
                     max_iterations: None,
                     mode: PermissionMode::Edit,
                     dangerously_allow_all: false,
+                    request_config: agens_core::RequestConfig::default(),
                     session: None,
                     active_agent: None,
                     effective_capabilities: None,
@@ -1141,6 +1157,74 @@ fn complete_tui_turn(
         session.pending_system_reminder = None;
     }
     Ok(completion.text)
+}
+
+fn select_tui_model(
+    bootstrap: &Bootstrap,
+    command: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
+    let model = command.strip_prefix("/model").unwrap_or_default().trim();
+    if model.is_empty() {
+        let selector = TuiModelSelector::new("gpt-4.1");
+        let values = selector
+            .model_values()
+            .map_err(CliError::unavailable)?
+            .join(", ");
+        let context = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        let current = context
+            .selection
+            .as_ref()
+            .map(|selection| selection.model())
+            .or_else(|| bootstrap.model())
+            .unwrap_or_else(|| default_model(bootstrap));
+        return Ok(format!("Model: {current}. Available: {values}."));
+    }
+
+    let mut selector = TuiModelSelector::new(model);
+    selector
+        .apply_model(model)
+        .map_err(CliError::configuration)?;
+    let model = selector.model().to_owned();
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    context.selection = Some(selector);
+    Ok(format!("Model: {model}."))
+}
+
+fn select_tui_effort(
+    bootstrap: &Bootstrap,
+    command: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
+    let effort = command.strip_prefix("/effort").unwrap_or_default().trim();
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    if effort.is_empty() {
+        let current = context
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.reasoning_effort())
+            .unwrap_or("default");
+        return Ok(format!("Reasoning effort: {current}."));
+    }
+
+    let model = context
+        .selection
+        .as_ref()
+        .map(|selection| selection.model())
+        .or_else(|| bootstrap.model())
+        .unwrap_or_else(|| default_model(bootstrap));
+    let mut selector = TuiModelSelector::new(model);
+    selector
+        .apply_reasoning_effort(effort)
+        .map_err(CliError::configuration)?;
+    context.selection = Some(selector);
+    Ok(format!("Reasoning effort: {effort}."))
 }
 
 fn rotate_tui_agent(
@@ -1322,6 +1406,7 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         max_iterations: None,
         mode: PermissionMode::Edit,
         dangerously_allow_all: false,
+        request_config: agens_core::RequestConfig::default(),
         session: None,
         active_agent: None,
         effective_capabilities: None,
@@ -1583,7 +1668,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
-                move |model, messages, tools| {
+                move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
                         bootstrap.provider_base_url(),
@@ -1593,7 +1678,9 @@ fn run_production_headless_chat_with_progress(
                         std::time::Duration::from_secs(120),
                     )
                     .map(|provider| {
-                        provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                        provider
+                            .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                            .with_request_config(request_config)
                     })
                     .map_err(|_| {
                         CliError::authentication("OpenAI API authentication is unavailable")
@@ -1613,7 +1700,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
-                move |model, messages, tools| {
+                move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
                         bootstrap.provider_base_url(),
@@ -1625,7 +1712,9 @@ fn run_production_headless_chat_with_progress(
                         std::time::Duration::from_secs(120),
                     )
                     .map(|provider| {
-                        provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                        provider
+                            .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                            .with_request_config(request_config)
                     })
                     .map_err(|_| {
                         CliError::authentication("ChatGPT credentials are unavailable or invalid")
@@ -1644,7 +1733,12 @@ fn run_production_headless_chat_with_provider<P>(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    build_provider: impl FnOnce(String, Vec<Message>, Vec<OpenAiFunctionTool>) -> Result<P, CliError>,
+    build_provider: impl FnOnce(
+        String,
+        Vec<Message>,
+        Vec<OpenAiFunctionTool>,
+        agens_core::RequestConfig,
+    ) -> Result<P, CliError>,
 ) -> Result<HeadlessChatCompletion, CliError>
 where
     P: ProgressAwareProvider,
@@ -1682,7 +1776,12 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut provider = build_provider(model, provider_messages(&request), provider_tools)?;
+    let mut provider = build_provider(
+        model,
+        provider_messages(&request),
+        provider_tools,
+        request.request_config.clone(),
+    )?;
     if let Some(progress) = progress {
         provider = provider.with_progress_sink(Arc::clone(progress));
     }
@@ -3367,6 +3466,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            request_config: agens_core::RequestConfig::default(),
             session: None,
             active_agent: None,
             effective_capabilities: None,
@@ -3687,6 +3787,7 @@ mod tests {
                 max_iterations: None,
                 mode: PermissionMode::Edit,
                 dangerously_allow_all: false,
+                request_config: agens_core::RequestConfig::default(),
                 session: None,
                 active_agent: None,
                 effective_capabilities: None,
@@ -3850,6 +3951,7 @@ mod tests {
                 max_iterations: None,
                 mode: PermissionMode::Edit,
                 dangerously_allow_all: false,
+                request_config: agens_core::RequestConfig::default(),
                 session: None,
                 active_agent: None,
                 effective_capabilities: None,
@@ -3930,6 +4032,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            request_config: agens_core::RequestConfig::default(),
             session: None,
             active_agent: None,
             effective_capabilities: None,

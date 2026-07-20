@@ -1,3 +1,4 @@
+use agens_core::{ReasoningEffort, RequestConfig};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -26,6 +27,68 @@ pub(crate) fn bundled_openai_models() -> Result<Vec<ModelMetadata>, ModelRegistr
     }
 
     parse_models(SNAPSHOT)
+}
+
+/// Validates and retains the bounded selections exposed by the terminal UI adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiModelSelector {
+    model: String,
+    request_config: RequestConfig,
+}
+
+impl TuiModelSelector {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            request_config: RequestConfig::default(),
+        }
+    }
+
+    pub fn model_values(&self) -> Result<Vec<String>, String> {
+        bundled_openai_models()
+            .map(|models| models.into_iter().map(|model| model.id).collect())
+            .map_err(|_| "model registry is unavailable".to_owned())
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn apply_model(&mut self, model: &str) -> Result<(), String> {
+        if !is_bundled_model(model)? {
+            return Err("model is unavailable".to_owned());
+        }
+
+        self.model = model.to_owned();
+        Ok(())
+    }
+
+    pub const fn reasoning_effort_values(&self) -> [&'static str; 6] {
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&'static str> {
+        self.request_config
+            .reasoning_effort()
+            .map(ReasoningEffort::as_str)
+    }
+
+    pub const fn request_config(&self) -> &RequestConfig {
+        &self.request_config
+    }
+
+    pub fn apply_reasoning_effort(&mut self, effort: &str) -> Result<(), String> {
+        let request_config = RequestConfig::with_reasoning_effort(effort)
+            .map_err(|_| "reasoning effort is unsupported".to_owned())?;
+        self.request_config = request_config;
+        Ok(())
+    }
+}
+
+fn is_bundled_model(model: &str) -> Result<bool, String> {
+    bundled_openai_models()
+        .map(|models| models.iter().any(|candidate| candidate.id == model))
+        .map_err(|_| "model registry is unavailable".to_owned())
 }
 
 pub(crate) fn bundled_snapshot_checksum() -> String {

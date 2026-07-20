@@ -8,13 +8,14 @@ use std::thread;
 use std::time::Duration;
 
 use agens::{
-    CliDependencies, ExitStatus, bootstrap, execute, execute_os, execute_with_cancellation,
+    CliDependencies, ExitStatus, TuiModelSelector, bootstrap, execute, execute_os,
+    execute_with_cancellation,
 };
 use agens_core::{
     CompletedSessionTurn, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
     HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError,
-    Message, MessagePart, PermissionDecision, Role, SessionMessage, SessionMetadata, TurnEvent,
-    TurnProvider, run_headless_turn,
+    Message, MessagePart, PermissionDecision, ReasoningEffort, Role, SessionMessage,
+    SessionMetadata, TurnEvent, TurnProvider, run_headless_turn,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::McpTransport;
@@ -955,6 +956,64 @@ fn tui_resume_shapes_reach_the_injected_tui_launcher() {
         assert_eq!(result.status, ExitStatus::Success, "{arguments:?}");
         assert_eq!(result.stdout, expected, "{arguments:?}");
     }
+}
+
+#[test]
+fn tui_model_selector_applies_only_bundled_models_and_preserves_state_on_refusal() {
+    let mut selector = TuiModelSelector::new("gpt-4.1");
+
+    assert_eq!(
+        selector
+            .model_values()
+            .expect("registry should be available"),
+        vec![
+            "gpt-4.1",
+            "gpt-4.1-mini",
+            "gpt-4.1-nano",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "o3",
+            "o4-mini",
+        ]
+    );
+    assert_eq!(selector.model(), "gpt-4.1");
+
+    selector
+        .apply_model("o3")
+        .expect("bundled model should apply");
+    assert_eq!(selector.model(), "o3");
+
+    assert_eq!(
+        selector.apply_model("not-a-model"),
+        Err("model is unavailable".to_owned())
+    );
+    assert_eq!(selector.model(), "o3");
+}
+
+#[test]
+fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_without_mutation() {
+    let mut selector = TuiModelSelector::new("gpt-4.1");
+
+    assert_eq!(
+        selector.reasoning_effort_values(),
+        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(selector.reasoning_effort(), None);
+
+    selector
+        .apply_reasoning_effort("high")
+        .expect("supported effort should apply");
+    assert_eq!(
+        selector.request_config().reasoning_effort(),
+        Some(ReasoningEffort::High)
+    );
+    assert_eq!(selector.reasoning_effort(), Some("high"));
+
+    assert_eq!(
+        selector.apply_reasoning_effort("unsupported"),
+        Err("reasoning effort is unsupported".to_owned())
+    );
+    assert_eq!(selector.reasoning_effort(), Some("high"));
 }
 
 #[cfg(unix)]
