@@ -4043,6 +4043,168 @@ mod tests {
     }
 
     #[test]
+    fn tui_model_and_effort_commands_reach_each_provider_with_latest_selection_only() {
+        for provider_type in ["openai-api", "openai-chatgpt"] {
+            let request = run_tui_model_effort_provider_case(provider_type);
+
+            assert_eq!(request["model"], "o3", "{provider_type}");
+            assert!(
+                !request.to_string().contains("gpt-4.1"),
+                "{provider_type} request retained the replaced model: {request}"
+            );
+
+            let reasoning = &request["reasoning"];
+            assert_eq!(reasoning["effort"], "high", "{provider_type}");
+            assert!(
+                !reasoning.to_string().contains("low"),
+                "{provider_type} request retained the replaced effort: {reasoning}"
+            );
+        }
+    }
+
+    fn run_tui_model_effort_provider_case(provider_type: &str) -> serde_json::Value {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-tui-model-effort-{provider_type}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let project_root = temporary.join("project");
+        let config_home = temporary.join("config");
+        let data_directory = temporary.join("data");
+        std::fs::create_dir_all(project_root.join(".git"))
+            .expect("project marker should be created");
+        std::fs::create_dir_all(&config_home).expect("config directory should be created");
+
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock provider should have an address");
+        let worker = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock provider should accept the selected request");
+            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("request line should be readable");
+            assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+            let mut content_length = None;
+            loop {
+                let mut header = String::new();
+                reader
+                    .read_line(&mut header)
+                    .expect("request header should be readable");
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length: ") {
+                    content_length = Some(
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("content length should be numeric"),
+                    );
+                }
+            }
+
+            let mut body =
+                vec![0_u8; content_length.expect("request should include content length")];
+            std::io::Read::read_exact(&mut reader, &mut body)
+                .expect("request body should be readable");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"selected answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                .expect("mock response should be written");
+
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("provider request should be valid JSON")
+        });
+
+        if provider_type == "openai-chatgpt" {
+            std::fs::write(
+                config_home.join("auth.json"),
+                r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"refresh","account_id":"account","expires_at":"2030-01-01T00:00:00Z"}}"#,
+            )
+            .expect("ChatGPT credentials should be written");
+        }
+
+        let dependencies = CliDependencies::for_test(
+            project_root,
+            Some(temporary.join("home")),
+            BTreeMap::from([
+                (
+                    "AGENS_CONFIG_HOME".to_owned(),
+                    config_home.display().to_string(),
+                ),
+                ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+            ]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"{provider_type}\"\nmodel = \"gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            )]),
+        );
+        let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = HeadlessTurnCancellation::new();
+
+        for (command, expected) in [
+            ("/model gpt-4.1", "Model: gpt-4.1."),
+            ("/effort low", "Reasoning effort: low."),
+            ("/model o3", "Model: o3."),
+            ("/effort high", "Reasoning effort: high."),
+        ] {
+            assert_eq!(
+                run_tui_prompt(&bootstrap, command, &cancellation, &session, None)
+                    .expect("valid TUI selection should succeed"),
+                expected
+            );
+        }
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/model unavailable",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect_err("invalid model should be refused")
+            .to_string(),
+            "config: model is unavailable"
+        );
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/effort unsupported",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect_err("invalid effort should be refused")
+            .to_string(),
+            "config: reasoning effort is unsupported"
+        );
+        assert_eq!(
+            run_tui_prompt(&bootstrap, "next request", &cancellation, &session, None)
+                .expect("selected prompt should complete"),
+            "selected answer"
+        );
+
+        let request = worker.join().expect("mock provider should finish");
+        std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
+        request
+    }
+
+    #[test]
     fn permission_prompt_answers_preserve_choices_and_redact_sensitive_targets() {
         for (input, expected) in [
             ("a", PermissionPromptAnswer::AllowOnce),
