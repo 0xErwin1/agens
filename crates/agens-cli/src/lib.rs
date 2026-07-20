@@ -1338,23 +1338,11 @@ impl TuiRuntimeRouter {
     ) -> TuiSubmissionOutcome {
         let command = input.trim();
         let auth = match command {
-            "/connect" => Some(self.connect(ChatGptAuthFlow::Browser, progress)),
             "/connect --device-auth" => Some(self.connect(ChatGptAuthFlow::Device, progress)),
-            "/disconnect" => Some(self.disconnect()),
             _ => None,
         };
         if let Some(result) = auth {
-            return match result {
-                Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
-                Err(AuthRouteError::Auth(error)) => TuiSubmissionOutcome::LocalActionableError {
-                    message: error.message().into(),
-                    action: error.action().into(),
-                },
-                Err(AuthRouteError::Runtime(error)) => TuiSubmissionOutcome::LocalActionableError {
-                    message: error.to_string(),
-                    action: TUI_ERROR_ACTION.into(),
-                },
-            };
+            return auth_route_outcome(result);
         }
         self.resolve(input)
             .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
@@ -1371,7 +1359,9 @@ impl TuiRuntimeRouter {
         let result = match request {
             TuiRouteRequest::Input(input) => return self.route_with_progress(input, progress),
             TuiRouteRequest::OpenDialog(route_id) => self.open_dialog(&route_id),
-            TuiRouteRequest::DialogAction(action_id) => self.route_dialog_action(&action_id),
+            TuiRouteRequest::DialogAction(action_id) => {
+                return self.route_dialog_action(&action_id, progress);
+            }
         };
         result.unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
             message: error.to_string(),
@@ -1382,6 +1372,22 @@ impl TuiRuntimeRouter {
     fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
         let dialog = match route_id {
+            "connect" => DialogView::selection(
+                "Connect to ChatGPT",
+                Some("Choose an authentication flow"),
+                vec![
+                    DialogEntry::action("Browser", "connect:browser"),
+                    DialogEntry::action("Device Code", "connect:device"),
+                ],
+            ),
+            "disconnect" => DialogView::selection(
+                "Disconnect from ChatGPT",
+                Some("Remove stored ChatGPT credentials?"),
+                vec![
+                    DialogEntry::action("Disconnect", "disconnect:confirm"),
+                    DialogEntry::cancel("Cancel"),
+                ],
+            ),
             "model" => {
                 let selector = TuiModelSelector::new("gpt-4.1");
                 let values = selector.model_values().map_err(CliError::unavailable)?;
@@ -1440,24 +1446,123 @@ impl TuiRuntimeRouter {
                 Some(render_tui_help(&self.palette)),
                 Vec::new(),
             ),
+            "sessions" => {
+                let project = tui_project_identifier(&bootstrap)?;
+                let store = SessionStore::open(bootstrap.data_directory())
+                    .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+                let mut sessions = store
+                    .list_sessions()
+                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
+                    .into_iter()
+                    .filter(|session| session.project == project)
+                    .collect::<Vec<_>>();
+                sessions.sort_by_key(|session| session.id);
+                let entries = sessions
+                    .into_iter()
+                    .map(|session| {
+                        let label = format!(
+                            "#{} {} ({} turns)",
+                            session.id, session.title, session.completed_turn_count
+                        );
+                        DialogEntry::action(label, format!("session:{}", session.id))
+                    })
+                    .collect::<Vec<_>>();
+                let help = entries.is_empty().then_some("No saved sessions.");
+                DialogView::selection("Resume session", help, entries)
+            }
+            "agent" => {
+                let catalog = tui_agent_catalog(&bootstrap, &BundledModelValidator)?;
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let current = context
+                    .active_agent
+                    .as_ref()
+                    .map(|agent| agent.name.as_str())
+                    .or_else(|| {
+                        context
+                            .metadata
+                            .as_ref()
+                            .map(|metadata| metadata.active_agent.as_str())
+                    })
+                    .unwrap_or("primary");
+                let entries = catalog
+                    .primary_or_all()
+                    .map(|agent| {
+                        let label = if agent.name == current {
+                            format!("{} (current)", agent.name)
+                        } else {
+                            agent.name.clone()
+                        };
+                        DialogEntry::action(label, format!("agent:{}", agent.name))
+                    })
+                    .collect();
+                DialogView::selection("Choose agent", Some("Eligible primary agents"), entries)
+            }
             _ => return Err(CliError::usage("TUI dialog is unavailable")),
         };
         Ok(TuiSubmissionOutcome::Dialog(dialog))
     }
 
-    fn route_dialog_action(&self, action_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
-        let bootstrap = self.bootstrap()?;
-        let message = if let Some(model) = action_id.strip_prefix("model:") {
-            apply_tui_model(model, &self.session)?
-        } else if let Some(effort) = action_id.strip_prefix("effort:") {
-            apply_tui_effort(&bootstrap, effort, &self.session)?
-        } else {
-            return Err(CliError::usage("TUI dialog action is unavailable"));
-        };
-        Ok(TuiSubmissionOutcome::ContextChanged {
-            message,
-            presentation: self.presentation()?,
-        })
+    fn route_dialog_action(
+        &self,
+        action_id: &str,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> TuiSubmissionOutcome {
+        match action_id {
+            "connect:browser" => {
+                return auth_route_outcome(self.connect(ChatGptAuthFlow::Browser, progress));
+            }
+            "connect:device" => {
+                return auth_route_outcome(self.connect(ChatGptAuthFlow::Device, progress));
+            }
+            "disconnect:confirm" => return auth_route_outcome(self.disconnect()),
+            _ => {}
+        }
+        let result = (|| {
+            let bootstrap = self.bootstrap()?;
+            if let Some(identifier) = action_id.strip_prefix("session:") {
+                let identifier = identifier
+                    .parse()
+                    .map_err(|_| CliError::usage("session action is invalid"))?;
+                let resumed = resume_tui_session(&bootstrap, identifier, &self.skills)?;
+                let message = resumed.note();
+                let mut session = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                if session.running {
+                    return Err(CliError::runtime(HeadlessTurnError::State));
+                }
+                *session = resumed;
+                drop(session);
+                return Ok(TuiSubmissionOutcome::ContextChanged {
+                    message,
+                    presentation: self.presentation()?,
+                });
+            }
+            let message = if let Some(model) = action_id.strip_prefix("model:") {
+                apply_tui_model(model, &self.session)?
+            } else if let Some(effort) = action_id.strip_prefix("effort:") {
+                apply_tui_effort(&bootstrap, effort, &self.session)?
+            } else if let Some(agent) = action_id.strip_prefix("agent:") {
+                rotate_tui_agent(&bootstrap, agent, &self.session, &self.skills)?
+            } else {
+                return Err(CliError::usage("TUI dialog action is unavailable"));
+            };
+            Ok(TuiSubmissionOutcome::ContextChanged {
+                message,
+                presentation: self.presentation()?,
+            })
+        })();
+        match result {
+            Ok(outcome) => outcome,
+            Err(error) => TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        }
     }
 
     fn palette_entries(&self) -> &[PaletteEntry] {
@@ -1485,7 +1590,9 @@ impl TuiRuntimeRouter {
         let outcome = match command {
             "/help" => self.open_dialog("help")?,
             "/quit" => TuiSubmissionOutcome::Quit,
-            "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&bootstrap)?),
+            "/sessions" | "/resume" => self.open_dialog("sessions")?,
+            "/connect" => self.open_dialog("connect")?,
+            "/disconnect" => self.open_dialog("disconnect")?,
             "/new" => {
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1525,11 +1632,7 @@ impl TuiRuntimeRouter {
                 message: rotate_tui_agent(&bootstrap, &command[7..], &self.session, &self.skills)?,
                 presentation: self.presentation()?,
             },
-            "/agent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
-                &bootstrap,
-                &self.session,
-                agens_core::AgentMode::Primary,
-            )?),
+            "/agent" => self.open_dialog("agent")?,
             command if command.starts_with("/subagent ") => TuiSubmissionOutcome::ContextChanged {
                 message: select_tui_subagent(&bootstrap, &command[10..], &self.session)?,
                 presentation: self.presentation()?,
@@ -1700,6 +1803,20 @@ enum AuthRouteError {
     Runtime(CliError),
 }
 
+fn auth_route_outcome(result: Result<String, AuthRouteError>) -> TuiSubmissionOutcome {
+    match result {
+        Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
+        Err(AuthRouteError::Auth(error)) => TuiSubmissionOutcome::LocalActionableError {
+            message: error.message().into(),
+            action: error.action().into(),
+        },
+        Err(AuthRouteError::Runtime(error)) => TuiSubmissionOutcome::LocalActionableError {
+            message: error.to_string(),
+            action: TUI_ERROR_ACTION.into(),
+        },
+    }
+}
+
 fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
     match result {
         Ok(output) => TuiProviderOutcome::Completed(output),
@@ -1822,7 +1939,12 @@ fn resolved_tui_palette(commands: &CommandCatalog, skills: &SkillCatalog) -> Vec
         .iter()
         .map(|(name, description, hint, dialog_id)| {
             let entry = PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn);
-            dialog_id.map_or(entry.clone(), |dialog_id| entry.with_dialog(dialog_id))
+            let dialog_id = dialog_id.or(match *name {
+                "connect" | "disconnect" | "agent" => Some(*name),
+                "sessions" | "resume" => Some("sessions"),
+                _ => None,
+            });
+            dialog_id.map_or(entry.clone(), |route| entry.with_dialog(route))
         })
         .collect::<Vec<_>>();
     let mut custom_commands = commands
@@ -2377,6 +2499,7 @@ impl AgentModelValidator for BundledModelValidator {
     }
 }
 
+#[cfg(test)]
 fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
     let project = tui_project_identifier(bootstrap)?;
     let store = SessionStore::open(bootstrap.data_directory())
@@ -4441,6 +4564,7 @@ mod tests {
         AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot,
         Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState, Usage,
     };
+    use agens_tui::{Action, Event, Key};
 
     #[test]
     fn production_task_error_mapping_reserves_provider_for_provider_failures() {
@@ -5808,11 +5932,8 @@ mod tests {
             assert_eq!(prompt, expected);
         }
 
-        let sessions = enter_tui_input(&mut tui, "/sessions");
-        assert!(
-            tui.apply_submission_outcome(router.route(sessions))
-                .is_none()
-        );
+        let sessions = router.open_dialog("sessions").unwrap();
+        assert!(matches!(sessions, TuiSubmissionOutcome::Dialog(_)));
         assert!(matches!(
             router.route("/help".into()),
             TuiSubmissionOutcome::Dialog(_)
@@ -5905,6 +6026,134 @@ mod tests {
     }
 
     #[test]
+    fn tui_sessions_resume_and_agent_overlays_filter_navigate_cancel_and_apply_typed_outcomes() {
+        let temporary = tui_session_directory("session-agent-overlays");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[
+                (
+                    "all",
+                    "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
+                ),
+                (
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                ),
+            ],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let (progress, _) = std::sync::mpsc::channel();
+
+        let empty = router.route_request(
+            agens_tui::TuiRouteRequest::OpenDialog("sessions".into()),
+            progress.clone(),
+        );
+        tui.apply_submission_outcome(empty);
+        assert!(render_tui_test_backend(&tui, 80, 24).contains("No saved sessions."));
+        tui.handle(Event::Key(Key::Escape));
+
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let current = persist_tui_session(&mut store, &tui_project(&temporary), "current");
+        let other = persist_tui_session(
+            &mut store,
+            &temporary.join("other").display().to_string(),
+            "other",
+        );
+        drop(store);
+
+        open_tui_palette_dialog(&mut tui, &router, "/se", "sessions", progress.clone());
+        let sessions = render_tui_test_backend(&tui, 80, 24);
+        assert!(sessions.contains(&format!("#{} current", current.id)));
+        assert!(!sessions.contains(&format!("#{} other", other.id)));
+        let original = session.lock().unwrap().clone();
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert_eq!(*session.lock().unwrap(), original);
+
+        open_tui_palette_dialog(&mut tui, &router, "/re", "sessions", progress.clone());
+        dispatch_tui_dialog_selection(&mut tui, &router, progress.clone());
+        assert_eq!(tui.view().session, format!("session #{}", current.id));
+        assert!(
+            matches!(tui.transcript().last(), Some(agens_tui::TranscriptEntry::Info(note)) if note.contains("Resumed session"))
+        );
+
+        open_tui_palette_dialog(&mut tui, &router, "/ag", "agent", progress.clone());
+        let agents = render_tui_test_backend(&tui, 80, 24);
+        assert!(agents.contains("primary (current)"), "{agents:?}");
+        tui.handle(Event::Key(Key::Down));
+        dispatch_tui_dialog_selection(&mut tui, &router, progress);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_connect_and_disconnect_overlays_select_flows_and_cancel_without_credentials_mutation() {
+        let temporary = tui_session_directory("auth-overlays");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        let initial_credentials = r#"{"openai-api":{"api_key":"preserved"}}"#;
+        std::fs::write(&credentials_path, initial_credentials).unwrap();
+        let flows = Arc::new(Mutex::new(Vec::new()));
+        let coordinator = ChatGptAuthCoordinator::with_authenticator({
+            let flows = Arc::clone(&flows);
+            move |flow, _, publish| {
+                flows.lock().unwrap().push(flow);
+                publish(ChatGptAuthProgress::BrowserUrl("auth-url".into()));
+                Ok(test_chatgpt_credentials("new-access"))
+            }
+        });
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::with_auth_coordinator(
+            tui_session_bootstrap(&temporary, &[]),
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            coordinator,
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let (progress, _) = std::sync::mpsc::channel();
+
+        for (prefix, down, flow) in [
+            ("/co", false, ChatGptAuthFlow::Browser),
+            ("/co", true, ChatGptAuthFlow::Device),
+        ] {
+            open_tui_palette_dialog(&mut tui, &router, prefix, "connect", progress.clone());
+            if down {
+                tui.handle(Event::Key(Key::Down));
+            }
+            dispatch_tui_dialog_selection(&mut tui, &router, progress.clone());
+            assert_eq!(flows.lock().unwrap().last(), Some(&flow));
+        }
+
+        open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress.clone());
+        let connected = std::fs::read_to_string(&credentials_path).unwrap();
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        let after_cancel = std::fs::read_to_string(&credentials_path).unwrap();
+        assert_eq!(after_cancel, connected);
+        open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress);
+        dispatch_tui_dialog_selection(&mut tui, &router, std::sync::mpsc::channel().0);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_history() {
         let temporary = tui_session_directory("auth-router");
         let config_home = temporary.join("config");
@@ -5939,26 +6188,18 @@ mod tests {
         );
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
 
-        for command in ["/connect", "/connect --device-auth"] {
-            assert!(matches!(
-                router.route_with_progress(command.into(), progress_tx.clone()),
-                TuiSubmissionOutcome::LocalInfo(_)
-            ));
-        }
-        assert_eq!(progress_rx.try_iter().count(), 2);
-        assert_eq!(
-            *flows.lock().unwrap(),
-            vec![ChatGptAuthFlow::Browser, ChatGptAuthFlow::Device]
-        );
+        assert!(matches!(
+            router.route_with_progress("/connect --device-auth".into(), progress_tx),
+            TuiSubmissionOutcome::LocalInfo(_)
+        ));
+        assert_eq!(progress_rx.try_iter().count(), 1);
+        assert_eq!(*flows.lock().unwrap(), vec![ChatGptAuthFlow::Device]);
         assert_eq!(*session.lock().unwrap(), TuiSessionContext::fresh());
         assert!(router.bootstrap().unwrap().provider_type() == Some("openai-chatgpt"));
         let connected = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(connected.contains("new-access"));
 
-        assert!(matches!(
-            router.route("/disconnect".into()),
-            TuiSubmissionOutcome::LocalInfo(_)
-        ));
+        assert!(router.disconnect().is_ok());
         assert!(router.bootstrap().unwrap().provider_type() == Some("openai-api"));
         let stored = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(stored.contains("preserved"));
@@ -6112,6 +6353,36 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn open_tui_palette_dialog(
+        tui: &mut Tui<ProductionTuiEngine>,
+        router: &TuiRuntimeRouter,
+        prefix: &str,
+        expected_route: &str,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) {
+        for character in prefix.chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("palette Enter should open a dialog");
+        };
+        assert_eq!(route_id, expected_route);
+        let outcome = router.route_request(TuiRouteRequest::OpenDialog(route_id), progress);
+        assert!(tui.apply_submission_outcome(outcome).is_none());
+    }
+
+    fn dispatch_tui_dialog_selection(
+        tui: &mut Tui<ProductionTuiEngine>,
+        router: &TuiRuntimeRouter,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) {
+        let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("dialog Enter should dispatch an action");
+        };
+        let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
+        assert!(tui.apply_submission_outcome(outcome).is_none());
     }
 
     fn write_tui_command(root: &Path, name: &str, description: &str, template: &str) {
