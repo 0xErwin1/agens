@@ -526,6 +526,7 @@ fn typed_submission_outcomes_start_only_explicit_provider_turns() {
 
     assert_eq!(
         tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+            display: "provider prompt".into(),
             prompt: "provider prompt".into(),
         }),
         Some("provider prompt".into())
@@ -614,6 +615,7 @@ fn typed_reset_and_context_outcomes_update_visible_state_after_success() {
 fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
     let mut success = Tui::new(FakeEngine::default());
     success.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        display: "request".into(),
         prompt: "request".into(),
     });
     success.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
@@ -630,6 +632,7 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
 
     let mut failure = Tui::new(FakeEngine::default());
     failure.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        display: "request".into(),
         prompt: "request".into(),
     });
     failure.finish_provider_turn(TuiProviderOutcome::Failed {
@@ -668,6 +671,7 @@ fn submission_start_resets_footer_metrics() {
     assert_eq!(tui.view().turn_duration, Some(Duration::from_millis(25)));
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        display: "next".into(),
         prompt: "next".into(),
     });
 

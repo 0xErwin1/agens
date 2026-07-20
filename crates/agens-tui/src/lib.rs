@@ -121,6 +121,7 @@ impl TuiPresentation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TuiSubmissionOutcome {
     ProviderTurn {
+        display: String,
         prompt: String,
     },
     LocalInfo(String),
@@ -820,8 +821,8 @@ where
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
         self.dialog = None;
         match outcome {
-            TuiSubmissionOutcome::ProviderTurn { prompt } => {
-                self.begin_submission(prompt.clone());
+            TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
+                self.begin_submission(display);
                 Some(prompt)
             }
             TuiSubmissionOutcome::LocalInfo(message) => {

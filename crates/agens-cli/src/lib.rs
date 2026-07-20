@@ -29,13 +29,13 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
-    AgentCatalog, AgentModelValidator, AuthorizedToolCall, DispatchTool, EffectiveCapabilitySet,
-    McpHttpTransport, McpLimits, McpRegistry, McpSseTransport, McpStdioTransport,
-    McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
-    NativeToolCatalog, NativeTools, PermissionPromptContext, ReadFileInput, RemoteToolMetadata,
-    SkillCatalog, TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest,
-    TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    AgentCatalog, AgentModelValidator, AuthorizedToolCall, CommandCatalog, CommandDefinition,
+    DispatchTool, EffectiveCapabilitySet, McpHttpTransport, McpLimits, McpRegistry,
+    McpSseTransport, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
+    McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
+    PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, TaskRunContext,
+    TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
+    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, ToolResultState, Tui,
@@ -52,6 +52,17 @@ pub use model_registry::TuiModelSelector;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
+const RESERVED_TUI_COMMANDS: &[&str] = &[
+    "agent",
+    "connect",
+    "disconnect",
+    "effort",
+    "model",
+    "new",
+    "resume",
+    "sessions",
+    "subagent",
+];
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
@@ -1249,6 +1260,7 @@ struct TuiRuntimeRouter {
     session: Arc<Mutex<TuiSessionContext>>,
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
+    commands: Arc<CommandCatalog>,
 }
 
 impl TuiRuntimeRouter {
@@ -1256,11 +1268,13 @@ impl TuiRuntimeRouter {
         bootstrap: Bootstrap,
         session: Arc<Mutex<TuiSessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+        commands: Arc<CommandCatalog>,
     ) -> Self {
         Self::with_auth_coordinator(
             bootstrap,
             session,
             cancellation,
+            commands,
             ChatGptAuthCoordinator::production(),
         )
     }
@@ -1269,6 +1283,7 @@ impl TuiRuntimeRouter {
         bootstrap: Bootstrap,
         session: Arc<Mutex<TuiSessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+        commands: Arc<CommandCatalog>,
         auth: ChatGptAuthCoordinator,
     ) -> Self {
         Self {
@@ -1276,6 +1291,7 @@ impl TuiRuntimeRouter {
             session,
             cancellation,
             auth,
+            commands,
         }
     }
 
@@ -1319,10 +1335,21 @@ impl TuiRuntimeRouter {
 
     fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
         if !input.starts_with('/') {
-            return Ok(TuiSubmissionOutcome::ProviderTurn { prompt: input });
+            return Ok(TuiSubmissionOutcome::ProviderTurn {
+                display: input.clone(),
+                prompt: input,
+            });
         }
 
         let command = input.trim();
+        let invocation = command
+            .strip_prefix('/')
+            .expect("slash command input was checked");
+        let name_end = invocation
+            .find(char::is_whitespace)
+            .unwrap_or(invocation.len());
+        let (name, arguments) = invocation.split_at(name_end);
+        let arguments = arguments.trim();
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&bootstrap)?),
@@ -1397,7 +1424,16 @@ impl TuiRuntimeRouter {
                 message: select_tui_effort(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
-            _ => return Err(CliError::usage(format!("unknown TUI command: {command}"))),
+            _ if RESERVED_TUI_COMMANDS.contains(&name) => {
+                return Err(CliError::usage(format!("unknown TUI command: {command}")));
+            }
+            _ => match self.commands.command(name) {
+                Some(command) => TuiSubmissionOutcome::ProviderTurn {
+                    display: input.clone(),
+                    prompt: command.expand(arguments),
+                },
+                None => return Err(CliError::usage(format!("unknown TUI command: {command}"))),
+            },
         };
         Ok(outcome)
     }
@@ -1538,6 +1574,48 @@ fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome 
     }
 }
 
+fn start_tui_commands<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    bootstrap: &Bootstrap,
+) -> Result<Arc<CommandCatalog>, CliError> {
+    let global_root = bootstrap
+        .paths
+        .global_config
+        .parent()
+        .ok_or_else(|| CliError::configuration("global command root is unavailable"))?
+        .join("commands");
+    let project_root = bootstrap
+        .paths
+        .project_config
+        .parent()
+        .ok_or_else(|| CliError::configuration("project command root is unavailable"))?
+        .join("commands");
+    let built_ins = RESERVED_TUI_COMMANDS
+        .iter()
+        .map(|name| {
+            CommandDefinition::new(*name, "Reserved TUI command", *name)
+                .expect("reserved TUI command names are valid")
+        })
+        .collect::<Vec<_>>();
+    let discovery = CommandCatalog::discover(&built_ins, global_root, project_root)
+        .map_err(CliError::configuration)?;
+
+    for diagnostic in discovery.diagnostics() {
+        tui.add_info(format!(
+            "Command diagnostic ({}): {}",
+            diagnostic.path().display(),
+            diagnostic.message()
+        ));
+    }
+    for name in discovery.shadowed() {
+        tui.add_info(format!(
+            "Command /{name} has multiple definitions; applied source precedence."
+        ));
+    }
+
+    Ok(Arc::new(discovery.catalog().clone()))
+}
+
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
@@ -1559,7 +1637,13 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     }
     tui.set_presentation(provider, model, session_label);
 
-    let router = TuiRuntimeRouter::new(bootstrap.clone(), session, Arc::clone(&cancellation));
+    let commands = start_tui_commands(&mut tui, bootstrap)?;
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        session,
+        Arc::clone(&cancellation),
+        commands,
+    );
     let route_router = router.clone();
     run_with_default_progress_submit(
         &mut tui,
@@ -1592,13 +1676,15 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
-            let result = run_tui_prompt(
-                &runtime_bootstrap,
-                &prompt,
-                &turn_cancellation,
-                &router.session,
-                Some(&sink),
-            );
+            let result =
+                run_tui_prompt_with(&runtime_bootstrap, &prompt, &router.session, |request| {
+                    run_production_headless_chat_with_progress(
+                        request,
+                        &runtime_bootstrap,
+                        &turn_cancellation,
+                        Some(&sink),
+                    )
+                });
 
             finish_tui_metrics(&metrics, &result);
 
@@ -1614,6 +1700,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     Ok(String::new())
 }
 
+#[cfg(test)]
 fn run_tui_prompt(
     bootstrap: &Bootstrap,
     prompt: &str,
@@ -1627,6 +1714,7 @@ fn run_tui_prompt(
                 bootstrap.clone(),
                 Arc::clone(session),
                 Arc::new(Mutex::new(None)),
+                Arc::new(CommandCatalog::default()),
             );
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
@@ -1638,45 +1726,49 @@ fn run_tui_prompt(
                 }
             }
         }
-        prompt => {
-            let prompt = expand_tui_file_reference(bootstrap, prompt)?;
-            let request = {
-                let mut session = session.lock().map_err(|_| {
-                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-                })?;
-                if session.running {
-                    return Err(CliError::runtime(HeadlessTurnError::State));
-                }
-                session.running = true;
-                session.apply_to(HeadlessChatRequest {
-                    prompt,
-                    history: Vec::new(),
-                    model: None,
-                    system_prompt: None,
-                    max_iterations: None,
-                    mode: PermissionMode::Edit,
-                    dangerously_allow_all: false,
-                    request_config: agens_core::RequestConfig::default(),
-                    session: None,
-                    active_agent: None,
-                    effective_capabilities: None,
-                    pending_system_reminder: None,
-                })
-            };
-            let consumed_reminder = request.pending_system_reminder.is_some();
-            let completion = run_production_headless_chat_with_progress(
-                request,
-                bootstrap,
-                cancellation,
-                progress,
-            );
-            let mut session = session.lock().map_err(|_| {
-                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-            })?;
-            session.running = false;
-            complete_tui_turn(&mut session, completion, consumed_reminder)
-        }
+        prompt => run_tui_prompt_with(bootstrap, prompt, session, |request| {
+            run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
+        }),
     }
+}
+
+fn run_tui_prompt_with(
+    bootstrap: &Bootstrap,
+    prompt: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+    run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, CliError>,
+) -> Result<String, CliError> {
+    let prompt = expand_tui_file_reference(bootstrap, prompt)?;
+    let request = {
+        let mut session = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        if session.running {
+            return Err(CliError::runtime(HeadlessTurnError::State));
+        }
+        session.running = true;
+        session.apply_to(HeadlessChatRequest {
+            prompt,
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            request_config: agens_core::RequestConfig::default(),
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+        })
+    };
+    let consumed_reminder = request.pending_system_reminder.is_some();
+    let completion = run(request);
+    let mut session = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    session.running = false;
+    complete_tui_turn(&mut session, completion, consumed_reminder)
 }
 
 pub fn tui_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
@@ -4873,8 +4965,12 @@ mod tests {
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let router =
-            TuiRuntimeRouter::new(bootstrap, Arc::clone(&session), Arc::new(Mutex::new(None)));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+        );
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine { cancellation });
         let input = enter_tui_input(&mut tui, "/unknown");
@@ -4909,6 +5005,123 @@ mod tests {
     }
 
     #[test]
+    fn tui_startup_commands_route_real_enter_to_captured_provider_requests() {
+        let temporary = tui_session_directory("declarative-commands");
+        let config_home = temporary.join("config");
+        let global_commands = config_home.join("commands");
+        let project_commands = temporary.join("project/.agens/commands");
+        std::fs::create_dir_all(&global_commands).unwrap();
+        std::fs::create_dir_all(&project_commands).unwrap();
+        for (root, name, description, template) in [
+            (&global_commands, "shared", "global", "global:$ARGUMENTS"),
+            (
+                &global_commands,
+                "global-only",
+                "global only",
+                "Keep literal text [$ARGUMENTS]",
+            ),
+            (
+                &global_commands,
+                "slash-template",
+                "literal slash",
+                "/literal $ARGUMENTS",
+            ),
+            (
+                &global_commands,
+                "connect",
+                "collision",
+                "must not run $ARGUMENTS",
+            ),
+            (&project_commands, "shared", "project", "project:$ARGUMENTS"),
+        ] {
+            write_tui_command(root, name, description, template);
+        }
+        std::fs::write(
+            project_commands.join("broken.md"),
+            "---\ndescription: [invalid\n---\nbroken\n",
+        )
+        .unwrap();
+
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            cancellation,
+            commands,
+        );
+        let captured = Arc::new(Mutex::new(Vec::new()));
+
+        submit_tui_command(
+            &mut tui,
+            &router,
+            &bootstrap,
+            "/shared   hello world   ",
+            &captured,
+        );
+        assert!(tui.transcript().contains(&agens_tui::TranscriptEntry::User(
+            "/shared   hello world   ".into()
+        )));
+        submit_tui_command(
+            &mut tui,
+            &router,
+            &bootstrap,
+            "/global-only   value   ",
+            &captured,
+        );
+        submit_tui_command(
+            &mut tui,
+            &router,
+            &bootstrap,
+            "/slash-template text",
+            &captured,
+        );
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "project:hello world",
+                "Keep literal text [value]",
+                "/literal text",
+            ]
+        );
+        drop(requests);
+
+        for input in ["/connect custom", "/unknown"] {
+            submit_tui_command(&mut tui, &router, &bootstrap, input, &captured);
+        }
+        assert_eq!(captured.lock().unwrap().len(), 3);
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(agens_tui::TranscriptEntry::Error(_))
+        ));
+        assert!(session.lock().unwrap().messages.is_empty());
+
+        let startup = tui
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                agens_tui::TranscriptEntry::Info(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(startup.iter().any(|message| message.contains("broken.md")));
+        assert!(startup.iter().any(|message| message.contains("/shared")));
+        assert!(startup.iter().any(|message| message.contains("/connect")));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_history() {
         let temporary = tui_session_directory("auth-router");
         let config_home = temporary.join("config");
@@ -4937,6 +5150,7 @@ mod tests {
             bootstrap,
             Arc::clone(&session),
             Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
             coordinator,
         );
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -5099,6 +5313,47 @@ mod tests {
             panic!("Enter should submit through the production TUI path");
         };
         input
+    }
+
+    fn write_tui_command(root: &Path, name: &str, description: &str, template: &str) {
+        std::fs::write(
+            root.join(format!("{name}.md")),
+            format!("---\ndescription: {description}\n---\n{template}\n"),
+        )
+        .unwrap();
+    }
+
+    fn submit_tui_command(
+        tui: &mut Tui<ProductionTuiEngine>,
+        router: &TuiRuntimeRouter,
+        bootstrap: &Bootstrap,
+        input: &str,
+        captured: &Arc<Mutex<Vec<HeadlessChatRequest>>>,
+    ) {
+        let input = enter_tui_input(tui, input);
+        let Some(prompt) = tui.apply_submission_outcome(router.route(input)) else {
+            return;
+        };
+        let result = run_tui_prompt_with(bootstrap, &prompt, &router.session, {
+            let captured = Arc::clone(captured);
+            move |request| {
+                captured.lock().unwrap().push(request);
+                Ok(HeadlessChatCompletion {
+                    text: "captured".into(),
+                    metadata: SessionMetadata {
+                        id: 1,
+                        project: "project".into(),
+                        title: "captured".into(),
+                        active_agent: "build".into(),
+                        created_at: 1,
+                        updated_at: 1,
+                        completed_turn_count: 1,
+                        resumable: true,
+                    },
+                })
+            }
+        });
+        tui.finish_provider_turn(tui_provider_outcome(result));
     }
 
     fn tui_project(temporary: &Path) -> String {
