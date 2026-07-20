@@ -212,6 +212,65 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
 }
 
 #[test]
+fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn() {
+    let backend = TestBackend::new(52, 16);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("first-user-sentinel");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "first-reasoning-sentinel".into(),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "first-call".into(),
+        name: "native::read".into(),
+        input: "first-input".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "first-call".into(),
+        content: "first-result-sentinel".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed(
+        "first-answer-sentinel".into(),
+    ));
+
+    tui.begin_submission("second-user-sentinel");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "second-answer-sentinel".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("second-answer-sentinel"));
+
+    let mut history = rendered_text(&renderer);
+    for _ in 0..30 {
+        tui.handle(Event::Key(Key::PageUp));
+        renderer.render(tui.view()).unwrap();
+        history.push_str(&rendered_text(&renderer));
+    }
+    for expected in [
+        "first-user-sentinel",
+        "first-reasoning-sentinel",
+        "first-call",
+        "first-result-sentinel",
+        "first-answer-sentinel",
+    ] {
+        assert!(history.contains(expected), "missing {expected:?} in {history:?}");
+    }
+
+    tui.handle(Event::Key(Key::CtrlO));
+    let mut collapsed = String::new();
+    for _ in 0..30 {
+        tui.handle(Event::Key(Key::PageDown));
+        renderer.render(tui.view()).unwrap();
+        collapsed.push_str(&rendered_text(&renderer));
+    }
+    assert!(collapsed.contains("output collapsed"));
+}
+
+#[test]
 fn renderer_sanitizes_runtime_errors_and_preserves_the_action() {
     let backend = TestBackend::new(120, 40);
     let terminal = Terminal::new(backend).unwrap();

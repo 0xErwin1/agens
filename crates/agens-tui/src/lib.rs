@@ -221,6 +221,8 @@ pub struct ViewState<'a> {
     pub latest_usage: Option<&'a Usage>,
     /// Authoritative typed conversation projection, when a turn is active or completed.
     pub conversation: Option<&'a Conversation>,
+    /// Completed typed conversations retained before the active turn.
+    pub completed_conversations: &'a [Conversation],
     /// Tool outputs collapsed only for presentation; their source output remains retained.
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
     /// A bounded informational dialog rendered above the conversation.
@@ -414,18 +416,27 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     let mut transcript = state
-        .conversation
-        .map(|conversation| {
-            render::conversation_lines(
-                conversation,
-                state.runtime_events,
-                state.collapsed_tool_outputs,
-            )
+        .completed_conversations
+        .iter()
+        .flat_map(|conversation| {
+            render::conversation_lines(conversation, &[], state.collapsed_tool_outputs)
         })
-        .unwrap_or_else(|| transcript_lines(state.transcript));
+        .collect::<Vec<_>>();
+    if let Some(conversation) = state.conversation {
+        transcript.extend(render::conversation_lines(
+            conversation,
+            state.runtime_events,
+            state.collapsed_tool_outputs,
+        ));
+    }
+    let conversation_is_authoritative =
+        !state.completed_conversations.is_empty() || state.conversation.is_some();
+    if !conversation_is_authoritative {
+        transcript = transcript_lines(state.transcript);
+    }
     transcript.extend(render::detail_lines(
         state.runtime_events,
-        state.conversation.is_some(),
+        conversation_is_authoritative,
     ));
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
     let bottom_scroll =
@@ -932,6 +943,7 @@ pub struct Tui<E> {
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     latest_usage: Option<Usage>,
+    completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
     dialog: Option<DialogView>,
@@ -963,6 +975,7 @@ where
             runtime_events: Vec::new(),
             turn_duration: None,
             latest_usage: None,
+            completed_conversations: Vec::new(),
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
             dialog: None,
@@ -1036,6 +1049,9 @@ where
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
         self.palette_open = false;
         let prompt = prompt.into();
+        if let Some(conversation) = self.conversation.take() {
+            self.completed_conversations.push(conversation);
+        }
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
@@ -1196,6 +1212,7 @@ where
     /// Clears the current visible conversation for a new session.
     pub fn clear_transcript(&mut self) {
         self.transcript.clear();
+        self.completed_conversations.clear();
         self.conversation = None;
         self.collapsed_tool_outputs.clear();
         self.set_running(false);
@@ -1269,6 +1286,7 @@ where
             turn_duration: self.turn_duration,
             latest_usage: self.latest_usage.as_ref(),
             conversation: self.conversation.as_ref(),
+            completed_conversations: &self.completed_conversations,
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
             dialog: self.dialog.as_ref(),
             palette: self.palette_open.then_some(PaletteView {
@@ -1606,12 +1624,11 @@ where
     }
 
     fn toggle_tool_output_expansion(&mut self) {
-        let Some(conversation) = self.conversation.as_ref() else {
-            return;
-        };
-        let completed_call_ids = conversation
-            .tool_batches
+        let completed_call_ids = self
+            .completed_conversations
             .iter()
+            .chain(self.conversation.iter())
+            .flat_map(|conversation| &conversation.tool_batches)
             .flat_map(|batch| &batch.calls)
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
