@@ -51,6 +51,7 @@ impl TuiModelSource {
 pub struct TuiModelSelector {
     model: String,
     source: TuiModelSource,
+    reasoning_effort: Option<ReasoningEffort>,
     request_config: RequestConfig,
 }
 
@@ -63,6 +64,7 @@ impl TuiModelSelector {
         Self {
             model: model.into(),
             source,
+            reasoning_effort: None,
             request_config: RequestConfig::default(),
         }
     }
@@ -90,17 +92,38 @@ impl TuiModelSelector {
         }
 
         self.model = model.to_owned();
+        if self
+            .reasoning_effort
+            .is_some_and(|effort| !self.reasoning_effort_values().contains(&effort.as_str()))
+        {
+            self.reasoning_effort = None;
+            self.request_config = RequestConfig::default();
+        }
         Ok(())
     }
 
-    pub const fn reasoning_effort_values(&self) -> [&'static str; 6] {
-        ["none", "minimal", "low", "medium", "high", "xhigh"]
+    pub fn reasoning_effort_values(&self) -> Vec<&'static str> {
+        match (self.source, self.model.as_str()) {
+            (
+                TuiModelSource::ChatGptSubscription,
+                "gpt-5.3-codex-spark" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5",
+            ) => {
+                vec![
+                    "default", "none", "minimal", "low", "medium", "high", "xhigh",
+                ]
+            }
+            (TuiModelSource::OpenAiApi, "gpt-5.5") => {
+                vec!["default", "none", "low", "medium", "high", "xhigh"]
+            }
+            (TuiModelSource::OpenAiApi, "o3" | "o4-mini") => {
+                vec!["default", "none", "minimal", "low", "medium", "high"]
+            }
+            _ => vec!["default"],
+        }
     }
 
     pub fn reasoning_effort(&self) -> Option<&'static str> {
-        self.request_config
-            .reasoning_effort()
-            .map(ReasoningEffort::as_str)
+        self.reasoning_effort.map(ReasoningEffort::as_str)
     }
 
     pub const fn request_config(&self) -> &RequestConfig {
@@ -108,9 +131,25 @@ impl TuiModelSelector {
     }
 
     pub fn apply_reasoning_effort(&mut self, effort: &str) -> Result<(), String> {
-        let request_config = RequestConfig::with_reasoning_effort(effort)
+        if effort == "default" {
+            self.reasoning_effort = None;
+            self.request_config = RequestConfig::default();
+            return Ok(());
+        }
+        if !self.reasoning_effort_values().contains(&effort) {
+            return Err("reasoning effort is unsupported".to_owned());
+        }
+
+        let selected = RequestConfig::with_reasoning_effort(effort)
             .map_err(|_| "reasoning effort is unsupported".to_owned())?;
-        self.request_config = request_config;
+        let payload = if self.source == TuiModelSource::ChatGptSubscription && effort == "minimal" {
+            "low"
+        } else {
+            effort
+        };
+        self.reasoning_effort = selected.reasoning_effort();
+        self.request_config = RequestConfig::with_reasoning_effort(payload)
+            .map_err(|_| "reasoning effort is unsupported".to_owned())?;
         Ok(())
     }
 }

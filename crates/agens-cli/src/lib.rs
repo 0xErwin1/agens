@@ -1435,27 +1435,39 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let current = context
+                let model = context
                     .selection
                     .as_ref()
-                    .and_then(TuiModelSelector::reasoning_effort)
-                    .unwrap_or("default");
-                let entries = ["low", "medium", "high"]
+                    .map(TuiModelSelector::model)
+                    .or_else(|| bootstrap.model())
+                    .unwrap_or_else(|| default_model(&bootstrap));
+                let selector = context.selection.clone().unwrap_or_else(|| {
+                    TuiModelSelector::for_source(model, tui_model_source(&bootstrap))
+                });
+                let current = selector.reasoning_effort().unwrap_or("default");
+                let values = selector.reasoning_effort_values();
+                let selected = values
+                    .iter()
+                    .position(|effort| *effort == current)
+                    .unwrap_or_default();
+                let entries = values
                     .into_iter()
                     .map(|effort| {
-                        let label = if effort == current {
-                            format!("{effort} (current)")
+                        let name = if effort == "default" {
+                            "Default"
                         } else {
-                            effort.to_owned()
+                            effort
+                        };
+                        let label = if effort == current {
+                            format!("{name} (current)")
+                        } else {
+                            name.to_owned()
                         };
                         DialogEntry::action(label, format!("effort:{effort}"))
                     })
                     .collect();
-                DialogView::selection(
-                    "Choose effort",
-                    Some(format!("Current: {current}")),
-                    entries,
-                )
+                DialogView::selection("Choose effort", Some(format!("Model: {model}")), entries)
+                    .with_selected(selected)
             }
             "help" => DialogView::selection(
                 "Commands and skills",
@@ -2278,7 +2290,7 @@ fn format_model_metadata(model: &model_registry::ModelMetadata) -> String {
 }
 
 fn format_token_count(tokens: u64) -> String {
-    if tokens % 1_000 == 0 {
+    if tokens.is_multiple_of(1_000) {
         format!("{}K", tokens / 1_000)
     } else {
         tokens.to_string()
@@ -2317,16 +2329,27 @@ fn apply_tui_model(
     model: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
-    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap));
-    selector
-        .apply_model(model)
-        .map_err(CliError::configuration)?;
-    let model = selector.model().to_owned();
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    let mut selector = context
+        .selection
+        .clone()
+        .unwrap_or_else(|| TuiModelSelector::for_source(model, tui_model_source(bootstrap)));
+    let previous_effort = selector.reasoning_effort();
+    selector
+        .apply_model(model)
+        .map_err(CliError::configuration)?;
+    let reset_effort = previous_effort.filter(|_| selector.reasoning_effort().is_none());
     context.selection = Some(selector);
-    Ok(format!("Model: {model}."))
+    Ok(reset_effort.map_or_else(
+        || format!("Model: {model}."),
+        |effort| {
+            format!(
+                "Model: {model}. Reasoning effort reset to Default because {effort} is unsupported."
+            )
+        },
+    ))
 }
 
 fn select_tui_effort(
@@ -2370,6 +2393,11 @@ fn apply_tui_effort(
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
     context.selection = Some(selector);
+    let effort = if effort == "default" {
+        "Default"
+    } else {
+        effort
+    };
     Ok(format!("Reasoning effort: {effort}."))
 }
 
@@ -6044,7 +6072,7 @@ mod tests {
 
         for (prefix, route_id, expected) in [
             ("/mo", "model", ["Choose model", "gpt-4.1 (current)"]),
-            ("/ef", "effort", ["Choose effort", "medium"]),
+            ("/ef", "effort", ["Choose effort", "Default"]),
             ("/he", "help", ["Commands and skills", "/connect"]),
         ] {
             for character in prefix.chars() {
@@ -6141,6 +6169,59 @@ mod tests {
 
             std::fs::remove_dir_all(temporary).unwrap();
         }
+    }
+
+    #[test]
+    fn tui_effort_overlay_and_model_change_use_grounded_sets_and_atomic_reset() {
+        let temporary = tui_session_directory("effort-capabilities");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let (progress, _) = std::sync::mpsc::channel();
+
+        assert_eq!(
+            router.route("/effort xhigh".into()),
+            TuiSubmissionOutcome::ContextChanged {
+                message: "Reasoning effort: xhigh.".into(),
+                presentation: router.presentation().unwrap(),
+            }
+        );
+        assert!(
+            tui.apply_submission_outcome(
+                router.route_request(TuiRouteRequest::OpenDialog("effort".into()), progress)
+            )
+            .is_none()
+        );
+        let overlay = render_tui_test_backend(&tui, 80, 24);
+        assert!(overlay.contains("Default"), "{overlay:?}");
+        assert!(overlay.contains("xhigh (current)"), "{overlay:?}");
+        assert!(!overlay.contains("minimal"), "{overlay:?}");
+
+        let reset = router.route("/model gpt-4.1".into());
+        let TuiSubmissionOutcome::ContextChanged { message, .. } = reset else {
+            panic!("model change should be local context information");
+        };
+        assert_eq!(
+            message,
+            "Model: gpt-4.1. Reasoning effort reset to Default because xhigh is unsupported."
+        );
+        let selection = session.lock().unwrap().selection.clone().unwrap();
+        assert_eq!(selection.model(), "gpt-4.1");
+        assert_eq!(selection.reasoning_effort(), None);
+        assert_eq!(selection.request_config().reasoning_effort(), None);
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -7156,22 +7237,18 @@ mod tests {
 
     #[test]
     fn tui_model_and_effort_commands_reach_each_provider_with_latest_selection_only() {
-        for (provider_type, expected_model) in [("openai-api", "o3"), ("openai-chatgpt", "gpt-5.5")]
+        for (provider_type, expected_effort) in [("openai-api", "xhigh"), ("openai-chatgpt", "low")]
         {
             let request = run_tui_model_effort_provider_case(provider_type);
 
-            assert_eq!(request["model"], expected_model, "{provider_type}");
+            assert_eq!(request["model"], "gpt-5.5", "{provider_type}");
             assert!(
                 !request.to_string().contains("gpt-4.1"),
                 "{provider_type} request retained the replaced model: {request}"
             );
 
             let reasoning = &request["reasoning"];
-            assert_eq!(reasoning["effort"], "high", "{provider_type}");
-            assert!(
-                !reasoning.to_string().contains("low"),
-                "{provider_type} request retained the replaced effort: {reasoning}"
-            );
+            assert_eq!(reasoning["effort"], expected_effort, "{provider_type}");
         }
     }
 
@@ -7274,23 +7351,22 @@ mod tests {
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let cancellation = HeadlessTurnCancellation::new();
 
-        let model_commands = if provider_type == "openai-chatgpt" {
+        let commands = if provider_type == "openai-chatgpt" {
             [
                 ("/model gpt-5.4", "Model: gpt-5.4."),
+                ("/effort high", "Reasoning effort: high."),
                 ("/model gpt-5.5", "Model: gpt-5.5."),
+                ("/effort minimal", "Reasoning effort: minimal."),
             ]
         } else {
             [
-                ("/model gpt-4.1", "Model: gpt-4.1."),
                 ("/model o3", "Model: o3."),
+                ("/effort high", "Reasoning effort: high."),
+                ("/model gpt-5.5", "Model: gpt-5.5."),
+                ("/effort xhigh", "Reasoning effort: xhigh."),
             ]
         };
-        for (command, expected) in [
-            model_commands[0],
-            ("/effort low", "Reasoning effort: low."),
-            model_commands[1],
-            ("/effort high", "Reasoning effort: high."),
-        ] {
+        for (command, expected) in commands {
             assert_eq!(
                 run_tui_prompt(&bootstrap, command, &cancellation, &session, None)
                     .expect("valid TUI selection should succeed"),

@@ -1043,28 +1043,48 @@ fn tui_model_selector_exposes_only_models_compatible_with_the_effective_source()
 
 #[test]
 fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_without_mutation() {
-    let mut selector = TuiModelSelector::new("gpt-4.1");
+    let mut selector = TuiModelSelector::for_source("gpt-5.5", TuiModelSource::OpenAiApi);
 
     assert_eq!(
         selector.reasoning_effort_values(),
-        ["none", "minimal", "low", "medium", "high", "xhigh"]
+        ["default", "none", "low", "medium", "high", "xhigh"]
     );
     assert_eq!(selector.reasoning_effort(), None);
 
     selector
-        .apply_reasoning_effort("high")
+        .apply_reasoning_effort("xhigh")
         .expect("supported effort should apply");
     assert_eq!(
         selector.request_config().reasoning_effort(),
-        Some(ReasoningEffort::High)
+        Some(ReasoningEffort::XHigh)
     );
-    assert_eq!(selector.reasoning_effort(), Some("high"));
+    assert_eq!(selector.reasoning_effort(), Some("xhigh"));
 
     assert_eq!(
-        selector.apply_reasoning_effort("unsupported"),
+        selector.apply_reasoning_effort("minimal"),
         Err("reasoning effort is unsupported".to_owned())
     );
-    assert_eq!(selector.reasoning_effort(), Some("high"));
+    assert_eq!(selector.reasoning_effort(), Some("xhigh"));
+
+    let mut subscription =
+        TuiModelSelector::for_source("gpt-5.5", TuiModelSource::ChatGptSubscription);
+    assert_eq!(
+        subscription.reasoning_effort_values(),
+        [
+            "default", "none", "minimal", "low", "medium", "high", "xhigh"
+        ]
+    );
+    subscription
+        .apply_reasoning_effort("minimal")
+        .expect("subscription minimal effort should be selectable");
+    assert_eq!(subscription.reasoning_effort(), Some("minimal"));
+    assert_eq!(
+        subscription.request_config().reasoning_effort(),
+        Some(ReasoningEffort::Low)
+    );
+
+    let non_reasoning = TuiModelSelector::new("gpt-4.1");
+    assert_eq!(non_reasoning.reasoning_effort_values(), ["default"]);
 }
 
 #[cfg(unix)]
