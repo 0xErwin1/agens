@@ -109,16 +109,34 @@ fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submiss
 }
 
 #[test]
-fn command_dialog_precedence_consumes_keys_before_global_and_composer_handling() {
+fn command_handlers_fall_through_from_dialog_to_global_and_composer() {
     let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("running".into()));
     app.set_composer("draft");
     app.set_dialog(Some(Dialog::Command));
+
     assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, Instant::now())),
-        vec![Effect::DialogCommand(Command::ControlC)]
+        app.reduce(AppEvent::Command(Command::Select, Instant::now())),
+        vec![Effect::DialogCommand(Command::Select)]
     );
     assert_eq!(app.composer(), "draft");
     assert_eq!(app.dialog(), Some(&Dialog::Command));
+
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::Model, Instant::now())),
+        vec![Effect::RefuseCommand(
+            "This command is unavailable while a response is in progress.".into()
+        )]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, Instant::now())),
+        vec![Effect::CancelTurn]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::Navigate, Instant::now())),
+        vec![Effect::Render]
+    );
+
     assert_eq!(
         app.reduce(AppEvent::Command(Command::Escape, Instant::now())),
         vec![Effect::Render]
@@ -182,19 +200,70 @@ fn command_control_c_follows_running_composer_warning_exit_and_disarm_states() {
 }
 
 #[test]
+fn exit_warning_is_disarmed_by_composer_edits_and_all_runtime_terminal_events() {
+    let now = Instant::now();
+
+    let mut composer = AppState::new(1);
+    assert_eq!(
+        composer.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::ExitWarning]
+    );
+    composer.set_composer("");
+    assert_eq!(
+        composer.reduce(AppEvent::Command(
+            Command::ControlC,
+            now + Duration::from_secs(1)
+        )),
+        vec![Effect::ExitWarning]
+    );
+
+    for terminal_event in [
+        AppEvent::TurnCompleted("answer".into()),
+        AppEvent::TurnCancelled,
+        AppEvent::TurnFailed,
+    ] {
+        let mut app = AppState::new(1);
+        assert_eq!(
+            app.reduce(AppEvent::Command(Command::ControlC, now)),
+            vec![Effect::ExitWarning]
+        );
+        assert_eq!(
+            app.reduce(AppEvent::SubmitPrompt("running".into())),
+            vec![Effect::StartPrompt("running".into())]
+        );
+        app.reduce(terminal_event);
+
+        assert_eq!(
+            app.reduce(AppEvent::Command(
+                Command::ControlC,
+                now + Duration::from_secs(1)
+            )),
+            vec![Effect::ExitWarning]
+        );
+    }
+}
+
+#[test]
 fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_mutations() {
     let mut app = AppState::new(1);
     let now = Instant::now();
-    let backend = TestBackend::new(80, 24);
-    let terminal = Terminal::new(backend).unwrap();
     app.set_composer("draft");
+    let before_reset_request = app.clone();
+
     assert_eq!(
         app.reduce(AppEvent::Command(Command::New, now)),
         vec![Effect::ResetConversation]
     );
-    assert_eq!(app.composer(), "draft");
+    assert_eq!(app, before_reset_request);
+
+    app.reduce(AppEvent::SubmitPrompt("running".into()));
+    app.reduce(AppEvent::SubmitPrompt("queued".into()));
+    app.reduce(AppEvent::TurnCompleted("answer".into()));
+    app.set_composer("replacement draft");
+    app.set_dialog(Some(Dialog::Command));
+
     assert_eq!(app.reduce(AppEvent::ResetSucceeded), vec![Effect::Render]);
-    assert_eq!(app.composer(), "");
+    assert_eq!(app, AppState::new(1));
 
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     for command in [
@@ -224,7 +293,6 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     }
     assert_eq!(app.runtime(), &Runtime::Running);
     assert_eq!(app.composer(), "");
-    assert_eq!(terminal.backend().buffer().area.width, 80);
 }
 
 #[test]

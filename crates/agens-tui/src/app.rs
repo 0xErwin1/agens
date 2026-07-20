@@ -85,7 +85,6 @@ pub struct AppState {
     composer: String,
     dialog: Option<Dialog>,
     exit_armed_until: Option<Instant>,
-    reset_pending: bool,
 }
 
 impl AppState {
@@ -102,7 +101,6 @@ impl AppState {
             composer: String::new(),
             dialog: None,
             exit_armed_until: None,
-            reset_pending: false,
         }
     }
 
@@ -147,6 +145,7 @@ impl AppState {
 
     pub fn set_composer(&mut self, composer: impl Into<String>) {
         self.composer = composer.into();
+        self.disarm_exit();
     }
 
     pub fn composer(&self) -> &str {
@@ -163,6 +162,8 @@ impl AppState {
     }
 
     fn submit_prompt(&mut self, prompt: String) -> Vec<Effect> {
+        self.disarm_exit();
+
         if self.runtime == Runtime::Idle {
             self.active_prompt = Some(prompt.clone());
             self.runtime = Runtime::Running;
@@ -180,6 +181,8 @@ impl AppState {
     }
 
     fn complete_turn(&mut self, output: String) -> Vec<Effect> {
+        self.disarm_exit();
+
         let Some(prompt) = self.active_prompt.take() else {
             return Vec::new();
         };
@@ -201,43 +204,50 @@ impl AppState {
 
         self.active_prompt = Some(next_prompt.clone());
         self.runtime = Runtime::Running;
+        self.disarm_exit();
 
         Some(Effect::StartPrompt(next_prompt))
     }
 
     fn command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
-        if self.dialog.is_some() {
-            return if command == Command::Escape {
-                self.set_dialog(None);
-                vec![Effect::Render]
-            } else {
-                vec![Effect::DialogCommand(command)]
-            };
+        if self.is_unsafe_while_running(command) {
+            return vec![Effect::RefuseCommand(RUNNING_REFUSAL.into())];
         }
 
-        if command != Command::ControlC {
-            self.disarm_exit();
+        if let Some(effects) = self.handle_dialog_command(command) {
+            return effects;
         }
 
         if command == Command::ControlC {
             return self.control_c(now);
         }
 
-        if self.runtime == Runtime::Running
-            && matches!(
-                command,
-                Command::Model | Command::Effort | Command::Session | Command::Agent | Command::New
-            )
-        {
-            return vec![Effect::RefuseCommand(RUNNING_REFUSAL.into())];
-        }
+        self.disarm_exit();
 
         if command == Command::New {
-            self.reset_pending = true;
             return vec![Effect::ResetConversation];
         }
 
         vec![Effect::Render]
+    }
+
+    fn is_unsafe_while_running(&self, command: Command) -> bool {
+        self.runtime == Runtime::Running
+            && matches!(
+                command,
+                Command::Model | Command::Effort | Command::Session | Command::Agent | Command::New
+            )
+    }
+
+    fn handle_dialog_command(&mut self, command: Command) -> Option<Vec<Effect>> {
+        match (self.dialog.as_ref(), command) {
+            (Some(Dialog::Command), Command::Escape) => {
+                self.set_dialog(None);
+                Some(vec![Effect::Render])
+            }
+            (Some(Dialog::Command), Command::Select) => Some(vec![Effect::DialogCommand(command)]),
+            _ => None,
+        }
     }
 
     fn control_c(&mut self, now: Instant) -> Vec<Effect> {
@@ -262,16 +272,12 @@ impl AppState {
     }
 
     fn reset_after_backend_success(&mut self) -> Vec<Effect> {
-        if !self.reset_pending {
-            return Vec::new();
-        }
-
         self.runtime = Runtime::Idle;
         self.active_prompt = None;
         self.queued_prompts.clear();
         self.completed_history.clear();
         self.composer.clear();
-        self.reset_pending = false;
+        self.dialog = None;
         self.disarm_exit();
 
         vec![Effect::Render]
@@ -279,5 +285,33 @@ impl AppState {
 
     fn disarm_exit(&mut self) {
         self.exit_armed_until = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_running_commands_refuse_without_changing_a_stale_armed_state() {
+        let now = Instant::now();
+        for command in [
+            Command::Model,
+            Command::Effort,
+            Command::Session,
+            Command::Agent,
+            Command::New,
+        ] {
+            let mut app = AppState::new(1);
+            app.runtime = Runtime::Running;
+            app.exit_armed_until = Some(now + EXIT_WARNING_WINDOW);
+            let before = app.clone();
+
+            assert_eq!(
+                app.reduce(AppEvent::Command(command, now)),
+                vec![Effect::RefuseCommand(RUNNING_REFUSAL.into())]
+            );
+            assert_eq!(app, before);
+        }
     }
 }
