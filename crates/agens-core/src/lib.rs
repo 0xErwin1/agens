@@ -251,12 +251,22 @@ impl std::error::Error for TurnTransitionError {}
 pub enum TurnEvent {
     StateChanged(TurnState),
     ProviderPart(MessagePart),
+    Usage(Usage),
     ToolCallRequested {
         id: String,
         name: String,
         input: String,
     },
     ToolResult(MessagePart),
+}
+
+/// Observed provider usage values. Unavailable upstream or model metadata remains absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub context_window: Option<u64>,
 }
 
 /// Optional observational output for interactive surfaces. It never affects turn results.

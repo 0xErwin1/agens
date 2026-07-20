@@ -1,7 +1,8 @@
-use agens_core::{Error, Message, MessagePart, Role};
+use agens_core::{Error, Message, MessagePart, Role, TurnEvent, Usage};
 use agens_providers::{
-    OpenAiFunctionTool, decode_openai_response_events, encode_openai_response_request,
-    encode_openai_response_request_with_messages, encode_openai_response_request_with_tools,
+    OpenAiFunctionTool, decode_openai_response_events, decode_openai_response_events_with_usage,
+    encode_openai_response_request, encode_openai_response_request_with_messages,
+    encode_openai_response_request_with_tools,
 };
 use serde_json::json;
 
@@ -357,6 +358,44 @@ fn decodes_text_reasoning_and_function_call_parts_in_arrival_order() {
                 input: "{\"city\":\"Paris\"}".to_owned(),
             },
         ]
+    );
+}
+
+#[test]
+fn usage_openai_stream_decodes_reported_and_partial_usage_without_fabrication() {
+    let complete = [
+        r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_123","usage":{"input_tokens":120,"output_tokens":25,"total_tokens":145}}}"#,
+    ];
+    let partial = [
+        r#"{"type":"response.completed","response":{"id":"resp_456","usage":{"input_tokens":7}}}"#,
+    ];
+    let missing = [r#"{"type":"response.completed","response":{"id":"resp_789"}}"#];
+
+    assert_eq!(
+        decode_openai_response_events_with_usage(complete),
+        Ok(vec![
+            TurnEvent::ProviderPart(MessagePart::Text("Hello".to_owned())),
+            TurnEvent::Usage(Usage {
+                input_tokens: Some(120),
+                output_tokens: Some(25),
+                total_tokens: Some(145),
+                context_window: None,
+            }),
+        ])
+    );
+    assert_eq!(
+        decode_openai_response_events_with_usage(partial),
+        Ok(vec![TurnEvent::Usage(Usage {
+            input_tokens: Some(7),
+            output_tokens: None,
+            total_tokens: None,
+            context_window: None,
+        })])
+    );
+    assert_eq!(
+        decode_openai_response_events_with_usage(missing),
+        Ok(vec![TurnEvent::Usage(Usage::default())])
     );
 }
 

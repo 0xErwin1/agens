@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
-    Role, TurnEvent, TurnProgressSink, TurnProvider,
+    Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -1125,6 +1125,9 @@ fn process_sse_frame(
             for part in &decoder.parts[start..] {
                 progress(agens_core::TurnEvent::ProviderPart(part.clone()));
             }
+            if let Some(usage) = decoder.completed_usage() {
+                progress(TurnEvent::Usage(usage));
+            }
         }
     }
     frame.clear();
@@ -1467,6 +1470,28 @@ where
     decoder.finish().map(|response| response.parts)
 }
 
+pub fn decode_openai_response_events_with_usage<I, S>(events: I) -> Result<Vec<TurnEvent>, Error>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut decoder = OpenAiResponseDecoder::default();
+
+    for event in events {
+        decoder.process(event.as_ref())?;
+    }
+
+    decoder.finish().map(|response| {
+        let mut events = response
+            .parts
+            .into_iter()
+            .map(TurnEvent::ProviderPart)
+            .collect::<Vec<_>>();
+        events.push(TurnEvent::Usage(response.usage));
+        events
+    })
+}
+
 pub fn decode_openai_response_stream(
     events: Receiver<String>,
     cancellation: &ProviderCancellation,
@@ -1511,11 +1536,13 @@ struct OpenAiResponseDecoder {
     replay_item_positions: BTreeMap<String, usize>,
     completed_function_output_item_ids: BTreeSet<String>,
     require_encrypted_reasoning: bool,
+    usage: Option<Usage>,
     completed: bool,
 }
 
 struct DecodedResponse {
     parts: Vec<MessagePart>,
+    usage: Usage,
     response_id: Option<String>,
     pending_calls: Vec<PendingToolCall>,
     replay_items: Vec<Value>,
@@ -1555,6 +1582,7 @@ impl OpenAiResponseDecoder {
             "response.failed" => return Err(response_failed_error(&event)),
             "response.completed" => {
                 self.capture_response_id(&event)?;
+                self.usage = Some(usage_from_event(&event));
                 self.completed = true;
             }
             _ => {}
@@ -1596,10 +1624,16 @@ impl OpenAiResponseDecoder {
 
         Ok(DecodedResponse {
             parts: self.parts,
+            usage: self.usage.unwrap_or_default(),
             response_id: self.response_id,
             pending_calls,
             replay_items: self.replay_items,
         })
+    }
+
+    fn completed_usage(&self) -> Option<Usage> {
+        self.completed
+            .then(|| self.usage.clone().unwrap_or_default())
     }
 
     fn process_output_item(&mut self, event: &Value) -> Result<(), Error> {
@@ -1820,6 +1854,24 @@ fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a Vec<Value>, E
         .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| protocol_error("event is missing a required array field"))
+}
+
+fn usage_from_event(event: &Value) -> Usage {
+    let usage = event
+        .get("response")
+        .and_then(|response| response.get("usage"));
+    let field = |name| {
+        usage
+            .and_then(|usage| usage.get(name))
+            .and_then(Value::as_u64)
+    };
+
+    Usage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        total_tokens: field("total_tokens"),
+        context_window: None,
+    }
 }
 
 fn upstream_error(event: &Value) -> Error {

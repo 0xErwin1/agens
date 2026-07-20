@@ -4,15 +4,15 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agens_core::{
-    Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig,
-    TurnProvider,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
+    TurnProgressSink, TurnProvider, Usage,
 };
-use agens_providers::ChatGptResponsesProvider;
+use agens_providers::{ChatGptResponsesProvider, ProgressAwareProvider};
 use serde_json::{Value, json};
 
 static TEMP_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -104,6 +104,42 @@ fn subscription_reasoning_effort_is_sent_only_when_configured() {
         server.join();
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
+}
+
+#[test]
+fn usage_chatgpt_stream_publishes_partial_usage_without_counters() {
+    let directory = temporary_directory("usage");
+    let credentials = write_credentials(&directory);
+    let server = LocalServer::start(ServerBehavior::Sse(usage_sse()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: TurnProgressSink = Arc::new(move |event| {
+        sink_events
+            .lock()
+            .expect("events should be available")
+            .push(event);
+    });
+    let mut provider = provider(&credentials, &server.base_url()).with_progress_sink(sink);
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("done".to_owned())])
+    );
+    assert_eq!(
+        *events.lock().expect("events should be available"),
+        vec![
+            TurnEvent::ProviderPart(MessagePart::Text("done".to_owned())),
+            TurnEvent::Usage(Usage {
+                input_tokens: Some(9),
+                output_tokens: None,
+                total_tokens: Some(9),
+                context_window: None,
+            }),
+        ]
+    );
+
+    server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
 #[test]
@@ -1853,6 +1889,12 @@ fn completed_text_sse(text: &str) -> String {
         "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\"}}\n\n\
 data: {{\"type\":\"response.completed\"}}\n\n"
     )
+}
+
+fn usage_sse() -> String {
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"usage\":{\"input_tokens\":9,\"total_tokens\":9}}}\n\n"
+        .to_owned()
 }
 
 fn tool_call_sse(item_id: &str, call_id: &str, name: &str, arguments: &str) -> String {
