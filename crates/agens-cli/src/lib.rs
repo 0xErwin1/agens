@@ -38,9 +38,9 @@ use agens_tools::{
     ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
-    BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, ToolResultState, Tui,
-    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
-    run_with_default_progress_submit,
+    BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, PaletteEntry,
+    PaletteEntryKind, ToolResultState, Tui, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
+    TuiRuntimeEvent, TuiSubmissionOutcome, run_with_default_progress_submit,
 };
 
 mod chatgpt_auth;
@@ -57,11 +57,26 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "connect",
     "disconnect",
     "effort",
+    "help",
     "model",
     "new",
+    "quit",
     "resume",
     "sessions",
     "subagent",
+];
+
+const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str)] = &[
+    ("connect", "Connect to ChatGPT", "[--device-auth]"),
+    ("disconnect", "Disconnect ChatGPT credentials", ""),
+    ("new", "Start a new session", ""),
+    ("sessions", "List saved sessions", ""),
+    ("resume", "Resume a saved session", "<id>"),
+    ("agent", "List or select the primary agent", "[name]"),
+    ("model", "List or select the model", "[name]"),
+    ("effort", "Show or set reasoning effort", "[level]"),
+    ("help", "Show commands and skills", ""),
+    ("quit", "Exit Agens", ""),
 ];
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
@@ -1263,6 +1278,7 @@ struct TuiRuntimeRouter {
     auth: ChatGptAuthCoordinator,
     commands: Arc<CommandCatalog>,
     skills: Arc<SkillCatalog>,
+    palette: Arc<[PaletteEntry]>,
 }
 
 impl TuiRuntimeRouter {
@@ -1291,6 +1307,7 @@ impl TuiRuntimeRouter {
         skills: Arc<SkillCatalog>,
         auth: ChatGptAuthCoordinator,
     ) -> Self {
+        let palette = resolved_tui_palette(&commands, &skills).into();
         Self {
             bootstrap: Arc::new(Mutex::new(bootstrap)),
             session,
@@ -1298,6 +1315,7 @@ impl TuiRuntimeRouter {
             auth,
             commands,
             skills,
+            palette,
         }
     }
 
@@ -1339,6 +1357,10 @@ impl TuiRuntimeRouter {
             })
     }
 
+    fn palette_entries(&self) -> &[PaletteEntry] {
+        &self.palette
+    }
+
     fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
         if !input.starts_with('/') {
             return Ok(TuiSubmissionOutcome::ProviderTurn {
@@ -1358,6 +1380,8 @@ impl TuiRuntimeRouter {
         let arguments = arguments.trim();
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
+            "/help" => TuiSubmissionOutcome::LocalInfo(render_tui_help(&self.palette)),
+            "/quit" => TuiSubmissionOutcome::Quit,
             "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&bootstrap)?),
             "/new" => {
                 let mut session = self.session.lock().map_err(|_| {
@@ -1622,14 +1646,14 @@ fn start_tui_commands<E: TuiEngine>(
         .map_err(CliError::configuration)?;
 
     for diagnostic in discovery.diagnostics() {
-        tui.add_info(format!(
+        tui.add_diagnostic(format!(
             "Command diagnostic ({}): {}",
             diagnostic.path().display(),
             diagnostic.message()
         ));
     }
     for name in discovery.shadowed() {
-        tui.add_info(format!(
+        tui.add_diagnostic(format!(
             "Command /{name} has multiple definitions; applied source precedence."
         ));
     }
@@ -1643,14 +1667,14 @@ fn start_tui_skills<E: TuiEngine>(
 ) -> Result<Arc<SkillCatalog>, CliError> {
     let discovery = discover_skill_catalog(bootstrap)?;
     for diagnostic in discovery.diagnostics() {
-        tui.add_info(format!(
+        tui.add_diagnostic(format!(
             "Skill diagnostic ({}): {}",
             diagnostic.path().display(),
             diagnostic.message()
         ));
     }
     for shadow in discovery.shadowed() {
-        tui.add_info(format!(
+        tui.add_diagnostic(format!(
             "Skill /{} has multiple definitions; applied source precedence.",
             shadow.name()
         ));
@@ -1691,11 +1715,67 @@ fn report_tui_extension_collisions<E: TuiEngine>(
         .skills()
         .filter(|skill| commands.command(skill.name()).is_some())
     {
-        tui.add_info(format!(
+        tui.add_diagnostic(format!(
             "Skill /{} is shadowed by a command; command routing wins.",
             skill.name()
         ));
     }
+}
+
+fn resolved_tui_palette(commands: &CommandCatalog, skills: &SkillCatalog) -> Vec<PaletteEntry> {
+    let mut entries = TUI_PALETTE_BUILT_INS
+        .iter()
+        .map(|(name, description, hint)| {
+            PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn)
+        })
+        .collect::<Vec<_>>();
+    let mut custom_commands = commands
+        .iter()
+        .filter(|command| !RESERVED_TUI_COMMANDS.contains(&command.name()))
+        .collect::<Vec<_>>();
+    custom_commands.sort_by_key(|command| command.name());
+    entries.extend(custom_commands.into_iter().map(|command| {
+        PaletteEntry::new(
+            command.name(),
+            command.description(),
+            "[arguments]",
+            PaletteEntryKind::Command,
+        )
+    }));
+    let mut resolved_skills = skills
+        .skills()
+        .filter(|skill| {
+            !RESERVED_TUI_COMMANDS.contains(&skill.name())
+                && commands.command(skill.name()).is_none()
+        })
+        .collect::<Vec<_>>();
+    resolved_skills.sort_by_key(|skill| skill.name());
+    entries.extend(resolved_skills.into_iter().map(|skill| {
+        PaletteEntry::new(
+            skill.name(),
+            skill.description(),
+            "[arguments]",
+            PaletteEntryKind::Skill,
+        )
+    }));
+    entries
+}
+
+fn render_tui_help(entries: &[PaletteEntry]) -> String {
+    let surface = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "/{} {}  [{}] {}",
+                entry.name(),
+                entry.argument_hint(),
+                entry.kind().label(),
+                entry.description()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Available commands and skills:\n{surface}")
 }
 
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
@@ -1729,6 +1809,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         commands,
         Arc::clone(&skills),
     );
+    tui.set_palette_entries(router.palette_entries().to_vec());
     let route_router = router.clone();
     run_with_default_progress_submit(
         &mut tui,
@@ -1815,6 +1896,7 @@ fn run_tui_prompt(
                 | TuiSubmissionOutcome::LocalActionableError { .. } => {
                     unreachable!("slash routing returns a local result or CLI error")
                 }
+                TuiSubmissionOutcome::Quit => Ok(String::new()),
             }
         }
         prompt => run_tui_prompt_with(bootstrap, prompt, session, None, |request| {
@@ -5195,6 +5277,8 @@ mod tests {
             cancellation: Arc::clone(&cancellation),
         });
         let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        assert!(tui.view().dialog.is_some());
+        assert!(tui.transcript().is_empty());
         let router = TuiRuntimeRouter::new(
             bootstrap.clone(),
             Arc::clone(&session),
@@ -5252,18 +5336,6 @@ mod tests {
             Some(agens_tui::TranscriptEntry::Error(_))
         ));
         assert!(session.lock().unwrap().messages.is_empty());
-
-        let startup = tui
-            .transcript()
-            .iter()
-            .filter_map(|entry| match entry {
-                agens_tui::TranscriptEntry::Info(message) => Some(message.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(startup.iter().any(|message| message.contains("broken.md")));
-        assert!(startup.iter().any(|message| message.contains("/shared")));
-        assert!(startup.iter().any(|message| message.contains("/connect")));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -5334,6 +5406,8 @@ mod tests {
         let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
         let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
         report_tui_extension_collisions(&mut tui, &commands, &skills);
+        assert!(tui.view().dialog.is_some());
+        assert!(tui.transcript().is_empty());
         let router = TuiRuntimeRouter::new(
             bootstrap.clone(),
             session,
@@ -5441,13 +5515,205 @@ mod tests {
             tui.transcript().last(),
             Some(agens_tui::TranscriptEntry::Error(_))
         ));
-        let collision_diagnostics = tui
-            .transcript()
-            .iter()
-            .filter(|entry| matches!(entry, agens_tui::TranscriptEntry::Info(message) if message.contains("/shared") && message.contains("command")))
-            .count();
-        assert_eq!(collision_diagnostics, 1);
         drop(requests);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_palette_uses_the_resolved_surface_and_renders_inside_a_narrow_resize() {
+        let temporary = tui_session_directory("resolved-palette");
+        let config_home = temporary.join("config");
+        let global_commands = config_home.join("commands");
+        let project_commands = temporary.join("project/.agens/commands");
+        let global_skills = config_home.join("skills");
+        let project_skills = temporary.join("project/.agens/skills");
+        std::fs::create_dir_all(&global_commands).unwrap();
+        std::fs::create_dir_all(&project_commands).unwrap();
+        write_tui_command(&global_commands, "shared", "global command", "global");
+        write_tui_command(&project_commands, "shared", "project command", "project");
+        write_tui_command(
+            &project_commands,
+            "review",
+            "review changes",
+            "review:$ARGUMENTS",
+        );
+        write_tui_command(&project_commands, "connect", "reserved collision", "wrong");
+        write_tui_skill(&global_skills, "shared", "shadowed skill", "wrong");
+        write_tui_skill(&project_skills, "inspect", "inspect code", "INSPECT");
+        std::fs::write(
+            project_commands.join("broken.md"),
+            "---\ndescription: [invalid\n---\nbroken\n",
+        )
+        .unwrap();
+
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        report_tui_extension_collisions(&mut tui, &commands, &skills);
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            cancellation,
+            commands,
+            skills,
+        );
+        let entries = router.palette_entries();
+
+        assert_eq!(
+            entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
+            vec![
+                "connect",
+                "disconnect",
+                "new",
+                "sessions",
+                "resume",
+                "agent",
+                "model",
+                "effort",
+                "help",
+                "quit",
+                "review",
+                "shared",
+                "inspect",
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.name() == "shared")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.name() == "shared")
+                .unwrap()
+                .kind(),
+            agens_tui::PaletteEntryKind::Command
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.name() == "shared")
+                .unwrap()
+                .description(),
+            "project command"
+        );
+        assert!(!entries.iter().any(|entry| entry.name() == "subagent"));
+        assert!(tui.transcript().is_empty());
+        assert!(tui.view().dialog.is_some());
+
+        tui.set_palette_entries(entries.to_vec());
+        for character in "/sha".chars() {
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
+        }
+        tui.handle(agens_tui::Event::Resize {
+            width: 20,
+            height: 6,
+        });
+        let terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 6)).unwrap();
+        let mut renderer = agens_tui::RatatuiRenderer::new(terminal);
+        agens_tui::Renderer::render(&mut renderer, tui.view()).unwrap();
+        let text = renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("commands"), "{text:?}");
+        assert!(text.contains("/shared"), "{text:?}");
+        assert!(!text.contains("inspect"), "{text:?}");
+
+        let original = session.lock().unwrap().clone();
+        assert_eq!(
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape)),
+            agens_tui::Action::Render
+        );
+        assert_eq!(tui.input(), "/sha");
+        assert_eq!(*session.lock().unwrap(), original);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_palette_enter_routes_built_in_command_skill_help_quit_and_unknown_once() {
+        let temporary = tui_session_directory("palette-routing");
+        let config_home = temporary.join("config");
+        let project_commands = temporary.join("project/.agens/commands");
+        let project_skills = temporary.join("project/.agens/skills");
+        std::fs::create_dir_all(config_home.join("commands")).unwrap();
+        std::fs::create_dir_all(&project_commands).unwrap();
+        write_tui_command(
+            &project_commands,
+            "review",
+            "review changes",
+            "REVIEW:$ARGUMENTS",
+        );
+        write_tui_skill(&project_skills, "inspect", "inspect code", "INSPECT_BODY");
+
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            cancellation,
+            commands,
+            skills,
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let mut provider_prompts = Vec::new();
+
+        for (input, expected) in [
+            ("/review target", "REVIEW:target"),
+            (
+                "/inspect src",
+                "## Skill: inspect\nINSPECT_BODY\n\n## User arguments\nsrc",
+            ),
+        ] {
+            let input = enter_tui_input(&mut tui, input);
+            let prompt = tui.apply_submission_outcome(router.route(input)).unwrap();
+            provider_prompts.push(prompt.clone());
+            tui.finish_provider_turn(TuiProviderOutcome::Completed("captured".into()));
+            assert_eq!(prompt, expected);
+        }
+
+        let sessions = enter_tui_input(&mut tui, "/sessions");
+        assert!(
+            tui.apply_submission_outcome(router.route(sessions))
+                .is_none()
+        );
+        let help = enter_tui_input(&mut tui, "/h");
+        assert!(tui.apply_submission_outcome(router.route(help)).is_none());
+        let help = tui.transcript().last().unwrap();
+        assert!(
+            matches!(help, agens_tui::TranscriptEntry::Info(text) if text.contains("/connect") && text.contains("/review") && text.contains("/inspect") && !text.contains("/subagent"))
+        );
+
+        let unknown = enter_tui_input(&mut tui, "/unknown");
+        assert!(
+            tui.apply_submission_outcome(router.route(unknown))
+                .is_none()
+        );
+        assert_eq!(provider_prompts.len(), 2);
+        assert!(session.lock().unwrap().messages.is_empty());
+
+        let quit = enter_tui_input(&mut tui, "/quit");
+        assert_eq!(router.route(quit), TuiSubmissionOutcome::Quit);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

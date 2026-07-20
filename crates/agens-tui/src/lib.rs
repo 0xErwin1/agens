@@ -140,6 +140,7 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
     },
+    Quit,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,7 +225,7 @@ pub enum PaletteEntryKind {
 }
 
 impl PaletteEntryKind {
-    const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::BuiltIn => "built-in",
             Self::Command => "command",
@@ -447,7 +448,7 @@ fn render_palette(
     palette: PaletteView<'_>,
 ) {
     let matches = palette_matches(palette.entries, input);
-    let content_rows = matches.len().max(1).min(6) as u16;
+    let content_rows = matches.len().clamp(1, 6) as u16;
     let height = content_rows.saturating_add(2).min(composer.y);
     if height < 3 || area.width == 0 {
         return;
@@ -965,6 +966,29 @@ where
         self.project_conversation(ConversationEvent::Info(text));
     }
 
+    pub fn add_diagnostic(&mut self, text: impl AsRef<str>) {
+        const MAX_DIAGNOSTICS: usize = 8;
+        const MAX_DIAGNOSTIC_CHARS: usize = 160;
+
+        let text = text
+            .as_ref()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_DIAGNOSTIC_CHARS)
+            .collect::<String>();
+        match self.dialog.as_mut() {
+            Some(dialog)
+                if dialog.title == "Extension diagnostics"
+                    && dialog.body.lines().count() < MAX_DIAGNOSTICS =>
+            {
+                dialog.body.push('\n');
+                dialog.body.push_str(&text);
+            }
+            Some(dialog) if dialog.title == "Extension diagnostics" => {}
+            _ => self.show_dialog("Extension diagnostics", text),
+        }
+    }
+
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
         self.palette_open = false;
         self.dialog = None;
@@ -999,6 +1023,10 @@ where
                 self.set_running(false);
                 self.apply_presentation(presentation);
                 self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::Quit => {
+                self.set_running(false);
                 None
             }
         }
@@ -1192,6 +1220,13 @@ where
                 Action::Render
             }
             Key::Char(character) => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.title == "Extension diagnostics")
+                {
+                    self.dialog = None;
+                }
                 self.input.insert(self.input_cursor, character);
                 self.input_cursor += character.len_utf8();
                 if !self.running && self.input == "/" {
@@ -1295,6 +1330,10 @@ where
                 Action::Render
             }
             Key::Escape if self.running => self.cancel_running(),
+            Key::Escape if self.dialog.is_some() => {
+                self.dialog = None;
+                Action::Render
+            }
             Key::Escape => Action::Render,
             Key::CtrlC if self.running => self.cancel_running(),
             Key::CtrlC if !self.input.is_empty() => {
@@ -1629,7 +1668,11 @@ where
             tui.finish_provider_turn(outcome);
         }
         while let Ok(outcome) = route_receiver.try_recv() {
+            let quit = matches!(outcome, TuiSubmissionOutcome::Quit);
             let Some(prompt) = tui.apply_submission_outcome(outcome) else {
+                if quit {
+                    return Ok(());
+                }
                 continue;
             };
             let submit = Arc::clone(&submit);
@@ -1839,5 +1882,16 @@ mod runtime_tests {
             map_key(KeyCode::Char('o'), KeyModifiers::CONTROL),
             Some(Event::Key(Key::CtrlO))
         );
+    }
+
+    #[test]
+    fn maps_palette_navigation_keys() {
+        for (code, key) in [
+            (KeyCode::Up, Key::Up),
+            (KeyCode::Down, Key::Down),
+            (KeyCode::Tab, Key::Tab),
+        ] {
+            assert_eq!(map_key(code, KeyModifiers::NONE), Some(Event::Key(key)));
+        }
     }
 }
