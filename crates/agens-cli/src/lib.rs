@@ -12,11 +12,12 @@ use agens_config::{
     mcp_servers, merge_toml_documents, parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
-    CompletedTurnSnapshot, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
-    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
-    HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
-    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProgressSink,
-    run_headless_turn_with_max_iterations_and_progress,
+    CompletedSessionTurn, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
+    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
+    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
+    Message, MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
+    PermissionRule, PermissionSession, Role, SessionMessage, SessionMetadata, TurnEvent,
+    TurnProgressSink, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
@@ -262,6 +263,7 @@ pub struct HeadlessChatRequest {
     pub max_iterations: Option<usize>,
     pub mode: PermissionMode,
     pub dangerously_allow_all: bool,
+    session: Option<SessionMetadata>,
 }
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
@@ -823,7 +825,8 @@ struct ProductionTuiEngine {
 #[derive(Clone, Default)]
 struct TuiSessionContext {
     identifier: Option<i64>,
-    snapshot: Option<CompletedTurnSnapshot>,
+    metadata: Option<SessionMetadata>,
+    messages: Vec<Message>,
 }
 
 impl TuiSessionContext {
@@ -831,10 +834,11 @@ impl TuiSessionContext {
         Self::default()
     }
 
-    fn resumed(identifier: i64, snapshot: CompletedTurnSnapshot) -> Self {
+    fn resumed(identifier: i64, metadata: SessionMetadata, messages: Vec<Message>) -> Self {
         Self {
             identifier: Some(identifier),
-            snapshot: Some(snapshot),
+            metadata: Some(metadata),
+            messages,
         }
     }
 
@@ -842,38 +846,39 @@ impl TuiSessionContext {
         let identifier = self
             .identifier
             .expect("resumed TUI session context always has an identifier");
-        let events = self
-            .snapshot
+        let metadata = self
+            .metadata
             .as_ref()
-            .expect("resumed TUI session context always has a snapshot")
-            .events()
-            .len();
-        format!("Resumed session {identifier}: {events} event(s)")
+            .expect("resumed TUI session context always has metadata");
+        format!(
+            "Resumed session {identifier}: agent={} turns={}",
+            metadata.active_agent, metadata.completed_turn_count
+        )
     }
 
     fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
-        let Some(snapshot) = self.snapshot.as_ref() else {
+        if self.identifier.is_none() {
             return request;
-        };
-        let Some(identifier) = self.identifier else {
-            return request;
-        };
-        let context = snapshot
-            .events()
+        }
+        let context = self
+            .messages
             .iter()
-            .filter_map(|event| match event {
-                TurnEvent::ProviderPart(MessagePart::Text(text)) => Some(text.as_str()),
-                _ => None,
+            .flat_map(|message| message.parts.iter())
+            .map(|part| match part {
+                MessagePart::Text(text) | MessagePart::Reasoning(text) => text.as_str(),
+                MessagePart::ToolCall { input, .. } => input.as_str(),
+                MessagePart::ToolResult { content, .. } => content.as_str(),
             })
             .collect::<String>();
 
         if !context.is_empty() {
             request.prompt = format!(
-                "Resumed session {identifier} context:\n{context}\n\nUser: {}",
+                "Resumed session context:\n{context}\n\nUser: {}",
                 request.prompt
             );
         }
 
+        request.session = self.metadata.clone();
         request
     }
 }
@@ -983,6 +988,7 @@ fn run_tui_prompt(
                     max_iterations: None,
                     mode: PermissionMode::Edit,
                     dangerously_allow_all: false,
+                    session: None,
                 });
             run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
         }
@@ -993,7 +999,7 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let sessions = store
-        .list_completed_turns()
+        .list_sessions()
         .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
 
     if sessions.is_empty() {
@@ -1002,13 +1008,7 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
 
     Ok(sessions
         .iter()
-        .map(|session| {
-            format!(
-                "{}\t{} event(s)",
-                session.id,
-                session.snapshot.events().len()
-            )
-        })
+        .map(|session| format!("{}\t{} event(s)", session.id, session.completed_turn_count))
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -1019,10 +1019,14 @@ fn resume_tui_session(
 ) -> Result<TuiSessionContext, CliError> {
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let snapshot = store
-        .load_completed_turn_for_resume(identifier)
+    let session = store
+        .load_session_for_resume(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
-    Ok(TuiSessionContext::resumed(identifier, snapshot))
+    Ok(TuiSessionContext::resumed(
+        identifier,
+        session.metadata,
+        session.messages,
+    ))
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -1033,6 +1037,7 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         max_iterations: None,
         mode: PermissionMode::Edit,
         dangerously_allow_all: false,
+        session: None,
     };
     let mut index = 0;
 
@@ -1381,13 +1386,12 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut provider = build_provider(model, request.prompt, provider_tools)?;
+    let mut provider = build_provider(model, request.prompt.clone(), provider_tools)?;
     if let Some(progress) = progress {
         provider = provider.with_progress_sink(Arc::clone(progress));
     }
     cancellation_result(cancellation)?;
-    let mut store = SessionStore::open(bootstrap.data_directory())
-        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let mut repository = DiscardCompletedTurnRepository;
     let mut gate = ProductionPermissionGate::new(
         policy.clone(),
         Arc::clone(&grants),
@@ -1418,7 +1422,7 @@ where
                 &mut gate,
                 &mut resolver,
                 &mut dispatcher,
-                &mut store,
+                &mut repository,
                 cancellation,
                 max_iterations,
                 progress,
@@ -1429,12 +1433,21 @@ where
             &mut gate,
             &mut resolver,
             &mut dispatcher,
-            &mut store,
+            &mut repository,
             cancellation,
             progress,
         )),
     }?
     .map_err(CliError::runtime)?;
+
+    let turn = completed_session_turn(&request.prompt, &snapshot)?;
+    let mut store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let metadata =
+        next_session_metadata(&store, bootstrap, &request.prompt, request.session.as_ref())?;
+    store
+        .persist_completed_session_turn(&metadata, &turn)
+        .map_err(|_| CliError::storage("completed session could not be saved"))?;
 
     let text = snapshot
         .events()
@@ -1451,6 +1464,104 @@ where
         Ok("completed".to_owned())
     } else {
         Ok(text)
+    }
+}
+
+struct DiscardCompletedTurnRepository;
+
+impl CompletedTurnRepository for DiscardCompletedTurnRepository {
+    fn persist_completed_turn(
+        &mut self,
+        _: CompletedTurnSnapshot,
+    ) -> impl std::future::Future<Output = Result<(), CompletedTurnStoreError>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
+fn next_session_metadata(
+    store: &SessionStore,
+    bootstrap: &Bootstrap,
+    title: &str,
+    resumed: Option<&SessionMetadata>,
+) -> Result<SessionMetadata, CliError> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| CliError::storage("session clock is unavailable"))?
+        .as_secs() as i64;
+
+    if let Some(metadata) = resumed {
+        return Ok(SessionMetadata {
+            updated_at: timestamp,
+            ..metadata.clone()
+        });
+    }
+
+    let id = store
+        .list_sessions()
+        .map_err(|_| CliError::storage("saved sessions could not be listed"))?
+        .iter()
+        .map(|session| session.id)
+        .max()
+        .unwrap_or_default()
+        + 1;
+    Ok(SessionMetadata {
+        id,
+        project: bootstrap
+            .project_root()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "default".to_owned()),
+        title: title.to_owned(),
+        active_agent: "primary".to_owned(),
+        created_at: timestamp,
+        updated_at: timestamp,
+        completed_turn_count: 0,
+        resumable: false,
+    })
+}
+
+fn completed_session_turn(
+    prompt: &str,
+    snapshot: &CompletedTurnSnapshot,
+) -> Result<CompletedSessionTurn, CliError> {
+    let mut messages = vec![Message {
+        role: Role::User,
+        parts: vec![MessagePart::Text(prompt.to_owned())],
+    }];
+    let mut role = None;
+    let mut parts = Vec::new();
+    for event in snapshot.events() {
+        let (next_role, part) = match event {
+            TurnEvent::ProviderPart(part) => (Role::Assistant, part),
+            TurnEvent::ToolResult(part) => (Role::Tool, part),
+            TurnEvent::StateChanged(_) | TurnEvent::ToolCallRequested { .. } => continue,
+        };
+        if role != Some(next_role) {
+            if let Some(role) = role {
+                flush_parts(&mut messages, role, &mut parts);
+            }
+            role = Some(next_role);
+        }
+        parts.push(part.clone());
+    }
+    if let Some(role) = role {
+        flush_parts(&mut messages, role, &mut parts);
+    }
+
+    let messages = messages
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CliError::storage("completed session could not be encoded"))?;
+    CompletedSessionTurn::new(messages)
+        .map_err(|_| CliError::storage("completed session could not be encoded"))
+}
+
+fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessagePart>) {
+    if !parts.is_empty() {
+        messages.push(Message {
+            role,
+            parts: std::mem::take(parts),
+        });
     }
 }
 
@@ -2600,28 +2711,38 @@ mod tests {
 
     #[test]
     fn resumed_tui_session_adds_restored_context_to_the_next_prompt() {
-        let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
-            TurnEvent::StateChanged(TurnState::Requesting),
-            TurnEvent::StateChanged(TurnState::Streaming),
-            TurnEvent::ProviderPart(MessagePart::Text("previous answer".into())),
-            TurnEvent::StateChanged(TurnState::Completed),
-        ])
-        .expect("completed turn snapshot should be valid");
+        let metadata = SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 1,
+            resumable: true,
+        };
+        let messages = vec![Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("previous answer".into())],
+        }];
 
-        let request = TuiSessionContext::resumed(7, snapshot).apply_to(HeadlessChatRequest {
-            prompt: "next question".into(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-        });
+        let request =
+            TuiSessionContext::resumed(7, metadata, messages).apply_to(HeadlessChatRequest {
+                prompt: "next question".into(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                session: None,
+            });
 
         assert_eq!(
             request.prompt,
-            "Resumed session 7 context:\nprevious answer\n\nUser: next question"
+            "Resumed session context:\nprevious answer\n\nUser: next question"
         );
         assert_eq!(request.system_prompt, None);
+        assert_eq!(request.session.as_ref().map(|session| session.id), Some(7));
     }
 
     #[test]
@@ -2633,6 +2754,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            session: None,
         });
 
         assert_eq!(request.system_prompt, None);

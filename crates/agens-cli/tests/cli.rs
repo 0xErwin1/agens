@@ -1052,6 +1052,36 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
             &HeadlessTurnCancellation::new(),
         ))
         .expect("local headless turn should complete");
+        let metadata = SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let turn = CompletedSessionTurn::new(
+            [
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("hello".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("completed locally".into())],
+                },
+            ]
+            .into_iter()
+            .map(SessionMessage::try_from)
+            .collect::<Result<_, _>>()
+            .expect("session messages should be valid"),
+        )
+        .expect("completed session turn should be valid");
+        store
+            .persist_completed_session_turn(&metadata, &turn)
+            .expect("normalized session should persist");
 
         Ok(format!("{} events", snapshot.events().len()))
     });
@@ -1063,9 +1093,15 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
     assert_eq!(chat.status, ExitStatus::Success);
     assert_eq!(chat.stdout, "16 events\n");
     assert_eq!(sessions.status, ExitStatus::Success);
-    assert_eq!(sessions.stdout, "No saved sessions.\n");
+    assert_eq!(
+        sessions.stdout,
+        "ID\tPROJECT\tTITLE\tAGENT\tTURNS\n1\tproject\tconversation\tprimary\t1\n"
+    );
     assert_eq!(resumed.status, ExitStatus::Success);
-    assert_eq!(resumed.stdout, "Session 1: 16 event(s)\n");
+    assert_eq!(
+        resumed.stdout,
+        "Session 1: project=project title=conversation agent=primary turns=1 messages=2\n"
+    );
     assert!(!format!("{}{}{}", chat.stdout, sessions.stdout, resumed.stdout).contains("secret"));
 }
 
@@ -1133,10 +1169,7 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     assert_eq!(String::from_utf8_lossy(&chat.stdout), "Hello from OpenAI\n");
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
     assert!(sessions.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
-    );
+    assert!(String::from_utf8_lossy(&sessions.stdout).ends_with("\tprimary\t1\n"));
     assert!(
         !format!(
             "{}{}",
@@ -1196,10 +1229,7 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
         "Hello from ChatGPT\n"
     );
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
-    assert_eq!(
-        String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
-    );
+    assert!(String::from_utf8_lossy(&sessions.stdout).ends_with("\tprimary\t1\n"));
     let diagnostics = format!(
         "{}{}",
         String::from_utf8_lossy(&chat.stdout),
@@ -1424,7 +1454,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
             "{name}"
         );
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
-        assert_eq!(
+        assert!(
             String::from_utf8_lossy(
                 &Command::new(env!("CARGO_BIN_EXE_agens"))
                     .args(["sessions", "list"])
@@ -1433,9 +1463,8 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
                     .output()
                     .expect("sessions command should execute")
                     .stdout,
-            ),
-            "No saved sessions.\n",
-            "{name}"
+            )
+            .ends_with("\tprimary\t1\n")
         );
         assert_sqlite_has_no_sentinels(
             &data_directory.join("rust-sessions.db"),
@@ -1569,13 +1598,13 @@ fn production_binary_executes_allowed_native_read_then_continues_and_persists() 
         "native read completed\n"
     );
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
-    assert_eq!(
-        String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
-    );
+    assert!(String::from_utf8_lossy(&sessions.stdout).ends_with("\tprimary\t1\n"));
     assert_eq!(
         String::from_utf8_lossy(&resumed.stdout),
-        "Session 1: 10 event(s)\n"
+        format!(
+            "Session 1: project={} title=read the native file agent=primary turns=1 messages=4\n",
+            project_root.display(),
+        ),
     );
 
     server.join();
@@ -1739,7 +1768,7 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
             "{name}"
         );
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
-        assert_eq!(
+        assert!(
             String::from_utf8_lossy(
                 &Command::new(env!("CARGO_BIN_EXE_agens"))
                     .args(["sessions", "list"])
@@ -1748,9 +1777,8 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
                     .output()
                     .expect("sessions command should execute")
                     .stdout,
-            ),
-            "No saved sessions.\n",
-            "{name}"
+            )
+            .ends_with("\tprimary\t1\n")
         );
         assert!(
             PermissionGrantStore::open(&data_directory)
@@ -1914,7 +1942,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
             "must not be read",
             "{name}"
         );
-        assert_eq!(
+        assert!(
             String::from_utf8_lossy(
                 &Command::new(env!("CARGO_BIN_EXE_agens"))
                     .args(["sessions", "list"])
@@ -1923,9 +1951,8 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
                     .output()
                     .expect("sessions command should execute")
                     .stdout,
-            ),
-            "No saved sessions.\n",
-            "{name}"
+            )
+            .ends_with("\tprimary\t1\n")
         );
 
         server.join();
@@ -2070,10 +2097,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
         .output()
         .expect("sessions command should execute");
     assert!(sessions.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
-    );
+    assert!(String::from_utf8_lossy(&sessions.stdout).ends_with("\tprimary\t1\n"));
     assert!(
         PermissionGrantStore::open(&data_directory)
             .expect("grant store should open")
@@ -2577,7 +2601,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     assert!(!diagnostics.contains("SENTINEL_MCP_PROTOCOL"));
     assert!(!diagnostics.contains("SENTINEL_MCP_STDERR"));
     assert!(!diagnostics.contains("SENTINEL_MCP_TRANSPORT"));
-    assert_eq!(
+    assert!(
         String::from_utf8_lossy(
             &Command::new(env!("CARGO_BIN_EXE_agens"))
                 .args(["sessions", "list"])
@@ -2586,12 +2610,12 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
                 .output()
                 .expect("sessions command should execute")
                 .stdout,
-        ),
-        "No saved sessions.\n"
+        )
+        .ends_with("\tprimary\t1\n")
     );
-    let snapshot = SessionStore::open(&data_directory)
+    let session = SessionStore::open(&data_directory)
         .expect("session store should open")
-        .load_completed_turn_for_resume(1)
+        .load_session_for_resume(1)
         .expect("completed session should be readable");
     for secret in [
         "SENTINEL_OPENAI_API_KEY",
@@ -2600,7 +2624,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
         "SENTINEL_MCP_TRANSPORT",
     ] {
         assert!(
-            !format!("{snapshot:?}").contains(secret),
+            !format!("{session:?}").contains(secret),
             "snapshot leaked {secret}"
         );
     }
@@ -2744,15 +2768,15 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
     ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
-    let snapshot = SessionStore::open(&data_directory)
+    let session = SessionStore::open(&data_directory)
         .expect("session store should open")
-        .load_completed_turn_for_resume(1)
+        .load_session_for_resume(1)
         .expect("completed session should be readable");
     assert!(
-        format!("{snapshot:?}").contains("SENTINEL_MCP_ARGUMENT"),
+        format!("{session:?}").contains("SENTINEL_MCP_ARGUMENT"),
         "model-visible MCP arguments must remain resumable conversation content"
     );
-    assert!(!format!("{snapshot:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
+    assert!(!format!("{session:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &[
@@ -2833,16 +2857,16 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
     ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
-    let snapshot = SessionStore::open(&data_directory)
+    let session = SessionStore::open(&data_directory)
         .expect("session store should open")
-        .load_completed_turn_for_resume(1)
+        .load_session_for_resume(1)
         .expect("completed session should be readable");
     assert!(
-        format!("{snapshot:?}").contains("SENTINEL_NATIVE_ARGUMENT"),
+        format!("{session:?}").contains("SENTINEL_NATIVE_ARGUMENT"),
         "model-visible native arguments must remain resumable conversation content"
     );
-    assert!(snapshot.events().iter().all(|event| {
-        !matches!(event, TurnEvent::ToolResult(MessagePart::ToolResult { content, .. }) if content.contains("SENTINEL_NATIVE_OUTPUT"))
+    assert!(session.messages.iter().flat_map(|message| &message.parts).all(|part| {
+        !matches!(part, MessagePart::ToolResult { content, .. } if content.contains("SENTINEL_NATIVE_OUTPUT"))
     }));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
@@ -3108,7 +3132,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
             );
         }
         if persists {
-            assert_eq!(
+            assert!(
                 String::from_utf8_lossy(
                     &Command::new(env!("CARGO_BIN_EXE_agens"))
                         .args(["sessions", "list"])
@@ -3117,9 +3141,8 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
                         .output()
                         .expect("sessions command should execute")
                         .stdout,
-                ),
-                "No saved sessions.\n",
-                "{name}"
+                )
+                .ends_with("\tprimary\t1\n")
             );
         } else {
             assert_no_saved_sessions(&project_root, &config_home);
