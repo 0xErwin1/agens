@@ -463,6 +463,8 @@ fn device_code_login_cancels_while_a_poll_request_is_blocked() {
         "http://{}/token",
         poll_listener.local_addr().expect("address")
     );
+    let (poll_started_send, poll_started_receive) = mpsc::sync_channel(1);
+    let (poll_closed_send, poll_closed_receive) = mpsc::sync_channel(1);
     let user_server = thread::spawn(move || {
         let (mut stream, _) = user_listener.accept().expect("user request should arrive");
         let _ = read_http_request(&mut stream);
@@ -475,29 +477,29 @@ fn device_code_login_cancels_while_a_poll_request_is_blocked() {
     let poll_server = thread::spawn(move || {
         let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
         let _ = read_http_request(&mut stream);
-        thread::sleep(Duration::from_millis(150));
-        write_http_response(&mut stream, 403, "{}");
+        poll_started_send
+            .send(())
+            .expect("test should observe the blocked poll");
+        poll_closed_send
+            .send(client_closed_before_late_response(&mut stream, 403, "{}"))
+            .expect("test should observe whether cancellation closed the poll");
     });
     let cancellation = LoginCancellation::new();
-    let canceller = cancellation.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(15));
-        canceller.cancel();
-    });
-
-    let started = Instant::now();
-    assert_eq!(
-        device_code_login(
-            ChatGptDeviceCodeLoginOptions::for_test(
-                &user_endpoint,
-                &poll_endpoint,
-                "http://127.0.0.1:1/token"
-            ),
-            cancellation,
+    assert_login_cancels_after_request_starts(
+        ChatGptDeviceCodeLoginOptions::for_test(
+            &user_endpoint,
+            &poll_endpoint,
+            "http://127.0.0.1:1/token",
         ),
-        Err(LoginError::Cancelled)
+        cancellation,
+        poll_started_receive,
     );
-    assert!(started.elapsed() < Duration::from_millis(150));
+    assert!(
+        poll_closed_receive
+            .recv_timeout(Duration::from_millis(500))
+            .expect("poll server should finish after cancellation"),
+        "cancellation must close the blocked poll socket"
+    );
     user_server.join().expect("user server should finish");
     poll_server.join().expect("poll server should finish");
 }
@@ -638,6 +640,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         "http://{}/token",
         poll_listener.local_addr().expect("address")
     );
+    let (poll_finished_send, poll_finished_receive) = mpsc::sync_channel(1);
     let user_server = thread::spawn(move || {
         let (mut stream, _) = user_listener.accept().expect("user request should arrive");
         let _ = read_http_request(&mut stream);
@@ -651,26 +654,20 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
         let _ = read_http_request(&mut stream);
         write_http_response(&mut stream, 403, "{}");
+        poll_finished_send
+            .send(())
+            .expect("test should observe the pending poll");
     });
     let cancellation = LoginCancellation::new();
-    let canceller = cancellation.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(15));
-        canceller.cancel();
-    });
-    let started = Instant::now();
-    assert_eq!(
-        device_code_login(
-            ChatGptDeviceCodeLoginOptions::for_test(
-                &user_endpoint,
-                &poll_endpoint,
-                "http://127.0.0.1:1/token"
-            ),
-            cancellation,
+    assert_login_cancels_after_request_starts(
+        ChatGptDeviceCodeLoginOptions::for_test(
+            &user_endpoint,
+            &poll_endpoint,
+            "http://127.0.0.1:1/token",
         ),
-        Err(LoginError::Cancelled)
+        cancellation,
+        poll_finished_receive,
     );
-    assert!(started.elapsed() < Duration::from_millis(150));
     user_server.join().expect("user server should finish");
     poll_server.join().expect("poll server should finish");
 
@@ -716,28 +713,33 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         "http://{}/usercode",
         listener.local_addr().expect("address")
     );
+    let (request_started_send, request_started_receive) = mpsc::sync_channel(1);
+    let (request_closed_send, request_closed_receive) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("request should arrive");
         let _ = read_http_request(&mut stream);
-        thread::sleep(Duration::from_millis(100));
-        write_http_response(&mut stream, 200, "{}");
+        request_started_send
+            .send(())
+            .expect("test should observe the user-code request");
+        request_closed_send
+            .send(client_closed_before_late_response(&mut stream, 200, "{}"))
+            .expect("test should observe whether cancellation closed the request");
     });
     let cancellation = LoginCancellation::new();
-    let canceller = cancellation.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(15));
-        canceller.cancel();
-    });
-    assert_eq!(
-        device_code_login(
-            ChatGptDeviceCodeLoginOptions::for_test(
-                &endpoint,
-                "http://127.0.0.1:1/poll",
-                "http://127.0.0.1:1/token"
-            ),
-            cancellation,
+    assert_login_cancels_after_request_starts(
+        ChatGptDeviceCodeLoginOptions::for_test(
+            &endpoint,
+            "http://127.0.0.1:1/poll",
+            "http://127.0.0.1:1/token",
         ),
-        Err(LoginError::Cancelled)
+        cancellation,
+        request_started_receive,
+    );
+    assert!(
+        request_closed_receive
+            .recv_timeout(Duration::from_millis(500))
+            .expect("user-code server should finish after cancellation"),
+        "cancellation must close the blocked user-code socket"
     );
     server.join().expect("server should finish");
 }
@@ -807,6 +809,8 @@ fn device_code_login_rejects_nonpending_and_malformed_success_and_cancels_token_
         "http://{}/token",
         oauth_listener.local_addr().expect("address")
     );
+    let (oauth_started_send, oauth_started_receive) = mpsc::sync_channel(1);
+    let (oauth_closed_send, oauth_closed_receive) = mpsc::sync_channel(1);
     let pkce = generate_pkce(&|length| Ok(vec![9; length])).expect("PKCE should generate");
     let user_server = thread::spawn(move || {
         let (mut stream, _) = user_listener.accept().expect("user request should arrive");
@@ -834,25 +838,24 @@ fn device_code_login_rejects_nonpending_and_malformed_success_and_cancels_token_
             .accept()
             .expect("OAuth request should arrive");
         let _ = read_http_request(&mut stream);
-        thread::sleep(Duration::from_millis(100));
-        write_http_response(&mut stream, 500, "{}");
+        oauth_started_send
+            .send(())
+            .expect("test should observe the OAuth request");
+        oauth_closed_send
+            .send(client_closed_before_late_response(&mut stream, 500, "{}"))
+            .expect("test should observe whether cancellation closed the request");
     });
     let cancellation = LoginCancellation::new();
-    let canceller = cancellation.clone();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(15));
-        canceller.cancel();
-    });
-    assert_eq!(
-        device_code_login(
-            ChatGptDeviceCodeLoginOptions::for_test(
-                &user_endpoint,
-                &poll_endpoint,
-                &oauth_endpoint
-            ),
-            cancellation,
-        ),
-        Err(LoginError::Cancelled)
+    assert_login_cancels_after_request_starts(
+        ChatGptDeviceCodeLoginOptions::for_test(&user_endpoint, &poll_endpoint, &oauth_endpoint),
+        cancellation,
+        oauth_started_receive,
+    );
+    assert!(
+        oauth_closed_receive
+            .recv_timeout(Duration::from_millis(500))
+            .expect("OAuth server should finish after cancellation"),
+        "cancellation must close the blocked OAuth socket"
     );
     user_server.join().expect("user server should finish");
     poll_server.join().expect("poll server should finish");
@@ -1544,6 +1547,48 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
     write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response should be written");
     stream.flush().expect("response should flush");
+}
+
+fn assert_login_cancels_after_request_starts(
+    options: ChatGptDeviceCodeLoginOptions,
+    cancellation: LoginCancellation,
+    request_started: mpsc::Receiver<()>,
+) {
+    let login_cancellation = cancellation.clone();
+    let (result_send, result_receive) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        result_send
+            .send(device_code_login(options, login_cancellation))
+            .expect("test should receive the login result");
+    });
+
+    request_started
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request should start");
+    cancellation.cancel();
+    assert_eq!(
+        result_receive
+            .recv_timeout(Duration::from_millis(100))
+            .expect("cancellation should promptly finish login"),
+        Err(LoginError::Cancelled),
+    );
+    worker.join().expect("login worker should finish");
+}
+
+fn client_closed_before_late_response(stream: &mut TcpStream, status: u16, body: &str) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("client close timeout should be set");
+    let mut byte = [0_u8; 1];
+    let client_closed = matches!(stream.read(&mut byte), Ok(0));
+
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.flush();
+    client_closed
 }
 
 fn temporary_directory(name: &str) -> PathBuf {

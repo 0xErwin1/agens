@@ -8,7 +8,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -903,18 +902,18 @@ fn device_user_code_request(
     deadline: Instant,
 ) -> Result<Value, LoginError> {
     let endpoint = endpoint.to_owned();
-    let response = cancellable_request(cancellation, deadline, move || {
-        reqwest::blocking::Client::builder()
-            .timeout(DEVICE_HTTP_TIMEOUT)
+    let request_timeout = token_request_timeout(deadline)?;
+    let response = cancellable_request(cancellation, deadline, async move {
+        let response = reqwest::Client::builder()
+            .timeout(request_timeout)
             .build()
             .expect("the fixed device HTTP client configuration is valid")
             .post(endpoint)
             .json(&serde_json::json!({ "client_id": CLIENT_ID }))
             .send()
-            .map(|mut response| {
-                let status = response.status().as_u16();
-                (status, read_device_json(&mut response))
-            })
+            .await?;
+        let status = response.status().as_u16();
+        Ok((status, read_device_json(response).await))
     })?;
     match response {
         (404, _) => Err(LoginError::Authentication("Authentication unavailable")),
@@ -933,9 +932,10 @@ fn device_token_request(
     let endpoint = endpoint.to_owned();
     let device_auth_id = device_auth_id.to_owned();
     let user_code = user_code.to_owned();
-    let response = cancellable_request(cancellation, deadline, move || {
-        reqwest::blocking::Client::builder()
-            .timeout(DEVICE_HTTP_TIMEOUT)
+    let request_timeout = token_request_timeout(deadline)?;
+    let response = cancellable_request(cancellation, deadline, async move {
+        let response = reqwest::Client::builder()
+            .timeout(request_timeout)
             .build()
             .expect("the fixed device HTTP client configuration is valid")
             .post(endpoint)
@@ -944,10 +944,9 @@ fn device_token_request(
                 "user_code": user_code,
             }))
             .send()
-            .map(|mut response| {
-                let status = response.status().as_u16();
-                (status, read_device_json(&mut response))
-            })
+            .await?;
+        let status = response.status().as_u16();
+        Ok((status, read_device_json(response).await))
     })?;
     match response {
         (403 | 404, _) => Ok(None),
@@ -1021,7 +1020,7 @@ fn valid_base64url_no_pad(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn read_device_json(response: &mut reqwest::blocking::Response) -> Result<Value, ()> {
+async fn read_device_json(mut response: reqwest::Response) -> Result<Value, ()> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_DEVICE_JSON_BYTES as u64)
@@ -1030,12 +1029,11 @@ fn read_device_json(response: &mut reqwest::blocking::Response) -> Result<Value,
     }
 
     let mut body = Vec::new();
-    response
-        .take((MAX_DEVICE_JSON_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|_| ())?;
-    if body.len() > MAX_DEVICE_JSON_BYTES {
-        return Err(());
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if body.len().saturating_add(chunk.len()) > MAX_DEVICE_JSON_BYTES {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
     }
 
     serde_json::from_slice(&body).map_err(|_| ())
@@ -1066,8 +1064,8 @@ fn exchange_code_cancellable(
     let redirect_uri = redirect_uri.to_owned();
     let verifier = verifier.to_owned();
     let request_timeout = token_request_timeout(deadline)?;
-    let response = cancellable_request(cancellation, deadline, move || {
-        reqwest::blocking::Client::builder()
+    let response = cancellable_request(cancellation, deadline, async move {
+        let response = reqwest::Client::builder()
             .timeout(request_timeout)
             .build()
             .expect("the fixed authentication HTTP client configuration is valid")
@@ -1081,15 +1079,14 @@ fn exchange_code_cancellable(
                 ("code_verifier", verifier.as_str()),
             ])
             .send()
-            .map(|mut response| {
-                let status = response.status().as_u16();
-                let body = if (200..300).contains(&status) {
-                    read_device_json(&mut response)
-                } else {
-                    Err(())
-                };
-                (status, body)
-            })
+            .await?;
+        let status = response.status().as_u16();
+        let body = if (200..300).contains(&status) {
+            read_device_json(response).await
+        } else {
+            Err(())
+        };
+        Ok((status, body))
     })
     .map_err(|error| match error {
         LoginError::Cancelled | LoginError::TimedOut => error,
@@ -1103,29 +1100,31 @@ fn exchange_code_cancellable(
     credentials_from_token(&token, now())
 }
 
-fn cancellable_request<T: Send + 'static>(
+fn cancellable_request<T>(
     cancellation: &LoginCancellation,
     deadline: Instant,
-    request: impl FnOnce() -> Result<T, reqwest::Error> + Send + 'static,
+    request: impl std::future::Future<Output = Result<T, reqwest::Error>>,
 ) -> Result<T, LoginError> {
     check_login_stop(cancellation, deadline)?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let _ = sender.send(request().map_err(|_| ()));
-    });
-    loop {
-        check_login_stop(cancellation, deadline)?;
-        match receiver.recv_timeout(DEVICE_WAIT_SLICE) {
-            Ok(Ok(value)) => {
-                check_login_stop(cancellation, deadline)?;
-                return Ok(value);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|_| LoginError::Authentication("device authorization failed"))?;
+    runtime.block_on(async {
+        tokio::pin!(request);
+        loop {
+            tokio::select! {
+                result = &mut request => {
+                    check_login_stop(cancellation, deadline)?;
+                    return result.map_err(|_| LoginError::Authentication("device authorization failed"));
+                }
+                _ = tokio::time::sleep(DEVICE_WAIT_SLICE) => {
+                    check_login_stop(cancellation, deadline)?;
+                }
             }
-            Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
-                return Err(LoginError::Authentication("device authorization failed"));
-            }
-            Err(RecvTimeoutError::Timeout) => {}
         }
-    }
+    })
 }
 
 fn token_request_timeout(deadline: Instant) -> Result<Duration, LoginError> {
