@@ -861,7 +861,7 @@ fn short_session_dialog_keeps_search_selected_row_and_compact_details_visible() 
                 format!("#{id} Session {id}"),
                 "2 turns · now · primary",
                 format!("{id} Session {id} /work/alpha primary"),
-                format!("ID: {id} · Session {id}\nTurns: 2 · Agent: primary"),
+                format!("Turns: 2 · Agent: primary\nID: {id} · Session {id}"),
                 format!("session:{id}"),
             )
         })

@@ -1203,6 +1203,87 @@ fn session_timestamp() -> Option<i64> {
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
 }
 
+fn current_session_timestamp() -> i64 {
+    session_timestamp().unwrap_or_default()
+}
+
+fn session_dialog_entry(
+    session: &SessionMetadata,
+    current_session: Option<i64>,
+    all_projects: bool,
+    now: i64,
+) -> DialogEntry {
+    let age = session_relative_age(session.updated_at, now);
+    let turns = if session.completed_turn_count == 1 {
+        "1 turn".to_owned()
+    } else {
+        format!("{} turns", session.completed_turn_count)
+    };
+    let current = (current_session == Some(session.id)).then_some(" · current");
+    let root = all_projects.then(|| format!(" · root={}", compact_session_root(&session.project)));
+    let row_detail = if let Some(root) = root.as_deref() {
+        format!(
+            "{turns}{root} · {age} · {}{}",
+            session.active_agent,
+            current.unwrap_or_default()
+        )
+    } else {
+        format!(
+            "{turns} · {age} · {}{}",
+            session.active_agent,
+            current.unwrap_or_default()
+        )
+    };
+    let selected_detail = format!(
+        "Turns: {} · Agent: {}{}\nUpdated: {} ({}){}\nID: {} · {}",
+        session.completed_turn_count,
+        session.active_agent,
+        current.unwrap_or_default(),
+        session.updated_at,
+        age,
+        root.as_deref().unwrap_or_default(),
+        session.id,
+        session.title,
+    );
+
+    DialogEntry::action_with_metadata(
+        format!("#{} {}", session.id, session.title),
+        row_detail,
+        format!(
+            "{} {} {} {}",
+            session.id, session.title, session.project, session.active_agent
+        ),
+        selected_detail,
+        format!("session:{}", session.id),
+    )
+}
+
+fn compact_session_root(root: &str) -> String {
+    const MAX_CHARS: usize = 30;
+    let character_count = root.chars().count();
+    if character_count <= MAX_CHARS {
+        return root.into();
+    }
+
+    format!(
+        "...{}",
+        root.chars()
+            .skip(character_count - MAX_CHARS)
+            .collect::<String>()
+    )
+}
+
+fn session_relative_age(updated_at: i64, now: i64) -> String {
+    let age = now.saturating_sub(updated_at);
+    match age {
+        ..=0 => "now".into(),
+        1..=59 => format!("{age}s ago"),
+        60..=3_599 => format!("{}m ago", age / 60),
+        3_600..=86_399 => format!("{}h ago", age / 3_600),
+        _ => format!("{}d ago", age / 86_400),
+    }
+}
+
 impl TuiSessionContext {
     fn fresh() -> Self {
         Self::default()
@@ -1285,6 +1366,7 @@ struct TuiRuntimeRouter {
     commands: Arc<CommandCatalog>,
     skills: Arc<SkillCatalog>,
     palette: Arc<[PaletteEntry]>,
+    clock: fn() -> i64,
 }
 
 impl TuiRuntimeRouter {
@@ -1322,7 +1404,22 @@ impl TuiRuntimeRouter {
             commands,
             skills,
             palette,
+            clock: current_session_timestamp,
         }
+    }
+
+    #[cfg(test)]
+    fn with_clock(
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<TuiSessionContext>>,
+        cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+        commands: Arc<CommandCatalog>,
+        skills: Arc<SkillCatalog>,
+        clock: fn() -> i64,
+    ) -> Self {
+        let mut router = Self::new(bootstrap, session, cancellation, commands, skills);
+        router.clock = clock;
+        router
     }
 
     #[cfg(test)]
@@ -1478,25 +1575,25 @@ impl TuiRuntimeRouter {
                 let project = tui_project_identifier(&bootstrap)?;
                 let store = SessionStore::open(bootstrap.data_directory())
                     .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-                let mut sessions = store
+                let sessions = store
                     .list_sessions()
-                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
-                    .into_iter()
+                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
+                let current_session = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?
+                    .identifier;
+                let now = (self.clock)();
+                let current_project = sessions
+                    .iter()
                     .filter(|session| session.project == project)
-                    .collect::<Vec<_>>();
-                sessions.sort_by_key(|session| session.id);
-                let entries = sessions
+                    .map(|session| session_dialog_entry(session, current_session, false, now))
+                    .collect();
+                let all_projects = sessions
                     .into_iter()
-                    .map(|session| {
-                        let label = format!(
-                            "#{} {} ({} turns)",
-                            session.id, session.title, session.completed_turn_count
-                        );
-                        DialogEntry::action(label, format!("session:{}", session.id))
-                    })
-                    .collect::<Vec<_>>();
-                let help = entries.is_empty().then_some("No saved sessions.");
-                DialogView::selection("Resume session", help, entries)
+                    .map(|session| session_dialog_entry(&session, current_session, true, now))
+                    .collect();
+                DialogView::sessions(current_project, all_projects)
             }
             "agent" => {
                 let catalog = tui_agent_catalog(&bootstrap, &BundledModelValidator)?;
@@ -6260,7 +6357,10 @@ mod tests {
             progress.clone(),
         );
         tui.apply_submission_outcome(empty);
-        assert!(render_tui_test_backend(&tui, 80, 24).contains("No saved sessions."));
+        assert!(
+            render_tui_test_backend(&tui, 80, 24)
+                .contains("No resumable sessions in current project.")
+        );
         tui.handle(Event::Key(Key::Escape));
 
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
@@ -6297,6 +6397,115 @@ mod tests {
         dispatch_tui_dialog_selection(&mut tui, &router, progress);
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn session_overlay_uses_real_metadata_scope_search_sort_clock_and_atomic_failure() {
+        let temporary = tui_session_directory("session-metadata-overlay");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project = tui_project(&temporary);
+        let other_project = temporary.join("other-root").display().to_string();
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let old = persist_tui_session_metadata(&mut store, &project, "Alpha", "primary", 9_900);
+        let other =
+            persist_tui_session_metadata(&mut store, &other_project, "Beta", "build", 9_950);
+        let current =
+            persist_tui_session_metadata(&mut store, &project, "Gamma", "reviewer", 9_950);
+        drop(store);
+
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            identifier: Some(current.id),
+            ..TuiSessionContext::fresh()
+        }));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        tui.set_presentation("openai-api", "gpt-4.1", format!("session #{}", current.id));
+        tui.replace_history(&tui_session_messages()).unwrap();
+        let router = TuiRuntimeRouter::with_clock(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            || 10_000,
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let (progress, _) = std::sync::mpsc::channel();
+        let original_context = session.lock().unwrap().clone();
+
+        open_tui_palette_dialog(&mut tui, &router, "/se", "sessions", progress.clone());
+        let project_rows = render_tui_test_backend(&tui, 100, 24);
+        assert!(project_rows.contains("Resume session · Current project"));
+        assert!(project_rows.contains(&format!("#{} Gamma", current.id)));
+        assert!(project_rows.contains(&format!("#{} Alpha", old.id)));
+        assert!(project_rows.contains("reviewer · current"));
+        assert!(
+            project_rows.contains("Updated: 9950 (50s ago)"),
+            "{project_rows:?}"
+        );
+        assert!(project_rows.find("Gamma").unwrap() < project_rows.find("Alpha").unwrap());
+        assert!(!project_rows.contains("Beta"));
+
+        tui.handle(Event::Key(Key::LineStart));
+        let global_rows = render_tui_test_backend(&tui, 100, 24);
+        assert!(global_rows.contains("Resume session · All projects"));
+        assert!(global_rows.contains(&format!("#{} Beta", other.id)));
+        assert!(global_rows.contains("root="));
+        assert!(global_rows.contains("other-root"));
+        assert!(global_rows.find("Gamma").unwrap() < global_rows.find("Beta").unwrap());
+        assert!(global_rows.find("Beta").unwrap() < global_rows.find("Alpha").unwrap());
+
+        for character in "reviewer".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        let agent_search = render_tui_test_backend(&tui, 100, 24);
+        assert!(agent_search.contains("Gamma"));
+        assert!(!agent_search.contains("Alpha"));
+        assert!(!agent_search.contains("Beta"));
+        tui.handle(Event::Key(Key::Escape));
+        for character in "other-root".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        let root_search = render_tui_test_backend(&tui, 100, 24);
+        assert!(root_search.contains("Beta"));
+        assert!(!root_search.contains("Gamma"));
+        assert_eq!(*session.lock().unwrap(), original_context);
+
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::Key(Key::LineStart));
+        SessionStore::open(bootstrap.data_directory())
+            .unwrap()
+            .delete_session(current.id)
+            .unwrap();
+        let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("session Enter should dispatch through the router");
+        };
+        let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
+        tui.apply_submission_outcome(outcome);
+        assert_eq!(tui.view().session, format!("session #{}", current.id));
+        assert_eq!(*session.lock().unwrap(), original_context);
+        assert!(render_tui_test_backend(&tui, 100, 24).contains("saved session is unavailable"));
+        tui.handle(Event::Key(Key::Escape));
+        assert!(render_tui_test_backend(&tui, 100, 24).contains("previous request"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn session_relative_age_uses_stable_boundaries() {
+        for (updated_at, expected) in [
+            (100_000, "now"),
+            (99_941, "59s ago"),
+            (99_940, "1m ago"),
+            (96_401, "59m ago"),
+            (96_400, "1h ago"),
+            (13_601, "23h ago"),
+            (13_600, "1d ago"),
+        ] {
+            assert_eq!(session_relative_age(updated_at, 100_000), expected);
+        }
     }
 
     #[test]
@@ -6923,6 +7132,20 @@ mod tests {
                 &turn,
             )
             .unwrap()
+    }
+
+    fn persist_tui_session_metadata(
+        store: &mut SessionStore,
+        project: &str,
+        title: &str,
+        active_agent: &str,
+        updated_at: i64,
+    ) -> SessionMetadata {
+        let mut metadata = persist_tui_session(store, project, title);
+        metadata.active_agent = active_agent.into();
+        metadata.updated_at = updated_at;
+        store.update_session(&metadata).unwrap();
+        metadata
     }
 
     #[test]

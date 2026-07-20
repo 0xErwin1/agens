@@ -380,7 +380,7 @@ impl DialogEntry {
             label: bounded_dialog_text(label.as_ref(), 128),
             detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
             search_text: Some(bounded_dialog_text(search_text.as_ref(), 512)),
-            selected_detail: Some(bounded_dialog_text(selected_detail.as_ref(), 512)),
+            selected_detail: Some(bounded_dialog_multiline(selected_detail.as_ref(), 512)),
             action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
                 action_id.as_ref(),
                 128,
@@ -2303,6 +2303,14 @@ fn bounded_dialog_text(value: &str, limit: usize) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn bounded_dialog_multiline(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .filter(|character| *character == '\n' || !character.is_control())
         .take(limit)
         .collect()
 }
