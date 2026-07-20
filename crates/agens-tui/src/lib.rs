@@ -838,13 +838,35 @@ impl Drop for Terminal {
     }
 }
 
+trait RuntimeTerminal {
+    fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
+}
+
+impl RuntimeTerminal for Terminal {
+    fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        Self::poll(self, timeout)
+    }
+}
+
 /// Runs a terminal event loop and hands rendering to the caller-owned renderer.
 pub fn run<E, R>(tui: &mut Tui<E>, renderer: &mut R) -> io::Result<()>
 where
     E: Engine,
     R: Renderer,
 {
-    let mut terminal = Terminal::enter()?;
+    run_with_runtime_terminal(tui, renderer, Terminal::enter()?)
+}
+
+fn run_with_runtime_terminal<E, R, T>(
+    tui: &mut Tui<E>,
+    renderer: &mut R,
+    mut terminal: T,
+) -> io::Result<()>
+where
+    E: Engine,
+    R: Renderer,
+    T: RuntimeTerminal,
+{
     renderer.render(tui.view())?;
 
     loop {
@@ -1004,4 +1026,123 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
     };
 
     Some(Event::Key(key))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::terminal::{TerminalControl, TerminalModeGuard, TerminalOperation};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[derive(Default)]
+    struct RecordingControl {
+        calls: Rc<RefCell<Vec<TerminalOperation>>>,
+    }
+
+    impl TerminalControl for RecordingControl {
+        fn apply(&mut self, operation: TerminalOperation) -> io::Result<()> {
+            self.calls.borrow_mut().push(operation);
+            Ok(())
+        }
+    }
+
+    struct GuardedRuntime {
+        guard: TerminalModeGuard,
+        control: RecordingControl,
+        input_error: io::ErrorKind,
+    }
+
+    impl GuardedRuntime {
+        fn new(input_error: io::ErrorKind) -> (Self, Rc<RefCell<Vec<TerminalOperation>>>) {
+            let mut control = RecordingControl::default();
+            let calls = Rc::clone(&control.calls);
+            let guard = TerminalModeGuard::enter(&mut control).unwrap();
+
+            (
+                Self {
+                    guard,
+                    control,
+                    input_error,
+                },
+                calls,
+            )
+        }
+    }
+
+    impl RuntimeTerminal for GuardedRuntime {
+        fn poll(&mut self, _: Duration) -> io::Result<Option<Event>> {
+            Err(io::Error::from(self.input_error))
+        }
+    }
+
+    impl Drop for GuardedRuntime {
+        fn drop(&mut self) {
+            let _ = self.guard.restore(&mut self.control);
+        }
+    }
+
+    struct NoopEngine;
+
+    impl Engine for NoopEngine {
+        fn cancel(&mut self) {}
+    }
+
+    struct FailingRenderer {
+        fail_on_render: usize,
+        renders: usize,
+    }
+
+    impl Renderer for FailingRenderer {
+        fn render(&mut self, _: ViewState<'_>) -> io::Result<()> {
+            self.renders += 1;
+            if self.renders == self.fail_on_render {
+                return Err(io::Error::other("injected renderer failure"));
+            }
+
+            Ok(())
+        }
+    }
+
+    fn expected_terminal_calls() -> Vec<TerminalOperation> {
+        vec![
+            TerminalOperation::EnableRaw,
+            TerminalOperation::EnterAlternate,
+            TerminalOperation::EnableMouse,
+            TerminalOperation::DisableMouse,
+            TerminalOperation::LeaveAlternate,
+            TerminalOperation::DisableRaw,
+        ]
+    }
+
+    #[test]
+    fn runtime_restores_each_mode_once_after_renderer_failure() {
+        let (terminal, calls) = GuardedRuntime::new(io::ErrorKind::Other);
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = FailingRenderer {
+            fail_on_render: 1,
+            renders: 0,
+        };
+
+        let error = run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(*calls.borrow(), expected_terminal_calls());
+    }
+
+    #[test]
+    fn runtime_restores_each_mode_once_after_input_poll_or_read_failure() {
+        for input_error in [io::ErrorKind::TimedOut, io::ErrorKind::UnexpectedEof] {
+            let (terminal, calls) = GuardedRuntime::new(input_error);
+            let mut tui = Tui::new(NoopEngine);
+            let mut renderer = FailingRenderer {
+                fail_on_render: 2,
+                renders: 0,
+            };
+
+            let error = run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap_err();
+
+            assert_eq!(error.kind(), input_error);
+            assert_eq!(*calls.borrow(), expected_terminal_calls());
+        }
+    }
 }
