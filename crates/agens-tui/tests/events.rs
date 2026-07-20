@@ -604,9 +604,10 @@ fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
         ],
     ));
 
-    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    for character in "sec".chars() {
+        assert_eq!(tui.handle(Event::Key(Key::Char(character))), Action::Render);
+    }
     assert_eq!(tui.input(), "d");
-    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("second".into())
@@ -617,6 +618,57 @@ fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
         Action::Submit("d".into())
     );
     assert_eq!(tui.engine().cancellations, 0);
+}
+
+#[test]
+fn selection_dialog_search_edits_navigates_filtered_rows_and_clears_before_closing() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 24,
+        height: 12,
+    });
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        Some("Search options"),
+        (0..20)
+            .map(|index| DialogEntry::action(format!("Option {index:02}"), format!("pick:{index}")))
+            .collect(),
+    ));
+
+    for character in "Option 1x".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::Backspace));
+    tui.handle(Event::Key(Key::PageDown));
+    tui.handle(Event::Key(Key::PageDown));
+    tui.handle(Event::Key(Key::ScrollUp));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("pick:18".into())
+    );
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        None::<String>,
+        vec![DialogEntry::action("Alpha", "alpha")],
+    ));
+    for character in "alpha".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    tui.handle(Event::Key(Key::DeletePreviousWord));
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().dialog.is_none());
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        None::<String>,
+        vec![DialogEntry::action("Alpha", "alpha")],
+    ));
+    tui.handle(Event::Key(Key::Char('a')));
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().dialog.is_none());
 }
 
 #[test]

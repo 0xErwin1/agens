@@ -377,6 +377,7 @@ pub struct DialogView {
     title: String,
     help: Option<String>,
     entries: Vec<DialogEntry>,
+    query: String,
     selected: usize,
     offset: usize,
     interactive: bool,
@@ -396,6 +397,7 @@ impl DialogView {
             title: bounded_dialog_text(title.as_ref(), 64),
             help: help.map(|help| bounded_dialog_text(help.as_ref(), 2_048)),
             entries,
+            query: String::new(),
             selected,
             offset: 0,
             interactive: true,
@@ -407,11 +409,29 @@ impl DialogView {
             title: bounded_dialog_text(title.as_ref(), 64),
             help: Some(bounded_dialog_text(body.as_ref(), 2_048)),
             entries: Vec::new(),
+            query: String::new(),
             selected: 0,
             offset: 0,
             interactive: false,
         }
     }
+}
+
+fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
+    let query = dialog.query.to_lowercase();
+    dialog
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            query.is_empty()
+                || entry.label.to_lowercase().contains(&query)
+                || entry
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.to_lowercase().contains(&query))
+        })
+        .collect()
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -629,6 +649,7 @@ fn render_palette(
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
     let dialog_area = dialog_area(area, dialog);
+    let matches = dialog_matches(dialog);
 
     frame.render_widget(Clear, dialog_area);
     let mut lines: Vec<Line<'_>> = dialog
@@ -642,14 +663,18 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
             }
         })
         .unwrap_or_default();
-    if dialog.entries.is_empty() && dialog.help.is_none() {
+    if dialog.interactive {
+        lines.push(Line::styled(
+            format!("Search: {}", dialog.query),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if matches.is_empty() && dialog.help.is_none() {
         lines.push(Line::from("No options available."));
     }
     lines.extend(
-        dialog
-            .entries
-            .iter()
-            .enumerate()
+        matches
+            .into_iter()
             .skip(dialog.offset)
             .map(|(index, entry)| {
                 let selected = dialog.interactive && index == dialog.selected;
@@ -690,7 +715,8 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
 fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
     let width = area.width.saturating_sub(4).clamp(1, 64);
     let content_rows = usize::from(dialog.help.is_some())
-        .saturating_add(dialog.entries.len().max(1))
+        .saturating_add(usize::from(dialog.interactive))
+        .saturating_add(dialog_matches(dialog).len().max(1))
         .saturating_add(2) as u16;
     let height = content_rows
         .min(12)
@@ -1754,6 +1780,29 @@ where
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
+            Key::Char(character) => {
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.query.push(character);
+                }
+                self.reset_dialog_selection();
+                Action::Render
+            }
+            Key::Backspace => {
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.query.pop();
+                }
+                self.reset_dialog_selection();
+                Action::Render
+            }
+            Key::DeletePreviousWord => {
+                if let Some(dialog) = self.dialog.as_mut() {
+                    let boundary =
+                        previous_word_boundary(&dialog.query, dialog.query.chars().count());
+                    dialog.query.truncate(byte_index(&dialog.query, boundary));
+                }
+                self.reset_dialog_selection();
+                Action::Render
+            }
             Key::Up | Key::Down | Key::ScrollUp | Key::ScrollDown => {
                 self.move_dialog_selection(key, 1, true);
                 Action::Render
@@ -1781,6 +1830,18 @@ where
                     None => Action::Render,
                 }
             }
+            Key::Escape
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| !dialog.query.is_empty()) =>
+            {
+                if let Some(dialog) = self.dialog.as_mut() {
+                    dialog.query.clear();
+                }
+                self.reset_dialog_selection();
+                Action::Render
+            }
             Key::Escape | Key::CtrlC => {
                 self.dialog = None;
                 Action::Render
@@ -1793,10 +1854,8 @@ where
         let Some(dialog) = self.dialog.as_mut() else {
             return;
         };
-        let enabled = dialog
-            .entries
-            .iter()
-            .enumerate()
+        let enabled = dialog_matches(dialog)
+            .into_iter()
             .filter_map(|(index, entry)| entry.action.as_ref().map(|_| index))
             .collect::<Vec<_>>();
         let Some(position) = enabled.iter().position(|index| *index == dialog.selected) else {
@@ -1821,15 +1880,31 @@ where
         let Some(dialog) = self.dialog.as_mut() else {
             return;
         };
-        dialog.selected = dialog.selected.min(dialog.entries.len().saturating_sub(1));
-        dialog.offset = dialog
-            .offset
-            .min(dialog.entries.len().saturating_sub(capacity));
-        if dialog.selected < dialog.offset {
-            dialog.offset = dialog.selected;
-        } else if dialog.selected >= dialog.offset.saturating_add(capacity) {
-            dialog.offset = dialog.selected.saturating_add(1).saturating_sub(capacity);
+        let matches = dialog_matches(dialog);
+        let selected = matches
+            .iter()
+            .position(|(index, _)| *index == dialog.selected)
+            .unwrap_or_default();
+        dialog.offset = dialog.offset.min(matches.len().saturating_sub(capacity));
+        if selected < dialog.offset {
+            dialog.offset = selected;
+        } else if selected >= dialog.offset.saturating_add(capacity) {
+            dialog.offset = selected.saturating_add(1).saturating_sub(capacity);
         }
+    }
+
+    fn reset_dialog_selection(&mut self) {
+        if let Some(dialog) = self.dialog.as_mut() {
+            let matches = dialog_matches(dialog);
+            dialog.selected = matches
+                .iter()
+                .find(|(_, entry)| entry.action.is_some())
+                .or_else(|| matches.first())
+                .map(|(index, _)| *index)
+                .unwrap_or_default();
+            dialog.offset = 0;
+        }
+        self.ensure_dialog_selection_visible();
     }
 
     fn dialog_page_rows(&self) -> usize {
@@ -1840,6 +1915,7 @@ where
         let help_rows = usize::from(dialog.help.is_some() && !dialog.entries.is_empty());
         usize::from(dialog_area(area, dialog).height.saturating_sub(2))
             .saturating_sub(help_rows)
+            .saturating_sub(usize::from(dialog.interactive))
             .max(1)
     }
 

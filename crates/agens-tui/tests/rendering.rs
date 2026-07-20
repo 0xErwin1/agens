@@ -765,12 +765,12 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     tui.handle(Event::Key(Key::PageDown));
     renderer.render(tui.view()).unwrap();
     let page = rendered_text(&renderer);
-    assert!(page.contains("> Option 11"), "{page:?}");
+    assert!(page.contains("> Option 10"), "{page:?}");
 
     tui.handle(Event::Key(Key::ScrollUp));
     renderer.render(tui.view()).unwrap();
     let wheel = rendered_text(&renderer);
-    assert!(wheel.contains("> Option 10"), "{wheel:?}");
+    assert!(wheel.contains("> Option 09"), "{wheel:?}");
 
     tui.handle(Event::Resize {
         width: 24,
@@ -778,7 +778,17 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     });
     renderer.render(tui.view()).unwrap();
     let resized = rendered_text(&renderer);
-    assert!(resized.contains("> Option 10"), "{resized:?}");
+    assert!(resized.contains("> Option 09"), "{resized:?}");
+
+    tui.handle(Event::Key(Key::Char('1')));
+    for _ in 0..10 {
+        tui.handle(Event::Key(Key::PageDown));
+    }
+    renderer.render(tui.view()).unwrap();
+    let filtered = rendered_text(&renderer);
+    assert!(filtered.contains("Search: 1"), "{filtered:?}");
+    assert!(filtered.contains("> Option 19"), "{filtered:?}");
+    assert!(!filtered.contains("Option 08"), "{filtered:?}");
 }
 
 #[test]
