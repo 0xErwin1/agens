@@ -268,6 +268,8 @@ pub struct HeadlessChatRequest {
     pub dangerously_allow_all: bool,
     session: Option<SessionMetadata>,
     active_agent: Option<String>,
+    effective_capabilities: Option<EffectiveCapabilitySet>,
+    pending_system_reminder: Option<String>,
 }
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
@@ -826,12 +828,13 @@ struct ProductionTuiEngine {
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TuiSessionContext {
     identifier: Option<i64>,
     metadata: Option<SessionMetadata>,
     messages: Vec<Message>,
     active_agent: Option<ActiveAgentRuntime>,
+    pending_system_reminder: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveAgentRuntime {
@@ -882,7 +885,7 @@ fn rotate_active_agent(
     validator: &dyn AgentModelValidator,
     store: Option<&mut SessionStore>,
     busy: bool,
-) -> Result<Option<String>, AgentRotationError> {
+) -> Result<(), AgentRotationError> {
     if busy {
         return Err(AgentRotationError::Busy);
     }
@@ -919,8 +922,9 @@ fn rotate_active_agent(
 
     context.active_agent = Some(next);
     context.metadata = metadata;
+    context.pending_system_reminder = reminder;
 
-    Ok(reminder)
+    Ok(())
 }
 
 fn session_timestamp() -> Option<i64> {
@@ -935,12 +939,18 @@ impl TuiSessionContext {
         Self::default()
     }
 
-    fn resumed(identifier: i64, metadata: SessionMetadata, messages: Vec<Message>) -> Self {
+    fn resumed(
+        identifier: i64,
+        metadata: SessionMetadata,
+        messages: Vec<Message>,
+        active_agent: ActiveAgentRuntime,
+    ) -> Self {
         Self {
             identifier: Some(identifier),
             metadata: Some(metadata),
             messages,
-            active_agent: None,
+            active_agent: Some(active_agent),
+            pending_system_reminder: None,
         }
     }
 
@@ -972,7 +982,9 @@ impl TuiSessionContext {
                 .system_prompt
                 .get_or_insert_with(|| agent.system_prompt.clone());
             request.active_agent = Some(agent.name.clone());
+            request.effective_capabilities = Some(agent.capabilities.clone());
         }
+        request.pending_system_reminder = self.pending_system_reminder.clone();
 
         request
     }
@@ -1089,7 +1101,10 @@ fn run_tui_prompt(
                     dangerously_allow_all: false,
                     session: None,
                     active_agent: None,
+                    effective_capabilities: None,
+                    pending_system_reminder: None,
                 });
+            let consumed_reminder = request.pending_system_reminder.is_some();
             let completion = run_production_headless_chat_with_progress(
                 request,
                 bootstrap,
@@ -1101,6 +1116,9 @@ fn run_tui_prompt(
             })?;
             session.identifier = Some(completion.metadata.id);
             session.metadata = Some(completion.metadata);
+            if consumed_reminder {
+                session.pending_system_reminder = None;
+            }
             Ok(completion.text)
         }
     }
@@ -1153,7 +1171,7 @@ fn rotate_tui_agent(
         .then(|| SessionStore::open(bootstrap.data_directory()))
         .transpose()
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let reminder = rotate_active_agent(
+    rotate_active_agent(
         &mut context,
         agent,
         &project_root.display().to_string(),
@@ -1163,7 +1181,7 @@ fn rotate_tui_agent(
         false,
     )
     .map_err(agent_rotation_error)?;
-    Ok(reminder.unwrap_or_else(|| format!("Active agent: {}.", agent.name)))
+    Ok(format!("Active agent: {}.", agent.name))
 }
 
 fn tui_agent_catalog(
@@ -1239,11 +1257,41 @@ fn resume_tui_session(
     let session = store
         .load_session_for_resume(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent)?;
     Ok(TuiSessionContext::resumed(
         identifier,
         session.metadata,
         session.messages,
+        active_agent,
     ))
+}
+
+fn active_tui_agent_runtime(
+    bootstrap: &Bootstrap,
+    name: &str,
+) -> Result<ActiveAgentRuntime, CliError> {
+    let validator = BundledModelValidator;
+    let catalog = tui_agent_catalog(bootstrap, &validator)?;
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root)?;
+    let dispatcher = dispatcher
+        .lock()
+        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
+    let agent = catalog
+        .agent(name)
+        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
+        .ok_or_else(|| CliError::configuration("active agent is unavailable"))?;
+
+    ActiveAgentRuntime::build(
+        agent,
+        bootstrap.model(),
+        &project_root.display().to_string(),
+        &dispatcher,
+        &validator,
+    )
+    .map_err(agent_rotation_error)
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -1257,6 +1305,8 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         dangerously_allow_all: false,
         session: None,
         active_agent: None,
+        effective_capabilities: None,
+        pending_system_reminder: None,
     };
     let mut index = 0;
 
@@ -1598,6 +1648,7 @@ where
         &project,
         request.mode,
         &tool_runtime,
+        request.effective_capabilities.as_ref(),
     )?;
     let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
@@ -1666,7 +1717,11 @@ where
     }?
     .map_err(CliError::runtime)?;
 
-    let turn = completed_session_turn(&request.prompt, &snapshot)?;
+    let turn = completed_session_turn(
+        &request.prompt,
+        &snapshot,
+        request.pending_system_reminder.as_deref(),
+    )?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let metadata = next_session_metadata(
@@ -1756,11 +1811,19 @@ fn next_session_metadata(
 fn completed_session_turn(
     prompt: &str,
     snapshot: &CompletedTurnSnapshot,
+    pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
-    let mut messages = vec![Message {
+    let mut messages = pending_system_reminder
+        .map(|reminder| Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(reminder.to_owned())],
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+    messages.push(Message {
         role: Role::User,
         parts: vec![MessagePart::Text(prompt.to_owned())],
-    }];
+    });
     let mut role = None;
     let mut parts = Vec::new();
     for event in snapshot.events() {
@@ -2483,8 +2546,9 @@ fn permission_policy(
     project: &str,
     mode: PermissionMode,
     dispatcher: &SharedToolDispatcher,
+    effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<PermissionPolicy, CliError> {
-    let rules = rules
+    let mut rules = rules
         .iter()
         .map(|rule| {
             let decision = match rule.decision {
@@ -2511,6 +2575,9 @@ fn permission_policy(
             })
         })
         .collect::<Result<Vec<_>, CliError>>()?;
+    if let Some(capabilities) = effective_capabilities {
+        rules.extend(capabilities.permission_rules());
+    }
     Ok(PermissionPolicy::new(mode, rules))
 }
 
@@ -2883,7 +2950,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_agent_rotation_is_atomic_persistent_and_only_reminds_on_expansion() {
+    fn idle_agent_rotation_restores_runtime_and_queues_expansion_reminders_atomically() {
         let temporary = std::env::temp_dir().join(format!(
             "agens-agent-rotation-test-{}-{}",
             std::process::id(),
@@ -2917,17 +2984,17 @@ mod tests {
         let metadata = store
             .persist_completed_session_turn(&metadata, &turn)
             .unwrap();
-        let mut context = TuiSessionContext::resumed(1, metadata, Vec::new());
-        context.active_agent = Some(
-            ActiveAgentRuntime::build(
-                &primary,
-                None,
-                "project",
-                &dispatcher,
-                &BundledModelValidator,
-            )
-            .unwrap(),
-        );
+        let primary_runtime = ActiveAgentRuntime::build(
+            &primary,
+            None,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+        )
+        .unwrap();
+        let mut context =
+            TuiSessionContext::resumed(1, metadata.clone(), Vec::new(), primary_runtime);
+        let original = context.clone();
 
         let busy = rotate_active_agent(
             &mut context,
@@ -2939,7 +3006,37 @@ mod tests {
             true,
         );
         assert_eq!(busy, Err(AgentRotationError::Busy));
-        let reminder = rotate_active_agent(
+        assert_eq!(context, original);
+        assert_eq!(
+            SessionStore::open(&temporary)
+                .unwrap()
+                .load_session_for_resume(1)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "primary"
+        );
+
+        let mut conflicting = metadata.clone();
+        conflicting.title = "changed elsewhere".into();
+        conflicting.updated_at = 2;
+        let conflicting = store
+            .persist_completed_session_turn(&conflicting, &turn)
+            .unwrap();
+        let rollback = rotate_active_agent(
+            &mut context,
+            &reviewer,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+            Some(&mut store),
+            false,
+        );
+        assert_eq!(rollback, Err(AgentRotationError::Persistence));
+        assert_eq!(context, original);
+
+        context.metadata = Some(conflicting);
+        rotate_active_agent(
             &mut context,
             &reviewer,
             "project",
@@ -2950,14 +3047,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            reminder.as_deref(),
+            context.pending_system_reminder.as_deref(),
             Some("Agent capabilities expanded: primary -> reviewer.")
         );
+
+        let request = context.apply_to(HeadlessChatRequest {
+            prompt: "next".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+        });
+        assert_eq!(request.active_agent.as_deref(), Some("reviewer"));
+        assert_eq!(request.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(request.system_prompt.as_deref(), Some("You are reviewer."));
+        assert_eq!(
+            request.effective_capabilities,
+            context
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.capabilities.clone())
+        );
+
+        let policy = permission_policy(
+            &[],
+            "project",
+            PermissionMode::Edit,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+            request.effective_capabilities.as_ref(),
+        )
+        .unwrap();
+        assert!(matches!(
+            rotation_dispatcher()
+                .evaluate(
+                    &policy,
+                    &[],
+                    &PermissionSession::new(),
+                    ToolDispatchRequest::new(
+                        "project",
+                        "native::read",
+                        serde_json::json!({"target":"file"})
+                    ),
+                )
+                .unwrap(),
+            ToolEvaluationOutcome::Authorized(_)
+        ));
+
+        let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("answer".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ])
+        .unwrap();
+        let turn = completed_session_turn(
+            "next",
+            &snapshot,
+            request.pending_system_reminder.as_deref(),
+        )
+        .unwrap();
+        let persisted = store
+            .persist_completed_session_turn(context.metadata.as_ref().unwrap(), &turn)
+            .unwrap();
+        context.metadata = Some(persisted);
+        context.pending_system_reminder = None;
         let reopened = SessionStore::open(&temporary)
             .unwrap()
             .load_session_for_resume(1)
             .unwrap();
         assert_eq!(reopened.metadata.active_agent, "reviewer");
+        let reminder = reopened
+            .messages
+            .iter()
+            .find(|message| message.role == Role::System)
+            .unwrap();
+        assert_eq!(
+            reminder.parts,
+            vec![MessagePart::Text(
+                "Agent capabilities expanded: primary -> reviewer.".into()
+            )]
+        );
+        assert!(context.pending_system_reminder.is_none());
+
+        let mut no_expansion = TuiSessionContext::resumed(
+            1,
+            reopened.metadata,
+            reopened.messages,
+            context.active_agent.clone().unwrap(),
+        );
+        no_expansion.metadata = None;
+        rotate_active_agent(
+            &mut no_expansion,
+            &reviewer,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(no_expansion.pending_system_reminder.is_none());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -3101,8 +3296,17 @@ mod tests {
             },
         ];
 
-        let request = TuiSessionContext::resumed(7, metadata, messages.clone()).apply_to(
-            HeadlessChatRequest {
+        let dispatcher = rotation_dispatcher();
+        let active_agent = ActiveAgentRuntime::build(
+            &rotation_agent("primary", None, false),
+            None,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+        )
+        .unwrap();
+        let request = TuiSessionContext::resumed(7, metadata, messages.clone(), active_agent)
+            .apply_to(HeadlessChatRequest {
                 prompt: "next question".into(),
                 history: Vec::new(),
                 model: None,
@@ -3112,12 +3316,13 @@ mod tests {
                 dangerously_allow_all: false,
                 session: None,
                 active_agent: None,
-            },
-        );
+                effective_capabilities: None,
+                pending_system_reminder: None,
+            });
 
         assert_eq!(request.prompt, "next question");
         assert_eq!(request.history, messages);
-        assert_eq!(request.system_prompt, None);
+        assert_eq!(request.system_prompt.as_deref(), Some("You are primary."));
         assert_eq!(request.session.as_ref().map(|session| session.id), Some(7));
     }
 
@@ -3136,6 +3341,13 @@ mod tests {
         let data_directory = temporary.join("data");
         std::fs::create_dir_all(project_root.join(".git"))
             .expect("project marker should be created");
+        std::fs::create_dir_all(config_home.join("agents"))
+            .expect("agent directory should be created");
+        std::fs::write(
+            config_home.join("agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: gpt-4o\npermissions: []\n---\nYou are reviewer.\n",
+        )
+        .expect("reviewer agent should be written");
 
         let listener =
             std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
@@ -3199,7 +3411,7 @@ mod tests {
             BTreeMap::from([(
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             )]),
@@ -3267,6 +3479,8 @@ mod tests {
                 dangerously_allow_all: false,
                 session: None,
                 active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
             });
         let completion = run_production_headless_chat_with_progress(
             request,
@@ -3335,6 +3549,8 @@ mod tests {
             dangerously_allow_all: false,
             session: None,
             active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
         });
 
         assert_eq!(request.system_prompt, None);
@@ -4016,6 +4232,7 @@ mod tests {
                 "project",
                 PermissionMode::Edit,
                 &runtime,
+                None,
             )
             .expect("legacy configuration should resolve to the canonical model tool");
             let outcome = runtime

@@ -46,6 +46,13 @@ impl EffectiveCapabilitySet {
         &self.descriptors
     }
 
+    pub fn permission_rules(&self) -> Vec<PermissionRule> {
+        self.descriptors
+            .iter()
+            .map(EffectiveCapabilityDescriptor::permission_rule)
+            .collect()
+    }
+
     pub fn is_expansion_from(&self, prior: &Self) -> bool {
         let prior_decisions = prior.decisions();
         let candidate_decisions = self.decisions();
@@ -91,6 +98,19 @@ impl EffectiveCapabilityDescriptor {
             }
         }
     }
+
+    fn permission_rule(&self) -> PermissionRule {
+        PermissionRule::global(
+            self.decision,
+            self.selector.permission_pattern(),
+            self.target
+                .as_ref()
+                .map(|pattern| {
+                    PermissionPattern::glob(pattern.clone()).expect("stored target is validated")
+                })
+                .unwrap_or(PermissionPattern::Any),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,6 +120,17 @@ enum ToolSelector {
         source: String,
         identities: Vec<String>,
     },
+}
+
+impl ToolSelector {
+    fn permission_pattern(&self) -> PermissionPattern {
+        match self {
+            Self::Exact(identity) => PermissionPattern::Exact(identity.clone()),
+            Self::Pattern { source, .. } => {
+                PermissionPattern::glob(source.clone()).expect("stored selector is validated")
+            }
+        }
+    }
 }
 
 type DescriptorKey = (ToolSelector, Option<String>);
