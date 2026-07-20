@@ -11,8 +11,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime};
 
 use agens_core::{
-    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, Role, TurnEvent,
-    TurnProgressSink, TurnProvider,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
+    Role, TurnEvent, TurnProgressSink, TurnProvider,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -62,6 +62,7 @@ pub struct OpenAiResponsesProvider {
     api_key: String,
     base_url: String,
     model: String,
+    request_config: RequestConfig,
     initial_input: Value,
     tools: Vec<OpenAiFunctionTool>,
     parallel_tool_calls: bool,
@@ -82,6 +83,7 @@ pub struct ChatGptResponsesProvider {
     base_url: String,
     oauth_url: String,
     model: String,
+    request_config: RequestConfig,
     instructions: String,
     initial_input: Vec<Value>,
     session_id: String,
@@ -247,6 +249,7 @@ impl OpenAiResponsesProvider {
                 .trim_end_matches('/')
                 .to_owned(),
             model,
+            request_config: RequestConfig::default(),
             initial_input: serde_json::json!([{
                 "role": "user",
                 "content": prompt,
@@ -289,6 +292,11 @@ impl OpenAiResponsesProvider {
 
     pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
         self.parallel_tool_calls = parallel_tool_calls;
+        self
+    }
+
+    pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
+        self.request_config = request_config;
         self
     }
 
@@ -416,6 +424,7 @@ impl ChatGptResponsesProvider {
                 .unwrap_or(DEFAULT_CHATGPT_OAUTH_URL)
                 .to_owned(),
             model,
+            request_config: RequestConfig::default(),
             instructions,
             initial_input: vec![serde_json::json!({
                 "role": "user",
@@ -468,6 +477,11 @@ impl ChatGptResponsesProvider {
 
     pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
         self.parallel_tool_calls = parallel_tool_calls;
+        self
+    }
+
+    pub fn with_request_config(mut self, request_config: RequestConfig) -> Self {
+        self.request_config = request_config;
         self
     }
 
@@ -661,6 +675,9 @@ impl ChatGptResponsesProvider {
             "reasoning": {"summary": "auto"},
         });
         payload["tools"] = function_tools_json(&self.tools);
+        if let Some(effort) = self.request_config.reasoning_effort() {
+            payload["reasoning"]["effort"] = Value::String(effort.as_str().to_owned());
+        }
         payload
     }
 
@@ -821,6 +838,7 @@ impl TurnProvider for OpenAiResponsesProvider {
 
                 match continuation_payload(
                     &self.model,
+                    &self.request_config,
                     &self.tools,
                     self.parallel_tool_calls,
                     &previous_response_id,
@@ -893,12 +911,17 @@ impl OpenAiResponsesProvider {
             payload["tools"] = function_tools_json(&self.tools);
         }
 
+        if let Some(effort) = self.request_config.reasoning_effort() {
+            payload["reasoning"] = serde_json::json!({"effort": effort.as_str()});
+        }
+
         payload
     }
 }
 
 fn continuation_payload(
     model: &str,
+    request_config: &RequestConfig,
     tools: &[OpenAiFunctionTool],
     parallel_tool_calls: bool,
     previous_response_id: &str,
@@ -958,6 +981,10 @@ fn continuation_payload(
 
     if !tools.is_empty() {
         payload["tools"] = function_tools_json(tools);
+    }
+
+    if let Some(effort) = request_config.reasoning_effort() {
+        payload["reasoning"] = serde_json::json!({"effort": effort.as_str()});
     }
 
     Ok(payload)

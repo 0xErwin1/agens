@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError, TurnEvent, TurnProvider};
+use agens_core::{
+    HeadlessTurnCancellation, HeadlessTurnPortError, RequestConfig, TurnEvent, TurnProvider,
+};
 use agens_providers::{OpenAiFunctionTool, OpenAiResponsesProvider};
 use serde_json::json;
 
@@ -194,6 +196,43 @@ fn tool_enabled_initial_request_uses_flat_function_tool_json() {
         })
     );
     server.join();
+}
+
+#[test]
+fn reasoning_effort_is_sent_only_when_configured() {
+    for (config, expected) in [
+        (RequestConfig::default(), None),
+        (
+            RequestConfig::with_reasoning_effort("high").expect("effort should be valid"),
+            Some(json!({"effort": "high"})),
+        ),
+    ] {
+        let mut server =
+            LocalResponsesServer::start_scripted(vec![completed_text_response("resp", "done")]);
+        let observed_body = server.take_observed_body();
+        let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+            "test-api-key".into(),
+            Some(&server.base_url()),
+            "test-model".into(),
+            "test prompt".into(),
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured")
+        .with_request_config(config);
+
+        provider_runtime()
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .expect("response should complete");
+
+        assert_eq!(
+            observed_body
+                .recv_timeout(Duration::from_secs(1))
+                .expect("request should be observed")
+                .get("reasoning"),
+            expected.as_ref()
+        );
+        server.join();
+    }
 }
 
 #[test]

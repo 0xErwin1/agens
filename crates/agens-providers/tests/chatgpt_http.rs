@@ -9,7 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agens_core::{
-    Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, TurnProvider,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig,
+    TurnProvider,
 };
 use agens_providers::ChatGptResponsesProvider;
 use serde_json::{Value, json};
@@ -74,6 +75,35 @@ fn subscription_transport_posts_the_codex_request_and_returns_text() {
 
     server.join();
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_reasoning_effort_is_sent_only_when_configured() {
+    for (config, expected) in [
+        (RequestConfig::default(), json!({"summary": "auto"})),
+        (
+            RequestConfig::with_reasoning_effort("high").expect("effort should be valid"),
+            json!({"summary": "auto", "effort": "high"}),
+        ),
+    ] {
+        let directory = temporary_directory("reasoning-effort");
+        let credentials = write_credentials(&directory);
+        let mut server = LocalServer::start(ServerBehavior::Sse(completed_text_sse("done")));
+        let observed_request = server.take_observed_request();
+        let mut provider = provider(&credentials, &server.base_url()).with_request_config(config);
+
+        run(&mut provider, HeadlessTurnCancellation::new()).expect("response should complete");
+
+        assert_eq!(
+            observed_request
+                .recv_timeout(Duration::from_secs(1))
+                .expect("request should be observed")
+                .body["reasoning"],
+            expected
+        );
+        server.join();
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
 }
 
 #[test]

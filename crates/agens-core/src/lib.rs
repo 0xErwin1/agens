@@ -10,6 +10,10 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 
+mod request_config;
+
+pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: Role,
