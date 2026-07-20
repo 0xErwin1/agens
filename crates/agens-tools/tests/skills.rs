@@ -1,10 +1,13 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agens_tools::{SkillCatalog, SkillResourceClass};
+use agens_tools::{
+    DispatchTool, SkillCatalog, SkillResourceClass, SkillResourceTool, ToolExecutionContext,
+};
+use serde_json::json;
 
 #[test]
 fn discovers_global_and_project_skills_with_project_shadowing() {
@@ -540,6 +543,99 @@ fn progressively_discloses_only_bounded_confined_skill_content() {
             .unwrap_err(),
         "skill resource exceeds 262144 byte limit"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn skill_resource_tool_discloses_only_selected_confined_content() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, os::unix::fs::symlink};
+
+    let temporary = TemporaryDirectory::new();
+    let root = temporary.path.join("root");
+    write_skill(
+        &root,
+        "research",
+        "---\nname: research\ndescription: research skill\n---\nlevel two instructions\n",
+    );
+    let references = root.join("research/references");
+    fs::create_dir_all(&references).unwrap();
+    fs::create_dir_all(root.join("research/scripts")).unwrap();
+    fs::create_dir_all(root.join("research/assets")).unwrap();
+    fs::write(references.join("guide.md"), "level three reference").unwrap();
+    fs::write(
+        root.join("research/scripts/run.sh"),
+        format!("touch {}", temporary.path.join("executed").display()),
+    )
+    .unwrap();
+    fs::write(root.join("research/assets/data.txt"), "level three asset").unwrap();
+    fs::write(references.join("large.md"), "x".repeat(256 * 1024 + 1)).unwrap();
+    fs::write(temporary.path.join("outside.md"), "outside").unwrap();
+    symlink(
+        temporary.path.join("outside.md"),
+        references.join("escape.md"),
+    )
+    .unwrap();
+    let linked = temporary.path.join("linked.md");
+    fs::write(&linked, "linked").unwrap();
+    fs::hard_link(&linked, references.join("linked.md")).unwrap();
+    let fifo = references.join("stream");
+    let fifo = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    let catalog = SkillCatalog::discover(&root, temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let mut tool = SkillResourceTool::new(catalog);
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+
+    assert_eq!(
+        tool.execute(&context, json!({"skill":"research"}))
+            .unwrap()
+            .content,
+        "level two instructions"
+    );
+    assert_eq!(
+        tool.execute(
+            &context,
+            json!({"skill":"research","resource_class":"reference","resource":"guide.md"}),
+        )
+        .unwrap()
+        .content,
+        "level three reference"
+    );
+    assert!(
+        tool.execute(
+            &context,
+            json!({"skill":"research","resource_class":"script","resource":"run.sh"}),
+        )
+        .unwrap()
+        .content
+        .starts_with("touch ")
+    );
+    assert!(!temporary.path.join("executed").exists());
+    assert_eq!(
+        tool.execute(
+            &context,
+            json!({"skill":"research","resource_class":"asset","resource":"data.txt"}),
+        )
+        .unwrap()
+        .content,
+        "level three asset"
+    );
+
+    for arguments in [
+        json!({"skill":"missing"}),
+        json!({"skill":"research","resource_class":"reference"}),
+        json!({"skill":"research","resource_class":"reference","resource":"../outside.md"}),
+        json!({"skill":"research","resource_class":"reference","resource":"escape.md"}),
+        json!({"skill":"research","resource_class":"reference","resource":"linked.md"}),
+        json!({"skill":"research","resource_class":"reference","resource":"stream"}),
+        json!({"skill":"research","resource_class":"reference","resource":"large.md"}),
+        json!({"skill":"research","resource_class":"unknown","resource":"guide.md"}),
+    ] {
+        assert!(tool.execute(&context, arguments).unwrap().is_error);
+    }
 }
 
 #[cfg(unix)]

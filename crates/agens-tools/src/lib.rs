@@ -539,6 +539,86 @@ impl SkillCatalog {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct SkillResourceTool {
+    catalog: SkillCatalog,
+}
+
+impl SkillResourceTool {
+    pub fn new(catalog: SkillCatalog) -> Self {
+        Self { catalog }
+    }
+
+    pub fn input_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["skill"],
+            "properties": {
+                "skill": {"type": "string", "minLength": 1, "maxLength": 64},
+                "resource_class": {"type": "string", "enum": ["reference", "script", "asset"]},
+                "resource": {"type": "string", "minLength": 1}
+            }
+        })
+    }
+}
+
+impl DispatchTool for SkillResourceTool {
+    fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
+        arguments
+            .get("skill")
+            .and_then(Value::as_str)
+            .filter(|skill| !skill.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Tool("skill arguments are invalid".into()))
+    }
+
+    fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
+        let Some(arguments) = arguments.as_object().filter(|arguments| {
+            arguments
+                .keys()
+                .all(|key| matches!(key.as_str(), "skill" | "resource_class" | "resource"))
+        }) else {
+            return Ok(ToolOutput::failure("skill arguments are invalid"));
+        };
+        let Some(skill_name) = arguments
+            .get("skill")
+            .and_then(Value::as_str)
+            .filter(|skill| !skill.is_empty())
+        else {
+            return Ok(ToolOutput::failure("skill arguments are invalid"));
+        };
+        let Some(skill) = self.catalog.skill(skill_name) else {
+            return Ok(ToolOutput::failure("skill is unavailable"));
+        };
+        let content = match (
+            arguments.get("resource_class").and_then(Value::as_str),
+            arguments.get("resource").and_then(Value::as_str),
+        ) {
+            (None, None) => skill.load_instructions(),
+            (Some(class), Some(resource)) => {
+                let class = match class {
+                    "reference" => SkillResourceClass::Reference,
+                    "script" => SkillResourceClass::Script,
+                    "asset" => SkillResourceClass::Asset,
+                    _ => return Ok(ToolOutput::failure("skill resource class is invalid")),
+                };
+                skill.load_resource(class, resource)
+            }
+            _ => {
+                return Ok(ToolOutput::failure(
+                    "skill resource arguments are incomplete",
+                ));
+            }
+        };
+
+        Ok(match content {
+            Ok(content) => ToolOutput::success(content),
+            Err(_) => ToolOutput::failure("skill content is unavailable"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillDiscovery {
     catalog: SkillCatalog,
