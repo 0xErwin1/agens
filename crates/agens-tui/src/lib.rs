@@ -3,6 +3,7 @@
 mod app;
 mod bridge;
 mod conversation;
+mod render;
 mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
@@ -137,6 +138,8 @@ pub struct ViewState<'a> {
     pub active_tool: Option<&'a str>,
     /// Current byte cursor position in the editable prompt.
     pub input_cursor: usize,
+    /// Typed metrics retained for rich, lossless presentation.
+    pub runtime_events: &'a [TuiRuntimeEvent],
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -171,9 +174,11 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_header(frame, layout.header, &state, layout.show_context);
     }
 
-    let transcript = transcript_lines(state.transcript);
+    let mut transcript = transcript_lines(state.transcript);
+    transcript.extend(render::detail_lines(state.runtime_events));
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
-    let bottom_scroll = transcript.len().saturating_sub(visible_rows) as u16;
+    let bottom_scroll =
+        transcript_rows(&transcript, layout.transcript.width).saturating_sub(visible_rows) as u16;
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
@@ -428,6 +433,12 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
                 Span::styled("  │ ", Style::default().fg(color)),
                 Span::raw(text.clone()),
             ]));
+            if matches!(entry, TranscriptEntry::Error(_)) {
+                lines.push(Line::from(Span::styled(
+                    "  │ Action: retry the request or inspect the runtime error.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
             lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
         } else {
             lines.push(Line::from(vec![
@@ -439,6 +450,14 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
         lines.push(Line::default());
     }
     lines
+}
+
+fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| line.width().div_ceil(width).max(1))
+        .sum()
 }
 
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
@@ -636,6 +655,7 @@ where
             turn_state: self.turn_state,
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
+            runtime_events: &self.runtime_events,
         }
     }
 
