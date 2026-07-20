@@ -372,6 +372,7 @@ pub struct DialogView {
     help: Option<String>,
     entries: Vec<DialogEntry>,
     selected: usize,
+    offset: usize,
     interactive: bool,
 }
 
@@ -390,6 +391,7 @@ impl DialogView {
             help: help.map(|help| bounded_dialog_text(help.as_ref(), 2_048)),
             entries,
             selected,
+            offset: 0,
             interactive: true,
         }
     }
@@ -400,6 +402,7 @@ impl DialogView {
             help: Some(bounded_dialog_text(body.as_ref(), 2_048)),
             entries: Vec::new(),
             selected: 0,
+            offset: 0,
             interactive: false,
         }
     }
@@ -615,21 +618,7 @@ fn render_palette(
 }
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
-    let width = area.width.saturating_sub(4).clamp(1, 64);
-    let content_rows = usize::from(dialog.help.is_some())
-        .saturating_add(dialog.entries.len().max(1))
-        .saturating_add(2) as u16;
-    let height = content_rows
-        .min(12)
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    let dialog_area = Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 2),
-        width,
-        height,
-    );
+    let dialog_area = dialog_area(area, dialog);
 
     frame.render_widget(Clear, dialog_area);
     let mut lines: Vec<Line<'_>> = dialog
@@ -646,23 +635,30 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
     if dialog.entries.is_empty() && dialog.help.is_none() {
         lines.push(Line::from("No options available."));
     }
-    lines.extend(dialog.entries.iter().enumerate().map(|(index, entry)| {
-        let selected = dialog.interactive && index == dialog.selected;
-        let text = match (&entry.action, &entry.detail) {
-            (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
-            (None, None) => format!("disabled {}", entry.label),
-            _ if selected => format!("> {}", entry.label),
-            _ => format!("  {}", entry.label),
-        };
-        let style = if selected {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else if entry.action.is_none() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default()
-        };
-        Line::styled(text, style)
-    }));
+    lines.extend(
+        dialog
+            .entries
+            .iter()
+            .enumerate()
+            .skip(dialog.offset)
+            .map(|(index, entry)| {
+                let selected = dialog.interactive && index == dialog.selected;
+                let text = match (&entry.action, &entry.detail) {
+                    (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
+                    (None, None) => format!("disabled {}", entry.label),
+                    _ if selected => format!("> {}", entry.label),
+                    _ => format!("  {}", entry.label),
+                };
+                let style = if selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if entry.action.is_none() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                Line::styled(text, style)
+            }),
+    );
 
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -679,6 +675,24 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
         ),
         dialog_area,
     );
+}
+
+fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
+    let width = area.width.saturating_sub(4).clamp(1, 64);
+    let content_rows = usize::from(dialog.help.is_some())
+        .saturating_add(dialog.entries.len().max(1))
+        .saturating_add(2) as u16;
+    let height = content_rows
+        .min(12)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    )
 }
 
 struct ScreenLayout {
@@ -1009,7 +1023,7 @@ where
             engine,
             input: String::new(),
             input_cursor: 0,
-            size: (0, 0),
+            size: (80, 24),
             running: false,
             quit_armed: false,
             transcript: Vec::new(),
@@ -1041,6 +1055,7 @@ where
                 self.quit_armed = false;
                 self.clamp_palette_selection();
                 self.clamp_scroll_offset();
+                self.ensure_dialog_selection_visible();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
@@ -1372,6 +1387,7 @@ where
         self.palette_open = false;
         self.quit_armed = false;
         self.dialog = Some(dialog);
+        self.ensure_dialog_selection_visible();
     }
 
     pub fn runtime_events(&self) -> &[TuiRuntimeEvent] {
@@ -1711,24 +1727,12 @@ where
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
-            Key::Up | Key::Down => {
-                let Some(dialog) = self.dialog.as_mut() else {
-                    return Action::Render;
-                };
-                let enabled = dialog
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| entry.action.as_ref().map(|_| index))
-                    .collect::<Vec<_>>();
-                if let Some(position) = enabled.iter().position(|index| *index == dialog.selected) {
-                    let next = if key == Key::Up {
-                        (position + enabled.len() - 1) % enabled.len()
-                    } else {
-                        (position + 1) % enabled.len()
-                    };
-                    dialog.selected = enabled[next];
-                }
+            Key::Up | Key::Down | Key::ScrollUp | Key::ScrollDown => {
+                self.move_dialog_selection(key, 1, true);
+                Action::Render
+            }
+            Key::PageUp | Key::PageDown => {
+                self.move_dialog_selection(key, self.dialog_page_rows(), false);
                 Action::Render
             }
             Key::Enter => {
@@ -1756,6 +1760,60 @@ where
             }
             _ => Action::Render,
         }
+    }
+
+    fn move_dialog_selection(&mut self, key: Key, amount: usize, wrap: bool) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        let enabled = dialog
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.action.as_ref().map(|_| index))
+            .collect::<Vec<_>>();
+        let Some(position) = enabled.iter().position(|index| *index == dialog.selected) else {
+            return;
+        };
+        let backwards = matches!(key, Key::Up | Key::ScrollUp | Key::PageUp);
+        let next = if backwards && wrap {
+            (position + enabled.len() - 1) % enabled.len()
+        } else if backwards {
+            position.saturating_sub(amount)
+        } else if wrap {
+            (position + 1) % enabled.len()
+        } else {
+            position.saturating_add(amount).min(enabled.len() - 1)
+        };
+        dialog.selected = enabled[next];
+        self.ensure_dialog_selection_visible();
+    }
+
+    fn ensure_dialog_selection_visible(&mut self) {
+        let capacity = self.dialog_page_rows();
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        dialog.selected = dialog.selected.min(dialog.entries.len().saturating_sub(1));
+        dialog.offset = dialog
+            .offset
+            .min(dialog.entries.len().saturating_sub(capacity));
+        if dialog.selected < dialog.offset {
+            dialog.offset = dialog.selected;
+        } else if dialog.selected >= dialog.offset.saturating_add(capacity) {
+            dialog.offset = dialog.selected.saturating_add(1).saturating_sub(capacity);
+        }
+    }
+
+    fn dialog_page_rows(&self) -> usize {
+        let Some(dialog) = self.dialog.as_ref() else {
+            return 1;
+        };
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let help_rows = usize::from(dialog.help.is_some() && !dialog.entries.is_empty());
+        usize::from(dialog_area(area, dialog).height.saturating_sub(2))
+            .saturating_sub(help_rows)
+            .max(1)
     }
 
     fn clamp_palette_selection(&mut self) {
@@ -1998,11 +2056,21 @@ impl TerminalControl for CrosstermControl {
             TerminalOperation::DisableMouse => {
                 execute!(self.stdout, DisableMouseCapture).map(|_| ())
             }
-            TerminalOperation::EnableKeyboardEnhancement => execute!(
-                self.stdout,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )
-            .map(|_| ()),
+            TerminalOperation::EnableKeyboardEnhancement => {
+                if !crossterm_terminal::supports_keyboard_enhancement()? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "terminal does not support keyboard enhancement",
+                    ));
+                }
+                execute!(
+                    self.stdout,
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                )
+                .map(|_| ())
+            }
             TerminalOperation::DisableKeyboardEnhancement => {
                 execute!(self.stdout, PopKeyboardEnhancementFlags).map(|_| ())
             }

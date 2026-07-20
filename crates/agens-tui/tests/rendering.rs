@@ -449,6 +449,49 @@ fn renderer_clips_selection_help_options_current_and_disabled_states_after_resiz
 }
 
 #[test]
+fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_resize() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(30, 8)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 30,
+        height: 8,
+    });
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        Some("Navigate"),
+        (0..20)
+            .map(|index| DialogEntry::action(format!("Option {index:02}"), format!("pick:{index}")))
+            .collect(),
+    ));
+
+    for _ in 0..8 {
+        tui.handle(Event::Key(Key::Down));
+    }
+    renderer.render(tui.view()).unwrap();
+    let arrows = rendered_text(&renderer);
+    assert!(arrows.contains("> Option 08"), "{arrows:?}");
+    assert!(!arrows.contains("Option 00"), "{arrows:?}");
+
+    tui.handle(Event::Key(Key::PageDown));
+    renderer.render(tui.view()).unwrap();
+    let page = rendered_text(&renderer);
+    assert!(page.contains("> Option 11"), "{page:?}");
+
+    tui.handle(Event::Key(Key::ScrollUp));
+    renderer.render(tui.view()).unwrap();
+    let wheel = rendered_text(&renderer);
+    assert!(wheel.contains("> Option 10"), "{wheel:?}");
+
+    tui.handle(Event::Resize {
+        width: 24,
+        height: 5,
+    });
+    renderer.render(tui.view()).unwrap();
+    let resized = rendered_text(&renderer);
+    assert!(resized.contains("> Option 10"), "{resized:?}");
+}
+
+#[test]
 fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation() {
     let backend = TestBackend::new(34, 10);
     let terminal = Terminal::new(backend).unwrap();
