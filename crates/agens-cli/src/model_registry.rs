@@ -10,6 +10,8 @@ pub(crate) struct ModelMetadata {
     pub(crate) id: String,
     pub(crate) name: Option<String>,
     pub(crate) context: Option<u64>,
+    pub(crate) output: Option<u64>,
+    pub(crate) reasoning: Option<bool>,
     pub(crate) input_price: Option<f64>,
     pub(crate) output_price: Option<f64>,
 }
@@ -29,25 +31,53 @@ pub(crate) fn bundled_openai_models() -> Result<Vec<ModelMetadata>, ModelRegistr
     parse_models(SNAPSHOT)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiModelSource {
+    OpenAiApi,
+    ChatGptSubscription,
+}
+
+impl TuiModelSource {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "OpenAI API",
+            Self::ChatGptSubscription => "ChatGPT subscription",
+        }
+    }
+}
+
 /// Validates and retains the bounded selections exposed by the terminal UI adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiModelSelector {
     model: String,
+    source: TuiModelSource,
     request_config: RequestConfig,
 }
 
 impl TuiModelSelector {
     pub fn new(model: impl Into<String>) -> Self {
+        Self::for_source(model, TuiModelSource::OpenAiApi)
+    }
+
+    pub fn for_source(model: impl Into<String>, source: TuiModelSource) -> Self {
         Self {
             model: model.into(),
+            source,
             request_config: RequestConfig::default(),
         }
     }
 
     pub fn model_values(&self) -> Result<Vec<String>, String> {
-        bundled_openai_models()
+        self.models()
             .map(|models| models.into_iter().map(|model| model.id).collect())
-            .map_err(|_| "model registry is unavailable".to_owned())
+    }
+
+    pub const fn source_label(&self) -> &'static str {
+        self.source.label()
+    }
+
+    pub(crate) fn models(&self) -> Result<Vec<ModelMetadata>, String> {
+        source_models(self.source).map_err(|_| "model registry is unavailable".to_owned())
     }
 
     pub fn model(&self) -> &str {
@@ -55,8 +85,8 @@ impl TuiModelSelector {
     }
 
     pub fn apply_model(&mut self, model: &str) -> Result<(), String> {
-        if !is_bundled_model(model)? {
-            return Err("model is unavailable".to_owned());
+        if !self.models()?.iter().any(|candidate| candidate.id == model) {
+            return Err(format!("model is unavailable for {}", self.source.label()));
         }
 
         self.model = model.to_owned();
@@ -85,10 +115,55 @@ impl TuiModelSelector {
     }
 }
 
-fn is_bundled_model(model: &str) -> Result<bool, String> {
-    bundled_openai_models()
-        .map(|models| models.iter().any(|candidate| candidate.id == model))
-        .map_err(|_| "model registry is unavailable".to_owned())
+fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
+    let mut models = match source {
+        TuiModelSource::OpenAiApi => {
+            let mut models = bundled_openai_models()?;
+            for model in &mut models {
+                let (output, reasoning) = bundled_capabilities(&model.id);
+                model.output = output;
+                model.reasoning = reasoning;
+            }
+            models.push(pinned_model("gpt-5.5", "GPT-5.5", 272_000, 128_000, true));
+            models
+        }
+        TuiModelSource::ChatGptSubscription => vec![
+            pinned_model(
+                "gpt-5.3-codex-spark",
+                "GPT-5.3 Codex Spark",
+                128_000,
+                128_000,
+                true,
+            ),
+            pinned_model("gpt-5.4", "GPT-5.4", 272_000, 128_000, true),
+            pinned_model("gpt-5.4-mini", "GPT-5.4 mini", 272_000, 128_000, true),
+            pinned_model("gpt-5.5", "GPT-5.5", 272_000, 128_000, true),
+        ],
+    };
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(models)
+}
+
+// Grounded in references/pi-mono at f58c1156; the bundled snapshot remains unchanged.
+fn bundled_capabilities(model: &str) -> (Option<u64>, Option<bool>) {
+    match model {
+        "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" => (Some(32_768), Some(false)),
+        "gpt-4o" | "gpt-4o-mini" => (Some(16_384), Some(false)),
+        "o3" | "o4-mini" => (Some(100_000), Some(true)),
+        _ => (None, None),
+    }
+}
+
+fn pinned_model(id: &str, name: &str, context: u64, output: u64, reasoning: bool) -> ModelMetadata {
+    ModelMetadata {
+        id: id.to_owned(),
+        name: Some(name.to_owned()),
+        context: Some(context),
+        output: Some(output),
+        reasoning: Some(reasoning),
+        input_price: None,
+        output_price: None,
+    }
 }
 
 pub(crate) fn bundled_snapshot_checksum() -> String {
@@ -116,6 +191,8 @@ pub(crate) fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelR
                 id,
                 name: model.name.filter(|name| !name.trim().is_empty()),
                 context: model.context,
+                output: None,
+                reasoning: None,
                 input_price: model.input_price,
                 output_price: model.output_price,
             })

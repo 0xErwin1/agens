@@ -49,7 +49,7 @@ mod model_registry;
 
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 
-pub use model_registry::TuiModelSelector;
+pub use model_registry::{TuiModelSelector, TuiModelSource};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
@@ -1389,8 +1389,6 @@ impl TuiRuntimeRouter {
                 ],
             ),
             "model" => {
-                let selector = TuiModelSelector::new("gpt-4.1");
-                let values = selector.model_values().map_err(CliError::unavailable)?;
                 let context = self
                     .session
                     .lock()
@@ -1400,19 +1398,37 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .map(TuiModelSelector::model)
                     .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| default_model(&bootstrap));
+                    .unwrap_or_else(|| default_model(&bootstrap))
+                    .to_owned();
+                drop(context);
+                let selector =
+                    TuiModelSelector::for_source(current.clone(), tui_model_source(&bootstrap));
+                let values = selector.models().map_err(CliError::unavailable)?;
+                let selected = values
+                    .iter()
+                    .position(|model| model.id == current)
+                    .unwrap_or_default();
                 let entries = values
                     .into_iter()
                     .map(|model| {
-                        let label = if model == current {
-                            format!("{model} (current)")
+                        let label = if model.id == current {
+                            format!("{} (current)", model.id)
                         } else {
-                            model.clone()
+                            model.id.clone()
                         };
-                        DialogEntry::action(label, format!("model:{model}"))
+                        DialogEntry::action_with_detail(
+                            label,
+                            Some(format_model_metadata(&model)),
+                            format!("model:{}", model.id),
+                        )
                     })
                     .collect();
-                DialogView::selection("Choose model", Some("Available models"), entries)
+                DialogView::selection(
+                    "Choose model",
+                    Some(format!("Source: {}", selector.source_label())),
+                    entries,
+                )
+                .with_selected(selected)
             }
             "effort" => {
                 let context = self
@@ -1545,7 +1561,7 @@ impl TuiRuntimeRouter {
                 });
             }
             let message = if let Some(model) = action_id.strip_prefix("model:") {
-                apply_tui_model(model, &self.session)?
+                apply_tui_model(&bootstrap, model, &self.session)?
             } else if let Some(effort) = action_id.strip_prefix("effort:") {
                 apply_tui_effort(&bootstrap, effort, &self.session)?
             } else if let Some(agent) = action_id.strip_prefix("agent:") {
@@ -2237,6 +2253,38 @@ fn complete_tui_turn(
     Ok(completion.text)
 }
 
+fn tui_model_source(bootstrap: &Bootstrap) -> TuiModelSource {
+    match bootstrap.provider_type() {
+        Some("openai-chatgpt") => TuiModelSource::ChatGptSubscription,
+        _ => TuiModelSource::OpenAiApi,
+    }
+}
+
+fn format_model_metadata(model: &model_registry::ModelMetadata) -> String {
+    let context = model
+        .context
+        .map(format_token_count)
+        .unwrap_or_else(|| "?".into());
+    let output = model
+        .output
+        .map(format_token_count)
+        .unwrap_or_else(|| "?".into());
+    let reasoning = match model.reasoning {
+        Some(true) => "reasoning",
+        Some(false) => "no reasoning",
+        None => "reasoning unknown",
+    };
+    format!("{context} context | {output} output | {reasoning}")
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens % 1_000 == 0 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn select_tui_model(
     bootstrap: &Bootstrap,
     command: &str,
@@ -2244,7 +2292,7 @@ fn select_tui_model(
 ) -> Result<String, CliError> {
     let model = command.strip_prefix("/model").unwrap_or_default().trim();
     if model.is_empty() {
-        let selector = TuiModelSelector::new("gpt-4.1");
+        let selector = TuiModelSelector::for_source("gpt-4.1", tui_model_source(bootstrap));
         let values = selector
             .model_values()
             .map_err(CliError::unavailable)?
@@ -2261,14 +2309,15 @@ fn select_tui_model(
         return Ok(format!("Model: {current}. Available: {values}."));
     }
 
-    apply_tui_model(model, session)
+    apply_tui_model(bootstrap, model, session)
 }
 
 fn apply_tui_model(
+    bootstrap: &Bootstrap,
     model: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
-    let mut selector = TuiModelSelector::new(model);
+    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap));
     selector
         .apply_model(model)
         .map_err(CliError::configuration)?;
@@ -2316,7 +2365,7 @@ fn apply_tui_effort(
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
         .unwrap_or_else(|| default_model(bootstrap));
-    let mut selector = TuiModelSelector::new(model);
+    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap));
     selector
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
@@ -5074,6 +5123,8 @@ mod tests {
                     id: "missing".to_owned(),
                     name: None,
                     context: None,
+                    output: None,
+                    reasoning: None,
                     input_price: None,
                     output_price: Some(0.6),
                 },
@@ -5081,6 +5132,8 @@ mod tests {
                     id: "known".to_owned(),
                     name: Some("Known".to_owned()),
                     context: Some(128000),
+                    output: None,
+                    reasoning: None,
                     input_price: Some(2.5),
                     output_price: Some(10.0),
                 },
@@ -6043,6 +6096,54 @@ mod tests {
     }
 
     #[test]
+    fn tui_model_overlay_labels_source_metadata_current_and_compatible_sets() {
+        for (provider, source, included, excluded) in [
+            ("openai-api", "OpenAI API", "gpt-4o", "gpt-5.4"),
+            (
+                "openai-chatgpt",
+                "ChatGPT subscription",
+                "gpt-5.4",
+                "gpt-4o",
+            ),
+        ] {
+            let temporary = tui_session_directory(&format!("model-source-{provider}"));
+            let bootstrap =
+                tui_session_bootstrap_for_provider(&temporary, &[], provider, "gpt-5.5");
+            let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+            let cancellation = Arc::new(Mutex::new(None));
+            let mut tui = Tui::new(ProductionTuiEngine {
+                cancellation: Arc::clone(&cancellation),
+            });
+            let router = TuiRuntimeRouter::new(
+                bootstrap,
+                session,
+                cancellation,
+                Arc::new(CommandCatalog::default()),
+                Arc::new(SkillCatalog::default()),
+            );
+            let (progress, _) = std::sync::mpsc::channel();
+
+            assert!(
+                tui.apply_submission_outcome(
+                    router.route_request(TuiRouteRequest::OpenDialog("model".into()), progress)
+                )
+                .is_none()
+            );
+            let text = render_tui_test_backend(&tui, 80, 24);
+
+            assert!(text.contains(source), "{provider}: {text:?}");
+            assert!(text.contains("gpt-5.5 (current)"), "{provider}: {text:?}");
+            assert!(text.contains(included), "{provider}: {text:?}");
+            assert!(!text.contains(excluded), "{provider}: {text:?}");
+            assert!(text.contains("272K context"), "{provider}: {text:?}");
+            assert!(text.contains("128K output"), "{provider}: {text:?}");
+            assert!(text.contains("reasoning"), "{provider}: {text:?}");
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
     fn tui_sessions_resume_and_agent_overlays_filter_navigate_cancel_and_apply_typed_outcomes() {
         let temporary = tui_session_directory("session-agent-overlays");
         let bootstrap = tui_session_bootstrap(
@@ -6594,6 +6695,15 @@ mod tests {
     }
 
     fn tui_session_bootstrap(temporary: &Path, agents: &[(&str, &str)]) -> Bootstrap {
+        tui_session_bootstrap_for_provider(temporary, agents, "openai-api", "gpt-4.1")
+    }
+
+    fn tui_session_bootstrap_for_provider(
+        temporary: &Path,
+        agents: &[(&str, &str)],
+        provider: &str,
+        model: &str,
+    ) -> Bootstrap {
         let config_home = temporary.join("config");
         let data_directory = temporary.join("data");
         let agents_directory = config_home.join("agents");
@@ -6611,7 +6721,7 @@ mod tests {
             BTreeMap::from([(
                 config_home.join("config.toml"),
                 format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
                     data_directory.display()
                 ),
             )]),
@@ -7046,10 +7156,11 @@ mod tests {
 
     #[test]
     fn tui_model_and_effort_commands_reach_each_provider_with_latest_selection_only() {
-        for provider_type in ["openai-api", "openai-chatgpt"] {
+        for (provider_type, expected_model) in [("openai-api", "o3"), ("openai-chatgpt", "gpt-5.5")]
+        {
             let request = run_tui_model_effort_provider_case(provider_type);
 
-            assert_eq!(request["model"], "o3", "{provider_type}");
+            assert_eq!(request["model"], expected_model, "{provider_type}");
             assert!(
                 !request.to_string().contains("gpt-4.1"),
                 "{provider_type} request retained the replaced model: {request}"
@@ -7163,10 +7274,21 @@ mod tests {
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let cancellation = HeadlessTurnCancellation::new();
 
+        let model_commands = if provider_type == "openai-chatgpt" {
+            [
+                ("/model gpt-5.4", "Model: gpt-5.4."),
+                ("/model gpt-5.5", "Model: gpt-5.5."),
+            ]
+        } else {
+            [
+                ("/model gpt-4.1", "Model: gpt-4.1."),
+                ("/model o3", "Model: o3."),
+            ]
+        };
         for (command, expected) in [
-            ("/model gpt-4.1", "Model: gpt-4.1."),
+            model_commands[0],
             ("/effort low", "Reasoning effort: low."),
-            ("/model o3", "Model: o3."),
+            model_commands[1],
             ("/effort high", "Reasoning effort: high."),
         ] {
             assert_eq!(
@@ -7185,7 +7307,14 @@ mod tests {
             )
             .expect_err("invalid model should be refused")
             .to_string(),
-            "config: model is unavailable"
+            format!(
+                "config: model is unavailable for {}",
+                if provider_type == "openai-chatgpt" {
+                    "ChatGPT subscription"
+                } else {
+                    "OpenAI API"
+                }
+            )
         );
         assert_eq!(
             run_tui_prompt(

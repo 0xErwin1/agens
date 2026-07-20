@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use agens::{
-    CliDependencies, ExitStatus, TuiModelSelector, bootstrap, execute, execute_os,
+    CliDependencies, ExitStatus, TuiModelSelector, TuiModelSource, bootstrap, execute, execute_os,
     execute_with_cancellation,
 };
 use agens_core::{
@@ -995,6 +995,7 @@ fn tui_model_selector_applies_only_bundled_models_and_preserves_state_on_refusal
             "gpt-4.1-nano",
             "gpt-4o",
             "gpt-4o-mini",
+            "gpt-5.5",
             "o3",
             "o4-mini",
         ]
@@ -1008,9 +1009,36 @@ fn tui_model_selector_applies_only_bundled_models_and_preserves_state_on_refusal
 
     assert_eq!(
         selector.apply_model("not-a-model"),
-        Err("model is unavailable".to_owned())
+        Err("model is unavailable for OpenAI API".to_owned())
     );
     assert_eq!(selector.model(), "o3");
+}
+
+#[test]
+fn tui_model_selector_exposes_only_models_compatible_with_the_effective_source() {
+    let mut api = TuiModelSelector::for_source("gpt-5.5", TuiModelSource::OpenAiApi);
+    let mut subscription =
+        TuiModelSelector::for_source("gpt-5.5", TuiModelSource::ChatGptSubscription);
+
+    assert!(
+        api.model_values()
+            .expect("API model registry should be available")
+            .contains(&"gpt-4o".to_owned())
+    );
+    assert_eq!(
+        subscription
+            .model_values()
+            .expect("subscription model registry should be available"),
+        ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+    );
+    assert_eq!(api.source_label(), "OpenAI API");
+    assert_eq!(subscription.source_label(), "ChatGPT subscription");
+    assert_eq!(
+        subscription.apply_model("gpt-4o"),
+        Err("model is unavailable for ChatGPT subscription".to_owned())
+    );
+    api.apply_model("gpt-4o")
+        .expect("API model should remain selectable");
 }
 
 #[test]

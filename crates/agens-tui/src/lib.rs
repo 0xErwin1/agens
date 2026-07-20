@@ -344,9 +344,20 @@ pub struct DialogEntry {
 
 impl DialogEntry {
     pub fn action(label: impl AsRef<str>, action_id: impl AsRef<str>) -> Self {
+        Self::action_with_detail(label, None::<String>, action_id)
+    }
+
+    pub fn action_with_detail<D>(
+        label: impl AsRef<str>,
+        detail: Option<D>,
+        action_id: impl AsRef<str>,
+    ) -> Self
+    where
+        D: AsRef<str>,
+    {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
-            detail: None,
+            detail: detail.map(|detail| bounded_dialog_text(detail.as_ref(), 256)),
             action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
                 action_id.as_ref(),
                 128,
@@ -402,6 +413,17 @@ impl DialogView {
             offset: 0,
             interactive: true,
         }
+    }
+
+    pub fn with_selected(mut self, selected: usize) -> Self {
+        if self
+            .entries
+            .get(selected)
+            .is_some_and(|entry| entry.action.is_some())
+        {
+            self.selected = selected;
+        }
+        self
     }
 
     fn informational(title: impl AsRef<str>, body: impl AsRef<str>) -> Self {
@@ -681,6 +703,10 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                 let text = match (&entry.action, &entry.detail) {
                     (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
                     (None, None) => format!("disabled {}", entry.label),
+                    (Some(_), Some(detail)) if selected => {
+                        format!("> {} - {detail}", entry.label)
+                    }
+                    (Some(_), Some(detail)) => format!("  {} - {detail}", entry.label),
                     _ if selected => format!("> {}", entry.label),
                     _ => format!("  {}", entry.label),
                 };
