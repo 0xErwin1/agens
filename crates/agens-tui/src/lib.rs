@@ -1,5 +1,9 @@
 //! Terminal lifecycle and input-event boundary for the interactive surface.
 
+mod bridge;
+
+pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
+
 use std::{
     io::{self, Stdout, Write},
     sync::{Arc, mpsc},

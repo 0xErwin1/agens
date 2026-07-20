@@ -1,6 +1,13 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
-use agens_tui::{Action, Engine, Event, Key, RatatuiRenderer, Renderer, TranscriptEntry, Tui};
+use agens_tui::{
+    Action, BridgeCancel, BridgeTx, Engine, Event, Key, PublishOutcome, RatatuiRenderer, Renderer,
+    TranscriptEntry, Tui,
+};
 use ratatui::{Terminal, backend::TestBackend};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Default)]
 struct FakeEngine {
@@ -11,6 +18,91 @@ impl Engine for FakeEngine {
     fn cancel(&mut self) {
         self.cancellations += 1;
     }
+}
+
+#[test]
+fn bridge_clones_cannot_overtake_a_source_waiting_for_capacity() {
+    let (bridge, receiver) = BridgeTx::bounded(1);
+    let cancellation = BridgeCancel::new();
+
+    assert_eq!(
+        bridge.publish("occupied", &cancellation, None),
+        PublishOutcome::Published { ordinal: 0 }
+    );
+
+    let first_bridge = bridge.clone();
+    let first_cancellation = cancellation.clone();
+    let first = thread::spawn(move || first_bridge.publish("first", &first_cancellation, None));
+    thread::sleep(Duration::from_millis(10));
+
+    let second_cancellation = cancellation.clone();
+    let second = thread::spawn(move || bridge.publish("second", &second_cancellation, None));
+
+    assert_eq!(receiver.recv().unwrap().into_parts(), (0, "occupied"));
+    assert_eq!(receiver.recv().unwrap().into_parts(), (1, "first"));
+    assert_eq!(receiver.recv().unwrap().into_parts(), (2, "second"));
+    let _ = first.join().unwrap();
+    let _ = second.join().unwrap();
+}
+
+#[test]
+fn bridge_full_channel_stops_waiting_when_cancelled() {
+    let (bridge, _receiver) = BridgeTx::bounded(1);
+    let cancellation = BridgeCancel::new();
+
+    assert_eq!(
+        bridge.publish("queued", &cancellation, None),
+        PublishOutcome::Published { ordinal: 0 }
+    );
+    let waiting_bridge = bridge.clone();
+    let waiting_cancellation = cancellation.clone();
+    let waiting =
+        thread::spawn(move || waiting_bridge.publish("cancelled", &waiting_cancellation, None));
+
+    thread::sleep(Duration::from_millis(10));
+    cancellation.cancel();
+
+    assert_eq!(waiting.join().unwrap(), PublishOutcome::Cancelled);
+}
+
+#[test]
+fn bridge_full_channel_stops_waiting_at_deadline() {
+    let (bridge, _receiver) = BridgeTx::bounded(1);
+    let cancellation = BridgeCancel::new();
+
+    assert_eq!(
+        bridge.publish("queued", &cancellation, None),
+        PublishOutcome::Published { ordinal: 0 }
+    );
+
+    assert_eq!(
+        bridge.publish(
+            "expired",
+            &cancellation,
+            Some(Instant::now() + Duration::from_millis(10)),
+        ),
+        PublishOutcome::DeadlineExpired
+    );
+}
+
+#[test]
+fn bridge_fails_closed_when_receiver_disconnects_while_full() {
+    let (bridge, receiver) = BridgeTx::bounded(1);
+    let cancellation = BridgeCancel::new();
+
+    assert_eq!(
+        bridge.publish("queued", &cancellation, None),
+        PublishOutcome::Published { ordinal: 0 }
+    );
+    let waiting_bridge = bridge.clone();
+    let waiting_cancellation = cancellation.clone();
+    let waiting =
+        thread::spawn(move || waiting_bridge.publish("disconnected", &waiting_cancellation, None));
+
+    thread::sleep(Duration::from_millis(10));
+    drop(receiver);
+
+    assert_eq!(waiting.join().unwrap(), PublishOutcome::Disconnected);
 }
 
 #[test]
