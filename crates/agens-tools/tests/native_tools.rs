@@ -90,6 +90,78 @@ fn rejects_absolute_traversal_and_symlink_escape_paths() {
 }
 
 #[test]
+fn tui_file_candidates_are_bounded_sorted_and_safe() {
+    let root = project_root();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("zeta.txt"), "zeta").unwrap();
+    fs::write(root.join("alpha.txt"), "alpha").unwrap();
+    fs::write(root.join("bravo.txt"), "bravo").unwrap();
+    fs::write(root.join("nested/valid.txt"), "valid").unwrap();
+    fs::write(root.join("large.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    fs::hard_link(root.join("alpha.txt"), root.join("linked.txt")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("zeta.txt"), root.join("symlink.txt")).unwrap();
+
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools.tui_file_candidates(2).unwrap(),
+        vec![String::from("bravo.txt"), String::from("nested/valid.txt")]
+    );
+    assert_eq!(
+        tools.tui_file_candidates(8).unwrap(),
+        vec![
+            String::from("bravo.txt"),
+            String::from("nested/valid.txt"),
+            String::from("zeta.txt")
+        ]
+    );
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("linked.txt")).unwrap(),
+        ToolOutput::failure("read: path has multiple hard links")
+    );
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("large.txt")).unwrap(),
+        ToolOutput::failure("read: file exceeds 1048576 byte limit")
+    );
+    assert!(
+        tools
+            .read_file(ReadFileInput::new("nested"))
+            .unwrap()
+            .is_error
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_file_reads_reject_root_swaps_and_invalid_utf8() {
+    let root = project_root();
+    let outside = project_root();
+    fs::write(root.join("invalid.txt"), [0xff]).unwrap();
+    fs::write(root.join("safe.txt"), "safe").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert!(
+        tools
+            .read_file(ReadFileInput::new("invalid.txt"))
+            .unwrap()
+            .is_error
+    );
+    fs::rename(&root, root.with_extension("moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, &root).unwrap();
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("safe.txt")).unwrap(),
+        ToolOutput::failure("path: outside project root")
+    );
+
+    fs::remove_file(&root).unwrap();
+    fs::remove_dir_all(root.with_extension("moved")).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
 fn writes_lists_and_searches_only_within_the_project() {
     let root = project_root();
     fs::create_dir(root.join("logs")).unwrap();

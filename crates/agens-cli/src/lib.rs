@@ -34,9 +34,10 @@ use agens_tools::{
     AgentCatalog, AgentModelValidator, AuthorizedToolCall, DispatchTool, EffectiveCapabilitySet,
     McpHttpTransport, McpLimits, McpRegistry, McpSseTransport, McpStdioTransport,
     McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
-    NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata, SkillCatalog,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    NativeToolCatalog, NativeTools, PermissionPromptContext, ReadFileInput, RemoteToolMetadata,
+    SkillCatalog, TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest,
+    TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
@@ -1144,6 +1145,7 @@ fn run_tui_prompt(
             select_tui_effort(bootstrap, command, session)
         }
         prompt => {
+            let prompt = expand_tui_file_reference(bootstrap, prompt)?;
             let request = {
                 let mut session = session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1181,6 +1183,47 @@ fn run_tui_prompt(
             complete_tui_turn(&mut session, completion, consumed_reminder)
         }
     }
+}
+
+pub fn tui_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    NativeTools::open(project_root)
+        .map_err(|_| CliError::configuration("native tools are unavailable"))?
+        .tui_file_candidates(100)
+        .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
+}
+
+fn expand_tui_file_reference(bootstrap: &Bootstrap, prompt: &str) -> Result<String, CliError> {
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    let tools = NativeTools::open(project_root)
+        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let mut expanded = String::with_capacity(prompt.len());
+
+    for segment in prompt.split_inclusive(char::is_whitespace) {
+        let token = segment.trim_end_matches(char::is_whitespace);
+        let whitespace = &segment[token.len()..];
+        if let Some(path) = token.strip_prefix('@').filter(|path| !path.is_empty()) {
+            let output = tools
+                .read_file(ReadFileInput::new(path))
+                .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
+            if output.is_error {
+                return Err(CliError::new(ExitStatus::Failure, "file", output.content));
+            }
+            expanded.push_str(&format!(
+                "<file path=\"{path}\">\n{}\n</file>",
+                output.content
+            ));
+        } else {
+            expanded.push_str(token);
+        }
+        expanded.push_str(whitespace);
+    }
+
+    Ok(expanded)
 }
 
 fn complete_tui_turn(
@@ -4243,6 +4286,40 @@ mod tests {
                 .list_sessions()
                 .unwrap(),
             saved_sessions
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_file_candidates_and_expansion_use_confined_reads() {
+        let temporary = tui_session_directory("files");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project = temporary.join("project");
+        std::fs::write(project.join("zeta.txt"), "zeta").unwrap();
+        std::fs::write(project.join("alpha.txt"), "alpha").unwrap();
+        let oversized = vec![b'x'; 1024 * 1024 + 1];
+        std::fs::write(project.join("large.txt"), oversized).unwrap();
+
+        assert_eq!(
+            tui_file_candidates(&bootstrap).unwrap(),
+            vec!["alpha.txt".to_owned(), "zeta.txt".to_owned()]
+        );
+        assert_eq!(
+            expand_tui_file_reference(&bootstrap, "review @alpha.txt please").unwrap(),
+            "review <file path=\"alpha.txt\">\nalpha\n</file> please"
+        );
+        assert_eq!(
+            expand_tui_file_reference(&bootstrap, "@../outside.txt")
+                .unwrap_err()
+                .to_string(),
+            "file: path: traversal is not allowed"
+        );
+        assert_eq!(
+            expand_tui_file_reference(&bootstrap, "@large.txt")
+                .unwrap_err()
+                .to_string(),
+            "file: read: file exceeds 1048576 byte limit"
         );
 
         std::fs::remove_dir_all(temporary).unwrap();

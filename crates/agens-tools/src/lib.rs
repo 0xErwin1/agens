@@ -3411,6 +3411,9 @@ impl NativeTools {
     }
 
     pub fn read_file(&self, input: ReadFileInput) -> Result<ToolOutput, Error> {
+        if let Err(output) = self.ensure_project_root_is_stable() {
+            return Ok(output);
+        }
         if let Err(output) = self.validate_relative(&input.path) {
             return Ok(output);
         }
@@ -3432,6 +3435,38 @@ impl NativeTools {
         ));
 
         Ok(result.unwrap_or_else(|output| output))
+    }
+
+    /// Lists bounded, readable project files for the TUI `@file` picker.
+    pub fn tui_file_candidates(&self, limit: usize) -> Result<Vec<String>, ToolOutput> {
+        if limit == 0 {
+            return Err(ToolOutput::failure(
+                "file picker: limit must be greater than zero",
+            ));
+        }
+        self.ensure_project_root_is_stable()?;
+
+        let mut files = Vec::new();
+        let mut budget = SearchBudget::new(&self.limits, "file picker");
+        self.collect_tool_files(&self.project_root, 0, &mut budget, &mut files)?;
+        self.ensure_project_root_is_stable()?;
+
+        let mut candidates = files
+            .into_iter()
+            .filter_map(|path| {
+                path.strip_prefix(&self.project_root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .filter_map(|path| path.to_str().map(str::to_owned))
+            .filter(|path| {
+                self.read_file(ReadFileInput::new(path))
+                    .is_ok_and(|output| !output.is_error)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.truncate(limit);
+        Ok(candidates)
     }
 
     pub fn write_file(&self, input: WriteFileInput) -> Result<ToolOutput, Error> {
@@ -4120,6 +4155,30 @@ impl NativeTools {
         } else {
             Err(ToolOutput::failure("path: traversal is not allowed"))
         }
+    }
+
+    fn ensure_project_root_is_stable(&self) -> Result<(), ToolOutput> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let root = fs::canonicalize(&self.project_root)
+                .map_err(|_| ToolOutput::failure("path: outside project root"))?;
+            let metadata = fs::symlink_metadata(&self.project_root)
+                .map_err(|_| ToolOutput::failure("path: outside project root"))?;
+            let opened = self
+                .project_root_dir
+                .metadata()
+                .map_err(|_| ToolOutput::failure("path: outside project root"))?;
+            if root != self.project_root
+                || metadata.file_type().is_symlink()
+                || (metadata.dev(), metadata.ino()) != (opened.dev(), opened.ino())
+            {
+                return Err(ToolOutput::failure("path: outside project root"));
+            }
+        }
+
+        Ok(())
     }
 }
 
