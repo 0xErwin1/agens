@@ -922,7 +922,9 @@ fn rotate_active_agent(
 
     context.active_agent = Some(next);
     context.metadata = metadata;
-    context.pending_system_reminder = reminder;
+    if reminder.is_some() {
+        context.pending_system_reminder = reminder;
+    }
 
     Ok(())
 }
@@ -1110,18 +1112,27 @@ fn run_tui_prompt(
                 bootstrap,
                 cancellation,
                 progress,
-            )?;
+            );
             let mut session = session.lock().map_err(|_| {
                 CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
             })?;
-            session.identifier = Some(completion.metadata.id);
-            session.metadata = Some(completion.metadata);
-            if consumed_reminder {
-                session.pending_system_reminder = None;
-            }
-            Ok(completion.text)
+            complete_tui_turn(&mut session, completion, consumed_reminder)
         }
     }
+}
+
+fn complete_tui_turn(
+    session: &mut TuiSessionContext,
+    completion: Result<HeadlessChatCompletion, CliError>,
+    consumed_reminder: bool,
+) -> Result<String, CliError> {
+    let completion = completion?;
+    session.identifier = Some(completion.metadata.id);
+    session.metadata = Some(completion.metadata);
+    if consumed_reminder {
+        session.pending_system_reminder = None;
+    }
+    Ok(completion.text)
 }
 
 fn rotate_tui_agent(
@@ -1757,6 +1768,12 @@ where
 
 fn provider_messages(request: &HeadlessChatRequest) -> Vec<Message> {
     let mut messages = request.history.clone();
+    if let Some(reminder) = &request.pending_system_reminder {
+        messages.push(Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(reminder.clone())],
+        });
+    }
     messages.push(Message {
         role: Role::User,
         parts: vec![MessagePart::Text(request.prompt.clone())],
@@ -3074,6 +3091,36 @@ mod tests {
                 .as_ref()
                 .map(|agent| agent.capabilities.clone())
         );
+        assert_eq!(
+            provider_messages(&request),
+            vec![
+                Message {
+                    role: Role::System,
+                    parts: vec![MessagePart::Text(
+                        "Agent capabilities expanded: primary -> reviewer.".into(),
+                    )],
+                },
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("next".into())],
+                },
+            ]
+        );
+
+        rotate_active_agent(
+            &mut context,
+            &reviewer,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+            Some(&mut store),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            context.pending_system_reminder.as_deref(),
+            Some("Agent capabilities expanded: primary -> reviewer.")
+        );
 
         let policy = permission_policy(
             &[],
@@ -3155,6 +3202,41 @@ mod tests {
         assert!(no_expansion.pending_system_reminder.is_none());
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn completed_tui_turn_clears_reminders_only_after_successful_persistence() {
+        let metadata = SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "reviewer".into(),
+            created_at: 1,
+            updated_at: 2,
+            completed_turn_count: 2,
+            resumable: true,
+        };
+        let mut context = TuiSessionContext::fresh();
+        context.pending_system_reminder = Some("reminder".into());
+
+        assert_eq!(
+            complete_tui_turn(
+                &mut context,
+                Ok(HeadlessChatCompletion {
+                    text: "answer".into(),
+                    metadata: metadata.clone(),
+                }),
+                true,
+            )
+            .unwrap(),
+            "answer"
+        );
+        assert_eq!(context.metadata, Some(metadata));
+        assert!(context.pending_system_reminder.is_none());
+
+        context.pending_system_reminder = Some("reminder".into());
+        assert!(complete_tui_turn(&mut context, Err(CliError::storage("failed")), true).is_err());
+        assert_eq!(context.pending_system_reminder.as_deref(), Some("reminder"));
     }
 
     mod model_registry {
@@ -3467,7 +3549,7 @@ mod tests {
             .persist_completed_session_turn(&metadata, &initial_turn)
             .expect("normalized session should persist");
 
-        let request = resume_tui_session(&bootstrap, 1)
+        let mut request = resume_tui_session(&bootstrap, 1)
             .expect("normalized session should resume")
             .apply_to(HeadlessChatRequest {
                 prompt: "second input".into(),
@@ -3482,6 +3564,8 @@ mod tests {
                 effective_capabilities: None,
                 pending_system_reminder: None,
             });
+        request.pending_system_reminder =
+            Some("Agent capabilities expanded: primary -> reviewer.".into());
         let completion = run_production_headless_chat_with_progress(
             request,
             &bootstrap,
@@ -3504,6 +3588,7 @@ mod tests {
                 {"type": "function_call", "call_id": "call-history", "name": "native::read", "arguments": "{\"path\":\"notes.md\"}"},
                 {"role": "assistant", "content": [{"type": "output_text", "text": "calling the tool"}]},
                 {"type": "function_call_output", "call_id": "call-history", "output": "file contents"},
+                {"role": "system", "content": [{"type": "input_text", "text": "Agent capabilities expanded: primary -> reviewer."}]},
                 {"role": "user", "content": [{"type": "input_text", "text": "second input"}]},
             ])
         );
@@ -3520,6 +3605,7 @@ mod tests {
                 Role::User,
                 Role::Assistant,
                 Role::Tool,
+                Role::System,
                 Role::User,
                 Role::Assistant
             ]
@@ -3527,10 +3613,16 @@ mod tests {
         assert_eq!(reopened.messages[..3], initial_messages);
         assert_eq!(
             reopened.messages[3].parts,
-            vec![MessagePart::Text("second input".into())]
+            vec![MessagePart::Text(
+                "Agent capabilities expanded: primary -> reviewer.".into()
+            )]
         );
         assert_eq!(
             reopened.messages[4].parts,
+            vec![MessagePart::Text("second input".into())]
+        );
+        assert_eq!(
+            reopened.messages[5].parts,
             vec![MessagePart::Text("second answer".into())]
         );
 
