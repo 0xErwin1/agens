@@ -1438,7 +1438,22 @@ impl TuiRuntimeRouter {
                     display: input.clone(),
                     prompt: command.expand(arguments),
                 },
-                None => return Err(CliError::usage(format!("unknown TUI command: {command}"))),
+                None => match self.skills.skill(name) {
+                    Some(skill) => TuiSubmissionOutcome::ProviderTurn {
+                        display: input.clone(),
+                        prompt: format!(
+                            "## Skill: {}\n{}\n\n## User arguments\n{}",
+                            skill.name(),
+                            skill.load_instructions().map_err(|_| {
+                                CliError::usage(format!("skill /{name} is unavailable"))
+                            })?,
+                            arguments
+                        ),
+                    },
+                    None => {
+                        return Err(CliError::usage(format!("unknown TUI command: {command}")));
+                    }
+                },
             },
         };
         Ok(outcome)
@@ -1667,6 +1682,22 @@ fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
     )
 }
 
+fn report_tui_extension_collisions<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    commands: &CommandCatalog,
+    skills: &SkillCatalog,
+) {
+    for skill in skills
+        .skills()
+        .filter(|skill| commands.command(skill.name()).is_some())
+    {
+        tui.add_info(format!(
+            "Skill /{} is shadowed by a command; command routing wins.",
+            skill.name()
+        ));
+    }
+}
+
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
@@ -1690,6 +1721,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     tui.set_presentation(provider, model, session_label);
 
     let commands = start_tui_commands(&mut tui, bootstrap)?;
+    report_tui_extension_collisions(&mut tui, &commands, &skills);
     let router = TuiRuntimeRouter::new(
         bootstrap.clone(),
         session,
@@ -5255,10 +5287,36 @@ mod tests {
             "GLOBAL_SHARED_BODY_SENTINEL",
         );
         write_tui_skill(
+            &global_skills,
+            "invoke",
+            "global invoke",
+            "GLOBAL_INVOKE_BODY_SENTINEL",
+        );
+        write_tui_skill(
             &project_skills,
             "shared",
             "project shared",
             "PROJECT_SHARED_BODY_SENTINEL",
+        );
+        write_tui_skill(
+            &project_skills,
+            "invoke",
+            "project invoke",
+            "PROJECT_INVOKE_BODY_SENTINEL",
+        );
+        write_tui_skill(
+            &project_skills,
+            "broken",
+            "broken after startup",
+            "BROKEN_BODY_SENTINEL",
+        );
+        let global_commands = config_home.join("commands");
+        std::fs::create_dir_all(&global_commands).unwrap();
+        write_tui_command(
+            &global_commands,
+            "shared",
+            "command wins",
+            "COMMAND:$ARGUMENTS",
         );
         std::fs::create_dir_all(project_skills.join("shared/references")).unwrap();
         std::fs::write(
@@ -5275,6 +5333,7 @@ mod tests {
         });
         let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
         let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        report_tui_extension_collisions(&mut tui, &commands, &skills);
         let router = TuiRuntimeRouter::new(
             bootstrap.clone(),
             session,
@@ -5289,11 +5348,16 @@ mod tests {
         let request = captured.lock().unwrap()[0].clone();
         let context = request.system_prompt.unwrap();
         assert_eq!(context.matches("## Available skills").count(), 1);
-        assert!(context.contains("- alpha: global alpha\n- shared: project shared"));
+        assert!(context.contains("- alpha: global alpha"));
+        assert!(context.contains("- invoke: project invoke"));
+        assert!(context.contains("- shared: project shared"));
         for secret in [
             "GLOBAL_ALPHA_BODY_SENTINEL",
             "GLOBAL_SHARED_BODY_SENTINEL",
+            "GLOBAL_INVOKE_BODY_SENTINEL",
             "PROJECT_SHARED_BODY_SENTINEL",
+            "PROJECT_INVOKE_BODY_SENTINEL",
+            "BROKEN_BODY_SENTINEL",
             "RESOURCE_SENTINEL",
         ] {
             assert!(!context.contains(secret));
@@ -5345,6 +5409,45 @@ mod tests {
             "PROJECT_SHARED_BODY_SENTINEL"
         );
         drop(dispatcher);
+
+        submit_tui_command(
+            &mut tui,
+            &router,
+            &bootstrap,
+            "/invoke   explicit arguments   ",
+            &captured,
+        );
+        submit_tui_command(
+            &mut tui,
+            &router,
+            &bootstrap,
+            "/shared command arguments",
+            &captured,
+        );
+        std::fs::remove_file(project_skills.join("broken/SKILL.md")).unwrap();
+        submit_tui_command(&mut tui, &router, &bootstrap, "/broken args", &captured);
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1].prompt,
+            "## Skill: invoke\nPROJECT_INVOKE_BODY_SENTINEL\n\n## User arguments\nexplicit arguments"
+        );
+        assert_eq!(requests[2].prompt, "COMMAND:command arguments");
+        assert!(tui.transcript().contains(&agens_tui::TranscriptEntry::User(
+            "/invoke   explicit arguments   ".into()
+        )));
+        assert!(matches!(
+            tui.transcript().last(),
+            Some(agens_tui::TranscriptEntry::Error(_))
+        ));
+        let collision_diagnostics = tui
+            .transcript()
+            .iter()
+            .filter(|entry| matches!(entry, agens_tui::TranscriptEntry::Info(message) if message.contains("/shared") && message.contains("command")))
+            .count();
+        assert_eq!(collision_diagnostics, 1);
+        drop(requests);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
