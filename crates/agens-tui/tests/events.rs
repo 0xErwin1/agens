@@ -3,7 +3,7 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PublishOutcome,
     RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome,
-    TuiSubmissionOutcome,
+    TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -607,6 +607,30 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
     assert_eq!(view.conversation.unwrap().errors.len(), 1);
     assert_eq!(view.conversation.unwrap().errors[0].message, "[redacted]");
     assert!(view.conversation.unwrap().final_markdown.is_none());
+}
+
+#[test]
+fn submission_start_resets_footer_metrics() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(agens_core::Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        total_tokens: Some(15),
+        context_window: Some(8_192),
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: Some(Duration::from_millis(25)),
+    });
+    assert_eq!(tui.view().latest_usage.unwrap().total_tokens, Some(15));
+    assert_eq!(tui.view().turn_duration, Some(Duration::from_millis(25)));
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
+        prompt: "next".into(),
+    });
+
+    assert!(tui.view().latest_usage.is_none());
+    assert!(tui.view().turn_duration.is_none());
 }
 
 #[test]

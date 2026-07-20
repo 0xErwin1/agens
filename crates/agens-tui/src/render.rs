@@ -96,25 +96,6 @@ pub(super) fn detail_lines(
 
     for event in events {
         match event {
-            TuiRuntimeEvent::TurnStarted => line(&mut lines, "TURN", Color::Cyan, "started"),
-            TuiRuntimeEvent::TurnEnded { status, duration } => line(
-                &mut lines,
-                "TURN",
-                turn_color(*status),
-                format!("{status:?}{}", duration_label(*duration)),
-            ),
-            TuiRuntimeEvent::Usage(usage) => line(
-                &mut lines,
-                "USAGE",
-                Color::Gray,
-                format!(
-                    "input {} · output {} · total {} · context {}",
-                    optional_number(usage.input_tokens),
-                    optional_number(usage.output_tokens),
-                    optional_number(usage.total_tokens),
-                    optional_number(usage.context_window),
-                ),
-            ),
             TuiRuntimeEvent::ToolStarted {
                 call_id,
                 name,
@@ -144,7 +125,12 @@ pub(super) fn detail_lines(
                     diff_line(&mut lines, change.number, change.kind, &change.text);
                 }
             }
-            _ => {}
+            TuiRuntimeEvent::TurnStarted
+            | TuiRuntimeEvent::TurnEnded { .. }
+            | TuiRuntimeEvent::Usage(_)
+            | TuiRuntimeEvent::ToolStarted { .. }
+            | TuiRuntimeEvent::ToolEnded { .. }
+            | TuiRuntimeEvent::Diff { .. } => {}
         }
     }
 
@@ -211,10 +197,6 @@ fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl In
     lines.push(Line::default());
 }
 
-fn optional_number(value: Option<u64>) -> String {
-    value.map_or_else(|| "unavailable".into(), |number| number.to_string())
-}
-
 fn duration_label(duration: Option<Duration>) -> String {
     duration.map_or_else(String::new, |value| {
         if value.as_secs() > 0 {
@@ -229,14 +211,5 @@ fn result_color(result: ToolResultState) -> Color {
     match result {
         ToolResultState::Success => Color::Green,
         ToolResultState::Failure => Color::Red,
-    }
-}
-
-fn turn_color(state: agens_core::TurnState) -> Color {
-    match state {
-        agens_core::TurnState::Completed => Color::Green,
-        agens_core::TurnState::Failed => Color::Red,
-        agens_core::TurnState::Cancelled => Color::Yellow,
-        _ => Color::Cyan,
     }
 }

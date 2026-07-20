@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use agens_core::{MessagePart, TurnEvent, TurnState};
+use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
@@ -191,6 +191,8 @@ pub struct ViewState<'a> {
     pub input_cursor: usize,
     /// Typed metrics retained for rich, lossless presentation.
     pub runtime_events: &'a [TuiRuntimeEvent],
+    pub turn_duration: Option<Duration>,
+    pub latest_usage: Option<&'a Usage>,
     /// Authoritative typed conversation projection, when a turn is active or completed.
     pub conversation: Option<&'a Conversation>,
     /// Tool outputs collapsed only for presentation; their source output remains retained.
@@ -329,7 +331,8 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     if layout.footer.height > 0 {
         frame.render_widget(
-            Paragraph::new(footer_text(area.width)).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(footer_text(area.width, &state))
+                .style(Style::default().fg(Color::DarkGray)),
             layout.footer,
         );
     }
@@ -494,6 +497,7 @@ fn turn_state_label(state: Option<TurnState>, running: bool) -> &'static str {
         Some(TurnState::Dispatching) => "Using tool",
         Some(TurnState::Cancelled) => "Cancelling",
         Some(TurnState::Failed) => "Failed",
+        Some(TurnState::Completed) => "Completed",
         _ if running => "Working",
         _ => "Ready",
     }
@@ -515,11 +519,33 @@ fn composer_metadata(input: &str) -> String {
     format!(" {lines} lines · {} chars ", input.chars().count())
 }
 
-fn footer_text(width: u16) -> &'static str {
+fn footer_text(width: u16, state: &ViewState<'_>) -> String {
+    let duration = state.turn_duration.map_or_else(String::new, |value| {
+        if value.as_secs() > 0 {
+            format!(" · {}s", value.as_secs())
+        } else {
+            format!(" · {}ms", value.as_millis())
+        }
+    });
+    let usage = state.latest_usage.map_or_else(String::new, |usage| {
+        let tokens = usage
+            .total_tokens
+            .map_or_else(|| "unavailable".into(), |value| value.to_string());
+        let context = usage
+            .context_window
+            .map_or_else(|| "unavailable".into(), |value| value.to_string());
+        format!(" · tokens {tokens} · context {context}")
+    });
+    let metrics = format!(
+        " {}{duration}{usage}",
+        turn_state_label(state.turn_state, state.running)
+    );
     if width < 60 {
-        " Enter send  ·  Ctrl+C cancel/quit "
+        format!("{metrics}  ·  Enter send  ·  Ctrl+C cancel/quit")
     } else {
-        " Enter send  ·  Shift+Enter newline  ·  Ctrl+O output  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow "
+        format!(
+            "{metrics}  ·  Enter send  ·  Shift+Enter newline  ·  Ctrl+O output  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow"
+        )
     }
 }
 
@@ -631,6 +657,8 @@ pub struct Tui<E> {
     turn_state: Option<TurnState>,
     active_tool: Option<String>,
     runtime_events: Vec<TuiRuntimeEvent>,
+    turn_duration: Option<Duration>,
+    latest_usage: Option<Usage>,
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
     dialog: Option<DialogView>,
@@ -657,6 +685,8 @@ where
             turn_state: None,
             active_tool: None,
             runtime_events: Vec::new(),
+            turn_duration: None,
+            latest_usage: None,
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
             dialog: None,
@@ -719,6 +749,9 @@ where
     /// Adds a user prompt before the composition layer starts the shared runtime.
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
         let prompt = prompt.into();
+        self.runtime_events.clear();
+        self.turn_duration = None;
+        self.latest_usage = None;
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
         self.conversation = Some(Conversation::new(prompt));
         self.collapsed_tool_outputs.clear();
@@ -817,8 +850,19 @@ where
 
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
     pub fn apply_runtime_event(&mut self, event: TuiRuntimeEvent) {
-        if let TuiRuntimeEvent::Diff { lines, .. } = &event {
-            self.project_conversation(ConversationEvent::Diff(lines.clone()));
+        match &event {
+            TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
+            TuiRuntimeEvent::TurnEnded { status, duration } => {
+                self.running = false;
+                self.turn_state = Some(*status);
+                self.turn_duration = *duration;
+                self.active_tool = None;
+            }
+            TuiRuntimeEvent::Usage(usage) => self.latest_usage = Some(usage.clone()),
+            TuiRuntimeEvent::Diff { lines, .. } => {
+                self.project_conversation(ConversationEvent::Diff(lines.clone()));
+            }
+            TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
     }
@@ -861,6 +905,8 @@ where
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
             runtime_events: &self.runtime_events,
+            turn_duration: self.turn_duration,
+            latest_usage: self.latest_usage.as_ref(),
             conversation: self.conversation.as_ref(),
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
             dialog: self.dialog.as_ref(),

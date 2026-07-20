@@ -89,7 +89,8 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         "write result",
         "12ms",
         "8 + new line",
-        "input 3",
+        "tokens 8",
+        "context 128",
         "Request failed safely",
         "Action: Check credentials and retry.",
     ] {
@@ -97,6 +98,36 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     }
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(text.find("read-1").unwrap() < text.find("write-2").unwrap());
+}
+
+#[test]
+fn lifecycle_metrics_render_in_footer_without_transcript_rows() {
+    let backend = TestBackend::new(140, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        total_tokens: Some(15),
+        context_window: Some(8_192),
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: agens_core::TurnState::Completed,
+        duration: Some(Duration::from_millis(25)),
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(!text.contains("TURN"));
+    assert!(!text.contains("USAGE"));
+    assert!(text.contains("Completed"));
+    assert!(text.contains("25ms"));
+    assert!(text.contains("tokens 15"));
+    assert!(text.contains("context 8192"));
 }
 
 #[test]
@@ -296,7 +327,8 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         "12ms",
         "7 - old line",
         "8 + new line",
-        "input 3",
+        "tokens 8",
+        "context 128",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
