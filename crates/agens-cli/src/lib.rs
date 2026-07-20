@@ -34,8 +34,9 @@ use agens_tools::{
     AgentCatalog, AgentModelValidator, AuthorizedToolCall, DispatchTool, EffectiveCapabilitySet,
     McpHttpTransport, McpLimits, McpRegistry, McpSseTransport, McpStdioTransport,
     McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
-    NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata, SkillCatalog,
+    TaskRunner, TaskTool, TaskTurnRequest, ToolDispatchRequest, ToolDispatcher,
+    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
@@ -1913,6 +1914,13 @@ fn production_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
+    register_production_task_tool(
+        bootstrap,
+        project_root,
+        &mut dispatcher,
+        &mut provider_tools,
+    )?;
+
     let mut runtime = ProductionMcpRuntime {
         registry: mcp_registry,
         dispatcher: Arc::new(Mutex::new(dispatcher)),
@@ -1928,6 +1936,247 @@ fn production_tool_runtime(
     }
 
     Ok((provider_tools.into_values().collect(), runtime.dispatcher))
+}
+
+fn register_production_task_tool(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    dispatcher: &mut ToolDispatcher,
+    provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+) -> Result<(), CliError> {
+    let validator = BundledModelValidator;
+    let agents = tui_agent_catalog(bootstrap, &validator)?;
+    if !agents
+        .subagents()
+        .any(|agent| agent.mode == agens_core::AgentMode::Subagent)
+    {
+        return Ok(());
+    }
+
+    let global_skills = bootstrap.paths.global_config.with_file_name("skills");
+    let project_skills = bootstrap.paths.project_config.with_file_name("skills");
+    let skills = SkillCatalog::discover(global_skills, project_skills)
+        .map_err(|_| CliError::configuration("skill catalog is unavailable"))?
+        .catalog()
+        .clone();
+    let parent_model = bootstrap
+        .model()
+        .unwrap_or_else(|| default_model(bootstrap))
+        .to_owned();
+    let task = TaskTool::from_catalogs_with_model_validator(
+        agents,
+        skills,
+        parent_model,
+        validator,
+        ProductionTaskRunner {
+            bootstrap: bootstrap.clone(),
+            project_root: project_root.to_path_buf(),
+        },
+    );
+
+    provider_tools.insert(
+        "task".into(),
+        OpenAiFunctionTool::new(
+            "task",
+            "Run an isolated subagent task",
+            TaskTool::<ProductionTaskRunner>::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("task tool is unavailable"))?,
+    );
+    dispatcher
+        .register_native("native::task", agens_core::ToolAccess::Write, task)
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))
+}
+
+fn default_model(bootstrap: &Bootstrap) -> &'static str {
+    match bootstrap.provider_type() {
+        Some("openai-chatgpt") => "gpt-5.5",
+        _ => "gpt-4.1",
+    }
+}
+
+struct ProductionTaskRunner {
+    bootstrap: Bootstrap,
+    project_root: PathBuf,
+}
+
+impl TaskRunner for ProductionTaskRunner {
+    fn run(&mut self, request: TaskTurnRequest) -> Result<ToolOutput, agens_core::Error> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| run_production_task(request, &self.bootstrap, &self.project_root))
+                .join()
+                .ok()
+                .and_then(Result::ok)
+                .map(ToolOutput::success)
+                .ok_or_else(|| agens_core::Error::Tool("task: child execution failed".into()))
+        })
+    }
+}
+
+fn run_production_task(
+    request: TaskTurnRequest,
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<String, CliError> {
+    let messages = vec![
+        Message {
+            role: Role::System,
+            parts: vec![MessagePart::Text(task_system_prompt(&request))],
+        },
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(request.description().to_owned())],
+        },
+    ];
+    let (provider_tools, tool_runtime) = production_read_only_tool_runtime(project_root)?;
+
+    match bootstrap.provider_type() {
+        Some("openai-api") => {
+            let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
+                CliError::authentication("OpenAI API authentication is unavailable")
+            })?;
+            let provider =
+                OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
+                    api_key,
+                    bootstrap.provider_base_url(),
+                    request.model().to_owned(),
+                    messages,
+                    provider_tools,
+                    std::time::Duration::from_secs(120),
+                )
+                .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
+                .map_err(|_| {
+                    CliError::authentication("OpenAI API authentication is unavailable")
+                })?;
+            run_isolated_task_turn(provider, tool_runtime, project_root)
+        }
+        Some("openai-chatgpt") => {
+            let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
+                &bootstrap.paths.credentials,
+                bootstrap.provider_base_url(),
+                None,
+                request.model().to_owned(),
+                task_system_prompt(&request),
+                messages,
+                provider_tools,
+                std::time::Duration::from_secs(120),
+            )
+            .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
+            .map_err(|_| CliError::authentication("ChatGPT credentials are unavailable or invalid"))?;
+            run_isolated_task_turn(provider, tool_runtime, project_root)
+        }
+        _ => Err(CliError::configuration(
+            "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
+        )),
+    }
+}
+
+fn task_system_prompt(request: &TaskTurnRequest) -> String {
+    request
+        .skills()
+        .iter()
+        .fold(request.system_prompt().to_owned(), |prompt, skill| {
+            format!("{prompt}\n\n## {}\n{}", skill.name(), skill.instructions())
+        })
+}
+
+fn run_isolated_task_turn<P>(
+    mut provider: P,
+    tool_runtime: SharedToolDispatcher,
+    project_root: &Path,
+) -> Result<String, CliError>
+where
+    P: ProgressAwareProvider,
+{
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::read".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let grants = Arc::new(Mutex::new(Vec::new()));
+    let session = PermissionSession::new();
+    let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut repository = DiscardCompletedTurnRepository;
+    let cancellation = HeadlessTurnCancellation::new();
+    let project = project_root.display().to_string();
+    let mut gate = ProductionPermissionGate::new(
+        policy.clone(),
+        Arc::clone(&grants),
+        session,
+        project.clone(),
+        Arc::clone(&tool_runtime),
+        Arc::clone(&pending),
+        Arc::clone(&prompts),
+    );
+    let mut resolver = ChildPermissionResolver;
+    let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
+    let snapshot = block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &cancellation,
+        16,
+        None,
+    ))?
+    .map_err(CliError::runtime)?;
+
+    Ok(snapshot
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ProviderPart(MessagePart::Text(text)) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect())
+}
+
+struct ChildPermissionResolver;
+
+impl HeadlessPermissionResolver for ChildPermissionResolver {
+    fn resolve(
+        &mut self,
+        _: &HeadlessToolCall,
+        _: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(Ok(PermissionDecision::Deny))
+    }
+}
+
+fn production_read_only_tool_runtime(
+    project_root: &Path,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+        NativeTools::open(project_root)
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+    )));
+    let metadata = NativeToolCatalog::metadata()
+        .into_iter()
+        .find(|metadata| metadata.qualified_name == "native::read")
+        .ok_or_else(|| CliError::configuration("native read tool is unavailable"))?;
+    let name = native_model_tool_name(&metadata.qualified_name)?;
+    let tool = OpenAiFunctionTool::new(name.clone(), metadata.description, metadata.input_schema)
+        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native(
+            "native::read",
+            metadata.access,
+            RegisteredNativeTool {
+                name: "native::read".into(),
+                catalog,
+            },
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
 }
 
 struct ProductionMcpRuntime {

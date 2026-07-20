@@ -1183,6 +1183,71 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
 }
 
 #[test]
+fn production_task_runs_an_isolated_provider_backed_subagent() {
+    let temporary = TemporaryDirectory::new("production-task-subagent");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
+    std::fs::write(
+        config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["task".into(), "parent request".into()],
+            response: native_tool_call_response(
+                "task-call",
+                "task",
+                r#"{"agent":"reviewer","description":"child request"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "child request".into(),
+                "You are the isolated reviewer.".into(),
+                "gpt-4o".into(),
+                "read".into(),
+                "!parent request".into(),
+                "!task".into(),
+                "!write".into(),
+                "!bash".into(),
+                "!webfetch".into(),
+            ],
+            response: text_response("child answer"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child answer".into()],
+            response: text_response("parent answer"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .current_dir(&project_root)
+        .args(["chat", "parent request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert!(result.status.success());
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), "parent answer\n");
+}
+
+#[test]
 fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_the_turn() {
     let temporary = TemporaryDirectory::new("production-chatgpt");
     let config_home = temporary.path().join("config");
