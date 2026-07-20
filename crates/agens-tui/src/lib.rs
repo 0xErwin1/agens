@@ -94,6 +94,8 @@ pub enum Action {
     Render,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Ask the composition layer to resolve a palette dialog by stable route ID.
+    OpenDialog(String),
     /// Dispatch the selected dialog action through the composition layer.
     DialogAction(String),
     /// An active engine turn was asked to cancel.
@@ -142,7 +144,15 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
     },
+    Dialog(DialogView),
     Quit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiRouteRequest {
+    Input(String),
+    OpenDialog(String),
+    DialogAction(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,6 +252,7 @@ pub struct PaletteEntry {
     description: String,
     argument_hint: String,
     kind: PaletteEntryKind,
+    dialog_id: Option<String>,
 }
 
 impl PaletteEntry {
@@ -256,7 +267,13 @@ impl PaletteEntry {
             description: description.into(),
             argument_hint: argument_hint.into(),
             kind,
+            dialog_id: None,
         }
+    }
+
+    pub fn with_dialog(mut self, route_id: impl Into<String>) -> Self {
+        self.dialog_id = Some(route_id.into());
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -1140,6 +1157,11 @@ where
                 self.add_info(message);
                 None
             }
+            TuiSubmissionOutcome::Dialog(dialog) => {
+                self.set_running(false);
+                self.show_selection_dialog(dialog);
+                None
+            }
             TuiSubmissionOutcome::Quit => {
                 self.set_running(false);
                 None
@@ -1445,6 +1467,12 @@ where
             }
             Key::Enter => {
                 if self.palette_open {
+                    if let Some(route_id) = self.selected_palette_dialog() {
+                        self.palette_open = false;
+                        self.input.clear();
+                        self.input_cursor = 0;
+                        return Action::OpenDialog(route_id);
+                    }
                     self.complete_palette_selection();
                 }
                 self.palette_open = false;
@@ -1561,6 +1589,20 @@ where
         };
         self.input_cursor = self.input.len();
         self.palette_selected = 0;
+    }
+
+    fn selected_palette_dialog(&self) -> Option<String> {
+        let invocation = self.input.strip_prefix('/').unwrap_or(&self.input);
+        let arguments = invocation
+            .find(char::is_whitespace)
+            .map_or("", |index| invocation[index..].trim());
+        if !arguments.is_empty() {
+            return None;
+        }
+
+        palette_matches(&self.palette_entries, &self.input)
+            .get(self.palette_selected)
+            .and_then(|entry| entry.dialog_id.clone())
     }
 
     fn toggle_tool_output_expansion(&mut self) {
@@ -1749,9 +1791,11 @@ where
 
         match tui.handle(event) {
             Action::Quit => return Ok(()),
-            Action::Render | Action::Submit(_) | Action::DialogAction(_) | Action::Cancel => {
-                renderer.render(tui.view())?
-            }
+            Action::Render
+            | Action::Submit(_)
+            | Action::OpenDialog(_)
+            | Action::DialogAction(_)
+            | Action::Cancel => renderer.render(tui.view())?,
         }
     }
 }
@@ -1789,7 +1833,7 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render | Action::DialogAction(_) | Action::Cancel => {
+            Action::Render | Action::OpenDialog(_) | Action::DialogAction(_) | Action::Cancel => {
                 renderer.render(tui.view())?
             }
         }
@@ -1816,7 +1860,10 @@ pub fn run_with_default_progress_submit<E, R, F>(
 ) -> io::Result<()>
 where
     E: Engine + Send,
-    R: Fn(String, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome + Send + Sync + 'static,
+    R: Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
     F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
         + Send
         + Sync
@@ -1882,11 +1929,28 @@ where
                 let route_sender = route_sender.clone();
                 let progress = route_progress_sender.clone();
                 thread::spawn(move || {
-                    let outcome = route(prompt, progress);
+                    let outcome = route(TuiRouteRequest::Input(prompt), progress);
                     let _ = route_sender.send(outcome);
                 });
             }
-            Action::Render | Action::DialogAction(_) | Action::Cancel => {}
+            Action::OpenDialog(route_id) => {
+                let outcome = route(
+                    TuiRouteRequest::OpenDialog(route_id),
+                    route_progress_sender.clone(),
+                );
+                let _ = route_sender.send(outcome);
+            }
+            Action::DialogAction(action_id) => {
+                tui.begin_route();
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
+                thread::spawn(move || {
+                    let outcome = route(TuiRouteRequest::DialogAction(action_id), progress);
+                    let _ = route_sender.send(outcome);
+                });
+            }
+            Action::Render | Action::Cancel => {}
         }
     }
 }

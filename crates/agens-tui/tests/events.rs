@@ -566,6 +566,32 @@ fn slash_palette_uses_only_the_name_prefix_and_escape_preserves_composer_and_bac
 }
 
 #[test]
+fn slash_palette_selector_enter_emits_a_route_id_but_explicit_arguments_still_submit() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_palette_entries(vec![
+        PaletteEntry::new("model", "Choose model", "[name]", PaletteEntryKind::BuiltIn)
+            .with_dialog("model"),
+    ]);
+
+    for character in "/mo".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::OpenDialog("model".into())
+    );
+    assert_eq!(tui.input(), "");
+
+    for character in "/model o3".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("/model o3".into())
+    );
+}
+
+#[test]
 fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Key(Key::Char('d')));

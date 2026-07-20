@@ -38,9 +38,10 @@ use agens_tools::{
     ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
-    BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, PaletteEntry,
-    PaletteEntryKind, ToolResultState, Tui, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
-    TuiRuntimeEvent, TuiSubmissionOutcome, run_with_default_progress_submit,
+    BridgeCancel, BridgeTx, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine as TuiEngine,
+    PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPresentation, TuiProviderOutcome,
+    TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
+    run_with_default_progress_submit,
 };
 
 mod chatgpt_auth;
@@ -66,17 +67,22 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "subagent",
 ];
 
-const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str)] = &[
-    ("connect", "Connect to ChatGPT", "[--device-auth]"),
-    ("disconnect", "Disconnect ChatGPT credentials", ""),
-    ("new", "Start a new session", ""),
-    ("sessions", "List saved sessions", ""),
-    ("resume", "Resume a saved session", "<id>"),
-    ("agent", "List or select the primary agent", "[name]"),
-    ("model", "List or select the model", "[name]"),
-    ("effort", "Show or set reasoning effort", "[level]"),
-    ("help", "Show commands and skills", ""),
-    ("quit", "Exit Agens", ""),
+const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
+    ("connect", "Connect to ChatGPT", "[--device-auth]", None),
+    ("disconnect", "Disconnect ChatGPT credentials", "", None),
+    ("new", "Start a new session", "", None),
+    ("sessions", "List saved sessions", "", None),
+    ("resume", "Resume a saved session", "<id>", None),
+    ("agent", "List or select the primary agent", "[name]", None),
+    ("model", "List or select the model", "[name]", Some("model")),
+    (
+        "effort",
+        "Show or set reasoning effort",
+        "[level]",
+        Some("effort"),
+    ),
+    ("help", "Show commands and skills", "", Some("help")),
+    ("quit", "Exit Agens", "", None),
 ];
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
@@ -1357,6 +1363,103 @@ impl TuiRuntimeRouter {
             })
     }
 
+    fn route_request(
+        &self,
+        request: TuiRouteRequest,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> TuiSubmissionOutcome {
+        let result = match request {
+            TuiRouteRequest::Input(input) => return self.route_with_progress(input, progress),
+            TuiRouteRequest::OpenDialog(route_id) => self.open_dialog(&route_id),
+            TuiRouteRequest::DialogAction(action_id) => self.route_dialog_action(&action_id),
+        };
+        result.unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
+            message: error.to_string(),
+            action: TUI_ERROR_ACTION.into(),
+        })
+    }
+
+    fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let dialog = match route_id {
+            "model" => {
+                let selector = TuiModelSelector::new("gpt-4.1");
+                let values = selector.model_values().map_err(CliError::unavailable)?;
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let current = context
+                    .selection
+                    .as_ref()
+                    .map(TuiModelSelector::model)
+                    .or_else(|| bootstrap.model())
+                    .unwrap_or_else(|| default_model(&bootstrap));
+                let entries = values
+                    .into_iter()
+                    .map(|model| {
+                        let label = if model == current {
+                            format!("{model} (current)")
+                        } else {
+                            model.clone()
+                        };
+                        DialogEntry::action(label, format!("model:{model}"))
+                    })
+                    .collect();
+                DialogView::selection("Choose model", Some("Available models"), entries)
+            }
+            "effort" => {
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let current = context
+                    .selection
+                    .as_ref()
+                    .and_then(TuiModelSelector::reasoning_effort)
+                    .unwrap_or("default");
+                let entries = ["low", "medium", "high"]
+                    .into_iter()
+                    .map(|effort| {
+                        let label = if effort == current {
+                            format!("{effort} (current)")
+                        } else {
+                            effort.to_owned()
+                        };
+                        DialogEntry::action(label, format!("effort:{effort}"))
+                    })
+                    .collect();
+                DialogView::selection(
+                    "Choose effort",
+                    Some(format!("Current: {current}")),
+                    entries,
+                )
+            }
+            "help" => DialogView::selection(
+                "Commands and skills",
+                Some(render_tui_help(&self.palette)),
+                Vec::new(),
+            ),
+            _ => return Err(CliError::usage("TUI dialog is unavailable")),
+        };
+        Ok(TuiSubmissionOutcome::Dialog(dialog))
+    }
+
+    fn route_dialog_action(&self, action_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let message = if let Some(model) = action_id.strip_prefix("model:") {
+            apply_tui_model(model, &self.session)?
+        } else if let Some(effort) = action_id.strip_prefix("effort:") {
+            apply_tui_effort(&bootstrap, effort, &self.session)?
+        } else {
+            return Err(CliError::usage("TUI dialog action is unavailable"));
+        };
+        Ok(TuiSubmissionOutcome::ContextChanged {
+            message,
+            presentation: self.presentation()?,
+        })
+    }
+
     fn palette_entries(&self) -> &[PaletteEntry] {
         &self.palette
     }
@@ -1380,7 +1483,7 @@ impl TuiRuntimeRouter {
         let arguments = arguments.trim();
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
-            "/help" => TuiSubmissionOutcome::LocalInfo(render_tui_help(&self.palette)),
+            "/help" => self.open_dialog("help")?,
             "/quit" => TuiSubmissionOutcome::Quit,
             "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&bootstrap)?),
             "/new" => {
@@ -1436,20 +1539,12 @@ impl TuiRuntimeRouter {
                 &self.session,
                 agens_core::AgentMode::Subagent,
             )?),
-            "/model" => TuiSubmissionOutcome::LocalInfo(select_tui_model(
-                &bootstrap,
-                command,
-                &self.session,
-            )?),
+            "/model" => self.open_dialog("model")?,
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
                 message: select_tui_model(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
-            "/effort" => TuiSubmissionOutcome::LocalInfo(select_tui_effort(
-                &bootstrap,
-                command,
-                &self.session,
-            )?),
+            "/effort" => self.open_dialog("effort")?,
             command if command.starts_with("/effort ") => TuiSubmissionOutcome::ContextChanged {
                 message: select_tui_effort(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
@@ -1725,8 +1820,9 @@ fn report_tui_extension_collisions<E: TuiEngine>(
 fn resolved_tui_palette(commands: &CommandCatalog, skills: &SkillCatalog) -> Vec<PaletteEntry> {
     let mut entries = TUI_PALETTE_BUILT_INS
         .iter()
-        .map(|(name, description, hint)| {
-            PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn)
+        .map(|(name, description, hint, dialog_id)| {
+            let entry = PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn);
+            dialog_id.map_or(entry.clone(), |dialog_id| entry.with_dialog(dialog_id))
         })
         .collect::<Vec<_>>();
     let mut custom_commands = commands
@@ -1813,7 +1909,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     let route_router = router.clone();
     run_with_default_progress_submit(
         &mut tui,
-        move |prompt, progress| route_router.route_with_progress(prompt, progress),
+        move |request, progress| route_router.route_request(request, progress),
         move |prompt, progress, metrics| {
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
@@ -1893,7 +1989,8 @@ fn run_tui_prompt(
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
-                | TuiSubmissionOutcome::LocalActionableError { .. } => {
+                | TuiSubmissionOutcome::LocalActionableError { .. }
+                | TuiSubmissionOutcome::Dialog(_) => {
                     unreachable!("slash routing returns a local result or CLI error")
                 }
                 TuiSubmissionOutcome::Quit => Ok(String::new()),
@@ -2034,6 +2131,13 @@ fn select_tui_model(
         return Ok(format!("Model: {current}. Available: {values}."));
     }
 
+    apply_tui_model(model, session)
+}
+
+fn apply_tui_model(
+    model: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
     let mut selector = TuiModelSelector::new(model);
     selector
         .apply_model(model)
@@ -2052,7 +2156,7 @@ fn select_tui_effort(
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
     let effort = command.strip_prefix("/effort").unwrap_or_default().trim();
-    let mut context = session
+    let context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     if effort.is_empty() {
@@ -2064,6 +2168,18 @@ fn select_tui_effort(
         return Ok(format!("Reasoning effort: {current}."));
     }
 
+    drop(context);
+    apply_tui_effort(bootstrap, effort, session)
+}
+
+fn apply_tui_effort(
+    bootstrap: &Bootstrap,
+    effort: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     let model = context
         .selection
         .as_ref()
@@ -5697,12 +5813,10 @@ mod tests {
             tui.apply_submission_outcome(router.route(sessions))
                 .is_none()
         );
-        let help = enter_tui_input(&mut tui, "/h");
-        assert!(tui.apply_submission_outcome(router.route(help)).is_none());
-        let help = tui.transcript().last().unwrap();
-        assert!(
-            matches!(help, agens_tui::TranscriptEntry::Info(text) if text.contains("/connect") && text.contains("/review") && text.contains("/inspect") && !text.contains("/subagent"))
-        );
+        assert!(matches!(
+            router.route("/help".into()),
+            TuiSubmissionOutcome::Dialog(_)
+        ));
 
         let unknown = enter_tui_input(&mut tui, "/unknown");
         assert!(
@@ -5715,6 +5829,78 @@ mod tests {
         let quit = enter_tui_input(&mut tui, "/quit");
         assert_eq!(router.route(quit), TuiSubmissionOutcome::Quit);
 
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_model_effort_and_help_palette_routes_open_local_overlays_and_dispatch_once() {
+        let temporary = tui_session_directory("local-overlays");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let (progress, _) = std::sync::mpsc::channel();
+
+        for (prefix, route_id, expected) in [
+            ("/mo", "model", ["Choose model", "gpt-4.1 (current)"]),
+            ("/ef", "effort", ["Choose effort", "medium"]),
+            ("/he", "help", ["Commands and skills", "/connect"]),
+        ] {
+            for character in prefix.chars() {
+                tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
+            }
+            let agens_tui::Action::OpenDialog(actual_route) =
+                tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
+            else {
+                panic!("palette Enter should open the selected overlay");
+            };
+            assert_eq!(actual_route, route_id);
+            let outcome = router.route_request(
+                agens_tui::TuiRouteRequest::OpenDialog(actual_route),
+                progress.clone(),
+            );
+            assert!(tui.apply_submission_outcome(outcome).is_none());
+            let text = render_tui_test_backend(&tui, 80, 24);
+            assert!(text.contains(expected[0]), "{route_id}: {text:?}");
+            assert!(text.contains(expected[1]), "{route_id}: {text:?}");
+
+            if route_id == "help" {
+                assert_eq!(
+                    tui.handle(agens_tui::Event::Key(agens_tui::Key::CtrlC)),
+                    agens_tui::Action::Render
+                );
+                continue;
+            }
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Down));
+            let agens_tui::Action::DialogAction(action_id) =
+                tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
+            else {
+                panic!("dialog Enter should emit one action ID");
+            };
+            let outcome = router.route_request(
+                agens_tui::TuiRouteRequest::DialogAction(action_id),
+                progress.clone(),
+            );
+            assert!(tui.apply_submission_outcome(outcome).is_none());
+            assert!(tui.view().dialog.is_none());
+        }
+
+        assert!(session.lock().unwrap().messages.is_empty());
+        assert!(
+            tui.transcript()
+                .iter()
+                .all(|entry| !matches!(entry, agens_tui::TranscriptEntry::User(_)))
+        );
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -5911,6 +6097,21 @@ mod tests {
             panic!("Enter should submit through the production TUI path");
         };
         input
+    }
+
+    fn render_tui_test_backend(tui: &Tui<ProductionTuiEngine>, width: u16, height: u16) -> String {
+        let terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut renderer = agens_tui::RatatuiRenderer::new(terminal);
+        agens_tui::Renderer::render(&mut renderer, tui.view()).unwrap();
+        renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     fn write_tui_command(root: &Path, name: &str, description: &str, template: &str) {
