@@ -1,7 +1,7 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
-    Action, BridgeCancel, BridgeTx, Engine, Event, Key, PublishOutcome, RatatuiRenderer, Renderer,
-    TranscriptEntry, Tui,
+    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Effect, Engine, Event, Key, PublishOutcome,
+    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -18,6 +18,89 @@ impl Engine for FakeEngine {
     fn cancel(&mut self) {
         self.cancellations += 1;
     }
+}
+
+#[test]
+fn reducer_starts_idle_prompt_and_persists_only_after_success() {
+    let mut app = AppState::new(2);
+
+    assert_eq!(
+        app.reduce(AppEvent::SubmitPrompt("first".into())),
+        vec![Effect::StartPrompt("first".into())]
+    );
+    assert_eq!(app.runtime(), &Runtime::Running);
+    assert!(app.completed_history().is_empty());
+
+    assert_eq!(
+        app.reduce(AppEvent::TurnCompleted("answer".into())),
+        vec![Effect::PersistCompleted {
+            prompt: "first".into(),
+            output: "answer".into(),
+        }]
+    );
+    assert_eq!(app.runtime(), &Runtime::Idle);
+    assert_eq!(app.completed_history(), [("first".into(), "answer".into())]);
+}
+
+#[test]
+fn reducer_queues_safe_prompts_in_bounded_fifo_order() {
+    let mut app = AppState::new(2);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+
+    assert!(
+        app.reduce(AppEvent::SubmitPrompt("second".into()))
+            .is_empty()
+    );
+    assert!(
+        app.reduce(AppEvent::SubmitPrompt("third".into()))
+            .is_empty()
+    );
+    assert_eq!(app.queued_prompts(), ["second", "third"]);
+
+    assert_eq!(
+        app.reduce(AppEvent::TurnCompleted("one".into())),
+        vec![
+            Effect::PersistCompleted {
+                prompt: "first".into(),
+                output: "one".into(),
+            },
+            Effect::StartPrompt("second".into()),
+        ]
+    );
+    assert_eq!(app.queued_prompts(), ["third"]);
+    assert_eq!(app.runtime(), &Runtime::Running);
+}
+
+#[test]
+fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
+    let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+    app.reduce(AppEvent::SubmitPrompt("queued".into()));
+
+    assert_eq!(
+        app.reduce(AppEvent::SubmitPrompt("refused".into())),
+        vec![Effect::RefusePrompt(
+            "A response is already in progress.".into()
+        )]
+    );
+    assert_eq!(app.queued_prompts(), ["queued"]);
+    assert!(app.completed_history().is_empty());
+}
+
+#[test]
+fn reducer_cancelled_or_failed_turns_do_not_complete_history_or_advance_queue() {
+    let mut app = AppState::new(1);
+    app.reduce(AppEvent::SubmitPrompt("first".into()));
+    app.reduce(AppEvent::SubmitPrompt("queued".into()));
+
+    assert!(app.reduce(AppEvent::TurnCancelled).is_empty());
+    assert_eq!(app.runtime(), &Runtime::Idle);
+    assert_eq!(app.queued_prompts(), ["queued"]);
+    assert!(app.completed_history().is_empty());
+
+    app.reduce(AppEvent::SubmitPrompt("next".into()));
+    assert!(app.reduce(AppEvent::TurnFailed).is_empty());
+    assert!(app.completed_history().is_empty());
 }
 
 #[test]

@@ -1,7 +1,9 @@
 //! Terminal lifecycle and input-event boundary for the interactive surface.
 
+mod app;
 mod bridge;
 
+pub use app::{AppEvent, AppState, Effect, Runtime};
 pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 
 use std::{
