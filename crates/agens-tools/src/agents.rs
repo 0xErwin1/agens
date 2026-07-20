@@ -68,7 +68,7 @@ impl AgentCatalog {
     pub fn subagents(&self) -> impl Iterator<Item = &AgentDefinition> {
         self.agents
             .iter()
-            .filter(|agent| agent.mode == AgentMode::Subagent)
+            .filter(|agent| agent.mode != AgentMode::Primary)
     }
 
     fn insert(&mut self, agent: AgentDefinition, source: PathBuf) -> Option<PathBuf> {

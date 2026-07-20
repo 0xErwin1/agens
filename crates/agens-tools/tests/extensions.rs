@@ -10,7 +10,8 @@ use agens_core::{
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
-    CommandDefinition, DispatchTool, EffectiveCapabilitySet, ToolDispatcher, ToolExecutionContext,
+    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskInvocation,
+    TaskRunner, TaskSkill, TaskTool, TaskTurnRequest, ToolDispatcher, ToolExecutionContext,
     ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
@@ -457,6 +458,94 @@ fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
 }
 
 #[test]
+fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_running() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let skills = temporary.path.join("skills");
+    fs::create_dir_all(&agents).unwrap();
+    fs::create_dir_all(&skills).unwrap();
+    write_agent(&agents, "all", "all agent", "all");
+    write_agent(&agents, "primary", "primary agent", "primary");
+    fs::write(
+        agents.join("missing.md"),
+        "---\nname: missing\ndescription: missing skill\nmode: subagent\nskills:\n  - absent\n---\nmissing instructions\n",
+    )
+    .unwrap();
+    fs::write(
+        agents.join("worker.md"),
+        "---\nname: worker\ndescription: worker agent\nmode: subagent\nmodel: worker-model\nskills:\n  - allowed\n---\nworker instructions\n",
+    )
+    .unwrap();
+    fs::create_dir_all(skills.join("allowed")).unwrap();
+    fs::write(
+        skills.join("allowed/SKILL.md"),
+        "---\nname: allowed\ndescription: allowed skill\n---\nallowed instructions\n",
+    )
+    .unwrap();
+
+    let agent_catalog =
+        AgentCatalog::discover(&[], &agents, &temporary.path.join("missing")).unwrap();
+    let skill_catalog = SkillCatalog::discover(&skills, temporary.path.join("missing")).unwrap();
+    let mut task = TaskTool::from_catalogs(
+        agent_catalog.catalog().clone(),
+        skill_catalog.catalog().clone(),
+        "parent-model",
+        RecordingTaskRunner,
+    );
+    let context = ToolExecutionContext::new(
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::time::Duration::from_secs(1),
+    );
+
+    assert_eq!(agent_catalog.catalog().subagents().count(), 3);
+    assert_eq!(
+        task.permission_target(&serde_json::json!({"description":"default task"}))
+            .unwrap(),
+        "all"
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"worker","description":"inspect the repository"}),
+        )
+        .unwrap(),
+        ToolOutput::success("worker:worker agent:worker-model:allowed:inspect the repository")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"all","description":"use the parent model"}),
+        )
+        .unwrap(),
+        ToolOutput::success("all:all agent:parent-model:none:use the parent model")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"missing","description":"do not run"}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: requested skill is unavailable")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"primary","description":"reject me"}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: requested agent is unavailable")
+    );
+    assert!(
+        TaskInvocation::from_value(serde_json::json!({"description":"x","unexpected":true}))
+            .is_err()
+    );
+    assert_eq!(
+        TaskTool::<RecordingTaskRunner>::input_schema(),
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"description":{"type":"string","minLength":1,"maxLength":16384}}})
+    );
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -666,6 +755,25 @@ struct InertTool;
 impl DispatchTool for InertTool {
     fn execute(&mut self, _: &ToolExecutionContext, _: Value) -> Result<ToolOutput, Error> {
         Ok(ToolOutput::success("unused"))
+    }
+}
+
+struct RecordingTaskRunner;
+
+impl TaskRunner for RecordingTaskRunner {
+    fn run(&mut self, request: TaskTurnRequest) -> Result<ToolOutput, Error> {
+        Ok(ToolOutput::success(format!(
+            "{}:{}:{}:{}:{}",
+            request.agent_name(),
+            request.agent_description(),
+            request.model(),
+            request
+                .skills()
+                .first()
+                .map(TaskSkill::name)
+                .unwrap_or("none"),
+            request.description()
+        )))
     }
 }
 

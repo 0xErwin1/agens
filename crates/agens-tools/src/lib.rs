@@ -32,6 +32,7 @@ mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
 mod stdio_mcp;
+mod task;
 
 pub use agents::{
     AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
@@ -40,6 +41,7 @@ pub use agents::{
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
+pub use task::{TaskInvocation, TaskRunner, TaskSkill, TaskTool, TaskTurnRequest};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
