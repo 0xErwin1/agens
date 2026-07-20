@@ -2769,6 +2769,207 @@ mod tests {
     }
 
     #[test]
+    fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_same_session() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-resumed-headless-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let project_root = temporary.join("project");
+        let config_home = temporary.join("config");
+        let data_directory = temporary.join("data");
+        std::fs::create_dir_all(project_root.join(".git"))
+            .expect("project marker should be created");
+
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock provider should have an address");
+        let worker = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock provider should accept the resumed request");
+            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("request line should be readable");
+            assert_eq!(request_line, "POST /responses HTTP/1.1\r\n");
+
+            let mut content_length = None;
+            loop {
+                let mut header = String::new();
+                reader
+                    .read_line(&mut header)
+                    .expect("request header should be readable");
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.strip_prefix("content-length: ") {
+                    content_length = Some(
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("content length should be numeric"),
+                    );
+                }
+            }
+
+            let mut body =
+                vec![0_u8; content_length.expect("request should include content length")];
+            std::io::Read::read_exact(&mut reader, &mut body)
+                .expect("request body should be readable");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"second answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                .expect("mock response should be written");
+
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("resumed provider request should be valid JSON")
+        });
+
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([
+                (
+                    "AGENS_CONFIG_HOME".to_owned(),
+                    config_home.display().to_string(),
+                ),
+                ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+            ]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            )]),
+        );
+        let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+        let initial_messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("first input".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("first reasoning".into()),
+                    MessagePart::ToolCall {
+                        id: "call-history".into(),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    },
+                    MessagePart::Text("calling the tool".into()),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-history".into(),
+                    content: "file contents".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let initial_turn = CompletedSessionTurn::new(
+            initial_messages
+                .clone()
+                .into_iter()
+                .map(SessionMessage::try_from)
+                .collect::<Result<_, _>>()
+                .expect("typed history should be a valid completed turn"),
+        )
+        .expect("typed history should be a valid completed turn");
+        let metadata = SessionMetadata {
+            id: 0,
+            project: project_root.display().to_string(),
+            title: "first input".into(),
+            active_agent: "reviewer".into(),
+            created_at: 10,
+            updated_at: 10,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        SessionStore::open(&data_directory)
+            .expect("session store should open")
+            .persist_completed_session_turn(&metadata, &initial_turn)
+            .expect("normalized session should persist");
+
+        let request = resume_tui_session(&bootstrap, 1)
+            .expect("normalized session should resume")
+            .apply_to(HeadlessChatRequest {
+                prompt: "second input".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                session: None,
+            });
+        let completion = run_production_headless_chat_with_progress(
+            request,
+            &bootstrap,
+            &HeadlessTurnCancellation::new(),
+            None,
+        )
+        .expect("resumed production turn should complete");
+        let provider_request = worker.join().expect("mock provider should finish");
+        let reopened = SessionStore::open(&data_directory)
+            .expect("session store should reopen")
+            .load_session_for_resume(1)
+            .expect("same session should remain resumable");
+
+        assert_eq!(completion.metadata.id, 1);
+        assert_eq!(
+            provider_request["input"],
+            serde_json::json!([
+                {"role": "user", "content": [{"type": "input_text", "text": "first input"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first reasoning"}]},
+                {"type": "function_call", "call_id": "call-history", "name": "native::read", "arguments": "{\"path\":\"notes.md\"}"},
+                {"role": "assistant", "content": [{"type": "output_text", "text": "calling the tool"}]},
+                {"type": "function_call_output", "call_id": "call-history", "output": "file contents"},
+                {"role": "user", "content": [{"type": "input_text", "text": "second input"}]},
+            ])
+        );
+        assert_eq!(reopened.metadata.id, 1);
+        assert_eq!(reopened.metadata.active_agent, "reviewer");
+        assert_eq!(reopened.metadata.completed_turn_count, 2);
+        assert_eq!(
+            reopened
+                .messages
+                .iter()
+                .map(|message| message.role)
+                .collect::<Vec<_>>(),
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::Tool,
+                Role::User,
+                Role::Assistant
+            ]
+        );
+        assert_eq!(reopened.messages[..3], initial_messages);
+        assert_eq!(
+            reopened.messages[3].parts,
+            vec![MessagePart::Text("second input".into())]
+        );
+        assert_eq!(
+            reopened.messages[4].parts,
+            vec![MessagePart::Text("second answer".into())]
+        );
+
+        std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
+    }
+
+    #[test]
     fn fresh_tui_session_does_not_reuse_prior_context() {
         let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
             prompt: "new question".into(),
