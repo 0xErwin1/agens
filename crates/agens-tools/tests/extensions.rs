@@ -458,7 +458,7 @@ fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
 }
 
 #[test]
-fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_running() {
+fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration() {
     let temporary = TemporaryDirectory::new();
     let agents = temporary.path.join("agents");
     let skills = temporary.path.join("skills");
@@ -467,8 +467,8 @@ fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_runn
     write_agent(&agents, "all", "all agent", "all");
     write_agent(&agents, "primary", "primary agent", "primary");
     fs::write(
-        agents.join("missing.md"),
-        "---\nname: missing\ndescription: missing skill\nmode: subagent\nskills:\n  - absent\n---\nmissing instructions\n",
+        agents.join("zmissing.md"),
+        "---\nname: zmissing\ndescription: missing skill\nmode: subagent\nskills:\n  - absent\n---\nmissing instructions\n",
     )
     .unwrap();
     fs::write(
@@ -476,6 +476,7 @@ fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_runn
         "---\nname: worker\ndescription: worker agent\nmode: subagent\nmodel: worker-model\nskills:\n  - allowed\n---\nworker instructions\n",
     )
     .unwrap();
+    write_agent(&agents, "zfallback", "fallback agent", "subagent");
     fs::create_dir_all(skills.join("allowed")).unwrap();
     fs::write(
         skills.join("allowed/SKILL.md"),
@@ -486,10 +487,11 @@ fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_runn
     let agent_catalog =
         AgentCatalog::discover(&[], &agents, &temporary.path.join("missing")).unwrap();
     let skill_catalog = SkillCatalog::discover(&skills, temporary.path.join("missing")).unwrap();
-    let mut task = TaskTool::from_catalogs(
+    let mut task = TaskTool::from_catalogs_with_model_validator(
         agent_catalog.catalog().clone(),
         skill_catalog.catalog().clone(),
         "parent-model",
+        TaskModels,
         RecordingTaskRunner,
     );
     let context = ToolExecutionContext::new(
@@ -497,35 +499,51 @@ fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_runn
         std::time::Duration::from_secs(1),
     );
 
-    assert_eq!(agent_catalog.catalog().subagents().count(), 3);
+    assert_eq!(agent_catalog.catalog().subagents().count(), 4);
     assert_eq!(
         task.permission_target(&serde_json::json!({"description":"default task"}))
             .unwrap(),
-        "all"
+        "worker"
     );
     assert_eq!(
         task.execute(
             &context,
-            serde_json::json!({"agent":"worker","description":"inspect the repository"}),
+            serde_json::json!({"agent":"worker","model":"override-model","skills":["allowed"],"description":"inspect the repository"}),
         )
         .unwrap(),
-        ToolOutput::success("worker:worker agent:worker-model:allowed:inspect the repository")
+        ToolOutput::success("worker:worker agent:override-model:allowed:inspect the repository")
     );
     assert_eq!(
         task.execute(
             &context,
-            serde_json::json!({"agent":"all","description":"use the parent model"}),
+            serde_json::json!({"agent":"worker","description":"load agent defaults"}),
         )
         .unwrap(),
-        ToolOutput::success("all:all agent:parent-model:none:use the parent model")
+        ToolOutput::success("worker:worker agent:worker-model:allowed:load agent defaults")
     );
     assert_eq!(
         task.execute(
             &context,
-            serde_json::json!({"agent":"missing","description":"do not run"}),
+            serde_json::json!({"agent":"all","description":"reject all"}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: requested agent is unavailable")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"zmissing","description":"do not run"}),
         )
         .unwrap(),
         ToolOutput::failure("task: requested skill is unavailable")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"zfallback","description":"use parent defaults"}),
+        )
+        .unwrap(),
+        ToolOutput::success("zfallback:fallback agent:parent-model:none:use parent defaults")
     );
     assert_eq!(
         task.execute(
@@ -535,13 +553,29 @@ fn task_dispatch_resolves_eligible_agents_models_and_declared_skills_before_runn
         .unwrap(),
         ToolOutput::failure("task: requested agent is unavailable")
     );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"worker","model":"unavailable","description":"reject model"}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: requested model is unavailable")
+    );
+    assert_eq!(
+        task.execute(
+            &context,
+            serde_json::json!({"agent":"worker","skills":["unavailable"],"description":"reject skill"}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: requested skill is unavailable")
+    );
     assert!(
         TaskInvocation::from_value(serde_json::json!({"description":"x","unexpected":true}))
             .is_err()
     );
     assert_eq!(
         TaskTool::<RecordingTaskRunner>::input_schema(),
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"description":{"type":"string","minLength":1,"maxLength":16384}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     );
 }
 
@@ -745,6 +779,16 @@ struct SupportedModels;
 impl AgentModelValidator for SupportedModels {
     fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError> {
         (model == "supported")
+            .then_some(())
+            .ok_or(AgentModelValidationError::Unavailable)
+    }
+}
+
+struct TaskModels;
+
+impl AgentModelValidator for TaskModels {
+    fn validate_model(&self, model: &str) -> Result<(), AgentModelValidationError> {
+        matches!(model, "parent-model" | "worker-model" | "override-model")
             .then_some(())
             .ok_or(AgentModelValidationError::Unavailable)
     }
