@@ -496,3 +496,31 @@ impl Drop for TaskPermit {
         self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_worker_without_publication_cancels_and_cannot_publish_late_value() {
+        let publication = AtomicU8::new(OPEN);
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || drop(sender)).join().unwrap();
+
+        assert_eq!(
+            receiver.recv_timeout(TASK_RESULT_POLL_INTERVAL),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+
+        assert_eq!(
+            finish_task_call(
+                &publication,
+                &receiver,
+                ToolOutput::failure("task: child execution failed"),
+            ),
+            ToolOutput::failure("task: child execution failed")
+        );
+        assert_eq!(publication.load(Ordering::Acquire), CANCELLED);
+        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+    }
+}

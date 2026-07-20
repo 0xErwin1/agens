@@ -724,6 +724,33 @@ fn task_rejects_an_oversized_unicode_result() {
 }
 
 #[test]
+fn task_description_limit_counts_unicode_scalars_not_bytes() {
+    let accepted = "😀".repeat(16_384);
+    assert!(accepted.len() > 16_384);
+
+    let mut task = task_tool(TerminalTaskRunner::Success);
+    assert_eq!(
+        task.execute(
+            &task_context(),
+            serde_json::json!({"description": accepted}),
+        )
+        .unwrap(),
+        ToolOutput::success("done")
+    );
+
+    let rejected = "😀".repeat(16_385);
+    assert!(rejected.len() > 16_385);
+    assert_eq!(
+        task.execute(
+            &task_context(),
+            serde_json::json!({"description": rejected}),
+        )
+        .unwrap(),
+        ToolOutput::failure("task: input exceeds configured bounds")
+    );
+}
+
+#[test]
 fn task_reports_exact_terminal_taxonomy_without_runner_details() {
     for (runner, expected) in [
         (
