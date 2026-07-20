@@ -4,7 +4,7 @@ mod app;
 mod bridge;
 mod terminal;
 
-pub use app::{AppEvent, AppState, Effect, Runtime};
+pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,

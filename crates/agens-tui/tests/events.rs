@@ -1,7 +1,7 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
-    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Effect, Engine, Event, Key, PublishOutcome,
-    RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
+    Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Dialog, Effect, Engine, Event,
+    Key, PublishOutcome, RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -106,6 +106,125 @@ fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submiss
         assert_eq!(app.queued_prompts(), ["next"]);
         assert!(app.completed_history().is_empty());
     }
+}
+
+#[test]
+fn command_dialog_precedence_consumes_keys_before_global_and_composer_handling() {
+    let mut app = AppState::new(1);
+    app.set_composer("draft");
+    app.set_dialog(Some(Dialog::Command));
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, Instant::now())),
+        vec![Effect::DialogCommand(Command::ControlC)]
+    );
+    assert_eq!(app.composer(), "draft");
+    assert_eq!(app.dialog(), Some(&Dialog::Command));
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::Escape, Instant::now())),
+        vec![Effect::Render]
+    );
+    assert_eq!(app.dialog(), None);
+}
+
+#[test]
+fn command_control_c_follows_running_composer_warning_exit_and_disarm_states() {
+    let mut app = AppState::new(1);
+    let now = Instant::now();
+    app.reduce(AppEvent::SubmitPrompt("running".into()));
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::CancelTurn]
+    );
+    app.reduce(AppEvent::TurnCancelled);
+    app.set_composer("draft");
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::Render]
+    );
+    assert_eq!(app.composer(), "");
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::ExitWarning]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::Navigate, now)),
+        vec![Effect::Render]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::ExitWarning]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(
+            Command::ControlC,
+            now + Duration::from_secs(1)
+        )),
+        vec![Effect::Quit]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(
+            Command::ControlC,
+            now + Duration::from_secs(3)
+        )),
+        vec![Effect::ExitWarning]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::TimerTick(now + Duration::from_secs(6))),
+        vec![Effect::Render]
+    );
+    assert_eq!(
+        app.reduce(AppEvent::Command(
+            Command::ControlC,
+            now + Duration::from_secs(6)
+        )),
+        vec![Effect::ExitWarning]
+    );
+}
+
+#[test]
+fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_mutations() {
+    let mut app = AppState::new(1);
+    let now = Instant::now();
+    let backend = TestBackend::new(80, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    app.set_composer("draft");
+    assert_eq!(
+        app.reduce(AppEvent::Command(Command::New, now)),
+        vec![Effect::ResetConversation]
+    );
+    assert_eq!(app.composer(), "draft");
+    assert_eq!(app.reduce(AppEvent::ResetSucceeded), vec![Effect::Render]);
+    assert_eq!(app.composer(), "");
+
+    app.reduce(AppEvent::SubmitPrompt("running".into()));
+    for command in [
+        Command::Navigate,
+        Command::Display,
+        Command::Select,
+        Command::Queue,
+    ] {
+        assert_eq!(
+            app.reduce(AppEvent::Command(command, now)),
+            vec![Effect::Render]
+        );
+    }
+    for command in [
+        Command::Model,
+        Command::Effort,
+        Command::Session,
+        Command::Agent,
+        Command::New,
+    ] {
+        assert_eq!(
+            app.reduce(AppEvent::Command(command, now)),
+            vec![Effect::RefuseCommand(
+                "This command is unavailable while a response is in progress.".into()
+            )]
+        );
+    }
+    assert_eq!(app.runtime(), &Runtime::Running);
+    assert_eq!(app.composer(), "");
+    assert_eq!(terminal.backend().buffer().area.width, 80);
 }
 
 #[test]
