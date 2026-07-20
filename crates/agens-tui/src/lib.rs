@@ -2,9 +2,14 @@
 
 mod app;
 mod bridge;
+mod terminal;
 
 pub use app::{AppEvent, AppState, Effect, Runtime};
 pub use bridge::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
+pub use terminal::{
+    PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
+    teardown,
+};
 
 use std::{
     io::{self, Stdout, Write},
@@ -15,9 +20,12 @@ use std::{
 
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
+        KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self as crossterm_terminal, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     Terminal as RatatuiTerminal,
@@ -772,25 +780,18 @@ where
 
 /// Owns raw-mode and alternate-screen restoration for an interactive terminal session.
 pub struct Terminal {
-    stdout: Stdout,
-    active: bool,
+    control: CrosstermControl,
+    guard: TerminalModeGuard,
 }
 
 impl Terminal {
-    /// Enters raw mode and the alternate screen, restoring raw mode if setup fails.
+    /// Enters the terminal modes required by the TUI.
     pub fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-            let _ = terminal::disable_raw_mode();
-            return Err(error);
-        }
-
-        Ok(Self {
-            stdout,
-            active: true,
-        })
+        let mut control = CrosstermControl {
+            stdout: io::stdout(),
+        };
+        let guard = TerminalModeGuard::enter(&mut control)?;
+        Ok(Self { control, guard })
     }
 
     /// Waits up to `timeout` for a terminal event relevant to the TUI engine.
@@ -804,15 +805,30 @@ impl Terminal {
 
     /// Restores the main screen and normal terminal mode. It is safe to call repeatedly.
     pub fn restore(&mut self) -> io::Result<()> {
-        if !self.active {
-            return Ok(());
+        self.guard.restore(&mut self.control)
+    }
+}
+
+struct CrosstermControl {
+    stdout: Stdout,
+}
+
+impl TerminalControl for CrosstermControl {
+    fn apply(&mut self, operation: TerminalOperation) -> io::Result<()> {
+        match operation {
+            TerminalOperation::EnableRaw => crossterm_terminal::enable_raw_mode(),
+            TerminalOperation::DisableRaw => crossterm_terminal::disable_raw_mode(),
+            TerminalOperation::EnterAlternate => {
+                execute!(self.stdout, EnterAlternateScreen).map(|_| ())
+            }
+            TerminalOperation::LeaveAlternate => {
+                execute!(self.stdout, LeaveAlternateScreen).map(|_| ())
+            }
+            TerminalOperation::EnableMouse => execute!(self.stdout, EnableMouseCapture).map(|_| ()),
+            TerminalOperation::DisableMouse => {
+                execute!(self.stdout, DisableMouseCapture).map(|_| ())
+            }
         }
-
-        self.active = false;
-        let leave_result = execute!(self.stdout, LeaveAlternateScreen);
-        let raw_mode_result = terminal::disable_raw_mode();
-
-        leave_result.and(raw_mode_result)
     }
 }
 
