@@ -67,7 +67,7 @@ impl AppState {
             AppEvent::TurnCancelled | AppEvent::TurnFailed => {
                 self.runtime = Runtime::Idle;
                 self.active_prompt = None;
-                Vec::new()
+                self.begin_next_queued_turn().into_iter().collect()
             }
         }
     }
@@ -114,12 +114,19 @@ impl AppState {
         self.runtime = Runtime::Idle;
         let mut effects = vec![Effect::PersistCompleted { prompt, output }];
 
-        if let Some(next_prompt) = self.queued_prompts.pop_front() {
-            self.active_prompt = Some(next_prompt.clone());
-            self.runtime = Runtime::Running;
-            effects.push(Effect::StartPrompt(next_prompt));
+        if let Some(effect) = self.begin_next_queued_turn() {
+            effects.push(effect);
         }
 
         effects
+    }
+
+    fn begin_next_queued_turn(&mut self) -> Option<Effect> {
+        let next_prompt = self.queued_prompts.pop_front()?;
+
+        self.active_prompt = Some(next_prompt.clone());
+        self.runtime = Runtime::Running;
+
+        Some(Effect::StartPrompt(next_prompt))
     }
 }

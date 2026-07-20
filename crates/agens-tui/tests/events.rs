@@ -88,19 +88,24 @@ fn reducer_refuses_prompt_when_running_queue_is_full_without_history() {
 }
 
 #[test]
-fn reducer_cancelled_or_failed_turns_do_not_complete_history_or_advance_queue() {
-    let mut app = AppState::new(1);
-    app.reduce(AppEvent::SubmitPrompt("first".into()));
-    app.reduce(AppEvent::SubmitPrompt("queued".into()));
+fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submissions() {
+    for terminal_event in [AppEvent::TurnCancelled, AppEvent::TurnFailed] {
+        let mut app = AppState::new(2);
+        app.reduce(AppEvent::SubmitPrompt("first".into()));
+        app.reduce(AppEvent::SubmitPrompt("queued".into()));
 
-    assert!(app.reduce(AppEvent::TurnCancelled).is_empty());
-    assert_eq!(app.runtime(), &Runtime::Idle);
-    assert_eq!(app.queued_prompts(), ["queued"]);
-    assert!(app.completed_history().is_empty());
+        assert_eq!(
+            app.reduce(terminal_event),
+            vec![Effect::StartPrompt("queued".into())]
+        );
+        assert_eq!(app.runtime(), &Runtime::Running);
+        assert!(app.queued_prompts().is_empty());
+        assert!(app.completed_history().is_empty());
 
-    app.reduce(AppEvent::SubmitPrompt("next".into()));
-    assert!(app.reduce(AppEvent::TurnFailed).is_empty());
-    assert!(app.completed_history().is_empty());
+        assert!(app.reduce(AppEvent::SubmitPrompt("next".into())).is_empty());
+        assert_eq!(app.queued_prompts(), ["next"]);
+        assert!(app.completed_history().is_empty());
+    }
 }
 
 #[test]
