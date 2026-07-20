@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use agens_core::{MessagePart, TurnEvent, Usage};
 use agens_tui::{
-    ConversationEvent, DiffLine, DiffLineKind, Engine, Event, Key, PaletteEntry, PaletteEntryKind,
-    RatatuiRenderer, Renderer, ToolResultState, Tui, TuiRuntimeEvent,
+    ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
+    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
+    TuiRuntimeEvent,
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -258,6 +259,36 @@ fn renderer_clips_a_generic_dialog_inside_the_viewport() {
 
     assert!(text.contains("Details"), "{text:?}");
     assert!(text.contains("bounded dialog body"), "{text:?}");
+}
+
+#[test]
+fn renderer_clips_selection_help_options_current_and_disabled_states_after_resize() {
+    let backend = TestBackend::new(28, 8);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose a model",
+        Some("Up/Down navigate, Enter selects, Esc cancels"),
+        vec![
+            DialogEntry::action("gpt-4.1 (current)", "model:gpt-4.1"),
+            DialogEntry::disabled("future-model", "Unavailable"),
+            DialogEntry::action("o3", "model:o3"),
+        ],
+    ));
+
+    tui.handle(Event::Resize {
+        width: 28,
+        height: 8,
+    });
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("Choose a model"), "{text:?}");
+    assert!(text.contains("gpt-4.1 (current)"), "{text:?}");
+    assert!(text.contains("future-model"), "{text:?}");
+    assert!(text.contains("disabled"), "{text:?}");
+    assert!(!text.contains("model:gpt-4.1"), "{text:?}");
 }
 
 #[test]

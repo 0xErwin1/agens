@@ -94,6 +94,8 @@ pub enum Action {
     Render,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Dispatch the selected dialog action through the composition layer.
+    DialogAction(String),
     /// An active engine turn was asked to cancel.
     Cancel,
     /// End the terminal event loop.
@@ -280,11 +282,86 @@ pub struct PaletteView<'a> {
     selected: usize,
 }
 
-/// Generic bounded dialog state for interactive surfaces that are introduced later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DialogEntryAction {
+    Dispatch(String),
+    Cancel,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogEntry {
+    label: String,
+    detail: Option<String>,
+    action: Option<DialogEntryAction>,
+}
+
+impl DialogEntry {
+    pub fn action(label: impl AsRef<str>, action_id: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: None,
+            action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
+                action_id.as_ref(),
+                128,
+            ))),
+        }
+    }
+
+    pub fn cancel(label: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: None,
+            action: Some(DialogEntryAction::Cancel),
+        }
+    }
+
+    pub fn disabled(label: impl AsRef<str>, detail: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
+            action: None,
+        }
+    }
+}
+
+/// Generic bounded dialog state for informational, selection, and confirmation overlays.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DialogView {
     title: String,
-    body: String,
+    help: Option<String>,
+    entries: Vec<DialogEntry>,
+    selected: usize,
+    interactive: bool,
+}
+
+impl DialogView {
+    pub fn selection<H>(title: impl AsRef<str>, help: Option<H>, entries: Vec<DialogEntry>) -> Self
+    where
+        H: AsRef<str>,
+    {
+        let entries = entries.into_iter().take(64).collect::<Vec<_>>();
+        let selected = entries
+            .iter()
+            .position(|entry| entry.action.is_some())
+            .unwrap_or_default();
+        Self {
+            title: bounded_dialog_text(title.as_ref(), 64),
+            help: help.map(|help| bounded_dialog_text(help.as_ref(), 2_048)),
+            entries,
+            selected,
+            interactive: true,
+        }
+    }
+
+    fn informational(title: impl AsRef<str>, body: impl AsRef<str>) -> Self {
+        Self {
+            title: bounded_dialog_text(title.as_ref(), 64),
+            help: Some(bounded_dialog_text(body.as_ref(), 2_048)),
+            entries: Vec::new(),
+            selected: 0,
+            interactive: false,
+        }
+    }
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -502,7 +579,13 @@ fn render_palette(
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
     let width = area.width.saturating_sub(4).clamp(1, 64);
-    let height = area.height.saturating_sub(4).clamp(1, 8);
+    let content_rows = usize::from(dialog.help.is_some())
+        .saturating_add(dialog.entries.len().max(1))
+        .saturating_add(2) as u16;
+    let height = content_rows
+        .min(12)
+        .min(area.height.saturating_sub(2))
+        .max(1);
     let dialog_area = Rect::new(
         area.x.saturating_add(area.width.saturating_sub(width) / 2),
         area.y
@@ -512,21 +595,51 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
     );
 
     frame.render_widget(Clear, dialog_area);
+    let mut lines: Vec<Line<'_>> = dialog
+        .help
+        .as_deref()
+        .map(|help| {
+            if dialog.entries.is_empty() {
+                help.lines().map(Line::from).collect()
+            } else {
+                help.lines().next().map(Line::from).into_iter().collect()
+            }
+        })
+        .unwrap_or_default();
+    if dialog.entries.is_empty() && dialog.help.is_none() {
+        lines.push(Line::from("No options available."));
+    }
+    lines.extend(dialog.entries.iter().enumerate().map(|(index, entry)| {
+        let selected = dialog.interactive && index == dialog.selected;
+        let text = match (&entry.action, &entry.detail) {
+            (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
+            (None, None) => format!("disabled {}", entry.label),
+            _ if selected => format!("> {}", entry.label),
+            _ => format!("  {}", entry.label),
+        };
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else if entry.action.is_none() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        Line::styled(text, style)
+    }));
+
     frame.render_widget(
-        Paragraph::new(dialog.body.as_str())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
-                    .title(Span::styled(
-                        format!(" {} ", dialog.title),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(lines)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(Span::styled(
+                    format!(" {} ", dialog.title),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        ),
         dialog_area,
     );
 }
@@ -979,10 +1092,12 @@ where
         match self.dialog.as_mut() {
             Some(dialog)
                 if dialog.title == "Extension diagnostics"
-                    && dialog.body.lines().count() < MAX_DIAGNOSTICS =>
+                    && dialog.help.as_deref().unwrap_or_default().lines().count()
+                        < MAX_DIAGNOSTICS =>
             {
-                dialog.body.push('\n');
-                dialog.body.push_str(&text);
+                let help = dialog.help.get_or_insert_default();
+                help.push('\n');
+                help.push_str(&text);
             }
             Some(dialog) if dialog.title == "Extension diagnostics" => {}
             _ => self.show_dialog("Extension diagnostics", text),
@@ -1100,10 +1215,13 @@ where
 
     /// Opens a generic bounded dialog without changing the underlying conversation.
     pub fn show_dialog(&mut self, title: impl Into<String>, body: impl Into<String>) {
-        self.dialog = Some(DialogView {
-            title: title.into(),
-            body: body.into(),
-        });
+        self.dialog = Some(DialogView::informational(title.into(), body.into()));
+    }
+
+    pub fn show_selection_dialog(&mut self, dialog: DialogView) {
+        self.palette_open = false;
+        self.quit_armed = false;
+        self.dialog = Some(dialog);
     }
 
     pub fn runtime_events(&self) -> &[TuiRuntimeEvent] {
@@ -1212,6 +1330,14 @@ where
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
             self.quit_armed = false;
+        }
+
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.interactive)
+        {
+            return self.handle_selection_dialog_key(key);
         }
 
         match key {
@@ -1358,6 +1484,55 @@ where
         Action::Cancel
     }
 
+    fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
+        match key {
+            Key::Up | Key::Down => {
+                let Some(dialog) = self.dialog.as_mut() else {
+                    return Action::Render;
+                };
+                let enabled = dialog
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| entry.action.as_ref().map(|_| index))
+                    .collect::<Vec<_>>();
+                if let Some(position) = enabled.iter().position(|index| *index == dialog.selected) {
+                    let next = if key == Key::Up {
+                        (position + enabled.len() - 1) % enabled.len()
+                    } else {
+                        (position + 1) % enabled.len()
+                    };
+                    dialog.selected = enabled[next];
+                }
+                Action::Render
+            }
+            Key::Enter => {
+                let action = self.dialog.as_ref().and_then(|dialog| {
+                    dialog
+                        .entries
+                        .get(dialog.selected)
+                        .and_then(|entry| entry.action.clone())
+                });
+                match action {
+                    Some(DialogEntryAction::Dispatch(action_id)) => {
+                        self.dialog = None;
+                        Action::DialogAction(action_id)
+                    }
+                    Some(DialogEntryAction::Cancel) => {
+                        self.dialog = None;
+                        Action::Render
+                    }
+                    None => Action::Render,
+                }
+            }
+            Key::Escape | Key::CtrlC => {
+                self.dialog = None;
+                Action::Render
+            }
+            _ => Action::Render,
+        }
+    }
+
     fn clamp_palette_selection(&mut self) {
         if !self.palette_open {
             return;
@@ -1465,6 +1640,10 @@ fn palette_matches<'a>(entries: &'a [PaletteEntry], input: &str) -> Vec<&'a Pale
 }
 
 fn bounded_auth_text(value: &str, limit: usize) -> String {
+    bounded_dialog_text(value, limit)
+}
+
+fn bounded_dialog_text(value: &str, limit: usize) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
@@ -1570,7 +1749,9 @@ where
 
         match tui.handle(event) {
             Action::Quit => return Ok(()),
-            Action::Render | Action::Submit(_) | Action::Cancel => renderer.render(tui.view())?,
+            Action::Render | Action::Submit(_) | Action::DialogAction(_) | Action::Cancel => {
+                renderer.render(tui.view())?
+            }
         }
     }
 }
@@ -1608,7 +1789,9 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render | Action::Cancel => renderer.render(tui.view())?,
+            Action::Render | Action::DialogAction(_) | Action::Cancel => {
+                renderer.render(tui.view())?
+            }
         }
     }
 }
@@ -1703,7 +1886,7 @@ where
                     let _ = route_sender.send(outcome);
                 });
             }
-            Action::Render | Action::Cancel => {}
+            Action::Render | Action::DialogAction(_) | Action::Cancel => {}
         }
     }
 }

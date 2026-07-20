@@ -1,9 +1,10 @@
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
-    ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PaletteEntry,
-    PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui,
-    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
+    ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
+    Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
+    TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
+    TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -562,6 +563,85 @@ fn slash_palette_uses_only_the_name_prefix_and_escape_preserves_composer_and_bac
     assert_eq!(tui.input(), "");
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+}
+
+#[test]
+fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Key(Key::Char('d')));
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        Some("Pick one option"),
+        vec![
+            DialogEntry::action("First", "first"),
+            DialogEntry::action("Second", "second"),
+        ],
+    ));
+
+    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    assert_eq!(tui.input(), "d");
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("second".into())
+    );
+    assert!(tui.view().dialog.is_none());
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("d".into())
+    );
+    assert_eq!(tui.engine().cancellations, 0);
+}
+
+#[test]
+fn selection_dialog_escape_control_c_empty_and_disabled_states_never_dispatch() {
+    for cancel_key in [Key::Escape, Key::CtrlC] {
+        let mut tui = Tui::new(FakeEngine::default());
+        tui.show_selection_dialog(DialogView::selection(
+            "Confirm",
+            None::<String>,
+            vec![DialogEntry::action("Proceed", "proceed")],
+        ));
+
+        assert_eq!(tui.handle(Event::Key(cancel_key)), Action::Render);
+        assert!(tui.view().dialog.is_none());
+        assert_eq!(tui.engine().cancellations, 0);
+    }
+
+    for entries in [
+        Vec::new(),
+        vec![DialogEntry::disabled("Unavailable", "Not configured")],
+    ] {
+        let mut tui = Tui::new(FakeEngine::default());
+        tui.show_selection_dialog(DialogView::selection(
+            "Empty",
+            Some("Nothing can be selected"),
+            entries,
+        ));
+
+        assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+        assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+        assert!(tui.view().dialog.is_some());
+        assert_eq!(tui.engine().cancellations, 0);
+    }
+}
+
+#[test]
+fn selection_dialog_cancel_entry_closes_without_dispatch_or_backend_mutation() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(DialogView::selection(
+        "Disconnect",
+        None::<String>,
+        vec![
+            DialogEntry::action("Disconnect", "disconnect"),
+            DialogEntry::cancel("Cancel"),
+        ],
+    ));
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert!(tui.view().dialog.is_none());
+    assert_eq!(tui.engine().cancellations, 0);
 }
 
 #[test]
