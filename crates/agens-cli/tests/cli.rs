@@ -470,7 +470,7 @@ fn auth_login_selects_browser_or_device_flow_and_uses_the_compatible_credentials
     )
     .with_auth_login({
         let selected_flows = std::sync::Arc::clone(&selected_flows);
-        move |path, device_auth| {
+        move |path, device_auth, _| {
             selected_flows
                 .lock()
                 .expect("flow recording lock should be available")
@@ -493,6 +493,29 @@ fn auth_login_selects_browser_or_device_flow_and_uses_the_compatible_credentials
             .expect("flow recording lock should be available"),
         vec![false, true]
     );
+}
+
+#[test]
+fn auth_login_stops_before_start_for_command_cancellation_or_timeout() {
+    let dependencies = CliDependencies::for_test(
+        PathBuf::from("/project"),
+        Some(PathBuf::from("/home/user")),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    )
+    .with_auth_login(|_, _, _| panic!("a stopped login must not reach the provider"));
+    let cancelled = HeadlessTurnCancellation::new();
+    cancelled.cancel();
+    let expired = HeadlessTurnCancellation::with_deadline(Duration::ZERO);
+
+    for (cancellation, expected) in [
+        (cancelled, "error: auth: ChatGPT login was cancelled\n"),
+        (expired, "error: auth: ChatGPT login timed out\n"),
+    ] {
+        let result = execute_with_cancellation(["auth", "login"], &dependencies, &cancellation);
+        assert_eq!(result.status, ExitStatus::Authentication);
+        assert_eq!(result.stderr, expected);
+    }
 }
 
 #[test]

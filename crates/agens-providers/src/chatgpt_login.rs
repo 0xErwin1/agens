@@ -97,6 +97,9 @@ impl std::fmt::Debug for ChatGptCredentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginError {
     Authentication(&'static str),
+    TokenTransport,
+    TokenStatus,
+    TokenFormat,
     Account,
     Expiry,
     Cancelled,
@@ -109,6 +112,9 @@ impl std::fmt::Display for LoginError {
             Self::Authentication(message) => {
                 return write!(formatter, "ChatGPT authentication required: {message}");
             }
+            Self::TokenTransport => "ChatGPT token request failed; check the network and retry",
+            Self::TokenStatus => "ChatGPT token request was rejected; retry authentication",
+            Self::TokenFormat => "ChatGPT token response was invalid; retry authentication",
             Self::Account => "ChatGPT account ID was missing; retry authentication",
             Self::Expiry => "ChatGPT token expiry was invalid; retry authentication",
             Self::Cancelled => "ChatGPT login was cancelled",
@@ -119,6 +125,30 @@ impl std::fmt::Display for LoginError {
 }
 
 impl std::error::Error for LoginError {}
+
+impl LoginError {
+    pub fn stage_message(&self) -> &'static str {
+        match self {
+            Self::Authentication("authorization was denied") => {
+                "ChatGPT authorization was denied; retry and approve access"
+            }
+            Self::Authentication(
+                "callback request is invalid"
+                | "callback state did not match"
+                | "callback code is missing"
+                | "loopback callback failed",
+            ) => "ChatGPT login callback failed; retry authentication",
+            Self::Authentication(_) => "ChatGPT login setup failed; retry authentication",
+            Self::TokenTransport => "ChatGPT token request failed; check the network and retry",
+            Self::TokenStatus => "ChatGPT token request was rejected; retry authentication",
+            Self::TokenFormat => "ChatGPT token response was invalid; retry authentication",
+            Self::Account => "ChatGPT account ID was missing; retry authentication",
+            Self::Expiry => "ChatGPT token expiry was invalid; retry authentication",
+            Self::Cancelled => "ChatGPT login was cancelled",
+            Self::TimedOut => "ChatGPT login timed out",
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct LoginCancellation {
@@ -132,6 +162,10 @@ impl LoginCancellation {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn from_shared_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self { cancelled }
     }
 
     fn is_cancelled(&self) -> bool {
@@ -264,6 +298,8 @@ pub fn login(
     options: ChatGptLoginOptions,
     cancellation: LoginCancellation,
 ) -> Result<ChatGptCredentials, LoginError> {
+    let deadline = Instant::now() + options.timeout.min(LOGIN_TIMEOUT);
+    check_login_stop(&cancellation, deadline)?;
     let pkce = generate_pkce(options.random_bytes.as_ref())?;
     let state = generate_state(options.random_bytes.as_ref())?;
     let listener = bind_candidate_port(&options.callback_ports, options.bind_port.as_ref())?;
@@ -284,12 +320,14 @@ pub fn login(
     (options.publish_url)(authorization_url.as_str());
     let _ = (options.open_browser)(authorization_url.as_str());
 
-    let code = wait_for_callback(listener, &state, options.timeout, &cancellation)?;
-    exchange_code(
+    let code = wait_for_callback(listener, &state, deadline, &cancellation)?;
+    exchange_code_cancellable(
         &options.token_endpoint,
         &code,
         &redirect_uri,
         &pkce.verifier,
+        &cancellation,
+        deadline,
         options.now,
     )
 }
@@ -534,20 +572,14 @@ fn bind_candidate_port(
 fn wait_for_callback(
     listener: TcpListener,
     state: &str,
-    timeout: Duration,
+    deadline: Instant,
     cancellation: &LoginCancellation,
 ) -> Result<String, LoginError> {
     listener
         .set_nonblocking(true)
         .map_err(|_| LoginError::Authentication("loopback callback is unavailable"))?;
-    let started = Instant::now();
     loop {
-        if cancellation.is_cancelled() {
-            return Err(LoginError::Cancelled);
-        }
-        if started.elapsed() >= timeout {
-            return Err(LoginError::TimedOut);
-        }
+        check_login_stop(cancellation, deadline)?;
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream
@@ -557,7 +589,7 @@ fn wait_for_callback(
                     &mut stream,
                     state,
                     listener.local_addr().ok(),
-                    started + timeout,
+                    deadline,
                     cancellation,
                 ) {
                     return result;
@@ -818,34 +850,6 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-fn exchange_code(
-    token_endpoint: &str,
-    code: &str,
-    redirect_uri: &str,
-    verifier: &str,
-    now: Clock,
-) -> Result<ChatGptCredentials, LoginError> {
-    let response = reqwest::blocking::Client::new()
-        .post(token_endpoint)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", CLIENT_ID),
-            ("code_verifier", verifier),
-        ])
-        .send()
-        .map_err(|_| LoginError::Authentication("token exchange failed"))?;
-    if !response.status().is_success() {
-        return Err(LoginError::Authentication("token exchange failed"));
-    }
-    let token = response
-        .json::<Value>()
-        .map_err(|_| LoginError::Authentication("token response is invalid"))?;
-    credentials_from_token(&token, now())
-}
-
 fn credentials_from_token(
     token: &Value,
     now: SystemTime,
@@ -1061,9 +1065,10 @@ fn exchange_code_cancellable(
     let code = code.to_owned();
     let redirect_uri = redirect_uri.to_owned();
     let verifier = verifier.to_owned();
+    let request_timeout = token_request_timeout(deadline)?;
     let response = cancellable_request(cancellation, deadline, move || {
         reqwest::blocking::Client::builder()
-            .timeout(DEVICE_HTTP_TIMEOUT)
+            .timeout(request_timeout)
             .build()
             .expect("the fixed authentication HTTP client configuration is valid")
             .post(token_endpoint)
@@ -1076,19 +1081,25 @@ fn exchange_code_cancellable(
                 ("code_verifier", verifier.as_str()),
             ])
             .send()
-            .map(|response| {
-                (
-                    response.status().is_success(),
-                    response.json::<Value>().ok(),
-                )
+            .map(|mut response| {
+                let status = response.status().as_u16();
+                let body = if (200..300).contains(&status) {
+                    read_device_json(&mut response)
+                } else {
+                    Err(())
+                };
+                (status, body)
             })
+    })
+    .map_err(|error| match error {
+        LoginError::Cancelled | LoginError::TimedOut => error,
+        _ => LoginError::TokenTransport,
     })?;
-    let (success, Some(token)) = response else {
-        return Err(LoginError::Authentication("token exchange failed"));
+    let (status, body) = response;
+    if !(200..300).contains(&status) {
+        return Err(LoginError::TokenStatus);
     };
-    if !success {
-        return Err(LoginError::Authentication("token exchange failed"));
-    }
+    let token = body.map_err(|()| LoginError::TokenFormat)?;
     credentials_from_token(&token, now())
 }
 
@@ -1097,6 +1108,7 @@ fn cancellable_request<T: Send + 'static>(
     deadline: Instant,
     request: impl FnOnce() -> Result<T, reqwest::Error> + Send + 'static,
 ) -> Result<T, LoginError> {
+    check_login_stop(cancellation, deadline)?;
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let _ = sender.send(request().map_err(|_| ()));
@@ -1104,13 +1116,27 @@ fn cancellable_request<T: Send + 'static>(
     loop {
         check_login_stop(cancellation, deadline)?;
         match receiver.recv_timeout(DEVICE_WAIT_SLICE) {
-            Ok(Ok(value)) => return Ok(value),
+            Ok(Ok(value)) => {
+                check_login_stop(cancellation, deadline)?;
+                return Ok(value);
+            }
             Ok(Err(())) | Err(RecvTimeoutError::Disconnected) => {
                 return Err(LoginError::Authentication("device authorization failed"));
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
+}
+
+fn token_request_timeout(deadline: Instant) -> Result<Duration, LoginError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(LoginError::TimedOut);
+    }
+    if remaining < DEVICE_HTTP_TIMEOUT {
+        return Ok(remaining.saturating_add(DEVICE_WAIT_SLICE));
+    }
+    Ok(DEVICE_HTTP_TIMEOUT)
 }
 
 fn sleep_with_cancellation(
@@ -1413,6 +1439,22 @@ fn write_credentials_atomically_at(
 mod tests {
     use super::*;
 
+    fn local_token_endpoint(status: u16, body: &'static str) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("token listener should bind");
+        let endpoint = format!("http://{}/token", listener.local_addr().expect("address"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("token request should arrive");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (endpoint, server)
+    }
+
     fn token_response(access_claims: Value, expires_in: Option<Value>) -> Value {
         let id_token = jwt(
             r#"{"alg":"RS256"}"#,
@@ -1561,6 +1603,45 @@ mod tests {
     }
 
     #[test]
+    fn token_exchange_reports_sanitized_transport_status_and_format_stages() {
+        for (status, body, expected) in [
+            (503, r#"{"private":"body"}"#, LoginError::TokenStatus),
+            (200, "private-invalid-body", LoginError::TokenFormat),
+        ] {
+            let (endpoint, server) = local_token_endpoint(status, body);
+            let error = exchange_code_cancellable(
+                &endpoint,
+                "private-code",
+                "http://localhost/private-callback",
+                "private-verifier",
+                &LoginCancellation::new(),
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(SystemTime::now),
+            )
+            .expect_err("token response should fail");
+            assert_eq!(error, expected);
+            assert!(!error.stage_message().contains("private"));
+            server.join().expect("token server should finish");
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let endpoint = format!("http://{}/token", listener.local_addr().expect("address"));
+        drop(listener);
+        assert_eq!(
+            exchange_code_cancellable(
+                &endpoint,
+                "private-code",
+                "http://localhost/private-callback",
+                "private-verifier",
+                &LoginCancellation::new(),
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(SystemTime::now),
+            ),
+            Err(LoginError::TokenTransport)
+        );
+    }
+
+    #[test]
     fn callback_parsers_reject_the_http_and_query_attack_matrix() {
         assert!(
             parse_http_request(b"GET /auth/callback HTTP/1.1\r\nHost: localhost:1455\r\n\r\n")
@@ -1600,7 +1681,7 @@ mod tests {
             wait_for_callback(
                 listener,
                 "expected-state",
-                Duration::from_millis(250),
+                Instant::now() + Duration::from_millis(250),
                 &LoginCancellation::new(),
             )
         });
@@ -1623,7 +1704,7 @@ mod tests {
             wait_for_callback(
                 listener,
                 "expected-state",
-                Duration::from_millis(35),
+                Instant::now() + Duration::from_millis(35),
                 &LoginCancellation::new(),
             )
         });

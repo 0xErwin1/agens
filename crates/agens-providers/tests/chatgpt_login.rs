@@ -1257,6 +1257,7 @@ fn callback_state_error_and_missing_code_are_sanitized_authentication_failures()
         "state={state}",
     ] {
         let callback = callback.to_owned();
+        let denied = callback.contains("error=");
         let options = ChatGptLoginOptions {
             callback_ports: vec![0],
             timeout: Duration::from_secs(1),
@@ -1296,6 +1297,12 @@ fn callback_state_error_and_missing_code_are_sanitized_authentication_failures()
         let error =
             login(options, LoginCancellation::new()).expect_err("invalid callback should fail");
         let rendered = error.to_string();
+        let stage = if denied {
+            "ChatGPT authorization was denied; retry and approve access"
+        } else {
+            "ChatGPT login callback failed; retry authentication"
+        };
+        assert_eq!(error.stage_message(), stage);
         assert!(rendered.starts_with("ChatGPT authentication required:"));
         assert!(!rendered.contains("secret-authorization-code"));
         assert!(!rendered.contains("wrong-state"));

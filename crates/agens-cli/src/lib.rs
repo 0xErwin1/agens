@@ -21,7 +21,7 @@ use agens_core::{
     run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
-    ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation,
+    ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation, LoginError,
     device_code_login_with_progress, login, remove_provider_entry, upsert_chatgpt_credentials,
     upsert_provider_entry,
 };
@@ -58,7 +58,7 @@ type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
 type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>) -> Result<String, CliError>>;
-type AuthLogin = Box<dyn Fn(&Path, bool) -> Result<String, CliError>>;
+type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
 
 pub struct CliDependencies {
     current_directory: CurrentDirectory,
@@ -107,7 +107,7 @@ impl CliDependencies {
             read_file: Box::new(move |path| Ok(files.get(path).cloned())),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
-            auth_login: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
+            auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
     }
 
@@ -134,7 +134,7 @@ impl CliDependencies {
 
     pub fn with_auth_login(
         mut self,
-        login: impl Fn(&Path, bool) -> Result<String, CliError> + 'static,
+        login: impl Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError> + 'static,
     ) -> Self {
         self.auth_login = Box::new(login);
         self
@@ -412,7 +412,7 @@ fn execute_command(
         [command] if is_help(command) => Ok(root_help()),
         [command] if is_version(command) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
         [command, rest @ ..] if command == "config" => run_config(rest, dependencies),
-        [command, rest @ ..] if command == "auth" => run_auth(rest, dependencies),
+        [command, rest @ ..] if command == "auth" => run_auth(rest, dependencies, cancellation),
         [command, rest @ ..] if command == "chat" => run_chat(rest, dependencies, cancellation),
         [command, rest @ ..] if command == "models" => run_models(rest),
         [command, rest @ ..] if command == "sessions" => run_sessions(rest, dependencies),
@@ -442,7 +442,11 @@ fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<St
     }
 }
 
-fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+fn run_auth(
+    arguments: &[String],
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
     if arguments.iter().any(|argument| is_help(argument)) {
         return Ok("Usage: agens auth <status|login|logout>\n".to_owned());
     }
@@ -467,9 +471,9 @@ fn run_auth(arguments: &[String], dependencies: &CliDependencies) -> Result<Stri
             let bootstrap = bootstrap(dependencies)?;
             provider_status(&bootstrap.paths.credentials, provider)
         }
-        [command] if command == "login" => run_auth_login(dependencies, false),
+        [command] if command == "login" => run_auth_login(dependencies, false, cancellation),
         [command, flag] if command == "login" && flag == "--device-auth" => {
-            run_auth_login(dependencies, true)
+            run_auth_login(dependencies, true, cancellation)
         }
         [command, subcommand, provider, rest @ ..]
             if command == "login" && subcommand == "api-key" =>
@@ -684,18 +688,40 @@ fn provider_status(path: &Path, provider: CredentialProvider) -> Result<String, 
     }
 }
 
-fn run_auth_login(dependencies: &CliDependencies, device_auth: bool) -> Result<String, CliError> {
+fn run_auth_login(
+    dependencies: &CliDependencies,
+    device_auth: bool,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
+    if cancellation.is_cancelled() {
+        return Err(chatgpt_login_error(LoginError::Cancelled));
+    }
+    if cancellation.is_expired() {
+        return Err(chatgpt_login_error(LoginError::TimedOut));
+    }
     let bootstrap = bootstrap(dependencies)?;
-    let mut output = (dependencies.auth_login)(&bootstrap.paths.credentials, device_auth)?;
+    let mut output =
+        (dependencies.auth_login)(&bootstrap.paths.credentials, device_auth, cancellation)?;
     output.push_str("Logged in to ChatGPT.\n");
     Ok(output)
 }
 
-fn run_production_auth_login(path: &Path, device_auth: bool) -> Result<String, CliError> {
+fn run_production_auth_login(
+    path: &Path,
+    device_auth: bool,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
+    let cancellation_view = cancellation.adapter_view();
+    let login_cancellation =
+        LoginCancellation::from_shared_flag(cancellation_view.cancellation_handle());
     let credentials = if device_auth {
+        let mut options = ChatGptDeviceCodeLoginOptions::default();
+        if let Some(remaining) = cancellation_view.remaining_duration() {
+            options.timeout = options.timeout.min(remaining);
+        }
         device_code_login_with_progress(
-            ChatGptDeviceCodeLoginOptions::default(),
-            LoginCancellation::new(),
+            options,
+            login_cancellation,
             move |verification_url, user_code| {
                 let _ = writeln!(
                     std::io::stdout(),
@@ -708,27 +734,32 @@ fn run_production_auth_login(path: &Path, device_auth: bool) -> Result<String, C
         )
         .map(|result| result.credentials)
     } else {
-        login(
-            ChatGptLoginOptions::new(
-                Arc::new(|url| {
-                    std::process::Command::new("xdg-open")
-                        .arg(url)
-                        .spawn()
-                        .map(|_| ())
-                }),
-                Arc::new(|url| {
-                    let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");
-                    let _ = std::io::stdout().flush();
-                }),
-            ),
-            LoginCancellation::new(),
-        )
+        let mut options = ChatGptLoginOptions::new(
+            Arc::new(|url| {
+                std::process::Command::new("xdg-open")
+                    .arg(url)
+                    .spawn()
+                    .map(|_| ())
+            }),
+            Arc::new(|url| {
+                let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");
+                let _ = std::io::stdout().flush();
+            }),
+        );
+        if let Some(remaining) = cancellation_view.remaining_duration() {
+            options.timeout = options.timeout.min(remaining);
+        }
+        login(options, login_cancellation)
     }
-    .map_err(|_| CliError::authentication("ChatGPT login failed"))?;
+    .map_err(chatgpt_login_error)?;
 
     upsert_chatgpt_credentials(path, &credentials)
         .map_err(|_| CliError::authentication("ChatGPT credentials could not be saved"))?;
     Ok(String::new())
+}
+
+fn chatgpt_login_error(error: LoginError) -> CliError {
+    CliError::authentication(error.stage_message())
 }
 
 fn run_chat(
@@ -6256,5 +6287,26 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+}
+#[test]
+fn production_chatgpt_login_errors_render_fixed_sanitized_stages() {
+    for error in [
+        LoginError::Authentication("setup detail"),
+        LoginError::Authentication("callback request is invalid"),
+        LoginError::Authentication("authorization was denied"),
+        LoginError::TokenTransport,
+        LoginError::TokenStatus,
+        LoginError::TokenFormat,
+        LoginError::Account,
+        LoginError::Expiry,
+        LoginError::Cancelled,
+        LoginError::TimedOut,
+    ] {
+        let expected = format!("error: auth: {}\n", error.stage_message());
+        let result = error_result(&[], chatgpt_login_error(error));
+        assert_eq!(result.stderr, expected);
+        assert!(!result.stderr.contains("detail"));
+        assert_ne!(result.stderr, "error: auth: ChatGPT login failed\n");
     }
 }
