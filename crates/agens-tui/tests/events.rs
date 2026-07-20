@@ -769,10 +769,8 @@ fn typed_reset_and_context_outcomes_update_visible_state_after_success() {
     });
     assert_eq!(tui.view().provider_model, "openai-api / o3");
     assert_eq!(tui.view().session, "session #42");
-    assert_eq!(
-        tui.transcript().last(),
-        Some(&TranscriptEntry::Info("Resumed session 42.".into()))
-    );
+    assert!(tui.transcript().is_empty());
+    assert_eq!(tui.view().status, Some("Resumed session 42."));
 }
 
 #[test]
@@ -1026,8 +1024,8 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     assert!(text.contains("agens"));
     assert!(text.contains("openai-api / gpt-4.1"));
     assert!(text.contains("session #42"));
-    assert!(text.contains("USER"));
-    assert!(text.contains("THINKING"));
+    assert!(text.contains("You"));
+    assert!(text.contains("Thinking"));
     assert!(text.contains("Compose"));
     assert!(text.contains("2 lines"));
     assert!(text.contains("Shift+Enter"));
@@ -1036,9 +1034,9 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     let user_cell = buffer
         .content
         .iter()
-        .find(|cell| cell.symbol() == "U")
+        .find(|cell| cell.symbol() == "Y")
         .expect("user role label is rendered");
-    assert_eq!(user_cell.fg, ratatui::style::Color::Green);
+    assert_eq!(user_cell.fg, ratatui::style::Color::Cyan);
 
     tui.apply_progress(TurnEvent::ToolCallRequested {
         id: "call-1".into(),
@@ -1054,8 +1052,8 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(tool_text.contains("TOOL"));
-    assert!(tool_text.contains("Tool: native::read"));
+    assert!(tool_text.contains("Tools"));
+    assert!(tool_text.contains("native::read"));
 
     let backend = TestBackend::new(50, 14);
     let terminal = Terminal::new(backend).unwrap();

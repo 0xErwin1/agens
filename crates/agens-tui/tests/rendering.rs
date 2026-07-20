@@ -53,6 +53,77 @@ fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
 }
 
 #[test]
+fn multiline_wrapped_user_message_uses_one_accented_identity() {
+    let terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission(
+        "A deliberately long user message wraps naturally in this narrow viewport.\nSecond source line.",
+    );
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert_eq!(text.matches("You").count(), 1, "{text:?}");
+    assert!(!text.contains("USER"), "{text:?}");
+    assert!(text.contains("deliberately long user"), "{text:?}");
+    assert!(text.contains("Second source line."), "{text:?}");
+    let user = cell_for_text(&renderer, "You");
+    assert_eq!(user.fg, Color::Cyan);
+    assert!(user.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn thinking_renders_markdown_expanded_by_default_and_honors_collapse_setting() {
+    let terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "**THOUGHTTOKEN**\n\n- inspect\n- verify".into(),
+    )));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert_eq!(expanded.matches("Thinking").count(), 1, "{expanded:?}");
+    assert!(!expanded.contains("THINKING"), "{expanded:?}");
+    assert!(!expanded.contains("**"), "{expanded:?}");
+    assert!(expanded.contains("THOUGHTTOKEN"), "{expanded:?}");
+    assert!(
+        cell_for_text(&renderer, "THOUGHTTOKEN")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+
+    tui.set_collapse_thinking(true);
+    renderer.render(tui.view()).unwrap();
+    let collapsed = rendered_text(&renderer);
+    assert!(collapsed.contains("Thinking · collapsed"), "{collapsed:?}");
+    assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
+}
+
+#[test]
+fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
+    let terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.apply_submission_outcome(agens_tui::TuiSubmissionOutcome::LocalInfo(
+        "local-info-sentinel".into(),
+    ));
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert_eq!(text.matches("local-info-sentinel").count(), 1, "{text:?}");
+    assert!(tui.transcript().is_empty());
+    assert!(tui.view().conversation.is_none());
+}
+
+#[test]
 fn renderer_renders_practical_markdown_semantics() {
     let terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
@@ -92,9 +163,19 @@ fn renderer_renders_practical_markdown_semantics() {
     }
 
     assert!(
+        cell_for_text(&renderer, "Result")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
         cell_for_text(&renderer, "STRONGTOKEN")
             .modifier
             .contains(Modifier::BOLD)
+    );
+    assert!(
+        cell_for_text(&renderer, "EMPHASISTOKEN")
+            .modifier
+            .contains(Modifier::ITALIC)
     );
     assert_eq!(cell_for_text(&renderer, "INLINE_TOKEN").fg, Color::Yellow);
     let link = cell_for_text(&renderer, "LINKTOKEN");
@@ -159,7 +240,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         },
         ConversationEvent::ToolResult {
             call_id: "read-1".into(),
-            output: "read result".into(),
+            output: "```text\nread result\n```".into(),
             is_error: false,
         },
         ConversationEvent::Diff(vec![DiffLine::new(8, DiffLineKind::Added, "new line")]),
@@ -188,9 +269,9 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     for expected in [
         "final markdown",
         "inspect every changed line",
-        "read-1 native::read",
+        "native::read · read-1",
         "read result",
-        "write-2 native::write",
+        "native::write · write-2",
         "write result",
         "12ms",
         "8 + new line",
@@ -203,6 +284,9 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     }
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(!text.contains("**"), "{text:?}");
+    assert!(!text.contains("```"), "{text:?}");
+    assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
+    assert_eq!(text.matches("Error").count(), 1, "{text:?}");
     assert!(text.find("read-1").unwrap() < text.find("write-2").unwrap());
 }
 
@@ -465,11 +549,16 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    let order = "first user|first reasoning|c1 read|first answer|first result|persisted reminder|second user|second answer";
+    let order = "first user|first reasoning|read · c1|first answer|first result|persisted reminder|second user|second answer";
     let mut offset = 0;
     for expected in order.split('|') {
         let position = text[offset..].find(expected).expect(expected);
         offset += position + expected.len();
+    }
+    assert_eq!(text.matches("You").count(), 2, "{text:?}");
+    assert_eq!(text.matches("Thinking").count(), 1, "{text:?}");
+    for label in ["USER", "ASSISTANT", "THINKING"] {
+        assert!(!text.contains(label), "found {label:?} in {text:?}");
     }
 }
 
@@ -625,6 +714,7 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     ]);
 
     renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("conversation sentinel"));
     let composer_row_before = renderer
         .terminal()
         .backend()
@@ -657,9 +747,8 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
 
     tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
-    assert!(tui.transcript().iter().any(
-        |entry| matches!(entry, agens_tui::TranscriptEntry::Info(text) if text == "conversation sentinel")
-    ));
+    assert!(tui.transcript().is_empty());
+    assert!(tui.view().status.is_none());
 }
 
 #[test]

@@ -2007,6 +2007,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    tui.set_collapse_thinking(bootstrap.collapse_thinking);
     let skills = start_tui_skills(&mut tui, bootstrap)?;
     let provider = bootstrap.provider_type().unwrap_or("provider");
     let model = bootstrap.model().unwrap_or("default model");
@@ -2682,6 +2683,7 @@ pub struct Bootstrap {
     system_prompt: Option<String>,
     max_iterations: Option<usize>,
     parallel_tool_calls: bool,
+    collapse_thinking: bool,
     openai_api_key: Option<String>,
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
@@ -2706,6 +2708,7 @@ impl Clone for Bootstrap {
             system_prompt: self.system_prompt.clone(),
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
+            collapse_thinking: self.collapse_thinking,
             openai_api_key: self.openai_api_key.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
@@ -2832,6 +2835,12 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
             .and_then(|agent| agent.get("parallel_tool_calls"))
             .and_then(toml::Value::as_bool)
             .unwrap_or(true),
+        collapse_thinking: document
+            .get("ui")
+            .and_then(toml::Value::as_table)
+            .and_then(|ui| ui.get("collapse_thinking"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false),
         openai_api_key: openai_api_key(credentials.as_deref(), &environment),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
@@ -6140,7 +6149,7 @@ mod tests {
         for expected in [
             "previous request",
             "previous reasoning",
-            "resume-call read",
+            "read · resume-call",
             "previous answer",
             "previous result",
             "persisted reminder",
@@ -6608,6 +6617,29 @@ mod tests {
             )]),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn bootstrap_retains_the_ui_collapse_thinking_setting() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-collapse-thinking-{}", std::process::id()));
+        let config_home = temporary.join("config");
+        let dependencies = CliDependencies::for_test(
+            temporary.join("project"),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                "[ui]\ncollapse_thinking = true\n".to_owned(),
+            )]),
+        );
+
+        let bootstrap = bootstrap(&dependencies).expect("UI configuration should be valid");
+
+        assert!(bootstrap.collapse_thinking);
     }
 
     fn tui_session_messages() -> Vec<Message> {

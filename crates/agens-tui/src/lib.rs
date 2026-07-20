@@ -247,6 +247,8 @@ pub struct ViewState<'a> {
     pub completed_conversations: &'a [Conversation],
     /// Tool outputs collapsed only for presentation; their source output remains retained.
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
+    /// Whether complete reasoning is collapsed according to the UI setting.
+    pub collapse_thinking: bool,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
     /// Slash palette metadata and current filtered selection.
@@ -912,7 +914,12 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
         .completed_conversations
         .iter()
         .flat_map(|conversation| {
-            render::conversation_lines(conversation, &[], state.collapsed_tool_outputs)
+            render::conversation_lines(
+                conversation,
+                &[],
+                state.collapsed_tool_outputs,
+                state.collapse_thinking,
+            )
         })
         .collect::<Vec<_>>();
     if let Some(conversation) = state.conversation {
@@ -920,6 +927,7 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
             conversation,
             state.runtime_events,
             state.collapsed_tool_outputs,
+            state.collapse_thinking,
         ));
     }
     let conversation_is_authoritative =
@@ -1007,6 +1015,7 @@ pub struct Tui<E> {
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
+    collapse_thinking: bool,
     dialog: Option<DialogView>,
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
@@ -1040,6 +1049,7 @@ where
             completed_conversations: Vec::new(),
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
+            collapse_thinking: false,
             dialog: None,
             palette_entries: Vec::new(),
             palette_open: false,
@@ -1094,6 +1104,10 @@ where
     pub fn set_palette_entries(&mut self, entries: Vec<PaletteEntry>) {
         self.palette_entries = entries;
         self.clamp_palette_selection();
+    }
+
+    pub fn set_collapse_thinking(&mut self, collapse: bool) {
+        self.collapse_thinking = collapse;
     }
 
     /// Updates active-turn state after the composition layer starts or finishes a turn.
@@ -1185,11 +1199,9 @@ where
         self.finish_provider_turn(outcome);
     }
 
-    /// Adds a local session or lifecycle note to the visible conversation.
+    /// Shows a local session or lifecycle notice outside the conversation.
     pub fn add_info(&mut self, text: impl Into<String>) {
-        let text = text.into();
-        self.transcript.push(TranscriptEntry::Info(text.clone()));
-        self.project_conversation(ConversationEvent::Info(text));
+        self.status = Some(text.into());
     }
 
     pub fn add_diagnostic(&mut self, text: impl AsRef<str>) {
@@ -1416,6 +1428,7 @@ where
             conversation: self.conversation.as_ref(),
             completed_conversations: &self.completed_conversations,
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
+            collapse_thinking: self.collapse_thinking,
             dialog: self.dialog.as_ref(),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
