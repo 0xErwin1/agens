@@ -30,7 +30,7 @@ use std::{
 use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
         KeyEventKind, KeyModifiers,
     },
     execute,
@@ -56,8 +56,12 @@ pub trait Engine {
 pub enum Event {
     /// A key that participates in normal interaction.
     Key(Key),
+    Paste(String),
     /// A terminal resize in columns and rows.
-    Resize { width: u16, height: u16 },
+    Resize {
+        width: u16,
+        height: u16,
+    },
 }
 
 /// Keys handled by the TUI engine boundary.
@@ -67,6 +71,10 @@ pub enum Key {
     Char(char),
     /// Deletes the preceding input character.
     Backspace,
+    Delete,
+    DeletePreviousWord,
+    DeleteToLineStart,
+    DeleteToLineEnd,
     /// Submits the current input.
     Enter,
     /// Cancels an active turn when one exists.
@@ -78,6 +86,8 @@ pub enum Key {
     ShiftEnter,
     Left,
     Right,
+    PreviousWord,
+    NextWord,
     Home,
     End,
     PageUp,
@@ -218,7 +228,7 @@ pub struct ViewState<'a> {
     pub turn_state: Option<TurnState>,
     /// Tool name currently being dispatched, when known.
     pub active_tool: Option<&'a str>,
-    /// Current byte cursor position in the editable prompt.
+    /// Current character cursor position in the editable prompt.
     pub input_cursor: usize,
     /// Typed metrics retained for rich, lossless presentation.
     pub runtime_events: &'a [TuiRuntimeEvent],
@@ -1006,6 +1016,20 @@ where
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
+            Event::Paste(text) => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.interactive)
+                {
+                    Action::Render
+                } else {
+                    self.quit_armed = false;
+                    self.status = None;
+                    self.insert_text(&text);
+                    Action::Render
+                }
+            }
         }
     }
 
@@ -1443,69 +1467,13 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
+        if let Some(action) = self.handle_composer_key(key) {
+            return action;
+        }
+
         match key {
             Key::CtrlO => {
                 self.toggle_tool_output_expansion();
-                Action::Render
-            }
-            Key::Char(character) => {
-                if self
-                    .dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.title == "Extension diagnostics")
-                {
-                    self.dialog = None;
-                }
-                self.input.insert(self.input_cursor, character);
-                self.input_cursor += character.len_utf8();
-                if !self.running && self.input == "/" {
-                    self.palette_open = true;
-                    self.palette_selected = 0;
-                }
-                self.clamp_palette_selection();
-                Action::Render
-            }
-            Key::Backspace => {
-                if let Some(previous) = self.input[..self.input_cursor].char_indices().last() {
-                    self.input_cursor = previous.0;
-                    self.input.remove(self.input_cursor);
-                }
-                self.clamp_palette_selection();
-                Action::Render
-            }
-            Key::ShiftEnter => {
-                self.input.insert(self.input_cursor, '\n');
-                self.input_cursor += 1;
-                Action::Render
-            }
-            Key::Left => {
-                self.input_cursor = self.input[..self.input_cursor]
-                    .char_indices()
-                    .last()
-                    .map_or(0, |(index, _)| index);
-                Action::Render
-            }
-            Key::Right => {
-                self.input_cursor = self.input[self.input_cursor..]
-                    .chars()
-                    .next()
-                    .map_or(self.input.len(), |character| {
-                        self.input_cursor + character.len_utf8()
-                    });
-                Action::Render
-            }
-            Key::Home => {
-                self.input_cursor = self.input[..self.input_cursor]
-                    .rfind('\n')
-                    .map_or(0, |index| index + 1);
-                Action::Render
-            }
-            Key::End => {
-                self.following_bottom = true;
-                self.scroll_offset = 0;
-                self.input_cursor = self.input[self.input_cursor..]
-                    .find('\n')
-                    .map_or(self.input.len(), |index| self.input_cursor + index);
                 Action::Render
             }
             Key::PageUp => {
@@ -1582,7 +1550,72 @@ where
                 self.quit_armed = true;
                 Action::Render
             }
+            _ => unreachable!("composer keys are handled before global keys"),
         }
+    }
+
+    fn handle_composer_key(&mut self, key: Key) -> Option<Action> {
+        let cursor = self.input_cursor;
+        match key {
+            Key::Char(character) => self.insert_text(&character.to_string()),
+            Key::ShiftEnter => self.insert_text("\n"),
+            Key::Backspace if cursor > 0 => self.replace_chars(cursor - 1, cursor, ""),
+            Key::Delete => self.replace_chars(cursor, cursor.saturating_add(1), ""),
+            Key::DeletePreviousWord => {
+                self.replace_chars(previous_word_boundary(&self.input, cursor), cursor, "");
+            }
+            Key::DeleteToLineStart => {
+                self.replace_chars(line_start(&self.input, cursor), cursor, "");
+            }
+            Key::DeleteToLineEnd => {
+                self.replace_chars(cursor, line_end(&self.input, cursor), "");
+            }
+            Key::Left => self.input_cursor = cursor.saturating_sub(1),
+            Key::Right => {
+                self.input_cursor = cursor.saturating_add(1).min(self.input.chars().count());
+            }
+            Key::PreviousWord => {
+                self.input_cursor = previous_word_boundary(&self.input, cursor);
+            }
+            Key::NextWord => self.input_cursor = next_word_boundary(&self.input, cursor),
+            Key::Home => self.input_cursor = line_start(&self.input, cursor),
+            Key::End => {
+                self.following_bottom = true;
+                self.scroll_offset = 0;
+                self.input_cursor = line_end(&self.input, cursor);
+            }
+            Key::Backspace => {}
+            _ => return None,
+        }
+
+        self.clamp_palette_selection();
+        Some(Action::Render)
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.title == "Extension diagnostics")
+        {
+            self.dialog = None;
+        }
+        self.replace_chars(self.input_cursor, self.input_cursor, text);
+        if !self.running && self.input == "/" {
+            self.palette_open = true;
+            self.palette_selected = 0;
+        }
+        self.clamp_palette_selection();
+    }
+
+    fn replace_chars(&mut self, start: usize, end: usize, replacement: &str) {
+        let character_count = self.input.chars().count();
+        let start = start.min(character_count);
+        let end = end.min(character_count).max(start);
+        let start_byte = byte_index(&self.input, start);
+        let end_byte = byte_index(&self.input, end);
+        self.input.replace_range(start_byte..end_byte, replacement);
+        self.input_cursor = start + replacement.chars().count();
     }
 
     fn cancel_running(&mut self) -> Action {
@@ -1668,7 +1701,7 @@ where
         } else {
             format!("/{} {arguments}", entry.name)
         };
-        self.input_cursor = self.input.len();
+        self.input_cursor = self.input.chars().count();
         self.palette_selected = 0;
     }
 
@@ -1759,6 +1792,65 @@ fn palette_matches<'a>(entries: &'a [PaletteEntry], input: &str) -> Vec<&'a Pale
         .iter()
         .filter(|entry| entry.name.starts_with(prefix))
         .collect()
+}
+
+fn byte_index(input: &str, character_index: usize) -> usize {
+    input
+        .char_indices()
+        .nth(character_index)
+        .map_or(input.len(), |(index, _)| index)
+}
+
+fn line_start(input: &str, cursor: usize) -> usize {
+    input
+        .chars()
+        .take(cursor)
+        .enumerate()
+        .filter_map(|(index, character)| (character == '\n').then_some(index + 1))
+        .last()
+        .unwrap_or_default()
+}
+
+fn line_end(input: &str, cursor: usize) -> usize {
+    input
+        .chars()
+        .skip(cursor)
+        .position(|character| character == '\n')
+        .map_or_else(|| input.chars().count(), |offset| cursor + offset)
+}
+
+fn previous_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut last_word_start = 0;
+    let mut found_word = false;
+    let mut in_word = false;
+
+    for (index, character) in input.chars().take(cursor).enumerate() {
+        if character.is_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            last_word_start = index;
+            found_word = true;
+            in_word = true;
+        }
+    }
+
+    if found_word { last_word_start } else { 0 }
+}
+
+fn next_word_boundary(input: &str, cursor: usize) -> usize {
+    let mut in_word = false;
+
+    for (offset, character) in input.chars().skip(cursor).enumerate() {
+        if character.is_whitespace() {
+            if in_word {
+                return cursor + offset;
+            }
+        } else {
+            in_word = true;
+        }
+    }
+
+    input.chars().count()
 }
 
 fn bounded_auth_text(value: &str, limit: usize) -> String {
@@ -2046,20 +2138,49 @@ impl Drop for RatatuiRestore {
 fn map_event(event: CrosstermEvent) -> Option<Event> {
     match event {
         CrosstermEvent::Resize(width, height) => Some(Event::Resize { width, height }),
-        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            map_key(key.code, key.modifiers)
-        }
+        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => map_key(key),
+        CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
         _ => None,
     }
 }
 
-fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
-    let key = match (code, modifiers) {
+fn map_key(event: KeyEvent) -> Option<Event> {
+    let key = match (event.code, event.modifiers) {
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlC
         }
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
+        }
+        (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeletePreviousWord
+        }
+        (KeyCode::Char('u' | 'U'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeleteToLineStart
+        }
+        (KeyCode::Char('k' | 'K'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeleteToLineEnd
+        }
+        (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::Home
+        }
+        (KeyCode::Char('e' | 'E'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::End
+        }
+        (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::Left
+        }
+        (KeyCode::Char('f' | 'F'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::Right
+        }
+        (KeyCode::Char('d' | 'D'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::Delete
+        }
+        (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+            Key::PreviousWord
+        }
+        (KeyCode::Char('f' | 'F'), modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+            Key::NextWord
         }
         (KeyCode::Char(character), modifiers)
             if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
@@ -2069,8 +2190,13 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
         (KeyCode::Backspace, _) => Key::Backspace,
         (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => Key::ShiftEnter,
         (KeyCode::Enter, _) => Key::Enter,
+        (KeyCode::Left, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::PreviousWord
+        }
+        (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => Key::NextWord,
         (KeyCode::Left, _) => Key::Left,
         (KeyCode::Right, _) => Key::Right,
+        (KeyCode::Delete, _) => Key::Delete,
         (KeyCode::Home, _) => Key::Home,
         (KeyCode::End, _) => Key::End,
         (KeyCode::PageUp, _) => Key::PageUp,
@@ -2206,7 +2332,7 @@ mod runtime_tests {
     #[test]
     fn maps_control_o_to_tool_output_toggle() {
         assert_eq!(
-            map_key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            map_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             Some(Event::Key(Key::CtrlO))
         );
     }
@@ -2218,7 +2344,112 @@ mod runtime_tests {
             (KeyCode::Down, Key::Down),
             (KeyCode::Tab, Key::Tab),
         ] {
-            assert_eq!(map_key(code, KeyModifiers::NONE), Some(Event::Key(key)));
+            assert_eq!(
+                map_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                Some(Event::Key(key))
+            );
         }
+    }
+
+    fn press<E: Engine>(tui: &mut Tui<E>, code: KeyCode, modifiers: KeyModifiers) -> Action {
+        let event = map_key(crossterm::event::KeyEvent::new(code, modifiers)).unwrap();
+        tui.handle(event)
+    }
+
+    #[test]
+    fn maps_readline_crossterm_keys_to_composer_actions() {
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        for (code, modifiers, expected) in [
+            (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
+            (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
+            (KeyCode::Char('k'), ctrl, Key::DeleteToLineEnd),
+            (KeyCode::Char('a'), ctrl, Key::Home),
+            (KeyCode::Char('e'), ctrl, Key::End),
+            (KeyCode::Char('b'), ctrl, Key::Left),
+            (KeyCode::Char('f'), ctrl, Key::Right),
+            (KeyCode::Char('b'), alt, Key::PreviousWord),
+            (KeyCode::Char('f'), alt, Key::NextWord),
+            (KeyCode::Left, ctrl, Key::PreviousWord),
+            (KeyCode::Right, ctrl, Key::NextWord),
+            (KeyCode::Char('d'), ctrl, Key::Delete),
+            (KeyCode::Delete, KeyModifiers::NONE, Key::Delete),
+        ] {
+            assert_eq!(
+                map_key(crossterm::event::KeyEvent::new(code, modifiers)),
+                Some(Event::Key(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn real_key_events_edit_unicode_multiline_text_without_changing_submission_semantics() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(map_event(CrosstermEvent::Paste("café 🙂\nsecond line".into())).unwrap());
+
+        press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(tui.view().input_cursor, 5);
+        press(&mut tui, KeyCode::Right, KeyModifiers::CONTROL);
+        assert_eq!(tui.view().input_cursor, 6);
+
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(map_event(CrosstermEvent::Paste("café 🙂\nsecond line".into())).unwrap());
+        press(&mut tui, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        assert_eq!(tui.input(), "café 🙂\nsecond ");
+        press(&mut tui, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(tui.input(), "café 🙂\n");
+
+        press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Backspace, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert_eq!(tui.input(), "café ");
+        press(&mut tui, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Delete, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(tui.input(), "café!");
+
+        press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert_eq!(tui.input(), "");
+        tui.handle(map_event(CrosstermEvent::Paste("café!".into())).unwrap());
+
+        assert_eq!(
+            press(&mut tui, KeyCode::Enter, KeyModifiers::SHIFT),
+            Action::Render
+        );
+        press(&mut tui, KeyCode::Char('é'), KeyModifiers::NONE);
+        assert_eq!(
+            press(&mut tui, KeyCode::Enter, KeyModifiers::NONE),
+            Action::Submit("café!\né".into())
+        );
+
+        let mut running = Tui::new(NoopEngine);
+        running.begin_submission("active");
+        running.handle(map_event(CrosstermEvent::Paste("queued 🙂".into())).unwrap());
+        assert_eq!(
+            press(&mut running, KeyCode::Enter, KeyModifiers::NONE),
+            Action::Render
+        );
+        assert_eq!(running.input(), "queued 🙂");
+    }
+
+    #[test]
+    fn selection_dialog_consumes_readline_keys_before_the_composer() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(map_event(CrosstermEvent::Paste("draft text".into())).unwrap());
+        tui.show_selection_dialog(DialogView::selection(
+            "Choose",
+            None::<String>,
+            vec![DialogEntry::action("Keep", "keep")],
+        ));
+
+        assert_eq!(
+            press(&mut tui, KeyCode::Char('w'), KeyModifiers::CONTROL),
+            Action::Render
+        );
+        assert_eq!(tui.input(), "draft text");
+        assert!(tui.view().dialog.is_some());
     }
 }
