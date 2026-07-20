@@ -1183,7 +1183,7 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
 }
 
 #[test]
-fn production_task_runs_an_isolated_provider_backed_subagent() {
+fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() {
     let temporary = TemporaryDirectory::new("production-task-subagent");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -1281,6 +1281,18 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("sessions should reopen the parent turn");
+    let removed = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "rm", "1"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions should remove the parent turn");
+    let empty = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions should confirm the parent turn was removed");
 
     assert!(listed.status.success());
     assert_eq!(
@@ -1297,6 +1309,16 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
             "Session 1: project={} title=parent request agent=primary turns=1 messages=4\n",
             project_root.display()
         )
+    );
+    assert!(removed.status.success());
+    assert_eq!(
+        String::from_utf8(removed.stdout).unwrap(),
+        "Removed session 1.\n"
+    );
+    assert!(empty.status.success());
+    assert_eq!(
+        String::from_utf8(empty.stdout).unwrap(),
+        "No saved sessions.\n"
     );
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
