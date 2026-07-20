@@ -168,7 +168,7 @@ impl LoginCancellation {
         Self { cancelled }
     }
 
-    fn is_cancelled(&self) -> bool {
+    pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
 }

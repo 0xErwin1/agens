@@ -20,11 +20,7 @@ use agens_core::{
     SessionMetadata, TurnEvent, TurnProgressSink, TurnState,
     run_headless_turn_with_max_iterations_and_progress,
 };
-use agens_providers::chatgpt_login::{
-    ChatGptDeviceCodeLoginOptions, ChatGptLoginOptions, LoginCancellation, LoginError,
-    device_code_login_with_progress, login, remove_provider_entry, upsert_chatgpt_credentials,
-    upsert_provider_entry,
-};
+use agens_providers::chatgpt_login::{LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry};
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
     ProgressAwareProvider, load_chatgpt_auth_state,
@@ -45,7 +41,10 @@ use agens_tui::{
     run_with_default_progress_submit,
 };
 
+mod chatgpt_auth;
 mod model_registry;
+
+use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 
 pub use model_registry::TuiModelSelector;
 
@@ -734,47 +733,37 @@ fn run_production_auth_login(
     let cancellation_view = cancellation.adapter_view();
     let login_cancellation =
         LoginCancellation::from_shared_flag(cancellation_view.cancellation_handle());
-    let credentials = if device_auth {
-        let mut options = ChatGptDeviceCodeLoginOptions::default();
-        if let Some(remaining) = cancellation_view.remaining_duration() {
-            options.timeout = options.timeout.min(remaining);
-        }
-        device_code_login_with_progress(
-            options,
+    let deadline = cancellation_view
+        .deadline()
+        .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(600));
+    ChatGptAuthCoordinator::production()
+        .login(
+            path,
+            if device_auth {
+                ChatGptAuthFlow::Device
+            } else {
+                ChatGptAuthFlow::Browser
+            },
             login_cancellation,
-            move |verification_url, user_code| {
-                let _ = writeln!(
-                    std::io::stdout(),
-                    "Open {} and enter code {}.",
+            deadline,
+            |progress| match progress {
+                ChatGptAuthProgress::BrowserUrl(url) => {
+                    let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");
+                    let _ = std::io::stdout().flush();
+                }
+                ChatGptAuthProgress::DeviceCode {
                     verification_url,
-                    user_code
-                );
-                let _ = std::io::stdout().flush();
+                    user_code,
+                } => {
+                    let _ = writeln!(
+                        std::io::stdout(),
+                        "Open {verification_url} and enter code {user_code}."
+                    );
+                    let _ = std::io::stdout().flush();
+                }
             },
         )
-        .map(|result| result.credentials)
-    } else {
-        let mut options = ChatGptLoginOptions::new(
-            Arc::new(|url| {
-                std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .spawn()
-                    .map(|_| ())
-            }),
-            Arc::new(|url| {
-                let _ = writeln!(std::io::stdout(), "Open {url} to authenticate.");
-                let _ = std::io::stdout().flush();
-            }),
-        );
-        if let Some(remaining) = cancellation_view.remaining_duration() {
-            options.timeout = options.timeout.min(remaining);
-        }
-        login(options, login_cancellation)
-    }
-    .map_err(chatgpt_login_error)?;
-
-    upsert_chatgpt_credentials(path, &credentials)
-        .map_err(|_| CliError::authentication("ChatGPT credentials could not be saved"))?;
+        .map_err(|error| CliError::authentication(error.message()))?;
     Ok(String::new())
 }
 
