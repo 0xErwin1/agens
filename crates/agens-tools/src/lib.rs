@@ -17,8 +17,8 @@ use std::{
 };
 
 use agens_core::{
-    Error, HeadlessTurnCancellationAdapter, PermissionDecision, PermissionPolicy,
-    PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
+    Error, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter, PermissionDecision,
+    PermissionPolicy, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::RegexBuilder;
@@ -2698,10 +2698,33 @@ fn has_duplicate_qualified_name(metadata: &[RemoteToolMetadata]) -> bool {
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    task_terminal: Option<HeadlessTaskTerminal>,
+}
+
+impl PartialEq for ToolOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content && self.is_error == other.is_error
+    }
+}
+
+impl Eq for ToolOutput {}
+
+impl ToolOutput {
+    pub fn task_terminal(terminal: HeadlessTaskTerminal) -> Self {
+        Self {
+            content: terminal.message().to_owned(),
+            is_error: true,
+            task_terminal: Some(terminal),
+        }
+    }
+
+    pub fn terminal(&self) -> Option<HeadlessTaskTerminal> {
+        self.task_terminal
+    }
 }
 
 pub trait DispatchTool: Send {
@@ -3114,6 +3137,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            task_terminal: None,
         }
     }
 
@@ -3121,6 +3145,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            task_terminal: None,
         }
     }
 }

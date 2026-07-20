@@ -1,4 +1,4 @@
-use agens_core::{AgentDefinition, AgentMode, Error};
+use agens_core::{AgentDefinition, AgentMode, Error, HeadlessTaskTerminal};
 use serde_json::Value;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -175,6 +175,8 @@ pub struct TaskTurnResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskRunnerError {
+    Cancelled,
+    TimedOut,
     ProviderFailure,
     IterationLimit,
     ChildFailure,
@@ -196,10 +198,10 @@ impl TaskRunContext {
 
     fn terminal_output(&self) -> Option<ToolOutput> {
         if self.cancellation.load(Ordering::Acquire) {
-            return Some(ToolOutput::failure("task: cancelled"));
+            return Some(task_terminal(HeadlessTaskTerminal::Cancelled));
         }
         if Instant::now() >= self.deadline {
-            return Some(ToolOutput::failure("task: timed out"));
+            return Some(task_terminal(HeadlessTaskTerminal::TimedOut));
         }
         None
     }
@@ -272,7 +274,7 @@ impl<R> TaskTool<R> {
                     .flatten()
             })
             .filter(|agent| agent.mode == AgentMode::Subagent)
-            .ok_or_else(|| ToolOutput::failure("task: requested agent is unavailable"))
+            .ok_or_else(|| task_terminal(HeadlessTaskTerminal::AgentUnavailable))
     }
 
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
@@ -283,7 +285,7 @@ impl<R> TaskTool<R> {
             .or_else(|| agent.model.clone())
             .unwrap_or_else(|| self.parent_model.clone());
         if self.model_validator.validate_model(&model).is_err() {
-            return Err(ToolOutput::failure("task: requested model is unavailable"));
+            return Err(task_terminal(HeadlessTaskTerminal::ModelUnavailable));
         }
 
         let skills = self.resolve_skills(agent, invocation.skills.as_deref())?;
@@ -304,7 +306,7 @@ impl<R> TaskTool<R> {
     ) -> Result<Vec<TaskSkill>, ToolOutput> {
         let names = requested.unwrap_or(&agent.skills);
         if !names.iter().all(|name| agent.skills.contains(name)) {
-            return Err(ToolOutput::failure("task: requested skill is unavailable"));
+            return Err(task_terminal(HeadlessTaskTerminal::SkillUnavailable));
         }
 
         names
@@ -313,10 +315,10 @@ impl<R> TaskTool<R> {
                 let skill = self
                     .skills
                     .skill(name)
-                    .ok_or_else(|| ToolOutput::failure("task: requested skill is unavailable"))?;
+                    .ok_or_else(|| task_terminal(HeadlessTaskTerminal::SkillUnavailable))?;
                 let instructions = skill
                     .load_instructions()
-                    .map_err(|_| ToolOutput::failure("task: requested skill is unavailable"))?;
+                    .map_err(|_| task_terminal(HeadlessTaskTerminal::SkillUnavailable))?;
                 Ok(TaskSkill {
                     name: skill.name().to_owned(),
                     description: skill.description().to_owned(),
@@ -343,7 +345,7 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
     ) -> Result<ToolOutput, Error> {
         let invocation = match TaskInvocation::from_value(arguments) {
             Ok(invocation) => invocation,
-            Err(_) => return Ok(ToolOutput::failure("task: input exceeds configured bounds")),
+            Err(_) => return Ok(task_terminal(HeadlessTaskTerminal::InputLimit)),
         };
         let context = TaskRunContext::inherit(parent);
         if let Some(output) = context.terminal_output() {
@@ -354,7 +356,7 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
             Err(output) => return Ok(output),
         };
         let Some(permit) = TaskPermit::acquire(&self.active) else {
-            return Ok(ToolOutput::failure("task: concurrent child limit reached"));
+            return Ok(task_terminal(HeadlessTaskTerminal::ConcurrencyLimit));
         };
         if let Some(output) = context.terminal_output() {
             return Ok(output);
@@ -398,13 +400,13 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
                 Ok(output) if publication.load(Ordering::Acquire) == PUBLISHED => {
                     return Ok(output);
                 }
-                Ok(_) => return Ok(ToolOutput::failure("task: child execution failed")),
+                Ok(_) => return Ok(task_terminal(HeadlessTaskTerminal::ChildFailure)),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Ok(finish_task_call(
                         &publication,
                         &receiver,
-                        ToolOutput::failure("task: child execution failed"),
+                        task_terminal(HeadlessTaskTerminal::ChildFailure),
                     ));
                 }
             }
@@ -417,19 +419,21 @@ fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolO
         return output;
     }
     if result.iterations > MAX_TASK_ITERATIONS {
-        return ToolOutput::failure("task: iteration limit reached");
+        return task_terminal(HeadlessTaskTerminal::IterationLimit);
     }
     if result.output.chars().count() > MAX_TASK_OUTPUT_CHARS {
-        return ToolOutput::failure("task: output exceeds configured bounds");
+        return task_terminal(HeadlessTaskTerminal::OutputLimit);
     }
     ToolOutput::success(result.output)
 }
 
 fn task_error_output(error: TaskRunnerError) -> ToolOutput {
     match error {
-        TaskRunnerError::ProviderFailure => ToolOutput::failure("task: provider failure"),
-        TaskRunnerError::IterationLimit => ToolOutput::failure("task: iteration limit reached"),
-        TaskRunnerError::ChildFailure => ToolOutput::failure("task: child execution failed"),
+        TaskRunnerError::Cancelled => task_terminal(HeadlessTaskTerminal::Cancelled),
+        TaskRunnerError::TimedOut => task_terminal(HeadlessTaskTerminal::TimedOut),
+        TaskRunnerError::ProviderFailure => task_terminal(HeadlessTaskTerminal::ProviderFailure),
+        TaskRunnerError::IterationLimit => task_terminal(HeadlessTaskTerminal::IterationLimit),
+        TaskRunnerError::ChildFailure => task_terminal(HeadlessTaskTerminal::ChildFailure),
     }
 }
 
@@ -458,9 +462,13 @@ fn finish_task_call(
         Ok(_) | Err(CANCELLED) => terminal,
         Err(PUBLISHED) => receiver
             .recv()
-            .unwrap_or_else(|_| ToolOutput::failure("task: child execution failed")),
-        Err(_) => ToolOutput::failure("task: child execution failed"),
+            .unwrap_or_else(|_| task_terminal(HeadlessTaskTerminal::ChildFailure)),
+        Err(_) => task_terminal(HeadlessTaskTerminal::ChildFailure),
     }
+}
+
+fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
+    ToolOutput::task_terminal(terminal)
 }
 
 struct TaskPermit {
@@ -516,9 +524,9 @@ mod tests {
             finish_task_call(
                 &publication,
                 &receiver,
-                ToolOutput::failure("task: child execution failed"),
+                task_terminal(HeadlessTaskTerminal::ChildFailure),
             ),
-            ToolOutput::failure("task: child execution failed")
+            task_terminal(HeadlessTaskTerminal::ChildFailure)
         );
         assert_eq!(publication.load(Ordering::Acquire), CANCELLED);
         assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));

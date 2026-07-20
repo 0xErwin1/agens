@@ -695,6 +695,40 @@ pub struct HeadlessToolOutput {
     pub is_error: bool,
 }
 
+/// Sanitized terminal outcome emitted by the built-in synchronous task tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadlessTaskTerminal {
+    Cancelled,
+    TimedOut,
+    AgentUnavailable,
+    ModelUnavailable,
+    SkillUnavailable,
+    IterationLimit,
+    InputLimit,
+    OutputLimit,
+    ConcurrencyLimit,
+    ProviderFailure,
+    ChildFailure,
+}
+
+impl HeadlessTaskTerminal {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Cancelled => "task: cancelled",
+            Self::TimedOut => "task: timed out",
+            Self::AgentUnavailable => "task: requested agent is unavailable",
+            Self::ModelUnavailable => "task: requested model is unavailable",
+            Self::SkillUnavailable => "task: requested skill is unavailable",
+            Self::IterationLimit => "task: iteration limit reached",
+            Self::InputLimit => "task: input exceeds configured bounds",
+            Self::OutputLimit => "task: output exceeds configured bounds",
+            Self::ConcurrencyLimit => "task: concurrent child limit reached",
+            Self::ProviderFailure => "task: provider failure",
+            Self::ChildFailure => "task: child execution failed",
+        }
+    }
+}
+
 impl HeadlessToolOutput {
     pub fn success(content: impl Into<String>) -> Self {
         Self {
@@ -719,6 +753,7 @@ pub enum HeadlessTurnPortError {
     Provider,
     Permission,
     Tool,
+    TaskTerminal(HeadlessTaskTerminal),
 }
 
 pub trait TurnProvider {
@@ -842,6 +877,7 @@ pub enum HeadlessTurnError {
     Store,
     MaxIterations,
     State,
+    TaskTerminal(HeadlessTaskTerminal),
 }
 
 impl fmt::Display for HeadlessTurnError {
@@ -857,6 +893,7 @@ impl fmt::Display for HeadlessTurnError {
             Self::Store => "completed turn could not be saved",
             Self::MaxIterations => "turn reached the maximum iterations",
             Self::State => "invalid headless turn state",
+            Self::TaskTerminal(terminal) => terminal.message(),
         };
 
         formatter.write_str(message)
@@ -1151,6 +1188,13 @@ fn finish_port_error(
         return coordinator
             .fail()
             .map(|()| HeadlessTurnError::Authentication)
+            .unwrap_or(HeadlessTurnError::State);
+    }
+
+    if let HeadlessTurnPortError::TaskTerminal(terminal) = error {
+        return coordinator
+            .fail()
+            .map(|()| HeadlessTurnError::TaskTerminal(terminal))
             .unwrap_or(HeadlessTurnError::State);
     }
 

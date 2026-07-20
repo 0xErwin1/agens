@@ -1324,7 +1324,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
     )
     .expect("subagent definition should be written");
 
-    let mut server = TaskStalledOpenAiMockServer::start();
+    let mut server = TaskStalledOpenAiMockServer::start(Duration::from_secs(1));
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -1372,6 +1372,117 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
     );
 
     server.join();
+}
+
+#[test]
+fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
+    let temporary = TemporaryDirectory::new("production-task-provider-failure");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
+    std::fs::write(
+        config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+    let server = BoundedScriptedOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["parent provider failure".into()],
+            response: native_tool_call_response(
+                "task-failure",
+                "task",
+                r#"{"agent":"reviewer","description":"child provider failure"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child provider failure".into()],
+            response: "HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .current_dir(&project_root)
+        .args(["chat", "parent provider failure"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: task: provider failure\n"
+    );
+    assert_no_saved_sessions(&project_root, &config_home);
+    assert_output_and_store_exclude_sentinels(
+        &output,
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_PROVIDER_ERROR",
+            "SENTINEL_HEADER",
+        ],
+    );
+}
+
+#[test]
+fn production_task_deadline_is_exact_and_aborts_the_parent_turn() {
+    let temporary = TemporaryDirectory::new("production-task-deadline");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
+    std::fs::write(
+        config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+    let server = TaskStalledOpenAiMockServer::start(Duration::from_secs(40));
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .current_dir(&project_root)
+        .args(["chat", "parent task deadline"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: task: timed out\n"
+    );
+    assert_no_saved_sessions(&project_root, &config_home);
+    assert_output_and_store_exclude_sentinels(
+        &output,
+        &data_directory.join("rust-sessions.db"),
+        &["SENTINEL_OPENAI_API_KEY"],
+    );
 }
 
 #[test]
@@ -3798,7 +3909,7 @@ impl StalledOpenAiMockServer {
 }
 
 impl TaskStalledOpenAiMockServer {
-    fn start() -> Self {
+    fn start(stall_timeout: Duration) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
         let address = listener
             .local_addr()
@@ -3809,7 +3920,7 @@ impl TaskStalledOpenAiMockServer {
                 .accept()
                 .expect("mock server should accept the parent request");
             let parent_body = read_openai_request_body(&parent);
-            assert!(parent_body.contains("parent task cancellation"));
+            assert!(parent_body.contains("parent task"));
             parent
                 .write_all(
                     native_tool_call_response(
@@ -3843,7 +3954,7 @@ impl TaskStalledOpenAiMockServer {
                 );
             }
             child
-                .set_read_timeout(Some(Duration::from_secs(1)))
+                .set_read_timeout(Some(stall_timeout))
                 .expect("child close timeout should be configured");
             let mut byte = [0_u8; 1];
             let _ = std::io::Read::read(
@@ -4071,6 +4182,27 @@ fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]
             assert!(!value.contains(sentinel), "{location} leaked {sentinel}");
         }
     }
+}
+
+fn assert_output_and_store_exclude_sentinels(
+    output: &std::process::Output,
+    database: &std::path::Path,
+    sentinels: &[&str],
+) {
+    let visible_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    for sentinel in sentinels {
+        assert!(
+            !visible_output.contains(sentinel),
+            "output leaked {sentinel}"
+        );
+    }
+
+    assert_sqlite_has_no_sentinels(database, sentinels);
 }
 
 fn assert_sqlite_contains_sentinels(database: &std::path::Path, sentinels: &[&str]) {

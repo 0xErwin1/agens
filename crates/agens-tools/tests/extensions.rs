@@ -11,8 +11,8 @@ use std::{
 };
 
 use agens_core::{
-    AgentDefinition, AgentMode, Error, PermissionDecision, PermissionMode, PermissionPattern,
-    PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
+    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionDecision, PermissionMode,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
@@ -752,20 +752,34 @@ fn task_description_limit_counts_unicode_scalars_not_bytes() {
 
 #[test]
 fn task_reports_exact_terminal_taxonomy_without_runner_details() {
-    for (runner, expected) in [
+    for (runner, expected, terminal) in [
         (
             TerminalTaskRunner::Iterations,
             "task: iteration limit reached",
+            HeadlessTaskTerminal::IterationLimit,
         ),
-        (TerminalTaskRunner::Provider, "task: provider failure"),
-        (TerminalTaskRunner::Child, "task: child execution failed"),
-        (TerminalTaskRunner::Panic, "task: child execution failed"),
+        (
+            TerminalTaskRunner::Provider,
+            "task: provider failure",
+            HeadlessTaskTerminal::ProviderFailure,
+        ),
+        (
+            TerminalTaskRunner::Child,
+            "task: child execution failed",
+            HeadlessTaskTerminal::ChildFailure,
+        ),
+        (
+            TerminalTaskRunner::Panic,
+            "task: child execution failed",
+            HeadlessTaskTerminal::ChildFailure,
+        ),
     ] {
         let mut task = task_tool(runner);
-        assert_eq!(
-            task.execute(&task_context(), task_arguments()).unwrap(),
-            ToolOutput::failure(expected)
-        );
+        let output = task.execute(&task_context(), task_arguments()).unwrap();
+        assert_eq!(output, ToolOutput::task_terminal(terminal));
+        assert_eq!(output.content, expected);
+        assert_eq!(output.terminal(), Some(terminal));
+        assert!(!output.content.contains("secret panic payload"));
     }
 }
 

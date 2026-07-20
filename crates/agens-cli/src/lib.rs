@@ -237,6 +237,9 @@ impl CliError {
                 "runtime",
                 "headless turn entered an invalid state",
             ),
+            HeadlessTurnError::TaskTerminal(terminal) => {
+                (ExitStatus::Failure, "", terminal.message())
+            }
         };
         Self::new(status, category, message)
     }
@@ -252,6 +255,10 @@ impl CliError {
 
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.category.is_empty() {
+            return formatter.write_str(&self.message);
+        }
+
         write!(formatter, "{}: {}", self.category, self.message)
     }
 }
@@ -2021,6 +2028,8 @@ impl TaskRunner for ProductionTaskRunner {
 
 fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
     match error {
+        HeadlessTurnError::Cancelled => TaskRunnerError::Cancelled,
+        HeadlessTurnError::TimedOut => TaskRunnerError::TimedOut,
         HeadlessTurnError::Provider => TaskRunnerError::ProviderFailure,
         HeadlessTurnError::MaxIterations => TaskRunnerError::IterationLimit,
         _ => TaskRunnerError::ChildFailure,
@@ -2781,30 +2790,34 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
             .lock()
             .map_err(|_| HeadlessTurnPortError::Tool)
             .and_then(|mut allowed| allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool));
-        let output = allowed.and_then(|allowed| {
-            if allowed.name != call.name || allowed.input != call.input {
-                return Err(HeadlessTurnPortError::Tool);
-            }
-            self.dispatcher
-                .lock()
-                .map_err(|_| HeadlessTurnPortError::Tool)?
-                .execute(
-                    allowed.handle,
-                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
-                )
-                .map(|output| {
-                    let content = if output.is_error {
-                        "tool execution failed".to_owned()
-                    } else {
-                        output.content
-                    };
-                    HeadlessToolOutput {
-                        content,
-                        is_error: output.is_error,
-                    }
+        let output = allowed
+            .and_then(|allowed| {
+                if allowed.name != call.name || allowed.input != call.input {
+                    return Err(HeadlessTurnPortError::Tool);
+                }
+                self.dispatcher
+                    .lock()
+                    .map_err(|_| HeadlessTurnPortError::Tool)?
+                    .execute(
+                        allowed.handle,
+                        &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+                    )
+                    .map_err(headless_tool_error)
+            })
+            .and_then(|output| {
+                if let Some(terminal) = output.terminal() {
+                    return Err(HeadlessTurnPortError::TaskTerminal(terminal));
+                }
+                let content = if output.is_error {
+                    "tool execution failed".to_owned()
+                } else {
+                    output.content
+                };
+                Ok(HeadlessToolOutput {
+                    content,
+                    is_error: output.is_error,
                 })
-                .map_err(headless_tool_error)
-        });
+            });
         std::future::ready(output)
     }
 }
