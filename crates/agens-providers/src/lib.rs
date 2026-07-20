@@ -62,7 +62,7 @@ pub struct OpenAiResponsesProvider {
     api_key: String,
     base_url: String,
     model: String,
-    prompt: String,
+    initial_input: Value,
     tools: Vec<OpenAiFunctionTool>,
     parallel_tool_calls: bool,
     client: reqwest::Client,
@@ -83,7 +83,7 @@ pub struct ChatGptResponsesProvider {
     oauth_url: String,
     model: String,
     instructions: String,
-    input: String,
+    initial_input: Vec<Value>,
     session_id: String,
     client: reqwest::Client,
     tools: Vec<OpenAiFunctionTool>,
@@ -247,7 +247,10 @@ impl OpenAiResponsesProvider {
                 .trim_end_matches('/')
                 .to_owned(),
             model,
-            prompt,
+            initial_input: serde_json::json!([{
+                "role": "user",
+                "content": prompt,
+            }]),
             tools,
             parallel_tool_calls: true,
             client: reqwest::Client::builder()
@@ -261,6 +264,27 @@ impl OpenAiResponsesProvider {
             continuation_rounds: 0,
             progress: None,
         })
+    }
+
+    pub fn from_api_key_with_messages_and_tools_and_timeout(
+        api_key: String,
+        base_url: Option<&str>,
+        model: String,
+        messages: Vec<Message>,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
+        let initial_input = resumed_input(&model, &messages, &tools)?;
+        let mut provider = Self::from_api_key_with_tools_and_timeout(
+            api_key,
+            base_url,
+            model,
+            "resumed session".to_owned(),
+            tools,
+            request_timeout,
+        )?;
+        provider.initial_input = Value::Array(initial_input);
+        Ok(provider)
     }
 
     pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
@@ -393,7 +417,10 @@ impl ChatGptResponsesProvider {
                 .to_owned(),
             model,
             instructions,
-            input,
+            initial_input: vec![serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": input}],
+            })],
             session_id: format!(
                 "agens-{}",
                 TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -411,6 +438,32 @@ impl ChatGptResponsesProvider {
             continuation_rounds: 0,
             progress: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
+        credentials_path: &Path,
+        base_url: Option<&str>,
+        oauth_url: Option<&str>,
+        model: String,
+        instructions: String,
+        messages: Vec<Message>,
+        tools: Vec<OpenAiFunctionTool>,
+        request_timeout: Duration,
+    ) -> Result<Self, Error> {
+        let initial_input = resumed_input(&model, &messages, &tools)?;
+        let mut provider = Self::from_credentials_with_tools_and_timeout_and_auth_url(
+            credentials_path,
+            base_url,
+            oauth_url,
+            model,
+            instructions,
+            "resumed session".to_owned(),
+            tools,
+            request_timeout,
+        )?;
+        provider.initial_input = initial_input;
+        Ok(provider)
     }
 
     pub fn with_parallel_tool_calls(mut self, parallel_tool_calls: bool) -> Self {
@@ -612,10 +665,7 @@ impl ChatGptResponsesProvider {
     }
 
     fn initial_input(&self) -> Vec<Value> {
-        vec![serde_json::json!({
-            "role": "user",
-            "content": [{"type": "input_text", "text": self.input}],
-        })]
+        self.initial_input.clone()
     }
 }
 
@@ -834,7 +884,7 @@ impl OpenAiResponsesProvider {
     fn initial_payload(&self) -> Value {
         let mut payload = serde_json::json!({
             "model": self.model,
-            "input": [{ "role": "user", "content": self.prompt }],
+            "input": self.initial_input,
             "parallel_tool_calls": self.parallel_tool_calls,
             "stream": true,
         });
@@ -1357,6 +1407,19 @@ pub fn encode_openai_response_request_with_messages(
     }
 
     Ok(request.to_string())
+}
+
+fn resumed_input(
+    model: &str,
+    messages: &[Message],
+    tools: &[OpenAiFunctionTool],
+) -> Result<Vec<Value>, Error> {
+    let request = encode_openai_response_request_with_messages(model, messages, tools)?;
+    serde_json::from_str::<Value>(&request)
+        .ok()
+        .and_then(|request| request.get("input").cloned())
+        .and_then(|input| input.as_array().cloned())
+        .ok_or_else(invalid_resumed_history)
 }
 
 fn invalid_resumed_history() -> Error {
@@ -2092,6 +2155,60 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn resumed_input_preserves_typed_message_boundaries() {
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("reasoning".into()),
+                    MessagePart::ToolCall {
+                        id: "call-1".into(),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "contents".into(),
+                    is_error: false,
+                }],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("new input".into())],
+            },
+        ];
+
+        assert_eq!(
+            resumed_input("test-model", &messages, &[]).expect("history should encode"),
+            vec![
+                serde_json::json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "reasoning"}],
+                }),
+                serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "native::read",
+                    "arguments": r#"{"path":"notes.md"}"#,
+                }),
+                serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "contents",
+                }),
+                serde_json::json!({
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "new input"}],
+                }),
+            ]
+        );
     }
 
     fn credentials() -> String {

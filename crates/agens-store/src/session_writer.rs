@@ -199,8 +199,12 @@ impl SessionStore {
         &mut self,
         metadata: &SessionMetadata,
         turn: &CompletedSessionTurn,
-    ) -> Result<(), SessionStoreError> {
-        metadata.validate().map_err(|error| {
+    ) -> Result<SessionMetadata, SessionStoreError> {
+        let mut persisted_metadata = metadata.clone();
+        if persisted_metadata.id == 0 {
+            persisted_metadata.id = 1;
+        }
+        persisted_metadata.validate().map_err(|error| {
             SessionStoreError::operation(
                 "validate session metadata",
                 &self.database_path,
@@ -208,13 +212,24 @@ impl SessionStore {
             )
         })?;
         let expected_turn_count =
-            i64::try_from(metadata.completed_turn_count).map_err(|error| {
+            i64::try_from(persisted_metadata.completed_turn_count).map_err(|error| {
                 SessionStoreError::operation(
                     "validate session metadata",
                     &self.database_path,
                     error,
                 )
             })?;
+        persisted_metadata.completed_turn_count = persisted_metadata
+            .completed_turn_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                SessionStoreError::operation(
+                    "validate session metadata",
+                    &self.database_path,
+                    "completed turn count overflow",
+                )
+            })?;
+        persisted_metadata.resumable = true;
 
         let transaction = self
             .connection
@@ -222,8 +237,26 @@ impl SessionStore {
             .map_err(|error| {
                 SessionStoreError::operation("start session turn", &self.database_path, error)
             })?;
-        transaction
-            .execute(
+        if metadata.id == 0 {
+            transaction
+                .execute(
+                    "INSERT INTO sessions (project, title, active_agent, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        metadata.project,
+                        metadata.title,
+                        metadata.active_agent,
+                        metadata.created_at,
+                        metadata.updated_at
+                    ],
+                )
+                .map_err(|error| {
+                    SessionStoreError::operation("create session", &self.database_path, error)
+                })?;
+            persisted_metadata.id = transaction.last_insert_rowid();
+        } else {
+            transaction
+                .execute(
                 "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
                 params![
@@ -234,10 +267,12 @@ impl SessionStore {
                     metadata.created_at,
                     metadata.updated_at
                 ],
-            )
-            .map_err(|error| {
+                )
+                .map_err(|error| {
                 SessionStoreError::operation("create session", &self.database_path, error)
-            })?;
+                })?;
+        }
+        let metadata = &persisted_metadata;
         if transaction.execute(
             "UPDATE sessions SET active_agent = ?1, updated_at = ?2, completed_turn_count = completed_turn_count + 1, resumable = 1
              WHERE id = ?3 AND completed_turn_count = ?4",
@@ -276,7 +311,8 @@ impl SessionStore {
         }
         transaction.commit().map_err(|error| {
             SessionStoreError::operation("commit session turn", &self.database_path, error)
-        })
+        })?;
+        Ok(persisted_metadata)
     }
 }
 

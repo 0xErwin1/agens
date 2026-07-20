@@ -258,6 +258,7 @@ impl std::error::Error for CliError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
     pub prompt: String,
+    history: Vec<Message>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub max_iterations: Option<usize>,
@@ -857,28 +858,11 @@ impl TuiSessionContext {
     }
 
     fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
-        if self.identifier.is_none() {
-            return request;
-        }
-        let context = self
-            .messages
-            .iter()
-            .flat_map(|message| message.parts.iter())
-            .map(|part| match part {
-                MessagePart::Text(text) | MessagePart::Reasoning(text) => text.as_str(),
-                MessagePart::ToolCall { input, .. } => input.as_str(),
-                MessagePart::ToolResult { content, .. } => content.as_str(),
-            })
-            .collect::<String>();
-
-        if !context.is_empty() {
-            request.prompt = format!(
-                "Resumed session context:\n{context}\n\nUser: {}",
-                request.prompt
-            );
+        if self.identifier.is_some() {
+            request.history = self.messages.clone();
+            request.session = self.metadata.clone();
         }
 
-        request.session = self.metadata.clone();
         request
     }
 }
@@ -983,6 +967,7 @@ fn run_tui_prompt(
                 })?
                 .apply_to(HeadlessChatRequest {
                     prompt: prompt.to_owned(),
+                    history: Vec::new(),
                     model: None,
                     system_prompt: None,
                     max_iterations: None,
@@ -990,7 +975,18 @@ fn run_tui_prompt(
                     dangerously_allow_all: false,
                     session: None,
                 });
-            run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
+            let completion = run_production_headless_chat_with_progress(
+                request,
+                bootstrap,
+                cancellation,
+                progress,
+            )?;
+            let mut session = session.lock().map_err(|_| {
+                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+            })?;
+            session.identifier = Some(completion.metadata.id);
+            session.metadata = Some(completion.metadata);
+            Ok(completion.text)
         }
     }
 }
@@ -1032,6 +1028,7 @@ fn resume_tui_session(
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
     let mut request = HeadlessChatRequest {
         prompt: String::new(),
+        history: Vec::new(),
         model: None,
         system_prompt: None,
         max_iterations: None,
@@ -1271,6 +1268,12 @@ fn run_production_headless_chat(
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     run_production_headless_chat_with_progress(request, bootstrap, cancellation, None)
+        .map(|completion| completion.text)
+}
+
+struct HeadlessChatCompletion {
+    text: String,
+    metadata: SessionMetadata,
 }
 
 fn run_production_headless_chat_with_progress(
@@ -1278,7 +1281,7 @@ fn run_production_headless_chat_with_progress(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-) -> Result<String, CliError> {
+) -> Result<HeadlessChatCompletion, CliError> {
     match bootstrap.provider_type() {
         Some("openai-api") => {
             let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
@@ -1289,12 +1292,12 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
-                move |model, prompt, tools| {
-                    OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
+                move |model, messages, tools| {
+                    OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
                         bootstrap.provider_base_url(),
                         model,
-                        prompt,
+                        messages,
                         tools,
                         std::time::Duration::from_secs(120),
                     )
@@ -1319,14 +1322,14 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
-                move |model, prompt, tools| {
-                    ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+                move |model, messages, tools| {
+                    ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
                         bootstrap.provider_base_url(),
                         None,
                         model,
                         instructions,
-                        prompt,
+                        messages,
                         tools,
                         std::time::Duration::from_secs(120),
                     )
@@ -1350,13 +1353,14 @@ fn run_production_headless_chat_with_provider<P>(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    build_provider: impl FnOnce(String, String, Vec<OpenAiFunctionTool>) -> Result<P, CliError>,
-) -> Result<String, CliError>
+    build_provider: impl FnOnce(String, Vec<Message>, Vec<OpenAiFunctionTool>) -> Result<P, CliError>,
+) -> Result<HeadlessChatCompletion, CliError>
 where
     P: ProgressAwareProvider,
 {
     let model = request
         .model
+        .clone()
         .or_else(|| bootstrap.model().map(ToOwned::to_owned))
         .unwrap_or_else(|| match bootstrap.provider_type() {
             Some("openai-chatgpt") => "gpt-5.5".to_owned(),
@@ -1386,7 +1390,7 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut provider = build_provider(model, request.prompt.clone(), provider_tools)?;
+    let mut provider = build_provider(model, provider_messages(&request), provider_tools)?;
     if let Some(progress) = progress {
         provider = provider.with_progress_sink(Arc::clone(progress));
     }
@@ -1443,9 +1447,8 @@ where
     let turn = completed_session_turn(&request.prompt, &snapshot)?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let metadata =
-        next_session_metadata(&store, bootstrap, &request.prompt, request.session.as_ref())?;
-    store
+    let metadata = next_session_metadata(bootstrap, &request.prompt, request.session.as_ref())?;
+    let metadata = store
         .persist_completed_session_turn(&metadata, &turn)
         .map_err(|_| CliError::storage("completed session could not be saved"))?;
 
@@ -1461,10 +1464,22 @@ where
         .collect::<String>();
 
     if text.is_empty() {
-        Ok("completed".to_owned())
+        Ok(HeadlessChatCompletion {
+            text: "completed".to_owned(),
+            metadata,
+        })
     } else {
-        Ok(text)
+        Ok(HeadlessChatCompletion { text, metadata })
     }
+}
+
+fn provider_messages(request: &HeadlessChatRequest) -> Vec<Message> {
+    let mut messages = request.history.clone();
+    messages.push(Message {
+        role: Role::User,
+        parts: vec![MessagePart::Text(request.prompt.clone())],
+    });
+    messages
 }
 
 struct DiscardCompletedTurnRepository;
@@ -1479,7 +1494,6 @@ impl CompletedTurnRepository for DiscardCompletedTurnRepository {
 }
 
 fn next_session_metadata(
-    store: &SessionStore,
     bootstrap: &Bootstrap,
     title: &str,
     resumed: Option<&SessionMetadata>,
@@ -1496,16 +1510,8 @@ fn next_session_metadata(
         });
     }
 
-    let id = store
-        .list_sessions()
-        .map_err(|_| CliError::storage("saved sessions could not be listed"))?
-        .iter()
-        .map(|session| session.id)
-        .max()
-        .unwrap_or_default()
-        + 1;
     Ok(SessionMetadata {
-        id,
+        id: 0,
         project: bootstrap
             .project_root()
             .map(|path| path.display().to_string())
@@ -2710,7 +2716,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_tui_session_adds_restored_context_to_the_next_prompt() {
+    fn resumed_tui_session_preserves_typed_history_for_the_next_prompt() {
         let metadata = SessionMetadata {
             id: 7,
             project: "project".into(),
@@ -2721,26 +2727,43 @@ mod tests {
             completed_turn_count: 1,
             resumable: true,
         };
-        let messages = vec![Message {
-            role: Role::Assistant,
-            parts: vec![MessagePart::Text("previous answer".into())],
-        }];
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("previous reasoning".into()),
+                    MessagePart::ToolCall {
+                        id: "call-1".into(),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "previous result".into(),
+                    is_error: false,
+                }],
+            },
+        ];
 
-        let request =
-            TuiSessionContext::resumed(7, metadata, messages).apply_to(HeadlessChatRequest {
+        let request = TuiSessionContext::resumed(7, metadata, messages.clone()).apply_to(
+            HeadlessChatRequest {
                 prompt: "next question".into(),
+                history: Vec::new(),
                 model: None,
                 system_prompt: None,
                 max_iterations: None,
                 mode: PermissionMode::Edit,
                 dangerously_allow_all: false,
                 session: None,
-            });
-
-        assert_eq!(
-            request.prompt,
-            "Resumed session context:\nprevious answer\n\nUser: next question"
+            },
         );
+
+        assert_eq!(request.prompt, "next question");
+        assert_eq!(request.history, messages);
         assert_eq!(request.system_prompt, None);
         assert_eq!(request.session.as_ref().map(|session| session.id), Some(7));
     }
@@ -2749,6 +2772,7 @@ mod tests {
     fn fresh_tui_session_does_not_reuse_prior_context() {
         let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
             prompt: "new question".into(),
+            history: Vec::new(),
             model: None,
             system_prompt: None,
             max_iterations: None,
