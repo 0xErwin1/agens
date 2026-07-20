@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use agens_core::{MessagePart, TurnEvent, Usage};
 use agens_tui::{
-    DiffLine, DiffLineKind, Engine, RatatuiRenderer, Renderer, ToolResultState, Tui,
-    TuiRuntimeEvent,
+    ConversationEvent, DiffLine, DiffLineKind, Engine, Event, Key, RatatuiRenderer, Renderer,
+    ToolResultState, Tui, TuiRuntimeEvent,
 };
 use ratatui::{Terminal, backend::TestBackend};
 
@@ -12,6 +12,125 @@ struct FakeEngine;
 
 impl Engine for FakeEngine {
     fn cancel(&mut self) {}
+}
+
+fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
+    renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+#[test]
+fn renderer_projects_conversation_losslessly_by_call_id() {
+    let backend = TestBackend::new(120, 50);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("review the patch");
+    for event in [
+        ConversationEvent::ReasoningDelta("inspect every changed line".into()),
+        ConversationEvent::MarkdownDelta("stale live markdown".into()),
+        ConversationEvent::MarkdownFinal("final **markdown**".into()),
+        ConversationEvent::ToolCall {
+            call_id: "read-1".into(),
+            name: "native::read".into(),
+            input: "src/render.rs".into(),
+        },
+        ConversationEvent::ToolCall {
+            call_id: "write-2".into(),
+            name: "native::write".into(),
+            input: "src/render.rs".into(),
+        },
+        ConversationEvent::ToolResult {
+            call_id: "write-2".into(),
+            output: "write result".into(),
+            is_error: false,
+        },
+        ConversationEvent::ToolResult {
+            call_id: "read-1".into(),
+            output: "read result".into(),
+            is_error: false,
+        },
+        ConversationEvent::Diff(vec![DiffLine::new(8, DiffLineKind::Added, "new line")]),
+        ConversationEvent::Error {
+            message: "Request failed safely".into(),
+            action: "Check credentials and retry.".into(),
+        },
+    ] {
+        tui.apply_conversation_event(event).unwrap();
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "read-1".into(),
+        duration: Some(Duration::from_millis(12)),
+        result: ToolResultState::Success,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(5),
+        total_tokens: Some(8),
+        context_window: Some(128),
+    }));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for expected in [
+        "final **markdown**",
+        "inspect every changed line",
+        "read-1 native::read",
+        "read result",
+        "write-2 native::write",
+        "write result",
+        "12ms",
+        "8 + new line",
+        "input 3",
+        "Request failed safely",
+        "Action: Check credentials and retry.",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+    }
+    assert!(!text.contains("stale live markdown"), "{text:?}");
+    assert!(text.find("read-1").unwrap() < text.find("write-2").unwrap());
+}
+
+#[test]
+fn renderer_recovers_collapsed_long_tool_output_in_a_bounded_viewport() {
+    let backend = TestBackend::new(48, 12);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "large.log".into(),
+    })
+    .unwrap();
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "read-1".into(),
+        output: format!("short preview\n{}", "full-output-sentinel ".repeat(12)),
+        is_error: false,
+    })
+    .unwrap();
+    tui.set_tool_output_expanded("read-1", false);
+
+    renderer.render(tui.view()).unwrap();
+    let collapsed = rendered_text(&renderer);
+    assert!(collapsed.contains("output collapsed"), "{collapsed:?}");
+    assert!(!collapsed.contains("full-output-sentinel"), "{collapsed:?}");
+
+    tui.set_tool_output_expanded("read-1", true);
+    tui.handle(Event::Key(Key::PageUp));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(expanded.contains("full-output-sentinel"), "{expanded:?}");
 }
 
 #[test]

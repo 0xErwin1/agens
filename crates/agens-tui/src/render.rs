@@ -7,9 +7,88 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{DiffLineKind, ToolResultState, TuiRuntimeEvent};
+use std::collections::BTreeSet;
 
-pub(super) fn detail_lines(events: &[TuiRuntimeEvent]) -> Vec<Line<'static>> {
+use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
+
+pub(super) fn conversation_lines(
+    conversation: &Conversation,
+    events: &[TuiRuntimeEvent],
+    collapsed_tool_outputs: &BTreeSet<String>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    line(&mut lines, "USER", Color::Green, &conversation.user);
+    markdown_lines(
+        &mut lines,
+        "ASSISTANT",
+        conversation
+            .final_markdown
+            .as_deref()
+            .unwrap_or(&conversation.live_markdown),
+    );
+    markdown_lines(&mut lines, "THINKING", &conversation.reasoning);
+
+    for (batch_index, batch) in conversation.tool_batches.iter().enumerate() {
+        line(
+            &mut lines,
+            "TOOLS",
+            Color::Magenta,
+            format!("batch {}", batch_index + 1),
+        );
+        for call in &batch.calls {
+            line(
+                &mut lines,
+                "TOOLS",
+                Color::Magenta,
+                format!("{} {}\n  input: {}", call.call_id, call.name, call.input),
+            );
+            if let Some(result) = &call.result {
+                let (result_state, duration) = tool_state(events, &call.call_id, result.is_error);
+                line(
+                    &mut lines,
+                    "TOOLS",
+                    result_color(result_state),
+                    format!(
+                        "{} {:?}{}",
+                        call.call_id,
+                        result_state,
+                        duration_label(duration)
+                    ),
+                );
+                if collapsed_tool_outputs.contains(&call.call_id) {
+                    line(
+                        &mut lines,
+                        "TOOLS",
+                        Color::Gray,
+                        "output collapsed; expand to recover",
+                    );
+                } else {
+                    markdown_lines(&mut lines, "OUTPUT", &result.output);
+                }
+            }
+        }
+    }
+
+    for change in &conversation.diffs {
+        diff_line(&mut lines, change.number, change.kind, &change.text);
+    }
+    for error in &conversation.errors {
+        line(&mut lines, "ERROR", Color::Red, &error.message);
+        line(
+            &mut lines,
+            "ACTION",
+            Color::Yellow,
+            format!("Action: {}", error.action),
+        );
+    }
+    lines
+}
+
+pub(super) fn detail_lines(
+    events: &[TuiRuntimeEvent],
+    conversation_is_authoritative: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     for event in events {
@@ -37,7 +116,7 @@ pub(super) fn detail_lines(events: &[TuiRuntimeEvent]) -> Vec<Line<'static>> {
                 call_id,
                 name,
                 input,
-            } => line(
+            } if !conversation_is_authoritative => line(
                 &mut lines,
                 "TOOLS",
                 Color::Magenta,
@@ -47,7 +126,7 @@ pub(super) fn detail_lines(events: &[TuiRuntimeEvent]) -> Vec<Line<'static>> {
                 call_id,
                 duration,
                 result,
-            } => line(
+            } if !conversation_is_authoritative => line(
                 &mut lines,
                 "TOOLS",
                 result_color(*result),
@@ -56,27 +135,64 @@ pub(super) fn detail_lines(events: &[TuiRuntimeEvent]) -> Vec<Line<'static>> {
             TuiRuntimeEvent::Diff {
                 call_id,
                 lines: diff,
-            } => {
+            } if !conversation_is_authoritative => {
                 line(&mut lines, "DIFF", Color::Yellow, format!("{call_id}:"));
                 for change in diff {
-                    let (marker, color) = match change.kind {
-                        DiffLineKind::Added => ('+', Color::Green),
-                        DiffLineKind::Removed => ('-', Color::Red),
-                        DiffLineKind::Context => (' ', Color::Gray),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {:>4} {marker} ", change.number),
-                            Style::default().fg(color),
-                        ),
-                        Span::raw(change.text.clone()),
-                    ]));
+                    diff_line(&mut lines, change.number, change.kind, &change.text);
                 }
             }
+            _ => {}
         }
     }
 
     lines
+}
+
+fn markdown_lines(lines: &mut Vec<Line<'static>>, label: &str, markdown: &str) {
+    if !markdown.is_empty() {
+        line(lines, label, Color::Cyan, markdown);
+    }
+}
+
+fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, text: &str) {
+    let (marker, color) = match kind {
+        DiffLineKind::Added => ('+', Color::Green),
+        DiffLineKind::Removed => ('-', Color::Red),
+        DiffLineKind::Context => (' ', Color::Gray),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("  {:>4} {marker} ", number),
+            Style::default().fg(color),
+        ),
+        Span::raw(text.to_owned()),
+    ]));
+}
+
+fn tool_state(
+    events: &[TuiRuntimeEvent],
+    call_id: &str,
+    is_error: bool,
+) -> (ToolResultState, Option<Duration>) {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            TuiRuntimeEvent::ToolEnded {
+                call_id: event_call_id,
+                duration,
+                result,
+            } if event_call_id == call_id => Some((*result, *duration)),
+            _ => None,
+        })
+        .unwrap_or((
+            if is_error {
+                ToolResultState::Failure
+            } else {
+                ToolResultState::Success
+            },
+            None,
+        ))
 }
 
 fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl Into<String>) {

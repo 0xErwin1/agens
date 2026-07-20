@@ -20,6 +20,7 @@ pub use terminal::{
 };
 
 use std::{
+    collections::BTreeSet,
     io::{self, Stdout, Write},
     sync::{Arc, mpsc},
     thread,
@@ -140,6 +141,10 @@ pub struct ViewState<'a> {
     pub input_cursor: usize,
     /// Typed metrics retained for rich, lossless presentation.
     pub runtime_events: &'a [TuiRuntimeEvent],
+    /// Authoritative typed conversation projection, when a turn is active or completed.
+    pub conversation: Option<&'a Conversation>,
+    /// Tool outputs collapsed only for presentation; their source output remains retained.
+    pub collapsed_tool_outputs: &'a BTreeSet<String>,
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -174,8 +179,20 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_header(frame, layout.header, &state, layout.show_context);
     }
 
-    let mut transcript = transcript_lines(state.transcript);
-    transcript.extend(render::detail_lines(state.runtime_events));
+    let mut transcript = state
+        .conversation
+        .map(|conversation| {
+            render::conversation_lines(
+                conversation,
+                state.runtime_events,
+                state.collapsed_tool_outputs,
+            )
+        })
+        .unwrap_or_else(|| transcript_lines(state.transcript));
+    transcript.extend(render::detail_lines(
+        state.runtime_events,
+        state.conversation.is_some(),
+    ));
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
     let bottom_scroll =
         transcript_rows(&transcript, layout.transcript.width).saturating_sub(visible_rows) as u16;
@@ -520,6 +537,8 @@ pub struct Tui<E> {
     turn_state: Option<TurnState>,
     active_tool: Option<String>,
     runtime_events: Vec<TuiRuntimeEvent>,
+    conversation: Option<Conversation>,
+    collapsed_tool_outputs: BTreeSet<String>,
 }
 
 impl<E> Tui<E>
@@ -543,6 +562,8 @@ where
             turn_state: None,
             active_tool: None,
             runtime_events: Vec::new(),
+            conversation: None,
+            collapsed_tool_outputs: BTreeSet::new(),
         }
     }
 
@@ -601,12 +622,23 @@ where
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
-        self.transcript.push(TranscriptEntry::User(prompt.into()));
+        let prompt = prompt.into();
+        self.transcript.push(TranscriptEntry::User(prompt.clone()));
+        self.conversation = Some(Conversation::new(prompt));
+        self.collapsed_tool_outputs.clear();
         self.set_running(true);
     }
 
     /// Records a completed runtime result without exposing provider internals.
     pub fn finish_submission(&mut self, result: Result<String, String>) {
+        let conversation_event = match &result {
+            Ok(output) => ConversationEvent::MarkdownFinal(output.clone()),
+            Err(error) => ConversationEvent::Error {
+                message: error.clone(),
+                action: "Retry the request or inspect the runtime error.".into(),
+            },
+        };
+        self.project_conversation(conversation_event);
         let entry = match result {
             Ok(output) => TranscriptEntry::Assistant(output),
             Err(error) => TranscriptEntry::Error(error),
@@ -623,6 +655,8 @@ where
     /// Clears the current visible conversation for a new session.
     pub fn clear_transcript(&mut self) {
         self.transcript.clear();
+        self.conversation = None;
+        self.collapsed_tool_outputs.clear();
         self.set_running(false);
     }
 
@@ -633,7 +667,30 @@ where
 
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
     pub fn apply_runtime_event(&mut self, event: TuiRuntimeEvent) {
+        if let TuiRuntimeEvent::Diff { lines, .. } = &event {
+            self.project_conversation(ConversationEvent::Diff(lines.clone()));
+        }
         self.runtime_events.push(event);
+    }
+
+    /// Adds a typed event to the authoritative, lossless conversation projection.
+    pub fn apply_conversation_event(
+        &mut self,
+        event: ConversationEvent,
+    ) -> Result<(), ConversationError> {
+        self.conversation
+            .get_or_insert_with(|| Conversation::new(String::new()))
+            .apply(event)
+    }
+
+    /// Collapses or expands a tool output without discarding its retained source text.
+    pub fn set_tool_output_expanded(&mut self, call_id: impl Into<String>, expanded: bool) {
+        let call_id = call_id.into();
+        if expanded {
+            self.collapsed_tool_outputs.remove(&call_id);
+        } else {
+            self.collapsed_tool_outputs.insert(call_id);
+        }
     }
 
     pub fn runtime_events(&self) -> &[TuiRuntimeEvent] {
@@ -656,6 +713,8 @@ where
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
             runtime_events: &self.runtime_events,
+            conversation: self.conversation.as_ref(),
+            collapsed_tool_outputs: &self.collapsed_tool_outputs,
         }
     }
 
@@ -667,6 +726,7 @@ where
     pub fn apply_progress(&mut self, event: TurnEvent) {
         match event {
             TurnEvent::ProviderPart(MessagePart::Text(delta)) => {
+                self.project_conversation(ConversationEvent::MarkdownDelta(delta.clone()));
                 self.turn_state = Some(TurnState::Streaming);
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
@@ -674,20 +734,33 @@ where
                 }
             }
             TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
+                self.project_conversation(ConversationEvent::ReasoningDelta(delta.clone()));
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Reasoning(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Reasoning(delta)),
                 }
             }
-            TurnEvent::ToolCallRequested { name, .. } => {
+            TurnEvent::ToolCallRequested { id, name, input } => {
+                self.project_conversation(ConversationEvent::ToolCall {
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                });
                 self.turn_state = Some(TurnState::Dispatching);
                 self.active_tool = Some(name.clone());
                 self.transcript
                     .push(TranscriptEntry::Tool(format!("{name} started")));
             }
             TurnEvent::ToolResult(MessagePart::ToolResult {
-                content, is_error, ..
+                tool_call_id,
+                content,
+                is_error,
             }) => {
+                self.project_conversation(ConversationEvent::ToolResult {
+                    call_id: tool_call_id.clone(),
+                    output: content.clone(),
+                    is_error,
+                });
                 let name = self
                     .transcript
                     .iter()
@@ -813,6 +886,19 @@ where
         self.quit_armed = false;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
+    }
+
+    fn project_conversation(&mut self, event: ConversationEvent) {
+        if self.apply_conversation_event(event).is_err() {
+            self.conversation
+                .as_mut()
+                .expect("conversation is initialized before projection")
+                .errors
+                .push(ActionableError {
+                    message: "Conversation event could not be projected.".into(),
+                    action: "Inspect the runtime error and retry the request.".into(),
+                });
+        }
     }
 }
 
