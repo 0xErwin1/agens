@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -24,9 +25,9 @@ pub(super) fn conversation_lines(
             ConversationItem::Info(text) => line(&mut lines, "INFO", Color::Yellow, text),
             ConversationItem::User(text) => line(&mut lines, "USER", Color::Green, text),
             ConversationItem::Assistant(text) => {
-                markdown_lines(&mut lines, "ASSISTANT", text);
+                markdown_lines(&mut lines, text, Style::default(), "");
             }
-            ConversationItem::Reasoning(text) => markdown_lines(&mut lines, "THINKING", text),
+            ConversationItem::Reasoning(text) => line(&mut lines, "THINKING", Color::Cyan, text),
             ConversationItem::ToolCall {
                 call_id,
                 name,
@@ -68,7 +69,7 @@ pub(super) fn conversation_lines(
                         "output collapsed; expand to recover",
                     );
                 } else {
-                    markdown_lines(&mut lines, "OUTPUT", output);
+                    markdown_lines(&mut lines, output, Style::default().fg(Color::Gray), "  │ ");
                 }
             }
             ConversationItem::Diff(diff) => {
@@ -139,9 +140,245 @@ pub(super) fn detail_lines(
     lines
 }
 
-fn markdown_lines(lines: &mut Vec<Line<'static>>, label: &str, markdown: &str) {
-    if !markdown.is_empty() {
-        line(lines, label, Color::Cyan, markdown);
+fn markdown_lines(lines: &mut Vec<Line<'static>>, markdown: &str, base_style: Style, prefix: &str) {
+    if markdown.is_empty() {
+        return;
+    }
+
+    lines.extend(MarkdownRenderer::new(base_style, prefix).render(markdown));
+    lines.push(Line::default());
+}
+
+struct MarkdownRenderer {
+    lines: Vec<Line<'static>>,
+    spans: Vec<Span<'static>>,
+    base_style: Style,
+    prefix: String,
+    strong: usize,
+    emphasis: usize,
+    heading: Option<HeadingLevel>,
+    code_block: bool,
+    quote_depth: usize,
+    lists: Vec<Option<u64>>,
+    links: Vec<String>,
+}
+
+impl MarkdownRenderer {
+    fn new(base_style: Style, prefix: &str) -> Self {
+        Self {
+            lines: Vec::new(),
+            spans: Vec::new(),
+            base_style,
+            prefix: prefix.to_owned(),
+            strong: 0,
+            emphasis: 0,
+            heading: None,
+            code_block: false,
+            quote_depth: 0,
+            lists: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+
+    fn render(mut self, markdown: &str) -> Vec<Line<'static>> {
+        for event in Parser::new(markdown) {
+            self.event(event);
+        }
+        self.finish_line();
+        while self.lines.last().is_some_and(|line| line.spans.is_empty()) {
+            self.lines.pop();
+        }
+        self.lines
+    }
+
+    fn event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                self.text(&text, self.current_style())
+            }
+            Event::Code(code) => self.text(
+                &code,
+                self.current_style()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Event::SoftBreak | Event::HardBreak => self.finish_line(),
+            Event::Rule => {
+                self.finish_line();
+                self.text("────────────────", self.base_style.fg(Color::DarkGray));
+                self.finish_line();
+            }
+            Event::TaskListMarker(checked) => {
+                self.text(if checked { "[x] " } else { "[ ] " }, self.base_style)
+            }
+            Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
+                self.text(&text, self.current_style())
+            }
+        }
+    }
+
+    fn start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Heading { level, .. } => {
+                self.finish_line();
+                self.heading = Some(level);
+            }
+            Tag::Strong => self.strong += 1,
+            Tag::Emphasis => self.emphasis += 1,
+            Tag::BlockQuote(_) => self.quote_depth += 1,
+            Tag::List(start) => self.lists.push(start),
+            Tag::Item => {
+                self.finish_line();
+                let depth = self.lists.len().saturating_sub(1);
+                let marker = match self.lists.last_mut() {
+                    Some(Some(next)) => {
+                        let marker = format!("{next}. ");
+                        *next += 1;
+                        marker
+                    }
+                    _ => "• ".to_owned(),
+                };
+                self.text(&format!("{}{marker}", "  ".repeat(depth)), self.base_style);
+            }
+            Tag::CodeBlock(kind) => {
+                self.finish_line();
+                self.code_block = true;
+                if let CodeBlockKind::Fenced(language) = kind
+                    && !language.is_empty()
+                {
+                    self.text(&language, self.base_style.fg(Color::DarkGray));
+                    self.finish_line();
+                }
+            }
+            Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
+            Tag::Paragraph
+            | Tag::HtmlBlock
+            | Tag::FootnoteDefinition(_)
+            | Tag::Strikethrough
+            | Tag::Image { .. }
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::MetadataBlock(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+            | Tag::Superscript
+            | Tag::Subscript => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => self.finish_block(),
+            TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
+            TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
+            TagEnd::BlockQuote(_) => {
+                self.finish_line();
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+            }
+            TagEnd::List(_) => {
+                self.finish_line();
+                self.lists.pop();
+            }
+            TagEnd::CodeBlock => {
+                self.finish_line();
+                self.code_block = false;
+                self.blank_line();
+            }
+            TagEnd::Link => {
+                if let Some(destination) = self.links.pop()
+                    && !destination.is_empty()
+                {
+                    self.text(
+                        &format!(" ({destination})"),
+                        self.base_style.fg(Color::Blue).add_modifier(Modifier::DIM),
+                    );
+                }
+            }
+            TagEnd::HtmlBlock
+            | TagEnd::FootnoteDefinition
+            | TagEnd::Strikethrough
+            | TagEnd::Image
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::MetadataBlock(_)
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Superscript
+            | TagEnd::Subscript => {}
+        }
+    }
+
+    fn text(&mut self, text: &str, style: Style) {
+        for (index, segment) in text.split('\n').enumerate() {
+            if index > 0 {
+                self.finish_line();
+            }
+            self.start_line();
+            if !segment.is_empty() {
+                self.spans.push(Span::styled(segment.to_owned(), style));
+            }
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        let mut style = self.base_style;
+        if self.strong > 0 || self.heading.is_some() {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.emphasis > 0 {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if !self.links.is_empty() {
+            style = style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+        }
+        if self.code_block {
+            style = style.fg(Color::Gray);
+        }
+        style
+    }
+
+    fn start_line(&mut self) {
+        if !self.spans.is_empty() {
+            return;
+        }
+        if !self.prefix.is_empty() {
+            self.spans.push(Span::styled(
+                self.prefix.clone(),
+                self.base_style.fg(Color::DarkGray),
+            ));
+        }
+        if self.quote_depth > 0 {
+            self.spans.push(Span::styled(
+                "│ ".repeat(self.quote_depth),
+                self.base_style.fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    fn finish_line(&mut self) {
+        if !self.spans.is_empty() {
+            self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        }
+    }
+
+    fn finish_block(&mut self) {
+        self.finish_line();
+        self.blank_line();
+        self.heading = None;
+    }
+
+    fn blank_line(&mut self) {
+        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
+            self.lines.push(Line::default());
+        }
     }
 }
 

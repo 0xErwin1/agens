@@ -1028,7 +1028,6 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     assert!(text.contains("session #42"));
     assert!(text.contains("USER"));
     assert!(text.contains("THINKING"));
-    assert!(text.contains("ASSISTANT"));
     assert!(text.contains("Compose"));
     assert!(text.contains("2 lines"));
     assert!(text.contains("Shift+Enter"));

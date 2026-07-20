@@ -6,7 +6,11 @@ use agens_tui::{
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
     TuiRuntimeEvent,
 };
-use ratatui::{Terminal, backend::TestBackend};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    style::{Color, Modifier},
+};
 
 #[derive(Default)]
 struct FakeEngine;
@@ -24,6 +28,106 @@ fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+fn cell_for_text<'a>(
+    renderer: &'a RatatuiRenderer<TestBackend>,
+    text: &str,
+) -> &'a ratatui::buffer::Cell {
+    let index = cell_index(renderer, text);
+    &renderer.terminal().backend().buffer().content[index]
+}
+
+fn rendered_row(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
+    cell_index(renderer, text) / usize::from(renderer.terminal().backend().buffer().area.width)
+}
+
+fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
+    let buffer = renderer.terminal().backend().buffer();
+    let width = text.chars().count();
+    buffer
+        .content
+        .windows(width)
+        .position(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == text)
+        .expect("text should be rendered")
+}
+
+#[test]
+fn renderer_renders_practical_markdown_semantics() {
+    let terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "# Result\n\nUse **STRONGTOKEN** and *EMPHASISTOKEN* with `INLINE_TOKEN`.\n\n```rust\nfn example() {}\n```\n\n- first item\n- second item\n\n> quoted text\n\n[LINKTOKEN](https://example.com/docs)"
+            .into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for absent in [
+        "ASSISTANT",
+        "**",
+        "*EMPHASISTOKEN*",
+        "```",
+        "`INLINE_TOKEN`",
+    ] {
+        assert!(!text.contains(absent), "found {absent:?} in {text:?}");
+    }
+    for expected in [
+        "Result",
+        "STRONGTOKEN",
+        "EMPHASISTOKEN",
+        "INLINE_TOKEN",
+        "rust",
+        "fn example() {}",
+        "first item",
+        "quoted text",
+        "LINKTOKEN",
+        "https://example.com/docs",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in {text:?}");
+    }
+
+    assert!(
+        cell_for_text(&renderer, "STRONGTOKEN")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert_eq!(cell_for_text(&renderer, "INLINE_TOKEN").fg, Color::Yellow);
+    let link = cell_for_text(&renderer, "LINKTOKEN");
+    assert_eq!(link.fg, Color::Blue);
+    assert!(link.modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn streamed_and_final_markdown_share_one_stable_rendering_path() {
+    let terminal = Terminal::new(TestBackend::new(64, 20)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    let markdown = "## Stable heading\n\nA **stable-answer-token**.";
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(markdown.into())));
+    renderer.render(tui.view()).unwrap();
+    let live = rendered_text(&renderer);
+    let live_row = rendered_row(&renderer, "stable-answer-token");
+
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed(markdown.into()));
+    renderer.render(tui.view()).unwrap();
+    let final_text = rendered_text(&renderer);
+
+    assert_eq!(live.matches("stable-answer-token").count(), 1, "{live:?}");
+    assert_eq!(
+        final_text.matches("stable-answer-token").count(),
+        1,
+        "{final_text:?}"
+    );
+    assert_eq!(rendered_row(&renderer, "stable-answer-token"), live_row);
+    assert!(!live.contains("##"), "{live:?}");
+    assert!(!final_text.contains("**"), "{final_text:?}");
 }
 
 #[test]
@@ -82,7 +186,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     let text = rendered_text(&renderer);
 
     for expected in [
-        "final **markdown**",
+        "final markdown",
         "inspect every changed line",
         "read-1 native::read",
         "read result",
@@ -98,6 +202,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
     assert!(!text.contains("stale live markdown"), "{text:?}");
+    assert!(!text.contains("**"), "{text:?}");
     assert!(text.find("read-1").unwrap() < text.find("write-2").unwrap());
 }
 
