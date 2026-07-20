@@ -779,9 +779,10 @@ where
 
     pub fn apply_route_progress(&mut self, progress: TuiRouteProgress) {
         let (title, body) = match progress {
-            TuiRouteProgress::BrowserUrl(url) => {
-                ("ChatGPT authentication", format!("Open {}", bounded_auth_text(&url, 512)))
-            }
+            TuiRouteProgress::BrowserUrl(url) => (
+                "ChatGPT authentication",
+                format!("Open {}", bounded_auth_text(&url, 512)),
+            ),
             TuiRouteProgress::DeviceCode {
                 verification_url,
                 user_code,
@@ -1362,10 +1363,7 @@ pub fn run_with_default_progress_submit<E, R, F>(
 ) -> io::Result<()>
 where
     E: Engine + Send,
-    R: Fn(String, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
-        + Send
-        + Sync
-        + 'static,
+    R: Fn(String, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome + Send + Sync + 'static,
     F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
         + Send
         + Sync

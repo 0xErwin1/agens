@@ -20,7 +20,9 @@ use agens_core::{
     SessionMetadata, TurnEvent, TurnProgressSink, TurnState,
     run_headless_turn_with_max_iterations_and_progress,
 };
-use agens_providers::chatgpt_login::{LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry};
+use agens_providers::chatgpt_login::{
+    LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
+};
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
     ProgressAwareProvider, load_chatgpt_auth_state,
@@ -37,7 +39,7 @@ use agens_tools::{
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, ToolResultState, Tui,
-    TuiPresentation, TuiProviderOutcome, TuiRuntimeEvent, TuiSubmissionOutcome,
+    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
     run_with_default_progress_submit,
 };
 
@@ -1243,16 +1245,71 @@ impl TuiEngine for ProductionTuiEngine {
 
 #[derive(Clone)]
 struct TuiRuntimeRouter {
-    bootstrap: Bootstrap,
+    bootstrap: Arc<Mutex<Bootstrap>>,
     session: Arc<Mutex<TuiSessionContext>>,
+    cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+    auth: ChatGptAuthCoordinator,
 }
 
 impl TuiRuntimeRouter {
-    fn new(bootstrap: Bootstrap, session: Arc<Mutex<TuiSessionContext>>) -> Self {
-        Self { bootstrap, session }
+    fn new(
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<TuiSessionContext>>,
+        cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+    ) -> Self {
+        Self::with_auth_coordinator(
+            bootstrap,
+            session,
+            cancellation,
+            ChatGptAuthCoordinator::production(),
+        )
     }
 
+    fn with_auth_coordinator(
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<TuiSessionContext>>,
+        cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+        auth: ChatGptAuthCoordinator,
+    ) -> Self {
+        Self {
+            bootstrap: Arc::new(Mutex::new(bootstrap)),
+            session,
+            cancellation,
+            auth,
+        }
+    }
+
+    #[cfg(test)]
     fn route(&self, input: String) -> TuiSubmissionOutcome {
+        let (progress, _) = std::sync::mpsc::channel();
+        self.route_with_progress(input, progress)
+    }
+
+    fn route_with_progress(
+        &self,
+        input: String,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> TuiSubmissionOutcome {
+        let command = input.trim();
+        let auth = match command {
+            "/connect" => Some(self.connect(ChatGptAuthFlow::Browser, progress)),
+            "/connect --device-auth" => Some(self.connect(ChatGptAuthFlow::Device, progress)),
+            "/disconnect" => Some(self.disconnect()),
+            _ => None,
+        };
+        if let Some(result) = auth {
+            return match result {
+                Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
+                Err(AuthRouteError::Auth(error)) => TuiSubmissionOutcome::LocalActionableError {
+                    message: error.message().into(),
+                    action: error.action().into(),
+                },
+                Err(AuthRouteError::Runtime(error)) => TuiSubmissionOutcome::LocalActionableError {
+                    message: error.to_string(),
+                    action: TUI_ERROR_ACTION.into(),
+                },
+            };
+        }
         self.resolve(input)
             .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
                 message: error.to_string(),
@@ -1266,8 +1323,9 @@ impl TuiRuntimeRouter {
         }
 
         let command = input.trim();
+        let bootstrap = self.bootstrap()?;
         let outcome = match command {
-            "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&self.bootstrap)?),
+            "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&bootstrap)?),
             "/new" => {
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1288,7 +1346,7 @@ impl TuiRuntimeRouter {
                     .trim()
                     .parse::<i64>()
                     .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
-                let resumed = resume_tui_session(&self.bootstrap, identifier)?;
+                let resumed = resume_tui_session(&bootstrap, identifier)?;
                 let message = resumed.note();
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1304,39 +1362,39 @@ impl TuiRuntimeRouter {
                 }
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
-                message: rotate_tui_agent(&self.bootstrap, &command[7..], &self.session)?,
+                message: rotate_tui_agent(&bootstrap, &command[7..], &self.session)?,
                 presentation: self.presentation()?,
             },
             "/agent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
-                &self.bootstrap,
+                &bootstrap,
                 &self.session,
                 agens_core::AgentMode::Primary,
             )?),
             command if command.starts_with("/subagent ") => TuiSubmissionOutcome::ContextChanged {
-                message: select_tui_subagent(&self.bootstrap, &command[10..], &self.session)?,
+                message: select_tui_subagent(&bootstrap, &command[10..], &self.session)?,
                 presentation: self.presentation()?,
             },
             "/subagent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
-                &self.bootstrap,
+                &bootstrap,
                 &self.session,
                 agens_core::AgentMode::Subagent,
             )?),
             "/model" => TuiSubmissionOutcome::LocalInfo(select_tui_model(
-                &self.bootstrap,
+                &bootstrap,
                 command,
                 &self.session,
             )?),
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
-                message: select_tui_model(&self.bootstrap, command, &self.session)?,
+                message: select_tui_model(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
             "/effort" => TuiSubmissionOutcome::LocalInfo(select_tui_effort(
-                &self.bootstrap,
+                &bootstrap,
                 command,
                 &self.session,
             )?),
             command if command.starts_with("/effort ") => TuiSubmissionOutcome::ContextChanged {
-                message: select_tui_effort(&self.bootstrap, command, &self.session)?,
+                message: select_tui_effort(&bootstrap, command, &self.session)?,
                 presentation: self.presentation()?,
             },
             _ => return Err(CliError::usage(format!("unknown TUI command: {command}"))),
@@ -1345,6 +1403,7 @@ impl TuiRuntimeRouter {
     }
 
     fn presentation(&self) -> Result<TuiPresentation, CliError> {
+        let bootstrap = self.bootstrap()?;
         let session = self
             .session
             .lock()
@@ -1359,17 +1418,110 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .and_then(|agent| agent.model.as_deref())
             })
-            .or_else(|| self.bootstrap.model())
-            .unwrap_or_else(|| default_model(&self.bootstrap));
+            .or_else(|| bootstrap.model())
+            .unwrap_or_else(|| default_model(&bootstrap));
         let label = session
             .identifier
             .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
         Ok(TuiPresentation::new(
-            self.bootstrap.provider_type().unwrap_or("provider"),
+            bootstrap.provider_type().unwrap_or("provider"),
             model,
             label,
         ))
     }
+
+    fn bootstrap(&self) -> Result<Bootstrap, CliError> {
+        self.bootstrap
+            .lock()
+            .map(|bootstrap| bootstrap.clone())
+            .map_err(|_| CliError::storage("TUI provider state is unavailable"))
+    }
+
+    fn connect(
+        &self,
+        flow: ChatGptAuthFlow,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> Result<String, AuthRouteError> {
+        let operation =
+            HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(600));
+        *self.cancellation.lock().map_err(|_| {
+            AuthRouteError::Runtime(CliError::storage("TUI cancellation is unavailable"))
+        })? = Some(operation.clone());
+        let view = operation.adapter_view();
+        let path = self
+            .bootstrap()
+            .map_err(AuthRouteError::Runtime)?
+            .paths
+            .credentials;
+        let result = self.auth.login(
+            &path,
+            flow,
+            LoginCancellation::from_shared_flag(view.cancellation_handle()),
+            view.deadline()
+                .expect("authentication has a fixed deadline"),
+            move |event| {
+                let event = match event {
+                    ChatGptAuthProgress::BrowserUrl(url) => TuiRouteProgress::BrowserUrl(url),
+                    ChatGptAuthProgress::DeviceCode {
+                        verification_url,
+                        user_code,
+                    } => TuiRouteProgress::DeviceCode {
+                        verification_url,
+                        user_code,
+                    },
+                };
+                let _ = progress.send(event);
+            },
+        );
+        if let Ok(mut active) = self.cancellation.lock() {
+            *active = None;
+        }
+        result.map_err(AuthRouteError::Auth)?;
+        self.reconcile_provider(true)
+            .map_err(AuthRouteError::Runtime)?;
+        Ok("Connected to ChatGPT.".into())
+    }
+
+    fn disconnect(&self) -> Result<String, AuthRouteError> {
+        let path = self
+            .bootstrap()
+            .map_err(AuthRouteError::Runtime)?
+            .paths
+            .credentials;
+        let removed = self.auth.disconnect(&path).map_err(AuthRouteError::Auth)?;
+        if removed {
+            self.reconcile_provider(false)
+                .map_err(AuthRouteError::Runtime)?;
+            Ok("Disconnected from ChatGPT.".into())
+        } else {
+            Ok("No ChatGPT credentials were stored.".into())
+        }
+    }
+
+    fn reconcile_provider(&self, connected: bool) -> Result<(), CliError> {
+        let mut bootstrap = self
+            .bootstrap
+            .lock()
+            .map_err(|_| CliError::storage("TUI provider state is unavailable"))?;
+        match (bootstrap.provider_source, connected) {
+            (ProviderSource::Auto, true) => {
+                bootstrap.provider_type = Some("openai-chatgpt".into());
+            }
+            (ProviderSource::Auto, false) => {
+                bootstrap.provider_type = resolve_current_auto_provider(&bootstrap)?;
+            }
+            (ProviderSource::ExplicitChatGpt, _) => {
+                bootstrap.provider_type = Some("openai-chatgpt".into());
+            }
+            (ProviderSource::ExplicitOther, _) => {}
+        }
+        Ok(())
+    }
+}
+
+enum AuthRouteError {
+    Auth(chatgpt_auth::ChatGptAuthError),
+    Runtime(CliError),
 }
 
 fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
@@ -1407,11 +1559,11 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     }
     tui.set_presentation(provider, model, session_label);
 
-    let router = TuiRuntimeRouter::new(bootstrap.clone(), session);
+    let router = TuiRuntimeRouter::new(bootstrap.clone(), session, Arc::clone(&cancellation));
     let route_router = router.clone();
     run_with_default_progress_submit(
         &mut tui,
-        move |prompt, _| route_router.route(prompt),
+        move |prompt, progress| route_router.route_with_progress(prompt, progress),
         move |prompt, progress, metrics| {
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
@@ -1436,8 +1588,12 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 }
                 let _ = progress.send(event);
             });
+            let runtime_bootstrap = match router.bootstrap() {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
             let result = run_tui_prompt(
-                &router.bootstrap,
+                &runtime_bootstrap,
                 &prompt,
                 &turn_cancellation,
                 &router.session,
@@ -1467,7 +1623,11 @@ fn run_tui_prompt(
 ) -> Result<String, CliError> {
     match prompt.trim() {
         command if command.starts_with('/') => {
-            let router = TuiRuntimeRouter::new(bootstrap.clone(), Arc::clone(session));
+            let router = TuiRuntimeRouter::new(
+                bootstrap.clone(),
+                Arc::clone(session),
+                Arc::new(Mutex::new(None)),
+            );
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
@@ -1977,12 +2137,19 @@ fn required_flag_value(
         .ok_or_else(|| CliError::usage(format!("chat {flag} requires a value")))
 }
 
+#[derive(Clone, Copy)]
+enum ProviderSource {
+    Auto,
+    ExplicitChatGpt,
+    ExplicitOther,
+}
 pub struct Bootstrap {
     paths: ConfigPaths,
     global_loaded: bool,
     project_loaded: bool,
     model: Option<String>,
     provider_type: Option<String>,
+    provider_source: ProviderSource,
     provider_base_url: Option<String>,
     system_prompt: Option<String>,
     max_iterations: Option<usize>,
@@ -2006,6 +2173,7 @@ impl Clone for Bootstrap {
             project_loaded: self.project_loaded,
             model: self.model.clone(),
             provider_type: self.provider_type.clone(),
+            provider_source: self.provider_source,
             provider_base_url: self.provider_base_url.clone(),
             system_prompt: self.system_prompt.clone(),
             max_iterations: self.max_iterations,
@@ -2109,14 +2277,18 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     let mcp_servers = mcp_servers(&document)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
     let credentials = (dependencies.read_file)(&paths.credentials)?;
-    let provider_type = resolve_provider_type(
-        string_value(&document, &["provider", "type"]),
-        credentials.as_deref(),
-        &environment,
-    );
+    let configured_provider = string_value(&document, &["provider", "type"]);
+    let provider_source = match configured_provider.as_deref() {
+        None => ProviderSource::Auto,
+        Some("openai-chatgpt") => ProviderSource::ExplicitChatGpt,
+        Some(_) => ProviderSource::ExplicitOther,
+    };
+    let provider_type =
+        resolve_provider_type(configured_provider, credentials.as_deref(), &environment);
     Ok(Bootstrap {
         model: string_value(&document, &["provider", "model"]),
         provider_type,
+        provider_source,
         provider_base_url: string_value(&document, &["provider", "base_url"]),
         system_prompt: string_value(&document, &["agent", "system_prompt"]),
         max_iterations: document
@@ -3692,6 +3864,24 @@ fn resolve_provider_type(
     None
 }
 
+fn resolve_current_auto_provider(bootstrap: &Bootstrap) -> Result<Option<String>, CliError> {
+    let credentials = match fs::read_to_string(&bootstrap.paths.credentials) {
+        Ok(credentials) => Some(credentials),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(CliError::storage("ChatGPT credentials are unavailable")),
+    };
+    let environment = bootstrap
+        .openai_api_key
+        .as_ref()
+        .map(|key| BTreeMap::from([("OPENAI_API_KEY".into(), key.clone())]))
+        .unwrap_or_default();
+    Ok(resolve_provider_type(
+        None,
+        credentials.as_deref(),
+        &environment,
+    ))
+}
+
 fn openai_api_key(
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
@@ -4683,7 +4873,8 @@ mod tests {
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let router = TuiRuntimeRouter::new(bootstrap, Arc::clone(&session));
+        let router =
+            TuiRuntimeRouter::new(bootstrap, Arc::clone(&session), Arc::new(Mutex::new(None)));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine { cancellation });
         let input = enter_tui_input(&mut tui, "/unknown");
@@ -4715,6 +4906,92 @@ mod tests {
         assert_eq!(tui.view().session, format!("session #{}", metadata.id));
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_history() {
+        let temporary = tui_session_directory("auth-router");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            &credentials_path,
+            r#"{"openai-api":{"api_key":"preserved"},"other":{"value":"kept"}}"#,
+        )
+        .unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.provider_source = ProviderSource::Auto;
+        bootstrap.provider_type = Some("openai-api".into());
+        bootstrap.openai_api_key = Some("preserved".into());
+        let flows = Arc::new(Mutex::new(Vec::new()));
+        let coordinator = ChatGptAuthCoordinator::with_authenticator({
+            let flows = Arc::clone(&flows);
+            move |flow, _, publish| {
+                flows.lock().unwrap().push(flow);
+                publish(ChatGptAuthProgress::BrowserUrl("auth-url".into()));
+                Ok(test_chatgpt_credentials("new-access"))
+            }
+        });
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::with_auth_coordinator(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            coordinator,
+        );
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+        for command in ["/connect", "/connect --device-auth"] {
+            assert!(matches!(
+                router.route_with_progress(command.into(), progress_tx.clone()),
+                TuiSubmissionOutcome::LocalInfo(_)
+            ));
+        }
+        assert_eq!(progress_rx.try_iter().count(), 2);
+        assert_eq!(
+            *flows.lock().unwrap(),
+            vec![ChatGptAuthFlow::Browser, ChatGptAuthFlow::Device]
+        );
+        assert_eq!(*session.lock().unwrap(), TuiSessionContext::fresh());
+        assert!(router.bootstrap().unwrap().provider_type() == Some("openai-chatgpt"));
+        let connected = std::fs::read_to_string(&credentials_path).unwrap();
+        assert!(connected.contains("new-access"));
+
+        assert!(matches!(
+            router.route("/disconnect".into()),
+            TuiSubmissionOutcome::LocalInfo(_)
+        ));
+        assert!(router.bootstrap().unwrap().provider_type() == Some("openai-api"));
+        let stored = std::fs::read_to_string(&credentials_path).unwrap();
+        assert!(stored.contains("preserved"));
+        assert!(stored.contains("kept"));
+        assert!(!stored.contains("new-access"));
+
+        for (source, provider) in [
+            (ProviderSource::ExplicitChatGpt, "openai-chatgpt"),
+            (ProviderSource::ExplicitOther, "openai-api"),
+            (ProviderSource::ExplicitOther, "unrelated"),
+        ] {
+            let mut bootstrap = router.bootstrap.lock().unwrap();
+            bootstrap.provider_source = source;
+            bootstrap.provider_type = Some(provider.into());
+            drop(bootstrap);
+            router.reconcile_provider(true).unwrap();
+            router.reconcile_provider(false).unwrap();
+            assert_eq!(router.bootstrap().unwrap().provider_type(), Some(provider));
+        }
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    fn test_chatgpt_credentials(
+        access_token: &str,
+    ) -> agens_providers::chatgpt_login::ChatGptCredentials {
+        agens_providers::chatgpt_login::ChatGptCredentials {
+            access_token: access_token.into(),
+            refresh_token: "refresh".into(),
+            account_id: "account".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+        }
     }
 
     #[test]

@@ -63,11 +63,7 @@ impl ChatGptAuthError {
     }
 }
 type ProgressSink = Arc<dyn Fn(ChatGptAuthProgress) + Send + Sync>;
-type Authenticator = dyn Fn(
-        ChatGptAuthFlow,
-        LoginCancellation,
-        ProgressSink,
-    ) -> Result<ChatGptCredentials, LoginError>
+type Authenticator = dyn Fn(ChatGptAuthFlow, LoginCancellation, ProgressSink) -> Result<ChatGptCredentials, LoginError>
     + Send
     + Sync;
 
@@ -111,7 +107,7 @@ impl ChatGptAuthCoordinator {
         })
     }
 
-    fn with_authenticator(
+    pub(crate) fn with_authenticator(
         authenticate: impl Fn(
             ChatGptAuthFlow,
             LoginCancellation,
@@ -146,8 +142,7 @@ impl ChatGptAuthCoordinator {
     }
 
     pub(crate) fn disconnect(&self, path: &Path) -> Result<bool, ChatGptAuthError> {
-        remove_provider_entry(path, "openai-chatgpt")
-            .map_err(|_| ChatGptAuthError::persistence())
+        remove_provider_entry(path, "openai-chatgpt").map_err(|_| ChatGptAuthError::persistence())
     }
 }
 
@@ -156,9 +151,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use agens_providers::chatgpt_login::{
-        ChatGptCredentials, LoginCancellation, LoginError,
-    };
+    use agens_providers::chatgpt_login::{ChatGptCredentials, LoginCancellation, LoginError};
 
     use super::*;
 
@@ -207,7 +200,10 @@ mod tests {
         );
         let progress = progress.lock().unwrap();
         assert!(matches!(progress[0], ChatGptAuthProgress::BrowserUrl(_)));
-        assert!(matches!(progress[1], ChatGptAuthProgress::DeviceCode { .. }));
+        assert!(matches!(
+            progress[1],
+            ChatGptAuthProgress::DeviceCode { .. }
+        ));
         let stored: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&credentials).unwrap()).unwrap();
         assert_eq!(stored["other"]["api_key"], "preserved");
@@ -216,7 +212,14 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&credentials).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&credentials)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
         }
     }
 
@@ -244,9 +247,8 @@ mod tests {
         assert_eq!(error.action(), "Run authentication again when ready.");
         assert_eq!(std::fs::read(&credentials).unwrap(), before);
 
-        let coordinator = ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
-            Err(LoginError::TokenTransport)
-        });
+        let coordinator =
+            ChatGptAuthCoordinator::with_authenticator(|_, _, _| Err(LoginError::TokenTransport));
         let error = coordinator
             .login(
                 &credentials,
