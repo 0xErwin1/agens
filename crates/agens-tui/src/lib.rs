@@ -44,8 +44,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+    },
 };
+
+const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
 pub trait Engine {
@@ -444,9 +448,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     let transcript = rendered_transcript(&state);
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
-    let bottom_scroll = saturating_u16(
-        transcript_rows(&transcript, layout.transcript.width).saturating_sub(visible_rows),
-    );
+    let transcript_width = layout
+        .transcript
+        .width
+        .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
+    let bottom_scroll =
+        saturating_u16(transcript_rows(&transcript, transcript_width).saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
@@ -463,6 +470,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
+                        .padding(Padding::left(TRANSCRIPT_CONTENT_INDENT))
                         .border_style(Style::default().fg(Color::DarkGray))
                         .title(Span::styled(
                             " transcript ",
@@ -1690,8 +1698,14 @@ where
         let layout = screen_layout(area, self.running);
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         saturating_u16(
-            transcript_rows(&rendered_transcript(&self.view()), layout.transcript.width)
-                .saturating_sub(visible_rows),
+            transcript_rows(
+                &rendered_transcript(&self.view()),
+                layout
+                    .transcript
+                    .width
+                    .saturating_sub(TRANSCRIPT_CONTENT_INDENT),
+            )
+            .saturating_sub(visible_rows),
         )
     }
 

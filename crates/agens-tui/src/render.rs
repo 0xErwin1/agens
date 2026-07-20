@@ -39,14 +39,14 @@ pub(super) fn conversation_lines(
             } => {
                 if let Some(batch) = batch {
                     lines.push(Line::from(Span::styled(
-                        format!("  Tools · batch {batch}"),
+                        format!("Tools · batch {batch}"),
                         Style::default()
                             .fg(Color::Magenta)
                             .add_modifier(Modifier::BOLD),
                     )));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("  ┌ ", Style::default().fg(Color::Magenta)),
+                    Span::styled("┌ ", Style::default().fg(Color::Magenta)),
                     Span::styled(
                         name.to_owned(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -57,7 +57,7 @@ pub(super) fn conversation_lines(
                     ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("  │ input ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("│ input ", Style::default().fg(Color::DarkGray)),
                     Span::raw(input.to_owned()),
                 ]));
             }
@@ -69,7 +69,7 @@ pub(super) fn conversation_lines(
                 let (result_state, duration) = tool_state(events, call_id, *is_error);
                 let color = result_color(result_state);
                 lines.push(Line::from(vec![
-                    Span::styled("  └ ", Style::default().fg(color)),
+                    Span::styled("└ ", Style::default().fg(color)),
                     Span::styled(
                         call_id.to_owned(),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
@@ -81,12 +81,12 @@ pub(super) fn conversation_lines(
                 ]));
                 if collapsed_tool_outputs.contains(call_id) {
                     lines.push(Line::from(Span::styled(
-                        "    output collapsed; expand to recover",
+                        "output collapsed; expand to recover",
                         Style::default().fg(Color::Gray),
                     )));
                     lines.push(Line::default());
                 } else {
-                    markdown_lines(&mut lines, output, Style::default().fg(Color::Gray), "  │ ");
+                    markdown_lines(&mut lines, output, Style::default().fg(Color::Gray), "");
                 }
             }
             ConversationItem::Diff(diff) => {
@@ -96,15 +96,15 @@ pub(super) fn conversation_lines(
             }
             ConversationItem::Error(error) => {
                 lines.push(Line::from(Span::styled(
-                    "  ┌ Error",
+                    "┌ Error",
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(vec![
-                    Span::styled("  │ ", Style::default().fg(Color::Red)),
+                    Span::styled("│ ", Style::default().fg(Color::Red)),
                     Span::raw(error.message.clone()),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    format!("  └ Action: {}", error.action),
+                    format!("└ Action: {}", error.action),
                     Style::default().fg(Color::Yellow),
                 )));
                 lines.push(Line::default());
@@ -116,25 +116,22 @@ pub(super) fn conversation_lines(
 
 fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::from(Span::styled(
-        "  You",
+        "You",
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )));
     for source_line in text.split('\n') {
-        lines.push(Line::from(vec![
-            Span::styled("  │ ", Style::default().fg(Color::Cyan)),
-            Span::raw(source_line.to_owned()),
-        ]));
+        lines.push(Line::from(Span::raw(source_line.to_owned())));
     }
     lines.push(Line::default());
 }
 
 fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
     let title = if collapsed {
-        "  Thinking · collapsed"
+        "Thinking · collapsed"
     } else {
-        "  Thinking"
+        "Thinking"
     };
     lines.push(Line::from(Span::styled(
         title,
@@ -145,7 +142,7 @@ fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
     if collapsed {
         lines.push(Line::default());
     } else {
-        markdown_lines(lines, text, Style::default().fg(Color::Gray), "  │ ");
+        markdown_lines(lines, text, Style::default().fg(Color::Gray), "");
     }
 }
 
@@ -448,7 +445,7 @@ fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, te
     };
     lines.push(Line::from(vec![
         Span::styled(
-            format!("  {:>4} {marker} ", number),
+            format!("{:>4} {marker} ", number),
             Style::default().fg(color),
         ),
         Span::raw(text.to_owned()),
@@ -485,7 +482,7 @@ fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl In
     for text_line in text.into().split('\n') {
         lines.push(Line::from(vec![
             Span::styled(
-                format!("  │ {label:<9} "),
+                format!("│ {label:<9} "),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::raw(text_line.to_owned()),

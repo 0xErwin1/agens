@@ -42,6 +42,10 @@ fn rendered_row(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
     cell_index(renderer, text) / usize::from(renderer.terminal().backend().buffer().area.width)
 }
 
+fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
+    cell_index(renderer, text) % usize::from(renderer.terminal().backend().buffer().area.width)
+}
+
 fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
     let buffer = renderer.terminal().backend().buffer();
     let width = text.chars().count();
@@ -73,6 +77,98 @@ fn multiline_wrapped_user_message_uses_one_accented_identity() {
     let user = cell_for_text(&renderer, "You");
     assert_eq!(user.fg, Color::Cyan);
     assert!(user.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn live_assistant_content_uses_the_user_body_column_at_normal_width() {
+    assert_conversation_content_column(56, false);
+}
+
+#[test]
+fn restored_assistant_content_uses_the_user_body_column_at_narrow_width() {
+    assert_conversation_content_column(24, true);
+}
+
+fn assert_conversation_content_column(width: u16, restored: bool) {
+    let terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    let content_width = usize::from(width - 4);
+    let first_line = format!(
+        "ASSISTANT_FIRST{}",
+        "x".repeat(content_width - "ASSISTANT_FIRST".len())
+    );
+    let markdown = format!(
+        "{first_line} ASSISTANT_WRAPPED\n\n```text\nASSISTANT_CODE\n```\n\n- ASSISTANT_LIST"
+    );
+
+    if restored {
+        tui.replace_history(&[
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("USER_BODY".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("THINKING_BODY".into()),
+                    MessagePart::ToolCall {
+                        id: "call-1".into(),
+                        name: "native::read".into(),
+                        input: "{}".into(),
+                    },
+                    MessagePart::Text(markdown),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "TOOL_BODY".into(),
+                    is_error: false,
+                }],
+            },
+        ])
+        .unwrap();
+    } else {
+        tui.begin_submission("USER_BODY");
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+            "THINKING_BODY".into(),
+        )));
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: "call-1".into(),
+            name: "native::read".into(),
+            input: "{}".into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "TOOL_BODY".into(),
+            is_error: false,
+        }));
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(markdown)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for content in [
+        "USER_BODY",
+        "ASSISTANT_FIRST",
+        "ASSISTANT_WRAPPED",
+        "ASSISTANT_CODE",
+        "THINKING_BODY",
+        "TOOL_BODY",
+        "• ASSISTANT_LIST",
+        "┌ native::read",
+    ] {
+        assert_eq!(
+            rendered_column(&renderer, content),
+            4,
+            "{content}: {text:?}"
+        );
+    }
+    assert_eq!(text.matches("You").count(), 1, "{text:?}");
+    assert!(!text.contains("Assistant"), "{text:?}");
 }
 
 #[test]
