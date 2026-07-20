@@ -139,6 +139,15 @@ pub enum TuiSubmissionOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiRouteProgress {
+    BrowserUrl(String),
+    DeviceCode {
+        verification_url: String,
+        user_code: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TuiProviderOutcome {
     Completed(String),
     Failed { message: String, action: String },
@@ -758,6 +767,36 @@ where
         self.set_running(true);
     }
 
+    pub fn begin_route(&mut self) {
+        self.runtime_events.clear();
+        self.turn_duration = None;
+        self.latest_usage = None;
+        self.dialog = None;
+        self.running = true;
+        self.turn_state = None;
+        self.quit_armed = false;
+    }
+
+    pub fn apply_route_progress(&mut self, progress: TuiRouteProgress) {
+        let (title, body) = match progress {
+            TuiRouteProgress::BrowserUrl(url) => {
+                ("ChatGPT authentication", format!("Open {}", bounded_auth_text(&url, 512)))
+            }
+            TuiRouteProgress::DeviceCode {
+                verification_url,
+                user_code,
+            } => (
+                "ChatGPT device authentication",
+                format!(
+                    "Open {}\nCode: {}",
+                    bounded_auth_text(&verification_url, 512),
+                    bounded_auth_text(&user_code, 64)
+                ),
+            ),
+        };
+        self.show_dialog(title, body);
+    }
+
     /// Records a completed runtime result without exposing provider internals.
     pub fn finish_submission(&mut self, result: Result<String, String>) {
         let outcome = match result {
@@ -778,16 +817,19 @@ where
     }
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
+        self.dialog = None;
         match outcome {
             TuiSubmissionOutcome::ProviderTurn { prompt } => {
                 self.begin_submission(prompt.clone());
                 Some(prompt)
             }
             TuiSubmissionOutcome::LocalInfo(message) => {
+                self.set_running(false);
                 self.add_info(message);
                 None
             }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
+                self.set_running(false);
                 self.add_error(message, action);
                 None
             }
@@ -804,6 +846,7 @@ where
                 message,
                 presentation,
             } => {
+                self.set_running(false);
                 self.apply_presentation(presentation);
                 self.add_info(message);
                 None
@@ -1150,6 +1193,14 @@ where
     }
 }
 
+fn bounded_auth_text(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
+}
+
 /// Owns raw-mode and alternate-screen restoration for an interactive terminal session.
 pub struct Terminal {
     control: CrosstermControl,
@@ -1311,15 +1362,21 @@ pub fn run_with_default_progress_submit<E, R, F>(
 ) -> io::Result<()>
 where
     E: Engine + Send,
-    R: Fn(String) -> TuiSubmissionOutcome + Send + Sync + 'static,
+    R: Fn(String, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
     F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
         + Send
         + Sync
         + 'static,
 {
+    let route = Arc::new(route);
     let submit = Arc::new(submit);
     let (sender, receiver) = mpsc::channel();
     let (completion_sender, completion_receiver) = mpsc::channel();
+    let (route_sender, route_receiver) = mpsc::channel();
+    let (route_progress_sender, route_progress_receiver) = mpsc::channel();
     let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
     let terminal = ratatui::try_init()?;
     let _restore = RatatuiRestore;
@@ -1336,8 +1393,24 @@ where
         while let Ok(event) = receiver.try_recv() {
             tui.apply_progress(event);
         }
+        while let Ok(progress) = route_progress_receiver.try_recv() {
+            tui.apply_route_progress(progress);
+        }
         while let Ok(outcome) = completion_receiver.try_recv() {
             tui.finish_provider_turn(outcome);
+        }
+        while let Ok(outcome) = route_receiver.try_recv() {
+            let Some(prompt) = tui.apply_submission_outcome(outcome) else {
+                continue;
+            };
+            let submit = Arc::clone(&submit);
+            let sender = sender.clone();
+            let metrics = metrics_sender.clone();
+            let completion_sender = completion_sender.clone();
+            thread::spawn(move || {
+                let outcome = submit(prompt, sender, metrics);
+                let _ = completion_sender.send(outcome);
+            });
         }
         renderer.render(tui.view())?;
         if !event::poll(Duration::from_millis(25))? {
@@ -1349,16 +1422,13 @@ where
         match tui.handle(event) {
             Action::Quit => return Ok(()),
             Action::Submit(prompt) => {
-                let Some(prompt) = tui.apply_submission_outcome(route(prompt)) else {
-                    continue;
-                };
-                let submit = Arc::clone(&submit);
-                let sender = sender.clone();
-                let metrics = metrics_sender.clone();
-                let completion_sender = completion_sender.clone();
+                tui.begin_route();
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, sender, metrics);
-                    let _ = completion_sender.send(outcome);
+                    let outcome = route(prompt, progress);
+                    let _ = route_sender.send(outcome);
                 });
             }
             Action::Render | Action::Cancel => {}

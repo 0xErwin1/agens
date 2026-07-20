@@ -3,7 +3,7 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DiffLine, DiffLineKind, Effect, Engine, Event, Key, PublishOutcome,
     RatatuiRenderer, Renderer, Runtime, TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome,
-    TuiRuntimeEvent, TuiSubmissionOutcome,
+    TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -534,6 +534,46 @@ fn typed_submission_outcomes_start_only_explicit_provider_turns() {
     assert_eq!(
         tui.transcript().last(),
         Some(&TranscriptEntry::User("provider prompt".into()))
+    );
+}
+
+#[test]
+fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
+    let backend = TestBackend::new(80, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+    renderer.render(tui.view()).unwrap();
+    let text = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    assert!(text.contains("https://auth.example/device"));
+    assert!(text.contains("ABCD-EFGH"));
+    assert!(tui.transcript().is_empty());
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::LocalActionableError {
+        message: "ChatGPT login was cancelled".into(),
+        action: "Run authentication again when ready.".into(),
+    });
+    assert!(!tui.view().running);
+    assert!(tui.view().dialog.is_none());
+    assert_eq!(
+        tui.transcript(),
+        [TranscriptEntry::Error("ChatGPT login was cancelled".into())]
     );
 }
 

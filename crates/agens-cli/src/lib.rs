@@ -1411,7 +1411,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     let route_router = router.clone();
     run_with_default_progress_submit(
         &mut tui,
-        move |prompt| route_router.route(prompt),
+        move |prompt, _| route_router.route(prompt),
         move |prompt, progress, metrics| {
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
