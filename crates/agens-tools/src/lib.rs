@@ -1,6 +1,6 @@
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt, fs,
     io::{self, Read, Write},
     net::{IpAddr, ToSocketAddrs},
@@ -241,6 +241,10 @@ impl CommandCatalog {
         let mut catalog = Self::default();
         let mut diagnostics = global.diagnostics;
         let mut shadowed = Vec::new();
+        let reserved = built_ins
+            .iter()
+            .map(|command| command.name.clone())
+            .collect::<BTreeSet<_>>();
 
         for command in built_ins {
             catalog.insert(command.clone());
@@ -249,6 +253,9 @@ impl CommandCatalog {
             if catalog.command(command.name()).is_some() {
                 shadowed.push(command.name.clone());
             }
+            if reserved.contains(command.name()) {
+                continue;
+            }
             catalog.insert(command);
         }
 
@@ -256,6 +263,9 @@ impl CommandCatalog {
         for command in project.commands {
             if catalog.command(command.name()).is_some() {
                 shadowed.push(command.name.clone());
+            }
+            if reserved.contains(command.name()) {
+                continue;
             }
             catalog.insert(command);
         }
@@ -279,6 +289,10 @@ impl CommandCatalog {
         self.positions
             .get(name)
             .map(|position| &self.commands[*position])
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, CommandDefinition> {
+        self.commands.iter()
     }
 
     fn insert(&mut self, command: CommandDefinition) {

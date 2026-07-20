@@ -247,7 +247,7 @@ fn discovers_commands_with_precedence_isolated_diagnostics_and_trimmed_arguments
 
     assert_eq!(
         discovery.catalog().command("shared").unwrap().description(),
-        "project"
+        "built-in"
     );
     assert_eq!(
         discovery
@@ -255,7 +255,15 @@ fn discovers_commands_with_precedence_isolated_diagnostics_and_trimmed_arguments
             .command("shared")
             .unwrap()
             .expand("  hello  "),
-        "project:hello"
+        "built-in:hello"
+    );
+    assert_eq!(
+        discovery
+            .catalog()
+            .iter()
+            .map(CommandDefinition::name)
+            .collect::<Vec<_>>(),
+        vec!["shared"]
     );
     assert_eq!(discovery.shadowed().len(), 2);
     assert_eq!(discovery.diagnostics().len(), 1);
