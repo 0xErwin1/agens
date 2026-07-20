@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
+use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode,
@@ -144,6 +144,11 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
     },
+    SessionResumed {
+        message: String,
+        presentation: TuiPresentation,
+        messages: Vec<Message>,
+    },
     Dialog(DialogView),
     Quit,
 }
@@ -219,6 +224,7 @@ pub struct ViewState<'a> {
     pub runtime_events: &'a [TuiRuntimeEvent],
     pub turn_duration: Option<Duration>,
     pub latest_usage: Option<&'a Usage>,
+    pub status: Option<&'a str>,
     /// Authoritative typed conversation projection, when a turn is active or completed.
     pub conversation: Option<&'a Conversation>,
     /// Completed typed conversations retained before the active turn.
@@ -804,6 +810,9 @@ fn composer_metadata(input: &str) -> String {
 }
 
 fn footer_text(width: u16, state: &ViewState<'_>) -> String {
+    if let Some(status) = state.status {
+        return format!(" {status}");
+    }
     let duration = state.turn_duration.map_or_else(String::new, |value| {
         if value.as_secs() > 0 {
             format!(" · {}s", value.as_secs())
@@ -943,6 +952,7 @@ pub struct Tui<E> {
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     latest_usage: Option<Usage>,
+    status: Option<String>,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
@@ -975,6 +985,7 @@ where
             runtime_events: Vec::new(),
             turn_duration: None,
             latest_usage: None,
+            status: None,
             completed_conversations: Vec::new(),
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
@@ -1049,6 +1060,7 @@ where
     pub fn begin_submission(&mut self, prompt: impl Into<String>) {
         self.palette_open = false;
         let prompt = prompt.into();
+        self.status = None;
         if let Some(conversation) = self.conversation.take() {
             self.completed_conversations.push(conversation);
         }
@@ -1062,6 +1074,7 @@ where
     }
 
     pub fn begin_route(&mut self) {
+        self.status = None;
         self.palette_open = false;
         self.runtime_events.clear();
         self.turn_duration = None;
@@ -1152,7 +1165,7 @@ where
             }
             TuiSubmissionOutcome::LocalActionableError { message, action } => {
                 self.set_running(false);
-                self.add_error(message, action);
+                self.show_dialog("Action required", format!("{message}\nAction: {action}"));
                 None
             }
             TuiSubmissionOutcome::ResetSucceeded {
@@ -1161,7 +1174,7 @@ where
             } => {
                 self.clear_transcript();
                 self.apply_presentation(presentation);
-                self.add_info(message);
+                self.status = Some(message);
                 None
             }
             TuiSubmissionOutcome::ContextChanged {
@@ -1171,6 +1184,22 @@ where
                 self.set_running(false);
                 self.apply_presentation(presentation);
                 self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::SessionResumed {
+                message,
+                presentation,
+                messages,
+            } => {
+                if self.replace_history(&messages).is_err() {
+                    self.show_dialog(
+                        "Action required",
+                        "Saved session history is invalid.\nAction: Choose another session.",
+                    );
+                    return None;
+                }
+                self.apply_presentation(presentation);
+                self.status = Some(message);
                 None
             }
             TuiSubmissionOutcome::Dialog(dialog) => {
@@ -1224,6 +1253,8 @@ where
         self.conversation = None;
         self.collapsed_tool_outputs.clear();
         self.set_running(false);
+        self.turn_state = None;
+        self.active_tool = None;
     }
 
     pub fn replace_history(
@@ -1241,6 +1272,8 @@ where
         self.following_bottom = true;
         self.scroll_offset = 0;
         self.set_running(false);
+        self.turn_state = None;
+        self.active_tool = None;
         Ok(())
     }
 
@@ -1311,6 +1344,7 @@ where
             runtime_events: &self.runtime_events,
             turn_duration: self.turn_duration,
             latest_usage: self.latest_usage.as_ref(),
+            status: self.status.as_deref(),
             conversation: self.conversation.as_ref(),
             completed_conversations: &self.completed_conversations,
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
@@ -1396,6 +1430,9 @@ where
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
             self.quit_armed = false;
+        }
+        if !matches!(key, Key::PageUp | Key::PageDown) {
+            self.status = None;
         }
 
         if self

@@ -38,9 +38,9 @@ use agens_tools::{
     ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
-    BridgeCancel, BridgeTx, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine as TuiEngine,
-    PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPresentation, TuiProviderOutcome,
-    TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
+    BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
+    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPresentation,
+    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
     run_with_default_progress_submit,
 };
 
@@ -1528,6 +1528,7 @@ impl TuiRuntimeRouter {
                     .map_err(|_| CliError::usage("session action is invalid"))?;
                 let resumed = resume_tui_session(&bootstrap, identifier, &self.skills)?;
                 let message = resumed.note();
+                let messages = resumed.messages.clone();
                 let mut session = self
                     .session
                     .lock()
@@ -1537,9 +1538,10 @@ impl TuiRuntimeRouter {
                 }
                 *session = resumed;
                 drop(session);
-                return Ok(TuiSubmissionOutcome::ContextChanged {
+                return Ok(TuiSubmissionOutcome::SessionResumed {
                     message,
                     presentation: self.presentation()?,
+                    messages,
                 });
             }
             let message = if let Some(model) = action_id.strip_prefix("model:") {
@@ -1615,6 +1617,7 @@ impl TuiRuntimeRouter {
                     .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
                 let resumed = resume_tui_session(&bootstrap, identifier, &self.skills)?;
                 let message = resumed.note();
+                let messages = resumed.messages.clone();
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
                 })?;
@@ -1623,9 +1626,10 @@ impl TuiRuntimeRouter {
                 }
                 *session = resumed;
                 drop(session);
-                TuiSubmissionOutcome::ContextChanged {
+                TuiSubmissionOutcome::SessionResumed {
                     message,
                     presentation: self.presentation()?,
+                    messages,
                 }
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
@@ -2010,7 +2014,8 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
 
     if let Some(identifier) = resume {
         let resumed = resume_tui_session(bootstrap, identifier, &skills)?;
-        tui.add_info(resumed.note());
+        tui.replace_history(&resumed.messages)
+            .map_err(|_| CliError::storage("saved session is unavailable"))?;
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
@@ -2109,7 +2114,8 @@ fn run_tui_prompt(
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
-                | TuiSubmissionOutcome::ContextChanged { message, .. } => Ok(message),
+                | TuiSubmissionOutcome::ContextChanged { message, .. }
+                | TuiSubmissionOutcome::SessionResumed { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::LocalActionableError { .. }
                 | TuiSubmissionOutcome::Dialog(_) => {
@@ -2223,6 +2229,7 @@ fn complete_tui_turn(
     let completion = completion?;
     session.identifier = Some(completion.metadata.id);
     session.metadata = Some(completion.metadata);
+    session.messages = completion.messages;
     if consumed_reminder {
         session.pending_system_reminder = None;
     }
@@ -2535,6 +2542,8 @@ fn resume_tui_session(
     if session.metadata.project != tui_project_identifier(bootstrap)? {
         return Err(CliError::storage("saved session is unavailable"));
     }
+    Conversation::from_messages(&session.messages)
+        .map_err(|_| CliError::storage("saved session is unavailable"))?;
     let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent, skills)?;
     Ok(TuiSessionContext::resumed(
         identifier,
@@ -2846,6 +2855,7 @@ fn run_production_headless_chat(
 struct HeadlessChatCompletion {
     text: String,
     metadata: SessionMetadata,
+    messages: Vec<Message>,
 }
 
 fn run_production_headless_chat_with_progress(
@@ -3051,6 +3061,10 @@ where
     let metadata = store
         .persist_completed_session_turn(&metadata, &turn)
         .map_err(|_| CliError::storage("completed session could not be saved"))?;
+    let messages = store
+        .load_session_for_resume(metadata.id)
+        .map_err(|_| CliError::storage("completed session could not be loaded"))?
+        .messages;
 
     let text = snapshot
         .events()
@@ -3067,9 +3081,14 @@ where
         Ok(HeadlessChatCompletion {
             text: "completed".to_owned(),
             metadata,
+            messages,
         })
     } else {
-        Ok(HeadlessChatCompletion { text, metadata })
+        Ok(HeadlessChatCompletion {
+            text,
+            metadata,
+            messages,
+        })
     }
 }
 
@@ -4884,6 +4903,7 @@ mod tests {
                 Ok(HeadlessChatCompletion {
                     text: "answer".into(),
                     metadata: metadata.clone(),
+                    messages: Vec::new(),
                 }),
                 true,
             )
@@ -5445,25 +5465,19 @@ mod tests {
         let provider_invocations =
             usize::from(tui.apply_submission_outcome(router.route(input)).is_some());
         assert_eq!(provider_invocations, 0);
-        assert!(matches!(
-            tui.transcript(),
-            [agens_tui::TranscriptEntry::Error(_)]
-        ));
+        assert!(tui.transcript().is_empty());
+        assert!(tui.view().dialog.is_some());
 
         session.lock().unwrap().running = true;
         let input = enter_tui_input(&mut tui, "/new");
         tui.apply_submission_outcome(router.route(input));
-        assert_eq!(tui.view().conversation.unwrap().errors.len(), 2);
+        assert!(tui.view().dialog.is_some());
 
         session.lock().unwrap().running = false;
         let input = enter_tui_input(&mut tui, "/new");
         tui.apply_submission_outcome(router.route(input));
-        assert_eq!(
-            tui.transcript(),
-            [agens_tui::TranscriptEntry::Info(
-                "Started a new session.".into()
-            )]
-        );
+        assert!(tui.transcript().is_empty());
+        assert_eq!(tui.view().status, Some("Started a new session."));
 
         let input = enter_tui_input(&mut tui, &format!("/resume {}", metadata.id));
         tui.apply_submission_outcome(router.route(input));
@@ -5571,10 +5585,7 @@ mod tests {
             submit_tui_command(&mut tui, &router, &bootstrap, input, &captured);
         }
         assert_eq!(captured.lock().unwrap().len(), 3);
-        assert!(matches!(
-            tui.transcript().last(),
-            Some(agens_tui::TranscriptEntry::Error(_))
-        ));
+        assert!(tui.view().dialog.is_some());
         assert!(session.lock().unwrap().messages.is_empty());
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -5751,10 +5762,7 @@ mod tests {
         assert!(tui.transcript().contains(&agens_tui::TranscriptEntry::User(
             "/invoke   explicit arguments   ".into()
         )));
-        assert!(matches!(
-            tui.transcript().last(),
-            Some(agens_tui::TranscriptEntry::Error(_))
-        ));
+        assert!(tui.view().dialog.is_some());
         drop(requests);
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -6084,8 +6092,11 @@ mod tests {
         open_tui_palette_dialog(&mut tui, &router, "/re", "sessions", progress.clone());
         dispatch_tui_dialog_selection(&mut tui, &router, progress.clone());
         assert_eq!(tui.view().session, format!("session #{}", current.id));
+        assert!(tui.transcript().is_empty());
         assert!(
-            matches!(tui.transcript().last(), Some(agens_tui::TranscriptEntry::Info(note)) if note.contains("Resumed session"))
+            tui.view()
+                .status
+                .is_some_and(|status| status.contains("Resumed session"))
         );
 
         open_tui_palette_dialog(&mut tui, &router, "/ag", "agent", progress.clone());
@@ -6093,6 +6104,132 @@ mod tests {
         assert!(agents.contains("primary (current)"), "{agents:?}");
         tui.handle(Event::Key(Key::Down));
         dispatch_tui_dialog_selection(&mut tui, &router, progress);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
+        let temporary = tui_session_directory("resume-production-path");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let first = persist_tui_session(&mut store, &tui_project(&temporary), "history");
+        let restored =
+            append_tui_session_turn(&mut store, &first, "second request", "second answer");
+        let restored_messages = store.load_session_for_resume(restored.id).unwrap().messages;
+        drop(store);
+
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        tui.set_palette_entries(router.palette_entries().to_vec());
+        let (progress, _) = std::sync::mpsc::channel();
+
+        open_tui_palette_dialog(&mut tui, &router, "/re", "sessions", progress.clone());
+        dispatch_tui_dialog_selection(&mut tui, &router, progress.clone());
+        let restored_render = render_tui_test_backend(&tui, 120, 50);
+        for expected in [
+            "previous request",
+            "previous reasoning",
+            "resume-call read",
+            "previous answer",
+            "previous result",
+            "persisted reminder",
+            "second request",
+            "second answer",
+        ] {
+            assert!(restored_render.contains(expected), "{restored_render:?}");
+            assert_eq!(
+                restored_render.matches(expected).count(),
+                1,
+                "{restored_render:?}"
+            );
+        }
+        assert_eq!(tui.view().session, format!("session #{}", restored.id));
+        assert!(tui.transcript().is_empty());
+        assert!(!restored_render.contains("INFO      Resumed session"));
+
+        let before_failure = session.lock().unwrap().clone();
+        let input = enter_tui_input(&mut tui, "/resume 999");
+        tui.apply_submission_outcome(router.route(input));
+        let failed = render_tui_test_backend(&tui, 120, 50);
+        assert!(
+            failed.contains("saved session is unavailable"),
+            "{failed:?}"
+        );
+        assert!(failed.contains("Action:"), "{failed:?}");
+        assert_eq!(tui.view().session, format!("session #{}", restored.id));
+        assert_eq!(*session.lock().unwrap(), before_failure);
+        assert!(tui.transcript().is_empty());
+
+        tui.handle(Event::Key(Key::Escape));
+        let prompt = enter_tui_input(&mut tui, "third request");
+        let prompt = tui.apply_submission_outcome(router.route(prompt)).unwrap();
+        let result = run_tui_prompt_with(
+            &bootstrap,
+            &prompt,
+            &router.session,
+            Some(Arc::clone(&router.skills)),
+            |request| {
+                assert_eq!(request.history, restored_messages);
+                let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+                let metadata = append_tui_session_turn(
+                    &mut store,
+                    request.session.as_ref().unwrap(),
+                    "third request",
+                    "third answer",
+                );
+                let messages = store.load_session_for_resume(metadata.id).unwrap().messages;
+                Ok(HeadlessChatCompletion {
+                    text: "third answer".into(),
+                    metadata,
+                    messages,
+                })
+            },
+        );
+        tui.finish_provider_turn(tui_provider_outcome(result));
+        let reopened = SessionStore::open(bootstrap.data_directory())
+            .unwrap()
+            .load_session_for_resume(restored.id)
+            .unwrap();
+        assert_eq!(session.lock().unwrap().messages, reopened.messages);
+
+        open_tui_palette_dialog(&mut tui, &router, "/re", "sessions", progress);
+        dispatch_tui_dialog_selection(&mut tui, &router, std::sync::mpsc::channel().0);
+        let reopened_render = render_tui_test_backend(&tui, 120, 60);
+        for expected in [
+            "previous request",
+            "second request",
+            "third request",
+            "third answer",
+        ] {
+            assert_eq!(
+                reopened_render.matches(expected).count(),
+                1,
+                "{reopened_render:?}"
+            );
+        }
+
+        for _ in 0..20 {
+            tui.handle(Event::Key(Key::PageUp));
+        }
+        assert!(render_tui_test_backend(&tui, 60, 14).contains("previous request"));
+
+        let input = enter_tui_input(&mut tui, "/new");
+        tui.apply_submission_outcome(router.route(input));
+        let reset = render_tui_test_backend(&tui, 120, 24);
+        assert_eq!(tui.view().session, "new session");
+        assert!(!reset.contains("previous request"), "{reset:?}");
+        assert!(!reset.contains("INFO"), "{reset:?}");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -6435,6 +6572,7 @@ mod tests {
                             completed_turn_count: 1,
                             resumable: true,
                         },
+                        messages: Vec::new(),
                     })
                 }
             },
@@ -6473,10 +6611,65 @@ mod tests {
     }
 
     fn tui_session_messages() -> Vec<Message> {
-        vec![Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text("previous request".into())],
-        }]
+        vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("previous request".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("previous reasoning".into()),
+                    MessagePart::ToolCall {
+                        id: "resume-call".into(),
+                        name: "read".into(),
+                        input: "{}".into(),
+                    },
+                    MessagePart::Text("previous answer".into()),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "resume-call".into(),
+                    content: "previous result".into(),
+                    is_error: false,
+                }],
+            },
+        ]
+    }
+
+    fn append_tui_session_turn(
+        store: &mut SessionStore,
+        metadata: &SessionMetadata,
+        user: &str,
+        answer: &str,
+    ) -> SessionMetadata {
+        let messages = vec![
+            Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text("persisted reminder".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text(user.into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text(answer.into())],
+            },
+        ];
+        let turn = CompletedSessionTurn::new(
+            messages
+                .into_iter()
+                .map(SessionMessage::try_from)
+                .collect::<Result<_, _>>()
+                .unwrap(),
+        )
+        .unwrap();
+        store
+            .persist_completed_session_turn(metadata, &turn)
+            .unwrap()
     }
 
     fn persist_tui_session(

@@ -688,12 +688,10 @@ fn typed_submission_outcomes_start_only_explicit_provider_turns() {
         None
     );
     assert_eq!(input, "/unknown");
-    assert_eq!(
-        tui.transcript(),
-        [TranscriptEntry::Error("Unknown command `/unknown`.".into())]
-    );
+    assert!(tui.transcript().is_empty());
     assert!(!tui.view().running);
-    assert_eq!(tui.view().conversation.unwrap().user, "");
+    assert!(tui.view().conversation.is_none());
+    assert!(tui.view().dialog.is_some());
 
     assert_eq!(
         tui.apply_submission_outcome(TuiSubmissionOutcome::ProviderTurn {
@@ -742,11 +740,8 @@ fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
         action: "Run authentication again when ready.".into(),
     });
     assert!(!tui.view().running);
-    assert!(tui.view().dialog.is_none());
-    assert_eq!(
-        tui.transcript(),
-        [TranscriptEntry::Error("ChatGPT login was cancelled".into())]
-    );
+    assert!(tui.view().dialog.is_some());
+    assert!(tui.transcript().is_empty());
 }
 
 #[test]
@@ -764,10 +759,8 @@ fn typed_reset_and_context_outcomes_update_visible_state_after_success() {
         }),
         None
     );
-    assert_eq!(
-        tui.transcript(),
-        [TranscriptEntry::Info("Started a new session.".into())]
-    );
+    assert!(tui.transcript().is_empty());
+    assert_eq!(tui.view().status, Some("Started a new session."));
     assert_eq!(tui.view().session, "new session");
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::ContextChanged {
