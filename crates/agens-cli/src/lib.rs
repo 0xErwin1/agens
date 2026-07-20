@@ -870,18 +870,16 @@ impl TuiMetricsPublisher {
         };
         let metric = match event {
             TurnEvent::StateChanged(TurnState::Requesting) => {
-                self.turn_started_at = Some(now);
-                Some(TuiRuntimeEvent::TurnStarted)
+                if self.turn_started_at.is_none() {
+                    self.turn_started_at = Some(now);
+                    Some(TuiRuntimeEvent::TurnStarted)
+                } else {
+                    None
+                }
             }
             TurnEvent::StateChanged(
-                status @ (TurnState::Completed | TurnState::Cancelled | TurnState::Failed),
-            ) => Some(TuiRuntimeEvent::TurnEnded {
-                status: *status,
-                duration: self
-                    .turn_started_at
-                    .take()
-                    .map(|started| now.duration_since(started)),
-            }),
+                TurnState::Completed | TurnState::Cancelled | TurnState::Failed,
+            ) => None,
             TurnEvent::Usage(usage) => Some(TuiRuntimeEvent::Usage(usage.clone())),
             TurnEvent::ToolCallRequested { id, name, input } => {
                 self.tools.insert(id.clone(), (name.clone(), now));
@@ -938,6 +936,26 @@ impl TuiMetricsPublisher {
                 );
             }
         }
+    }
+
+    fn finish(&mut self, result: Result<(), &CliError>) {
+        let status = match result {
+            Ok(()) => TurnState::Completed,
+            Err(error) if error.category == "cancelled" => TurnState::Cancelled,
+            Err(_) => TurnState::Failed,
+        };
+        let duration = self.turn_started_at.take().map(|started| started.elapsed());
+        let _ = self.bridge.publish(
+            TuiRuntimeEvent::TurnEnded { status, duration },
+            &self.cancellation,
+            None,
+        );
+    }
+}
+
+fn finish_tui_metrics<T>(metrics: &Arc<Mutex<TuiMetricsPublisher>>, result: &Result<T, CliError>) {
+    if let Ok(mut metrics) = metrics.lock() {
+        metrics.finish(result.as_ref().map(|_| ()));
     }
 }
 
@@ -1219,8 +1237,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             metrics,
             BridgeCancel::new(),
         )));
+        let metrics_progress = Arc::clone(&metrics);
         let sink: TurnProgressSink = Arc::new(move |event| {
-            if let Ok(mut metrics) = metrics.lock() {
+            if let Ok(mut metrics) = metrics_progress.lock() {
                 metrics.observe(&event);
             }
             let _ = progress.send(event);
@@ -1231,8 +1250,10 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             &turn_cancellation,
             &session,
             Some(&sink),
-        )
-        .map_err(|error| error.to_string());
+        );
+
+        finish_tui_metrics(&metrics, &result);
+        let result = result.map_err(|error| error.to_string());
 
         if let Ok(mut active) = cancellation.lock() {
             *active = None;
@@ -5188,8 +5209,9 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct BatchRepository;
+    struct BatchRepository {
+        fail_persistence: bool,
+    }
 
     impl CompletedTurnRepository for BatchRepository {
         fn persist_completed_turn(
@@ -5197,7 +5219,13 @@ mod tests {
             _: CompletedTurnSnapshot,
         ) -> impl std::future::Future<Output = Result<(), agens_core::CompletedTurnStoreError>> + Send
         {
-            std::future::ready(Ok(()))
+            if self.fail_persistence {
+                std::future::ready(Err(agens_core::CompletedTurnStoreError::new(
+                    "database unavailable",
+                )))
+            } else {
+                std::future::ready(Ok(()))
+            }
         }
     }
 
@@ -5277,6 +5305,7 @@ mod tests {
         prompts: Vec<String>,
         executions: Vec<String>,
         progress: Vec<TurnEvent>,
+        metrics: Vec<TuiRuntimeEvent>,
     }
 
     fn run_ready<T>(
@@ -5296,6 +5325,8 @@ mod tests {
         answers: Vec<PermissionPromptAnswer>,
         calls: Vec<MessagePart>,
         cancellation: Option<HeadlessTurnCancellation>,
+        provider_error: Option<HeadlessTurnPortError>,
+        fail_persistence: bool,
     ) -> BatchOutcome {
         let directory =
             std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
@@ -5346,12 +5377,28 @@ mod tests {
         );
         let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
         let mut provider = BatchProvider {
-            iterations: vec![Ok(calls), Ok(vec![MessagePart::Text("complete".into())])],
+            iterations: provider_error
+                .map(Err)
+                .into_iter()
+                .chain(std::iter::once(Ok(calls)))
+                .chain(std::iter::once(Ok(vec![MessagePart::Text(
+                    "complete".into(),
+                )])))
+                .collect(),
         };
         let progress_events = Arc::new(Mutex::new(Vec::new()));
+        let (metrics_sender, metrics_receiver) = BridgeTx::bounded(16);
+        let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
+            metrics_sender,
+            BridgeCancel::new(),
+        )));
         let progress: TurnProgressSink = {
             let progress_events = Arc::clone(&progress_events);
-            Arc::new(move |event| progress_events.lock().unwrap().push(event))
+            let metrics = Arc::clone(&metrics);
+            Arc::new(move |event| {
+                metrics.lock().unwrap().observe(&event);
+                progress_events.lock().unwrap().push(event);
+            })
         };
         let cancellation = cancellation.unwrap_or_default();
         let result = run_ready(agens_core::run_headless_turn_with_progress(
@@ -5359,10 +5406,15 @@ mod tests {
             &mut gate,
             &mut resolver,
             &mut tool_dispatcher,
-            &mut BatchRepository,
+            &mut BatchRepository { fail_persistence },
             &cancellation,
             Some(&progress),
         ));
+        let terminal = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| CliError::runtime(*error));
+        finish_tui_metrics(&metrics, &terminal);
         std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
 
         BatchOutcome {
@@ -5370,6 +5422,9 @@ mod tests {
             prompts: prompts.lock().unwrap().clone(),
             executions: executions.lock().unwrap().clone(),
             progress: progress_events.lock().unwrap().clone(),
+            metrics: std::iter::from_fn(|| metrics_receiver.try_recv().ok())
+                .map(|envelope| envelope.into_parts().1)
+                .collect(),
         }
     }
 
@@ -5383,6 +5438,8 @@ mod tests {
                 batch_call("later", "notes.md"),
             ],
             None,
+            None,
+            false,
         );
 
         assert!(outcome.result.is_ok());
@@ -5400,6 +5457,8 @@ mod tests {
                 batch_call("later", "notes.md"),
             ],
             None,
+            None,
+            false,
         );
 
         let snapshot = outcome
@@ -5439,6 +5498,8 @@ mod tests {
                 batch_call("second", "second.md"),
             ],
             None,
+            None,
+            false,
         );
 
         assert!(outcome.result.is_ok());
@@ -5460,6 +5521,8 @@ mod tests {
                 batch_call("second", "second.md"),
             ],
             Some(cancellation),
+            None,
+            false,
         );
 
         assert_eq!(outcome.result, Err(HeadlessTurnError::Cancelled));
@@ -5493,6 +5556,94 @@ mod tests {
     }
 
     #[test]
+    fn tui_metrics_publish_one_terminal_after_the_production_turn_outcome() {
+        let success = run_production_batch(
+            "metrics-success",
+            Vec::new(),
+            vec![MessagePart::Text("complete".into())],
+            None,
+            None,
+            false,
+        );
+        let cancellation = run_production_batch(
+            "metrics-cancelled",
+            vec![PermissionPromptAnswer::AllowOnce],
+            vec![batch_call("first", "notes.md")],
+            Some(HeadlessTurnCancellation::new()),
+            None,
+            false,
+        );
+        let provider_failure = run_production_batch(
+            "metrics-provider-failure",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(HeadlessTurnPortError::Provider),
+            false,
+        );
+        let persistence_failure = run_production_batch(
+            "metrics-persistence-failure",
+            Vec::new(),
+            vec![MessagePart::Text("complete".into())],
+            None,
+            None,
+            true,
+        );
+
+        assert!(success.result.is_ok());
+        assert!(matches!(
+            success.metrics.as_slice(),
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::TurnEnded {
+                    status: TurnState::Completed,
+                    duration: Some(_)
+                },
+            ]
+        ));
+
+        assert_eq!(cancellation.result, Err(HeadlessTurnError::Cancelled));
+        assert!(matches!(
+            cancellation.metrics.as_slice(),
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::ToolStarted { call_id, .. },
+                TuiRuntimeEvent::ToolEnded { call_id: ended_call_id, .. },
+                TuiRuntimeEvent::TurnEnded { status: TurnState::Cancelled, duration: Some(_) },
+            ] if call_id == "first" && ended_call_id == "first"
+        ));
+
+        assert_eq!(provider_failure.result, Err(HeadlessTurnError::Provider));
+        assert!(matches!(
+            provider_failure.metrics.as_slice(),
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::TurnEnded {
+                    status: TurnState::Failed,
+                    duration: Some(_)
+                },
+            ]
+        ));
+
+        assert_eq!(persistence_failure.result, Err(HeadlessTurnError::Store));
+        assert!(
+            persistence_failure
+                .progress
+                .contains(&TurnEvent::StateChanged(TurnState::Completed))
+        );
+        assert!(matches!(
+            persistence_failure.metrics.as_slice(),
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::TurnEnded {
+                    status: TurnState::Failed,
+                    duration: Some(_)
+                },
+            ]
+        ));
+    }
+
+    #[test]
     fn tui_metrics_production_publication_preserves_usage_tools_and_diffs_in_source_order() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(16);
         let cancellation = agens_tui::BridgeCancel::new();
@@ -5516,10 +5667,11 @@ mod tests {
                 content: "--- notes.md\n+++ notes.md\n@@ -1,1 +1,1 @@\n-old\n+new\n".into(),
                 is_error: false,
             }),
-            TurnEvent::StateChanged(TurnState::Completed),
         ] {
             publisher.observe(&event);
         }
+
+        publisher.finish(Ok(()));
 
         let events = (0..6)
             .map(|_| {
@@ -5584,7 +5736,7 @@ mod tests {
             content: "failed".into(),
             is_error: true,
         }));
-        publisher.observe(&TurnEvent::StateChanged(TurnState::Failed));
+        publisher.finish(Err(&CliError::runtime(HeadlessTurnError::Provider)));
 
         let events = (0..2)
             .map(|_| {
