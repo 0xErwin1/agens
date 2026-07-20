@@ -33,9 +33,9 @@ use agens_tools::{
     DispatchTool, EffectiveCapabilitySet, McpHttpTransport, McpLimits, McpRegistry,
     McpSseTransport, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
-    PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, TaskRunContext,
-    TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
-    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, SkillResourceTool,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, ToolResultState, Tui,
@@ -317,6 +317,7 @@ pub struct HeadlessChatRequest {
     active_agent: Option<String>,
     effective_capabilities: Option<EffectiveCapabilitySet>,
     pending_system_reminder: Option<String>,
+    skills: Option<Arc<SkillCatalog>>,
 }
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
@@ -1261,6 +1262,7 @@ struct TuiRuntimeRouter {
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
     commands: Arc<CommandCatalog>,
+    skills: Arc<SkillCatalog>,
 }
 
 impl TuiRuntimeRouter {
@@ -1269,12 +1271,14 @@ impl TuiRuntimeRouter {
         session: Arc<Mutex<TuiSessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
+        skills: Arc<SkillCatalog>,
     ) -> Self {
         Self::with_auth_coordinator(
             bootstrap,
             session,
             cancellation,
             commands,
+            skills,
             ChatGptAuthCoordinator::production(),
         )
     }
@@ -1284,6 +1288,7 @@ impl TuiRuntimeRouter {
         session: Arc<Mutex<TuiSessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
+        skills: Arc<SkillCatalog>,
         auth: ChatGptAuthCoordinator,
     ) -> Self {
         Self {
@@ -1292,6 +1297,7 @@ impl TuiRuntimeRouter {
             cancellation,
             auth,
             commands,
+            skills,
         }
     }
 
@@ -1373,7 +1379,7 @@ impl TuiRuntimeRouter {
                     .trim()
                     .parse::<i64>()
                     .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
-                let resumed = resume_tui_session(&bootstrap, identifier)?;
+                let resumed = resume_tui_session(&bootstrap, identifier, &self.skills)?;
                 let message = resumed.note();
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1389,7 +1395,7 @@ impl TuiRuntimeRouter {
                 }
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
-                message: rotate_tui_agent(&bootstrap, &command[7..], &self.session)?,
+                message: rotate_tui_agent(&bootstrap, &command[7..], &self.session, &self.skills)?,
                 presentation: self.presentation()?,
             },
             "/agent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
@@ -1616,6 +1622,51 @@ fn start_tui_commands<E: TuiEngine>(
     Ok(Arc::new(discovery.catalog().clone()))
 }
 
+fn start_tui_skills<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    bootstrap: &Bootstrap,
+) -> Result<Arc<SkillCatalog>, CliError> {
+    let discovery = discover_skill_catalog(bootstrap)?;
+    for diagnostic in discovery.diagnostics() {
+        tui.add_info(format!(
+            "Skill diagnostic ({}): {}",
+            diagnostic.path().display(),
+            diagnostic.message()
+        ));
+    }
+    for shadow in discovery.shadowed() {
+        tui.add_info(format!(
+            "Skill /{} has multiple definitions; applied source precedence.",
+            shadow.name()
+        ));
+    }
+
+    Ok(Arc::new(discovery.catalog().clone()))
+}
+
+fn discover_skill_catalog(bootstrap: &Bootstrap) -> Result<agens_tools::SkillDiscovery, CliError> {
+    SkillCatalog::discover(
+        bootstrap.paths.global_config.with_file_name("skills"),
+        bootstrap.paths.project_config.with_file_name("skills"),
+    )
+    .map_err(|_| CliError::configuration("skill catalog is unavailable"))
+}
+
+fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
+    if skills.is_empty() {
+        return base.to_owned();
+    }
+
+    let metadata = skills
+        .skills()
+        .map(|skill| format!("- {}: {}", skill.name(), skill.description()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{base}\n\n## Available skills\nUse the `skill` tool to load instructions or declared resources only when needed.\n{metadata}"
+    )
+}
+
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
@@ -1623,12 +1674,13 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    let skills = start_tui_skills(&mut tui, bootstrap)?;
     let provider = bootstrap.provider_type().unwrap_or("provider");
     let model = bootstrap.model().unwrap_or("default model");
     let mut session_label = "new session".to_owned();
 
     if let Some(identifier) = resume {
-        let resumed = resume_tui_session(bootstrap, identifier)?;
+        let resumed = resume_tui_session(bootstrap, identifier, &skills)?;
         tui.add_info(resumed.note());
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1643,6 +1695,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         session,
         Arc::clone(&cancellation),
         commands,
+        Arc::clone(&skills),
     );
     let route_router = router.clone();
     run_with_default_progress_submit(
@@ -1676,15 +1729,20 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
-            let result =
-                run_tui_prompt_with(&runtime_bootstrap, &prompt, &router.session, |request| {
+            let result = run_tui_prompt_with(
+                &runtime_bootstrap,
+                &prompt,
+                &router.session,
+                Some(Arc::clone(&router.skills)),
+                |request| {
                     run_production_headless_chat_with_progress(
                         request,
                         &runtime_bootstrap,
                         &turn_cancellation,
                         Some(&sink),
                     )
-                });
+                },
+            );
 
             finish_tui_metrics(&metrics, &result);
 
@@ -1715,6 +1773,7 @@ fn run_tui_prompt(
                 Arc::clone(session),
                 Arc::new(Mutex::new(None)),
                 Arc::new(CommandCatalog::default()),
+                Arc::new(SkillCatalog::default()),
             );
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
@@ -1726,7 +1785,7 @@ fn run_tui_prompt(
                 }
             }
         }
-        prompt => run_tui_prompt_with(bootstrap, prompt, session, |request| {
+        prompt => run_tui_prompt_with(bootstrap, prompt, session, None, |request| {
             run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
         }),
     }
@@ -1736,6 +1795,7 @@ fn run_tui_prompt_with(
     bootstrap: &Bootstrap,
     prompt: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
+    skills: Option<Arc<SkillCatalog>>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, CliError>,
 ) -> Result<String, CliError> {
     let prompt = expand_tui_file_reference(bootstrap, prompt)?;
@@ -1747,7 +1807,7 @@ fn run_tui_prompt_with(
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
         session.running = true;
-        session.apply_to(HeadlessChatRequest {
+        let mut request = session.apply_to(HeadlessChatRequest {
             prompt,
             history: Vec::new(),
             model: None,
@@ -1760,7 +1820,17 @@ fn run_tui_prompt_with(
             active_agent: None,
             effective_capabilities: None,
             pending_system_reminder: None,
-        })
+            skills: skills.clone(),
+        });
+        if let Some(skills) = skills {
+            let base = request
+                .system_prompt
+                .take()
+                .or_else(|| bootstrap.system_prompt.clone())
+                .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
+            request.system_prompt = Some(parent_skill_system_prompt(&base, &skills));
+        }
+        request
     };
     let consumed_reminder = request.pending_system_reminder.is_some();
     let completion = run(request);
@@ -1898,13 +1968,14 @@ fn rotate_tui_agent(
     bootstrap: &Bootstrap,
     name: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
+    skills: &SkillCatalog,
 ) -> Result<String, CliError> {
     let validator = BundledModelValidator;
     let catalog = tui_agent_catalog(bootstrap, &validator)?;
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root)?;
+    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(skills))?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
@@ -2101,6 +2172,7 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
 fn resume_tui_session(
     bootstrap: &Bootstrap,
     identifier: i64,
+    skills: &SkillCatalog,
 ) -> Result<TuiSessionContext, CliError> {
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -2110,7 +2182,7 @@ fn resume_tui_session(
     if session.metadata.project != tui_project_identifier(bootstrap)? {
         return Err(CliError::storage("saved session is unavailable"));
     }
-    let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent)?;
+    let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent, skills)?;
     Ok(TuiSessionContext::resumed(
         identifier,
         session.metadata,
@@ -2129,13 +2201,14 @@ fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
 fn active_tui_agent_runtime(
     bootstrap: &Bootstrap,
     name: &str,
+    skills: &SkillCatalog,
 ) -> Result<ActiveAgentRuntime, CliError> {
     let validator = BundledModelValidator;
     let catalog = tui_agent_catalog(bootstrap, &validator)?;
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root)?;
+    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(skills))?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
@@ -2168,6 +2241,7 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         active_agent: None,
         effective_capabilities: None,
         pending_system_reminder: None,
+        skills: None,
     };
     let mut index = 0;
 
@@ -2437,6 +2511,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
+                true,
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
@@ -2469,6 +2544,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
+                false,
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
@@ -2502,6 +2578,7 @@ fn run_production_headless_chat_with_provider<P>(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    include_system_prompt: bool,
     build_provider: impl FnOnce(
         String,
         Vec<Message>,
@@ -2523,7 +2600,8 @@ where
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (provider_tools, tool_runtime) = production_tool_runtime(bootstrap, project_root)?;
+    let (provider_tools, tool_runtime) =
+        production_tool_runtime(bootstrap, project_root, request.skills.as_deref())?;
     let project = project_root.display().to_string();
     let policy = permission_policy(
         bootstrap.permission_rules(),
@@ -2547,7 +2625,7 @@ where
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let mut provider = build_provider(
         model,
-        provider_messages(&request),
+        provider_messages(&request, include_system_prompt),
         provider_tools,
         request.request_config.clone(),
     )?;
@@ -2642,8 +2720,20 @@ where
     }
 }
 
-fn provider_messages(request: &HeadlessChatRequest) -> Vec<Message> {
+fn provider_messages(request: &HeadlessChatRequest, include_system_prompt: bool) -> Vec<Message> {
     let mut messages = request.history.clone();
+    if include_system_prompt
+        && request.skills.is_some()
+        && let Some(system_prompt) = &request.system_prompt
+    {
+        messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text(system_prompt.clone())],
+            },
+        );
+    }
     if let Some(reminder) = &request.pending_system_reminder {
         messages.push(Message {
             role: Role::System,
@@ -2768,6 +2858,7 @@ fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessageP
 fn production_tool_runtime(
     bootstrap: &Bootstrap,
     project_root: &Path,
+    skills: Option<&SkillCatalog>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
         NativeTools::open(project_root)
@@ -2779,6 +2870,14 @@ fn production_tool_runtime(
     )));
     let mut dispatcher = ToolDispatcher::new();
     let mut provider_tools = BTreeMap::new();
+    let discovered_skills;
+    let skills = match skills {
+        Some(skills) => skills,
+        None => {
+            discovered_skills = discover_skill_catalog(bootstrap)?.catalog().clone();
+            &discovered_skills
+        }
+    };
 
     for metadata in NativeToolCatalog::metadata() {
         let model_name = native_model_tool_name(&metadata.qualified_name)?;
@@ -2799,9 +2898,27 @@ fn production_tool_runtime(
             .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
     }
 
+    provider_tools.insert(
+        "skill".into(),
+        OpenAiFunctionTool::new(
+            "skill",
+            "Load selected skill instructions or a declared reference, script, or asset as text",
+            SkillResourceTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("skill tool is unavailable"))?,
+    );
+    dispatcher
+        .register_native(
+            "native::skill",
+            agens_core::ToolAccess::ReadOnly,
+            SkillResourceTool::new(skills.clone()),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
     register_production_task_tool(
         bootstrap,
         project_root,
+        skills,
         &mut dispatcher,
         &mut provider_tools,
     )?;
@@ -2826,6 +2943,7 @@ fn production_tool_runtime(
 fn register_production_task_tool(
     bootstrap: &Bootstrap,
     project_root: &Path,
+    skills: &SkillCatalog,
     dispatcher: &mut ToolDispatcher,
     provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
 ) -> Result<(), CliError> {
@@ -2838,19 +2956,13 @@ fn register_production_task_tool(
         return Ok(());
     }
 
-    let global_skills = bootstrap.paths.global_config.with_file_name("skills");
-    let project_skills = bootstrap.paths.project_config.with_file_name("skills");
-    let skills = SkillCatalog::discover(global_skills, project_skills)
-        .map_err(|_| CliError::configuration("skill catalog is unavailable"))?
-        .catalog()
-        .clone();
     let parent_model = bootstrap
         .model()
         .unwrap_or_else(|| default_model(bootstrap))
         .to_owned();
     let task = TaskTool::from_catalogs_with_model_validator(
         agents,
-        skills,
+        skills.clone(),
         parent_model,
         validator,
         ProductionTaskRunner {
@@ -4272,6 +4384,7 @@ mod tests {
             active_agent: None,
             effective_capabilities: None,
             pending_system_reminder: None,
+            skills: None,
         });
         assert_eq!(request.active_agent.as_deref(), Some("reviewer"));
         assert_eq!(request.model.as_deref(), Some("gpt-4o"));
@@ -4284,7 +4397,7 @@ mod tests {
                 .map(|agent| agent.capabilities.clone())
         );
         assert_eq!(
-            provider_messages(&request),
+            provider_messages(&request, false),
             vec![
                 Message {
                     role: Role::System,
@@ -4674,7 +4787,7 @@ mod tests {
 
         assert_eq!(list_tui_sessions(&bootstrap).unwrap(), "1\t1 event(s)");
 
-        let resumed = resume_tui_session(&bootstrap, current.id).unwrap();
+        let resumed = resume_tui_session(&bootstrap, current.id, &SkillCatalog::default()).unwrap();
         assert_eq!(resumed.identifier, Some(current.id));
         assert_eq!(resumed.metadata, Some(current));
         assert_eq!(resumed.messages, tui_session_messages());
@@ -4970,6 +5083,7 @@ mod tests {
             Arc::clone(&session),
             Arc::new(Mutex::new(None)),
             Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
         );
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine { cancellation });
@@ -5054,6 +5168,7 @@ mod tests {
             Arc::clone(&session),
             cancellation,
             commands,
+            Arc::new(SkillCatalog::default()),
         );
         let captured = Arc::new(Mutex::new(Vec::new()));
 
@@ -5122,6 +5237,119 @@ mod tests {
     }
 
     #[test]
+    fn tui_startup_skills_reach_parent_context_and_tool_without_subagents() {
+        let temporary = tui_session_directory("parent-skills");
+        let config_home = temporary.join("config");
+        let global_skills = config_home.join("skills");
+        let project_skills = temporary.join("project/.agens/skills");
+        write_tui_skill(
+            &global_skills,
+            "alpha",
+            "global alpha",
+            "GLOBAL_ALPHA_BODY_SENTINEL",
+        );
+        write_tui_skill(
+            &global_skills,
+            "shared",
+            "global shared",
+            "GLOBAL_SHARED_BODY_SENTINEL",
+        );
+        write_tui_skill(
+            &project_skills,
+            "shared",
+            "project shared",
+            "PROJECT_SHARED_BODY_SENTINEL",
+        );
+        std::fs::create_dir_all(project_skills.join("shared/references")).unwrap();
+        std::fs::write(
+            project_skills.join("shared/references/guide.md"),
+            "RESOURCE_SENTINEL",
+        )
+        .unwrap();
+
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            session,
+            cancellation,
+            commands,
+            Arc::clone(&skills),
+        );
+        let captured = Arc::new(Mutex::new(Vec::new()));
+
+        submit_tui_command(&mut tui, &router, &bootstrap, "normal prompt", &captured);
+
+        let request = captured.lock().unwrap()[0].clone();
+        let context = request.system_prompt.unwrap();
+        assert_eq!(context.matches("## Available skills").count(), 1);
+        assert!(context.contains("- alpha: global alpha\n- shared: project shared"));
+        for secret in [
+            "GLOBAL_ALPHA_BODY_SENTINEL",
+            "GLOBAL_SHARED_BODY_SENTINEL",
+            "PROJECT_SHARED_BODY_SENTINEL",
+            "RESOURCE_SENTINEL",
+        ] {
+            assert!(!context.contains(secret));
+        }
+
+        let (tools, dispatcher) = production_tool_runtime(
+            &bootstrap,
+            bootstrap.project_root().unwrap(),
+            Some(skills.as_ref()),
+        )
+        .unwrap();
+        assert!(tools.iter().any(|tool| tool.name() == "skill"));
+        assert!(!tools.iter().any(|tool| tool.name() == "task"));
+        assert!(
+            dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("skill")
+                .is_some()
+        );
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::skill".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let mut dispatcher = dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(call) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new("project", "skill", serde_json::json!({"skill":"shared"})),
+            )
+            .unwrap()
+        else {
+            panic!("skill tool should pass normal authorization");
+        };
+        assert_eq!(
+            dispatcher
+                .execute(
+                    call,
+                    &ToolExecutionContext::with_timeout(std::time::Duration::from_secs(1)),
+                )
+                .unwrap()
+                .content,
+            "PROJECT_SHARED_BODY_SENTINEL"
+        );
+        drop(dispatcher);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_history() {
         let temporary = tui_session_directory("auth-router");
         let config_home = temporary.join("config");
@@ -5151,6 +5379,7 @@ mod tests {
             Arc::clone(&session),
             Arc::new(Mutex::new(None)),
             Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
             coordinator,
         );
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
@@ -5323,6 +5552,16 @@ mod tests {
         .unwrap();
     }
 
+    fn write_tui_skill(root: &Path, name: &str, description: &str, body: &str) {
+        let directory = root.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
     fn submit_tui_command(
         tui: &mut Tui<ProductionTuiEngine>,
         router: &TuiRuntimeRouter,
@@ -5334,25 +5573,31 @@ mod tests {
         let Some(prompt) = tui.apply_submission_outcome(router.route(input)) else {
             return;
         };
-        let result = run_tui_prompt_with(bootstrap, &prompt, &router.session, {
-            let captured = Arc::clone(captured);
-            move |request| {
-                captured.lock().unwrap().push(request);
-                Ok(HeadlessChatCompletion {
-                    text: "captured".into(),
-                    metadata: SessionMetadata {
-                        id: 1,
-                        project: "project".into(),
-                        title: "captured".into(),
-                        active_agent: "build".into(),
-                        created_at: 1,
-                        updated_at: 1,
-                        completed_turn_count: 1,
-                        resumable: true,
-                    },
-                })
-            }
-        });
+        let result = run_tui_prompt_with(
+            bootstrap,
+            &prompt,
+            &router.session,
+            Some(Arc::clone(&router.skills)),
+            {
+                let captured = Arc::clone(captured);
+                move |request| {
+                    captured.lock().unwrap().push(request);
+                    Ok(HeadlessChatCompletion {
+                        text: "captured".into(),
+                        metadata: SessionMetadata {
+                            id: 1,
+                            project: "project".into(),
+                            title: "captured".into(),
+                            active_agent: "build".into(),
+                            created_at: 1,
+                            updated_at: 1,
+                            completed_turn_count: 1,
+                            resumable: true,
+                        },
+                    })
+                }
+            },
+        );
         tui.finish_provider_turn(tui_provider_outcome(result));
     }
 
@@ -5480,6 +5725,7 @@ mod tests {
                 active_agent: None,
                 effective_capabilities: None,
                 pending_system_reminder: None,
+                skills: None,
             });
 
         assert_eq!(request.prompt, "next question");
@@ -5629,7 +5875,7 @@ mod tests {
             .persist_completed_session_turn(&metadata, &initial_turn)
             .expect("normalized session should persist");
 
-        let mut request = resume_tui_session(&bootstrap, 1)
+        let mut request = resume_tui_session(&bootstrap, 1, &SkillCatalog::default())
             .expect("normalized session should resume")
             .apply_to(HeadlessChatRequest {
                 prompt: "second input".into(),
@@ -5644,6 +5890,7 @@ mod tests {
                 active_agent: None,
                 effective_capabilities: None,
                 pending_system_reminder: None,
+                skills: None,
             });
         request.pending_system_reminder =
             Some("Agent capabilities expanded: primary -> reviewer.".into());
@@ -5725,6 +5972,7 @@ mod tests {
             active_agent: None,
             effective_capabilities: None,
             pending_system_reminder: None,
+            skills: None,
         });
 
         assert_eq!(request.system_prompt, None);
@@ -6679,6 +6927,18 @@ mod tests {
                     assert_eq!(
                         run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
                         Ok(HeadlessToolOutput::success("executed"))
+                    );
+                    assert_eq!(
+                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
+                        Err(HeadlessTurnPortError::Tool)
+                    );
+                    let changed_call = HeadlessToolCall {
+                        input: r#"{"path":"changed.md"}"#.into(),
+                        ..call.clone()
+                    };
+                    assert_eq!(
+                        run_ready(production_dispatcher.dispatch(changed_call, &cancellation)),
+                        Err(HeadlessTurnPortError::Tool)
                     );
                     if answer == PermissionPromptAnswer::AllowAlways {
                         let later_call = HeadlessToolCall {
