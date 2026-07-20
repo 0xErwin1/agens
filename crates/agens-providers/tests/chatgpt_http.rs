@@ -12,7 +12,7 @@ use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
     TurnProgressSink, TurnProvider, Usage,
 };
-use agens_providers::{ChatGptResponsesProvider, ProgressAwareProvider};
+use agens_providers::{ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider};
 use serde_json::{Value, json};
 
 static TEMP_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -75,6 +75,89 @@ fn subscription_transport_posts_the_codex_request_and_returns_text() {
 
     server.join();
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_serializes_optional_and_dynamic_tools_as_non_strict() {
+    let directory = temporary_directory("non-strict-tools");
+    let credentials = write_credentials(&directory);
+    let mut server = LocalServer::start(ServerBehavior::Sse(completed_text_sse("done")));
+    let observed_request = server.take_observed_request();
+    let tools = vec![
+        OpenAiFunctionTool::new(
+            "optional_native",
+            "Accepts an optional path",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            }),
+        )
+        .expect("optional native tool should be valid"),
+        OpenAiFunctionTool::new(
+            "dynamic_mcp",
+            "Accepts dynamic MCP properties",
+            json!({
+                "type": "object",
+                "additionalProperties": true,
+            }),
+        )
+        .expect("dynamic MCP tool should be valid"),
+    ];
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.base_url()),
+            None,
+            "test-model".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            tools,
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured");
+
+    run(&mut provider, HeadlessTurnCancellation::new()).expect("response should complete");
+
+    let request = observed_request
+        .recv_timeout(Duration::from_secs(1))
+        .expect("request should be observed");
+    assert_eq!(request.body["tools"][0]["strict"], false);
+    assert!(request.body["tools"][0]["parameters"]["required"].is_null());
+    assert_eq!(request.body["tools"][1]["strict"], false);
+    assert_eq!(
+        request.body["tools"][1]["parameters"]["additionalProperties"],
+        true
+    );
+
+    server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_normalizes_chatgpt_base_urls_to_one_responses_endpoint() {
+    for suffix in ["", "/codex", "/codex/responses", "/backend-api/codex"] {
+        let directory = temporary_directory("base-url");
+        let credentials = write_credentials(&directory);
+        let mut server = LocalServer::start(ServerBehavior::Sse(completed_text_sse("done")));
+        let observed_request = server.take_observed_request();
+        let base_url = format!("http://{}{suffix}", server.address);
+        let mut provider = provider(&credentials, &base_url);
+
+        run(&mut provider, HeadlessTurnCancellation::new()).expect("response should complete");
+
+        let request = observed_request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("request should be observed");
+        let expected = if suffix.starts_with("/backend-api") {
+            "/backend-api/codex/responses"
+        } else {
+            "/codex/responses"
+        };
+        assert_eq!(request.path, expected, "base suffix {suffix:?}");
+
+        server.join();
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
 }
 
 #[test]

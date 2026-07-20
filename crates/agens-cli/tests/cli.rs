@@ -1600,6 +1600,7 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
             "\"store\":false".to_owned(),
             "\"model\":\"test-model\"".to_owned(),
             "\"parallel_tool_calls\":true".to_owned(),
+            "@all-tools-non-strict".to_owned(),
         ],
         response: text_response("Hello from ChatGPT"),
     }]);
@@ -3801,6 +3802,26 @@ impl ScriptedNativeOpenAiMockServer {
                     .expect("mock server should accept a request");
                 let body = read_openai_request_body(&stream);
                 for fragment in scripted.required_body_fragments {
+                    if fragment == "@all-tools-non-strict" {
+                        let payload: serde_json::Value = serde_json::from_str(&body)
+                            .expect("production provider payload should be JSON");
+                        let tools = payload["tools"]
+                            .as_array()
+                            .expect("production provider should advertise tools");
+                        assert!(!tools.is_empty(), "production provider should advertise tools");
+                        for tool in tools {
+                            assert_eq!(tool["type"], "function");
+                            assert_eq!(tool["strict"], false, "tool was strict: {tool}");
+                            assert!(tool["name"].as_str().is_some_and(|name| !name.is_empty()));
+                            assert!(
+                                tool["description"]
+                                    .as_str()
+                                    .is_some_and(|description| !description.is_empty())
+                            );
+                            assert_eq!(tool["parameters"]["type"], "object");
+                        }
+                        continue;
+                    }
                     if let Some(forbidden) = fragment.strip_prefix('!') {
                         assert!(
                             !body.contains(forbidden),
@@ -4144,7 +4165,10 @@ fn read_openai_request(stream: &std::net::TcpStream) {
     reader
         .read_line(&mut request)
         .expect("request line should be readable");
-    assert_eq!(request, "POST /responses HTTP/1.1\r\n");
+    assert!(
+        request == "POST /responses HTTP/1.1\r\n"
+            || request == "POST /codex/responses HTTP/1.1\r\n"
+    );
 
     loop {
         let mut header = String::new();
@@ -4163,7 +4187,10 @@ fn read_openai_request_body(stream: &std::net::TcpStream) -> String {
     reader
         .read_line(&mut request)
         .expect("request line should be readable");
-    assert_eq!(request, "POST /responses HTTP/1.1\r\n");
+    assert!(
+        request == "POST /responses HTTP/1.1\r\n"
+            || request == "POST /codex/responses HTTP/1.1\r\n"
+    );
 
     let mut content_length = None;
     loop {

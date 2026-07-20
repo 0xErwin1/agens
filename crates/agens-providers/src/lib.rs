@@ -192,6 +192,12 @@ impl OpenAiFunctionTool {
             "strict": true,
         })
     }
+
+    fn to_chatgpt_response_api_json(&self) -> Value {
+        let mut tool = self.to_response_api_json();
+        tool["strict"] = Value::Bool(false);
+        tool
+    }
 }
 
 impl OpenAiResponsesProvider {
@@ -414,11 +420,7 @@ impl ChatGptResponsesProvider {
             access_token,
             account_id,
             credentials_path: credentials_path.to_path_buf(),
-            base_url: base_url
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(DEFAULT_CHATGPT_BASE_URL)
-                .trim_end_matches('/')
-                .to_owned(),
+            base_url: chatgpt_responses_endpoint(base_url)?,
             oauth_url: oauth_url
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or(DEFAULT_CHATGPT_OAUTH_URL)
@@ -492,7 +494,7 @@ impl ChatGptResponsesProvider {
     ) -> Result<DecodedResponse, ChatGptResponseError> {
         let request = self
             .client
-            .post(format!("{}/responses", self.base_url))
+            .post(&self.base_url)
             .bearer_auth(&self.access_token)
             .header("ChatGPT-Account-ID", &self.account_id)
             .header("Accept", "text/event-stream")
@@ -674,7 +676,7 @@ impl ChatGptResponsesProvider {
             "include": ["reasoning.encrypted_content"],
             "reasoning": {"summary": "auto"},
         });
-        payload["tools"] = function_tools_json(&self.tools);
+        payload["tools"] = chatgpt_function_tools_json(&self.tools);
         if let Some(effort) = self.request_config.reasoning_effort() {
             payload["reasoning"]["effort"] = Value::String(effort.as_str().to_owned());
         }
@@ -1824,6 +1826,39 @@ fn function_tools_json(tools: &[OpenAiFunctionTool]) -> Value {
             .map(OpenAiFunctionTool::to_response_api_json)
             .collect(),
     )
+}
+
+fn chatgpt_function_tools_json(tools: &[OpenAiFunctionTool]) -> Value {
+    Value::Array(
+        tools
+            .iter()
+            .map(OpenAiFunctionTool::to_chatgpt_response_api_json)
+            .collect(),
+    )
+}
+
+fn chatgpt_responses_endpoint(base_url: Option<&str>) -> Result<String, Error> {
+    let base_url = base_url
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_CHATGPT_BASE_URL);
+    let mut url = url::Url::parse(base_url)
+        .map_err(|_| Error::Provider("ChatGPT HTTP endpoint is invalid".into()))?;
+    if url.cannot_be_a_base() || url.host_str().is_none() {
+        return Err(Error::Provider("ChatGPT HTTP endpoint is invalid".into()));
+    }
+
+    let path = url.path().trim_end_matches('/');
+    let path = if path.ends_with("/codex/responses") {
+        path.to_owned()
+    } else if path.ends_with("/codex") {
+        format!("{path}/responses")
+    } else {
+        format!("{path}/codex/responses")
+    };
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.into())
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Error> {
