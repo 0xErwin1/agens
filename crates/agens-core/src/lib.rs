@@ -781,6 +781,10 @@ impl HeadlessTurnCancellationAdapter {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
     }
+
+    pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
 }
 
 impl HeadlessTurnCancellation {

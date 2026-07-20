@@ -9,9 +9,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
     ChildCapability, SubagentInvocation, SubagentLimits, SubagentRunner, SubagentRunnerError,
-    SubagentTool, SubagentTurnRequest, SubagentTurnResult,
+    SubagentTool, SubagentTurnRequest, SubagentTurnResult, ToolExecutionContext,
 };
 
 #[test]
@@ -223,6 +224,108 @@ fn enforces_the_child_deadline_through_the_injected_runner_context() {
 
     assert!(output.is_error);
     assert_eq!(output.content, "subagent: deadline exceeded");
+}
+
+#[test]
+fn inherits_the_live_parent_cancellation_before_child_admission() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let runner = RecordingRunner::default();
+    let observed = Arc::clone(&runner.observed);
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        runner,
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+    let cancellation = HeadlessTurnCancellation::new();
+    cancellation.cancel();
+    let parent = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+
+    let output =
+        tool.execute_with_context(SubagentInvocation::new("researcher", "bounded"), &parent);
+
+    assert_eq!(output.content, "subagent: cancelled");
+    assert!(output.is_error);
+    assert!(observed.lock().expect("recorded request").is_none());
+}
+
+#[test]
+fn rejects_a_late_child_success_after_the_parent_cancels() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        DelayedThenSuccessfulRunner::default(),
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+    let cancellation = HeadlessTurnCancellation::new();
+    let parent = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+    let child = tool.clone();
+    let child_parent = parent.clone();
+
+    let worker = thread::spawn(move || {
+        child.execute_with_context(
+            SubagentInvocation::new("researcher", "bounded"),
+            &child_parent,
+        )
+    });
+    thread::sleep(Duration::from_millis(5));
+    cancellation.cancel();
+
+    let output = worker.join().expect("child caller");
+    assert_eq!(output.content, "subagent: cancelled");
+    assert!(output.is_error);
+
+    let next_parent = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+    let rejected = tool.execute_with_context(
+        SubagentInvocation::new("researcher", "second"),
+        &next_parent,
+    );
+    assert_eq!(rejected.content, "subagent: concurrent child limit reached");
+    assert!(rejected.is_error);
+
+    thread::sleep(Duration::from_millis(180));
+}
+
+#[test]
+fn uses_the_earlier_parent_deadline_for_the_child() {
+    let temporary = TemporaryDirectory::new();
+    let skills_root = temporary.path.join("skills");
+    write_skill(
+        &skills_root,
+        "researcher",
+        "---\nname: researcher\ndescription: Research a bounded question\n---\nUse only the supplied context.\n",
+    );
+    let tool = SubagentTool::discover(
+        &skills_root,
+        temporary.path.join("missing"),
+        DeadlineRunner,
+        SubagentLimits::new(1, 2, 64, 64, Duration::from_secs(1)).expect("limits"),
+    )
+    .expect("discover subagent skill");
+    let parent = ToolExecutionContext::from_headless_adapter(
+        HeadlessTurnCancellation::with_deadline(Duration::from_millis(1)).adapter_view(),
+    );
+
+    let output =
+        tool.execute_with_context(SubagentInvocation::new("researcher", "bounded"), &parent);
+
+    assert_eq!(output.content, "subagent: deadline exceeded");
+    assert!(output.is_error);
 }
 
 #[test]

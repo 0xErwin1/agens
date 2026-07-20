@@ -1354,10 +1354,10 @@ pub struct SubagentRunContext {
 }
 
 impl SubagentRunContext {
-    fn new(cancellation: Arc<AtomicBool>, timeout: Duration) -> Self {
+    fn inherit(parent: &ToolExecutionContext, timeout: Duration) -> Self {
         Self {
-            cancellation,
-            deadline: Instant::now() + timeout,
+            cancellation: parent.cancellation_handle(),
+            deadline: parent.deadline().min(Instant::now() + timeout),
         }
     }
 
@@ -1429,6 +1429,15 @@ impl<R: SubagentRunner> SubagentTool<R> {
         invocation: SubagentInvocation,
         cancellation: Arc<AtomicBool>,
     ) -> ToolOutput {
+        let context = ToolExecutionContext::new(cancellation, self.limits.timeout);
+        self.execute_with_context(invocation, &context)
+    }
+
+    pub fn execute_with_context(
+        &self,
+        invocation: SubagentInvocation,
+        parent: &ToolExecutionContext,
+    ) -> ToolOutput {
         let Some(skill) = self.catalog.skill(&invocation.skill_name) else {
             return ToolOutput::failure("subagent: requested skill is unavailable");
         };
@@ -1445,14 +1454,23 @@ impl<R: SubagentRunner> SubagentTool<R> {
         {
             return ToolOutput::failure("subagent: input exceeds configured bounds");
         }
-        if cancellation.load(Ordering::Acquire) {
+        if parent.is_cancelled() {
             return ToolOutput::failure("subagent: cancelled");
+        }
+        if parent.is_expired() {
+            return ToolOutput::failure("subagent: deadline exceeded");
         }
 
         let Some(permit) = SubagentPermit::acquire(&self.active, self.limits.max_concurrent) else {
             return ToolOutput::failure("subagent: concurrent child limit reached");
         };
-        let context = SubagentRunContext::new(cancellation, self.limits.timeout);
+        let context = SubagentRunContext::inherit(parent, self.limits.timeout);
+        if context.is_cancelled() {
+            return ToolOutput::failure("subagent: cancelled");
+        }
+        if context.is_expired() {
+            return ToolOutput::failure("subagent: deadline exceeded");
+        }
         let request = SubagentTurnRequest {
             skill_name: skill.name.clone(),
             skill_description: skill.description.clone(),
@@ -1776,6 +1794,22 @@ impl ToolExecutionContext {
     pub fn remaining(&self) -> Result<Duration, ToolExecutionStatus> {
         self.check()?;
         Ok(self.deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    pub fn cancellation_handle(&self) -> Arc<AtomicBool> {
+        self.cancellation
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| {
+                self.headless_cancellation
+                    .as_ref()
+                    .expect("tool execution context has a cancellation source")
+                    .cancellation_handle()
+            })
     }
 
     fn mcp_context(&self) -> McpOperationContext {
