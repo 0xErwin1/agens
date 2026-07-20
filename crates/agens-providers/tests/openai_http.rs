@@ -335,6 +335,71 @@ fn sends_ordered_tool_outputs_in_a_second_responses_request() {
 }
 
 #[test]
+fn configured_reasoning_effort_is_sent_on_continuation_request() {
+    let mut server = LocalResponsesServer::start_scripted(vec![
+        tool_call_response("resp_initial", "fc_first", "call_first"),
+        completed_text_response("resp_second", "done"),
+    ]);
+    let observed_body = server.take_observed_body();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_tools_and_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        vec![
+            OpenAiFunctionTool::new(
+                "lookup_weather",
+                "Looks up current weather.",
+                json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            )
+            .expect("tool should be valid"),
+        ],
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_request_config(
+        RequestConfig::with_reasoning_effort("high").expect("effort should be valid"),
+    );
+    let runtime = provider_runtime();
+    let cancellation = HeadlessTurnCancellation::new();
+
+    runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("initial response should produce a tool call");
+    runtime
+        .block_on(provider.next_parts(
+            &[tool_result("call_first", "first result", false)],
+            &cancellation,
+        ))
+        .expect("continuation should complete");
+
+    let _initial = observed_body
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server should capture initial request");
+    assert_eq!(
+        observed_body
+            .recv_timeout(Duration::from_secs(1))
+            .expect("server should capture continuation request"),
+        json!({
+            "model": "test-model",
+            "previous_response_id": "resp_initial",
+            "input": [{"type": "function_call_output", "call_id": "call_first", "output": "first result"}],
+            "tools": [{
+                "type": "function",
+                "name": "lookup_weather",
+                "description": "Looks up current weather.",
+                "parameters": {"type": "object", "properties": {}, "additionalProperties": false},
+                "strict": true,
+            }],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high"},
+            "stream": true,
+        })
+    );
+    server.join();
+}
+
+#[test]
 fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
     let mut server = LocalResponsesServer::start_scripted(vec![
         tool_call_response("resp_first", "fc_first", "call_first"),
