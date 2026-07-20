@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -73,28 +73,31 @@ fn authorization_url_uses_the_codex_pkce_contract_without_workspace_selection() 
 #[test]
 fn account_id_from_id_token_uses_the_documented_claim_order() {
     let all_claims = jwt(json!({
+        "https://api.openai.com/auth": {"chatgpt_account_id": "nested"},
         "chatgpt_account_id": "top-level",
-        "https://api.openai.com/auth.chatgpt_account_id": "namespaced",
         "organizations": [{"id": "organization"}],
     }));
-    let namespaced_and_organization = jwt(json!({
-        "https://api.openai.com/auth.chatgpt_account_id": "namespaced",
+    let top_level_and_organization = jwt(json!({
+        "chatgpt_account_id": "top-level",
         "organizations": [{"id": "organization"}],
     }));
     let organization_only = jwt(json!({"organizations": [{"id": "organization"}]}));
+    let erroneous_dotted_claim =
+        jwt(json!({"https://api.openai.com/auth.chatgpt_account_id": "dotted"}));
 
     assert_eq!(
         account_id_from_id_token(&all_claims),
-        Ok("top-level".to_owned())
+        Ok("nested".to_owned())
     );
     assert_eq!(
-        account_id_from_id_token(&namespaced_and_organization),
-        Ok("namespaced".to_owned())
+        account_id_from_id_token(&top_level_and_organization),
+        Ok("top-level".to_owned())
     );
     assert_eq!(
         account_id_from_id_token(&organization_only),
         Ok("organization".to_owned())
     );
+    assert!(account_id_from_id_token(&erroneous_dotted_claim).is_err());
 }
 
 #[test]
@@ -110,7 +113,7 @@ fn account_id_from_id_token_rejects_unusable_tokens_without_echoing_them() {
 
         assert_eq!(
             error,
-            "ChatGPT authentication required: token response is invalid"
+            "ChatGPT account ID was missing; retry authentication"
         );
         assert!(!error.contains(&token));
     }
@@ -251,31 +254,32 @@ fn device_code_login_uses_exact_json_requests_and_validates_the_server_pkce_pair
         );
         assert!(request.contains("code_verifier="));
         assert!(!request.contains("code_challenge"));
-        let id_token = jwt(json!({"https://api.openai.com/auth.chatgpt_account_id":"account_123"}));
-        let access_token = jwt(json!({"exp":1893456000}));
+        let id_token = jwt(json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account_123"}
+        }));
+        let access_token = jwt(json!({}));
         write_http_response(
             &mut stream,
             200,
             &format!(
-                r#"{{"id_token":"{id_token}","access_token":"{access_token}","refresh_token":"refresh-token"}}"#
+                r#"{{"id_token":"{id_token}","access_token":"{access_token}","refresh_token":"refresh-token","expires_in":3600}}"#
             ),
         );
     });
 
     let published_code = Arc::new(Mutex::new(None));
-    let result = device_code_login_with_progress(
-        ChatGptDeviceCodeLoginOptions::for_test(&device_endpoint, &poll_endpoint, &oauth_endpoint),
-        LoginCancellation::new(),
-        {
-            let published_code = Arc::clone(&published_code);
-            move |verification_url, user_code| {
-                *published_code
-                    .lock()
-                    .expect("published device code lock should be available") =
-                    Some((verification_url.to_owned(), user_code.to_owned()));
-            }
-        },
-    )
+    let mut options =
+        ChatGptDeviceCodeLoginOptions::for_test(&device_endpoint, &poll_endpoint, &oauth_endpoint);
+    options.now = Arc::new(|| UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    let result = device_code_login_with_progress(options, LoginCancellation::new(), {
+        let published_code = Arc::clone(&published_code);
+        move |verification_url, user_code| {
+            *published_code
+                .lock()
+                .expect("published device code lock should be available") =
+                Some((verification_url.to_owned(), user_code.to_owned()));
+        }
+    })
     .expect("device login should succeed");
 
     assert_eq!(
@@ -284,6 +288,7 @@ fn device_code_login_uses_exact_json_requests_and_validates_the_server_pkce_pair
     );
     assert_eq!(result.user_code, "ABCD-EFGH");
     assert_eq!(result.credentials.account_id, "account_123");
+    assert_eq!(result.credentials.expires_at, "2023-11-14T23:13:20Z");
     assert_eq!(
         *published_code
             .lock()
@@ -421,7 +426,9 @@ fn device_code_login_retries_many_pending_responses_before_success_with_exact_re
             .accept()
             .expect("OAuth request should arrive");
         let _ = read_http_request(&mut stream);
-        let id_token = jwt(json!({"https://api.openai.com/auth.chatgpt_account_id":"account"}));
+        let id_token = jwt(json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account"}
+        }));
         let access_token = jwt(json!({"exp":1893456000}));
         write_http_response(
             &mut stream,
@@ -545,7 +552,6 @@ fn device_code_login_uses_one_absolute_deadline_across_user_code_polls_and_excha
         let (mut stream, _) = oauth_listener.accept().expect("exchange should arrive");
         let _ = read_http_request(&mut stream);
         thread::sleep(Duration::from_millis(150));
-        write_http_response(&mut stream, 500, "{}");
     });
     let mut options =
         ChatGptDeviceCodeLoginOptions::for_test(&user_endpoint, &poll_endpoint, &oauth_endpoint);
@@ -1127,13 +1133,17 @@ fn login_accepts_only_the_expected_callback_then_exchanges_exact_form_and_extrac
     );
     let observed_form = Arc::new(Mutex::new(String::new()));
     let form_capture = observed_form.clone();
+    let (callback_response_send, callback_response_receive) = mpsc::channel();
+    let clock_calls = Arc::new(Mutex::new(0_u8));
     let token_thread = thread::spawn(move || {
         let (mut stream, _) = token_listener
             .accept()
             .expect("token request should arrive");
         let request = read_http_request(&mut stream);
         *form_capture.lock().expect("lock") = request.clone();
-        let id_token = jwt(json!({"https://api.openai.com/auth.chatgpt_account_id":"account_123"}));
+        let id_token = jwt(json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "account_123"}
+        }));
         let access_token = jwt(json!({"exp":1893456000}));
         write_http_response(
             &mut stream,
@@ -1172,9 +1182,23 @@ fn login_accepts_only_the_expected_callback_then_exchanges_exact_form_and_extrac
                 callback,
                 "GET /auth/callback?state={state}&code=authorization-code HTTP/1.1\r\nHost: {authority}\r\n\r\n"
             )?;
+            let callback_response_send = callback_response_send.clone();
+            thread::spawn(move || {
+                let _ = callback.set_read_timeout(Some(Duration::from_secs(1)));
+                let mut response = String::new();
+                let _ = callback.read_to_string(&mut response);
+                let _ = callback_response_send.send(response);
+            });
             Ok(())
         }),
         publish_url: Arc::new(move |url| publication.lock().expect("lock").push(url.to_owned())),
+        now: {
+            let clock_calls = Arc::clone(&clock_calls);
+            Arc::new(move || {
+                *clock_calls.lock().expect("clock lock") += 1;
+                SystemTime::now()
+            })
+        },
         ..ChatGptLoginOptions::for_test("http://127.0.0.1:1/authorize", &token_url)
     };
 
@@ -1195,6 +1219,21 @@ fn login_accepts_only_the_expected_callback_then_exchanges_exact_form_and_extrac
     assert_eq!(credentials.refresh_token, "refresh-token");
     assert_eq!(credentials.expires_at, "2030-01-01T00:00:00Z");
     assert_eq!(published.lock().expect("lock").len(), 1);
+    assert_eq!(*clock_calls.lock().expect("clock lock"), 1);
+    let callback_response = callback_response_receive
+        .recv_timeout(Duration::from_secs(1))
+        .expect("callback response should arrive");
+    assert!(callback_response.contains("Authorization received. Return to the terminal."));
+    assert!(
+        !callback_response
+            .to_ascii_lowercase()
+            .contains("login complete")
+    );
+    assert!(
+        !callback_response
+            .to_ascii_lowercase()
+            .contains("login successful")
+    );
 }
 
 #[test]
@@ -1214,7 +1253,7 @@ fn login_rejects_callbacks_and_tokens_without_exposing_secret_values() {
 fn callback_state_error_and_missing_code_are_sanitized_authentication_failures() {
     for callback in [
         "state=wrong-state&code=secret-authorization-code",
-        "state={state}&error=access_denied",
+        "state={state}&error=access_denied&error_description=private-remote-text",
         "state={state}",
     ] {
         let callback = callback.to_owned();
@@ -1254,12 +1293,13 @@ fn callback_state_error_and_missing_code_are_sanitized_authentication_failures()
             )
         };
 
-        let rendered = login(options, LoginCancellation::new())
-            .expect_err("invalid callback should fail")
-            .to_string();
+        let error =
+            login(options, LoginCancellation::new()).expect_err("invalid callback should fail");
+        let rendered = error.to_string();
         assert!(rendered.starts_with("ChatGPT authentication required:"));
         assert!(!rendered.contains("secret-authorization-code"));
         assert!(!rendered.contains("wrong-state"));
+        assert!(!rendered.contains("private-remote-text"));
     }
 }
 
@@ -1289,7 +1329,7 @@ fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts(
             "localhost",
         ),
         (
-            "state={state}&error=access_denied&error_description=duplicate",
+            "state={state}&error=access_denied&error_description=private-remote-text",
             "localhost",
         ),
         ("state=%FF&code=authorization-code", "localhost"),
@@ -1353,6 +1393,7 @@ fn callback_rejects_duplicate_parameters_malformed_encoding_and_untrusted_hosts(
         let error = login(options, LoginCancellation::new()).expect_err("callback must fail");
 
         assert!(matches!(error, LoginError::Authentication(_)));
+        assert!(!error.to_string().contains("private-remote-text"));
         let status = status_receive
             .recv_timeout(Duration::from_secs(1))
             .expect("callback response");

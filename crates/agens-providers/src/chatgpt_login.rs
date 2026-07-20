@@ -44,7 +44,7 @@ const MAX_DEVICE_JSON_BYTES: usize = 16 * 1024;
 const MAX_DEVICE_POLL_INTERVAL_SECONDS: f64 = 60.0;
 const DEVICE_WAIT_SLICE: Duration = Duration::from_millis(5);
 const DEVICE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
-const ACCOUNT_ID_CLAIM: &str = "https://api.openai.com/auth.chatgpt_account_id";
+const AUTH_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 const MIN_PKCE_VERIFIER_BYTES: usize = 43;
 const MAX_PKCE_VERIFIER_BYTES: usize = 128;
 const PKCE_CHALLENGE_BYTES: usize = 32;
@@ -97,19 +97,24 @@ impl std::fmt::Debug for ChatGptCredentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginError {
     Authentication(&'static str),
+    Account,
+    Expiry,
     Cancelled,
     TimedOut,
 }
 
 impl std::fmt::Display for LoginError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
+        let message = match self {
             Self::Authentication(message) => {
-                write!(formatter, "ChatGPT authentication required: {message}")
+                return write!(formatter, "ChatGPT authentication required: {message}");
             }
-            Self::Cancelled => formatter.write_str("ChatGPT login was cancelled"),
-            Self::TimedOut => formatter.write_str("ChatGPT login timed out"),
-        }
+            Self::Account => "ChatGPT account ID was missing; retry authentication",
+            Self::Expiry => "ChatGPT token expiry was invalid; retry authentication",
+            Self::Cancelled => "ChatGPT login was cancelled",
+            Self::TimedOut => "ChatGPT login timed out",
+        };
+        formatter.write_str(message)
     }
 }
 
@@ -138,6 +143,7 @@ type BrowserOpener = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 type UrlPublisher = Arc<dyn Fn(&str) + Send + Sync>;
 type RandomBytes = Arc<dyn Fn(usize) -> Result<Vec<u8>, LoginError> + Send + Sync>;
 type PortBinder = Arc<dyn Fn(u16) -> std::io::Result<TcpListener> + Send + Sync>;
+type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ChatGptLoginOptions {
@@ -149,6 +155,7 @@ pub struct ChatGptLoginOptions {
     pub publish_url: UrlPublisher,
     pub random_bytes: RandomBytes,
     pub bind_port: PortBinder,
+    pub now: Clock,
 }
 
 impl ChatGptLoginOptions {
@@ -162,6 +169,7 @@ impl ChatGptLoginOptions {
             publish_url,
             random_bytes: Arc::new(secure_random_bytes),
             bind_port: Arc::new(bind_loopback_port),
+            now: Arc::new(SystemTime::now),
         }
     }
 
@@ -183,6 +191,7 @@ pub struct ChatGptDeviceCodeLoginOptions {
     pub device_token_endpoint: String,
     pub token_endpoint: String,
     pub timeout: Duration,
+    pub now: Clock,
 }
 
 impl ChatGptDeviceCodeLoginOptions {
@@ -192,6 +201,7 @@ impl ChatGptDeviceCodeLoginOptions {
             device_token_endpoint: DEVICE_TOKEN_ENDPOINT.to_owned(),
             token_endpoint: TOKEN_ENDPOINT.to_owned(),
             timeout: LOGIN_TIMEOUT,
+            now: Arc::new(SystemTime::now),
         }
     }
 
@@ -205,6 +215,7 @@ impl ChatGptDeviceCodeLoginOptions {
             device_token_endpoint: device_token_endpoint.to_owned(),
             token_endpoint: token_endpoint.to_owned(),
             timeout: LOGIN_TIMEOUT,
+            now: Arc::new(SystemTime::now),
         }
     }
 }
@@ -279,6 +290,7 @@ pub fn login(
         &code,
         &redirect_uri,
         &pkce.verifier,
+        options.now,
     )
 }
 
@@ -318,6 +330,7 @@ pub fn device_code_login_with_progress(
                 &code_verifier,
                 &cancellation,
                 deadline,
+                options.now,
             )?;
             return Ok(ChatGptDeviceCodeLogin {
                 verification_url: DEVICE_VERIFICATION_URL.to_owned(),
@@ -630,7 +643,11 @@ fn handle_callback(
     let code = query.code.filter(|code| !code.is_empty());
     match code {
         Some(code) => {
-            write_response(stream, 200, "Login complete");
+            write_response(
+                stream,
+                200,
+                "Authorization received. Return to the terminal.",
+            );
             Some(Ok(code))
         }
         None => {
@@ -806,6 +823,7 @@ fn exchange_code(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
+    now: Clock,
 ) -> Result<ChatGptCredentials, LoginError> {
     let response = reqwest::blocking::Client::new()
         .post(token_endpoint)
@@ -825,21 +843,20 @@ fn exchange_code(
     let token = response
         .json::<Value>()
         .map_err(|_| LoginError::Authentication("token response is invalid"))?;
-    credentials_from_token(&token)
+    credentials_from_token(&token, now())
 }
 
-fn credentials_from_token(token: &Value) -> Result<ChatGptCredentials, LoginError> {
+fn credentials_from_token(
+    token: &Value,
+    now: SystemTime,
+) -> Result<ChatGptCredentials, LoginError> {
     let id_token = required_token(token, "id_token")?;
     let access_token = required_token(token, "access_token")?;
     let refresh_token = required_token(token, "refresh_token")?;
     let account_id = account_id_from_id_token(id_token)?;
-    let expires_at = jwt_claim(access_token, "exp")
-        .as_ref()
-        .and_then(Value::as_i64)
-        .filter(|seconds| *seconds >= 0)
-        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds as u64)))
-        .and_then(format_expiry)
-        .ok_or(LoginError::Authentication("token response is invalid"))?;
+    let expires_at = jwt_expiry(access_token, now)
+        .or_else(|| expires_in_expiry(token, now))
+        .ok_or(LoginError::Expiry)?;
     Ok(ChatGptCredentials {
         access_token: access_token.to_owned(),
         refresh_token: refresh_token.to_owned(),
@@ -849,15 +866,16 @@ fn credentials_from_token(token: &Value) -> Result<ChatGptCredentials, LoginErro
 }
 
 pub fn account_id_from_id_token(id_token: &str) -> Result<String, LoginError> {
-    let claims =
-        jwt_payload(id_token).ok_or(LoginError::Authentication("token response is invalid"))?;
+    let claims = jwt_payload(id_token).ok_or(LoginError::Account)?;
     let account_id = claims
-        .get("chatgpt_account_id")
+        .get(AUTH_CLAIM_NAMESPACE)
+        .and_then(Value::as_object)
+        .and_then(|auth| auth.get("chatgpt_account_id"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .or_else(|| {
             claims
-                .get(ACCOUNT_ID_CLAIM)
+                .get("chatgpt_account_id")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
         })
@@ -870,7 +888,7 @@ pub fn account_id_from_id_token(id_token: &str) -> Result<String, LoginError> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
         })
-        .ok_or(LoginError::Authentication("token response is invalid"))?;
+        .ok_or(LoginError::Account)?;
 
     Ok(account_id.to_owned())
 }
@@ -1037,6 +1055,7 @@ fn exchange_code_cancellable(
     verifier: &str,
     cancellation: &LoginCancellation,
     deadline: Instant,
+    now: Clock,
 ) -> Result<ChatGptCredentials, LoginError> {
     let token_endpoint = token_endpoint.to_owned();
     let code = code.to_owned();
@@ -1046,7 +1065,7 @@ fn exchange_code_cancellable(
         reqwest::blocking::Client::builder()
             .timeout(DEVICE_HTTP_TIMEOUT)
             .build()
-            .expect("the fixed device HTTP client configuration is valid")
+            .expect("the fixed authentication HTTP client configuration is valid")
             .post(token_endpoint)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .form(&[
@@ -1070,7 +1089,7 @@ fn exchange_code_cancellable(
     if !success {
         return Err(LoginError::Authentication("token exchange failed"));
     }
-    credentials_from_token(&token)
+    credentials_from_token(&token, now())
 }
 
 fn cancellable_request<T: Send + 'static>(
@@ -1125,14 +1144,29 @@ fn required_token<'a>(token: &'a Value, field: &str) -> Result<&'a str, LoginErr
         .ok_or(LoginError::Authentication("token response is incomplete"))
 }
 
+fn jwt_expiry(token: &str, now: SystemTime) -> Option<String> {
+    let seconds = jwt_payload(token)?.get("exp")?.as_u64()?;
+    let expiry = UNIX_EPOCH.checked_add(Duration::from_secs(seconds))?;
+    if expiry <= now {
+        return None;
+    }
+    format_expiry(expiry)
+}
+
+fn expires_in_expiry(token: &Value, now: SystemTime) -> Option<String> {
+    let seconds = token
+        .get("expires_in")?
+        .as_u64()
+        .filter(|seconds| (1..=u64::from(u32::MAX)).contains(seconds))?;
+    now.checked_add(Duration::from_secs(seconds))
+        .and_then(format_expiry)
+}
+
+#[cfg(test)]
 fn jwt_claim(token: &str, claim: &str) -> Option<Value> {
     let payload = jwt_payload(token)?;
     let value = payload.get(claim)?;
     match claim {
-        ACCOUNT_ID_CLAIM => value
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .map(|value| Value::String(value.to_owned())),
         "exp" => value.as_i64().filter(|value| *value >= 0).map(Value::from),
         _ => Some(value.clone()),
     }
@@ -1379,6 +1413,28 @@ fn write_credentials_atomically_at(
 mod tests {
     use super::*;
 
+    fn token_response(access_claims: Value, expires_in: Option<Value>) -> Value {
+        let id_token = jwt(
+            r#"{"alg":"RS256"}"#,
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"account"}}"#,
+            "signature",
+        );
+        let access_token = jwt(
+            r#"{"alg":"RS256"}"#,
+            &serde_json::to_string(&access_claims).expect("claims should encode"),
+            "signature",
+        );
+        let mut token = serde_json::json!({
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": "refresh",
+        });
+        if let Some(expires_in) = expires_in {
+            token["expires_in"] = expires_in;
+        }
+        token
+    }
+
     fn jwt(header: &str, payload: &str, signature: &str) -> String {
         format!(
             "{}.{}.{}",
@@ -1403,42 +1459,104 @@ mod tests {
             jwt(r#"{"alg":"RS256"}"#, "{}", ""),
         ];
         for token in malformed {
-            assert!(jwt_claim(&token, ACCOUNT_ID_CLAIM).is_none());
+            assert!(jwt_payload(&token).is_none());
         }
     }
 
     #[test]
-    fn jwt_claim_accepts_only_valid_account_and_expiration_claim_types() {
+    fn jwt_claim_accepts_only_valid_expiration_claim_types() {
         let header = r#"{"alg":"RS256"}"#;
-        assert_eq!(
-            jwt_claim(
-                &jwt(
-                    header,
-                    r#"{"https://api.openai.com/auth.chatgpt_account_id":"account"}"#,
-                    "signature"
-                ),
-                ACCOUNT_ID_CLAIM
-            ),
-            Some(Value::String("account".to_owned()))
-        );
         for payload in [
-            r#"{"https://api.openai.com/auth.chatgpt_account_id":""}"#,
-            r#"{"https://api.openai.com/auth.chatgpt_account_id":false}"#,
             r#"{"exp":-1}"#,
             r#"{"exp":"1"}"#,
             r#"{"exp":18446744073709551615}"#,
         ] {
-            let claim = if payload.contains("account") {
-                ACCOUNT_ID_CLAIM
-            } else {
-                "exp"
-            };
-            let value = jwt_claim(&jwt(header, payload, "signature"), claim);
+            let value = jwt_claim(&jwt(header, payload, "signature"), "exp");
             assert!(value.is_none() || value.as_ref().is_some_and(Value::is_i64));
         }
         assert_eq!(
             jwt_claim(&jwt(header, r#"{"exp":0}"#, "signature"), "exp"),
             Some(Value::from(0))
+        );
+    }
+
+    #[test]
+    fn token_expiry_prefers_a_future_jwt_and_falls_back_only_to_bounded_expires_in() {
+        let now_seconds = 1_700_000_000_u64;
+        let now = UNIX_EPOCH + Duration::from_secs(now_seconds);
+        let expected_jwt = format_expiry(UNIX_EPOCH + Duration::from_secs(now_seconds + 1))
+            .expect("expiry should format");
+        let expected_fallback =
+            format_expiry(now + Duration::from_secs(1)).expect("expiry should format");
+
+        let jwt_wins = credentials_from_token(
+            &token_response(
+                serde_json::json!({"exp": now_seconds + 1}),
+                Some(Value::from(0)),
+            ),
+            now,
+        )
+        .expect("a future JWT expiry should win");
+        assert_eq!(jwt_wins.expires_at, expected_jwt);
+
+        for unusable_exp in [
+            Value::Null,
+            Value::String("1700000001".to_owned()),
+            serde_json::json!(1.5),
+            Value::from(-1),
+            Value::from(0),
+            Value::from(now_seconds - 1),
+            Value::from(now_seconds),
+            Value::from(u64::MAX),
+        ] {
+            let fallback = credentials_from_token(
+                &token_response(
+                    serde_json::json!({"exp": unusable_exp}),
+                    Some(Value::from(1)),
+                ),
+                now,
+            )
+            .expect("a bounded fallback should replace an unusable JWT expiry");
+            assert_eq!(fallback.expires_at, expected_fallback);
+        }
+
+        let maximum = credentials_from_token(
+            &token_response(serde_json::json!({}), Some(Value::from(u32::MAX))),
+            UNIX_EPOCH,
+        )
+        .expect("the inclusive fallback bound should be accepted");
+        assert_eq!(
+            maximum.expires_at,
+            format_expiry(UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)))
+                .expect("maximum expiry should format")
+        );
+
+        for invalid_fallback in [
+            None,
+            Some(Value::String("1".to_owned())),
+            Some(serde_json::json!(1.5)),
+            Some(Value::from(-1)),
+            Some(Value::from(0)),
+            Some(Value::from(u64::from(u32::MAX) + 1)),
+        ] {
+            assert_eq!(
+                credentials_from_token(
+                    &token_response(serde_json::json!({"exp": now_seconds}), invalid_fallback),
+                    now,
+                ),
+                Err(LoginError::Expiry)
+            );
+        }
+
+        let maximum_time = UNIX_EPOCH
+            .checked_add(Duration::from_secs(i64::MAX as u64))
+            .expect("the platform should represent its maximum second");
+        assert_eq!(
+            credentials_from_token(
+                &token_response(serde_json::json!({}), Some(Value::from(1))),
+                maximum_time,
+            ),
+            Err(LoginError::Expiry)
         );
     }
 
