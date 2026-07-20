@@ -11,9 +11,10 @@ use agens::{
     CliDependencies, ExitStatus, bootstrap, execute, execute_os, execute_with_cancellation,
 };
 use agens_core::{
-    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart,
-    PermissionDecision, TurnEvent, TurnProvider, run_headless_turn,
+    CompletedSessionTurn, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
+    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnPortError,
+    Message, MessagePart, PermissionDecision, Role, SessionMessage, SessionMetadata, TurnEvent,
+    TurnProvider, run_headless_turn,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::McpTransport;
@@ -385,19 +386,14 @@ fn unavailable_surfaces_fail_explicitly_without_claiming_success() {
         BTreeMap::new(),
     );
 
-    for arguments in [
-        ["auth", "login"].as_slice(),
-        ["sessions", "rm", "1"].as_slice(),
-    ] {
-        let result = execute(arguments, &dependencies);
+    let result = execute(["auth", "login"], &dependencies);
 
-        assert_eq!(result.status, ExitStatus::Unavailable);
-        assert_eq!(result.stdout, "");
-        assert_eq!(
-            result.stderr,
-            "error: unavailable: this command is not implemented yet\n"
-        );
-    }
+    assert_eq!(result.status, ExitStatus::Unavailable);
+    assert_eq!(result.stdout, "");
+    assert_eq!(
+        result.stderr,
+        "error: unavailable: this command is not implemented yet\n"
+    );
 }
 
 #[test]
@@ -734,6 +730,85 @@ fn sessions_list_uses_configured_data_directory_and_reports_empty_store() {
 }
 
 #[test]
+fn sessions_crud_uses_normalized_metadata_and_idempotent_removal() {
+    let temporary = TemporaryDirectory::new("normalized-sessions");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
+        )]),
+    );
+    let metadata = SessionMetadata {
+        id: 7,
+        project: "project".into(),
+        title: "conversation".into(),
+        active_agent: "primary".into(),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let turn = CompletedSessionTurn::new(
+        vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("hello".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("world".into())],
+            },
+        ]
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .expect("session messages should be valid"),
+    )
+    .expect("completed session turn should be valid");
+    let mut store = SessionStore::open(&data_directory).expect("session store should open");
+    store
+        .persist_completed_session_turn(&metadata, &turn)
+        .expect("normalized session should persist");
+
+    let list = execute(["sessions", "list"], &dependencies);
+    let show = execute(["sessions", "show", "7"], &dependencies);
+    let remove = execute(["sessions", "rm", "7"], &dependencies);
+    let remove_again = execute(["sessions", "rm", "7"], &dependencies);
+    let missing = execute(["sessions", "show", "7"], &dependencies);
+    let empty = execute(["sessions", "list"], &dependencies);
+
+    assert_eq!(list.status, ExitStatus::Success);
+    assert_eq!(
+        list.stdout,
+        "ID\tPROJECT\tTITLE\tAGENT\tTURNS\n7\tproject\tconversation\tprimary\t1\n"
+    );
+    assert_eq!(show.status, ExitStatus::Success);
+    assert_eq!(
+        show.stdout,
+        "Session 7: project=project title=conversation agent=primary turns=1 messages=2\n"
+    );
+    assert_eq!(remove.status, ExitStatus::Success);
+    assert_eq!(remove.stdout, "Removed session 7.\n");
+    assert_eq!(remove_again.status, ExitStatus::Success);
+    assert_eq!(remove_again.stdout, "Removed session 7.\n");
+    assert_eq!(missing.status, ExitStatus::Failure);
+    assert_eq!(
+        missing.stderr,
+        "error: store: saved session is unavailable\n"
+    );
+    assert_eq!(empty.status, ExitStatus::Success);
+    assert_eq!(empty.stdout, "No saved sessions.\n");
+}
+
+#[test]
 fn config_doctor_rejects_semantically_invalid_configuration() {
     let temporary = TemporaryDirectory::new("semantic-config");
     let config_home = temporary.path().join("config");
@@ -988,7 +1063,7 @@ fn headless_chat_bootstraps_config_runs_local_turn_and_supports_session_resume()
     assert_eq!(chat.status, ExitStatus::Success);
     assert_eq!(chat.stdout, "16 events\n");
     assert_eq!(sessions.status, ExitStatus::Success);
-    assert_eq!(sessions.stdout, "ID\tEVENTS\n1\t16 event(s)\n");
+    assert_eq!(sessions.stdout, "No saved sessions.\n");
     assert_eq!(resumed.status, ExitStatus::Success);
     assert_eq!(resumed.stdout, "Session 1: 16 event(s)\n");
     assert!(!format!("{}{}{}", chat.stdout, sessions.stdout, resumed.stdout).contains("secret"));
@@ -1058,7 +1133,10 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     assert_eq!(String::from_utf8_lossy(&chat.stdout), "Hello from OpenAI\n");
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
     assert!(sessions.status.success());
-    assert!(String::from_utf8_lossy(&sessions.stdout).contains("1\t4 event(s)"));
+    assert_eq!(
+        String::from_utf8_lossy(&sessions.stdout),
+        "No saved sessions.\n"
+    );
     assert!(
         !format!(
             "{}{}",
@@ -1120,7 +1198,7 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
     assert_eq!(
         String::from_utf8_lossy(&sessions.stdout),
-        "ID\tEVENTS\n1\t4 event(s)\n"
+        "No saved sessions.\n"
     );
     let diagnostics = format!(
         "{}{}",
@@ -1356,7 +1434,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
                     .expect("sessions command should execute")
                     .stdout,
             ),
-            "ID\tEVENTS\n1\t10 event(s)\n",
+            "No saved sessions.\n",
             "{name}"
         );
         assert_sqlite_has_no_sentinels(
@@ -1493,7 +1571,7 @@ fn production_binary_executes_allowed_native_read_then_continues_and_persists() 
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
     assert_eq!(
         String::from_utf8_lossy(&sessions.stdout),
-        "ID\tEVENTS\n1\t10 event(s)\n"
+        "No saved sessions.\n"
     );
     assert_eq!(
         String::from_utf8_lossy(&resumed.stdout),
@@ -1671,7 +1749,7 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
                     .expect("sessions command should execute")
                     .stdout,
             ),
-            "ID\tEVENTS\n1\t10 event(s)\n",
+            "No saved sessions.\n",
             "{name}"
         );
         assert!(
@@ -1846,7 +1924,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
                     .expect("sessions command should execute")
                     .stdout,
             ),
-            "ID\tEVENTS\n1\t10 event(s)\n",
+            "No saved sessions.\n",
             "{name}"
         );
 
@@ -1994,7 +2072,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
     assert!(sessions.status.success());
     assert_eq!(
         String::from_utf8_lossy(&sessions.stdout),
-        "ID\tEVENTS\n1\t10 event(s)\n"
+        "No saved sessions.\n"
     );
     assert!(
         PermissionGrantStore::open(&data_directory)
@@ -2509,7 +2587,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
                 .expect("sessions command should execute")
                 .stdout,
         ),
-        "ID\tEVENTS\n1\t10 event(s)\n"
+        "No saved sessions.\n"
     );
     let snapshot = SessionStore::open(&data_directory)
         .expect("session store should open")
@@ -3040,7 +3118,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
                         .expect("sessions command should execute")
                         .stdout,
                 ),
-                "ID\tEVENTS\n1\t10 event(s)\n",
+                "No saved sessions.\n",
                 "{name}"
             );
         } else {
