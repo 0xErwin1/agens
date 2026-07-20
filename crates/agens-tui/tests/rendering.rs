@@ -792,6 +792,98 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
 }
 
 #[test]
+fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(78, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    let current = DialogEntry::action_with_metadata(
+        "#7 Alpha",
+        "2 turns · 5m ago · primary · current",
+        "7 Alpha /work/alpha primary",
+        "ID: 7 · Alpha\nTurns: 2 · Agent: primary\nUpdated: 100 (5m ago)",
+        "session:7",
+    );
+    let other = DialogEntry::action_with_metadata(
+        "#9 Beta",
+        "4 turns · 1h ago · reviewer · root=/work/beta",
+        "9 Beta /work/beta reviewer",
+        "ID: 9 · Beta\nTurns: 4 · Agent: reviewer\nUpdated: 90 (1h ago) · Root: /work/beta",
+        "session:9",
+    );
+    tui.show_selection_dialog(DialogView::sessions(
+        vec![current.clone()],
+        vec![current, other],
+    ));
+
+    renderer.render(tui.view()).unwrap();
+    let project = rendered_text(&renderer);
+    assert!(
+        project.contains("Resume session · Current project"),
+        "{project:?}"
+    );
+    assert!(project.contains("Ctrl+A All projects"), "{project:?}");
+    assert!(project.contains("#7 Alpha"), "{project:?}");
+    assert!(project.contains("Updated: 100 (5m ago)"), "{project:?}");
+    assert!(!project.contains("#9 Beta"), "{project:?}");
+
+    tui.handle(Event::Key(Key::LineStart));
+    renderer.render(tui.view()).unwrap();
+    let global = rendered_text(&renderer);
+    assert!(
+        global.contains("Resume session · All projects"),
+        "{global:?}"
+    );
+    assert!(global.contains("root=/work/beta"), "{global:?}");
+
+    for character in "missing".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    renderer.render(tui.view()).unwrap();
+    let search = rendered_text(&renderer);
+    assert!(search.contains("No sessions match search."), "{search:?}");
+
+    tui.show_selection_dialog(DialogView::sessions(Vec::new(), Vec::new()));
+    renderer.render(tui.view()).unwrap();
+    let empty_project = rendered_text(&renderer);
+    assert!(empty_project.contains("No resumable sessions in current project."));
+    tui.handle(Event::Key(Key::LineStart));
+    renderer.render(tui.view()).unwrap();
+    let empty_global = rendered_text(&renderer);
+    assert!(empty_global.contains("No resumable sessions in any project."));
+}
+
+#[test]
+fn short_session_dialog_keeps_search_selected_row_and_compact_details_visible() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(34, 7)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    let entries = (0..12)
+        .map(|id| {
+            DialogEntry::action_with_metadata(
+                format!("#{id} Session {id}"),
+                "2 turns · now · primary",
+                format!("{id} Session {id} /work/alpha primary"),
+                format!("ID: {id} · Session {id}\nTurns: 2 · Agent: primary"),
+                format!("session:{id}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    tui.show_selection_dialog(DialogView::sessions(entries.clone(), entries));
+    tui.handle(Event::Resize {
+        width: 34,
+        height: 7,
+    });
+    for _ in 0..8 {
+        tui.handle(Event::Key(Key::Down));
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    assert!(text.contains("Search:"), "{text:?}");
+    assert!(text.contains("#8 Session 8"), "{text:?}");
+    assert!(text.contains("Turns: 2"), "{text:?}");
+    assert!(!text.contains("#0 Session 0"), "{text:?}");
+}
+
+#[test]
 fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation() {
     let backend = TestBackend::new(34, 10);
     let terminal = Terminal::new(backend).unwrap();

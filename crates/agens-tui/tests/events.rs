@@ -672,6 +672,40 @@ fn selection_dialog_search_edits_navigates_filtered_rows_and_clears_before_closi
 }
 
 #[test]
+fn session_dialog_toggles_scope_preserves_search_and_dispatches_the_filtered_selection() {
+    let current = DialogEntry::action_with_metadata(
+        "#7 Alpha",
+        "2 turns · 5m ago · primary · current",
+        "7 Alpha /work/alpha primary",
+        "ID: 7 · Alpha\nTurns: 2 · Agent: primary\nUpdated: 100 (5m ago)",
+        "session:7",
+    );
+    let other = DialogEntry::action_with_metadata(
+        "#9 Beta",
+        "4 turns · 1h ago · reviewer · root=/work/beta",
+        "9 Beta /work/beta reviewer",
+        "ID: 9 · Beta\nTurns: 4 · Agent: reviewer\nUpdated: 90 (1h ago) · Root: /work/beta",
+        "session:9",
+    );
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(DialogView::sessions(
+        vec![current.clone()],
+        vec![current, other],
+    ));
+
+    for character in "reviewer".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    assert_eq!(tui.handle(Event::Key(Key::LineStart)), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("session:9".into())
+    );
+}
+
+#[test]
 fn selection_dialog_escape_control_c_empty_and_disabled_states_never_dispatch() {
     for cancel_key in [Key::Escape, Key::CtrlC] {
         let mut tui = Tui::new(FakeEngine::default());

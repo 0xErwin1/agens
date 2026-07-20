@@ -339,6 +339,8 @@ enum DialogEntryAction {
 pub struct DialogEntry {
     label: String,
     detail: Option<String>,
+    search_text: Option<String>,
+    selected_detail: Option<String>,
     action: Option<DialogEntryAction>,
 }
 
@@ -358,6 +360,27 @@ impl DialogEntry {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
             detail: detail.map(|detail| bounded_dialog_text(detail.as_ref(), 256)),
+            search_text: None,
+            selected_detail: None,
+            action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
+                action_id.as_ref(),
+                128,
+            ))),
+        }
+    }
+
+    pub fn action_with_metadata(
+        label: impl AsRef<str>,
+        detail: impl AsRef<str>,
+        search_text: impl AsRef<str>,
+        selected_detail: impl AsRef<str>,
+        action_id: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
+            search_text: Some(bounded_dialog_text(search_text.as_ref(), 512)),
+            selected_detail: Some(bounded_dialog_text(selected_detail.as_ref(), 512)),
             action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
                 action_id.as_ref(),
                 128,
@@ -369,6 +392,8 @@ impl DialogEntry {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
             detail: None,
+            search_text: None,
+            selected_detail: None,
             action: Some(DialogEntryAction::Cancel),
         }
     }
@@ -377,9 +402,18 @@ impl DialogEntry {
         Self {
             label: bounded_dialog_text(label.as_ref(), 128),
             detail: Some(bounded_dialog_text(detail.as_ref(), 256)),
+            search_text: None,
+            selected_detail: None,
             action: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionDialogEntries {
+    current_project: Vec<DialogEntry>,
+    all_projects: Vec<DialogEntry>,
+    showing_all_projects: bool,
 }
 
 /// Generic bounded dialog state for informational, selection, and confirmation overlays.
@@ -392,6 +426,7 @@ pub struct DialogView {
     selected: usize,
     offset: usize,
     interactive: bool,
+    session_entries: Option<SessionDialogEntries>,
 }
 
 impl DialogView {
@@ -412,7 +447,26 @@ impl DialogView {
             selected,
             offset: 0,
             interactive: true,
+            session_entries: None,
         }
+    }
+
+    pub fn sessions(current_project: Vec<DialogEntry>, all_projects: Vec<DialogEntry>) -> Self {
+        let current_project = current_project.into_iter().take(64).collect::<Vec<_>>();
+        let all_projects = all_projects.into_iter().take(64).collect::<Vec<_>>();
+        let mut dialog = Self::selection(
+            "Resume session · Current project",
+            Some(
+                "Type to search | Ctrl+A All projects | Up/Down navigate | Enter resume | Esc cancel",
+            ),
+            current_project.clone(),
+        );
+        dialog.session_entries = Some(SessionDialogEntries {
+            current_project,
+            all_projects,
+            showing_all_projects: false,
+        });
+        dialog
     }
 
     pub fn with_selected(mut self, selected: usize) -> Self {
@@ -435,6 +489,7 @@ impl DialogView {
             selected: 0,
             offset: 0,
             interactive: false,
+            session_entries: None,
         }
     }
 }
@@ -452,6 +507,10 @@ fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
                     .detail
                     .as_ref()
                     .is_some_and(|detail| detail.to_lowercase().contains(&query))
+                || entry
+                    .search_text
+                    .as_ref()
+                    .is_some_and(|text| text.to_lowercase().contains(&query))
         })
         .collect()
 }
@@ -672,34 +731,42 @@ fn render_palette(
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
     let dialog_area = dialog_area(area, dialog);
     let matches = dialog_matches(dialog);
+    let layout = dialog_content_layout(dialog, dialog_area.height);
 
     frame.render_widget(Clear, dialog_area);
-    let mut lines: Vec<Line<'_>> = dialog
-        .help
-        .as_deref()
-        .map(|help| {
-            if dialog.entries.is_empty() {
-                help.lines().map(Line::from).collect()
-            } else {
-                help.lines().next().map(Line::from).into_iter().collect()
-            }
-        })
-        .unwrap_or_default();
+    let mut lines: Vec<Line<'_>> = if layout.show_help {
+        dialog
+            .help
+            .as_deref()
+            .and_then(|help| help.lines().next())
+            .map(Line::from)
+            .into_iter()
+            .collect()
+    } else if dialog.entries.is_empty() && dialog.session_entries.is_none() {
+        dialog
+            .help
+            .as_deref()
+            .map(|help| help.lines().map(Line::from).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if dialog.interactive {
         lines.push(Line::styled(
             format!("Search: {}", dialog.query),
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if matches.is_empty() && dialog.help.is_none() {
-        lines.push(Line::from("No options available."));
+    if matches.is_empty() && (dialog.session_entries.is_some() || dialog.help.is_none()) {
+        lines.push(Line::from(dialog_empty_message(dialog)));
     }
     lines.extend(
         matches
-            .into_iter()
+            .iter()
             .skip(dialog.offset)
+            .take(layout.entry_rows)
             .map(|(index, entry)| {
-                let selected = dialog.interactive && index == dialog.selected;
+                let selected = dialog.interactive && *index == dialog.selected;
                 let text = match (&entry.action, &entry.detail) {
                     (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
                     (None, None) => format!("disabled {}", entry.label),
@@ -720,6 +787,18 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                 Line::styled(text, style)
             }),
     );
+    if let Some(detail) = matches
+        .iter()
+        .find(|(index, _)| *index == dialog.selected)
+        .and_then(|(_, entry)| entry.selected_detail.as_deref())
+    {
+        lines.extend(
+            detail
+                .lines()
+                .take(layout.detail_rows)
+                .map(|line| Line::styled(line, Style::default().fg(Color::DarkGray))),
+        );
+    }
 
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -743,9 +822,20 @@ fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
     let content_rows = usize::from(dialog.help.is_some())
         .saturating_add(usize::from(dialog.interactive))
         .saturating_add(dialog_matches(dialog).len().max(1))
+        .saturating_add(
+            dialog
+                .entries
+                .get(dialog.selected)
+                .and_then(|entry| entry.selected_detail.as_deref())
+                .map_or(0, |detail| detail.lines().count().min(3)),
+        )
         .saturating_add(2) as u16;
     let height = content_rows
-        .min(12)
+        .min(if dialog.session_entries.is_some() {
+            16
+        } else {
+            12
+        })
         .min(area.height.saturating_sub(2))
         .max(1);
     Rect::new(
@@ -755,6 +845,55 @@ fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
         width,
         height,
     )
+}
+
+#[derive(Clone, Copy)]
+struct DialogContentLayout {
+    show_help: bool,
+    entry_rows: usize,
+    detail_rows: usize,
+}
+
+fn dialog_content_layout(dialog: &DialogView, height: u16) -> DialogContentLayout {
+    let inner_rows = usize::from(height.saturating_sub(2));
+    let search_rows = usize::from(dialog.interactive);
+    let detail_rows = dialog
+        .entries
+        .get(dialog.selected)
+        .and_then(|entry| entry.selected_detail.as_deref())
+        .map_or(0, |detail| {
+            detail
+                .lines()
+                .count()
+                .min(3)
+                .min(inner_rows.saturating_sub(search_rows.saturating_add(1)))
+        });
+    let show_help = dialog.help.is_some()
+        && inner_rows > search_rows.saturating_add(detail_rows).saturating_add(1);
+    let entry_rows = inner_rows
+        .saturating_sub(search_rows)
+        .saturating_sub(detail_rows)
+        .saturating_sub(usize::from(show_help))
+        .max(1);
+
+    DialogContentLayout {
+        show_help,
+        entry_rows,
+        detail_rows,
+    }
+}
+
+fn dialog_empty_message(dialog: &DialogView) -> &'static str {
+    let Some(session_entries) = dialog.session_entries.as_ref() else {
+        return "No options available.";
+    };
+    if !dialog.query.is_empty() {
+        "No sessions match search."
+    } else if session_entries.showing_all_projects {
+        "No resumable sessions in any project."
+    } else {
+        "No resumable sessions in current project."
+    }
 }
 
 struct ScreenLayout {
@@ -1806,6 +1945,15 @@ where
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
+            Key::LineStart
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.session_entries.is_some()) =>
+            {
+                self.toggle_session_dialog_scope();
+                Action::Render
+            }
             Key::Char(character) => {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.push(character);
@@ -1839,10 +1987,10 @@ where
             }
             Key::Enter => {
                 let action = self.dialog.as_ref().and_then(|dialog| {
-                    dialog
-                        .entries
-                        .get(dialog.selected)
-                        .and_then(|entry| entry.action.clone())
+                    dialog_matches(dialog)
+                        .into_iter()
+                        .find(|(index, _)| *index == dialog.selected)
+                        .and_then(|(_, entry)| entry.action.clone())
                 });
                 match action {
                     Some(DialogEntryAction::Dispatch(action_id)) => {
@@ -1874,6 +2022,33 @@ where
             }
             _ => Action::Render,
         }
+    }
+
+    fn toggle_session_dialog_scope(&mut self) {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return;
+        };
+        let Some(session_entries) = dialog.session_entries.as_mut() else {
+            return;
+        };
+
+        session_entries.showing_all_projects = !session_entries.showing_all_projects;
+        if session_entries.showing_all_projects {
+            dialog.title = "Resume session · All projects".into();
+            dialog.help = Some(
+                "Type to search | Ctrl+A Current project | Up/Down navigate | Enter resume | Esc cancel"
+                    .into(),
+            );
+            dialog.entries.clone_from(&session_entries.all_projects);
+        } else {
+            dialog.title = "Resume session · Current project".into();
+            dialog.help = Some(
+                "Type to search | Ctrl+A All projects | Up/Down navigate | Enter resume | Esc cancel"
+                    .into(),
+            );
+            dialog.entries.clone_from(&session_entries.current_project);
+        }
+        self.reset_dialog_selection();
     }
 
     fn move_dialog_selection(&mut self, key: Key, amount: usize, wrap: bool) {
@@ -1938,11 +2113,8 @@ where
             return 1;
         };
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let help_rows = usize::from(dialog.help.is_some() && !dialog.entries.is_empty());
-        usize::from(dialog_area(area, dialog).height.saturating_sub(2))
-            .saturating_sub(help_rows)
-            .saturating_sub(usize::from(dialog.interactive))
-            .max(1)
+        let height = dialog_area(area, dialog).height;
+        dialog_content_layout(dialog, height).entry_rows
     }
 
     fn clamp_palette_selection(&mut self) {
