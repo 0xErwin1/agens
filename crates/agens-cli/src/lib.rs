@@ -847,7 +847,24 @@ struct TuiSessionContext {
     active_agent: Option<ActiveAgentRuntime>,
     pending_system_reminder: Option<String>,
     selection: Option<TuiModelSelector>,
+    selected_subagent: Option<String>,
+    running: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiSessionMutationError {
+    Busy,
+}
+
+fn reset_tui_session(context: &mut TuiSessionContext) -> Result<(), TuiSessionMutationError> {
+    if context.running {
+        return Err(TuiSessionMutationError::Busy);
+    }
+
+    *context = TuiSessionContext::fresh();
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ActiveAgentRuntime {
     name: String,
@@ -966,6 +983,8 @@ impl TuiSessionContext {
             active_agent: Some(active_agent),
             pending_system_reminder: None,
             selection: None,
+            selected_subagent: None,
+            running: false,
         }
     }
 
@@ -1084,26 +1103,40 @@ fn run_tui_prompt(
     match prompt.trim() {
         "/sessions" => list_tui_sessions(bootstrap),
         "/new" => {
-            *session.lock().map_err(|_| {
+            let mut session = session.lock().map_err(|_| {
                 CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-            })? = TuiSessionContext::fresh();
+            })?;
+            reset_tui_session(&mut session)
+                .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
             Ok("Started a new session.".to_owned())
         }
         command if command.starts_with("/resume ") => {
+            if tui_session_is_running(session)? {
+                return Err(CliError::runtime(HeadlessTurnError::State));
+            }
             let identifier = command[8..]
                 .trim()
                 .parse::<i64>()
                 .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
             let resumed = resume_tui_session(bootstrap, identifier)?;
             let note = resumed.note();
-            *session.lock().map_err(|_| {
+            let mut context = session.lock().map_err(|_| {
                 CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-            })? = resumed;
+            })?;
+            if context.running {
+                return Err(CliError::runtime(HeadlessTurnError::State));
+            }
+            *context = resumed;
             Ok(note)
         }
         command if command.starts_with("/agent ") => {
             rotate_tui_agent(bootstrap, &command[7..], session)
         }
+        "/agent" => list_tui_agents(bootstrap, session, agens_core::AgentMode::Primary),
+        command if command.starts_with("/subagent ") => {
+            select_tui_subagent(bootstrap, &command[10..], session)
+        }
+        "/subagent" => list_tui_agents(bootstrap, session, agens_core::AgentMode::Subagent),
         command if command == "/model" || command.starts_with("/model ") => {
             select_tui_model(bootstrap, command, session)
         }
@@ -1111,12 +1144,15 @@ fn run_tui_prompt(
             select_tui_effort(bootstrap, command, session)
         }
         prompt => {
-            let request = session
-                .lock()
-                .map_err(|_| {
+            let request = {
+                let mut session = session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-                })?
-                .apply_to(HeadlessChatRequest {
+                })?;
+                if session.running {
+                    return Err(CliError::runtime(HeadlessTurnError::State));
+                }
+                session.running = true;
+                session.apply_to(HeadlessChatRequest {
                     prompt: prompt.to_owned(),
                     history: Vec::new(),
                     model: None,
@@ -1129,7 +1165,8 @@ fn run_tui_prompt(
                     active_agent: None,
                     effective_capabilities: None,
                     pending_system_reminder: None,
-                });
+                })
+            };
             let consumed_reminder = request.pending_system_reminder.is_some();
             let completion = run_production_headless_chat_with_progress(
                 request,
@@ -1140,6 +1177,7 @@ fn run_tui_prompt(
             let mut session = session.lock().map_err(|_| {
                 CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
             })?;
+            session.running = false;
             complete_tui_turn(&mut session, completion, consumed_reminder)
         }
     }
@@ -1244,6 +1282,9 @@ fn rotate_tui_agent(
     let mut context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    if context.running {
+        return Err(CliError::runtime(HeadlessTurnError::State));
+    }
     if context.active_agent.is_none() {
         let current = context
             .metadata
@@ -1274,6 +1315,7 @@ fn rotate_tui_agent(
         .then(|| SessionStore::open(bootstrap.data_directory()))
         .transpose()
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let running = context.running;
     rotate_active_agent(
         &mut context,
         agent,
@@ -1281,10 +1323,77 @@ fn rotate_tui_agent(
         &dispatcher,
         &validator,
         store.as_mut(),
-        false,
+        running,
     )
     .map_err(agent_rotation_error)?;
     Ok(format!("Active agent: {}.", agent.name))
+}
+
+fn tui_session_is_running(session: &Arc<Mutex<TuiSessionContext>>) -> Result<bool, CliError> {
+    session
+        .lock()
+        .map(|context| context.running)
+        .map_err(|_| CliError::storage("TUI session is unavailable"))
+}
+
+fn list_tui_agents(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<TuiSessionContext>>,
+    mode: agens_core::AgentMode,
+) -> Result<String, CliError> {
+    let catalog = tui_agent_catalog(bootstrap, &BundledModelValidator)?;
+    let context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    let current = match mode {
+        agens_core::AgentMode::Primary => context
+            .active_agent
+            .as_ref()
+            .map(|agent| agent.name.as_str()),
+        agens_core::AgentMode::Subagent => context.selected_subagent.as_deref(),
+        agens_core::AgentMode::All => None,
+    }
+    .unwrap_or("none");
+    let agents = match mode {
+        agens_core::AgentMode::Primary => catalog
+            .primary_or_all()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        agens_core::AgentMode::Subagent => catalog
+            .subagents()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        agens_core::AgentMode::All => unreachable!("TUI selectors do not expose all-mode agents"),
+    };
+    let label = if mode == agens_core::AgentMode::Subagent {
+        "Subagent"
+    } else {
+        "Active agent"
+    };
+    Ok(format!(
+        "{label}: {current}. Available: {}.",
+        agents.join(", ")
+    ))
+}
+
+fn select_tui_subagent(
+    bootstrap: &Bootstrap,
+    name: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
+    let catalog = tui_agent_catalog(bootstrap, &BundledModelValidator)?;
+    let agent = catalog
+        .agent(name.trim())
+        .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
+        .ok_or_else(|| CliError::usage("/subagent requires an available subagent"))?;
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    if context.running {
+        return Err(CliError::runtime(HeadlessTurnError::State));
+    }
+    context.selected_subagent = Some(agent.name.clone());
+    Ok(format!("Subagent: {}.", agent.name))
 }
 
 fn tui_agent_catalog(
@@ -1334,11 +1443,15 @@ impl AgentModelValidator for BundledModelValidator {
 }
 
 fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
+    let project = tui_project_identifier(bootstrap)?;
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let sessions = store
         .list_sessions()
-        .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
+        .map_err(|_| CliError::storage("saved sessions could not be listed"))?
+        .into_iter()
+        .filter(|session| session.project == project)
+        .collect::<Vec<_>>();
 
     if sessions.is_empty() {
         return Ok("No saved sessions.".to_owned());
@@ -1360,6 +1473,9 @@ fn resume_tui_session(
     let session = store
         .load_session_for_resume(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    if session.metadata.project != tui_project_identifier(bootstrap)? {
+        return Err(CliError::storage("saved session is unavailable"));
+    }
     let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent)?;
     Ok(TuiSessionContext::resumed(
         identifier,
@@ -1367,6 +1483,13 @@ fn resume_tui_session(
         session.messages,
         active_agent,
     ))
+}
+
+fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
+    bootstrap
+        .project_root()
+        .map(|project| project.display().to_string())
+        .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
 }
 
 fn active_tui_agent_runtime(
@@ -3733,6 +3856,45 @@ mod tests {
                 "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
             );
         }
+    }
+
+    #[test]
+    fn tui_session_reset_refuses_running_mutation_without_state_change() {
+        let mut context = TuiSessionContext::fresh();
+        context.identifier = Some(7);
+        context.running = true;
+        let original = context.clone();
+
+        assert_eq!(
+            reset_tui_session(&mut context),
+            Err(TuiSessionMutationError::Busy)
+        );
+        assert_eq!(context, original);
+    }
+
+    #[test]
+    fn tui_session_reset_clears_resumed_state_when_idle() {
+        let mut context = TuiSessionContext::fresh();
+        context.identifier = Some(7);
+        context.metadata = Some(SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 1,
+            resumable: true,
+        });
+        context.messages = vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("previous request".into())],
+        }];
+        context.selected_subagent = Some("reviewer".into());
+
+        reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
+
+        assert_eq!(context, TuiSessionContext::fresh());
     }
 
     #[test]
