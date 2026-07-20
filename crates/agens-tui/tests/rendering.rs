@@ -170,6 +170,10 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
     let terminal = Terminal::new(backend).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 48,
+        height: 12,
+    });
 
     tui.begin_submission("request");
     tui.apply_conversation_event(ConversationEvent::ToolCall {
@@ -198,16 +202,13 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
         tui.handle(Event::Key(Key::PageUp));
         renderer.render(tui.view()).unwrap();
     }
-    let mut recovered_start = false;
+    let mut traversal = rendered_text(&renderer);
     for _ in 0..100 {
         tui.handle(Event::Key(Key::PageDown));
         renderer.render(tui.view()).unwrap();
-        recovered_start |= rendered_text(&renderer).contains("output-start-sentinel");
+        traversal.push_str(&rendered_text(&renderer));
     }
-    assert!(
-        recovered_start,
-        "the scroll traversal never recovered the start"
-    );
+    assert!(traversal.contains("output-start-sentinel"));
     assert!(rendered_text(&renderer).contains("output-end-sentinel"));
 }
 
@@ -217,6 +218,10 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
     let terminal = Terminal::new(backend).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 52,
+        height: 16,
+    });
 
     tui.begin_submission("first-user-sentinel");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
@@ -268,6 +273,55 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
         collapsed.push_str(&rendered_text(&renderer));
     }
     assert!(collapsed.contains("output collapsed"));
+}
+
+#[test]
+fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(52, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    let mut messages = Vec::new();
+    for turn in 0..12 {
+        messages.push(Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(format!("restored-user-{turn:02}"))],
+        });
+        messages.push(Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text(format!("restored-answer-{turn:02}"))],
+        });
+    }
+    tui.replace_history(&messages).unwrap();
+    tui.begin_submission("live-user-sentinel");
+    tui.handle(Event::Resize {
+        width: 52,
+        height: 14,
+    });
+    tui.handle(Event::Key(Key::ScrollUp));
+    renderer.render(tui.view()).unwrap();
+    let before = rendered_text(&renderer);
+    assert!(before.contains("restored-user-11"), "{before:?}");
+    assert!(before.contains("SCROLL"), "{before:?}");
+
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        (0..20)
+            .map(|line| format!("streaming-line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )));
+    renderer.render(tui.view()).unwrap();
+    let streamed = rendered_text(&renderer);
+    assert!(streamed.contains("restored-user-11"), "{streamed:?}");
+    assert!(!tui.following_bottom());
+
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("restored-user-00"));
+    assert!(!tui.following_bottom());
+
+    tui.handle(Event::Key(Key::End));
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("streaming-line-19"));
+    assert!(tui.following_bottom());
 }
 
 #[test]

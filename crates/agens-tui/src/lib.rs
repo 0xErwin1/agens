@@ -32,7 +32,8 @@ use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self as crossterm_terminal, EnterAlternateScreen, LeaveAlternateScreen},
@@ -89,10 +90,14 @@ pub enum Key {
     Right,
     PreviousWord,
     NextWord,
+    LineStart,
+    LineEnd,
     Home,
     End,
     PageUp,
     PageDown,
+    ScrollUp,
+    ScrollDown,
     Up,
     Down,
     Tab,
@@ -432,41 +437,20 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_header(frame, layout.header, &state, layout.show_context);
     }
 
-    let mut transcript = state
-        .completed_conversations
-        .iter()
-        .flat_map(|conversation| {
-            render::conversation_lines(conversation, &[], state.collapsed_tool_outputs)
-        })
-        .collect::<Vec<_>>();
-    if let Some(conversation) = state.conversation {
-        transcript.extend(render::conversation_lines(
-            conversation,
-            state.runtime_events,
-            state.collapsed_tool_outputs,
-        ));
-    }
-    let conversation_is_authoritative =
-        !state.completed_conversations.is_empty() || state.conversation.is_some();
-    if !conversation_is_authoritative {
-        transcript = transcript_lines(state.transcript);
-    }
-    transcript.extend(render::detail_lines(
-        state.runtime_events,
-        conversation_is_authoritative,
-    ));
+    let transcript = rendered_transcript(&state);
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
-    let bottom_scroll =
-        transcript_rows(&transcript, layout.transcript.width).saturating_sub(visible_rows) as u16;
+    let bottom_scroll = saturating_u16(
+        transcript_rows(&transcript, layout.transcript.width).saturating_sub(visible_rows),
+    );
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
-        bottom_scroll.saturating_sub(state.scroll_offset)
+        state.scroll_offset.min(bottom_scroll)
     };
     let scroll_label = if state.following_bottom {
-        " LIVE".to_owned()
+        format!(" LIVE {bottom_scroll}/{bottom_scroll}")
     } else {
-        format!(" SCROLL +{}", state.scroll_offset)
+        format!(" SCROLL {scroll}/{bottom_scroll}")
     };
     if layout.transcript.height > 0 {
         frame.render_widget(
@@ -909,6 +893,33 @@ fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
+fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
+    let mut transcript = state
+        .completed_conversations
+        .iter()
+        .flat_map(|conversation| {
+            render::conversation_lines(conversation, &[], state.collapsed_tool_outputs)
+        })
+        .collect::<Vec<_>>();
+    if let Some(conversation) = state.conversation {
+        transcript.extend(render::conversation_lines(
+            conversation,
+            state.runtime_events,
+            state.collapsed_tool_outputs,
+        ));
+    }
+    let conversation_is_authoritative =
+        !state.completed_conversations.is_empty() || state.conversation.is_some();
+    if !conversation_is_authoritative {
+        transcript = transcript_lines(state.transcript);
+    }
+    transcript.extend(render::detail_lines(
+        state.runtime_events,
+        conversation_is_authoritative,
+    ));
+    transcript
+}
+
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0;
     let mut current_line = String::new();
@@ -1029,6 +1040,7 @@ where
                 self.size = (width, height);
                 self.quit_armed = false;
                 self.clamp_palette_selection();
+                self.clamp_scroll_offset();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
@@ -1462,16 +1474,16 @@ where
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
             _ => {}
         }
-        if self.following_bottom {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
             self.quit_armed = false;
         }
-        if !matches!(key, Key::PageUp | Key::PageDown) {
+        if !matches!(
+            key,
+            Key::PageUp | Key::PageDown | Key::ScrollUp | Key::ScrollDown | Key::Home | Key::End
+        ) {
             self.status = None;
         }
 
@@ -1493,15 +1505,19 @@ where
                 Action::Render
             }
             Key::PageUp => {
-                self.following_bottom = false;
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                self.scroll_up(self.transcript_page_rows());
                 Action::Render
             }
             Key::PageDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(5);
-                if self.scroll_offset == 0 {
-                    self.following_bottom = true;
-                }
+                self.scroll_down(self.transcript_page_rows());
+                Action::Render
+            }
+            Key::ScrollUp => {
+                self.scroll_up(3);
+                Action::Render
+            }
+            Key::ScrollDown => {
+                self.scroll_down(3);
                 Action::Render
             }
             Key::Up if self.palette_open => {
@@ -1594,10 +1610,16 @@ where
                 self.input_cursor = previous_word_boundary(&self.input, cursor);
             }
             Key::NextWord => self.input_cursor = next_word_boundary(&self.input, cursor),
-            Key::Home => self.input_cursor = line_start(&self.input, cursor),
+            Key::LineStart => self.input_cursor = line_start(&self.input, cursor),
+            Key::LineEnd => self.input_cursor = line_end(&self.input, cursor),
+            Key::Home => {
+                self.following_bottom = false;
+                self.scroll_offset = 0;
+                self.input_cursor = line_start(&self.input, cursor);
+            }
             Key::End => {
                 self.following_bottom = true;
-                self.scroll_offset = 0;
+                self.scroll_offset = self.max_scroll_offset();
                 self.input_cursor = line_end(&self.input, cursor);
             }
             Key::Backspace => {}
@@ -1606,6 +1628,51 @@ where
 
         self.clamp_palette_selection();
         Some(Action::Render)
+    }
+
+    fn scroll_up(&mut self, rows: u16) {
+        let bottom = self.max_scroll_offset();
+        let current = if self.following_bottom {
+            bottom
+        } else {
+            self.scroll_offset.min(bottom)
+        };
+        self.following_bottom = false;
+        self.scroll_offset = current.saturating_sub(rows);
+    }
+
+    fn scroll_down(&mut self, rows: u16) {
+        let bottom = self.max_scroll_offset();
+        self.scroll_offset = self.scroll_offset.saturating_add(rows).min(bottom);
+        self.following_bottom = self.scroll_offset == bottom;
+    }
+
+    fn clamp_scroll_offset(&mut self) {
+        let bottom = self.max_scroll_offset();
+        if self.following_bottom {
+            self.scroll_offset = bottom;
+        } else {
+            self.scroll_offset = self.scroll_offset.min(bottom);
+        }
+    }
+
+    fn max_scroll_offset(&self) -> u16 {
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let layout = screen_layout(area, self.running);
+        let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
+        saturating_u16(
+            transcript_rows(&rendered_transcript(&self.view()), layout.transcript.width)
+                .saturating_sub(visible_rows),
+        )
+    }
+
+    fn transcript_page_rows(&self) -> u16 {
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        screen_layout(area, self.running)
+            .transcript
+            .height
+            .saturating_sub(1)
+            .max(1)
     }
 
     fn insert_text(&mut self, text: &str) {
@@ -1971,7 +2038,9 @@ where
     E: Engine,
     R: Renderer,
 {
-    run_with_runtime_terminal(tui, renderer, Terminal::enter()?)
+    let terminal = Terminal::enter()?;
+    sync_terminal_size(tui)?;
+    run_with_runtime_terminal(tui, renderer, terminal)
 }
 
 fn run_with_runtime_terminal<E, R, T>(
@@ -2012,6 +2081,7 @@ where
     let submit = Arc::new(submit);
     let (sender, receiver) = mpsc::channel();
     let mut terminal = Terminal::enter()?;
+    sync_terminal_size(tui)?;
     renderer.render(tui.view())?;
 
     loop {
@@ -2078,6 +2148,7 @@ where
     let (route_progress_sender, route_progress_receiver) = mpsc::channel();
     let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
     let mut runtime_terminal = Terminal::enter()?;
+    sync_terminal_size(tui)?;
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = RatatuiRenderer::new(terminal);
     renderer.render(tui.view())?;
@@ -2153,10 +2224,22 @@ where
     }
 }
 
+fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
+    let (width, height) = crossterm_terminal::size()?;
+    tui.handle(Event::Resize { width, height });
+    Ok(())
+}
+
 fn map_event(event: CrosstermEvent) -> Option<Event> {
     match event {
         CrosstermEvent::Resize(width, height) => Some(Event::Resize { width, height }),
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => map_key(key),
+        CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
+            Some(Event::Key(Key::ScrollUp))
+        }
+        CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
+            Some(Event::Key(Key::ScrollDown))
+        }
         CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
         _ => None,
     }
@@ -2180,10 +2263,10 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::DeleteToLineEnd
         }
         (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::Home
+            Key::LineStart
         }
         (KeyCode::Char('e' | 'E'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::End
+            Key::LineEnd
         }
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::Left
@@ -2373,6 +2456,27 @@ mod runtime_tests {
         }
     }
 
+    #[test]
+    fn maps_real_mouse_wheel_events_to_scroll_keys() {
+        for (kind, key) in [
+            (crossterm::event::MouseEventKind::ScrollUp, Key::ScrollUp),
+            (
+                crossterm::event::MouseEventKind::ScrollDown,
+                Key::ScrollDown,
+            ),
+        ] {
+            assert_eq!(
+                map_event(CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column: 4,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                })),
+                Some(Event::Key(key))
+            );
+        }
+    }
+
     fn press<E: Engine>(tui: &mut Tui<E>, code: KeyCode, modifiers: KeyModifiers) -> Action {
         let event = map_key(crossterm::event::KeyEvent::new(code, modifiers)).unwrap();
         tui.handle(event)
@@ -2394,8 +2498,8 @@ mod runtime_tests {
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
             (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
             (KeyCode::Char('k'), ctrl, Key::DeleteToLineEnd),
-            (KeyCode::Char('a'), ctrl, Key::Home),
-            (KeyCode::Char('e'), ctrl, Key::End),
+            (KeyCode::Char('a'), ctrl, Key::LineStart),
+            (KeyCode::Char('e'), ctrl, Key::LineEnd),
             (KeyCode::Char('b'), ctrl, Key::Left),
             (KeyCode::Char('f'), ctrl, Key::Right),
             (KeyCode::Char('b'), alt, Key::PreviousWord),
