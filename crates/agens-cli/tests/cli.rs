@@ -1190,11 +1190,20 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
     let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
+    std::fs::create_dir_all(config_home.join("skills/review-checklist"))
+        .expect("skill directory should exist");
+    std::fs::write(project_root.join("notes.md"), "child read content")
+        .expect("child read fixture should exist");
     std::fs::write(
         config_home.join("agents/reviewer.md"),
-        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\nskills:\n  - review-checklist\npermissions: []\n---\nYou are the isolated reviewer.\n",
     )
     .expect("subagent definition should be written");
+    std::fs::write(
+        config_home.join("skills/review-checklist/SKILL.md"),
+        "---\nname: review-checklist\ndescription: Review checklist\n---\nUse the review checklist.\n",
+    )
+    .expect("skill manifest should be written");
 
     let server = ScriptedNativeOpenAiMockServer::start(vec![
         ScriptedOpenAiResponse {
@@ -1202,13 +1211,14 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
             response: native_tool_call_response(
                 "task-call",
                 "task",
-                r#"{"agent":"reviewer","description":"child request"}"#,
+                r#"{"agent":"reviewer","skills":["review-checklist"],"description":"child request"}"#,
             ),
         },
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "child request".into(),
                 "You are the isolated reviewer.".into(),
+                "Use the review checklist.".into(),
                 "gpt-4o".into(),
                 "read".into(),
                 "!parent request".into(),
@@ -1216,6 +1226,18 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
                 "!write".into(),
                 "!bash".into(),
                 "!webfetch".into(),
+                "!mcp".into(),
+            ],
+            response: native_tool_call_response(
+                "child-read",
+                "native::read",
+                r#"{"path":"notes.md"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"call_id\":\"child-read\"".into(),
+                "child read content".into(),
             ],
             response: text_response("child answer"),
         },
@@ -1245,6 +1267,111 @@ fn production_task_runs_an_isolated_provider_backed_subagent() {
 
     assert!(result.status.success());
     assert_eq!(String::from_utf8(result.stdout).unwrap(), "parent answer\n");
+    assert_eq!(String::from_utf8(result.stderr).unwrap(), "");
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "list"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions should list the parent turn");
+    let reopened = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .args(["sessions", "show", "1"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .output()
+        .expect("sessions should reopen the parent turn");
+
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap(),
+        format!(
+            "ID\tPROJECT\tTITLE\tAGENT\tTURNS\n1\t{}\tparent request\tprimary\t1\n",
+            project_root.display()
+        )
+    );
+    assert!(reopened.status.success());
+    assert_eq!(
+        String::from_utf8(reopened.stdout).unwrap(),
+        format!(
+            "Session 1: project={} title=parent request agent=primary turns=1 messages=4\n",
+            project_root.display()
+        )
+    );
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_PROVIDER_ERROR",
+            "SENTINEL_PANIC",
+            "SENTINEL_HEADER",
+        ],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
+    let temporary = TemporaryDirectory::new("production-task-cancellation");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
+    std::fs::write(
+        config_home.join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
+    )
+    .expect("subagent definition should be written");
+
+    let mut server = TaskStalledOpenAiMockServer::start();
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+        .current_dir(&project_root)
+        .args(["chat", "parent task cancellation"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("production binary should start");
+    server.wait_for_child_request();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status()
+            .expect("SIGINT delivery should execute")
+            .success()
+    );
+    let output = wait_for_child_output(child, Duration::from_secs(2));
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "error: cancelled: headless turn was cancelled\n"
+    );
+    assert_no_saved_sessions(&project_root, &config_home);
+    assert_sqlite_has_no_sentinels(
+        &data_directory.join("rust-sessions.db"),
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_PROVIDER_ERROR",
+            "SENTINEL_PANIC",
+            "SENTINEL_HEADER",
+        ],
+    );
+
+    server.join();
 }
 
 #[test]
@@ -3617,6 +3744,12 @@ struct StalledOpenAiMockServer {
     worker: thread::JoinHandle<()>,
 }
 
+struct TaskStalledOpenAiMockServer {
+    address: std::net::SocketAddr,
+    observed_child_request: mpsc::Receiver<()>,
+    worker: thread::JoinHandle<()>,
+}
+
 impl StalledOpenAiMockServer {
     fn start() -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
@@ -3657,6 +3790,97 @@ impl StalledOpenAiMockServer {
         self.observed_request
             .recv_timeout(Duration::from_secs(1))
             .expect("production request should reach the local server");
+    }
+
+    fn join(self) {
+        self.worker.join().expect("mock server should finish");
+    }
+}
+
+impl TaskStalledOpenAiMockServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("mock server should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        let (observed_sender, observed_child_request) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut parent, _) = listener
+                .accept()
+                .expect("mock server should accept the parent request");
+            let parent_body = read_openai_request_body(&parent);
+            assert!(parent_body.contains("parent task cancellation"));
+            parent
+                .write_all(
+                    native_tool_call_response(
+                        "task-cancel",
+                        "task",
+                        r#"{"agent":"reviewer","description":"child cancellation request"}"#,
+                    )
+                    .as_bytes(),
+                )
+                .expect("parent response should be written");
+            drop(parent);
+
+            let (child, _) = listener
+                .accept()
+                .expect("mock server should accept the child request");
+            let child_body = read_openai_request_body(&child);
+            observed_sender
+                .send(())
+                .expect("test should receive the child request observation");
+            for forbidden in [
+                "parent task cancellation",
+                "task",
+                "write",
+                "bash",
+                "webfetch",
+                "mcp",
+            ] {
+                assert!(
+                    !child_body.contains(forbidden),
+                    "child request leaked {forbidden:?}: {child_body}"
+                );
+            }
+            child
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("child close timeout should be configured");
+            let mut byte = [0_u8; 1];
+            let _ = std::io::Read::read(
+                &mut child.try_clone().expect("child stream should clone"),
+                &mut byte,
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("mock server should enable continuation probe");
+            let deadline = std::time::Instant::now() + Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("parent continued after child cancellation"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock server probe failed: {error}"),
+                }
+            }
+        });
+
+        Self {
+            address,
+            observed_child_request,
+            worker,
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn wait_for_child_request(&mut self) {
+        self.observed_child_request
+            .recv_timeout(Duration::from_secs(1))
+            .expect("production child request should reach the local server");
     }
 
     fn join(self) {
