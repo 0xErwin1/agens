@@ -109,39 +109,31 @@ fn reducer_terminal_failures_start_the_oldest_queued_prompt_before_later_submiss
 }
 
 #[test]
-fn command_handlers_fall_through_from_dialog_to_global_and_composer() {
+fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing() {
     let mut app = AppState::new(1);
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     app.set_composer("draft");
     app.set_dialog(Some(Dialog::Command));
 
     assert_eq!(
-        app.reduce(AppEvent::Command(Command::Select, Instant::now())),
-        vec![Effect::DialogCommand(Command::Select)]
+        app.reduce(AppEvent::Key(Key::Char('x'), Instant::now())),
+        vec![Effect::DialogKey(Key::Char('x'))]
     );
     assert_eq!(app.composer(), "draft");
     assert_eq!(app.dialog(), Some(&Dialog::Command));
 
     assert_eq!(
-        app.reduce(AppEvent::Command(Command::Model, Instant::now())),
-        vec![Effect::RefuseCommand(
-            "This command is unavailable while a response is in progress.".into()
-        )]
-    );
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, Instant::now())),
+        app.reduce(AppEvent::Key(Key::CtrlC, Instant::now())),
         vec![Effect::CancelTurn]
     );
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::Navigate, Instant::now())),
-        vec![Effect::Render]
-    );
+    assert_eq!(app.dialog(), Some(&Dialog::Command));
 
+    app.set_dialog(None);
     assert_eq!(
-        app.reduce(AppEvent::Command(Command::Escape, Instant::now())),
-        vec![Effect::Render]
+        app.reduce(AppEvent::Key(Key::Char('x'), Instant::now())),
+        vec![Effect::ComposerEdited]
     );
-    assert_eq!(app.dialog(), None);
+    assert_eq!(app.composer(), "draftx");
 }
 
 #[test]
@@ -245,7 +237,7 @@ fn exit_warning_is_disarmed_by_composer_edits_and_all_runtime_terminal_events() 
 
 #[test]
 fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_mutations() {
-    let mut app = AppState::new(1);
+    let mut app = AppState::new(2);
     let now = Instant::now();
     app.set_composer("draft");
     let before_reset_request = app.clone();
@@ -257,13 +249,16 @@ fn command_new_resets_only_after_backend_success_and_running_matrix_refuses_muta
     assert_eq!(app, before_reset_request);
 
     app.reduce(AppEvent::SubmitPrompt("running".into()));
-    app.reduce(AppEvent::SubmitPrompt("queued".into()));
+    app.reduce(AppEvent::SubmitPrompt("first queued".into()));
+    app.reduce(AppEvent::SubmitPrompt("second queued".into()));
     app.reduce(AppEvent::TurnCompleted("answer".into()));
     app.set_composer("replacement draft");
     app.set_dialog(Some(Dialog::Command));
 
+    assert_eq!(app.queued_prompts(), ["second queued"]);
+
     assert_eq!(app.reduce(AppEvent::ResetSucceeded), vec![Effect::Render]);
-    assert_eq!(app, AppState::new(1));
+    assert_eq!(app, AppState::new(2));
 
     app.reduce(AppEvent::SubmitPrompt("running".into()));
     for command in [

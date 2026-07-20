@@ -5,6 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::Key;
+
 const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
 
@@ -48,6 +50,8 @@ pub enum AppEvent {
     TurnCancelled,
     /// The active turn failed.
     TurnFailed,
+    /// A terminal key routed through dialog, global, and composer handlers.
+    Key(Key, Instant),
     Command(Command, Instant),
     ResetSucceeded,
     TimerTick(Instant),
@@ -69,7 +73,11 @@ pub enum Effect {
     ExitWarning,
     Quit,
     Render,
+    /// The open dialog consumed this key.
+    DialogKey(Key),
     DialogCommand(Command),
+    /// Focused composer editing changed its buffer.
+    ComposerEdited,
     ResetConversation,
     RefuseCommand(String),
 }
@@ -115,6 +123,7 @@ impl AppState {
                 self.disarm_exit();
                 self.begin_next_queued_turn().into_iter().collect()
             }
+            AppEvent::Key(key, now) => self.key(key, now),
             AppEvent::Command(command, now) => self.command(command, now),
             AppEvent::ResetSucceeded => self.reset_after_backend_success(),
             AppEvent::TimerTick(now) => {
@@ -210,12 +219,28 @@ impl AppState {
     }
 
     fn command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
-        if self.is_unsafe_while_running(command) {
-            return vec![Effect::RefuseCommand(RUNNING_REFUSAL.into())];
-        }
-
         if let Some(effects) = self.handle_dialog_command(command) {
             return effects;
+        }
+
+        self.global_command(command, now)
+    }
+
+    fn key(&mut self, key: Key, now: Instant) -> Vec<Effect> {
+        if let Some(effects) = self.handle_dialog_key(key) {
+            return effects;
+        }
+
+        if let Some(effects) = self.handle_global_key(key, now) {
+            return effects;
+        }
+
+        self.handle_composer_key(key)
+    }
+
+    fn global_command(&mut self, command: Command, now: Instant) -> Vec<Effect> {
+        if self.is_unsafe_while_running(command) {
+            return vec![Effect::RefuseCommand(RUNNING_REFUSAL.into())];
         }
 
         if command == Command::ControlC {
@@ -229,6 +254,15 @@ impl AppState {
         }
 
         vec![Effect::Render]
+    }
+
+    fn handle_global_key(&mut self, key: Key, now: Instant) -> Option<Vec<Effect>> {
+        if key == Key::CtrlC {
+            return Some(self.global_command(Command::ControlC, now));
+        }
+
+        self.disarm_exit();
+        None
     }
 
     fn is_unsafe_while_running(&self, command: Command) -> bool {
@@ -247,6 +281,40 @@ impl AppState {
             }
             (Some(Dialog::Command), Command::Select) => Some(vec![Effect::DialogCommand(command)]),
             _ => None,
+        }
+    }
+
+    fn handle_dialog_key(&mut self, key: Key) -> Option<Vec<Effect>> {
+        let dialog = self.dialog.as_ref()?;
+
+        match (dialog, key) {
+            (Dialog::Command, Key::Escape) => {
+                self.set_dialog(None);
+                Some(vec![Effect::Render])
+            }
+            (_, Key::CtrlC) => None,
+            _ => {
+                self.disarm_exit();
+                Some(vec![Effect::DialogKey(key)])
+            }
+        }
+    }
+
+    fn handle_composer_key(&mut self, key: Key) -> Vec<Effect> {
+        match key {
+            Key::Char(character) => {
+                self.composer.push(character);
+                vec![Effect::ComposerEdited]
+            }
+            Key::Backspace => {
+                self.composer.pop();
+                vec![Effect::ComposerEdited]
+            }
+            Key::ShiftEnter => {
+                self.composer.push('\n');
+                vec![Effect::ComposerEdited]
+            }
+            _ => vec![Effect::Render],
         }
     }
 
