@@ -35,8 +35,8 @@ use agens_tools::{
     McpHttpTransport, McpLimits, McpRegistry, McpSseTransport, McpStdioTransport,
     McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
     NativeToolCatalog, NativeTools, PermissionPromptContext, RemoteToolMetadata, SkillCatalog,
-    TaskRunner, TaskTool, TaskTurnRequest, ToolDispatchRequest, ToolDispatcher,
-    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{Engine as TuiEngine, Tui, run_with_default_progress_submit};
 
@@ -2001,16 +2001,21 @@ struct ProductionTaskRunner {
 }
 
 impl TaskRunner for ProductionTaskRunner {
-    fn run(&mut self, request: TaskTurnRequest) -> Result<ToolOutput, agens_core::Error> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| run_production_task(request, &self.bootstrap, &self.project_root))
-                .join()
-                .ok()
-                .and_then(Result::ok)
-                .map(ToolOutput::success)
-                .ok_or_else(|| agens_core::Error::Tool("task: child execution failed".into()))
-        })
+    fn run(
+        &mut self,
+        request: TaskTurnRequest,
+        context: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        let cancellation = HeadlessTurnCancellation::with_cancellation_and_deadline(
+            Arc::clone(&context.cancellation),
+            Some(context.deadline),
+        );
+        run_production_task(request, &self.bootstrap, &self.project_root, &cancellation)
+            .map(|output| TaskTurnResult {
+                output,
+                iterations: 1,
+            })
+            .map_err(|_| TaskRunnerError::ProviderFailure)
     }
 }
 
@@ -2018,6 +2023,7 @@ fn run_production_task(
     request: TaskTurnRequest,
     bootstrap: &Bootstrap,
     project_root: &Path,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
     let messages = vec![
         Message {
@@ -2049,7 +2055,7 @@ fn run_production_task(
                 .map_err(|_| {
                     CliError::authentication("OpenAI API authentication is unavailable")
                 })?;
-            run_isolated_task_turn(provider, tool_runtime, project_root)
+            run_isolated_task_turn(provider, tool_runtime, project_root, cancellation)
         }
         Some("openai-chatgpt") => {
             let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
@@ -2064,7 +2070,7 @@ fn run_production_task(
             )
             .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
             .map_err(|_| CliError::authentication("ChatGPT credentials are unavailable or invalid"))?;
-            run_isolated_task_turn(provider, tool_runtime, project_root)
+            run_isolated_task_turn(provider, tool_runtime, project_root, cancellation)
         }
         _ => Err(CliError::configuration(
             "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
@@ -2085,6 +2091,7 @@ fn run_isolated_task_turn<P>(
     mut provider: P,
     tool_runtime: SharedToolDispatcher,
     project_root: &Path,
+    cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError>
 where
     P: ProgressAwareProvider,
@@ -2102,7 +2109,6 @@ where
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let mut repository = DiscardCompletedTurnRepository;
-    let cancellation = HeadlessTurnCancellation::new();
     let project = project_root.display().to_string();
     let mut gate = ProductionPermissionGate::new(
         policy.clone(),
@@ -2121,7 +2127,7 @@ where
         &mut resolver,
         &mut dispatcher,
         &mut repository,
-        &cancellation,
+        cancellation,
         16,
         None,
     ))?

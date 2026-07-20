@@ -1,5 +1,15 @@
 use agens_core::{AgentDefinition, AgentMode, Error};
 use serde_json::Value;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     AgentCatalog, AgentModelValidator, DispatchTool, SkillCatalog, ToolExecutionContext, ToolOutput,
@@ -9,6 +19,14 @@ const MAX_TASK_DESCRIPTION_CHARS: usize = 16_384;
 const MAX_TASK_MODEL_CHARS: usize = 64;
 const MAX_TASK_SKILLS: usize = 128;
 const MAX_TASK_SKILL_NAME_CHARS: usize = 64;
+const MAX_TASK_ITERATIONS: usize = 16;
+const MAX_TASK_OUTPUT_CHARS: usize = 65_536;
+const MAX_TASK_CONCURRENCY: usize = 4;
+const TASK_TIMEOUT: Duration = Duration::from_secs(30);
+const TASK_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const OPEN: u8 = 0;
+const CANCELLED: u8 = 1;
+const PUBLISHED: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskInvocation {
@@ -149,16 +167,70 @@ impl TaskTurnRequest {
     }
 }
 
-pub trait TaskRunner: Send {
-    fn run(&mut self, request: TaskTurnRequest) -> Result<ToolOutput, Error>;
+pub struct TaskTurnResult {
+    pub output: String,
+    pub iterations: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRunnerError {
+    ProviderFailure,
+    ChildFailure,
+}
+
+#[derive(Clone)]
+pub struct TaskRunContext {
+    pub cancellation: Arc<std::sync::atomic::AtomicBool>,
+    pub deadline: Instant,
+}
+
+impl TaskRunContext {
+    fn inherit(parent: &ToolExecutionContext) -> Self {
+        Self {
+            cancellation: parent.cancellation_handle(),
+            deadline: parent.deadline().min(Instant::now() + TASK_TIMEOUT),
+        }
+    }
+
+    fn terminal_output(&self) -> Option<ToolOutput> {
+        if self.cancellation.load(Ordering::Acquire) {
+            return Some(ToolOutput::failure("task: cancelled"));
+        }
+        if Instant::now() >= self.deadline {
+            return Some(ToolOutput::failure("task: timed out"));
+        }
+        None
+    }
+}
+
+pub trait TaskRunner: Send + 'static {
+    fn run(
+        &mut self,
+        request: TaskTurnRequest,
+        context: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError>;
 }
 
 pub struct TaskTool<R> {
     agents: AgentCatalog,
     skills: SkillCatalog,
     parent_model: String,
-    model_validator: Box<dyn AgentModelValidator + Send>,
-    runner: R,
+    model_validator: Arc<dyn AgentModelValidator + Send + Sync>,
+    runner: Arc<Mutex<R>>,
+    active: Arc<AtomicUsize>,
+}
+
+impl<R> Clone for TaskTool<R> {
+    fn clone(&self) -> Self {
+        Self {
+            agents: self.agents.clone(),
+            skills: self.skills.clone(),
+            parent_model: self.parent_model.clone(),
+            model_validator: Arc::clone(&self.model_validator),
+            runner: Arc::clone(&self.runner),
+            active: Arc::clone(&self.active),
+        }
+    }
 }
 
 impl<R> TaskTool<R> {
@@ -166,15 +238,16 @@ impl<R> TaskTool<R> {
         agents: AgentCatalog,
         skills: SkillCatalog,
         parent_model: impl Into<String>,
-        model_validator: impl AgentModelValidator + Send + 'static,
+        model_validator: impl AgentModelValidator + Send + Sync + 'static,
         runner: R,
     ) -> Self {
         Self {
             agents,
             skills,
             parent_model: parent_model.into(),
-            model_validator: Box::new(model_validator),
-            runner,
+            model_validator: Arc::new(model_validator),
+            runner: Arc::new(Mutex::new(runner)),
+            active: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -261,16 +334,145 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
             .map_err(|_| Error::Tool("task: requested agent is unavailable".into()))
     }
 
-    fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
+    fn execute(
+        &mut self,
+        parent: &ToolExecutionContext,
+        arguments: Value,
+    ) -> Result<ToolOutput, Error> {
         let invocation = match TaskInvocation::from_value(arguments) {
             Ok(invocation) => invocation,
             Err(_) => return Ok(ToolOutput::failure("task: input exceeds configured bounds")),
         };
+        let context = TaskRunContext::inherit(parent);
+        if let Some(output) = context.terminal_output() {
+            return Ok(output);
+        }
         let request = match self.resolve(invocation) {
             Ok(request) => request,
             Err(output) => return Ok(output),
         };
+        let Some(permit) = TaskPermit::acquire(&self.active) else {
+            return Ok(ToolOutput::failure("task: concurrent child limit reached"));
+        };
+        if let Some(output) = context.terminal_output() {
+            return Ok(output);
+        }
 
-        self.runner.run(request)
+        let publication = Arc::new(AtomicU8::new(OPEN));
+        let (sender, receiver) = mpsc::channel();
+        let runner = Arc::clone(&self.runner);
+        let worker_context = context.clone();
+        let worker_publication = Arc::clone(&publication);
+        thread::spawn(move || {
+            let _permit = permit;
+            let output = {
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    let mut runner = runner.lock().map_err(|_| TaskRunnerError::ChildFailure)?;
+                    if let Some(output) = worker_context.terminal_output() {
+                        return Ok(output);
+                    }
+                    let result = runner.run(request, &worker_context)?;
+                    Ok(task_result_output(result, &worker_context))
+                }))
+                .unwrap_or(Err(TaskRunnerError::ChildFailure));
+                result.unwrap_or_else(task_error_output)
+            };
+
+            if worker_publication
+                .compare_exchange(OPEN, PUBLISHED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = sender.send(output);
+            }
+        });
+
+        loop {
+            if let Some(output) = context.terminal_output() {
+                return Ok(finish_task_call(&publication, &receiver, output));
+            }
+
+            match receiver.recv_timeout(TASK_RESULT_POLL_INTERVAL) {
+                Ok(output) if publication.load(Ordering::Acquire) == PUBLISHED => {
+                    return Ok(output);
+                }
+                Ok(_) => return Ok(ToolOutput::failure("task: child execution failed")),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(finish_task_call(
+                        &publication,
+                        &receiver,
+                        ToolOutput::failure("task: child execution failed"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolOutput {
+    if let Some(output) = context.terminal_output() {
+        return output;
+    }
+    if result.iterations > MAX_TASK_ITERATIONS {
+        return ToolOutput::failure("task: iteration limit reached");
+    }
+    if result.output.chars().count() > MAX_TASK_OUTPUT_CHARS {
+        return ToolOutput::failure("task: output exceeds configured bounds");
+    }
+    ToolOutput::success(result.output)
+}
+
+fn task_error_output(error: TaskRunnerError) -> ToolOutput {
+    match error {
+        TaskRunnerError::ProviderFailure => ToolOutput::failure("task: provider failure"),
+        TaskRunnerError::ChildFailure => ToolOutput::failure("task: child execution failed"),
+    }
+}
+
+fn finish_task_call(
+    publication: &AtomicU8,
+    receiver: &mpsc::Receiver<ToolOutput>,
+    terminal: ToolOutput,
+) -> ToolOutput {
+    match publication.compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) | Err(CANCELLED) => terminal,
+        Err(PUBLISHED) => receiver
+            .recv()
+            .unwrap_or_else(|_| ToolOutput::failure("task: child execution failed")),
+        Err(_) => ToolOutput::failure("task: child execution failed"),
+    }
+}
+
+struct TaskPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl TaskPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        let mut current = active.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_TASK_CONCURRENCY {
+                return None;
+            }
+            match active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        active: Arc::clone(active),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for TaskPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
     }
 }

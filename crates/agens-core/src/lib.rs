@@ -799,6 +799,16 @@ impl HeadlessTurnCancellation {
         }
     }
 
+    pub fn with_cancellation_and_deadline(
+        cancelled: Arc<AtomicBool>,
+        deadline: Option<Instant>,
+    ) -> Self {
+        Self {
+            cancelled,
+            deadline,
+        }
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }

@@ -41,7 +41,10 @@ pub use agents::{
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
-pub use task::{TaskInvocation, TaskRunner, TaskSkill, TaskTool, TaskTurnRequest};
+pub use task::{
+    TaskInvocation, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTool,
+    TaskTurnRequest, TaskTurnResult,
+};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

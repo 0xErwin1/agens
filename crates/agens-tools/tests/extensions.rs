@@ -15,8 +15,9 @@ use agens_core::{
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskInvocation,
-    TaskRunner, TaskSkill, TaskTool, TaskTurnRequest, ToolDispatchRequest, ToolDispatcher,
-    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTool, TaskTurnRequest,
+    TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -682,6 +683,45 @@ fn task_dispatcher_preserves_late_validation_errors_without_running_the_child() 
 }
 
 #[test]
+fn task_rejects_an_oversized_unicode_result() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let skills = temporary.path.join("skills");
+    fs::create_dir_all(&agents).unwrap();
+    fs::create_dir_all(&skills).unwrap();
+    write_agent(&agents, "worker", "worker agent", "subagent");
+
+    let missing = temporary.path.join("missing");
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let skills = SkillCatalog::discover(&skills, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let mut task = TaskTool::from_catalogs_with_model_validator(
+        agents,
+        skills,
+        "parent-model",
+        TaskModels,
+        OversizedTaskRunner,
+    );
+
+    let output = task
+        .execute(
+            &ToolExecutionContext::with_timeout(std::time::Duration::from_secs(1)),
+            serde_json::json!({"description":"😀".repeat(16_384)}),
+        )
+        .unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::failure("task: output exceeds configured bounds")
+    );
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -907,28 +947,57 @@ impl DispatchTool for InertTool {
 struct RecordingTaskRunner;
 
 impl TaskRunner for RecordingTaskRunner {
-    fn run(&mut self, request: TaskTurnRequest) -> Result<ToolOutput, Error> {
-        Ok(ToolOutput::success(format!(
-            "{}:{}:{}:{}:{}",
-            request.agent_name(),
-            request.agent_description(),
-            request.model(),
-            request
-                .skills()
-                .first()
-                .map(TaskSkill::name)
-                .unwrap_or("none"),
-            request.description()
-        )))
+    fn run(
+        &mut self,
+        request: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        Ok(TaskTurnResult {
+            output: format!(
+                "{}:{}:{}:{}:{}",
+                request.agent_name(),
+                request.agent_description(),
+                request.model(),
+                request
+                    .skills()
+                    .first()
+                    .map(TaskSkill::name)
+                    .unwrap_or("none"),
+                request.description()
+            ),
+            iterations: 1,
+        })
     }
 }
 
 struct CountingTaskRunner(Arc<AtomicUsize>);
 
 impl TaskRunner for CountingTaskRunner {
-    fn run(&mut self, _: TaskTurnRequest) -> Result<ToolOutput, Error> {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
         self.0.fetch_add(1, Ordering::AcqRel);
-        Ok(ToolOutput::success("unexpected child execution"))
+        Ok(TaskTurnResult {
+            output: "unexpected child execution".into(),
+            iterations: 1,
+        })
+    }
+}
+
+struct OversizedTaskRunner;
+
+impl TaskRunner for OversizedTaskRunner {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        Ok(TaskTurnResult {
+            output: "x".repeat(65_537),
+            iterations: 1,
+        })
     }
 }
 
