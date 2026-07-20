@@ -41,7 +41,8 @@ use agens_tools::{
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, DiffLine, DiffLineKind, Engine as TuiEngine, ToolResultState, Tui,
-    TuiRuntimeEvent, run_with_default_progress_submit,
+    TuiPresentation, TuiProviderOutcome, TuiRuntimeEvent, TuiSubmissionOutcome,
+    run_with_default_progress_submit,
 };
 
 mod model_registry;
@@ -49,6 +50,7 @@ mod model_registry;
 pub use model_registry::TuiModelSelector;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
+const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
@@ -1250,6 +1252,151 @@ impl TuiEngine for ProductionTuiEngine {
     }
 }
 
+#[derive(Clone)]
+struct TuiRuntimeRouter {
+    bootstrap: Bootstrap,
+    session: Arc<Mutex<TuiSessionContext>>,
+}
+
+impl TuiRuntimeRouter {
+    fn new(bootstrap: Bootstrap, session: Arc<Mutex<TuiSessionContext>>) -> Self {
+        Self { bootstrap, session }
+    }
+
+    fn route(&self, input: String) -> TuiSubmissionOutcome {
+        self.resolve(input)
+            .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
+                message: error.to_string(),
+                action: TUI_ERROR_ACTION.into(),
+            })
+    }
+
+    fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
+        if !input.starts_with('/') {
+            return Ok(TuiSubmissionOutcome::ProviderTurn { prompt: input });
+        }
+
+        let command = input.trim();
+        let outcome = match command {
+            "/sessions" => TuiSubmissionOutcome::LocalInfo(list_tui_sessions(&self.bootstrap)?),
+            "/new" => {
+                let mut session = self.session.lock().map_err(|_| {
+                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+                })?;
+                reset_tui_session(&mut session)
+                    .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
+                drop(session);
+                TuiSubmissionOutcome::ResetSucceeded {
+                    message: "Started a new session.".into(),
+                    presentation: self.presentation()?,
+                }
+            }
+            command if command.starts_with("/resume ") => {
+                if tui_session_is_running(&self.session)? {
+                    return Err(CliError::runtime(HeadlessTurnError::State));
+                }
+                let identifier = command[8..]
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
+                let resumed = resume_tui_session(&self.bootstrap, identifier)?;
+                let message = resumed.note();
+                let mut session = self.session.lock().map_err(|_| {
+                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+                })?;
+                if session.running {
+                    return Err(CliError::runtime(HeadlessTurnError::State));
+                }
+                *session = resumed;
+                drop(session);
+                TuiSubmissionOutcome::ContextChanged {
+                    message,
+                    presentation: self.presentation()?,
+                }
+            }
+            command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
+                message: rotate_tui_agent(&self.bootstrap, &command[7..], &self.session)?,
+                presentation: self.presentation()?,
+            },
+            "/agent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
+                &self.bootstrap,
+                &self.session,
+                agens_core::AgentMode::Primary,
+            )?),
+            command if command.starts_with("/subagent ") => TuiSubmissionOutcome::ContextChanged {
+                message: select_tui_subagent(&self.bootstrap, &command[10..], &self.session)?,
+                presentation: self.presentation()?,
+            },
+            "/subagent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
+                &self.bootstrap,
+                &self.session,
+                agens_core::AgentMode::Subagent,
+            )?),
+            "/model" => TuiSubmissionOutcome::LocalInfo(select_tui_model(
+                &self.bootstrap,
+                command,
+                &self.session,
+            )?),
+            command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
+                message: select_tui_model(&self.bootstrap, command, &self.session)?,
+                presentation: self.presentation()?,
+            },
+            "/effort" => TuiSubmissionOutcome::LocalInfo(select_tui_effort(
+                &self.bootstrap,
+                command,
+                &self.session,
+            )?),
+            command if command.starts_with("/effort ") => TuiSubmissionOutcome::ContextChanged {
+                message: select_tui_effort(&self.bootstrap, command, &self.session)?,
+                presentation: self.presentation()?,
+            },
+            _ => return Err(CliError::usage(format!("unknown TUI command: {command}"))),
+        };
+        Ok(outcome)
+    }
+
+    fn presentation(&self) -> Result<TuiPresentation, CliError> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        let model = session
+            .selection
+            .as_ref()
+            .map(TuiModelSelector::model)
+            .or_else(|| {
+                session
+                    .active_agent
+                    .as_ref()
+                    .and_then(|agent| agent.model.as_deref())
+            })
+            .or_else(|| self.bootstrap.model())
+            .unwrap_or_else(|| default_model(&self.bootstrap));
+        let label = session
+            .identifier
+            .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
+        Ok(TuiPresentation::new(
+            self.bootstrap.provider_type().unwrap_or("provider"),
+            model,
+            label,
+        ))
+    }
+}
+
+fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
+    match result {
+        Ok(output) => TuiProviderOutcome::Completed(output),
+        Err(error) if error.category == "cancelled" => TuiProviderOutcome::Cancelled {
+            message: error.to_string(),
+            action: TUI_ERROR_ACTION.into(),
+        },
+        Err(error) => TuiProviderOutcome::Failed {
+            message: error.to_string(),
+            action: TUI_ERROR_ACTION.into(),
+        },
+    }
+}
+
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
@@ -1271,45 +1418,52 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     }
     tui.set_presentation(provider, model, session_label);
 
-    let bootstrap = bootstrap.clone();
-    let session = Arc::clone(&session);
-    run_with_default_progress_submit(&mut tui, move |prompt, progress, metrics| {
-        let turn_cancellation =
-            HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
-        let Ok(mut active) = cancellation.lock() else {
-            return Err("runtime: TUI cancellation is unavailable".to_owned());
-        };
-        *active = Some(turn_cancellation.clone());
-        drop(active);
+    let router = TuiRuntimeRouter::new(bootstrap.clone(), session);
+    let route_router = router.clone();
+    run_with_default_progress_submit(
+        &mut tui,
+        move |prompt| route_router.route(prompt),
+        move |prompt, progress, metrics| {
+            let turn_cancellation =
+                HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+            let Ok(mut active) = cancellation.lock() else {
+                return tui_provider_outcome(Err(CliError::new(
+                    ExitStatus::Failure,
+                    "ui",
+                    "TUI cancellation is unavailable",
+                )));
+            };
+            *active = Some(turn_cancellation.clone());
+            drop(active);
 
-        let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
-            metrics,
-            BridgeCancel::new(),
-        )));
-        let metrics_progress = Arc::clone(&metrics);
-        let sink: TurnProgressSink = Arc::new(move |event| {
-            if let Ok(mut metrics) = metrics_progress.lock() {
-                metrics.observe(&event);
+            let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
+                metrics,
+                BridgeCancel::new(),
+            )));
+            let metrics_progress = Arc::clone(&metrics);
+            let sink: TurnProgressSink = Arc::new(move |event| {
+                if let Ok(mut metrics) = metrics_progress.lock() {
+                    metrics.observe(&event);
+                }
+                let _ = progress.send(event);
+            });
+            let result = run_tui_prompt(
+                &router.bootstrap,
+                &prompt,
+                &turn_cancellation,
+                &router.session,
+                Some(&sink),
+            );
+
+            finish_tui_metrics(&metrics, &result);
+
+            if let Ok(mut active) = cancellation.lock() {
+                *active = None;
             }
-            let _ = progress.send(event);
-        });
-        let result = run_tui_prompt(
-            &bootstrap,
-            &prompt,
-            &turn_cancellation,
-            &session,
-            Some(&sink),
-        );
 
-        finish_tui_metrics(&metrics, &result);
-        let result = result.map_err(|error| error.to_string());
-
-        if let Ok(mut active) = cancellation.lock() {
-            *active = None;
-        }
-
-        result
-    })
+            tui_provider_outcome(result)
+        },
+    )
     .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
 
     Ok(String::new())
@@ -1323,47 +1477,17 @@ fn run_tui_prompt(
     progress: Option<&TurnProgressSink>,
 ) -> Result<String, CliError> {
     match prompt.trim() {
-        "/sessions" => list_tui_sessions(bootstrap),
-        "/new" => {
-            let mut session = session.lock().map_err(|_| {
-                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-            })?;
-            reset_tui_session(&mut session)
-                .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
-            Ok("Started a new session.".to_owned())
-        }
-        command if command.starts_with("/resume ") => {
-            if tui_session_is_running(session)? {
-                return Err(CliError::runtime(HeadlessTurnError::State));
+        command if command.starts_with('/') => {
+            let router = TuiRuntimeRouter::new(bootstrap.clone(), Arc::clone(session));
+            match router.resolve(command.to_owned())? {
+                TuiSubmissionOutcome::LocalInfo(message)
+                | TuiSubmissionOutcome::ResetSucceeded { message, .. }
+                | TuiSubmissionOutcome::ContextChanged { message, .. } => Ok(message),
+                TuiSubmissionOutcome::ProviderTurn { .. }
+                | TuiSubmissionOutcome::LocalActionableError { .. } => {
+                    unreachable!("slash routing returns a local result or CLI error")
+                }
             }
-            let identifier = command[8..]
-                .trim()
-                .parse::<i64>()
-                .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
-            let resumed = resume_tui_session(bootstrap, identifier)?;
-            let note = resumed.note();
-            let mut context = session.lock().map_err(|_| {
-                CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-            })?;
-            if context.running {
-                return Err(CliError::runtime(HeadlessTurnError::State));
-            }
-            *context = resumed;
-            Ok(note)
-        }
-        command if command.starts_with("/agent ") => {
-            rotate_tui_agent(bootstrap, &command[7..], session)
-        }
-        "/agent" => list_tui_agents(bootstrap, session, agens_core::AgentMode::Primary),
-        command if command.starts_with("/subagent ") => {
-            select_tui_subagent(bootstrap, &command[10..], session)
-        }
-        "/subagent" => list_tui_agents(bootstrap, session, agens_core::AgentMode::Subagent),
-        command if command == "/model" || command.starts_with("/model ") => {
-            select_tui_model(bootstrap, command, session)
-        }
-        command if command == "/effort" || command.starts_with("/effort ") => {
-            select_tui_effort(bootstrap, command, session)
         }
         prompt => {
             let prompt = expand_tui_file_reference(bootstrap, prompt)?;
@@ -1376,7 +1500,7 @@ fn run_tui_prompt(
                 }
                 session.running = true;
                 session.apply_to(HeadlessChatRequest {
-                    prompt: prompt.to_owned(),
+                    prompt,
                     history: Vec::new(),
                     model: None,
                     system_prompt: None,
@@ -4564,6 +4688,47 @@ mod tests {
     }
 
     #[test]
+    fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
+        let temporary = tui_session_directory("enter-local-routing");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(bootstrap, Arc::clone(&session));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine { cancellation });
+        let input = enter_tui_input(&mut tui, "/unknown");
+        let provider_invocations =
+            usize::from(tui.apply_submission_outcome(router.route(input)).is_some());
+        assert_eq!(provider_invocations, 0);
+        assert!(matches!(
+            tui.transcript(),
+            [agens_tui::TranscriptEntry::Error(_)]
+        ));
+
+        session.lock().unwrap().running = true;
+        let input = enter_tui_input(&mut tui, "/new");
+        tui.apply_submission_outcome(router.route(input));
+        assert_eq!(tui.view().conversation.unwrap().errors.len(), 2);
+
+        session.lock().unwrap().running = false;
+        let input = enter_tui_input(&mut tui, "/new");
+        tui.apply_submission_outcome(router.route(input));
+        assert_eq!(
+            tui.transcript(),
+            [agens_tui::TranscriptEntry::Info(
+                "Started a new session.".into()
+            )]
+        );
+
+        let input = enter_tui_input(&mut tui, &format!("/resume {}", metadata.id));
+        tui.apply_submission_outcome(router.route(input));
+        assert_eq!(tui.view().session, format!("session #{}", metadata.id));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_session_busy_agent_command_leaves_context_and_store_unchanged() {
         let temporary = tui_session_directory("busy-agent-command");
         let bootstrap = tui_session_bootstrap(
@@ -4656,6 +4821,18 @@ mod tests {
         ));
         std::fs::create_dir_all(temporary.join("project/.git")).unwrap();
         temporary
+    }
+
+    fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> String {
+        for character in input.chars() {
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
+        }
+        let agens_tui::Action::Submit(input) =
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
+        else {
+            panic!("Enter should submit through the production TUI path");
+        };
+        input
     }
 
     fn tui_project(temporary: &Path) -> String {

@@ -1134,7 +1134,10 @@ where
             .conversation
             .as_ref()
             .and_then(|conversation| conversation.errors.last())
-            .map_or_else(|| "Runtime request failed.".into(), |error| error.message.clone());
+            .map_or_else(
+                || "Runtime request failed.".into(),
+                |error| error.message.clone(),
+            );
         self.transcript.push(TranscriptEntry::Error(message));
     }
 
@@ -1301,16 +1304,22 @@ where
 }
 
 /// Runs a submit worker that can forward ordered runtime events while it is active.
-pub fn run_with_default_progress_submit<E, F>(tui: &mut Tui<E>, submit: F) -> io::Result<()>
+pub fn run_with_default_progress_submit<E, R, F>(
+    tui: &mut Tui<E>,
+    route: R,
+    submit: F,
+) -> io::Result<()>
 where
     E: Engine + Send,
-    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> Result<String, String>
+    R: Fn(String) -> TuiSubmissionOutcome + Send + Sync + 'static,
+    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
         + Send
         + Sync
         + 'static,
 {
     let submit = Arc::new(submit);
     let (sender, receiver) = mpsc::channel();
+    let (completion_sender, completion_receiver) = mpsc::channel();
     let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
     let terminal = ratatui::try_init()?;
     let _restore = RatatuiRestore;
@@ -1324,11 +1333,11 @@ where
             };
             tui.apply_runtime_event(envelope.into_parts().1);
         }
-        for _ in 0..32 {
-            let Ok(event) = receiver.try_recv() else {
-                break;
-            };
+        while let Ok(event) = receiver.try_recv() {
             tui.apply_progress(event);
+        }
+        while let Ok(outcome) = completion_receiver.try_recv() {
+            tui.finish_provider_turn(outcome);
         }
         renderer.render(tui.view())?;
         if !event::poll(Duration::from_millis(25))? {
@@ -1340,23 +1349,16 @@ where
         match tui.handle(event) {
             Action::Quit => return Ok(()),
             Action::Submit(prompt) => {
-                tui.begin_submission(prompt.clone());
+                let Some(prompt) = tui.apply_submission_outcome(route(prompt)) else {
+                    continue;
+                };
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
                 let metrics = metrics_sender.clone();
+                let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let progress = sender.clone();
-                    let _ = sender.send(TurnEvent::StateChanged(TurnState::Requesting));
-                    let result = submit(prompt, progress, metrics);
-                    match result {
-                        Ok(_) => {
-                            let _ = sender.send(TurnEvent::StateChanged(TurnState::Completed));
-                        }
-                        Err(error) => {
-                            let _ = sender.send(TurnEvent::StateChanged(TurnState::Failed));
-                            let _ = sender.send(TurnEvent::ProviderPart(MessagePart::Text(error)));
-                        }
-                    }
+                    let outcome = submit(prompt, sender, metrics);
+                    let _ = completion_sender.send(outcome);
                 });
             }
             Action::Render | Action::Cancel => {}

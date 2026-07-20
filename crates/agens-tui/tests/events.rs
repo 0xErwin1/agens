@@ -541,7 +541,9 @@ fn typed_submission_outcomes_start_only_explicit_provider_turns() {
 fn typed_reset_and_context_outcomes_update_visible_state_after_success() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.begin_submission("old prompt");
-    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("old answer".into())));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "old answer".into(),
+    )));
 
     assert_eq!(
         tui.apply_submission_outcome(TuiSubmissionOutcome::ResetSucceeded {
