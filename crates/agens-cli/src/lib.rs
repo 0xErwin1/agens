@@ -2108,6 +2108,14 @@ fn completed_session_turn(
     snapshot: &CompletedTurnSnapshot,
     pending_system_reminder: Option<&str>,
 ) -> Result<CompletedSessionTurn, CliError> {
+    completed_session_turn_from_events(prompt, snapshot.events(), pending_system_reminder)
+}
+
+fn completed_session_turn_from_events(
+    prompt: &str,
+    events: &[TurnEvent],
+    pending_system_reminder: Option<&str>,
+) -> Result<CompletedSessionTurn, CliError> {
     let mut messages = pending_system_reminder
         .map(|reminder| Message {
             role: Role::System,
@@ -2121,11 +2129,13 @@ fn completed_session_turn(
     });
     let mut role = None;
     let mut parts = Vec::new();
-    for event in snapshot.events() {
+    for event in events {
         let (next_role, part) = match event {
             TurnEvent::ProviderPart(part) => (Role::Assistant, part),
             TurnEvent::ToolResult(part) => (Role::Tool, part),
-            TurnEvent::StateChanged(_) | TurnEvent::ToolCallRequested { .. } => continue,
+            TurnEvent::StateChanged(_)
+            | TurnEvent::Usage(_)
+            | TurnEvent::ToolCallRequested { .. } => continue,
         };
         if role != Some(next_role) {
             if let Some(role) = role {
@@ -3467,7 +3477,7 @@ mod tests {
     use super::*;
     use agens_core::{
         AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot,
-        Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState,
+        Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState, Usage,
     };
 
     #[test]
@@ -3799,6 +3809,91 @@ mod tests {
         context.pending_system_reminder = Some("reminder".into());
         assert!(complete_tui_turn(&mut context, Err(CliError::storage("failed")), true).is_err());
         assert_eq!(context.pending_system_reminder.as_deref(), Some("reminder"));
+    }
+
+    #[test]
+    fn completed_session_turn_ignores_usage_without_changing_output_history_order() {
+        let events = [
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::ProviderPart(MessagePart::Text("before usage".into())),
+            TurnEvent::Usage(Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(3),
+                total_tokens: Some(8),
+                context_window: Some(16),
+            }),
+            TurnEvent::ProviderPart(MessagePart::Reasoning("after usage".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ];
+
+        let turn = completed_session_turn_from_events("prompt", &events, None)
+            .expect("completed session turn should exclude presentation usage");
+
+        assert_eq!(
+            turn.messages(),
+            &[
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("prompt".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        MessagePart::Text("before usage".into()),
+                        MessagePart::Reasoning("after usage".into()),
+                    ],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_session_turn_keeps_role_boundaries_around_usage() {
+        let events = [
+            TurnEvent::ProviderPart(MessagePart::Text("before tool".into())),
+            TurnEvent::Usage(Usage::default()),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "tool output".into(),
+                is_error: false,
+            }),
+            TurnEvent::Usage(Usage {
+                input_tokens: None,
+                output_tokens: Some(0),
+                total_tokens: None,
+                context_window: None,
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("after tool".into())),
+        ];
+
+        let turn = completed_session_turn_from_events("prompt", &events, None)
+            .expect("completed session turn should exclude presentation usage");
+
+        assert_eq!(
+            turn.messages(),
+            &[
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("prompt".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("before tool".into())],
+                },
+                Message {
+                    role: Role::Tool,
+                    parts: vec![MessagePart::ToolResult {
+                        tool_call_id: "call-1".into(),
+                        content: "tool output".into(),
+                        is_error: false,
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("after tool".into())],
+                },
+            ]
+        );
     }
 
     mod model_registry {
