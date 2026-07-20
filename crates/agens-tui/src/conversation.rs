@@ -53,6 +53,15 @@ pub struct ActionableError {
     pub action: String,
 }
 
+impl ActionableError {
+    fn sanitized(message: String, action: String) -> Self {
+        Self {
+            message: sanitize_error_message(message),
+            action,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolResult {
     pub output: String,
@@ -147,9 +156,9 @@ impl Conversation {
                 call.result = Some(ToolResult { output, is_error });
             }
             ConversationEvent::Diff(lines) => self.diffs.extend(lines),
-            ConversationEvent::Error { message, action } => {
-                self.errors.push(ActionableError { message, action })
-            }
+            ConversationEvent::Error { message, action } => self
+                .errors
+                .push(ActionableError::sanitized(message, action)),
         }
         self.last_was_tool_call = is_tool_call;
         Ok(())
@@ -167,5 +176,27 @@ impl Conversation {
             .iter_mut()
             .flat_map(|batch| &mut batch.calls)
             .find(|call| call.call_id == call_id)
+    }
+}
+
+fn sanitize_error_message(message: String) -> String {
+    let value = message.to_ascii_lowercase();
+    let sensitive_markers = [
+        "api_key",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "path:",
+        "prompt:",
+    ];
+
+    if sensitive_markers
+        .iter()
+        .any(|marker| value.contains(marker))
+    {
+        "[redacted]".into()
+    } else {
+        message
     }
 }

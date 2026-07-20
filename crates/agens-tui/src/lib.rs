@@ -42,7 +42,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
@@ -73,6 +73,8 @@ pub enum Key {
     Escape,
     /// Cancels an active turn, clears input, or arms quitting.
     CtrlC,
+    /// Collapses or expands completed tool outputs in the visible conversation.
+    CtrlO,
     ShiftEnter,
     Left,
     Right,
@@ -145,6 +147,15 @@ pub struct ViewState<'a> {
     pub conversation: Option<&'a Conversation>,
     /// Tool outputs collapsed only for presentation; their source output remains retained.
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
+    /// A bounded informational dialog rendered above the conversation.
+    pub dialog: Option<&'a DialogView>,
+}
+
+/// Generic bounded dialog state for interactive surfaces that are introduced later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogView {
+    title: String,
+    body: String,
 }
 
 /// Ratatui renderer usable with both real terminals and `TestBackend`.
@@ -275,6 +286,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         );
     }
 
+    if let Some(dialog) = state.dialog {
+        render_dialog(frame, area, dialog);
+    }
+
     let (line, column) = cursor_position(state.input, state.input_cursor);
     let cursor_y = layout
         .composer
@@ -289,6 +304,37 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if cursor_y < layout.composer.bottom() && cursor_x < layout.composer.right() {
         frame.set_cursor_position((cursor_x, cursor_y));
     }
+}
+
+fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
+    let width = area.width.saturating_sub(4).clamp(1, 64);
+    let height = area.height.saturating_sub(4).clamp(1, 8);
+    let dialog_area = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+
+    frame.render_widget(Clear, dialog_area);
+    frame.render_widget(
+        Paragraph::new(dialog.body.as_str())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(Span::styled(
+                        format!(" {} ", dialog.title),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+            )
+            .wrap(Wrap { trim: false }),
+        dialog_area,
+    );
 }
 
 struct ScreenLayout {
@@ -425,7 +471,7 @@ fn footer_text(width: u16) -> &'static str {
     if width < 60 {
         " Enter send  ·  Ctrl+C cancel/quit "
     } else {
-        " Enter send  ·  Shift+Enter newline  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow "
+        " Enter send  ·  Shift+Enter newline  ·  Ctrl+O output  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow "
     }
 }
 
@@ -539,6 +585,7 @@ pub struct Tui<E> {
     runtime_events: Vec<TuiRuntimeEvent>,
     conversation: Option<Conversation>,
     collapsed_tool_outputs: BTreeSet<String>,
+    dialog: Option<DialogView>,
 }
 
 impl<E> Tui<E>
@@ -564,6 +611,7 @@ where
             runtime_events: Vec::new(),
             conversation: None,
             collapsed_tool_outputs: BTreeSet::new(),
+            dialog: None,
         }
     }
 
@@ -683,14 +731,12 @@ where
             .apply(event)
     }
 
-    /// Collapses or expands a tool output without discarding its retained source text.
-    pub fn set_tool_output_expanded(&mut self, call_id: impl Into<String>, expanded: bool) {
-        let call_id = call_id.into();
-        if expanded {
-            self.collapsed_tool_outputs.remove(&call_id);
-        } else {
-            self.collapsed_tool_outputs.insert(call_id);
-        }
+    /// Opens a generic bounded dialog without changing the underlying conversation.
+    pub fn show_dialog(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.dialog = Some(DialogView {
+            title: title.into(),
+            body: body.into(),
+        });
     }
 
     pub fn runtime_events(&self) -> &[TuiRuntimeEvent] {
@@ -715,6 +761,7 @@ where
             runtime_events: &self.runtime_events,
             conversation: self.conversation.as_ref(),
             collapsed_tool_outputs: &self.collapsed_tool_outputs,
+            dialog: self.dialog.as_ref(),
         }
     }
 
@@ -795,6 +842,10 @@ where
         }
 
         match key {
+            Key::CtrlO => {
+                self.toggle_tool_output_expansion();
+                Action::Render
+            }
             Key::Char(character) => {
                 self.input.insert(self.input_cursor, character);
                 self.input_cursor += character.len_utf8();
@@ -886,6 +937,34 @@ where
         self.quit_armed = false;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
+    }
+
+    fn toggle_tool_output_expansion(&mut self) {
+        let Some(conversation) = self.conversation.as_ref() else {
+            return;
+        };
+        let completed_call_ids = conversation
+            .tool_batches
+            .iter()
+            .flat_map(|batch| &batch.calls)
+            .filter(|call| call.result.is_some())
+            .map(|call| call.call_id.clone())
+            .collect::<Vec<_>>();
+
+        if completed_call_ids.is_empty() {
+            return;
+        }
+
+        if completed_call_ids
+            .iter()
+            .all(|call_id| !self.collapsed_tool_outputs.contains(call_id))
+        {
+            self.collapsed_tool_outputs.extend(completed_call_ids);
+        } else {
+            for call_id in completed_call_ids {
+                self.collapsed_tool_outputs.remove(&call_id);
+            }
+        }
     }
 
     fn project_conversation(&mut self, event: ConversationEvent) {
@@ -1142,6 +1221,9 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> Option<Event> {
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlC
         }
+        (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlO
+        }
         (KeyCode::Char(character), modifiers)
             if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT =>
         {
@@ -1279,5 +1361,13 @@ mod runtime_tests {
             assert_eq!(error.kind(), input_error);
             assert_eq!(*calls.borrow(), expected_terminal_calls());
         }
+    }
+
+    #[test]
+    fn maps_control_o_to_tool_output_toggle() {
+        assert_eq!(
+            map_key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Some(Event::Key(Key::CtrlO))
+        );
     }
 }

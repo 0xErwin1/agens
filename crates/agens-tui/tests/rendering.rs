@@ -119,18 +119,114 @@ fn renderer_recovers_collapsed_long_tool_output_in_a_bounded_viewport() {
         is_error: false,
     })
     .unwrap();
-    tui.set_tool_output_expanded("read-1", false);
+    tui.handle(Event::Key(Key::CtrlO));
 
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
     assert!(collapsed.contains("output collapsed"), "{collapsed:?}");
     assert!(!collapsed.contains("full-output-sentinel"), "{collapsed:?}");
 
-    tui.set_tool_output_expanded("read-1", true);
-    tui.handle(Event::Key(Key::PageUp));
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let expanded = rendered_text(&renderer);
     assert!(expanded.contains("full-output-sentinel"), "{expanded:?}");
+}
+
+#[test]
+fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
+    let backend = TestBackend::new(48, 12);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "large.log".into(),
+    })
+    .unwrap();
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "read-1".into(),
+        output: format!(
+            "output-start-sentinel\n{}\noutput-end-sentinel",
+            (0..40)
+                .map(|line| format!("output-middle-{line:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        is_error: false,
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("output-end-sentinel"));
+
+    for _ in 0..100 {
+        tui.handle(Event::Key(Key::PageUp));
+        renderer.render(tui.view()).unwrap();
+    }
+    let mut recovered_start = false;
+    for _ in 0..100 {
+        tui.handle(Event::Key(Key::PageDown));
+        renderer.render(tui.view()).unwrap();
+        recovered_start |= rendered_text(&renderer).contains("output-start-sentinel");
+    }
+    assert!(
+        recovered_start,
+        "the scroll traversal never recovered the start"
+    );
+    assert!(rendered_text(&renderer).contains("output-end-sentinel"));
+}
+
+#[test]
+fn renderer_sanitizes_runtime_errors_and_preserves_the_action() {
+    let backend = TestBackend::new(120, 40);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_conversation_event(ConversationEvent::Error {
+        message: "api_key=key-sentinel; Authorization: header-sentinel; path: /path-sentinel; prompt: prompt-sentinel".into(),
+        action: "Retry after updating credentials.".into(),
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    for secret in [
+        "key-sentinel",
+        "header-sentinel",
+        "path-sentinel",
+        "prompt-sentinel",
+    ] {
+        assert!(!text.contains(secret), "leaked {secret:?} in {text:?}");
+    }
+    assert!(text.contains("[redacted]"), "{text:?}");
+    assert!(
+        text.contains("Action: Retry after updating credentials."),
+        "{text:?}"
+    );
+}
+
+#[test]
+fn renderer_clips_a_generic_dialog_inside_the_viewport() {
+    let backend = TestBackend::new(42, 14);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.show_dialog(
+        "Details",
+        "A bounded dialog body that remains inside the viewport.",
+    );
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("Details"), "{text:?}");
+    assert!(text.contains("bounded dialog body"), "{text:?}");
 }
 
 #[test]

@@ -196,13 +196,15 @@ fn tool_state(
 }
 
 fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl Into<String>) {
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("  │ {label:<9} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(text.into()),
-    ]));
+    for text_line in text.into().split('\n') {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  │ {label:<9} "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(text_line.to_owned()),
+        ]));
+    }
     lines.push(Line::default());
 }
 
