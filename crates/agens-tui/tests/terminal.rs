@@ -14,9 +14,14 @@ struct Control {
 impl Control {
     fn call(&mut self, operation: &'static str) -> io::Result<()> {
         self.calls.push(operation);
-        (self.fail != Some(operation))
-            .then_some(())
-            .ok_or_else(|| io::Error::other("injected"))
+        (self.fail != Some(operation)).then_some(()).ok_or_else(|| {
+            let kind = if operation == "keyboard-on" {
+                io::ErrorKind::Unsupported
+            } else {
+                io::ErrorKind::Other
+            };
+            io::Error::new(kind, "injected")
+        })
     }
 }
 impl TerminalControl for Control {
@@ -28,6 +33,10 @@ impl TerminalControl for Control {
             TerminalOperation::LeaveAlternate => "alternate-off",
             TerminalOperation::EnableMouse => "mouse-on",
             TerminalOperation::DisableMouse => "mouse-off",
+            TerminalOperation::EnableKeyboardEnhancement => "keyboard-on",
+            TerminalOperation::DisableKeyboardEnhancement => "keyboard-off",
+            TerminalOperation::EnablePaste => "paste-on",
+            TerminalOperation::DisablePaste => "paste-off",
         })
     }
 }
@@ -42,7 +51,7 @@ fn teardown_guards_reverse_activated_modes_and_clean_partial_setup() {
     assert!(guard.restore(&mut control).is_err());
     assert_calls(
         &control,
-        "raw-on,alternate-on,mouse-on,mouse-off,alternate-off,raw-off",
+        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,paste-off,keyboard-off,mouse-off,alternate-off,raw-off",
     );
 
     let mut control = Control {
@@ -53,6 +62,32 @@ fn teardown_guards_reverse_activated_modes_and_clean_partial_setup() {
     assert_calls(
         &control,
         "raw-on,alternate-on,mouse-on,alternate-off,raw-off",
+    );
+
+    let mut control = Control {
+        calls: Vec::new(),
+        fail: Some("paste-on"),
+    };
+    assert!(TerminalModeGuard::enter(&mut control).is_err());
+    assert_calls(
+        &control,
+        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,keyboard-off,mouse-off,alternate-off,raw-off",
+    );
+}
+
+#[test]
+fn unsupported_keyboard_enhancement_does_not_break_startup_or_restoration() {
+    let mut control = Control {
+        calls: Vec::new(),
+        fail: Some("keyboard-on"),
+    };
+
+    let mut guard = TerminalModeGuard::enter(&mut control).unwrap();
+    guard.restore(&mut control).unwrap();
+
+    assert_calls(
+        &control,
+        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,paste-off,mouse-off,alternate-off,raw-off",
     );
 }
 #[test]

@@ -55,6 +55,10 @@ pub enum TerminalOperation {
     LeaveAlternate,
     EnableMouse,
     DisableMouse,
+    EnableKeyboardEnhancement,
+    DisableKeyboardEnhancement,
+    EnablePaste,
+    DisablePaste,
 }
 pub trait TerminalControl {
     fn apply(&mut self, operation: TerminalOperation) -> io::Result<()>;
@@ -63,6 +67,8 @@ pub struct TerminalModeGuard {
     raw: bool,
     alternate: bool,
     mouse: bool,
+    keyboard_enhancement: bool,
+    paste: bool,
 }
 impl TerminalModeGuard {
     pub fn enter(control: &mut impl TerminalControl) -> io::Result<Self> {
@@ -71,6 +77,8 @@ impl TerminalModeGuard {
             raw: true,
             alternate: false,
             mouse: false,
+            keyboard_enhancement: false,
+            paste: false,
         };
         if let Err(error) = control.apply(TerminalOperation::EnterAlternate) {
             let _ = guard.restore(control);
@@ -82,14 +90,42 @@ impl TerminalModeGuard {
             return Err(error);
         }
         guard.mouse = true;
+        match control.apply(TerminalOperation::EnableKeyboardEnhancement) {
+            Ok(()) => guard.keyboard_enhancement = true,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
+            Err(error) => {
+                let _ = guard.restore(control);
+                return Err(error);
+            }
+        }
+        match control.apply(TerminalOperation::EnablePaste) {
+            Ok(()) => guard.paste = true,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {}
+            Err(error) => {
+                let _ = guard.restore(control);
+                return Err(error);
+            }
+        }
         Ok(guard)
     }
     pub fn restore(&mut self, control: &mut impl TerminalControl) -> io::Result<()> {
         let mut first_error = None;
+        if self.paste {
+            self.paste = false;
+            if let Err(error) = control.apply(TerminalOperation::DisablePaste) {
+                first_error = Some(error);
+            }
+        }
+        if self.keyboard_enhancement {
+            self.keyboard_enhancement = false;
+            if let Err(error) = control.apply(TerminalOperation::DisableKeyboardEnhancement) {
+                first_error.get_or_insert(error);
+            }
+        }
         if self.mouse {
             self.mouse = false;
             if let Err(error) = control.apply(TerminalOperation::DisableMouse) {
-                first_error = Some(error);
+                first_error.get_or_insert(error);
             }
         }
         if self.alternate {

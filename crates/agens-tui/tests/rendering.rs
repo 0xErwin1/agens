@@ -570,3 +570,33 @@ fn renderer_keeps_metrics_and_errors_readable_in_a_narrow_viewport() {
     );
     assert!(text.contains("2s"), "turn duration is missing: {text:?}");
 }
+
+#[test]
+fn renderer_scrolls_multiline_unicode_composer_and_keeps_cursor_visible() {
+    let terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    for character in "first\né🙂".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+
+    let cursor = renderer.terminal().backend().cursor_position();
+    assert_eq!((cursor.x, cursor.y), (4, 7));
+    assert!(rendered_text(&renderer).contains("2 lines · 8 chars"));
+
+    let terminal = Terminal::new(TestBackend::new(5, 8)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    for character in "ab🙂".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let cursor = renderer.terminal().backend().cursor_position();
+    assert!(
+        cursor.x < 4,
+        "cursor must remain inside the composer: {cursor:?}"
+    );
+}

@@ -30,15 +30,16 @@ use std::{
 use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{self as crossterm_terminal, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     Terminal as RatatuiTerminal,
-    backend::Backend,
+    backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -505,6 +506,11 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         Color::Cyan
     };
     if layout.composer.height > 0 {
+        let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
+        let inner_width = usize::from(layout.composer.width.saturating_sub(2));
+        let inner_height = usize::from(layout.composer.height.saturating_sub(2));
+        let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
+        let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
         frame.render_widget(
             Paragraph::new(state.input)
                 .block(
@@ -524,9 +530,27 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                         ))
                         .title_alignment(Alignment::Right),
                 )
-                .wrap(Wrap { trim: false }),
+                .scroll((
+                    saturating_u16(vertical_scroll),
+                    saturating_u16(horizontal_scroll),
+                )),
             layout.composer,
         );
+        if inner_width > 0 && inner_height > 0 {
+            let cursor_y = layout
+                .composer
+                .y
+                .saturating_add(1)
+                .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
+            let cursor_x = layout
+                .composer
+                .x
+                .saturating_add(1)
+                .saturating_add(saturating_u16(
+                    cursor_column.saturating_sub(horizontal_scroll),
+                ));
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
     }
 
     if layout.footer.height > 0 {
@@ -543,21 +567,6 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     if let Some(palette) = state.palette {
         render_palette(frame, area, layout.composer, state.input, palette);
-    }
-
-    let (line, column) = cursor_position(state.input, state.input_cursor);
-    let cursor_y = layout
-        .composer
-        .y
-        .saturating_add(1)
-        .saturating_add(line as u16);
-    let cursor_x = layout
-        .composer
-        .x
-        .saturating_add(1)
-        .saturating_add(column as u16);
-    if cursor_y < layout.composer.bottom() && cursor_x < layout.composer.right() {
-        frame.set_cursor_position((cursor_x, cursor_y));
     }
 }
 
@@ -815,7 +824,7 @@ fn turn_state_color(state: Option<TurnState>, running: bool) -> Color {
 }
 
 fn composer_metadata(input: &str) -> String {
-    let lines = input.lines().count().max(1);
+    let lines = input.chars().filter(|character| *character == '\n').count() + 1;
     format!(" {lines} lines · {} chars ", input.chars().count())
 }
 
@@ -901,14 +910,21 @@ fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
-    let cursor = cursor.min(input.len());
-    let before_cursor = &input[..cursor];
-    let line = before_cursor.bytes().filter(|byte| *byte == b'\n').count();
-    let column = before_cursor
-        .rsplit('\n')
-        .next()
-        .map_or(0, |line| line.chars().count());
-    (line, column)
+    let mut line = 0;
+    let mut current_line = String::new();
+    for character in input.chars().take(cursor) {
+        if character == '\n' {
+            line += 1;
+            current_line.clear();
+        } else {
+            current_line.push(character);
+        }
+    }
+    (line, Line::from(current_line).width())
+}
+
+fn saturating_u16(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 /// Renders the current TUI state. Rendering is deliberately independent of event handling.
@@ -1915,6 +1931,20 @@ impl TerminalControl for CrosstermControl {
             TerminalOperation::DisableMouse => {
                 execute!(self.stdout, DisableMouseCapture).map(|_| ())
             }
+            TerminalOperation::EnableKeyboardEnhancement => execute!(
+                self.stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )
+            .map(|_| ()),
+            TerminalOperation::DisableKeyboardEnhancement => {
+                execute!(self.stdout, PopKeyboardEnhancementFlags).map(|_| ())
+            }
+            TerminalOperation::EnablePaste => {
+                execute!(self.stdout, EnableBracketedPaste).map(|_| ())
+            }
+            TerminalOperation::DisablePaste => {
+                execute!(self.stdout, DisableBracketedPaste).map(|_| ())
+            }
         }
     }
 }
@@ -2018,8 +2048,7 @@ where
     E: Engine + Send,
     F: Fn(String) -> Result<String, String> + Send + Sync + 'static,
 {
-    let terminal = ratatui::try_init()?;
-    let _restore = RatatuiRestore;
+    let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = RatatuiRenderer::new(terminal);
     run_with_submit(tui, &mut renderer, submit)
 }
@@ -2048,8 +2077,8 @@ where
     let (route_sender, route_receiver) = mpsc::channel();
     let (route_progress_sender, route_progress_receiver) = mpsc::channel();
     let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
-    let terminal = ratatui::try_init()?;
-    let _restore = RatatuiRestore;
+    let mut runtime_terminal = Terminal::enter()?;
+    let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = RatatuiRenderer::new(terminal);
     renderer.render(tui.view())?;
 
@@ -2087,10 +2116,7 @@ where
             });
         }
         renderer.render(tui.view())?;
-        if !event::poll(Duration::from_millis(25))? {
-            continue;
-        }
-        let Some(event) = map_event(event::read()?) else {
+        let Some(event) = runtime_terminal.poll(Duration::from_millis(25))? else {
             continue;
         };
         match tui.handle(event) {
@@ -2124,14 +2150,6 @@ where
             }
             Action::Render | Action::Cancel => {}
         }
-    }
-}
-
-struct RatatuiRestore;
-
-impl Drop for RatatuiRestore {
-    fn drop(&mut self) {
-        let _ = ratatui::try_restore();
     }
 }
 
@@ -2291,6 +2309,10 @@ mod runtime_tests {
             TerminalOperation::EnableRaw,
             TerminalOperation::EnterAlternate,
             TerminalOperation::EnableMouse,
+            TerminalOperation::EnableKeyboardEnhancement,
+            TerminalOperation::EnablePaste,
+            TerminalOperation::DisablePaste,
+            TerminalOperation::DisableKeyboardEnhancement,
             TerminalOperation::DisableMouse,
             TerminalOperation::LeaveAlternate,
             TerminalOperation::DisableRaw,
@@ -2361,6 +2383,14 @@ mod runtime_tests {
         let ctrl = KeyModifiers::CONTROL;
         let alt = KeyModifiers::ALT;
         for (code, modifiers, expected) in [
+            (KeyCode::Backspace, KeyModifiers::NONE, Key::Backspace),
+            (KeyCode::Delete, KeyModifiers::NONE, Key::Delete),
+            (KeyCode::Home, KeyModifiers::NONE, Key::Home),
+            (KeyCode::End, KeyModifiers::NONE, Key::End),
+            (KeyCode::Left, KeyModifiers::NONE, Key::Left),
+            (KeyCode::Right, KeyModifiers::NONE, Key::Right),
+            (KeyCode::Enter, KeyModifiers::NONE, Key::Enter),
+            (KeyCode::Enter, KeyModifiers::SHIFT, Key::ShiftEnter),
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
             (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
             (KeyCode::Char('k'), ctrl, Key::DeleteToLineEnd),
@@ -2373,11 +2403,14 @@ mod runtime_tests {
             (KeyCode::Left, ctrl, Key::PreviousWord),
             (KeyCode::Right, ctrl, Key::NextWord),
             (KeyCode::Char('d'), ctrl, Key::Delete),
-            (KeyCode::Delete, KeyModifiers::NONE, Key::Delete),
+            (KeyCode::Char('c'), ctrl, Key::CtrlC),
+            (KeyCode::Char('o'), ctrl, Key::CtrlO),
         ] {
+            let event = crossterm::event::KeyEvent::new(code, modifiers);
+            assert_eq!(map_key(event), Some(Event::Key(expected)));
             assert_eq!(
-                map_key(crossterm::event::KeyEvent::new(code, modifiers)),
-                Some(Event::Key(expected))
+                Tui::new(NoopEngine).handle(map_key(event).unwrap()),
+                Action::Render
             );
         }
     }
