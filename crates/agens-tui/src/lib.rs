@@ -90,6 +90,8 @@ pub enum Key {
     CtrlC,
     /// Collapses or expands completed tool outputs in the visible conversation.
     CtrlO,
+    /// Opens the eligible subagent selection dialog.
+    CtrlShiftA,
     ShiftEnter,
     Left,
     Right,
@@ -1914,6 +1916,11 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
+        if key == Key::CtrlShiftA {
+            self.palette_open = false;
+            return Action::OpenDialog("subagent".into());
+        }
+
         if let Some(action) = self.handle_composer_key(key) {
             return action;
         }
@@ -2952,6 +2959,11 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
         }
+        (KeyCode::Char('a' | 'A'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftA
+        }
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
         }
@@ -3138,6 +3150,20 @@ mod runtime_tests {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             Some(Event::Key(Key::CtrlO))
+        );
+    }
+
+    #[test]
+    fn u15_c1a_maps_control_shift_a_to_the_subagent_dialog() {
+        let event = map_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(event, Some(Event::Key(Key::CtrlShiftA)));
+        assert_eq!(
+            Tui::new(NoopEngine).handle(event.unwrap()),
+            Action::OpenDialog("subagent".into())
         );
     }
 

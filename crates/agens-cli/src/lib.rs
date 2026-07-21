@@ -1887,6 +1887,19 @@ impl TuiRuntimeRouter {
                     .collect();
                 DialogView::selection("Choose agent", Some("Eligible primary agents"), entries)
             }
+            "subagent" => {
+                let entries =
+                    std::iter::once(DialogEntry::disabled("main", "Primary conversation agent"))
+                        .chain(tui_subagent_catalog(&bootstrap)?.map(|agent| {
+                            DialogEntry::action(&agent.name, format!("subagent:{}", agent.name))
+                        }))
+                        .collect();
+                DialogView::selection(
+                    "Choose subagent",
+                    Some("Eligible configured subagents"),
+                    entries,
+                )
+            }
             _ => return Err(CliError::usage("TUI dialog is unavailable")),
         };
         Ok(TuiSubmissionOutcome::Dialog(dialog))
@@ -1950,6 +1963,8 @@ impl TuiRuntimeRouter {
                 apply_tui_effort(&bootstrap, effort, &self.session)?
             } else if let Some(agent) = action_id.strip_prefix("agent:") {
                 rotate_tui_agent(&bootstrap, agent, &self.session, &self.skills)?
+            } else if let Some(agent) = action_id.strip_prefix("subagent:") {
+                select_tui_subagent(&bootstrap, agent, &self.session)?
             } else {
                 return Err(CliError::usage("TUI dialog action is unavailable"));
             };
@@ -2055,11 +2070,7 @@ impl TuiRuntimeRouter {
                 message: select_tui_subagent(&bootstrap, &command[10..], &self.session)?,
                 presentation: self.presentation()?,
             },
-            "/subagent" => TuiSubmissionOutcome::LocalInfo(list_tui_agents(
-                &bootstrap,
-                &self.session,
-                agens_core::AgentMode::Subagent,
-            )?),
+            "/subagent" => self.open_dialog("subagent")?,
             "/model" => self.open_dialog("model")?,
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
                 message: select_tui_model(&bootstrap, command, &self.session)?,
@@ -3240,6 +3251,7 @@ fn tui_session_is_running(session: &Arc<Mutex<TuiSessionContext>>) -> Result<boo
         .map_err(|_| CliError::storage("TUI session is unavailable"))
 }
 
+#[cfg(test)]
 fn list_tui_agents(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<TuiSessionContext>>,
@@ -3290,10 +3302,8 @@ fn select_tui_subagent(
     name: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
-    let catalog = tui_agent_catalog(bootstrap, &BundledModelValidator)?;
-    let agent = catalog
-        .agent(name.trim())
-        .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
+    let agent = tui_subagent_catalog(bootstrap)?
+        .find(|agent| agent.name == name.trim())
         .ok_or_else(|| CliError::usage("/subagent requires an available subagent"))?;
     let mut context = session
         .lock()
@@ -3303,6 +3313,17 @@ fn select_tui_subagent(
     }
     context.selected_subagent = Some(agent.name.clone());
     Ok(format!("Subagent: {}.", agent.name))
+}
+
+fn tui_subagent_catalog(
+    bootstrap: &Bootstrap,
+) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
+    let agents = tui_agent_catalog(bootstrap, &BundledModelValidator)?
+        .subagents()
+        .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(agents.into_iter())
 }
 
 fn tui_agent_catalog(
@@ -6648,6 +6669,78 @@ mod tests {
             session.lock().unwrap().selected_subagent.as_deref(),
             Some("reviewer")
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn u15_c1a_subagent_overlay_and_alias_expose_only_eligible_agents() {
+        let temporary = tui_session_directory("u15-c1a-subagents");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[
+                (
+                    "all",
+                    "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
+                ),
+                (
+                    "primary",
+                    "---\nname: primary\ndescription: primary\nmode: primary\npermissions: []\n---\nPrimary work.\n",
+                ),
+                (
+                    "invalid-model",
+                    "---\nname: invalid-model\ndescription: invalid\nmode: subagent\nmodel: unavailable\npermissions: []\n---\nInvalid work.\n",
+                ),
+                (
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                ),
+            ],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+
+        assert!(matches!(
+            router.route("/subagent".into()),
+            TuiSubmissionOutcome::Dialog(_)
+        ));
+        assert!(
+            tui.apply_submission_outcome(router.route("/subagent".into()))
+                .is_none()
+        );
+        let overlay = render_tui_test_backend(&tui, 80, 24);
+        assert!(overlay.contains("main"));
+        assert!(overlay.contains("reviewer"));
+        assert!(!overlay.contains("all"));
+        assert!(!overlay.contains("primary"));
+        assert!(!overlay.contains("invalid-model"));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("subagent:reviewer".into())
+        );
+        assert!(tui.transcript().is_empty());
+
+        assert!(matches!(
+            router.route("/subagent reviewer".into()),
+            TuiSubmissionOutcome::ContextChanged { .. }
+        ));
+        assert_eq!(
+            session.lock().unwrap().selected_subagent.as_deref(),
+            Some("reviewer")
+        );
+        assert!(matches!(
+            router.route("/subagent all".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

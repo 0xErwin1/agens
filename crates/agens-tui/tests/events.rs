@@ -638,6 +638,33 @@ fn slash_palette_selector_enter_emits_a_route_id_but_explicit_arguments_still_su
 }
 
 #[test]
+fn u15_c1a_subagent_shortcut_opens_the_same_dialog_route_as_the_palette() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_palette_entries(vec![
+        PaletteEntry::new(
+            "subagent",
+            "Choose a subagent",
+            "",
+            PaletteEntryKind::BuiltIn,
+        )
+        .with_dialog("subagent"),
+    ]);
+
+    for character in "/subagent".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::OpenDialog("subagent".into())
+    );
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlShiftA)),
+        Action::OpenDialog("subagent".into())
+    );
+    assert_eq!(tui.engine().cancellations, 0);
+}
+
+#[test]
 fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Key(Key::Char('d')));
