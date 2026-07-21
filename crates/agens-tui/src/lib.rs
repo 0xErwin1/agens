@@ -119,6 +119,7 @@ pub enum Action {
     OpenDialog(String),
     /// Dispatch the selected dialog action through the composition layer.
     DialogAction(String),
+    SafeDialogAction(String),
     /// An active engine turn was asked to cancel.
     Cancel,
     /// End the terminal event loop.
@@ -171,6 +172,13 @@ pub enum TuiSubmissionOutcome {
         messages: Vec<Message>,
     },
     Dialog(DialogView),
+    SafeDialog(DialogView),
+    SelectionInfo(String),
+    SelectionCancelled,
+    SelectionError {
+        message: String,
+        action: String,
+    },
     Quit,
 }
 
@@ -333,6 +341,7 @@ pub struct PaletteView<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DialogEntryAction {
     Dispatch(String),
+    SafeDispatch(String),
     Cancel,
     ToggleDetails,
 }
@@ -365,6 +374,19 @@ impl DialogEntry {
             search_text: None,
             selected_detail: None,
             action: Some(DialogEntryAction::Dispatch(bounded_dialog_text(
+                action_id.as_ref(),
+                128,
+            ))),
+        }
+    }
+
+    pub fn safe_action(label: impl AsRef<str>, action_id: impl AsRef<str>) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 128),
+            detail: None,
+            search_text: None,
+            selected_detail: None,
+            action: Some(DialogEntryAction::SafeDispatch(bounded_dialog_text(
                 action_id.as_ref(),
                 128,
             ))),
@@ -456,6 +478,7 @@ pub struct DialogView {
     refresh_id: Option<String>,
     details_open: bool,
     empty_message: Option<String>,
+    cancellation_action: Option<String>,
 }
 
 impl DialogView {
@@ -481,6 +504,7 @@ impl DialogView {
             refresh_id: None,
             details_open: false,
             empty_message: None,
+            cancellation_action: None,
         }
     }
 
@@ -501,6 +525,11 @@ impl DialogView {
 
     pub fn with_empty_message(mut self, message: impl AsRef<str>) -> Self {
         self.empty_message = Some(bounded_dialog_text(message.as_ref(), 256));
+        self
+    }
+
+    pub fn with_cancellation_action(mut self, action_id: impl AsRef<str>) -> Self {
+        self.cancellation_action = Some(bounded_dialog_text(action_id.as_ref(), 128));
         self
     }
 
@@ -565,6 +594,7 @@ impl DialogView {
             refresh_id: None,
             details_open: false,
             empty_message: None,
+            cancellation_action: None,
         }
     }
 }
@@ -1551,7 +1581,10 @@ where
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
         self.palette_open = false;
-        if !matches!(&outcome, TuiSubmissionOutcome::Dialog(_)) {
+        if !matches!(
+            &outcome,
+            TuiSubmissionOutcome::Dialog(_) | TuiSubmissionOutcome::SafeDialog(_)
+        ) {
             self.dialog = None;
         }
         match outcome {
@@ -1613,6 +1646,22 @@ where
             TuiSubmissionOutcome::Dialog(dialog) => {
                 self.set_running(false);
                 self.show_selection_dialog(dialog);
+                None
+            }
+            TuiSubmissionOutcome::SafeDialog(dialog) => {
+                self.show_selection_dialog(dialog);
+                None
+            }
+            TuiSubmissionOutcome::SelectionInfo(message) => {
+                self.add_info(message);
+                None
+            }
+            TuiSubmissionOutcome::SelectionCancelled => {
+                self.add_info("File selection cancelled.");
+                None
+            }
+            TuiSubmissionOutcome::SelectionError { message, action } => {
+                self.show_dialog("Action required", format!("{message}\nAction: {action}"));
                 None
             }
             TuiSubmissionOutcome::Quit => {
@@ -1910,6 +1959,12 @@ where
             }
             Key::Up | Key::Down | Key::Tab => Action::Render,
             Key::Enter if self.input.is_empty() => Action::Render,
+            Key::Enter if self.running && self.input.trim() == "/select" => {
+                self.palette_open = false;
+                self.input.clear();
+                self.input_cursor = 0;
+                Action::OpenDialog("select".into())
+            }
             Key::Enter if self.running => {
                 self.transcript.push(TranscriptEntry::Info(
                     "A response is already in progress.".into(),
@@ -2154,6 +2209,10 @@ where
                         self.dialog = None;
                         Action::DialogAction(action_id)
                     }
+                    Some(DialogEntryAction::SafeDispatch(action_id)) => {
+                        self.dialog = None;
+                        Action::SafeDialogAction(action_id)
+                    }
                     Some(DialogEntryAction::Cancel) => {
                         self.dialog = None;
                         Action::Render
@@ -2181,8 +2240,12 @@ where
                 Action::Render
             }
             Key::Escape | Key::CtrlC => {
+                let action_id = self
+                    .dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.cancellation_action.clone());
                 self.dialog = None;
-                Action::Render
+                action_id.map_or(Action::Render, Action::SafeDialogAction)
             }
             _ => Action::Render,
         }
@@ -2609,6 +2672,7 @@ where
             | Action::Submit(_)
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
+            | Action::SafeDialogAction(_)
             | Action::Cancel => renderer.render(tui.view())?,
         }
     }
@@ -2648,9 +2712,11 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render | Action::OpenDialog(_) | Action::DialogAction(_) | Action::Cancel => {
-                renderer.render(tui.view())?
-            }
+            Action::Render
+            | Action::OpenDialog(_)
+            | Action::DialogAction(_)
+            | Action::SafeDialogAction(_)
+            | Action::Cancel => renderer.render(tui.view())?,
         }
     }
 }
@@ -2820,6 +2886,13 @@ where
                     let outcome = route(TuiRouteRequest::DialogAction(action_id), progress);
                     let _ = route_sender.send(outcome);
                 });
+            }
+            Action::SafeDialogAction(action_id) => {
+                let outcome = route(
+                    TuiRouteRequest::DialogAction(action_id),
+                    route_progress_sender.clone(),
+                );
+                let _ = route_sender.send(outcome);
             }
             Action::Render | Action::Cancel => {
                 if cancel_permission

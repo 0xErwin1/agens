@@ -1818,14 +1818,17 @@ impl TuiRuntimeRouter {
             "select" => {
                 let entries = tui_select_candidates(&bootstrap)?
                     .into_iter()
-                    .map(|path| DialogEntry::action(&path, format!("select:{path}")))
+                    .map(|path| DialogEntry::safe_action(&path, format!("select:{path}")))
                     .collect();
-                DialogView::selection(
-                    "Select project file",
-                    Some("Choose one approved file | Esc cancel"),
-                    entries,
-                )
-                .with_empty_message("No approved project files are available.")
+                return Ok(TuiSubmissionOutcome::SafeDialog(
+                    DialogView::selection(
+                        "Select project file",
+                        Some("Choose one approved file | Esc cancel"),
+                        entries,
+                    )
+                    .with_empty_message("No approved project files are available.")
+                    .with_cancellation_action("select:cancel"),
+                ));
             }
             "sessions" => {
                 let project = tui_project_identifier(&bootstrap)?;
@@ -1903,11 +1906,13 @@ impl TuiRuntimeRouter {
         }
         let result = (|| {
             let bootstrap = self.bootstrap()?;
+            if action_id == "select:cancel" {
+                return Ok(TuiSubmissionOutcome::SelectionCancelled);
+            }
             if let Some(path) = action_id.strip_prefix("select:") {
-                return Ok(TuiSubmissionOutcome::LocalInfo(format!(
-                    "Selected file: {}",
-                    selected_tui_file(&bootstrap, path)?
-                )));
+                return selected_tui_file(&bootstrap, path).map(|path| {
+                    TuiSubmissionOutcome::SelectionInfo(format!("Selected file: {path}"))
+                });
             }
             if let Some(identifier) = action_id.strip_prefix("session:") {
                 let identifier = identifier
@@ -1952,6 +1957,12 @@ impl TuiRuntimeRouter {
         })();
         match result {
             Ok(outcome) => outcome,
+            Err(error) if action_id.starts_with("select:") => {
+                TuiSubmissionOutcome::SelectionError {
+                    message: error.to_string(),
+                    action: TUI_ERROR_ACTION.into(),
+                }
+            }
             Err(error) => TuiSubmissionOutcome::LocalActionableError {
                 message: error.to_string(),
                 action: TUI_ERROR_ACTION.into(),
@@ -2740,12 +2751,16 @@ fn run_tui_prompt(
             );
             match router.resolve(command.to_owned())? {
                 TuiSubmissionOutcome::LocalInfo(message)
+                | TuiSubmissionOutcome::SelectionInfo(message)
                 | TuiSubmissionOutcome::ResetSucceeded { message, .. }
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
                 | TuiSubmissionOutcome::SessionResumed { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
                 | TuiSubmissionOutcome::LocalActionableError { .. }
-                | TuiSubmissionOutcome::Dialog(_) => {
+                | TuiSubmissionOutcome::Dialog(_)
+                | TuiSubmissionOutcome::SafeDialog(_)
+                | TuiSubmissionOutcome::SelectionCancelled
+                | TuiSubmissionOutcome::SelectionError { .. } => {
                     unreachable!("slash routing returns a local result or CLI error")
                 }
                 TuiSubmissionOutcome::Quit => Ok(String::new()),
@@ -8385,7 +8400,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tui_native_select_returns_one_confined_local_result() {
+    fn tui_native_select_restores_mouse_mode_after_running_turn_outcomes() {
         use std::os::unix::fs::symlink;
 
         let temporary = tui_session_directory("native-select");
@@ -8409,42 +8424,142 @@ mod tests {
             cancellation: Arc::new(Mutex::new(None)),
         });
 
-        tui.apply_submission_outcome(router.route("/select".into()));
-        assert!(matches!(
-            tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape)),
-            agens_tui::Action::Render
-        ));
+        let mut control = TuiTerminalControl::default();
+        let mut guard = agens_tui::TerminalModeGuard::enter(&mut control).unwrap();
+        let transcript_count = open_running_tui_select(&mut tui, &router);
+        assert!(render_tui_test_backend(&tui, 80, 24).contains("Select project file"));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Escape)),
+            Action::SafeDialogAction("select:cancel".into())
+        );
+        let cancelled = router.route_request(
+            TuiRouteRequest::DialogAction("select:cancel".into()),
+            std::sync::mpsc::channel().0,
+        );
+        assert_eq!(cancelled, TuiSubmissionOutcome::SelectionCancelled);
+        assert!(tui.apply_submission_outcome(cancelled).is_none());
         assert!(tui.view().dialog.is_none());
-        assert!(tui.transcript().is_empty());
+        assert!(tui.view().running);
+        assert_eq!(tui.transcript().len(), transcript_count);
+        assert!(
+            tui.apply_submission_outcome(router.route_request(
+                TuiRouteRequest::DialogAction("select:cancel".into()),
+                std::sync::mpsc::channel().0,
+            ))
+            .is_none()
+        );
+        assert_eq!(tui.transcript().len(), transcript_count);
+        open_running_tui_select(&mut tui, &router);
+        assert_eq!(
+            tui.handle(Event::Key(Key::CtrlC)),
+            Action::SafeDialogAction("select:cancel".into())
+        );
+        assert_eq!(
+            router.route_request(
+                TuiRouteRequest::DialogAction("select:cancel".into()),
+                std::sync::mpsc::channel().0,
+            ),
+            TuiSubmissionOutcome::SelectionCancelled
+        );
+        guard.restore(&mut control).unwrap();
+        assert_tui_terminal_restored(&control);
 
-        assert!(matches!(
-            router.route("/select".into()),
-            TuiSubmissionOutcome::Dialog(_)
-        ));
+        let mut control = TuiTerminalControl::default();
+        let mut guard = agens_tui::TerminalModeGuard::enter(&mut control).unwrap();
+        let transcript_count = open_running_tui_select(&mut tui, &router);
+        let Action::SafeDialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("selection Enter should use the safe local action path");
+        };
         let selected = router.route_request(
-            TuiRouteRequest::DialogAction("select:approved.txt".into()),
+            TuiRouteRequest::DialogAction(action_id),
             std::sync::mpsc::channel().0,
         );
         assert_eq!(
             selected,
-            TuiSubmissionOutcome::LocalInfo("Selected file: approved.txt".into())
+            TuiSubmissionOutcome::SelectionInfo("Selected file: approved.txt".into())
         );
         assert!(tui.apply_submission_outcome(selected).is_none());
-        assert!(tui.transcript().is_empty());
-        for selection in ["../outside.txt", "escape.txt", "directory", "large.txt"] {
-            let rejected = router.route_request(
-                TuiRouteRequest::DialogAction(format!("select:{selection}")),
-                std::sync::mpsc::channel().0,
-            );
-            assert!(matches!(
-                rejected,
-                TuiSubmissionOutcome::LocalActionableError { .. }
-            ));
-            assert!(tui.apply_submission_outcome(rejected).is_none());
-            assert!(tui.transcript().is_empty());
-        }
+        assert!(tui.view().running);
+        assert_eq!(tui.transcript().len(), transcript_count);
+        guard.restore(&mut control).unwrap();
+        assert_tui_terminal_restored(&control);
+
+        let mut control = TuiTerminalControl::default();
+        let mut guard = agens_tui::TerminalModeGuard::enter(&mut control).unwrap();
+        let transcript_count = open_running_tui_select(&mut tui, &router);
+        let rejected = router.route_request(
+            TuiRouteRequest::DialogAction("select:escape.txt".into()),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(matches!(
+            rejected,
+            TuiSubmissionOutcome::SelectionError { .. }
+        ));
+        assert!(tui.apply_submission_outcome(rejected).is_none());
+        assert!(tui.view().running);
+        assert_eq!(tui.transcript().len(), transcript_count);
+        guard.restore(&mut control).unwrap();
+        assert_tui_terminal_restored(&control);
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[derive(Default)]
+    struct TuiTerminalControl {
+        operations: Vec<agens_tui::TerminalOperation>,
+    }
+
+    impl agens_tui::TerminalControl for TuiTerminalControl {
+        fn apply(&mut self, operation: agens_tui::TerminalOperation) -> std::io::Result<()> {
+            self.operations.push(operation);
+            Ok(())
+        }
+    }
+
+    fn assert_tui_terminal_restored(control: &TuiTerminalControl) {
+        use agens_tui::TerminalOperation::*;
+
+        assert_eq!(
+            control.operations,
+            vec![
+                EnableRaw,
+                EnterAlternate,
+                EnableMouse,
+                EnableKeyboardEnhancement,
+                EnablePaste,
+                DisablePaste,
+                DisableKeyboardEnhancement,
+                DisableMouse,
+                LeaveAlternate,
+                DisableRaw,
+            ]
+        );
+    }
+
+    fn open_running_tui_select(
+        tui: &mut Tui<ProductionTuiEngine>,
+        router: &TuiRuntimeRouter,
+    ) -> usize {
+        tui.begin_submission("running");
+        let transcript_count = tui.transcript().len();
+        for character in "/select".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::OpenDialog("select".into())
+        );
+        let outcome = router.route_request(
+            TuiRouteRequest::OpenDialog("select".into()),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(matches!(outcome, TuiSubmissionOutcome::SafeDialog(_)));
+        assert!(tui.apply_submission_outcome(outcome).is_none());
+        assert!(tui.view().running);
+        assert_eq!(tui.transcript().len(), transcript_count);
+
+        transcript_count
     }
 
     fn tui_session_directory(label: &str) -> PathBuf {
