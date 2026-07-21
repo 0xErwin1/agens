@@ -4,7 +4,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -28,6 +28,103 @@ const TASK_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const OPEN: u8 = 0;
 const CANCELLED: u8 = 1;
 const PUBLISHED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskExecutionId(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskLaunchMode {
+    Foreground,
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskTerminalState {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskExecutionEvent {
+    Admitted(TaskExecutionId, TaskLaunchMode),
+    Backgrounded(TaskExecutionId),
+    Completed(TaskExecutionId),
+    Failed(TaskExecutionId),
+    Cancelled(TaskExecutionId),
+}
+
+#[derive(Clone)]
+pub struct TaskExecutionLifecycle {
+    inner: Arc<Mutex<TaskExecutionLifecycleState>>,
+}
+
+struct TaskExecutionLifecycleState {
+    id: TaskExecutionId,
+    mode: TaskLaunchMode,
+    terminal: Option<TaskTerminalState>,
+    events: Vec<TaskExecutionEvent>,
+}
+
+impl TaskExecutionLifecycle {
+    fn new(id: TaskExecutionId, mode: TaskLaunchMode) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(TaskExecutionLifecycleState {
+                id,
+                mode,
+                terminal: None,
+                events: vec![TaskExecutionEvent::Admitted(id, mode)],
+            })),
+        }
+    }
+
+    pub fn id(&self) -> TaskExecutionId {
+        self.inner.lock().expect("task lifecycle lock poisoned").id
+    }
+
+    pub fn mode(&self) -> TaskLaunchMode {
+        self.inner
+            .lock()
+            .expect("task lifecycle lock poisoned")
+            .mode
+    }
+
+    pub fn events(&self) -> Vec<TaskExecutionEvent> {
+        self.inner
+            .lock()
+            .expect("task lifecycle lock poisoned")
+            .events
+            .clone()
+    }
+
+    pub fn transition_to_background(&self) -> bool {
+        let mut lifecycle = self.inner.lock().expect("task lifecycle lock poisoned");
+        if lifecycle.mode != TaskLaunchMode::Foreground || lifecycle.terminal.is_some() {
+            return false;
+        }
+
+        let id = lifecycle.id;
+        lifecycle.mode = TaskLaunchMode::Background;
+        lifecycle.events.push(TaskExecutionEvent::Backgrounded(id));
+        true
+    }
+
+    pub fn finish(&self, terminal: TaskTerminalState) -> bool {
+        let mut lifecycle = self.inner.lock().expect("task lifecycle lock poisoned");
+        if lifecycle.terminal.is_some() {
+            return false;
+        }
+
+        let id = lifecycle.id;
+        lifecycle.terminal = Some(terminal);
+        lifecycle.events.push(match terminal {
+            TaskTerminalState::Completed => TaskExecutionEvent::Completed(id),
+            TaskTerminalState::Failed => TaskExecutionEvent::Failed(id),
+            TaskTerminalState::Cancelled => TaskExecutionEvent::Cancelled(id),
+        });
+        true
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskInvocation {
@@ -186,6 +283,7 @@ pub enum TaskRunnerError {
 pub struct TaskRunContext {
     pub cancellation: Arc<std::sync::atomic::AtomicBool>,
     pub deadline: Instant,
+    execution: Option<TaskExecutionLifecycle>,
 }
 
 impl TaskRunContext {
@@ -193,7 +291,17 @@ impl TaskRunContext {
         Self {
             cancellation: parent.cancellation_handle(),
             deadline: parent.deadline().min(Instant::now() + TASK_TIMEOUT),
+            execution: None,
         }
+    }
+
+    fn with_execution(mut self, execution: TaskExecutionLifecycle) -> Self {
+        self.execution = Some(execution);
+        self
+    }
+
+    pub fn execution(&self) -> Option<&TaskExecutionLifecycle> {
+        self.execution.as_ref()
     }
 
     fn terminal_output(&self) -> Option<ToolOutput> {
@@ -222,6 +330,7 @@ pub struct TaskTool<R> {
     model_validator: Arc<dyn AgentModelValidator + Send + Sync>,
     runner: Arc<Mutex<R>>,
     active: Arc<AtomicUsize>,
+    execution_ids: Arc<AtomicU64>,
 }
 
 impl<R> Clone for TaskTool<R> {
@@ -233,6 +342,7 @@ impl<R> Clone for TaskTool<R> {
             model_validator: Arc::clone(&self.model_validator),
             runner: Arc::clone(&self.runner),
             active: Arc::clone(&self.active),
+            execution_ids: Arc::clone(&self.execution_ids),
         }
     }
 }
@@ -252,6 +362,7 @@ impl<R> TaskTool<R> {
             model_validator: Arc::new(model_validator),
             runner: Arc::new(Mutex::new(runner)),
             active: Arc::new(AtomicUsize::new(0)),
+            execution_ids: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -343,6 +454,17 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
         parent: &ToolExecutionContext,
         arguments: Value,
     ) -> Result<ToolOutput, Error> {
+        self.execute_with_launch_mode(parent, arguments, TaskLaunchMode::Foreground)
+    }
+}
+
+impl<R: TaskRunner> TaskTool<R> {
+    pub fn execute_with_launch_mode(
+        &mut self,
+        parent: &ToolExecutionContext,
+        arguments: Value,
+        mode: TaskLaunchMode,
+    ) -> Result<ToolOutput, Error> {
         let invocation = match TaskInvocation::from_value(arguments) {
             Ok(invocation) => invocation,
             Err(_) => return Ok(task_terminal(HeadlessTaskTerminal::InputLimit)),
@@ -362,6 +484,9 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
             return Ok(output);
         }
 
+        let execution_id = TaskExecutionId(self.execution_ids.fetch_add(1, Ordering::AcqRel) + 1);
+        let lifecycle = TaskExecutionLifecycle::new(execution_id, mode);
+        let context = context.with_execution(lifecycle);
         let publication = Arc::new(AtomicU8::new(OPEN));
         let (sender, receiver) = mpsc::channel();
         let runner = Arc::clone(&self.runner);
@@ -383,6 +508,11 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
                 result.unwrap_or_else(task_error_output)
             };
 
+            let terminal = task_terminal_state(&output);
+            if let Some(lifecycle) = worker_context.execution() {
+                lifecycle.finish(terminal);
+            }
+
             if worker_publication
                 .compare_exchange(OPEN, PUBLISHED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -393,7 +523,11 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
 
         loop {
             if let Some(output) = context.terminal_output() {
-                return Ok(finish_task_call(&publication, &receiver, output));
+                let output = finish_task_call(&publication, &receiver, output);
+                if let Some(lifecycle) = context.execution() {
+                    lifecycle.finish(task_terminal_state(&output));
+                }
+                return Ok(output);
             }
 
             match receiver.recv_timeout(TASK_RESULT_POLL_INTERVAL) {
@@ -403,14 +537,26 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
                 Ok(_) => return Ok(task_terminal(HeadlessTaskTerminal::ChildFailure)),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Ok(finish_task_call(
+                    let output = finish_task_call(
                         &publication,
                         &receiver,
                         task_terminal(HeadlessTaskTerminal::ChildFailure),
-                    ));
+                    );
+                    if let Some(lifecycle) = context.execution() {
+                        lifecycle.finish(task_terminal_state(&output));
+                    }
+                    return Ok(output);
                 }
             }
         }
+    }
+}
+
+fn task_terminal_state(output: &ToolOutput) -> TaskTerminalState {
+    match output.terminal() {
+        Some(HeadlessTaskTerminal::Cancelled) => TaskTerminalState::Cancelled,
+        Some(_) => TaskTerminalState::Failed,
+        None => TaskTerminalState::Completed,
     }
 }
 

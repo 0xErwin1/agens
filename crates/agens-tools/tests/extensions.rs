@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -16,10 +16,10 @@ use agens_core::{
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
-    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskInvocation,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTool, TaskTurnRequest,
-    TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskExecutionEvent,
+    TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode, TaskRunContext, TaskRunner,
+    TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -918,6 +918,85 @@ fn task_deadline_wins_over_a_noncooperative_worker() {
 }
 
 #[test]
+fn u15_lifecycle_shared_id_modes_and_terminal_ownership() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool(LifecycleTaskRunner {
+        calls: Arc::clone(&calls),
+        observed: Arc::clone(&observed),
+        terminal: None,
+    });
+    assert_eq!(
+        task.execute_with_launch_mode(
+            &task_context(),
+            task_arguments(),
+            TaskLaunchMode::Foreground
+        )
+        .unwrap(),
+        ToolOutput::success("done")
+    );
+    let mut background = task.clone();
+    assert_eq!(
+        background
+            .execute_with_launch_mode(
+                &task_context(),
+                task_arguments(),
+                TaskLaunchMode::Background
+            )
+            .unwrap(),
+        ToolOutput::success("done")
+    );
+    let observed = observed.lock().unwrap().clone();
+    let foreground = &observed[0];
+    let background = &observed[1];
+
+    let cancelled_observed = Arc::new(Mutex::new(Vec::new()));
+    let mut cancelled = task_tool(LifecycleTaskRunner {
+        calls: Arc::clone(&calls),
+        observed: Arc::clone(&cancelled_observed),
+        terminal: Some(TaskRunnerError::Cancelled),
+    });
+    assert_eq!(
+        cancelled
+            .execute_with_launch_mode(
+                &task_context(),
+                task_arguments(),
+                TaskLaunchMode::Foreground
+            )
+            .unwrap(),
+        ToolOutput::failure("task: cancelled")
+    );
+    let cancelled = cancelled_observed.lock().unwrap().pop().unwrap();
+
+    assert_eq!(calls.load(Ordering::Acquire), 3);
+    assert_ne!(foreground.id(), background.id());
+    assert_eq!(foreground.mode(), TaskLaunchMode::Background);
+    assert_eq!(
+        foreground.events(),
+        vec![
+            TaskExecutionEvent::Admitted(foreground.id(), TaskLaunchMode::Foreground),
+            TaskExecutionEvent::Backgrounded(foreground.id()),
+            TaskExecutionEvent::Completed(foreground.id()),
+        ]
+    );
+    assert_eq!(
+        background.events(),
+        vec![
+            TaskExecutionEvent::Admitted(background.id(), TaskLaunchMode::Background),
+            TaskExecutionEvent::Completed(background.id()),
+        ]
+    );
+    assert!(!cancelled.finish(TaskTerminalState::Completed));
+    assert_eq!(
+        cancelled.events(),
+        vec![
+            TaskExecutionEvent::Admitted(cancelled.id(), TaskLaunchMode::Foreground),
+            TaskExecutionEvent::Cancelled(cancelled.id()),
+        ]
+    );
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -1230,6 +1309,34 @@ impl TaskRunner for TerminalTaskRunner {
 struct BlockingTaskRunner {
     started: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
+}
+
+struct LifecycleTaskRunner {
+    calls: Arc<AtomicUsize>,
+    observed: Arc<Mutex<Vec<TaskExecutionLifecycle>>>,
+    terminal: Option<TaskRunnerError>,
+}
+
+impl TaskRunner for LifecycleTaskRunner {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        context: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let lifecycle = context.execution().cloned().expect("admitted lifecycle");
+        if self.terminal.is_none() && lifecycle.mode() == TaskLaunchMode::Foreground {
+            assert!(lifecycle.transition_to_background());
+        }
+        self.observed.lock().unwrap().push(lifecycle);
+        if let Some(error) = self.terminal {
+            return Err(error);
+        }
+        Ok(TaskTurnResult {
+            output: "done".into(),
+            iterations: 1,
+        })
+    }
 }
 
 impl TaskRunner for BlockingTaskRunner {

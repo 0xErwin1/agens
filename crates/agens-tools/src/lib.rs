@@ -48,7 +48,8 @@ pub use mcp_status::{
 };
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
-    TaskInvocation, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTool,
+    TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
     TaskTurnRequest, TaskTurnResult,
 };
 
