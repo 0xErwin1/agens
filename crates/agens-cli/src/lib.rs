@@ -1902,7 +1902,11 @@ impl TuiRuntimeRouter {
             }
             _ => return Err(CliError::usage("TUI dialog is unavailable")),
         };
-        Ok(TuiSubmissionOutcome::Dialog(dialog))
+        if route_id == "subagent" {
+            Ok(TuiSubmissionOutcome::SafeDialog(dialog))
+        } else {
+            Ok(TuiSubmissionOutcome::Dialog(dialog))
+        }
     }
 
     fn route_dialog_action(
@@ -3318,6 +3322,14 @@ fn select_tui_subagent(
 fn tui_subagent_catalog(
     bootstrap: &Bootstrap,
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
+    if bootstrap
+        .provider_type()
+        .and_then(TuiProvider::parse)
+        .is_none()
+    {
+        return Ok(Vec::new().into_iter());
+    }
+
     let agents = tui_agent_catalog(bootstrap, &BundledModelValidator)?
         .subagents()
         .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
@@ -6711,12 +6723,14 @@ mod tests {
 
         assert!(matches!(
             router.route("/subagent".into()),
-            TuiSubmissionOutcome::Dialog(_)
+            TuiSubmissionOutcome::SafeDialog(_)
         ));
+        tui.set_running(true);
         assert!(
             tui.apply_submission_outcome(router.route("/subagent".into()))
                 .is_none()
         );
+        assert!(tui.view().running);
         let overlay = render_tui_test_backend(&tui, 80, 24);
         assert!(overlay.contains("main"));
         assert!(overlay.contains("reviewer"));
@@ -6741,6 +6755,69 @@ mod tests {
             router.route("/subagent all".into()),
             TuiSubmissionOutcome::LocalActionableError { .. }
         ));
+
+        let unavailable_bootstrap = tui_session_bootstrap_for_provider(
+            &temporary,
+            &[(
+                "unavailable-provider",
+                "---\nname: unavailable-provider\ndescription: unavailable\nmode: subagent\npermissions: []\n---\nUnavailable work.\n",
+            )],
+            "unavailable-provider",
+            "gpt-4.1",
+        );
+        let unavailable_session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let unavailable_router = TuiRuntimeRouter::new(
+            unavailable_bootstrap.clone(),
+            Arc::clone(&unavailable_session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+
+        assert!(matches!(
+            unavailable_router.route("/subagent unavailable-provider".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ));
+        assert!(
+            unavailable_session
+                .lock()
+                .unwrap()
+                .selected_subagent
+                .is_none()
+        );
+        assert!(unavailable_session.lock().unwrap().messages.is_empty());
+
+        let mut unavailable_tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        submit_tui_command(
+            &mut unavailable_tui,
+            &unavailable_router,
+            &unavailable_bootstrap,
+            "/subagent unavailable-provider",
+            &captured,
+        );
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(!unavailable_tui.view().running);
+
+        let empty_selection =
+            unavailable_tui.apply_submission_outcome(unavailable_router.route("/subagent".into()));
+        assert_eq!(empty_selection, None);
+        assert_eq!(
+            unavailable_tui.handle(Event::Key(Key::Enter)),
+            Action::Render
+        );
+
+        unavailable_tui.apply_submission_outcome(unavailable_router.route("/subagent".into()));
+        assert_eq!(
+            unavailable_tui.handle(Event::Key(Key::Escape)),
+            Action::Render
+        );
+        assert!(unavailable_tui.transcript().is_empty());
+        let unavailable_context = unavailable_session.lock().unwrap();
+        assert!(unavailable_context.selected_subagent.is_none());
+        assert!(unavailable_context.messages.is_empty());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
