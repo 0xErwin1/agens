@@ -2149,6 +2149,18 @@ impl McpRegistry {
         Self::default()
     }
 
+    pub fn with_status_handle(status: McpStatusHandle) -> Self {
+        Self {
+            tools: BTreeMap::new(),
+            clients: BTreeMap::new(),
+            configured: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
+            attempted: BTreeSet::new(),
+            closed: false,
+            status,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -2424,7 +2436,7 @@ impl McpRegistry {
             },
             |factory| factory(),
         );
-        let report = match transport {
+        match transport {
             Ok(transport) => self.load_server(
                 server_name,
                 transport,
@@ -2444,11 +2456,9 @@ impl McpRegistry {
                     message: sanitized_mcp_load_error(&error).into(),
                 };
                 self.record_report(&report, Some(McpErrorCategory::from(&error)));
-                return report;
+                report
             }
-        };
-        self.record_report(&report, None);
-        report
+        }
     }
 
     fn failed(&mut self, server_name: &str) -> McpServerReport {

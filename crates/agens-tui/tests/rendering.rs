@@ -884,6 +884,38 @@ fn short_session_dialog_keeps_search_selected_row_and_compact_details_visible() 
 }
 
 #[test]
+fn read_only_dialog_renders_explicit_empty_and_clipped_selected_details() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(32, 7)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.show_selection_dialog(
+        DialogView::read_only(
+            "MCP servers",
+            Some("Type to search | Enter details"),
+            vec![DialogEntry::read_only(
+                "remote-server-with-a-long-name  http  enabled/ready  32 tools",
+                "remote http ready search fetch",
+                "Source: global\nEndpoint: https://example.test/a/safe/path\nTools: search, fetch",
+            )],
+            "mcp",
+        )
+        .with_empty_message("No MCP servers configured."),
+    );
+
+    tui.handle(Event::Key(Key::Enter));
+    renderer.render(tui.view()).unwrap();
+    let details = rendered_text(&renderer);
+    assert!(details.contains("Source: global"), "{details:?}");
+    assert!(!details.contains("safe/path"), "{details:?}");
+
+    tui.show_selection_dialog(
+        DialogView::read_only("MCP servers", Some("Search"), Vec::new(), "mcp")
+            .with_empty_message("No MCP servers configured."),
+    );
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("No MCP servers configured."));
+}
+
+#[test]
 fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation() {
     let backend = TestBackend::new(34, 10);
     let terminal = Terminal::new(backend).unwrap();

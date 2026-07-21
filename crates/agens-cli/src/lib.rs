@@ -30,8 +30,9 @@ use agens_providers::{
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{
     AgentCatalog, AgentModelValidator, AuthorizedToolCall, CommandCatalog, CommandDefinition,
-    DispatchTool, EffectiveCapabilitySet, McpHttpTransport, McpLimits, McpRegistry,
-    McpSseTransport, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
+    DispatchTool, EffectiveCapabilitySet, McpEndpointSummary, McpHttpTransport, McpLimits,
+    McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport, McpSseTransport,
+    McpStatusHandle, McpStatusSnapshot, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
     PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, SkillResourceTool,
     TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
@@ -59,6 +60,7 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "disconnect",
     "effort",
     "help",
+    "mcp",
     "model",
     "new",
     "provider",
@@ -89,6 +91,7 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
         Some("effort"),
     ),
     ("help", "Show commands and skills", "", Some("help")),
+    ("mcp", "Show configured MCP servers", "", Some("mcp")),
     ("quit", "Exit Agens", "", None),
 ];
 
@@ -1502,6 +1505,8 @@ struct TuiRuntimeRouter {
     commands: Arc<CommandCatalog>,
     skills: Arc<SkillCatalog>,
     palette: Arc<[PaletteEntry]>,
+    mcp_status: McpStatusHandle,
+    _mcp_registry: Arc<Mutex<McpRegistry>>,
     clock: fn() -> i64,
 }
 
@@ -1524,7 +1529,7 @@ impl TuiRuntimeRouter {
     }
 
     fn with_auth_coordinator(
-        bootstrap: Bootstrap,
+        mut bootstrap: Bootstrap,
         session: Arc<Mutex<TuiSessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
@@ -1532,6 +1537,16 @@ impl TuiRuntimeRouter {
         auth: ChatGptAuthCoordinator,
     ) -> Self {
         let palette = resolved_tui_palette(&commands, &skills).into();
+        let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
+        let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
+            &bootstrap,
+            project_root,
+        )));
+        let mcp_status = registry
+            .lock()
+            .expect("new MCP registry lock")
+            .status_handle();
+        bootstrap.mcp_status = Some(mcp_status.clone());
         Self {
             bootstrap: Arc::new(Mutex::new(bootstrap)),
             session,
@@ -1541,6 +1556,8 @@ impl TuiRuntimeRouter {
             commands,
             skills,
             palette,
+            mcp_status,
+            _mcp_registry: registry,
             clock: current_session_timestamp,
         }
     }
@@ -1775,6 +1792,7 @@ impl TuiRuntimeRouter {
                 Some(render_tui_help(&self.palette)),
                 Vec::new(),
             ),
+            "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
             "sessions" => {
                 let project = tui_project_identifier(&bootstrap)?;
                 let store = SessionStore::open(bootstrap.data_directory())
@@ -1925,6 +1943,7 @@ impl TuiRuntimeRouter {
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/help" => self.open_dialog("help")?,
+            "/mcp" => self.open_dialog("mcp")?,
             "/quit" => TuiSubmissionOutcome::Quit,
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
@@ -2452,6 +2471,42 @@ fn render_tui_help(entries: &[PaletteEntry]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("Available commands and skills:\n{surface}")
+}
+
+fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
+    let entries = snapshot
+        .servers()
+        .iter()
+        .map(|server| {
+            let descriptor = server.descriptor();
+            let transport = format!("{:?}", descriptor.transport()).to_lowercase();
+            let state = format!("{:?}", server.state()).to_lowercase();
+            let enabled = if descriptor.enabled() { "enabled" } else { "disabled" };
+            let source = format!("{:?}", descriptor.source()).to_lowercase();
+            let tools = server.tool_names().join(", ");
+            let endpoint = descriptor.endpoint().map_or("not configured", McpEndpointSummary::as_str);
+            let error = server.last_error().map_or_else(
+                || "none".into(),
+                |error| format!("{}: {}", format!("{:?}", error.category()).to_lowercase(), error.message()),
+            );
+            DialogEntry::read_only(
+                format!("{}  {transport}  {enabled}/{state}  {} tools", descriptor.name(), server.tool_count()),
+                format!("{} {transport} {state} {tools}", descriptor.name()),
+                format!(
+                    "Source: {source}\nEndpoint: {endpoint}\nTimeout: {}ms\nTools: {}\nLast error: {error}",
+                    descriptor.timeout().as_millis(),
+                    if tools.is_empty() { "none" } else { &tools },
+                ),
+            )
+        })
+        .collect();
+    DialogView::read_only(
+        "MCP servers",
+        Some("Type to search | Enter details | r refresh | Esc close"),
+        entries,
+        "mcp",
+    )
+    .with_empty_message("No MCP servers configured.")
 }
 
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
@@ -3316,6 +3371,7 @@ pub struct Bootstrap {
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
     mcp_servers: Vec<agens_config::McpServerConfig>,
+    mcp_status: Option<McpStatusHandle>,
     permission_rules: Vec<ConfigPermissionRule>,
 }
 
@@ -3341,6 +3397,7 @@ impl Clone for Bootstrap {
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
+            mcp_status: self.mcp_status.clone(),
             permission_rules: self.permission_rules.clone(),
         }
     }
@@ -3473,6 +3530,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
+        mcp_status: None,
         permission_rules,
         paths,
         global_loaded,
@@ -4327,10 +4385,15 @@ fn synchronize_server_dispatcher(
 }
 
 fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
-    let mut registry = McpRegistry::new();
+    let mut registry = bootstrap
+        .mcp_status
+        .clone()
+        .map_or_else(McpRegistry::new, McpRegistry::with_status_handle);
 
     for server in &bootstrap.mcp_servers {
+        let descriptor = mcp_server_descriptor(server);
         if server.disabled {
+            let _ = registry.register_disabled_server(descriptor);
             continue;
         }
         let timeout = std::time::Duration::from_millis(server.timeout_ms);
@@ -4339,10 +4402,9 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
         };
 
         let server = server.clone();
-        let name = server.name.clone();
         let project_root = project_root.to_path_buf();
-        let _ = registry.configure_server(
-            &name,
+        let _ = registry.configure_server_with_descriptor(
+            descriptor,
             move || configured_mcp_transport(&server, &project_root),
             timeouts,
             McpLimits::default(),
@@ -4350,6 +4412,29 @@ fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> M
     }
 
     registry
+}
+
+fn mcp_server_descriptor(server: &agens_config::McpServerConfig) -> McpServerDescriptor {
+    let transport = match server.transport {
+        McpTransport::Stdio => McpServerTransport::Stdio,
+        McpTransport::Http => McpServerTransport::Http,
+        McpTransport::Sse => McpServerTransport::Sse,
+    };
+    let endpoint = match server.transport {
+        McpTransport::Stdio => server.command.as_ref().map(McpEndpointSummary::stdio),
+        McpTransport::Http | McpTransport::Sse => server
+            .url
+            .as_deref()
+            .and_then(|url| McpEndpointSummary::remote(url).ok()),
+    };
+    McpServerDescriptor::new(
+        &server.name,
+        McpServerSource::Global,
+        transport,
+        !server.disabled,
+        std::time::Duration::from_millis(server.timeout_ms),
+        endpoint,
+    )
 }
 
 fn configured_mcp_transport(
@@ -6485,6 +6570,7 @@ mod tests {
                 "model",
                 "effort",
                 "help",
+                "mcp",
                 "quit",
                 "review",
                 "shared",
@@ -6690,6 +6776,104 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, agens_tui::TranscriptEntry::User(_)))
         );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_mcp_overlay_is_local_safe_refreshable_and_includes_disabled_servers() {
+        let temporary = tui_session_directory("mcp-overlay");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.mcp_servers = vec![
+            agens_config::McpServerConfig {
+                name: "files".into(),
+                disabled: false,
+                transport: McpTransport::Stdio,
+                command: Some("/private/bin/files-server".into()),
+                args: vec!["SENTINEL_ARG_SECRET".into()],
+                environment: BTreeMap::from([("TOKEN".into(), "SENTINEL_ENV_SECRET".into())]),
+                cwd: None,
+                url: None,
+                headers: BTreeMap::new(),
+                max_retries: 0,
+                timeout_ms: 250,
+            },
+            agens_config::McpServerConfig {
+                name: "disabled".into(),
+                disabled: true,
+                transport: McpTransport::Sse,
+                command: None,
+                args: Vec::new(),
+                environment: BTreeMap::new(),
+                cwd: None,
+                url: Some("https://user:SENTINEL_URL_SECRET@example.test/mcp?token=secret".into()),
+                headers: BTreeMap::from([(
+                    "Authorization".into(),
+                    "SENTINEL_HEADER_SECRET".into(),
+                )]),
+                max_retries: 0,
+                timeout_ms: 500,
+            },
+        ];
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+
+        assert!(
+            tui.apply_submission_outcome(router.route("/mcp".into()))
+                .is_none()
+        );
+        for character in "idle".chars() {
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
+        }
+        let filtered = render_tui_test_backend(&tui, 90, 24);
+        assert!(filtered.contains("files") && !filtered.contains("disabled  sse"));
+        tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape));
+        tui.handle(agens_tui::Event::Key(agens_tui::Key::Down));
+        tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter));
+        let text = render_tui_test_backend(&tui, 90, 24);
+        assert!(text.contains("stdio"), "{text:?}");
+        assert!(text.contains("enabled/idle"), "{text:?}");
+        assert!(text.contains("disabled"), "{text:?}");
+        assert!(text.contains("Source: global"), "{text:?}");
+        assert!(text.contains("files-server"), "{text:?}");
+        assert!(text.contains("250ms"), "{text:?}");
+        for secret in [
+            "SENTINEL_ARG_SECRET",
+            "SENTINEL_ENV_SECRET",
+            "SENTINEL_URL_SECRET",
+            "SENTINEL_HEADER_SECRET",
+        ] {
+            assert!(!text.contains(secret), "{secret}: {text:?}");
+        }
+
+        let mut live = McpRegistry::with_status_handle(router.mcp_status.clone());
+        live.register_disabled_server(McpServerDescriptor::new(
+            "later",
+            McpServerSource::Global,
+            McpServerTransport::Stdio,
+            false,
+            std::time::Duration::from_secs(10),
+            None,
+        ))
+        .unwrap();
+        let agens_tui::Action::OpenDialog(route_id) =
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char('r')))
+        else {
+            panic!("MCP refresh should remain local");
+        };
+        let refreshed = router.open_dialog(&route_id).unwrap();
+        tui.apply_submission_outcome(refreshed);
+        assert!(render_tui_test_backend(&tui, 90, 24).contains("later"));
+        assert!(session.lock().unwrap().messages.is_empty());
+        assert!(tui.transcript().is_empty());
         std::fs::remove_dir_all(temporary).unwrap();
     }
 

@@ -333,6 +333,7 @@ pub struct PaletteView<'a> {
 enum DialogEntryAction {
     Dispatch(String),
     Cancel,
+    ToggleDetails,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,6 +408,20 @@ impl DialogEntry {
             action: None,
         }
     }
+
+    pub fn read_only(
+        label: impl AsRef<str>,
+        search_text: impl AsRef<str>,
+        selected_detail: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            label: bounded_dialog_text(label.as_ref(), 256),
+            detail: None,
+            search_text: Some(bounded_dialog_text(search_text.as_ref(), 512)),
+            selected_detail: Some(bounded_dialog_multiline(selected_detail.as_ref(), 2_048)),
+            action: Some(DialogEntryAction::ToggleDetails),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,6 +452,9 @@ pub struct DialogView {
     interactive: bool,
     session_entries: Option<SessionDialogEntries>,
     query_action: Option<DialogQueryAction>,
+    refresh_id: Option<String>,
+    details_open: bool,
+    empty_message: Option<String>,
 }
 
 impl DialogView {
@@ -459,7 +477,30 @@ impl DialogView {
             interactive: true,
             session_entries: None,
             query_action: None,
+            refresh_id: None,
+            details_open: false,
+            empty_message: None,
         }
+    }
+
+    pub fn read_only<H>(
+        title: impl AsRef<str>,
+        help: Option<H>,
+        entries: Vec<DialogEntry>,
+        refresh_id: impl AsRef<str>,
+    ) -> Self
+    where
+        H: AsRef<str>,
+    {
+        let mut dialog = Self::selection(title, help, Vec::new());
+        dialog.entries = entries;
+        dialog.refresh_id = Some(bounded_dialog_text(refresh_id.as_ref(), 64));
+        dialog
+    }
+
+    pub fn with_empty_message(mut self, message: impl AsRef<str>) -> Self {
+        self.empty_message = Some(bounded_dialog_text(message.as_ref(), 256));
+        self
     }
 
     pub fn sessions(current_project: Vec<DialogEntry>, all_projects: Vec<DialogEntry>) -> Self {
@@ -520,6 +561,9 @@ impl DialogView {
             interactive: false,
             session_entries: None,
             query_action: None,
+            refresh_id: None,
+            details_open: false,
+            empty_message: None,
         }
     }
 }
@@ -812,7 +856,11 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if matches.is_empty() && (dialog.session_entries.is_some() || dialog.help.is_none()) {
+    if matches.is_empty()
+        && (dialog.session_entries.is_some()
+            || dialog.help.is_none()
+            || dialog.empty_message.is_some())
+    {
         lines.push(Line::from(dialog_empty_message(dialog)));
     }
     lines.extend(
@@ -842,10 +890,24 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                 Line::styled(text, style)
             }),
     );
-    if let Some(detail) = matches
-        .iter()
-        .find(|(index, _)| *index == dialog.selected)
-        .and_then(|(_, entry)| entry.selected_detail.as_deref())
+    if let Some(detail) = dialog
+        .details_open
+        .then(|| {
+            matches
+                .iter()
+                .find(|(index, _)| *index == dialog.selected)
+                .and_then(|(_, entry)| entry.selected_detail.as_deref())
+        })
+        .flatten()
+        .or_else(|| {
+            matches
+                .iter()
+                .find(|(index, entry)| {
+                    *index == dialog.selected
+                        && !matches!(entry.action, Some(DialogEntryAction::ToggleDetails))
+                })
+                .and_then(|(_, entry)| entry.selected_detail.as_deref())
+        })
     {
         lines.extend(
             detail
@@ -938,7 +1000,10 @@ fn dialog_content_layout(dialog: &DialogView, height: u16) -> DialogContentLayou
     }
 }
 
-fn dialog_empty_message(dialog: &DialogView) -> &'static str {
+fn dialog_empty_message(dialog: &DialogView) -> &str {
+    if let Some(message) = dialog.empty_message.as_deref() {
+        return message;
+    }
     let Some(session_entries) = dialog.session_entries.as_ref() else {
         return "No options available.";
     };
@@ -1485,7 +1550,9 @@ where
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
         self.palette_open = false;
-        self.dialog = None;
+        if !matches!(&outcome, TuiSubmissionOutcome::Dialog(_)) {
+            self.dialog = None;
+        }
         match outcome {
             TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
                 self.begin_submission(display);
@@ -1656,7 +1723,19 @@ where
         self.dialog = Some(DialogView::informational(title.into(), body.into()));
     }
 
-    pub fn show_selection_dialog(&mut self, dialog: DialogView) {
+    pub fn show_selection_dialog(&mut self, mut dialog: DialogView) {
+        if dialog.refresh_id.is_some()
+            && dialog.refresh_id
+                == self
+                    .dialog
+                    .as_ref()
+                    .and_then(|current| current.refresh_id.clone())
+            && let Some(current) = self.dialog.as_ref()
+        {
+            dialog.query.clone_from(&current.query);
+            dialog.selected = current.selected.min(dialog.entries.len().saturating_sub(1));
+            dialog.details_open = current.details_open;
+        }
         self.palette_open = false;
         self.quit_armed = false;
         self.dialog = Some(dialog);
@@ -2017,6 +2096,18 @@ where
                 Action::Render
             }
             Key::Char(character) => {
+                if character == 'r'
+                    && self
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.query.is_empty())
+                    && let Some(refresh_id) = self
+                        .dialog
+                        .as_ref()
+                        .and_then(|dialog| dialog.refresh_id.clone())
+                {
+                    return Action::OpenDialog(refresh_id);
+                }
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.push(character);
                     refresh_dialog_query_action(dialog);
@@ -2064,6 +2155,12 @@ where
                     }
                     Some(DialogEntryAction::Cancel) => {
                         self.dialog = None;
+                        Action::Render
+                    }
+                    Some(DialogEntryAction::ToggleDetails) => {
+                        if let Some(dialog) = self.dialog.as_mut() {
+                            dialog.details_open = !dialog.details_open;
+                        }
                         Action::Render
                     }
                     None => Action::Render,
@@ -2139,6 +2236,7 @@ where
             position.saturating_add(amount).min(enabled.len() - 1)
         };
         dialog.selected = enabled[next];
+        dialog.details_open = false;
         self.ensure_dialog_selection_visible();
     }
 
@@ -2170,6 +2268,7 @@ where
                 .map(|(index, _)| *index)
                 .unwrap_or_default();
             dialog.offset = 0;
+            dialog.details_open = false;
         }
         self.ensure_dialog_selection_visible();
     }
