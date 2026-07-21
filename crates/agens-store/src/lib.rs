@@ -675,7 +675,7 @@ fn decode_pattern(
 }
 
 const SESSIONS_DATABASE: &str = "rust-sessions.db";
-const SESSIONS_SCHEMA_VERSION: i64 = 2;
+const SESSIONS_SCHEMA_VERSION: i64 = 3;
 const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
     0, "id", "INTEGER", false, None, 1,
 )];
@@ -733,7 +733,7 @@ const LEGACY_TURN_EVENTS_INDEXES: [ExpectedIndexSignature; 2] = [
         false,
     ),
 ];
-const NORMALIZED_SESSION_SCHEMA: &str = "
+const NORMALIZED_SESSION_SCHEMA_V2: &str = "
     CREATE TABLE sessions (
         id INTEGER PRIMARY KEY,
         project TEXT NOT NULL CHECK(project <> ''),
@@ -838,7 +838,7 @@ impl SessionStore {
 
         match session_schema_version(&connection, &database_path)? {
             0 => {
-                initialize_v2_schema(&mut connection, &database_path)?;
+                initialize_v3_schema(&mut connection, &database_path)?;
                 connection
                     .pragma_update(None, "journal_mode", "WAL")
                     .map_err(|error| {
@@ -855,7 +855,8 @@ impl SessionStore {
                 migrate_v1_on_open(&mut store.connection, &store.database_path)?;
                 return Ok(store);
             }
-            2 => validate_v2_schema(&connection, &database_path)?,
+            2 => migrate_v2_on_open(&mut connection, &database_path)?,
+            3 => validate_v3_schema(&connection, &database_path)?,
             unsupported => {
                 return Err(SessionStoreError::operation(
                     "check schema version",
@@ -1070,7 +1071,18 @@ impl CompletedTurnRepository for SessionStore {
     }
 }
 
-fn initialize_v2_schema(
+fn normalized_session_schema_v3() -> String {
+    NORMALIZED_SESSION_SCHEMA_V2.replacen(
+        "CHECK(resumable = (completed_turn_count > 0))",
+        "provider_id TEXT CHECK(provider_id <> '' AND length(provider_id) <= 64),
+         model_id TEXT CHECK(model_id <> '' AND length(model_id) <= 64),
+         reasoning_effort TEXT CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh')),
+         CHECK(resumable = (completed_turn_count > 0))",
+        1,
+    )
+}
+
+fn initialize_v3_schema(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
@@ -1082,15 +1094,44 @@ fn initialize_v2_schema(
     create_legacy_archive_schema(&transaction, database_path)?;
     transaction
         .execute_batch(&format!(
-            "{NORMALIZED_SESSION_SCHEMA} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};"
+            "{} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};",
+            normalized_session_schema_v3()
         ))
         .map_err(|error| {
             SessionStoreError::operation("initialize v2 schema", database_path, error)
         })?;
-    validate_v2_schema(&transaction, database_path)?;
+    validate_v3_schema(&transaction, database_path)?;
     transaction.commit().map_err(|error| {
         SessionStoreError::operation("commit v2 initialization", database_path, error)
     })
+}
+
+fn migrate_v2_on_open(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            SessionStoreError::operation("start v2 migration", database_path, error)
+        })?;
+    validate_v2_schema(&transaction, database_path)?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE sessions ADD COLUMN provider_id TEXT
+             CHECK(provider_id <> '' AND length(provider_id) <= 64);
+         ALTER TABLE sessions ADD COLUMN model_id TEXT
+             CHECK(model_id <> '' AND length(model_id) <= 64);
+         ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT
+             CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh'));
+         PRAGMA user_version = 3;",
+        )
+        .map_err(|error| SessionStoreError::operation("migrate v2 schema", database_path, error))?;
+    migration_fault("before-v3-commit", database_path)?;
+    validate_v3_schema(&transaction, database_path)?;
+    transaction
+        .commit()
+        .map_err(|error| SessionStoreError::operation("commit v2 migration", database_path, error))
 }
 
 fn validate_v1_schema(
@@ -1178,7 +1219,7 @@ fn migrate_v1_on_open(
         .map_err(|error| {
             SessionStoreError::operation("reopen v2 migration", database_path, error)
         })?;
-    validate_v2_schema(&reopened, database_path)
+    validate_v3_schema(&reopened, database_path)
 }
 
 fn migration_fault(point: &str, database_path: &Path) -> Result<(), SessionStoreError> {
@@ -1377,16 +1418,17 @@ fn finalize_v2_migration(
 ) -> Result<(), SessionStoreError> {
     transaction
         .execute_batch(&format!(
-            "{NORMALIZED_SESSION_SCHEMA}
+            "{}
                  DROP TABLE completed_turn_events;
               DROP TABLE completed_turns;
-              PRAGMA user_version = 2;"
+              PRAGMA user_version = 3;",
+            normalized_session_schema_v3()
         ))
         .map_err(|error| {
             SessionStoreError::operation("finalize v1 migration", database_path, error)
         })?;
 
-    validate_v2_schema(transaction, database_path)
+    validate_v3_schema(transaction, database_path)
 }
 
 fn validate_v2_schema(
@@ -1394,7 +1436,22 @@ fn validate_v2_schema(
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
+    validate_normalized_session_schema(connection, database_path, NORMALIZED_SESSION_SCHEMA_V2)
+}
 
+fn validate_v3_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_legacy_archive(connection, database_path)?;
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v3())
+}
+
+fn validate_normalized_session_schema(
+    connection: &Connection,
+    database_path: &Path,
+    expected_schema: &str,
+) -> Result<(), SessionStoreError> {
     let mut statement = connection
         .prepare(
             "SELECT sql FROM sqlite_schema
@@ -1403,16 +1460,18 @@ fn validate_v2_schema(
                             'sessions_list', 'messages_turn_order', 'parts_message_order')",
         )
         .map_err(|error| {
-            SessionStoreError::operation("validate v2 schema", database_path, error)
+            SessionStoreError::operation("validate normalized schema", database_path, error)
         })?;
     let mut actual = statement
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| SessionStoreError::operation("validate v2 schema", database_path, error))?
+        .map_err(|error| {
+            SessionStoreError::operation("validate normalized schema", database_path, error)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|error| {
-            SessionStoreError::operation("validate v2 schema", database_path, error)
+            SessionStoreError::operation("validate normalized schema", database_path, error)
         })?;
-    let mut expected = NORMALIZED_SESSION_SCHEMA
+    let mut expected = expected_schema
         .split(';')
         .filter(|statement| statement.trim_start().starts_with("CREATE"))
         .map(normalize_schema_statement)
@@ -1427,7 +1486,7 @@ fn validate_v2_schema(
         Ok(())
     } else {
         Err(SessionStoreError::operation(
-            "validate v2 schema",
+            "validate normalized schema",
             database_path,
             "incompatible normalized session schema",
         ))
