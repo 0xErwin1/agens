@@ -2858,12 +2858,17 @@ fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> O
 
 enum ChatGptCredentialSnapshot {
     Absent,
-    Present(Vec<u8>),
+    Present(serde_json::Value),
 }
 
 fn snapshot_chatgpt_credentials(path: &Path) -> Result<ChatGptCredentialSnapshot, CliError> {
-    match fs::read(path) {
-        Ok(credentials) => Ok(ChatGptCredentialSnapshot::Present(credentials)),
+    match fs::read_to_string(path) {
+        Ok(credentials) => serde_json::from_str::<serde_json::Value>(&credentials)
+            .ok()
+            .and_then(|root| root.get("openai-chatgpt").cloned())
+            .map_or(Ok(ChatGptCredentialSnapshot::Absent), |entry| {
+                Ok(ChatGptCredentialSnapshot::Present(entry))
+            }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound || path.is_dir() => {
             Ok(ChatGptCredentialSnapshot::Absent)
         }
@@ -2875,15 +2880,15 @@ fn restore_chatgpt_credentials(
     path: &Path,
     snapshot: ChatGptCredentialSnapshot,
 ) -> Result<(), CliError> {
-    let result = match snapshot {
-        ChatGptCredentialSnapshot::Present(credentials) => fs::write(path, credentials),
-        ChatGptCredentialSnapshot::Absent => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        },
-    };
-    result.map_err(|_| CliError::storage("ChatGPT credential recovery failed"))
+    remove_provider_entry(path, "openai-chatgpt")
+        .map_err(|_| CliError::storage("ChatGPT credential recovery failed"))?;
+
+    if let ChatGptCredentialSnapshot::Present(entry) = snapshot {
+        upsert_provider_entry(path, "openai-chatgpt", entry)
+            .map_err(|_| CliError::storage("ChatGPT credential recovery failed"))?;
+    }
+
+    Ok(())
 }
 
 fn apply_tui_selection(
@@ -7971,7 +7976,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_chatgpt_refresh_atomicity_restores_exact_credentials_after_reconcile_failure() {
+    fn runtime_chatgpt_refresh_atomicity_preserves_intervening_unrelated_provider_write() {
         let temporary = tui_session_directory("refresh-rollback");
         let config_home = temporary.join("config");
         let credentials_path = config_home.join("auth.json");
@@ -7996,14 +8001,28 @@ mod tests {
             ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
                 Ok(test_chatgpt_credentials("new-access"))
             }),
-        );
+        )
+        .with_credential_restorer(|path, snapshot| {
+            upsert_provider_entry(path, "other-provider", serde_json::json!({"key": "kept"}))
+                .map_err(|_| CliError::storage("unrelated provider write failed"))?;
+            restore_chatgpt_credentials(path, snapshot)
+        });
 
         assert!(
             router
                 .connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0)
                 .is_err()
         );
-        assert_eq!(std::fs::read(&credentials_path).unwrap(), before);
+        let mut expected = serde_json::from_slice::<serde_json::Value>(before).unwrap();
+        expected
+            .as_object_mut()
+            .unwrap()
+            .insert("other-provider".into(), serde_json::json!({"key": "kept"}));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&credentials_path).unwrap())
+                .unwrap(),
+            expected
+        );
         assert_eq!(*session.lock().unwrap(), original_runtime);
 
         std::fs::remove_dir_all(temporary).unwrap();
