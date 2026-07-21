@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
+use agens_tools::{TaskExecutionEvent, TaskExecutionId, TaskLaunchMode};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
@@ -1120,4 +1121,24 @@ fn renderer_scrolls_multiline_unicode_composer_and_keeps_cursor_visible() {
         cursor.x < 4,
         "cursor must remain inside the composer: {cursor:?}"
     );
+}
+
+#[test]
+fn u15_c1b_renderer_shows_the_permanent_catalog_and_foreground_execution() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_agent_catalog(["reviewer"]);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TaskExecutionEvent::Admitted(
+            TaskExecutionId::from_u64(1),
+            TaskLaunchMode::Foreground,
+        ),
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("agents main, reviewer"), "{text:?}");
+    assert!(text.contains("reviewer · foreground running"), "{text:?}");
 }

@@ -188,7 +188,8 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::Usage(_)
             | TuiRuntimeEvent::ToolStarted { .. }
             | TuiRuntimeEvent::ToolEnded { .. }
-            | TuiRuntimeEvent::Diff { .. } => {}
+            | TuiRuntimeEvent::Diff { .. }
+            | TuiRuntimeEvent::TaskExecution { .. } => {}
         }
     }
 

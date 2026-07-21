@@ -8,8 +8,8 @@ mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
-    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiPermissionBridge,
-    TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, UiEnvelope,
+    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionState,
+    TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -29,6 +29,7 @@ use std::{
 };
 
 use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
+use agens_tools::{TaskExecutionEvent, TaskLaunchMode};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -268,6 +269,10 @@ pub struct ViewState<'a> {
     pub dialog: Option<&'a DialogView>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
+    /// Permanent main and eligible agent catalog, separate from execution instances.
+    pub agent_catalog: &'a [String],
+    /// Active and recent execution instances in deterministic recency order.
+    pub executions: Vec<&'a TuiExecution>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1107,6 +1112,20 @@ fn render_header(
             state.session,
             Style::default().fg(Color::Gray),
         ));
+        left.push(Span::styled(
+            format!("  ·  agents {}", state.agent_catalog.join(", ")),
+            Style::default().fg(Color::Gray),
+        ));
+        if let Some(execution) = state.executions.first() {
+            left.push(Span::styled(
+                format!(
+                    "  ·  {} · {}",
+                    execution.agent,
+                    execution_label(execution.state())
+                ),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(left)), area);
     let state_width = state_label.len() as u16 + 1;
@@ -1118,6 +1137,17 @@ fn render_header(
                 .alignment(Alignment::Right),
             state_area,
         );
+    }
+}
+
+fn execution_label(state: TuiExecutionState) -> &'static str {
+    match state {
+        TuiExecutionState::Selected => "selected",
+        TuiExecutionState::ForegroundRunning => "foreground running",
+        TuiExecutionState::BackgroundRunning => "background running",
+        TuiExecutionState::CompletedRecent => "completed recent",
+        TuiExecutionState::Failed => "failed",
+        TuiExecutionState::Cancelled => "cancelled",
     }
 }
 
@@ -1372,6 +1402,10 @@ pub struct Tui<E> {
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
     palette_selected: usize,
+    agent_catalog: Vec<String>,
+    selected_agent: Option<String>,
+    executions: Vec<TuiExecution>,
+    now: Duration,
 }
 
 impl<E> Tui<E>
@@ -1406,6 +1440,10 @@ where
             palette_entries: Vec::new(),
             palette_open: false,
             palette_selected: 0,
+            agent_catalog: vec!["main".into()],
+            selected_agent: None,
+            executions: Vec::new(),
+            now: Duration::ZERO,
         }
     }
 
@@ -1460,6 +1498,62 @@ where
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
         self.collapse_thinking = collapse;
+    }
+
+    pub fn set_agent_catalog<I, S>(&mut self, eligible: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.agent_catalog = std::iter::once("main".to_owned())
+            .chain(eligible.into_iter().map(|agent| agent.as_ref().to_owned()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if self.selected_agent.as_ref().is_some_and(|agent| {
+            self.agent_catalog.binary_search(agent).is_err() || agent == "main"
+        }) {
+            self.selected_agent = None;
+        }
+    }
+
+    pub fn select_agent(&mut self, agent: impl AsRef<str>) {
+        let agent = agent.as_ref();
+        self.selected_agent = self
+            .agent_catalog
+            .binary_search_by(|candidate| candidate.as_str().cmp(agent))
+            .ok()
+            .and_then(|index| (self.agent_catalog[index] != "main").then(|| agent.to_owned()));
+    }
+
+    pub fn agent_catalog(&self) -> &[String] {
+        &self.agent_catalog
+    }
+
+    pub fn selected_agent(&self) -> Option<&str> {
+        self.selected_agent.as_deref()
+    }
+
+    /// Returns newest activity first; equal timestamps break by descending execution ID.
+    pub fn executions(&self) -> Vec<&TuiExecution> {
+        let mut executions = self.executions.iter().collect::<Vec<_>>();
+        executions.sort_unstable_by(|left, right| {
+            right
+                .last_activity
+                .cmp(&left.last_activity)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        executions
+    }
+
+    /// Advances injected monotonic event-loop time and prunes only expired terminal instances.
+    pub fn tick(&mut self, now: Duration) {
+        self.now = now;
+        self.executions.retain(|execution| {
+            execution
+                .terminal_at
+                .is_none_or(|terminal_at| now < terminal_at + Duration::from_secs(60))
+        });
     }
 
     /// Updates active-turn state after the composition layer starts or finishes a turn.
@@ -1755,6 +1849,9 @@ where
             TuiRuntimeEvent::Diff { lines, .. } => {
                 self.project_conversation(ConversationEvent::Diff(lines.clone()));
             }
+            TuiRuntimeEvent::TaskExecution { agent, event } => {
+                self.apply_task_execution_event(agent, *event);
+            }
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
@@ -1826,7 +1923,62 @@ where
                 entries: &self.palette_entries,
                 selected: self.palette_selected,
             }),
+            agent_catalog: &self.agent_catalog,
+            executions: self.executions(),
         }
+    }
+
+    fn apply_task_execution_event(&mut self, agent: &str, event: TaskExecutionEvent) {
+        let (id, state) = match event {
+            TaskExecutionEvent::Admitted(id, TaskLaunchMode::Foreground) => {
+                self.add_execution(agent, id, TuiExecutionState::ForegroundRunning);
+                return;
+            }
+            TaskExecutionEvent::Admitted(id, TaskLaunchMode::Background) => {
+                self.add_execution(agent, id, TuiExecutionState::BackgroundRunning);
+                return;
+            }
+            TaskExecutionEvent::Backgrounded(id) => (id, TuiExecutionState::BackgroundRunning),
+            TaskExecutionEvent::Completed(id) => (id, TuiExecutionState::CompletedRecent),
+            TaskExecutionEvent::Failed(id) => (id, TuiExecutionState::Failed),
+            TaskExecutionEvent::Cancelled(id) => (id, TuiExecutionState::Cancelled),
+        };
+        let Some(execution) = self
+            .executions
+            .iter_mut()
+            .find(|execution| execution.id == id)
+        else {
+            return;
+        };
+        if execution.terminal_at.is_some()
+            || matches!(state, TuiExecutionState::BackgroundRunning)
+                && execution.state != TuiExecutionState::ForegroundRunning
+        {
+            return;
+        }
+        execution.state = state;
+        execution.last_activity = self.now;
+        if !matches!(state, TuiExecutionState::BackgroundRunning) {
+            execution.terminal_at = Some(self.now);
+        }
+    }
+
+    fn add_execution(
+        &mut self,
+        agent: &str,
+        id: agens_tools::TaskExecutionId,
+        state: TuiExecutionState,
+    ) {
+        if self.executions.iter().any(|execution| execution.id == id) {
+            return;
+        }
+        self.executions.push(TuiExecution {
+            id,
+            agent: agent.to_owned(),
+            state,
+            last_activity: self.now,
+            terminal_at: None,
+        });
     }
 
     pub const fn following_bottom(&self) -> bool {

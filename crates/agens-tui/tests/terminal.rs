@@ -1,3 +1,4 @@
+use agens_tools::{TaskExecutionEvent, TaskExecutionId, TaskLaunchMode};
 use agens_tui::{
     BridgeCancel, BridgeTx, PendingPermissions, PermissionReply, PublishOutcome, TerminalControl,
     TerminalModeGuard, TerminalOperation, teardown,
@@ -137,4 +138,33 @@ fn teardown_drains_permissions_fail_closed_once_and_bounds_the_worker_wait() {
         bridge.publish((), &BridgeCancel::new(), None),
         PublishOutcome::Closed
     );
+}
+
+#[test]
+fn u15_c1b_terminal_execution_expires_at_sixty_seconds_without_removing_the_catalog() {
+    struct Engine;
+    impl agens_tui::Engine for Engine {
+        fn cancel(&mut self) {}
+    }
+
+    let mut tui = agens_tui::Tui::new(Engine);
+    tui.set_agent_catalog(["reviewer"]);
+    tui.apply_runtime_event(agens_tui::TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TaskExecutionEvent::Admitted(
+            TaskExecutionId::from_u64(1),
+            TaskLaunchMode::Foreground,
+        ),
+    });
+    tui.apply_runtime_event(agens_tui::TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TaskExecutionEvent::Cancelled(TaskExecutionId::from_u64(1)),
+    });
+
+    tui.tick(Duration::from_nanos(59_999_999_999));
+    assert_eq!(tui.executions().len(), 1);
+    tui.tick(Duration::from_secs(60));
+
+    assert!(tui.executions().is_empty());
+    assert_eq!(tui.agent_catalog(), ["main", "reviewer"]);
 }

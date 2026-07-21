@@ -32,6 +32,12 @@ const PUBLISHED: u8 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskExecutionId(u64);
 
+impl TaskExecutionId {
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskLaunchMode {
     Foreground,
