@@ -1,17 +1,155 @@
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
 };
 
-use agens_core::{TurnState, Usage};
+use agens_core::{HeadlessTurnCancellation, TurnState, Usage};
 
 use crate::DiffLine;
 
 const RETRY_QUANTUM: Duration = Duration::from_millis(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiPermissionReply {
+    AllowOnce,
+    AllowAlways,
+    DenyOnce,
+    DenyAlways,
+    Cancelled,
+    DeadlineExpired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiPermissionRequest {
+    id: u64,
+    tool: String,
+    target: String,
+}
+
+impl TuiPermissionRequest {
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+struct PermissionBridgeState {
+    closed: AtomicBool,
+    next_id: AtomicU64,
+    pending: Mutex<BTreeMap<u64, Sender<TuiPermissionReply>>>,
+}
+
+#[derive(Clone)]
+pub struct TuiPermissionBridge {
+    requests: Sender<TuiPermissionRequest>,
+    state: Arc<PermissionBridgeState>,
+}
+
+impl TuiPermissionBridge {
+    pub fn channel() -> (Self, Receiver<TuiPermissionRequest>) {
+        let (requests, receiver) = mpsc::channel();
+        let state = Arc::new(PermissionBridgeState {
+            closed: AtomicBool::new(false),
+            next_id: AtomicU64::new(0),
+            pending: Mutex::new(BTreeMap::new()),
+        });
+
+        (Self { requests, state }, receiver)
+    }
+
+    pub fn wait_for_reply(
+        &self,
+        tool: impl Into<String>,
+        target: impl Into<String>,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> TuiPermissionReply {
+        if cancellation.is_cancelled() || self.state.closed.load(Ordering::Acquire) {
+            return TuiPermissionReply::Cancelled;
+        }
+        if cancellation.is_expired() {
+            return TuiPermissionReply::DeadlineExpired;
+        }
+
+        let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.state
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, sender);
+        if self
+            .requests
+            .send(TuiPermissionRequest {
+                id,
+                tool: tool.into(),
+                target: target.into(),
+            })
+            .is_err()
+        {
+            let _ = self.reply(id, TuiPermissionReply::Cancelled);
+        }
+
+        loop {
+            if cancellation.is_cancelled() || self.state.closed.load(Ordering::Acquire) {
+                let _ = self.reply(id, TuiPermissionReply::Cancelled);
+                return TuiPermissionReply::Cancelled;
+            }
+            if cancellation.is_expired() {
+                let _ = self.reply(id, TuiPermissionReply::DeadlineExpired);
+                return TuiPermissionReply::DeadlineExpired;
+            }
+
+            match receiver.recv_timeout(RETRY_QUANTUM) {
+                Ok(reply) => return reply,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return TuiPermissionReply::Cancelled,
+            }
+        }
+    }
+
+    pub fn reply(&self, id: u64, reply: TuiPermissionReply) -> bool {
+        self.state
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id)
+            .is_some_and(|sender| sender.send(reply).is_ok())
+    }
+
+    pub fn is_pending(&self, id: u64) -> bool {
+        self.state
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&id)
+    }
+
+    pub fn close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        let pending = std::mem::take(
+            &mut *self
+                .state
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for sender in pending.into_values() {
+            let _ = sender.send(TuiPermissionReply::Cancelled);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct BridgeCancel(Arc<AtomicBool>);

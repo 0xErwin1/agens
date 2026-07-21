@@ -1,10 +1,10 @@
-use agens_core::{MessagePart, TurnEvent, TurnState};
+use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnState};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, Tui, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubmissionOutcome,
+    TranscriptEntry, Tui, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
+    TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -485,6 +485,54 @@ fn bridge_fails_closed_when_receiver_disconnects_while_full() {
     drop(receiver);
 
     assert_eq!(waiting.join().unwrap(), PublishOutcome::Disconnected);
+}
+
+#[test]
+fn permission_wait_cancellation_fail_closed_once_and_late_reply_cannot_grant() {
+    let (bridge, requests) = TuiPermissionBridge::channel();
+    let cancellation = HeadlessTurnCancellation::new();
+    let waiting_bridge = bridge.clone();
+    let waiting_cancellation = cancellation.clone();
+    let waiting = thread::spawn(move || {
+        waiting_bridge.wait_for_reply("native::bash", "git status", &waiting_cancellation)
+    });
+
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    cancellation.cancel();
+
+    assert_eq!(waiting.join().unwrap(), TuiPermissionReply::Cancelled);
+    assert!(!bridge.reply(request.id(), TuiPermissionReply::AllowAlways));
+}
+
+#[test]
+fn permission_wait_deadline_and_in_time_replies_are_single_use() {
+    let (bridge, requests) = TuiPermissionBridge::channel();
+    let expired = HeadlessTurnCancellation::with_deadline(Duration::from_millis(100));
+    let expired_bridge = bridge.clone();
+    let expired_wait = thread::spawn(move || {
+        expired_bridge.wait_for_reply("native::write", "README.md", &expired)
+    });
+    let expired_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert_eq!(
+        expired_wait.join().unwrap(),
+        TuiPermissionReply::DeadlineExpired
+    );
+    assert!(!bridge.reply(expired_request.id(), TuiPermissionReply::AllowAlways));
+
+    let allowed = HeadlessTurnCancellation::new();
+    let allowed_bridge = bridge.clone();
+    let allowed_wait = thread::spawn(move || {
+        allowed_bridge.wait_for_reply("native::write", "README.md", &allowed)
+    });
+    let allowed_request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    assert!(bridge.reply(allowed_request.id(), TuiPermissionReply::AllowAlways));
+    assert_eq!(
+        allowed_wait.join().unwrap(),
+        TuiPermissionReply::AllowAlways
+    );
+    assert!(!bridge.reply(allowed_request.id(), TuiPermissionReply::DenyOnce));
 }
 
 #[test]

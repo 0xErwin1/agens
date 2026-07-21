@@ -40,9 +40,9 @@ use agens_tools::{
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
-    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPresentation,
-    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
-    run_with_default_progress_submit,
+    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPermissionBridge,
+    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest,
+    TuiRuntimeEvent, TuiSubmissionOutcome, run_with_default_progress_submit_with_permissions,
 };
 
 mod chatgpt_auth;
@@ -2635,7 +2635,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     );
     tui.set_palette_entries(router.palette_entries().to_vec());
     let route_router = router.clone();
-    run_with_default_progress_submit(
+    let (permission_bridge, permission_requests) = TuiPermissionBridge::channel();
+    let prompt_bridge = permission_bridge.clone();
+    run_with_default_progress_submit_with_permissions(
         &mut tui,
         move |request, progress| route_router.route_request(request, progress),
         move |prompt, progress, metrics| {
@@ -2677,6 +2679,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                         &runtime_bootstrap,
                         &turn_cancellation,
                         Some(&sink),
+                        Some(prompt_bridge.clone()),
                     )
                 },
             );
@@ -2689,6 +2692,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
 
             tui_provider_outcome(result)
         },
+        Some((permission_bridge, permission_requests)),
     )
     .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
 
@@ -2726,7 +2730,13 @@ fn run_tui_prompt(
             }
         }
         prompt => run_tui_prompt_with(bootstrap, prompt, session, None, |request| {
-            run_production_headless_chat_with_progress(request, bootstrap, cancellation, progress)
+            run_production_headless_chat_with_progress(
+                request,
+                bootstrap,
+                cancellation,
+                progress,
+                None,
+            )
         }),
     }
 }
@@ -3644,7 +3654,7 @@ fn run_production_headless_chat(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None)
+    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None, None)
         .map(|completion| completion.text)
 }
 
@@ -3659,6 +3669,7 @@ fn run_production_headless_chat_with_progress(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    permission_bridge: Option<TuiPermissionBridge>,
 ) -> Result<HeadlessChatCompletion, CliError> {
     match bootstrap.provider_type() {
         Some("openai-api") => {
@@ -3670,6 +3681,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
+                permission_bridge,
                 true,
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -3703,6 +3715,7 @@ fn run_production_headless_chat_with_progress(
                 bootstrap,
                 cancellation,
                 progress,
+                permission_bridge,
                 false,
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
@@ -3737,6 +3750,7 @@ fn run_production_headless_chat_with_provider<P>(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    permission_bridge: Option<TuiPermissionBridge>,
     include_system_prompt: bool,
     build_provider: impl FnOnce(
         String,
@@ -3808,7 +3822,10 @@ where
         Arc::clone(&prompts),
     );
     let mut resolver = ProductionPermissionResolver::new(
-        TtyPermissionPrompter,
+        permission_bridge.map_or(
+            ProductionPermissionPrompter::Tty(TtyPermissionPrompter),
+            ProductionPermissionPrompter::Tui,
+        ),
         grant_store,
         grants,
         prompts,
@@ -4779,6 +4796,7 @@ trait PermissionPrompter: Send {
     fn prompt(
         &mut self,
         context: &PermissionPromptContext,
+        cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError>;
 }
 
@@ -4788,6 +4806,7 @@ impl PermissionPrompter for TtyPermissionPrompter {
     fn prompt(
         &mut self,
         context: &PermissionPromptContext,
+        _: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
         if !std::io::stdin().is_terminal() {
             return Ok(PermissionPromptAnswer::DenyOnce);
@@ -4804,6 +4823,35 @@ impl PermissionPrompter for TtyPermissionPrompter {
             .map_err(|_| HeadlessTurnPortError::Permission)?;
 
         Ok(parse_permission_prompt_answer(&answer).unwrap_or(PermissionPromptAnswer::DenyOnce))
+    }
+}
+
+enum ProductionPermissionPrompter {
+    Tty(TtyPermissionPrompter),
+    Tui(TuiPermissionBridge),
+}
+
+impl PermissionPrompter for ProductionPermissionPrompter {
+    fn prompt(
+        &mut self,
+        context: &PermissionPromptContext,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+        match self {
+            Self::Tty(prompt) => prompt.prompt(context, cancellation),
+            Self::Tui(bridge) => match bridge.wait_for_reply(
+                context.qualified_tool_name.clone(),
+                render_permission_prompt(context),
+                cancellation,
+            ) {
+                TuiPermissionReply::AllowOnce => Ok(PermissionPromptAnswer::AllowOnce),
+                TuiPermissionReply::AllowAlways => Ok(PermissionPromptAnswer::AllowAlways),
+                TuiPermissionReply::DenyOnce => Ok(PermissionPromptAnswer::DenyOnce),
+                TuiPermissionReply::DenyAlways => Ok(PermissionPromptAnswer::DenyAlways),
+                TuiPermissionReply::Cancelled => Err(HeadlessTurnPortError::Cancelled),
+                TuiPermissionReply::DeadlineExpired => Err(HeadlessTurnPortError::TimedOut),
+            },
+        }
     }
 }
 
@@ -4915,7 +4963,7 @@ impl<P: PermissionPrompter> HeadlessPermissionResolver for ProductionPermissionR
                 .map_err(|_| HeadlessTurnPortError::Permission)?
                 .remove(&call.id)
                 .ok_or(HeadlessTurnPortError::Permission)?;
-            let answer = self.prompt.prompt(&context)?;
+            let answer = self.prompt.prompt(&context, cancellation)?;
 
             if cancellation.is_cancelled() || answer == PermissionPromptAnswer::Cancel {
                 return Err(HeadlessTurnPortError::Cancelled);
@@ -8835,6 +8883,7 @@ mod tests {
             &bootstrap,
             &HeadlessTurnCancellation::new(),
             None,
+            None,
         )
         .expect("resumed production turn should complete");
         let provider_request = worker.join().expect("mock provider should finish");
@@ -9257,6 +9306,7 @@ mod tests {
         fn prompt(
             &mut self,
             context: &PermissionPromptContext,
+            _: &HeadlessTurnCancellation,
         ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
             self.calls
                 .lock()
@@ -9820,6 +9870,7 @@ mod tests {
             fn prompt(
                 &mut self,
                 _: &PermissionPromptContext,
+                _: &HeadlessTurnCancellation,
             ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
                 Ok(self.0)
             }

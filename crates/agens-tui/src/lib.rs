@@ -8,7 +8,8 @@ mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
-    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiRuntimeEvent, UiEnvelope,
+    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiPermissionBridge,
+    TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -2666,10 +2667,40 @@ where
 }
 
 /// Runs a submit worker that can forward ordered runtime events while it is active.
+struct PermissionBridgeTeardown(Option<TuiPermissionBridge>);
+
+impl Drop for PermissionBridgeTeardown {
+    fn drop(&mut self) {
+        if let Some(bridge) = self.0.as_ref() {
+            bridge.close();
+        }
+    }
+}
+
 pub fn run_with_default_progress_submit<E, R, F>(
     tui: &mut Tui<E>,
     route: R,
     submit: F,
+) -> io::Result<()>
+where
+    E: Engine + Send,
+    R: Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
+    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+        + Send
+        + Sync
+        + 'static,
+{
+    run_with_default_progress_submit_with_permissions(tui, route, submit, None)
+}
+
+pub fn run_with_default_progress_submit_with_permissions<E, R, F>(
+    tui: &mut Tui<E>,
+    route: R,
+    submit: F,
+    permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
 ) -> io::Result<()>
 where
     E: Engine + Send,
@@ -2689,6 +2720,9 @@ where
     let (route_sender, route_receiver) = mpsc::channel();
     let (route_progress_sender, route_progress_receiver) = mpsc::channel();
     let (metrics_sender, metrics_receiver) = BridgeTx::bounded(128);
+    let (permission_bridge, permission_requests) = permissions.unzip();
+    let _permission_teardown = PermissionBridgeTeardown(permission_bridge.clone());
+    let mut active_permission = None;
     let mut runtime_terminal = Terminal::enter()?;
     sync_terminal_size(tui)?;
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -2728,12 +2762,45 @@ where
                 let _ = completion_sender.send(outcome);
             });
         }
+        if active_permission.is_none()
+            && let (Some(permission_bridge), Some(permission_requests)) =
+                (permission_bridge.as_ref(), permission_requests.as_ref())
+            && let Ok(request) = permission_requests.try_recv()
+            && permission_bridge.is_pending(request.id())
+        {
+            active_permission = Some(request.id());
+            tui.show_selection_dialog(DialogView::selection(
+                "Permission required",
+                Some(format!("{}\n{}", request.tool(), request.target())),
+                vec![
+                    DialogEntry::action(
+                        "Allow once",
+                        format!("permission:{}:allow-once", request.id()),
+                    ),
+                    DialogEntry::action(
+                        "Always allow",
+                        format!("permission:{}:allow-always", request.id()),
+                    ),
+                    DialogEntry::action(
+                        "Deny once",
+                        format!("permission:{}:deny-once", request.id()),
+                    ),
+                    DialogEntry::action(
+                        "Always deny",
+                        format!("permission:{}:deny-always", request.id()),
+                    ),
+                ],
+            ));
+        }
         renderer.render(tui.view())?;
         let Some(event) = runtime_terminal.poll(Duration::from_millis(25))? else {
             continue;
         };
+        let cancel_permission = matches!(event, Event::Key(Key::Escape | Key::CtrlC));
         match tui.handle(event) {
-            Action::Quit => return Ok(()),
+            Action::Quit => {
+                return Ok(());
+            }
             Action::Submit(prompt) => {
                 tui.begin_route();
                 let route = Arc::clone(&route);
@@ -2752,6 +2819,13 @@ where
                 let _ = route_sender.send(outcome);
             }
             Action::DialogAction(action_id) => {
+                if let Some((id, reply)) = parse_permission_reply(&action_id) {
+                    if let Some(permission_bridge) = permission_bridge.as_ref() {
+                        let _ = permission_bridge.reply(id, reply);
+                    }
+                    active_permission = None;
+                    continue;
+                }
                 tui.begin_route();
                 let route = Arc::clone(&route);
                 let route_sender = route_sender.clone();
@@ -2761,9 +2835,33 @@ where
                     let _ = route_sender.send(outcome);
                 });
             }
-            Action::Render | Action::Cancel => {}
+            Action::Render | Action::Cancel => {
+                if cancel_permission
+                    && let (Some(id), Some(permission_bridge)) =
+                        (active_permission.take(), permission_bridge.as_ref())
+                {
+                    let _ = permission_bridge.reply(id, TuiPermissionReply::Cancelled);
+                }
+            }
         }
     }
+}
+
+fn parse_permission_reply(action_id: &str) -> Option<(u64, TuiPermissionReply)> {
+    let mut parts = action_id.split(':');
+    let (Some("permission"), Some(id), Some(answer), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let reply = match answer {
+        "allow-once" => TuiPermissionReply::AllowOnce,
+        "allow-always" => TuiPermissionReply::AllowAlways,
+        "deny-once" => TuiPermissionReply::DenyOnce,
+        "deny-always" => TuiPermissionReply::DenyAlways,
+        _ => return None,
+    };
+    id.parse().ok().map(|id| (id, reply))
 }
 
 fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
