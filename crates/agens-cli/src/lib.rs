@@ -1097,6 +1097,7 @@ struct TuiSessionContext {
     pending_system_reminder: Option<String>,
     selection: Option<TuiModelSelector>,
     provider: Option<TuiProvider>,
+    chatgpt_unavailable: bool,
     resume_error: Option<String>,
     selected_subagent: Option<String>,
     running: bool,
@@ -1328,6 +1329,7 @@ impl TuiSessionContext {
             pending_system_reminder: None,
             selection: None,
             provider: None,
+            chatgpt_unavailable: false,
             resume_error: None,
             selected_subagent: None,
             running: false,
@@ -1508,7 +1510,11 @@ struct TuiRuntimeRouter {
     mcp_status: McpStatusHandle,
     _mcp_registry: Arc<Mutex<McpRegistry>>,
     clock: fn() -> i64,
+    credential_restorer: Arc<CredentialRestorer>,
 }
+
+type CredentialRestorer =
+    dyn Fn(&Path, ChatGptCredentialSnapshot) -> Result<(), CliError> + Send + Sync;
 
 impl TuiRuntimeRouter {
     fn new(
@@ -1559,7 +1565,20 @@ impl TuiRuntimeRouter {
             mcp_status,
             _mcp_registry: registry,
             clock: current_session_timestamp,
+            credential_restorer: Arc::new(restore_chatgpt_credentials),
         }
+    }
+
+    #[cfg(test)]
+    fn with_credential_restorer(
+        mut self,
+        restore: impl Fn(&Path, ChatGptCredentialSnapshot) -> Result<(), CliError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.credential_restorer = Arc::new(restore);
+        self
     }
 
     #[cfg(test)]
@@ -2093,6 +2112,11 @@ impl TuiRuntimeRouter {
             .session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        if context.chatgpt_unavailable {
+            return Err(CliError::authentication(
+                "ChatGPT credentials are unavailable; run /connect",
+            ));
+        }
         let provider = current_tui_provider(&bootstrap, &context)
             .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
         drop(context);
@@ -2127,17 +2151,24 @@ impl TuiRuntimeRouter {
         flow: ChatGptAuthFlow,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
     ) -> Result<String, AuthRouteError> {
+        let path = self
+            .bootstrap()
+            .map_err(AuthRouteError::Runtime)?
+            .paths
+            .credentials;
+        let credentials_before =
+            snapshot_chatgpt_credentials(&path).map_err(AuthRouteError::Runtime)?;
+        let runtime_before = self
+            .session
+            .lock()
+            .map_err(|_| AuthRouteError::Runtime(CliError::storage("TUI session is unavailable")))?
+            .clone();
         let operation =
             HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(600));
         *self.cancellation.lock().map_err(|_| {
             AuthRouteError::Runtime(CliError::storage("TUI cancellation is unavailable"))
         })? = Some(operation.clone());
         let view = operation.adapter_view();
-        let path = self
-            .bootstrap()
-            .map_err(AuthRouteError::Runtime)?
-            .paths
-            .credentials;
         let result = self.auth.login(
             &path,
             flow,
@@ -2162,8 +2193,19 @@ impl TuiRuntimeRouter {
             *active = None;
         }
         result.map_err(AuthRouteError::Auth)?;
-        self.reconcile_provider(true)
-            .map_err(AuthRouteError::Runtime)?;
+        if let Err(error) = self.reconcile_provider(true) {
+            if (self.credential_restorer)(&path, credentials_before).is_err() {
+                self.mark_chatgpt_unavailable()
+                    .map_err(AuthRouteError::Runtime)?;
+                return Err(AuthRouteError::Runtime(CliError::storage(
+                    "ChatGPT credential recovery failed",
+                )));
+            }
+            *self.session.lock().map_err(|_| {
+                AuthRouteError::Runtime(CliError::storage("TUI session is unavailable"))
+            })? = runtime_before;
+            return Err(AuthRouteError::Runtime(error));
+        }
         Ok("Connected to ChatGPT.".into())
     }
 
@@ -2175,8 +2217,11 @@ impl TuiRuntimeRouter {
             .credentials;
         let removed = self.auth.disconnect(&path).map_err(AuthRouteError::Auth)?;
         if removed {
-            self.reconcile_provider(false)
-                .map_err(AuthRouteError::Runtime)?;
+            if let Err(error) = self.reconcile_provider(false) {
+                self.mark_chatgpt_unavailable()
+                    .map_err(AuthRouteError::Runtime)?;
+                return Err(AuthRouteError::Runtime(error));
+            }
             Ok("Disconnected from ChatGPT.".into())
         } else {
             Ok("No ChatGPT credentials were stored.".into())
@@ -2185,24 +2230,41 @@ impl TuiRuntimeRouter {
 
     fn reconcile_provider(&self, connected: bool) -> Result<(), CliError> {
         let bootstrap = self.bootstrap()?;
-        if connected && bootstrap.provider_source != ProviderSource::ExplicitOther {
-            self.apply_provider(&bootstrap, "openai-chatgpt")?;
-        } else if !connected {
-            let context = self
-                .session
-                .lock()
-                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-            let current = current_tui_provider(&bootstrap, &context);
-            drop(context);
-            if current == Some(TuiProvider::OpenAiChatGpt)
-                && self
-                    .credentials
-                    .status(&bootstrap.paths.credentials, TuiProvider::OpenAiApi)
-                    .available()
-            {
-                self.apply_provider(&bootstrap, "openai-api")?;
+        match bootstrap.provider_source {
+            ProviderSource::Auto => {
+                let provider = if connected {
+                    "openai-chatgpt".to_owned()
+                } else {
+                    let credentials = fs::read_to_string(&bootstrap.paths.credentials).ok();
+                    resolve_provider_type(
+                        None,
+                        credentials.as_deref(),
+                        &(self.credentials.environment)(),
+                    )
+                    .ok_or_else(|| {
+                        CliError::authentication(
+                            "ChatGPT credentials are unavailable; run /connect",
+                        )
+                    })?
+                };
+                self.apply_provider(&bootstrap, &provider)?;
             }
+            ProviderSource::ExplicitChatGpt if connected => {
+                self.apply_provider(&bootstrap, "openai-chatgpt")?;
+            }
+            ProviderSource::ExplicitChatGpt => self.mark_chatgpt_unavailable()?,
+            ProviderSource::ExplicitOther => {}
         }
+        Ok(())
+    }
+
+    fn mark_chatgpt_unavailable(&self) -> Result<(), CliError> {
+        let mut context = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        context.provider = None;
+        context.chatgpt_unavailable = true;
         Ok(())
     }
 
@@ -2270,6 +2332,7 @@ impl TuiRuntimeRouter {
             )
         };
         apply_tui_selection(bootstrap, &mut context, provider, next)?;
+        context.chatgpt_unavailable = false;
         context.resume_error = None;
         Ok(message)
     }
@@ -2776,6 +2839,9 @@ fn complete_tui_turn(
 }
 
 fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> Option<TuiProvider> {
+    if context.chatgpt_unavailable {
+        return None;
+    }
     if context.resume_error.is_some()
         && context
             .metadata
@@ -2788,6 +2854,36 @@ fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> O
     context
         .provider
         .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
+}
+
+enum ChatGptCredentialSnapshot {
+    Absent,
+    Present(Vec<u8>),
+}
+
+fn snapshot_chatgpt_credentials(path: &Path) -> Result<ChatGptCredentialSnapshot, CliError> {
+    match fs::read(path) {
+        Ok(credentials) => Ok(ChatGptCredentialSnapshot::Present(credentials)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound || path.is_dir() => {
+            Ok(ChatGptCredentialSnapshot::Absent)
+        }
+        Err(_) => Err(CliError::storage("ChatGPT credentials could not be read")),
+    }
+}
+
+fn restore_chatgpt_credentials(
+    path: &Path,
+    snapshot: ChatGptCredentialSnapshot,
+) -> Result<(), CliError> {
+    let result = match snapshot {
+        ChatGptCredentialSnapshot::Present(credentials) => fs::write(path, credentials),
+        ChatGptCredentialSnapshot::Absent => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    };
+    result.map_err(|_| CliError::storage("ChatGPT credential recovery failed"))
 }
 
 fn apply_tui_selection(
@@ -7870,6 +7966,213 @@ mod tests {
         assert!(stored.contains("preserved"));
         assert!(stored.contains("kept"));
         assert!(!stored.contains("new-access"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn runtime_chatgpt_refresh_atomicity_restores_exact_credentials_after_reconcile_failure() {
+        let temporary = tui_session_directory("refresh-rollback");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        let before = br#"{"openai-api":{"api_key":"preserved"},"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#;
+        std::fs::write(&credentials_path, before).unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.provider_source = ProviderSource::Auto;
+        bootstrap.provider_type = Some("openai-api".into());
+        bootstrap.openai_api_key = Some("preserved".into());
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            running: true,
+            ..TuiSessionContext::fresh()
+        }));
+        let original_runtime = session.lock().unwrap().clone();
+        let router = TuiRuntimeRouter::with_auth_coordinator(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
+                Ok(test_chatgpt_credentials("new-access"))
+            }),
+        );
+
+        assert!(
+            router
+                .connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&credentials_path).unwrap(), before);
+        assert_eq!(*session.lock().unwrap(), original_runtime);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn runtime_chatgpt_refresh_atomicity_disconnects_explicit_chatgpt_fail_closed() {
+        let temporary = tui_session_directory("explicit-disconnect");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            &credentials_path,
+            r#"{"openai-api":{"api_key":"preserved"},"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.provider_source = ProviderSource::ExplicitChatGpt;
+        bootstrap.provider_type = Some("openai-chatgpt".into());
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            provider: Some(TuiProvider::OpenAiChatGpt),
+            ..TuiSessionContext::fresh()
+        }));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+
+        assert!(router.disconnect().is_ok());
+        assert_eq!(session.lock().unwrap().provider, None);
+        assert!(session.lock().unwrap().chatgpt_unavailable);
+        let error = match router.turn_bootstrap() {
+            Ok(_) => panic!("disconnected ChatGPT runtime must be unavailable"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "auth: ChatGPT credentials are unavailable; run /connect"
+        );
+        assert!(
+            !std::fs::read_to_string(&credentials_path)
+                .unwrap()
+                .contains("old-access")
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn runtime_chatgpt_refresh_atomicity_fails_closed_when_credential_restore_fails() {
+        let temporary = tui_session_directory("restore-failure");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            &credentials_path,
+            r#"{"openai-api":{"api_key":"preserved"}}"#,
+        )
+        .unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.provider_source = ProviderSource::Auto;
+        bootstrap.provider_type = Some("openai-api".into());
+        bootstrap.openai_api_key = Some("preserved".into());
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            running: true,
+            ..TuiSessionContext::fresh()
+        }));
+        let router = TuiRuntimeRouter::with_auth_coordinator(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
+                Ok(test_chatgpt_credentials("new-access"))
+            }),
+        )
+        .with_credential_restorer(|_, _| Err(CliError::storage("injected restore failure")));
+
+        let outcome = auth_route_outcome(
+            router.connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0),
+        );
+        assert!(matches!(
+            outcome,
+            TuiSubmissionOutcome::LocalActionableError { message, .. }
+                if message == "store: ChatGPT credential recovery failed"
+        ));
+        assert!(session.lock().unwrap().chatgpt_unavailable);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn runtime_chatgpt_refresh_atomicity_preserves_runtime_on_credential_write_failures() {
+        let temporary = tui_session_directory("credential-write-failures");
+        let config_home = temporary.join("config");
+        std::fs::create_dir_all(&config_home).unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.paths.credentials = config_home.clone();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            provider: Some(TuiProvider::OpenAiApi),
+            ..TuiSessionContext::fresh()
+        }));
+        let original_runtime = session.lock().unwrap().clone();
+        let router = TuiRuntimeRouter::with_auth_coordinator(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
+                Ok(test_chatgpt_credentials("new-access"))
+            }),
+        );
+
+        for outcome in [
+            auth_route_outcome(
+                router.connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0),
+            ),
+            auth_route_outcome(router.disconnect()),
+        ] {
+            assert!(matches!(
+                outcome,
+                TuiSubmissionOutcome::LocalActionableError { message, .. }
+                    if message == "ChatGPT credentials could not be saved"
+            ));
+            assert_eq!(*session.lock().unwrap(), original_runtime);
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn runtime_chatgpt_refresh_atomicity_leaves_auto_unavailable_after_disconnect_rebuild_failure()
+    {
+        let temporary = tui_session_directory("auto-disconnect-failure");
+        let config_home = temporary.join("config");
+        let credentials_path = config_home.join("auth.json");
+        std::fs::create_dir_all(&config_home).unwrap();
+        std::fs::write(
+            &credentials_path,
+            r#"{"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.provider_source = ProviderSource::Auto;
+        bootstrap.provider_type = Some("openai-chatgpt".into());
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            provider: Some(TuiProvider::OpenAiChatGpt),
+            ..TuiSessionContext::fresh()
+        }));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+
+        assert!(router.disconnect().is_err());
+        assert!(session.lock().unwrap().chatgpt_unavailable);
+        assert!(
+            !std::fs::read_to_string(&credentials_path)
+                .unwrap()
+                .contains("old-access")
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
