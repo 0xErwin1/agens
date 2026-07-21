@@ -120,8 +120,8 @@ pub enum Action {
     Render,
     /// Send this prompt to the composition layer.
     Submit(String),
-    /// Send this prompt through the selected subagent's background path.
     SubmitBackground(String),
+    TransitionToBackground(u64),
     /// Ask the composition layer to resolve a palette dialog by stable route ID.
     OpenDialog(String),
     /// Dispatch the selected dialog action through the composition layer.
@@ -1879,6 +1879,9 @@ where
             }
             TuiRuntimeEvent::TaskExecution { agent, event } => {
                 self.apply_task_execution_event(agent, *event);
+                if matches!(event, TuiExecutionEvent::Backgrounded { .. }) {
+                    self.set_running(false);
+                }
             }
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
@@ -2185,7 +2188,7 @@ where
                 Action::Render
             }
             Key::Escape => Action::Render,
-            Key::CtrlC if self.running => self.cancel_running(),
+            Key::CtrlC if self.running || self.has_active_execution() => self.cancel_running(),
             Key::CtrlC if !self.input.is_empty() => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -2255,10 +2258,7 @@ where
                 })
                 .map(TuiExecution::id)
         }) {
-            let agent = self.selected_agent.clone().unwrap_or_default();
-            self.apply_task_execution_event(&agent, TuiExecutionEvent::Backgrounded { id });
-            self.set_running(false);
-            return Action::Render;
+            return Action::TransitionToBackground(id);
         }
 
         if self.selected_agent.is_none() || self.input.trim().is_empty() {
@@ -2363,6 +2363,15 @@ where
         self.quit_armed = false;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
+    }
+
+    fn has_active_execution(&self) -> bool {
+        self.executions.iter().any(|execution| {
+            matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+            )
+        })
     }
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
@@ -2896,6 +2905,7 @@ where
             Action::Render
             | Action::Submit(_)
             | Action::SubmitBackground(_)
+            | Action::TransitionToBackground(_)
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -2940,6 +2950,7 @@ where
             }
             Action::Render
             | Action::SubmitBackground(_)
+            | Action::TransitionToBackground(_)
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -2982,13 +2993,14 @@ pub fn run_with_default_progress_submit(
     + Sync
     + 'static,
 ) -> io::Result<()> {
-    run_with_default_progress_submit_with_permissions(tui, route, submit, None)
+    run_with_default_progress_submit_with_permissions(tui, route, submit, |_| false, None)
 }
 
-pub fn run_with_default_progress_submit_with_permissions<E, R, F>(
+pub fn run_with_default_progress_submit_with_permissions<E, R, F, C>(
     tui: &mut Tui<E>,
     route: R,
     submit: F,
+    transition: C,
     permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
 ) -> io::Result<()>
 where
@@ -3001,9 +3013,11 @@ where
         + Send
         + Sync
         + 'static,
+    C: Fn(u64) -> bool + Send + Sync + 'static,
 {
     let route = Arc::new(route);
     let submit = Arc::new(submit);
+    let transition = Arc::new(transition);
     let (sender, receiver) = mpsc::channel();
     let (completion_sender, completion_receiver) = mpsc::channel();
     let (route_sender, route_receiver) = mpsc::channel();
@@ -3104,6 +3118,9 @@ where
                     let outcome = submit(prompt, true, sender, metrics);
                     let _ = completion_sender.send(outcome);
                 });
+            }
+            Action::TransitionToBackground(id) => {
+                let _ = transition(id);
             }
             Action::OpenDialog(route_id) => {
                 let outcome = route(

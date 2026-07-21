@@ -35,19 +35,17 @@ use agens_tools::{
     McpStatusHandle, McpStatusSnapshot, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
     PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, SkillResourceTool,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskExecutionEvent, TaskExecutionLifecycle, TaskLaunchMode, TaskRunContext, TaskRunner,
+    TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
+    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
-    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPermissionBridge,
-    TuiPermissionReply, TuiPermissionRequest, TuiPresentation, TuiProviderOutcome,
-    TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
+    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiExecutionEvent,
+    TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiPresentation,
+    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
     run_with_default_progress_submit_with_permissions,
 };
-
-#[cfg(test)]
-use agens_tools::TaskLaunchMode;
 
 mod chatgpt_auth;
 mod model_registry;
@@ -2626,6 +2624,7 @@ fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+    let task_controls = TuiTaskControls::default();
     let engine = ProductionTuiEngine {
         cancellation: Arc::clone(&cancellation),
     };
@@ -2687,6 +2686,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     tui.set_palette_entries(router.palette_entries().to_vec());
     let route_router = router.clone();
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
+    let transition_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
     run_with_default_progress_submit_with_permissions(
         &mut tui,
@@ -2704,6 +2704,8 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             *active = Some(turn_cancellation.clone());
             drop(active);
 
+            let lifecycle_bridge =
+                TuiTaskLifecycleBridge::new(metrics.clone(), task_controls.clone());
             let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
                 metrics,
                 BridgeCancel::new(),
@@ -2723,6 +2725,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 &runtime_bootstrap,
                 &router.skills,
                 prompt_bridge.clone(),
+                lifecycle_bridge,
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -2736,9 +2739,6 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             ) {
                 Ok(TuiSelectedTaskLaunch::NotSelected) => {}
                 Ok(TuiSelectedTaskLaunch::Dispatched) if background => {
-                    if let Ok(mut active) = cancellation.lock() {
-                        *active = None;
-                    }
                     return TuiProviderOutcome::Backgrounded;
                 }
                 Ok(TuiSelectedTaskLaunch::Dispatched) => {}
@@ -2772,6 +2772,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
 
             tui_provider_outcome(result)
         },
+        move |id| transition_controls.transition_to_background(id),
         Some((permission_bridge, permission_requests)),
     )
     .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
@@ -4298,6 +4299,7 @@ fn production_tui_task_runtime(
     bootstrap: &Bootstrap,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
+    lifecycle_bridge: TuiTaskLifecycleBridge,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let project_root = bootstrap
         .project_root()
@@ -4306,7 +4308,8 @@ fn production_tui_task_runtime(
         bootstrap,
         skills,
         permission_bridge,
-        ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
+        ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf())
+            .with_lifecycle_bridge(lifecycle_bridge),
     )
 }
 
@@ -4429,8 +4432,86 @@ fn default_model(bootstrap: &Bootstrap) -> &'static str {
 struct ProductionTaskRunner {
     bootstrap: Bootstrap,
     project_root: PathBuf,
+    lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>>,
+}
+
+#[derive(Clone, Default)]
+struct TuiTaskControls(Arc<Mutex<BTreeMap<u64, TaskExecutionLifecycle>>>);
+
+impl TuiTaskControls {
+    fn transition_to_background(&self, id: u64) -> bool {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|controls| controls.get(&id).cloned())
+            .is_some_and(|lifecycle| lifecycle.transition_to_background())
+    }
+}
+
+#[derive(Clone)]
+struct TuiTaskLifecycleBridge {
+    events: BridgeTx<TuiRuntimeEvent>,
+    controls: TuiTaskControls,
+}
+
+impl TuiTaskLifecycleBridge {
+    fn new(events: BridgeTx<TuiRuntimeEvent>, controls: TuiTaskControls) -> Self {
+        Self { events, controls }
+    }
+
+    fn observe(&self, agent: String, lifecycle: TaskExecutionLifecycle) {
+        let id = lifecycle.id().value();
+        if let Ok(mut controls) = self.controls.0.lock() {
+            controls.insert(id, lifecycle.clone());
+        }
+        let events = self.events.clone();
+        let controls = self.controls.clone();
+        std::thread::spawn(move || {
+            let mut seen = 0;
+            loop {
+                let lifecycle_events = lifecycle.events();
+                for event in &lifecycle_events[seen..] {
+                    let event = match *event {
+                        TaskExecutionEvent::Admitted(_, TaskLaunchMode::Foreground) => {
+                            TuiExecutionEvent::ForegroundStarted { id }
+                        }
+                        TaskExecutionEvent::Admitted(_, TaskLaunchMode::Background) => {
+                            TuiExecutionEvent::BackgroundStarted { id }
+                        }
+                        TaskExecutionEvent::Backgrounded(_) => {
+                            TuiExecutionEvent::Backgrounded { id }
+                        }
+                        TaskExecutionEvent::Completed(_) => TuiExecutionEvent::Completed { id },
+                        TaskExecutionEvent::Failed(_) => TuiExecutionEvent::Failed { id },
+                        TaskExecutionEvent::Cancelled(_) => TuiExecutionEvent::Cancelled { id },
+                    };
+                    let _ = events.publish(
+                        TuiRuntimeEvent::TaskExecution {
+                            agent: agent.clone(),
+                            event,
+                        },
+                        &BridgeCancel::new(),
+                        None,
+                    );
+                    if matches!(
+                        event,
+                        TuiExecutionEvent::Completed { .. }
+                            | TuiExecutionEvent::Failed { .. }
+                            | TuiExecutionEvent::Cancelled { .. }
+                    ) {
+                        if let Ok(mut controls) = controls.0.lock() {
+                            controls.remove(&id);
+                        }
+                        return;
+                    }
+                }
+                seen = lifecycle_events.len();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+    }
 }
 
 impl ProductionTaskRunner {
@@ -4438,9 +4519,15 @@ impl ProductionTaskRunner {
         Self {
             bootstrap,
             project_root,
+            lifecycle_bridge: None,
             #[cfg(test)]
             probe: None,
         }
+    }
+
+    fn with_lifecycle_bridge(mut self, lifecycle_bridge: TuiTaskLifecycleBridge) -> Self {
+        self.lifecycle_bridge = Some(lifecycle_bridge);
+        self
     }
 
     #[cfg(test)]
@@ -4452,6 +4539,22 @@ impl ProductionTaskRunner {
         Self {
             bootstrap,
             project_root,
+            lifecycle_bridge: None,
+            probe: Some(probe),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lifecycle_probe(
+        bootstrap: Bootstrap,
+        project_root: PathBuf,
+        probe: Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>,
+        lifecycle_bridge: TuiTaskLifecycleBridge,
+    ) -> Self {
+        Self {
+            bootstrap,
+            project_root,
+            lifecycle_bridge: Some(lifecycle_bridge),
             probe: Some(probe),
         }
     }
@@ -4463,6 +4566,11 @@ impl TaskRunner for ProductionTaskRunner {
         request: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
+        if let (Some(lifecycle_bridge), Some(execution)) =
+            (&self.lifecycle_bridge, context.execution())
+        {
+            lifecycle_bridge.observe(request.agent_name().to_owned(), execution.clone());
+        }
         #[cfg(test)]
         if let Some(probe) = &self.probe {
             let execution = context
@@ -4473,6 +4581,15 @@ impl TaskRunner for ProductionTaskRunner {
                 execution.mode(),
                 request.model().to_owned(),
             ));
+            if self.lifecycle_bridge.is_some() {
+                while !context
+                    .cancellation
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                return Err(TaskRunnerError::Cancelled);
+            }
             return Ok(TaskTurnResult {
                 output: "probe".into(),
                 iterations: 1,
@@ -5450,6 +5567,12 @@ fn launch_selected_tui_task(
     ) {
         Ok(TaskLaunchOutcome::Dispatched(output)) if !output.is_error => {
             Ok(TuiSelectedTaskLaunch::Dispatched)
+        }
+        Ok(TaskLaunchOutcome::Dispatched(_)) if cancellation.is_cancelled() => {
+            Err(CliError::runtime(HeadlessTurnError::Cancelled))
+        }
+        Ok(TaskLaunchOutcome::Dispatched(_)) if cancellation.is_expired() => {
+            Err(CliError::runtime(HeadlessTurnError::TimedOut))
         }
         Ok(outcome) => Ok(TuiSelectedTaskLaunch::Rejected(outcome)),
         Err(HeadlessTurnPortError::Cancelled) => {
@@ -10923,7 +11046,7 @@ mod tests {
     }
 
     #[test]
-    fn u15_c1c_selected_background_launch_uses_a1b2_once_without_session_mutation() {
+    fn u15_c1c_selected_task_lifecycle_is_visible_and_transitionable_without_relaunch() {
         let temporary = tui_session_directory("selected-background-launch");
         let bootstrap = tui_session_bootstrap(
             &temporary,
@@ -10933,14 +11056,17 @@ mod tests {
             )],
         );
         let probe = Arc::new(Mutex::new(Vec::new()));
+        let (events, receiver) = BridgeTx::bounded(8);
+        let controls = TuiTaskControls::default();
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
             &SkillCatalog::default(),
             production_tui_permission_bridge().0,
-            ProductionTaskRunner::with_probe(
+            ProductionTaskRunner::with_lifecycle_probe(
                 bootstrap.clone(),
                 bootstrap.project_root().unwrap().to_path_buf(),
                 Arc::clone(&probe),
+                TuiTaskLifecycleBridge::new(events, controls.clone()),
             ),
         )
         .unwrap();
@@ -10957,22 +11083,49 @@ mod tests {
             ..TuiSessionContext::fresh()
         }));
 
+        let cancellation = HeadlessTurnCancellation::new();
+        let next_event = |timeout| receiver.recv_timeout(timeout).unwrap().into_parts().1;
+        let worker = std::thread::spawn({
+            let session = Arc::clone(&session);
+            let cancellation = cancellation.clone();
+            move || {
+                launch_selected_tui_task(
+                    &mut runtime,
+                    &session,
+                    "review task",
+                    false,
+                    &cancellation,
+                )
+            }
+        });
         assert_eq!(
-            launch_selected_tui_task(
-                &mut runtime,
-                &session,
-                "review task",
-                true,
-                &HeadlessTurnCancellation::new(),
-            ),
-            Ok(TuiSelectedTaskLaunch::Dispatched)
+            next_event(std::time::Duration::from_secs(1)),
+            TuiRuntimeEvent::TaskExecution {
+                agent: "reviewer".into(),
+                event: TuiExecutionEvent::ForegroundStarted { id: 1 },
+            }
+        );
+        assert!(controls.transition_to_background(1));
+        assert_eq!(
+            next_event(std::time::Duration::from_secs(1)),
+            TuiRuntimeEvent::TaskExecution {
+                agent: "reviewer".into(),
+                event: TuiExecutionEvent::Backgrounded { id: 1 },
+            }
+        );
+        cancellation.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert_eq!(
+            next_event(std::time::Duration::from_secs(1)),
+            TuiRuntimeEvent::TaskExecution {
+                agent: "reviewer".into(),
+                event: TuiExecutionEvent::Cancelled { id: 1 },
+            }
         );
         let probe = probe.lock().unwrap();
         assert_eq!(probe.len(), 1);
-        assert_eq!(probe[0].1, TaskLaunchMode::Background);
         let session = session.lock().unwrap();
         assert!(session.messages.is_empty());
-        assert!(!session.running);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

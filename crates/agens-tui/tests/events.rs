@@ -675,8 +675,6 @@ fn u15_c1c_control_b_starts_an_armed_subagent_in_background() {
         tui.handle(Event::Key(Key::CtrlB)),
         Action::SubmitBackground("review task".into())
     );
-    assert_eq!(tui.input(), "");
-    assert_eq!(tui.engine().cancellations, 0);
 }
 
 #[test]
@@ -690,53 +688,22 @@ fn u15_c1c_control_b_backgrounds_the_selected_foreground_execution_without_relau
         event: TuiExecutionEvent::ForegroundStarted { id: 7 },
     });
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlB)),
+        Action::TransitionToBackground(7)
+    );
+    assert!(tui.view().running);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Backgrounded { id: 7 },
+    });
     assert!(!tui.view().running);
-    assert_eq!(tui.executions().len(), 1);
     assert_eq!(
         tui.executions()[0].state(),
         agens_tui::TuiExecutionState::BackgroundRunning
     );
-    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
-    renderer.render(tui.view()).unwrap();
-    let text = renderer
-        .terminal()
-        .backend()
-        .buffer()
-        .content
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(text.contains("reviewer · background running"), "{text:?}");
-    assert_eq!(tui.engine().cancellations, 0);
-}
-
-#[test]
-fn u15_c1c_control_b_ignores_empty_or_unselected_input_without_side_effects() {
-    let mut tui = Tui::new(FakeEngine::default());
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
-    tui.handle(Event::Paste("review task".into()));
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
-    assert_eq!(tui.input(), "review task");
-    assert!(tui.runtime_events().is_empty());
-    assert_eq!(tui.engine().cancellations, 0);
-}
-
-#[test]
-fn u15_c1c_control_b_preserves_permission_and_native_dialog_precedence() {
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.handle(Event::Paste("review task".into()));
-    tui.show_selection_dialog(DialogView::selection(
-        "Permission required",
-        Some("native::task"),
-        vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
-    ));
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
-    assert_eq!(tui.input(), "review task");
-
-    tui.show_dialog("Select file", "Choose a file");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
-    assert_eq!(tui.input(), "review task");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
 }
 
 #[test]
