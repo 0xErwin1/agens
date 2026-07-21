@@ -1426,9 +1426,21 @@ impl TuiCredentialResolver {
 
     #[cfg(test)]
     fn with_environment(environment: BTreeMap<String, String>) -> Self {
+        Self::with_environment_resolver(move || environment.clone())
+    }
+
+    #[cfg(test)]
+    fn with_environment_resolver(
+        resolve: impl Fn() -> BTreeMap<String, String> + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            environment: Arc::new(move || environment.clone()),
+            environment: Arc::new(resolve),
         }
+    }
+
+    fn api_key(&self, path: &Path) -> Option<String> {
+        let credentials = fs::read_to_string(path).ok();
+        openai_api_key(credentials.as_deref(), &(self.environment)())
     }
 
     fn status(&self, path: &Path, provider: TuiProvider) -> TuiProviderStatus {
@@ -1441,8 +1453,7 @@ impl TuiCredentialResolver {
                 }
             }
             TuiProvider::OpenAiApi => {
-                let credentials = fs::read_to_string(path).ok();
-                if openai_api_key(credentials.as_deref(), &(self.environment)()).is_some() {
+                if self.api_key(path).is_some() {
                     TuiProviderStatus::Ready
                 } else {
                     TuiProviderStatus::CredentialRequired
@@ -1513,6 +1524,20 @@ impl TuiRuntimeRouter {
             palette,
             clock: current_session_timestamp,
         }
+    }
+
+    #[cfg(test)]
+    fn with_credential_resolver(
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<TuiSessionContext>>,
+        cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+        commands: Arc<CommandCatalog>,
+        skills: Arc<SkillCatalog>,
+        credentials: TuiCredentialResolver,
+    ) -> Self {
+        let mut router = Self::new(bootstrap, session, cancellation, commands, skills);
+        router.credentials = credentials;
+        router
     }
 
     #[cfg(test)]
@@ -2010,6 +2035,41 @@ impl TuiRuntimeRouter {
             .map_err(|_| CliError::storage("TUI provider state is unavailable"))
     }
 
+    fn turn_bootstrap(&self) -> Result<Bootstrap, CliError> {
+        let mut bootstrap = self.bootstrap()?;
+        let context = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        let provider = current_tui_provider(&bootstrap, &context)
+            .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
+        drop(context);
+
+        bootstrap.provider_type = Some(provider.identifier().into());
+        bootstrap.openai_api_key = match provider {
+            TuiProvider::OpenAiApi => Some(
+                self.credentials
+                    .api_key(&bootstrap.paths.credentials)
+                    .ok_or_else(|| {
+                        CliError::authentication("OpenAI API authentication is unavailable")
+                    })?,
+            ),
+            TuiProvider::OpenAiChatGpt => {
+                if !self
+                    .credentials
+                    .status(&bootstrap.paths.credentials, provider)
+                    .available()
+                {
+                    return Err(CliError::authentication(
+                        "ChatGPT credentials are unavailable or invalid; run /connect",
+                    ));
+                }
+                None
+            }
+        };
+        Ok(bootstrap)
+    }
+
     fn connect(
         &self,
         flow: ChatGptAuthFlow,
@@ -2423,7 +2483,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 }
                 let _ = progress.send(event);
             });
-            let runtime_bootstrap = match router.bootstrap() {
+            let runtime_bootstrap = match router.turn_bootstrap() {
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
@@ -6534,6 +6594,176 @@ mod tests {
     }
 
     #[test]
+    fn tui_provider_overlay_filters_unavailable_entries_and_switches_without_history() {
+        let temporary = tui_session_directory("provider-overlay");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        std::fs::write(
+            &bootstrap.paths.credentials,
+            r#"{"openai-chatgpt":{"access_token":"secret-access","refresh_token":"secret-refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::with_credential_resolver(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            TuiCredentialResolver::with_environment(BTreeMap::new()),
+        );
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        let (progress, _) = std::sync::mpsc::channel();
+        tui.apply_submission_outcome(router.route_request(
+            TuiRouteRequest::OpenDialog("provider".into()),
+            progress.clone(),
+        ));
+        let overlay = render_tui_test_backend(&tui, 80, 24);
+        assert!(
+            overlay.contains("Current: OpenAI API · credential required"),
+            "{overlay:?}"
+        );
+        assert!(
+            overlay.contains("ChatGPT subscription - ready"),
+            "{overlay:?}"
+        );
+        assert!(!overlay.contains("OpenAI API (current)"), "{overlay:?}");
+        assert!(!overlay.contains("secret-"), "{overlay:?}");
+
+        dispatch_tui_dialog_selection(&mut tui, &router, progress);
+        assert_eq!(tui.view().provider_model, "openai-chatgpt / gpt-5.5");
+        tui.apply_submission_outcome(router.open_dialog("model").unwrap());
+        let model_overlay = render_tui_test_backend(&tui, 80, 24);
+        assert!(model_overlay.contains("Source: ChatGPT subscription"));
+        assert!(model_overlay.contains("gpt-5.5 (current)"));
+        assert!(tui.transcript().is_empty());
+        assert!(session.lock().unwrap().messages.is_empty());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_provider_switch_reconciles_compatible_incompatible_and_busy_state_atomically() {
+        let temporary = tui_session_directory("provider-reconcile");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        std::fs::write(
+            &bootstrap.paths.credentials,
+            r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::with_credential_resolver(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            TuiCredentialResolver::with_environment(BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "api-secret".into(),
+            )])),
+        );
+
+        let retained = router.route("/provider openai-chatgpt".into());
+        assert!(
+            matches!(retained, TuiSubmissionOutcome::ContextChanged { ref message, .. } if message.contains("Model retained: gpt-5.5"))
+        );
+        router.route("/model gpt-5.4".into());
+        router.route("/effort high".into());
+        let reset = router.route("/provider openai-api".into());
+        assert!(
+            matches!(reset, TuiSubmissionOutcome::ContextChanged { ref message, .. } if message.contains("Model reset to gpt-4.1") && message.contains("Default"))
+        );
+        let idle = session.lock().unwrap().clone();
+        assert_eq!(idle.selection.as_ref().unwrap().model(), "gpt-4.1");
+        assert_eq!(idle.selection.as_ref().unwrap().reasoning_effort(), None);
+        let mut context = session.lock().unwrap();
+        context.messages = tui_session_messages();
+        context.running = true;
+        drop(context);
+        let busy = session.lock().unwrap().clone();
+        assert!(matches!(
+            router.route("/provider openai-chatgpt".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
+        ));
+        assert_eq!(*session.lock().unwrap(), busy);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_turn_bootstrap_resolves_changed_and_removed_credentials_without_stale_reuse() {
+        let temporary = tui_session_directory("fresh-turn-credentials");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let configured_provider = bootstrap.provider_type.clone();
+        let credentials = bootstrap.paths.credentials.clone();
+        let environment = Arc::new(Mutex::new(BTreeMap::new()));
+        let resolver = TuiCredentialResolver::with_environment_resolver({
+            let environment = Arc::clone(&environment);
+            move || environment.lock().unwrap().clone()
+        });
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::with_credential_resolver(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+            resolver,
+        );
+
+        std::fs::write(&credentials, r#"{"openai-api":{"api_key":"file-one"}}"#).unwrap();
+        assert_eq!(
+            router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+            Some("file-one")
+        );
+        std::fs::write(&credentials, r#"{"openai-api":{"api_key":"file-two"}}"#).unwrap();
+        assert_eq!(
+            router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+            Some("file-two")
+        );
+        environment
+            .lock()
+            .unwrap()
+            .insert("OPENAI_API_KEY".into(), "env-current".into());
+        assert_eq!(
+            router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+            Some("env-current")
+        );
+        environment.lock().unwrap().clear();
+        std::fs::remove_file(&credentials).unwrap();
+        assert!(router.turn_bootstrap().is_err());
+
+        session.lock().unwrap().provider = Some(TuiProvider::OpenAiChatGpt);
+        std::fs::write(
+            &credentials,
+            r#"{"openai-chatgpt":{"access_token":"chat-access","refresh_token":"chat-refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            router.turn_bootstrap().unwrap().provider_type(),
+            Some("openai-chatgpt")
+        );
+        std::fs::remove_file(&credentials).unwrap();
+        assert!(router.turn_bootstrap().is_err());
+        assert!(matches!(
+            router.route("/provider openai-chatgpt".into()),
+            TuiSubmissionOutcome::LocalActionableError { ref message, .. }
+                if message.contains("run /connect")
+        ));
+        assert_eq!(
+            router.bootstrap().unwrap().provider_type,
+            configured_provider
+        );
+        assert!(session.lock().unwrap().messages.is_empty());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_model_overlay_selects_exact_unverified_id_with_unknown_metadata_and_default_effort() {
         let temporary = tui_session_directory("unverified-model");
         let bootstrap =
@@ -7888,6 +8118,12 @@ mod tests {
                 r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"refresh","account_id":"account","expires_at":"2030-01-01T00:00:00Z"}}"#,
             )
             .expect("ChatGPT credentials should be written");
+        } else {
+            std::fs::write(
+                config_home.join("auth.json"),
+                r#"{"openai-api":{"api_key":"test-key"}}"#,
+            )
+            .expect("OpenAI API credentials should be written");
         }
 
         let dependencies = CliDependencies::for_test(
@@ -7972,9 +8208,24 @@ mod tests {
                 "Model: gpt-5.6 (unverified metadata). Reasoning effort reset to Default."
             );
         }
+        let runtime_bootstrap = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        )
+        .turn_bootstrap()
+        .expect("turn provider credentials should resolve freshly");
         assert_eq!(
-            run_tui_prompt(&bootstrap, "next request", &cancellation, &session, None)
-                .expect("selected prompt should complete"),
+            run_tui_prompt(
+                &runtime_bootstrap,
+                "next request",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect("selected prompt should complete"),
             "selected answer"
         );
 
