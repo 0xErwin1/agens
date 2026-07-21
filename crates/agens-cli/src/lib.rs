@@ -5136,6 +5136,72 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
     }
 }
 
+#[allow(dead_code)]
+struct AuthorizedNativeTaskRuntime<P> {
+    gate: ProductionPermissionGate,
+    resolver: ProductionPermissionResolver<P>,
+    dispatcher: ProductionToolDispatcher,
+    next_call_id: u64,
+}
+
+impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
+    #[allow(dead_code)]
+    fn launch(
+        &mut self,
+        agent: &str,
+        description: &str,
+        background: bool,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<Option<HeadlessToolOutput>, HeadlessTurnPortError> {
+        if agent.trim().is_empty() || description.trim().is_empty() {
+            return Ok(None);
+        }
+        if cancellation.is_cancelled() {
+            return Err(HeadlessTurnPortError::Cancelled);
+        }
+        if cancellation.is_expired() {
+            return Err(HeadlessTurnPortError::TimedOut);
+        }
+
+        self.next_call_id += 1;
+        let call = HeadlessToolCall {
+            id: format!("tui-task-{}", self.next_call_id),
+            name: "native::task".into(),
+            input: serde_json::json!({
+                "agent": agent,
+                "description": description,
+                "background": background,
+            })
+            .to_string(),
+        };
+        let decision = poll_permission_port(self.gate.evaluate(&call, cancellation))?;
+        let decision = if decision == PermissionDecision::Ask {
+            poll_permission_port(self.resolver.resolve(&call, cancellation))?
+        } else {
+            decision
+        };
+
+        if decision == PermissionDecision::Deny {
+            return Ok(None);
+        }
+
+        poll_permission_port(self.dispatcher.dispatch(call, cancellation)).map(Some)
+    }
+}
+
+#[allow(dead_code)]
+fn poll_permission_port<T>(
+    future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
+) -> Result<T, HeadlessTurnPortError> {
+    let mut future = std::pin::pin!(future);
+    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+    match future.as_mut().poll(context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(HeadlessTurnPortError::Permission),
+    }
+}
+
 fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
     match error {
         agens_core::Error::Cancelled => HeadlessTurnPortError::Cancelled,
@@ -10085,6 +10151,158 @@ mod tests {
             }
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {
+        struct RecordingTaskTool(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl DispatchTool for RecordingTaskTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                arguments
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|agent| !agent.is_empty())
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| agens_core::Error::Tool("missing agent".into()))
+            }
+
+            fn execute(
+                &mut self,
+                _: &ToolExecutionContext,
+                _: serde_json::Value,
+            ) -> Result<ToolOutput, agens_core::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolOutput::success("executed"))
+            }
+        }
+
+        fn authorized_native_task_runtime<P: PermissionPrompter>(
+            directory: &Path,
+            policy: PermissionPolicy,
+            dispatcher: SharedToolDispatcher,
+            prompt: P,
+        ) -> AuthorizedNativeTaskRuntime<P> {
+            let grants = Arc::new(Mutex::new(Vec::new()));
+            let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+            let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+            let gate = ProductionPermissionGate::new(
+                policy.clone(),
+                Arc::clone(&grants),
+                PermissionSession::new(),
+                "project".into(),
+                Arc::clone(&dispatcher),
+                Arc::clone(&allowed),
+                Arc::clone(&prompts),
+            );
+            let resolver = ProductionPermissionResolver::new(
+                prompt,
+                PermissionGrantStore::open(directory).unwrap(),
+                grants,
+                prompts,
+                ProductionPromptAuthorization {
+                    policy,
+                    session: PermissionSession::new(),
+                    project: "project".into(),
+                    dispatcher: Arc::clone(&dispatcher),
+                    allowed: Arc::clone(&allowed),
+                },
+            );
+
+            AuthorizedNativeTaskRuntime {
+                gate,
+                resolver,
+                dispatcher: ProductionToolDispatcher::new(dispatcher, allowed),
+                next_call_id: 0,
+            }
+        }
+
+        let directory =
+            std::env::temp_dir().join(format!("agens-u15-authorization-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        dispatcher
+            .lock()
+            .unwrap()
+            .register_native(
+                "native::task",
+                agens_core::ToolAccess::Write,
+                RecordingTaskTool(Arc::clone(&executions)),
+            )
+            .unwrap();
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let mut model = authorized_native_task_runtime(
+            &directory,
+            policy.clone(),
+            Arc::clone(&dispatcher),
+            RecordingPrompt {
+                answers: vec![PermissionPromptAnswer::AllowOnce],
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let mut tui = authorized_native_task_runtime(
+            &directory,
+            policy,
+            Arc::clone(&dispatcher),
+            RecordingPrompt {
+                answers: vec![PermissionPromptAnswer::AllowOnce],
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+
+        assert_eq!(
+            model.launch("reviewer", "model task", false, &cancellation),
+            Ok(Some(HeadlessToolOutput::success("executed")))
+        );
+        assert_eq!(
+            tui.launch("reviewer", "TUI task", true, &cancellation),
+            Ok(Some(HeadlessToolOutput::success("executed")))
+        );
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let mut denied = authorized_native_task_runtime(
+            &directory,
+            PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Deny,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            ),
+            Arc::clone(&dispatcher),
+            RecordingPrompt {
+                answers: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        assert_eq!(
+            denied.launch("reviewer", "denied", false, &cancellation),
+            Ok(None)
+        );
+        assert_eq!(tui.launch("", "invalid", false, &cancellation), Ok(None));
+        assert_eq!(tui.launch("reviewer", "", false, &cancellation), Ok(None));
+        cancellation.cancel();
+        assert_eq!(
+            tui.launch("reviewer", "cancelled", false, &cancellation),
+            Err(HeadlessTurnPortError::Cancelled)
+        );
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -997,6 +997,39 @@ fn u15_lifecycle_shared_id_modes_and_terminal_ownership() {
 }
 
 #[test]
+fn u15_background_task_invocation_uses_the_shared_task_lifecycle() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut task = task_tool(LifecycleTaskRunner {
+        calls: Arc::new(AtomicUsize::new(0)),
+        observed: Arc::clone(&observed),
+        terminal: None,
+    });
+
+    assert_eq!(
+        task.execute(
+            &task_context(),
+            serde_json::json!({
+                "agent": "worker",
+                "description": "background task",
+                "background": true,
+            }),
+        )
+        .unwrap(),
+        ToolOutput::success("done")
+    );
+
+    let lifecycle = observed.lock().unwrap().pop().unwrap();
+    assert_eq!(lifecycle.mode(), TaskLaunchMode::Background);
+    assert_eq!(
+        lifecycle.events(),
+        vec![
+            TaskExecutionEvent::Admitted(lifecycle.id(), TaskLaunchMode::Background),
+            TaskExecutionEvent::Completed(lifecycle.id()),
+        ]
+    );
+}
+
+#[test]
 fn u15_lifecycle_terminal_follows_publication_winner_during_cancellation_and_deadline() {
     for (context, expected, event, cancel) in [
         (

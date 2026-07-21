@@ -131,6 +131,7 @@ pub struct TaskInvocation {
     agent: Option<String>,
     model: Option<String>,
     skills: Option<Vec<String>>,
+    background: bool,
     description: String,
 }
 
@@ -139,9 +140,13 @@ impl TaskInvocation {
         let object = value
             .as_object()
             .ok_or("task arguments must be an object")?;
-        if object.len() > 4
+        if object.len() > 5
             || object.keys().any(|key| {
-                key != "agent" && key != "description" && key != "model" && key != "skills"
+                key != "agent"
+                    && key != "background"
+                    && key != "description"
+                    && key != "model"
+                    && key != "skills"
             })
         {
             return Err("task arguments are invalid".into());
@@ -186,6 +191,11 @@ impl TaskInvocation {
             Some(_) => return Err("task skills are invalid".into()),
             None => None,
         };
+        let background = match object.get("background") {
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("task background is invalid".into()),
+            None => false,
+        };
         let description = object
             .get("description")
             .and_then(Value::as_str)
@@ -199,6 +209,7 @@ impl TaskInvocation {
             agent,
             model,
             skills,
+            background,
             description,
         })
     }
@@ -387,7 +398,7 @@ impl<R> TaskTool<R> {
     }
 
     pub fn input_schema() -> Value {
-        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+        serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     }
 
     fn resolve_agent(&self, requested: Option<&str>) -> Result<&AgentDefinition, ToolOutput> {
@@ -474,7 +485,16 @@ impl<R: TaskRunner> DispatchTool for TaskTool<R> {
         parent: &ToolExecutionContext,
         arguments: Value,
     ) -> Result<ToolOutput, Error> {
-        self.execute_with_launch_mode(parent, arguments, TaskLaunchMode::Foreground)
+        let mode = TaskInvocation::from_value(arguments.clone())
+            .map(|invocation| {
+                if invocation.background {
+                    TaskLaunchMode::Background
+                } else {
+                    TaskLaunchMode::Foreground
+                }
+            })
+            .unwrap_or(TaskLaunchMode::Foreground);
+        self.execute_with_launch_mode(parent, arguments, mode)
     }
 }
 
