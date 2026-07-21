@@ -67,6 +67,7 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "provider",
     "quit",
     "resume",
+    "select",
     "sessions",
     "subagent",
 ];
@@ -93,6 +94,7 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     ("help", "Show commands and skills", "", Some("help")),
     ("mcp", "Show configured MCP servers", "", Some("mcp")),
+    ("select", "Select a project file", "", Some("select")),
     ("quit", "Exit Agens", "", None),
 ];
 
@@ -1813,6 +1815,18 @@ impl TuiRuntimeRouter {
                 Vec::new(),
             ),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
+            "select" => {
+                let entries = tui_select_candidates(&bootstrap)?
+                    .into_iter()
+                    .map(|path| DialogEntry::action(&path, format!("select:{path}")))
+                    .collect();
+                DialogView::selection(
+                    "Select project file",
+                    Some("Choose one approved file | Esc cancel"),
+                    entries,
+                )
+                .with_empty_message("No approved project files are available.")
+            }
             "sessions" => {
                 let project = tui_project_identifier(&bootstrap)?;
                 let store = SessionStore::open(bootstrap.data_directory())
@@ -1889,6 +1903,12 @@ impl TuiRuntimeRouter {
         }
         let result = (|| {
             let bootstrap = self.bootstrap()?;
+            if let Some(path) = action_id.strip_prefix("select:") {
+                return Ok(TuiSubmissionOutcome::LocalInfo(format!(
+                    "Selected file: {}",
+                    selected_tui_file(&bootstrap, path)?
+                )));
+            }
             if let Some(identifier) = action_id.strip_prefix("session:") {
                 let identifier = identifier
                     .parse()
@@ -1964,6 +1984,7 @@ impl TuiRuntimeRouter {
         let outcome = match command {
             "/help" => self.open_dialog("help")?,
             "/mcp" => self.open_dialog("mcp")?,
+            "/select" => self.open_dialog("select")?,
             "/quit" => TuiSubmissionOutcome::Quit,
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
@@ -2801,6 +2822,25 @@ pub fn tui_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliErro
         .map_err(|_| CliError::configuration("native tools are unavailable"))?
         .tui_file_candidates(100)
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
+}
+
+fn selected_tui_file(bootstrap: &Bootstrap, selection: &str) -> Result<String, CliError> {
+    if selection.is_empty() || selection.chars().count() > 121 {
+        return Err(CliError::usage("selected file is invalid"));
+    }
+
+    tui_select_candidates(bootstrap)?
+        .into_iter()
+        .find(|candidate| candidate == selection)
+        .ok_or_else(|| CliError::usage("selected file is unavailable"))
+}
+
+fn tui_select_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
+    Ok(tui_file_candidates(bootstrap)?
+        .into_iter()
+        .filter(|path| path.chars().count() <= 121)
+        .take(64)
+        .collect())
 }
 
 fn expand_tui_file_reference(bootstrap: &Bootstrap, prompt: &str) -> Result<String, CliError> {
@@ -6725,6 +6765,7 @@ mod tests {
                 "effort",
                 "help",
                 "mcp",
+                "select",
                 "quit",
                 "review",
                 "shared",
@@ -8338,6 +8379,70 @@ mod tests {
                 .to_string(),
             "file: read: file exceeds 1048576 byte limit"
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_native_select_returns_one_confined_local_result() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tui_session_directory("native-select");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let project = temporary.join("project");
+        let outside = temporary.join("outside.txt");
+        std::fs::write(project.join("approved.txt"), "approved").unwrap();
+        std::fs::create_dir(project.join("directory")).unwrap();
+        std::fs::write(project.join("large.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        std::fs::write(&outside, "outside").unwrap();
+        symlink(&outside, project.join("escape.txt")).unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+
+        tui.apply_submission_outcome(router.route("/select".into()));
+        assert!(matches!(
+            tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape)),
+            agens_tui::Action::Render
+        ));
+        assert!(tui.view().dialog.is_none());
+        assert!(tui.transcript().is_empty());
+
+        assert!(matches!(
+            router.route("/select".into()),
+            TuiSubmissionOutcome::Dialog(_)
+        ));
+        let selected = router.route_request(
+            TuiRouteRequest::DialogAction("select:approved.txt".into()),
+            std::sync::mpsc::channel().0,
+        );
+        assert_eq!(
+            selected,
+            TuiSubmissionOutcome::LocalInfo("Selected file: approved.txt".into())
+        );
+        assert!(tui.apply_submission_outcome(selected).is_none());
+        assert!(tui.transcript().is_empty());
+        for selection in ["../outside.txt", "escape.txt", "directory", "large.txt"] {
+            let rejected = router.route_request(
+                TuiRouteRequest::DialogAction(format!("select:{selection}")),
+                std::sync::mpsc::channel().0,
+            );
+            assert!(matches!(
+                rejected,
+                TuiSubmissionOutcome::LocalActionableError { .. }
+            ));
+            assert!(tui.apply_submission_outcome(rejected).is_none());
+            assert!(tui.transcript().is_empty());
+        }
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
