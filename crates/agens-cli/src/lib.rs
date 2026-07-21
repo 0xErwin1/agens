@@ -5136,6 +5136,19 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
     }
 }
 
+struct TaskLaunchRequest<'a> {
+    agent: &'a str,
+    description: &'a str,
+    background: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum TaskLaunchOutcome {
+    Dispatched(HeadlessToolOutput),
+    RejectedEmptyInput,
+    RejectedCancelled,
+    Denied,
+}
+
 #[allow(dead_code)]
 struct AuthorizedNativeTaskRuntime<P> {
     gate: ProductionPermissionGate,
@@ -5148,16 +5161,14 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
     #[allow(dead_code)]
     fn launch(
         &mut self,
-        agent: &str,
-        description: &str,
-        background: bool,
+        request: TaskLaunchRequest<'_>,
         cancellation: &HeadlessTurnCancellation,
-    ) -> Result<Option<HeadlessToolOutput>, HeadlessTurnPortError> {
-        if agent.trim().is_empty() || description.trim().is_empty() {
-            return Ok(None);
+    ) -> Result<TaskLaunchOutcome, HeadlessTurnPortError> {
+        if request.agent.trim().is_empty() || request.description.trim().is_empty() {
+            return Ok(TaskLaunchOutcome::RejectedEmptyInput);
         }
         if cancellation.is_cancelled() {
-            return Err(HeadlessTurnPortError::Cancelled);
+            return Ok(TaskLaunchOutcome::RejectedCancelled);
         }
         if cancellation.is_expired() {
             return Err(HeadlessTurnPortError::TimedOut);
@@ -5168,9 +5179,9 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
             id: format!("tui-task-{}", self.next_call_id),
             name: "native::task".into(),
             input: serde_json::json!({
-                "agent": agent,
-                "description": description,
-                "background": background,
+                "agent": request.agent,
+                "description": request.description,
+                "background": request.background,
             })
             .to_string(),
         };
@@ -5182,10 +5193,11 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
         };
 
         if decision == PermissionDecision::Deny {
-            return Ok(None);
+            return Ok(TaskLaunchOutcome::Denied);
         }
 
-        poll_permission_port(self.dispatcher.dispatch(call, cancellation)).map(Some)
+        poll_permission_port(self.dispatcher.dispatch(call, cancellation))
+            .map(TaskLaunchOutcome::Dispatched)
     }
 }
 
@@ -10220,6 +10232,18 @@ mod tests {
             }
         }
 
+        fn launch_request<'a>(
+            agent: &'a str,
+            description: &'a str,
+            background: bool,
+        ) -> TaskLaunchRequest<'a> {
+            TaskLaunchRequest {
+                agent,
+                description,
+                background,
+            }
+        }
+
         let directory =
             std::env::temp_dir().join(format!("agens-u15-authorization-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -10235,7 +10259,7 @@ mod tests {
             )
             .unwrap();
 
-        let policy = PermissionPolicy::new(
+        let ask_policy = PermissionPolicy::new(
             PermissionMode::Edit,
             vec![PermissionRule::global(
                 PermissionDecision::Ask,
@@ -10245,7 +10269,14 @@ mod tests {
         );
         let mut model = authorized_native_task_runtime(
             &directory,
-            policy.clone(),
+            PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            ),
             Arc::clone(&dispatcher),
             RecordingPrompt {
                 answers: vec![PermissionPromptAnswer::AllowOnce],
@@ -10254,7 +10285,7 @@ mod tests {
         );
         let mut tui = authorized_native_task_runtime(
             &directory,
-            policy,
+            ask_policy,
             Arc::clone(&dispatcher),
             RecordingPrompt {
                 answers: vec![PermissionPromptAnswer::AllowOnce],
@@ -10264,12 +10295,20 @@ mod tests {
         let cancellation = HeadlessTurnCancellation::new();
 
         assert_eq!(
-            model.launch("reviewer", "model task", false, &cancellation),
-            Ok(Some(HeadlessToolOutput::success("executed")))
+            model.launch(
+                launch_request("reviewer", "model task", false),
+                &cancellation
+            ),
+            Ok(TaskLaunchOutcome::Dispatched(HeadlessToolOutput::success(
+                "executed"
+            )))
         );
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
-            tui.launch("reviewer", "TUI task", true, &cancellation),
-            Ok(Some(HeadlessToolOutput::success("executed")))
+            tui.launch(launch_request("reviewer", "TUI task", true), &cancellation),
+            Ok(TaskLaunchOutcome::Dispatched(HeadlessToolOutput::success(
+                "executed"
+            )))
         );
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
@@ -10290,15 +10329,24 @@ mod tests {
             },
         );
         assert_eq!(
-            denied.launch("reviewer", "denied", false, &cancellation),
-            Ok(None)
+            denied.launch(launch_request("reviewer", "denied", false), &cancellation),
+            Ok(TaskLaunchOutcome::Denied)
         );
-        assert_eq!(tui.launch("", "invalid", false, &cancellation), Ok(None));
-        assert_eq!(tui.launch("reviewer", "", false, &cancellation), Ok(None));
+        assert_eq!(
+            tui.launch(launch_request("", "invalid", false), &cancellation),
+            Ok(TaskLaunchOutcome::RejectedEmptyInput)
+        );
+        assert_eq!(
+            tui.launch(launch_request("reviewer", "", false), &cancellation),
+            Ok(TaskLaunchOutcome::RejectedEmptyInput)
+        );
         cancellation.cancel();
         assert_eq!(
-            tui.launch("reviewer", "cancelled", false, &cancellation),
-            Err(HeadlessTurnPortError::Cancelled)
+            tui.launch(
+                launch_request("reviewer", "cancelled", false),
+                &cancellation
+            ),
+            Ok(TaskLaunchOutcome::RejectedCancelled)
         );
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
