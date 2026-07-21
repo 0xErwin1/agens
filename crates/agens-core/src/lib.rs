@@ -159,6 +159,9 @@ pub struct SessionMetadata {
     pub project: String,
     pub title: String,
     pub active_agent: String,
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub created_at: i64,
     pub updated_at: i64,
     pub completed_turn_count: u64,
@@ -179,6 +182,22 @@ impl SessionMetadata {
             return Err(SessionMetadataError::InvalidActiveAgent);
         }
 
+        if self
+            .provider_id
+            .as_deref()
+            .is_some_and(|value| !is_catalog_name(value))
+        {
+            return Err(SessionMetadataError::InvalidProviderId);
+        }
+
+        if self
+            .model_id
+            .as_deref()
+            .is_some_and(|value| !is_model_identifier(value))
+        {
+            return Err(SessionMetadataError::InvalidModelId);
+        }
+
         (self.resumable == (self.completed_turn_count > 0))
             .then_some(())
             .ok_or(SessionMetadataError::InvalidResumability)
@@ -190,6 +209,8 @@ pub enum SessionMetadataError {
     InvalidId,
     EmptyProject,
     InvalidActiveAgent,
+    InvalidProviderId,
+    InvalidModelId,
     InvalidResumability,
 }
 
@@ -1602,6 +1623,14 @@ pub fn is_catalog_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+pub fn is_model_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AGENT_NAME_CHARS
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
 }
 
 fn is_bounded_description(value: &str) -> bool {

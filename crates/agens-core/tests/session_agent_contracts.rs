@@ -2,7 +2,7 @@ use agens_core::{
     AgentDefinition, AgentDefinitionError, AgentMode, CompletedSessionTurn,
     CompletedSessionTurnError, MAX_AGENT_DESCRIPTION_CHARS, MAX_AGENT_NAME_CHARS, MAX_AGENT_SKILLS,
     MAX_PERMISSION_GLOB_PATTERN_BYTES, MAX_PERMISSION_TARGET_BYTES, Message, MessagePart,
-    PermissionDecision, PermissionPattern, PermissionRule, Role, SessionMessage,
+    PermissionDecision, PermissionPattern, PermissionRule, ReasoningEffort, Role, SessionMessage,
     SessionMessageError, SessionMetadata, SessionMetadataError,
 };
 
@@ -189,6 +189,9 @@ fn session_metadata_enforces_identity_and_completion_boundaries() {
         project: "agens".into(),
         title: "Core contracts".into(),
         active_agent: "review-agent".into(),
+        provider_id: Some("openai-api".into()),
+        model_id: Some("gpt-5.5".into()),
+        reasoning_effort: Some(ReasoningEffort::XHigh),
         created_at: 10,
         updated_at: 11,
         completed_turn_count: 1,
@@ -235,6 +238,22 @@ fn session_metadata_enforces_identity_and_completion_boundaries() {
         }
         .validate(),
         Err(SessionMetadataError::InvalidActiveAgent)
+    );
+    assert_eq!(
+        SessionMetadata {
+            provider_id: Some("OpenAI API".into()),
+            ..resumable.clone()
+        }
+        .validate(),
+        Err(SessionMetadataError::InvalidProviderId)
+    );
+    assert_eq!(
+        SessionMetadata {
+            model_id: Some("bad model".into()),
+            ..resumable.clone()
+        }
+        .validate(),
+        Err(SessionMetadataError::InvalidModelId)
     );
     assert_eq!(
         SessionMetadata {

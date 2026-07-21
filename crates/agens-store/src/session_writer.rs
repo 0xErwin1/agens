@@ -1,4 +1,7 @@
-use agens_core::{CompletedSessionTurn, Message, MessagePart, Role, SessionMetadata};
+use agens_core::{
+    CompletedSessionTurn, Message, MessagePart, ReasoningEffort, RequestConfig, Role,
+    SessionMetadata,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{SessionStore, SessionStoreError};
@@ -23,7 +26,8 @@ impl SessionStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable
+                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
+                        provider_id, model_id, reasoning_effort
                  FROM sessions WHERE resumable = 1 ORDER BY updated_at DESC, id DESC",
             )
             .map_err(|error| SessionStoreError::operation("prepare session list", &self.database_path, error))?;
@@ -44,7 +48,8 @@ impl SessionStore {
         let metadata = self
             .connection
             .query_row(
-                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable
+                "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
+                        provider_id, model_id, reasoning_effort
                  FROM sessions WHERE id = ?1 AND resumable = 1",
                 [id],
                 session_metadata,
@@ -177,6 +182,63 @@ impl SessionStore {
         })
     }
 
+    pub fn update_session_selection(
+        &mut self,
+        metadata: &SessionMetadata,
+    ) -> Result<(), SessionStoreError> {
+        validate_metadata(metadata, &self.database_path)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "start session selection update",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        let count = i64::try_from(metadata.completed_turn_count).map_err(|error| {
+            SessionStoreError::operation("validate session metadata", &self.database_path, error)
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE sessions SET provider_id = ?1, model_id = ?2, reasoning_effort = ?3
+             WHERE id = ?4 AND project = ?5 AND title = ?6 AND active_agent = ?7
+               AND created_at = ?8 AND updated_at = ?9 AND completed_turn_count = ?10
+               AND resumable = ?11",
+                params![
+                    metadata.provider_id,
+                    metadata.model_id,
+                    metadata.reasoning_effort.map(ReasoningEffort::as_str),
+                    metadata.id,
+                    metadata.project,
+                    metadata.title,
+                    metadata.active_agent,
+                    metadata.created_at,
+                    metadata.updated_at,
+                    count,
+                    metadata.resumable,
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("update session selection", &self.database_path, error)
+            })?;
+        if changed != 1 {
+            return Err(SessionStoreError::operation(
+                "update session selection",
+                &self.database_path,
+                "session metadata changed",
+            ));
+        }
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation(
+                "commit session selection update",
+                &self.database_path,
+                error,
+            )
+        })
+    }
+
     pub fn delete_session(&mut self, id: i64) -> Result<(), SessionStoreError> {
         let transaction = self
             .connection
@@ -240,14 +302,18 @@ impl SessionStore {
         if metadata.id == 0 {
             transaction
                 .execute(
-                    "INSERT INTO sessions (project, title, active_agent, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO sessions (project, title, active_agent, provider_id, model_id,
+                                            reasoning_effort, created_at, updated_at)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         metadata.project,
                         metadata.title,
                         metadata.active_agent,
+                        metadata.provider_id,
+                        metadata.model_id,
+                        metadata.reasoning_effort.map(ReasoningEffort::as_str),
                         metadata.created_at,
-                        metadata.updated_at
+                        metadata.updated_at,
                     ],
                 )
                 .map_err(|error| {
@@ -257,28 +323,52 @@ impl SessionStore {
         } else {
             transaction
                 .execute(
-                "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
-                params![
-                    metadata.id,
-                    metadata.project,
-                    metadata.title,
-                    metadata.active_agent,
-                    metadata.created_at,
-                    metadata.updated_at
-                ],
+                    "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id,
+                                       reasoning_effort, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+                    params![
+                        metadata.id,
+                        metadata.project,
+                        metadata.title,
+                        metadata.active_agent,
+                        metadata.provider_id,
+                        metadata.model_id,
+                        metadata.reasoning_effort.map(ReasoningEffort::as_str),
+                        metadata.created_at,
+                        metadata.updated_at
+                    ],
                 )
                 .map_err(|error| {
-                SessionStoreError::operation("create session", &self.database_path, error)
+                    SessionStoreError::operation("create session", &self.database_path, error)
                 })?;
         }
         let metadata = &persisted_metadata;
-        if transaction.execute(
-            "UPDATE sessions SET active_agent = ?1, updated_at = ?2, completed_turn_count = completed_turn_count + 1, resumable = 1
-             WHERE id = ?3 AND completed_turn_count = ?4",
-            params![metadata.active_agent, metadata.updated_at, metadata.id, expected_turn_count],
-        ).map_err(|error| SessionStoreError::operation("update session", &self.database_path, error))? != 1 {
-            return Err(SessionStoreError::operation("update session", &self.database_path, "completed turn count changed"));
+        if transaction
+            .execute(
+                "UPDATE sessions SET active_agent = ?1, provider_id = ?2, model_id = ?3,
+                    reasoning_effort = ?4, updated_at = ?5,
+                    completed_turn_count = completed_turn_count + 1, resumable = 1
+             WHERE id = ?6 AND completed_turn_count = ?7",
+                params![
+                    metadata.active_agent,
+                    metadata.provider_id,
+                    metadata.model_id,
+                    metadata.reasoning_effort.map(ReasoningEffort::as_str),
+                    metadata.updated_at,
+                    metadata.id,
+                    expected_turn_count
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("update session", &self.database_path, error)
+            })?
+            != 1
+        {
+            return Err(SessionStoreError::operation(
+                "update session",
+                &self.database_path,
+                "completed turn count changed",
+            ));
         }
 
         let turn_sequence = next_sequence(&transaction, &self.database_path, "turns", metadata.id)?;
@@ -399,16 +489,59 @@ fn encode_role(role: Role) -> &'static str {
 fn session_metadata(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
     let completed_turn_count = row.get::<_, i64>(6)?;
 
-    Ok(SessionMetadata {
+    let reasoning_effort = row
+        .get::<_, Option<String>>(10)?
+        .map(|value| {
+            RequestConfig::with_reasoning_effort(&value)
+                .ok()
+                .and_then(|config| config.reasoning_effort())
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid reasoning effort",
+                        )
+                        .into(),
+                    )
+                })
+        })
+        .transpose()?;
+    let metadata = SessionMetadata {
         id: row.get(0)?,
         project: row.get(1)?,
         title: row.get(2)?,
         active_agent: row.get(3)?,
+        provider_id: row.get(8)?,
+        model_id: row.get(9)?,
+        reasoning_effort,
         created_at: row.get(4)?,
         updated_at: row.get(5)?,
         completed_turn_count: u64::try_from(completed_turn_count)
             .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(6, completed_turn_count))?,
         resumable: row.get(7)?,
+    };
+    metadata.validate().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid session metadata").into(),
+        )
+    })?;
+    Ok(metadata)
+}
+
+fn validate_metadata(
+    metadata: &SessionMetadata,
+    database_path: &std::path::Path,
+) -> Result<(), SessionStoreError> {
+    metadata.validate().map_err(|error| {
+        SessionStoreError::operation(
+            "validate session metadata",
+            database_path,
+            format!("{error:?}"),
+        )
     })
 }
 

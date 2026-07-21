@@ -4,7 +4,8 @@ use std::{
 };
 
 use agens_core::{
-    CompletedSessionTurn, Message, MessagePart, Role, SessionMessage, SessionMetadata,
+    CompletedSessionTurn, Message, MessagePart, ReasoningEffort, Role, SessionMessage,
+    SessionMetadata,
 };
 use agens_store::SessionStore;
 use rusqlite::Connection;
@@ -54,6 +55,9 @@ fn persists_text_completed_turn_and_reopens_in_order() {
         project: "project".into(),
         title: "title".into(),
         active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,
@@ -145,6 +149,9 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
         project: "project".into(),
         title: "title".into(),
         active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,
@@ -266,6 +273,9 @@ fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
         project: "project".into(),
         title: "title".into(),
         active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,
@@ -373,6 +383,9 @@ fn session_store_crud_round_trips_normalized_context() {
         project: "project".into(),
         title: "original".into(),
         active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,
@@ -459,6 +472,9 @@ fn session_store_rejects_legacy_resume_and_delete_is_idempotent() {
         project: "project".into(),
         title: "title".into(),
         active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,
@@ -483,5 +499,92 @@ fn session_store_rejects_legacy_resume_and_delete_is_idempotent() {
     store.delete_session(12).unwrap();
     store.delete_session(12).unwrap();
     assert!(store.list_sessions().unwrap().is_empty());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundaries() {
+    let directory = directory();
+    let completed = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("question".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("answer".into())],
+        },
+    ]);
+    let mut metadata = SessionMetadata {
+        id: 20,
+        project: "/project/a".into(),
+        title: "selection".into(),
+        active_agent: "primary".into(),
+        provider_id: Some("openai-chatgpt".into()),
+        model_id: Some("gpt-5.5".into()),
+        reasoning_effort: Some(ReasoningEffort::High),
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    metadata = store
+        .persist_completed_session_turn(&metadata, &completed)
+        .unwrap();
+    assert_eq!(
+        store.load_session_for_resume(20).unwrap().metadata,
+        metadata
+    );
+
+    metadata.provider_id = Some("openai-api".into());
+    metadata.model_id = Some("gpt-5.6".into());
+    metadata.reasoning_effort = None;
+    store.update_session_selection(&metadata).unwrap();
+    let before_failure = store.load_session_for_resume(20).unwrap().metadata;
+    Connection::open(store.database_path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_selection BEFORE UPDATE OF provider_id ON sessions
+         BEGIN SELECT RAISE(ABORT, 'reject selection'); END;",
+        )
+        .unwrap();
+    metadata.provider_id = Some("openai-chatgpt".into());
+    metadata.model_id = Some("gpt-5.4".into());
+    metadata.reasoning_effort = Some(ReasoningEffort::Low);
+    assert!(store.update_session_selection(&metadata).is_err());
+    assert_eq!(
+        store.load_session_for_resume(20).unwrap().metadata,
+        before_failure
+    );
+
+    let database = Connection::open(store.database_path()).unwrap();
+    let schema = database
+        .query_row(
+            "SELECT group_concat(name, ',') FROM pragma_table_info('sessions')",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(schema.ends_with("provider_id,model_id,reasoning_effort"));
+    for forbidden in [
+        "credential",
+        "token",
+        "account",
+        "base_url",
+        "secret-sentinel",
+    ] {
+        assert!(!schema.contains(forbidden));
+    }
+    drop(database);
+    store.delete_session(20).unwrap();
+    assert!(store.load_session_for_resume(20).is_err());
+    assert!(
+        store
+            .list_sessions()
+            .unwrap()
+            .iter()
+            .all(|session| session.project != "/project/a")
+    );
     fs::remove_dir_all(directory).unwrap();
 }
