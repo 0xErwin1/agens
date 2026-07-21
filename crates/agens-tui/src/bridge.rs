@@ -24,7 +24,6 @@ pub enum TuiPermissionReply {
     DeadlineExpired,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiPermissionRequest {
     id: u64,
     tool: String,
@@ -36,12 +35,8 @@ impl TuiPermissionRequest {
         self.id
     }
 
-    pub fn tool(&self) -> &str {
-        &self.tool
-    }
-
-    pub fn target(&self) -> &str {
-        &self.target
+    pub fn details(&self) -> (&str, &str) {
+        (&self.tool, &self.target)
     }
 }
 
@@ -49,6 +44,14 @@ struct PermissionBridgeState {
     closed: AtomicBool,
     next_id: AtomicU64,
     pending: Mutex<BTreeMap<u64, Sender<TuiPermissionReply>>>,
+}
+
+impl PermissionBridgeState {
+    fn pending(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, Sender<TuiPermissionReply>>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 }
 
 #[derive(Clone)]
@@ -65,7 +68,6 @@ impl TuiPermissionBridge {
             next_id: AtomicU64::new(0),
             pending: Mutex::new(BTreeMap::new()),
         });
-
         (Self { requests, state }, receiver)
     }
 
@@ -84,20 +86,13 @@ impl TuiPermissionBridge {
 
         let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        self.state
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(id, sender);
-        if self
-            .requests
-            .send(TuiPermissionRequest {
-                id,
-                tool: tool.into(),
-                target: target.into(),
-            })
-            .is_err()
-        {
+        self.state.pending().insert(id, sender);
+        let request = TuiPermissionRequest {
+            id,
+            tool: tool.into(),
+            target: target.into(),
+        };
+        if self.requests.send(request).is_err() {
             let _ = self.reply(id, TuiPermissionReply::Cancelled);
         }
 
@@ -121,33 +116,23 @@ impl TuiPermissionBridge {
 
     pub fn reply(&self, id: u64, reply: TuiPermissionReply) -> bool {
         self.state
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+            .pending()
             .remove(&id)
             .is_some_and(|sender| sender.send(reply).is_ok())
     }
 
     pub fn is_pending(&self, id: u64) -> bool {
-        self.state
-            .pending
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&id)
+        self.state.pending().contains_key(&id)
     }
 
-    pub fn close(&self) {
+    pub fn close(&self) -> bool {
         self.state.closed.store(true, Ordering::Release);
-        let pending = std::mem::take(
-            &mut *self
-                .state
-                .pending
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()),
-        );
+        let pending = std::mem::take(&mut *self.state.pending());
+        let had_pending = !pending.is_empty();
         for sender in pending.into_values() {
             let _ = sender.send(TuiPermissionReply::Cancelled);
         }
+        had_pending
     }
 }
 

@@ -488,7 +488,7 @@ fn bridge_fails_closed_when_receiver_disconnects_while_full() {
 }
 
 #[test]
-fn permission_wait_cancellation_fail_closed_once_and_late_reply_cannot_grant() {
+fn permission_wait_close_deadline_and_replies_remain_fail_closed() {
     let (bridge, requests) = TuiPermissionBridge::channel();
     let cancellation = HeadlessTurnCancellation::new();
     let waiting_bridge = bridge.clone();
@@ -498,14 +498,12 @@ fn permission_wait_cancellation_fail_closed_once_and_late_reply_cannot_grant() {
     });
 
     let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
-    cancellation.cancel();
+    assert!(bridge.close());
+    assert!(!bridge.close());
 
     assert_eq!(waiting.join().unwrap(), TuiPermissionReply::Cancelled);
     assert!(!bridge.reply(request.id(), TuiPermissionReply::AllowAlways));
-}
 
-#[test]
-fn permission_wait_deadline_and_in_time_replies_are_single_use() {
     let (bridge, requests) = TuiPermissionBridge::channel();
     let expired = HeadlessTurnCancellation::with_deadline(Duration::from_millis(100));
     let expired_bridge = bridge.clone();

@@ -2666,33 +2666,24 @@ where
     run_with_submit(tui, &mut renderer, submit)
 }
 
-/// Runs a submit worker that can forward ordered runtime events while it is active.
 struct PermissionBridgeTeardown(Option<TuiPermissionBridge>);
-
 impl Drop for PermissionBridgeTeardown {
     fn drop(&mut self) {
-        if let Some(bridge) = self.0.as_ref() {
-            bridge.close();
-        }
+        let _ = self.0.as_ref().is_some_and(TuiPermissionBridge::close);
     }
 }
 
-pub fn run_with_default_progress_submit<E, R, F>(
-    tui: &mut Tui<E>,
-    route: R,
-    submit: F,
-) -> io::Result<()>
-where
-    E: Engine + Send,
-    R: Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
-        + Send
-        + Sync
-        + 'static,
-    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
-        + Send
-        + Sync
-        + 'static,
-{
+pub fn run_with_default_progress_submit(
+    tui: &mut Tui<impl Engine + Send>,
+    route: impl Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
+    + Send
+    + Sync
+    + 'static,
+    submit: impl Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+    + Send
+    + Sync
+    + 'static,
+) -> io::Result<()> {
     run_with_default_progress_submit_with_permissions(tui, route, submit, None)
 }
 
@@ -2769,27 +2760,22 @@ where
             && permission_bridge.is_pending(request.id())
         {
             active_permission = Some(request.id());
+            let (tool, target) = request.details();
+            let entries = [
+                ("Allow once", "allow-once"),
+                ("Always allow", "allow-always"),
+                ("Deny once", "deny-once"),
+                ("Always deny", "deny-always"),
+            ]
+            .into_iter()
+            .map(|(label, answer)| {
+                DialogEntry::action(label, format!("permission:{}:{answer}", request.id()))
+            })
+            .collect();
             tui.show_selection_dialog(DialogView::selection(
                 "Permission required",
-                Some(format!("{}\n{}", request.tool(), request.target())),
-                vec![
-                    DialogEntry::action(
-                        "Allow once",
-                        format!("permission:{}:allow-once", request.id()),
-                    ),
-                    DialogEntry::action(
-                        "Always allow",
-                        format!("permission:{}:allow-always", request.id()),
-                    ),
-                    DialogEntry::action(
-                        "Deny once",
-                        format!("permission:{}:deny-once", request.id()),
-                    ),
-                    DialogEntry::action(
-                        "Always deny",
-                        format!("permission:{}:deny-always", request.id()),
-                    ),
-                ],
+                Some(format!("{tool}\n{target}")),
+                entries,
             ));
         }
         renderer.render(tui.view())?;

@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
@@ -41,8 +41,9 @@ use agens_tools::{
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
     Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiPermissionBridge,
-    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest,
-    TuiRuntimeEvent, TuiSubmissionOutcome, run_with_default_progress_submit_with_permissions,
+    TuiPermissionReply, TuiPermissionRequest, TuiPresentation, TuiProviderOutcome,
+    TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubmissionOutcome,
+    run_with_default_progress_submit_with_permissions,
 };
 
 mod chatgpt_auth;
@@ -2635,7 +2636,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     );
     tui.set_palette_entries(router.palette_entries().to_vec());
     let route_router = router.clone();
-    let (permission_bridge, permission_requests) = TuiPermissionBridge::channel();
+    let (permission_bridge, permission_requests) = production_tui_permission_bridge();
     let prompt_bridge = permission_bridge.clone();
     run_with_default_progress_submit_with_permissions(
         &mut tui,
@@ -4829,6 +4830,10 @@ impl PermissionPrompter for TtyPermissionPrompter {
 enum ProductionPermissionPrompter {
     Tty(TtyPermissionPrompter),
     Tui(TuiPermissionBridge),
+}
+
+fn production_tui_permission_bridge() -> (TuiPermissionBridge, Receiver<TuiPermissionRequest>) {
+    TuiPermissionBridge::channel()
 }
 
 impl PermissionPrompter for ProductionPermissionPrompter {
@@ -9864,18 +9869,6 @@ mod tests {
 
     #[test]
     fn production_prompt_decisions_authorize_only_allowed_calls() {
-        struct FixedPrompt(PermissionPromptAnswer);
-
-        impl PermissionPrompter for FixedPrompt {
-            fn prompt(
-                &mut self,
-                _: &PermissionPromptContext,
-                _: &HeadlessTurnCancellation,
-            ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
-                Ok(self.0)
-            }
-        }
-
         struct RecordingTool(Arc<std::sync::atomic::AtomicUsize>);
 
         impl DispatchTool for RecordingTool {
@@ -9967,8 +9960,24 @@ mod tests {
                 Arc::clone(&prompts),
             );
             let store = PermissionGrantStore::open(&directory).expect("grant store should open");
+            let (bridge, requests) = production_tui_permission_bridge();
+            let reply_bridge = bridge.clone();
+            let reply = std::thread::spawn(move || {
+                let request = requests
+                    .recv()
+                    .expect("permission request should reach the TUI");
+                let reply = match answer {
+                    PermissionPromptAnswer::AllowOnce => TuiPermissionReply::AllowOnce,
+                    PermissionPromptAnswer::AllowAlways => TuiPermissionReply::AllowAlways,
+                    PermissionPromptAnswer::DenyOnce => TuiPermissionReply::DenyOnce,
+                    PermissionPromptAnswer::DenyAlways => TuiPermissionReply::DenyAlways,
+                    PermissionPromptAnswer::Cancel => TuiPermissionReply::Cancelled,
+                };
+                let replied = reply_bridge.reply(request.id(), reply);
+                (request, replied)
+            });
             let mut resolver = ProductionPermissionResolver::new(
-                FixedPrompt(answer),
+                ProductionPermissionPrompter::Tui(bridge),
                 store,
                 Arc::clone(&grants),
                 Arc::clone(&prompts),
@@ -9987,6 +9996,10 @@ mod tests {
                 Ok(PermissionDecision::Ask)
             );
             let decision = run_ready(resolver.resolve(&call, &cancellation));
+            let (request, replied) = reply.join().expect("TUI permission reply should finish");
+            assert!(request.details().0.starts_with("native:"));
+            assert!(request.details().1.contains("notes.md"));
+            assert!(replied);
 
             match answer {
                 PermissionPromptAnswer::AllowOnce | PermissionPromptAnswer::AllowAlways => {
