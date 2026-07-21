@@ -4,6 +4,12 @@ use sha2::{Digest, Sha256};
 
 const SNAPSHOT: &[u8] = include_bytes!("../data/models.dev-openai.json");
 const SNAPSHOT_CHECKSUM: &str = include_str!("../data/models.dev-openai.json.sha256");
+const GPT_5_6_MODELS: [(&str, &str); 4] = [
+    ("gpt-5.6", "GPT-5.6 (Sol alias)"),
+    ("gpt-5.6-sol", "GPT-5.6 Sol"),
+    ("gpt-5.6-terra", "GPT-5.6 Terra"),
+    ("gpt-5.6-luna", "GPT-5.6 Luna"),
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ModelMetadata {
@@ -122,6 +128,10 @@ impl TuiModelSelector {
     }
 
     pub fn reasoning_effort_values(&self) -> Vec<&'static str> {
+        if is_gpt_5_6_model(&self.model) {
+            return vec!["default", "none", "low", "medium", "high", "xhigh", "max"];
+        }
+
         match (self.source, self.model.as_str()) {
             (
                 TuiModelSource::ChatGptSubscription,
@@ -139,6 +149,10 @@ impl TuiModelSelector {
             }
             _ => vec!["default"],
         }
+    }
+
+    pub fn reasoning_effort_default(&self) -> Option<&'static str> {
+        is_gpt_5_6_model(&self.model).then_some("medium")
     }
 
     pub fn reasoning_effort(&self) -> Option<&'static str> {
@@ -210,8 +224,21 @@ fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegi
             pinned_model("gpt-5.5", "GPT-5.5", 272_000, 128_000, true),
         ],
     };
+    models.retain(|model| !is_gpt_5_6_model(&model.id));
+    models.extend(official_gpt_5_6_models());
     models.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(models)
+}
+
+fn is_gpt_5_6_model(model: &str) -> bool {
+    GPT_5_6_MODELS.iter().any(|(id, _)| *id == model)
+}
+
+fn official_gpt_5_6_models() -> Vec<ModelMetadata> {
+    GPT_5_6_MODELS
+        .into_iter()
+        .map(|(id, name)| pinned_model(id, name, 1_050_000, 128_000, true))
+        .collect()
 }
 
 // Grounded in references/pi-mono at f58c1156; the bundled snapshot remains unchanged.

@@ -985,7 +985,7 @@ fn tui_resume_shapes_reach_the_injected_tui_launcher() {
 }
 
 #[test]
-fn tui_model_selector_applies_only_bundled_models_and_preserves_state_on_refusal() {
+fn tui_model_selector_applies_verified_api_catalog_and_preserves_state_on_refusal() {
     let mut selector = TuiModelSelector::new("gpt-4.1");
 
     assert_eq!(
@@ -999,6 +999,10 @@ fn tui_model_selector_applies_only_bundled_models_and_preserves_state_on_refusal
             "gpt-4o",
             "gpt-4o-mini",
             "gpt-5.5",
+            "gpt-5.6",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
             "o3",
             "o4-mini",
         ]
@@ -1032,7 +1036,16 @@ fn tui_model_selector_exposes_only_models_compatible_with_the_effective_source()
         subscription
             .model_values()
             .expect("subscription model registry should be available"),
-        ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
+        [
+            "gpt-5.3-codex-spark",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+        ]
     );
     assert_eq!(api.source_label(), "OpenAI API");
     assert_eq!(subscription.source_label(), "ChatGPT subscription");
@@ -1088,6 +1101,29 @@ fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_withou
 
     let non_reasoning = TuiModelSelector::new("gpt-4.1");
     assert_eq!(non_reasoning.reasoning_effort_values(), ["default"]);
+
+    for source in [
+        TuiModelSource::OpenAiApi,
+        TuiModelSource::ChatGptSubscription,
+    ] {
+        let mut gpt_5_6 = TuiModelSelector::for_source("gpt-5.6", source);
+        assert_eq!(gpt_5_6.reasoning_effort_default(), Some("medium"));
+        assert_eq!(
+            gpt_5_6.reasoning_effort_values(),
+            ["default", "none", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(
+            gpt_5_6.apply_reasoning_effort("minimal"),
+            Err("reasoning effort is unsupported".to_owned())
+        );
+        gpt_5_6
+            .apply_reasoning_effort("max")
+            .expect("official maximum effort should apply");
+        assert_eq!(
+            gpt_5_6.request_config().reasoning_effort(),
+            Some(ReasoningEffort::Max)
+        );
+    }
 }
 
 #[cfg(unix)]

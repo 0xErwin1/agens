@@ -1744,6 +1744,10 @@ impl TuiRuntimeRouter {
                 });
                 let current = selector.reasoning_effort().unwrap_or("default");
                 let values = selector.reasoning_effort_values();
+                let help = selector.reasoning_effort_default().map_or_else(
+                    || format!("Model: {model}"),
+                    |effort| format!("Model: {model} · Default: {effort}"),
+                );
                 let selected = values
                     .iter()
                     .position(|effort| *effort == current)
@@ -1764,8 +1768,7 @@ impl TuiRuntimeRouter {
                         DialogEntry::action(label, format!("effort:{effort}"))
                     })
                     .collect();
-                DialogView::selection("Choose effort", Some(format!("Model: {model}")), entries)
-                    .with_selected(selected)
+                DialogView::selection("Choose effort", Some(help), entries).with_selected(selected)
             }
             "help" => DialogView::selection(
                 "Commands and skills",
@@ -6711,7 +6714,7 @@ mod tests {
             });
             let router = TuiRuntimeRouter::new(
                 bootstrap,
-                session,
+                Arc::clone(&session),
                 cancellation,
                 Arc::new(CommandCatalog::default()),
                 Arc::new(SkillCatalog::default()),
@@ -6724,7 +6727,7 @@ mod tests {
                 )
                 .is_none()
             );
-            let text = render_tui_test_backend(&tui, 80, 24);
+            let text = render_tui_test_backend(&tui, 80, 60);
 
             assert!(text.contains(source), "{provider}: {text:?}");
             assert!(text.contains("gpt-5.5 (current)"), "{provider}: {text:?}");
@@ -6733,6 +6736,124 @@ mod tests {
             assert!(text.contains("272K context"), "{provider}: {text:?}");
             assert!(text.contains("128K output"), "{provider}: {text:?}");
             assert!(text.contains("reasoning"), "{provider}: {text:?}");
+
+            let source = if provider == "openai-chatgpt" {
+                TuiModelSource::ChatGptSubscription
+            } else {
+                TuiModelSource::OpenAiApi
+            };
+            let models = TuiModelSelector::for_source("gpt-5.5", source)
+                .models()
+                .unwrap();
+            let family = models
+                .iter()
+                .filter(|model| model.id.starts_with("gpt-5.6"))
+                .map(|model| {
+                    (
+                        model.id.as_str(),
+                        model.name.as_deref(),
+                        model.context,
+                        model.output,
+                        model.reasoning,
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                family,
+                [
+                    (
+                        "gpt-5.6",
+                        Some("GPT-5.6 (Sol alias)"),
+                        Some(1_050_000),
+                        Some(128_000),
+                        Some(true)
+                    ),
+                    (
+                        "gpt-5.6-luna",
+                        Some("GPT-5.6 Luna"),
+                        Some(1_050_000),
+                        Some(128_000),
+                        Some(true)
+                    ),
+                    (
+                        "gpt-5.6-sol",
+                        Some("GPT-5.6 Sol"),
+                        Some(1_050_000),
+                        Some(128_000),
+                        Some(true)
+                    ),
+                    (
+                        "gpt-5.6-terra",
+                        Some("GPT-5.6 Terra"),
+                        Some(1_050_000),
+                        Some(128_000),
+                        Some(true)
+                    ),
+                ],
+                "official OpenAI GPT-5.6 catalog metadata for {provider}"
+            );
+            for model in &family {
+                assert_eq!(
+                    models
+                        .iter()
+                        .filter(|candidate| candidate.id == model.0)
+                        .count(),
+                    1,
+                    "duplicate {} in {provider}",
+                    model.0
+                );
+            }
+            assert!(text.contains("gpt-5.6"), "{provider}: {text:?}");
+            assert!(text.contains("gpt-5.6-luna"), "{provider}: {text:?}");
+            assert!(
+                !text.contains("unverified metadata"),
+                "{provider}: {text:?}"
+            );
+
+            for _ in 0..4 {
+                tui.handle(Event::Key(Key::Down));
+            }
+            let scrolled = render_tui_test_backend(&tui, 80, 24);
+            assert!(scrolled.contains("gpt-5.6-sol"), "{provider}: {scrolled:?}");
+            assert!(
+                scrolled.contains("gpt-5.6-terra"),
+                "{provider}: {scrolled:?}"
+            );
+            tui.handle(Event::Key(Key::Up));
+            tui.handle(Event::Key(Key::Up));
+            tui.handle(Event::Key(Key::Up));
+            let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+                panic!("verified gpt-5.6 alias should be selectable");
+            };
+            let outcome = router.route_request(
+                TuiRouteRequest::DialogAction(action_id),
+                std::sync::mpsc::channel().0,
+            );
+            assert!(matches!(
+                &outcome,
+                TuiSubmissionOutcome::ContextChanged { message, presentation }
+                    if message == "Model: gpt-5.6."
+                        && presentation == &TuiPresentation::new(provider, "gpt-5.6", "new session")
+            ));
+            tui.apply_submission_outcome(outcome);
+            let selection = session.lock().unwrap().selection.clone().unwrap();
+            assert!(selection.metadata_known());
+            assert_eq!(selection.reasoning_effort_default(), Some("medium"));
+            assert_eq!(
+                selection.reasoning_effort_values(),
+                ["default", "none", "low", "medium", "high", "xhigh", "max"]
+            );
+
+            tui.apply_submission_outcome(router.open_dialog("model").unwrap());
+            for character in "gpt-5.6-sol".chars() {
+                tui.handle(Event::Key(Key::Char(character)));
+            }
+            let filtered = render_tui_test_backend(&tui, 80, 24);
+            assert!(filtered.contains("gpt-5.6-sol"), "{provider}: {filtered:?}");
+            assert!(
+                !filtered.contains("unverified metadata"),
+                "{provider}: {filtered:?}"
+            );
 
             std::fs::remove_dir_all(temporary).unwrap();
         }
@@ -7005,7 +7126,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_model_overlay_selects_exact_unverified_id_with_unknown_metadata_and_default_effort() {
+    fn tui_model_overlay_selects_exact_future_id_with_unknown_metadata_and_default_effort() {
         let temporary = tui_session_directory("unverified-model");
         let bootstrap =
             tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
@@ -7031,12 +7152,12 @@ mod tests {
             progress.clone(),
         ));
 
-        for character in "gpt-5.6".chars() {
+        for character in "gpt-future-1".chars() {
             tui.handle(Event::Key(Key::Char(character)));
         }
         let overlay = render_tui_test_backend(&tui, 80, 24);
         assert!(
-            overlay.contains("Use gpt-5.6 (unverified metadata)"),
+            overlay.contains("Use gpt-future-1 (unverified metadata)"),
             "{overlay:?}"
         );
         let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
@@ -7052,16 +7173,16 @@ mod tests {
         };
         assert_eq!(
             message,
-            "Model: gpt-5.6 (unverified metadata). Reasoning effort reset to Default."
+            "Model: gpt-future-1 (unverified metadata). Reasoning effort reset to Default."
         );
         assert_eq!(
             presentation,
-            &TuiPresentation::new("openai-api", "gpt-5.6", "new session")
+            &TuiPresentation::new("openai-api", "gpt-future-1", "new session")
         );
         tui.apply_submission_outcome(outcome);
 
         let selection = session.lock().unwrap().selection.clone().unwrap();
-        assert_eq!(selection.model(), "gpt-5.6");
+        assert_eq!(selection.model(), "gpt-future-1");
         assert!(!selection.metadata_known());
         assert_eq!(selection.reasoning_effort(), None);
         assert_eq!(
@@ -8290,31 +8411,24 @@ mod tests {
 
     #[test]
     fn tui_model_and_effort_commands_reach_each_provider_with_latest_selection_only() {
-        for (provider_type, expected_effort) in [("openai-api", "xhigh"), ("openai-chatgpt", "low")]
-        {
-            let request = run_tui_model_effort_provider_case(provider_type);
+        for provider_type in ["openai-api", "openai-chatgpt"] {
+            for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+                let request = run_tui_model_effort_provider_case(provider_type, model);
 
-            let expected_model = if provider_type == "openai-api" {
-                "gpt-5.6"
-            } else {
-                "gpt-5.5"
-            };
-            assert_eq!(request["model"], expected_model, "{provider_type}");
-            assert!(
-                !request.to_string().contains("gpt-4.1"),
-                "{provider_type} request retained the replaced model: {request}"
-            );
-
-            let reasoning = &request["reasoning"];
-            if provider_type == "openai-api" {
-                assert!(reasoning.is_null(), "{provider_type}: {request}");
-            } else {
-                assert_eq!(reasoning["effort"], expected_effort, "{provider_type}");
+                assert_eq!(request["model"], model, "{provider_type}: {model}");
+                assert_eq!(request["reasoning"]["effort"], "max", "{request}");
+                assert!(
+                    !request.to_string().contains("gpt-4.1"),
+                    "{provider_type} request retained the replaced model: {request}"
+                );
             }
         }
     }
 
-    fn run_tui_model_effort_provider_case(provider_type: &str) -> serde_json::Value {
+    fn run_tui_model_effort_provider_case(
+        provider_type: &str,
+        selected_model: &str,
+    ) -> serde_json::Value {
         let temporary = std::env::temp_dir().join(format!(
             "agens-tui-model-effort-{provider_type}-{}-{}",
             std::process::id(),
@@ -8419,24 +8533,32 @@ mod tests {
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let cancellation = HeadlessTurnCancellation::new();
 
-        let commands = if provider_type == "openai-chatgpt" {
-            [
-                ("/model gpt-5.4", "Model: gpt-5.4."),
-                ("/effort high", "Reasoning effort: high."),
-                ("/model gpt-5.5", "Model: gpt-5.5."),
-                ("/effort minimal", "Reasoning effort: minimal."),
-            ]
+        let previous_model = if provider_type == "openai-chatgpt" {
+            "gpt-5.4"
         } else {
-            [
-                ("/model o3", "Model: o3."),
-                ("/effort high", "Reasoning effort: high."),
-                ("/model gpt-5.5", "Model: gpt-5.5."),
-                ("/effort xhigh", "Reasoning effort: xhigh."),
-            ]
+            "o3"
         };
+        let commands = [
+            (
+                format!("/model {previous_model}"),
+                format!("Model: {previous_model}."),
+            ),
+            (
+                "/effort high".to_owned(),
+                "Reasoning effort: high.".to_owned(),
+            ),
+            (
+                format!("/model {selected_model}"),
+                format!("Model: {selected_model}."),
+            ),
+            (
+                "/effort max".to_owned(),
+                "Reasoning effort: max.".to_owned(),
+            ),
+        ];
         for (command, expected) in commands {
             assert_eq!(
-                run_tui_prompt(&bootstrap, command, &cancellation, &session, None)
+                run_tui_prompt(&bootstrap, &command, &cancellation, &session, None)
                     .expect("valid TUI selection should succeed"),
                 expected
             );
@@ -8472,13 +8594,6 @@ mod tests {
             .to_string(),
             "config: reasoning effort is unsupported"
         );
-        if provider_type == "openai-api" {
-            assert_eq!(
-                apply_tui_unverified_model(&bootstrap, "gpt-5.6", &session)
-                    .expect("bounded unverified model should be selected"),
-                "Model: gpt-5.6 (unverified metadata). Reasoning effort reset to Default."
-            );
-        }
         let runtime_bootstrap = TuiRuntimeRouter::new(
             bootstrap.clone(),
             Arc::clone(&session),
@@ -8508,23 +8623,31 @@ mod tests {
             persisted.metadata.provider_id.as_deref(),
             Some(provider_type)
         );
-        assert_eq!(
-            persisted.metadata.model_id.as_deref(),
-            Some(if provider_type == "openai-api" {
-                "gpt-5.6"
-            } else {
-                "gpt-5.5"
-            })
-        );
+        assert_eq!(persisted.metadata.model_id.as_deref(), Some(selected_model));
         assert_eq!(
             persisted
                 .metadata
                 .reasoning_effort
                 .map(agens_core::ReasoningEffort::as_str),
-            (provider_type == "openai-chatgpt").then_some("minimal")
+            Some("max")
         );
         assert!(!format!("{persisted:?}").contains("test-key"));
         assert!(!format!("{persisted:?}").contains("refresh"));
+
+        let reopened = resume_tui_session(
+            &bootstrap,
+            persisted.metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::with_environment(BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "test-key".into(),
+            )])),
+        )
+        .expect("persisted selection should reopen");
+        let reopened_selection = reopened.selection.unwrap();
+        assert_eq!(reopened_selection.model(), selected_model);
+        assert!(reopened_selection.metadata_known());
+        assert_eq!(reopened_selection.reasoning_effort(), Some("max"));
 
         let request = worker.join().expect("mock provider should finish");
         std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
