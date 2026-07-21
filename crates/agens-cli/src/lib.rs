@@ -2704,7 +2704,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
-            let task_runtime = match production_tui_task_runtime(
+            let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
                 &router.skills,
                 prompt_bridge.clone(),
@@ -2712,6 +2712,19 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            match launch_selected_tui_task(
+                &mut task_runtime,
+                &router.session,
+                &prompt,
+                false,
+                &turn_cancellation,
+            ) {
+                Ok(TuiSelectedTaskLaunch::NotSelected | TuiSelectedTaskLaunch::Dispatched) => {}
+                Ok(TuiSelectedTaskLaunch::Rejected(outcome)) => {
+                    return tui_provider_outcome(Err(selected_task_launch_error(outcome)));
+                }
+                Err(error) => return tui_provider_outcome(Err(error)),
+            }
             let result = run_tui_prompt_with(
                 &runtime_bootstrap,
                 &prompt,
@@ -5307,6 +5320,13 @@ struct TaskLaunchRequest<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum TuiSelectedTaskLaunch {
+    NotSelected,
+    Dispatched,
+    Rejected(TaskLaunchOutcome),
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum TaskLaunchOutcome {
     Dispatched(HeadlessToolOutput),
     RejectedEmptyInput,
@@ -5314,7 +5334,6 @@ enum TaskLaunchOutcome {
     Denied,
 }
 
-#[allow(dead_code)]
 struct AuthorizedNativeTaskRuntime<P> {
     gate: ProductionPermissionGate,
     resolver: ProductionPermissionResolver<P>,
@@ -5323,7 +5342,6 @@ struct AuthorizedNativeTaskRuntime<P> {
 }
 
 impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
-    #[allow(dead_code)]
     fn launch(
         &mut self,
         request: TaskLaunchRequest<'_>,
@@ -5363,6 +5381,51 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
 
         poll_permission_port(self.dispatcher.dispatch(call, cancellation))
             .map(TaskLaunchOutcome::Dispatched)
+    }
+}
+
+fn launch_selected_tui_task(
+    runtime: &mut ProductionTuiTaskRuntime,
+    session: &Arc<Mutex<TuiSessionContext>>,
+    description: &str,
+    background: bool,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<TuiSelectedTaskLaunch, CliError> {
+    let agent = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?
+        .selected_subagent
+        .take();
+    let Some(agent) = agent else {
+        return Ok(TuiSelectedTaskLaunch::NotSelected);
+    };
+
+    match runtime.authorized.launch(
+        TaskLaunchRequest {
+            agent: &agent,
+            description,
+            background,
+        },
+        cancellation,
+    ) {
+        Ok(TaskLaunchOutcome::Dispatched(output)) if !output.is_error => {
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        }
+        Ok(outcome) => Ok(TuiSelectedTaskLaunch::Rejected(outcome)),
+        Err(HeadlessTurnPortError::Cancelled) => {
+            Err(CliError::runtime(HeadlessTurnError::Cancelled))
+        }
+        Err(HeadlessTurnPortError::TimedOut) => Err(CliError::runtime(HeadlessTurnError::TimedOut)),
+        Err(_) => Err(CliError::runtime(HeadlessTurnError::Tool)),
+    }
+}
+
+fn selected_task_launch_error(outcome: TaskLaunchOutcome) -> CliError {
+    match outcome {
+        TaskLaunchOutcome::RejectedEmptyInput => CliError::usage("subagent task is empty"),
+        TaskLaunchOutcome::RejectedCancelled => CliError::runtime(HeadlessTurnError::Cancelled),
+        TaskLaunchOutcome::Denied => CliError::runtime(HeadlessTurnError::Permission),
+        TaskLaunchOutcome::Dispatched(_) => CliError::runtime(HeadlessTurnError::Tool),
     }
 }
 
@@ -10589,6 +10652,289 @@ mod tests {
         assert_eq!(probe.len(), 1);
         assert_eq!(probe[0].1, TaskLaunchMode::Foreground);
         assert_eq!(probe[0].2, "gpt-4o");
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
+        let temporary = tui_session_directory("selected-task-launch");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let (bridge, requests) = production_tui_permission_bridge();
+        let reply_bridge = bridge.clone();
+        let reply = std::thread::spawn(move || {
+            let request = requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("selected task should request permission");
+            reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
+        });
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            bridge,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let cancellation = HeadlessTurnCancellation::new();
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let mut dispatcher = runtime.dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::task",
+                    serde_json::json!({
+                        "agent": "reviewer",
+                        "description": "model task",
+                        "background": true,
+                    }),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("registered model task should authorize");
+        };
+        assert_eq!(
+            dispatcher
+                .execute(
+                    handle,
+                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+                )
+                .unwrap()
+                .content,
+            "probe"
+        );
+        drop(dispatcher);
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.len(), 2);
+        assert_eq!(probe[0].1, TaskLaunchMode::Background);
+        assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
+        assert_ne!(probe[0].0, probe[1].0);
+        assert!(reply.join().unwrap());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
+        fn policy(decision: PermissionDecision) -> PermissionPolicy {
+            PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    decision,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            )
+        }
+
+        let temporary = tui_session_directory("selected-task-cardinality");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let (bridge, requests) = production_tui_permission_bridge();
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            bridge.clone(),
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+        let cancellation = HeadlessTurnCancellation::new();
+        let selected = || {
+            Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }))
+        };
+
+        runtime.authorized.gate.policy = policy(PermissionDecision::Allow);
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "allow", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        assert!(requests.try_recv().is_err());
+
+        let ask = policy(PermissionDecision::Ask);
+        runtime.authorized.gate.policy = ask.clone();
+        runtime.authorized.resolver.authorization.policy = ask;
+        let reply_bridge = bridge.clone();
+        let reply = std::thread::spawn(move || {
+            let request = requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("ask should prompt once");
+            reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
+        });
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "ask", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        assert!(reply.join().unwrap());
+        assert_eq!(probe.lock().unwrap().len(), 2);
+
+        runtime.authorized.gate.policy = policy(PermissionDecision::Deny);
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "deny", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Rejected(TaskLaunchOutcome::Denied))
+        );
+        assert_eq!(probe.lock().unwrap().len(), 2);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn u15_a1b2_rejections_leave_the_concrete_runner_and_grants_unchanged() {
+        let temporary = tui_session_directory("selected-task-rejections");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let (bridge, requests) = production_tui_permission_bridge();
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            bridge.clone(),
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+        let selected = || {
+            Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }))
+        };
+        let cancellation = HeadlessTurnCancellation::new();
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Rejected(
+                TaskLaunchOutcome::RejectedEmptyInput
+            ))
+        );
+        cancellation.cancel();
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "cancelled", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Rejected(
+                TaskLaunchOutcome::RejectedCancelled
+            ))
+        );
+        assert_eq!(probe.lock().unwrap().len(), 0);
+        assert!(requests.try_recv().is_err());
+        assert!(runtime.authorized.gate.grants.lock().unwrap().is_empty());
+
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let unavailable = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("missing".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        assert_eq!(
+            launch_selected_tui_task(
+                &mut runtime,
+                &unavailable,
+                "missing",
+                false,
+                &HeadlessTurnCancellation::new(),
+            ),
+            Err(CliError::runtime(HeadlessTurnError::Tool))
+        );
+        assert_eq!(probe.lock().unwrap().len(), 0);
+
+        let expired = HeadlessTurnCancellation::with_deadline(std::time::Duration::ZERO);
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "expired", false, &expired),
+            Err(CliError::runtime(HeadlessTurnError::TimedOut))
+        );
+        assert_eq!(probe.lock().unwrap().len(), 0);
+
+        let ask = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        runtime.authorized.gate.policy = ask.clone();
+        runtime.authorized.resolver.authorization.policy = ask;
+        let active = HeadlessTurnCancellation::new();
+        let reply_bridge = bridge.clone();
+        let reply = std::thread::spawn(move || {
+            [TuiPermissionReply::DenyOnce, TuiPermissionReply::Cancelled]
+                .into_iter()
+                .map(|answer| {
+                    let request = requests
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .expect("asked rejection should prompt once");
+                    reply_bridge.reply(request.id(), answer)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "deny once", false, &active),
+            Ok(TuiSelectedTaskLaunch::Rejected(TaskLaunchOutcome::Denied))
+        );
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &selected(), "cancel ask", false, &active),
+            Err(CliError::runtime(HeadlessTurnError::Cancelled))
+        );
+        assert!(reply.join().unwrap().into_iter().all(|replied| replied));
+        assert_eq!(probe.lock().unwrap().len(), 0);
+        assert!(runtime.authorized.gate.grants.lock().unwrap().is_empty());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
