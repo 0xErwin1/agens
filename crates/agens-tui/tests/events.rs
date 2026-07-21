@@ -621,6 +621,53 @@ fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
 }
 
 #[test]
+fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
+    let dialog = DialogView::selection(
+        "Choose model",
+        Some("Search models"),
+        vec![DialogEntry::action("gpt-5.5", "model:gpt-5.5")],
+    )
+    .with_identifier_query_action("Use ", " (unverified metadata)", "model-custom:", 64);
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(dialog);
+
+    for character in "gpt-5.6".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("model-custom:gpt-5.6".into())
+    );
+
+    let dialog = DialogView::selection(
+        "Choose model",
+        Some("Search models"),
+        vec![DialogEntry::action("gpt-5.5", "model:gpt-5.5")],
+    )
+    .with_identifier_query_action("Use ", " (unverified metadata)", "model-custom:", 8);
+    tui.show_selection_dialog(dialog);
+    for character in "model-too-long".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    let dialog = DialogView::selection(
+        "Choose model",
+        Some("Search models"),
+        vec![DialogEntry::action("gpt-5.5", "model:gpt-5.5")],
+    )
+    .with_identifier_query_action("Use ", " (unverified metadata)", "model-custom:", 64);
+    tui.show_selection_dialog(dialog);
+    for character in "bad*model".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+}
+
+#[test]
 fn selection_dialog_search_edits_navigates_filtered_rows_and_clears_before_closing() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Resize {

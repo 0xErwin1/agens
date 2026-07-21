@@ -1526,6 +1526,12 @@ impl TuiRuntimeRouter {
                     entries,
                 )
                 .with_selected(selected)
+                .with_identifier_query_action(
+                    "Use ",
+                    " (unverified metadata)",
+                    "model-custom:",
+                    64,
+                )
             }
             "effort" => {
                 let context = self
@@ -1671,6 +1677,8 @@ impl TuiRuntimeRouter {
             }
             let message = if let Some(model) = action_id.strip_prefix("model:") {
                 apply_tui_model(&bootstrap, model, &self.session)?
+            } else if let Some(model) = action_id.strip_prefix("model-custom:") {
+                apply_tui_unverified_model(&bootstrap, model, &self.session)?
             } else if let Some(effort) = action_id.strip_prefix("effort:") {
                 apply_tui_effort(&bootstrap, effort, &self.session)?
             } else if let Some(agent) = action_id.strip_prefix("agent:") {
@@ -2447,6 +2455,31 @@ fn apply_tui_model(
             )
         },
     ))
+}
+
+fn apply_tui_unverified_model(
+    bootstrap: &Bootstrap,
+    model: &str,
+    session: &Arc<Mutex<TuiSessionContext>>,
+) -> Result<String, CliError> {
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+    let mut selector = context
+        .selection
+        .clone()
+        .unwrap_or_else(|| TuiModelSelector::for_source(model, tui_model_source(bootstrap)));
+    let reset_effort = selector.reasoning_effort().is_some();
+    selector
+        .apply_unverified_model(model)
+        .map_err(CliError::configuration)?;
+    context.selection = Some(selector);
+
+    Ok(if reset_effort {
+        format!("Model: {model} (unverified metadata). Reasoning effort reset to Default.")
+    } else {
+        format!("Model: {model} (unverified metadata).")
+    })
 }
 
 fn select_tui_effort(
@@ -6269,6 +6302,76 @@ mod tests {
     }
 
     #[test]
+    fn tui_model_overlay_selects_exact_unverified_id_with_unknown_metadata_and_default_effort() {
+        let temporary = tui_session_directory("unverified-model");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            cancellation,
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let (progress, _) = std::sync::mpsc::channel();
+        assert!(matches!(
+            router.route("/effort xhigh".into()),
+            TuiSubmissionOutcome::ContextChanged { .. }
+        ));
+        tui.apply_submission_outcome(router.route_request(
+            TuiRouteRequest::OpenDialog("model".into()),
+            progress.clone(),
+        ));
+
+        for character in "gpt-5.6".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        let overlay = render_tui_test_backend(&tui, 80, 24);
+        assert!(
+            overlay.contains("Use gpt-5.6 (unverified metadata)"),
+            "{overlay:?}"
+        );
+        let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("unverified model should dispatch a local action");
+        };
+        let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
+        let TuiSubmissionOutcome::ContextChanged {
+            message,
+            presentation,
+        } = &outcome
+        else {
+            panic!("unverified model should update session context");
+        };
+        assert_eq!(
+            message,
+            "Model: gpt-5.6 (unverified metadata). Reasoning effort reset to Default."
+        );
+        assert_eq!(
+            presentation,
+            &TuiPresentation::new("openai-api", "gpt-5.6", "new session")
+        );
+        tui.apply_submission_outcome(outcome);
+
+        let selection = session.lock().unwrap().selection.clone().unwrap();
+        assert_eq!(selection.model(), "gpt-5.6");
+        assert!(!selection.metadata_known());
+        assert_eq!(selection.reasoning_effort(), None);
+        assert_eq!(
+            selection.request_config(),
+            &agens_core::RequestConfig::default()
+        );
+        assert!(session.lock().unwrap().messages.is_empty());
+        assert!(tui.transcript().is_empty());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_effort_overlay_and_model_change_use_grounded_sets_and_atomic_reset() {
         let temporary = tui_session_directory("effort-capabilities");
         let bootstrap =
@@ -7464,14 +7567,23 @@ mod tests {
         {
             let request = run_tui_model_effort_provider_case(provider_type);
 
-            assert_eq!(request["model"], "gpt-5.5", "{provider_type}");
+            let expected_model = if provider_type == "openai-api" {
+                "gpt-5.6"
+            } else {
+                "gpt-5.5"
+            };
+            assert_eq!(request["model"], expected_model, "{provider_type}");
             assert!(
                 !request.to_string().contains("gpt-4.1"),
                 "{provider_type} request retained the replaced model: {request}"
             );
 
             let reasoning = &request["reasoning"];
-            assert_eq!(reasoning["effort"], expected_effort, "{provider_type}");
+            if provider_type == "openai-api" {
+                assert!(reasoning.is_null(), "{provider_type}: {request}");
+            } else {
+                assert_eq!(reasoning["effort"], expected_effort, "{provider_type}");
+            }
         }
     }
 
@@ -7627,6 +7739,13 @@ mod tests {
             .to_string(),
             "config: reasoning effort is unsupported"
         );
+        if provider_type == "openai-api" {
+            assert_eq!(
+                apply_tui_unverified_model(&bootstrap, "gpt-5.6", &session)
+                    .expect("bounded unverified model should be selected"),
+                "Model: gpt-5.6 (unverified metadata). Reasoning effort reset to Default."
+            );
+        }
         assert_eq!(
             run_tui_prompt(&bootstrap, "next request", &cancellation, &session, None)
                 .expect("selected prompt should complete"),

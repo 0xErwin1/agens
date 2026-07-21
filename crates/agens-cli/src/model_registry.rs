@@ -51,6 +51,7 @@ impl TuiModelSource {
 pub struct TuiModelSelector {
     model: String,
     source: TuiModelSource,
+    metadata_known: bool,
     reasoning_effort: Option<ReasoningEffort>,
     request_config: RequestConfig,
 }
@@ -64,6 +65,7 @@ impl TuiModelSelector {
         Self {
             model: model.into(),
             source,
+            metadata_known: true,
             reasoning_effort: None,
             request_config: RequestConfig::default(),
         }
@@ -86,12 +88,17 @@ impl TuiModelSelector {
         &self.model
     }
 
+    pub const fn metadata_known(&self) -> bool {
+        self.metadata_known
+    }
+
     pub fn apply_model(&mut self, model: &str) -> Result<(), String> {
         if !self.models()?.iter().any(|candidate| candidate.id == model) {
             return Err(format!("model is unavailable for {}", self.source.label()));
         }
 
         self.model = model.to_owned();
+        self.metadata_known = true;
         if self
             .reasoning_effort
             .is_some_and(|effort| !self.reasoning_effort_values().contains(&effort.as_str()))
@@ -99,6 +106,18 @@ impl TuiModelSelector {
             self.reasoning_effort = None;
             self.request_config = RequestConfig::default();
         }
+        Ok(())
+    }
+
+    pub fn apply_unverified_model(&mut self, model: &str) -> Result<(), String> {
+        if !valid_model_id(model) {
+            return Err("model identifier is invalid".to_owned());
+        }
+
+        self.model = model.to_owned();
+        self.metadata_known = false;
+        self.reasoning_effort = None;
+        self.request_config = RequestConfig::default();
         Ok(())
     }
 
@@ -152,6 +171,14 @@ impl TuiModelSelector {
             .map_err(|_| "reasoning effort is unsupported".to_owned())?;
         Ok(())
     }
+}
+
+fn valid_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 64
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
 }
 
 fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegistryError> {

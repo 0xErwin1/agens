@@ -416,6 +416,15 @@ struct SessionDialogEntries {
     showing_all_projects: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DialogQueryAction {
+    label_prefix: String,
+    label_suffix: String,
+    action_prefix: String,
+    base_entry_count: usize,
+    max_query_chars: usize,
+}
+
 /// Generic bounded dialog state for informational, selection, and confirmation overlays.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DialogView {
@@ -427,6 +436,7 @@ pub struct DialogView {
     offset: usize,
     interactive: bool,
     session_entries: Option<SessionDialogEntries>,
+    query_action: Option<DialogQueryAction>,
 }
 
 impl DialogView {
@@ -448,6 +458,7 @@ impl DialogView {
             offset: 0,
             interactive: true,
             session_entries: None,
+            query_action: None,
         }
     }
 
@@ -480,6 +491,24 @@ impl DialogView {
         self
     }
 
+    pub fn with_identifier_query_action(
+        mut self,
+        label_prefix: impl AsRef<str>,
+        label_suffix: impl AsRef<str>,
+        action_prefix: impl AsRef<str>,
+        max_query_chars: usize,
+    ) -> Self {
+        self.query_action = Some(DialogQueryAction {
+            label_prefix: bounded_dialog_text(label_prefix.as_ref(), 64),
+            label_suffix: bounded_dialog_text(label_suffix.as_ref(), 64),
+            action_prefix: bounded_dialog_text(action_prefix.as_ref(), 64),
+            base_entry_count: self.entries.len(),
+            max_query_chars,
+        });
+        refresh_dialog_query_action(&mut self);
+        self
+    }
+
     fn informational(title: impl AsRef<str>, body: impl AsRef<str>) -> Self {
         Self {
             title: bounded_dialog_text(title.as_ref(), 64),
@@ -490,8 +519,34 @@ impl DialogView {
             offset: 0,
             interactive: false,
             session_entries: None,
+            query_action: None,
         }
     }
+}
+
+fn refresh_dialog_query_action(dialog: &mut DialogView) {
+    let Some(action) = dialog.query_action.clone() else {
+        return;
+    };
+    dialog.entries.truncate(action.base_entry_count);
+    let query_chars = dialog.query.chars().count();
+    if query_chars == 0
+        || query_chars > action.max_query_chars
+        || !dialog.query.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+        || !dialog_matches(dialog).is_empty()
+    {
+        return;
+    }
+
+    dialog.entries.push(DialogEntry::action(
+        format!(
+            "{}{}{}",
+            action.label_prefix, dialog.query, action.label_suffix
+        ),
+        format!("{}{}", action.action_prefix, dialog.query),
+    ));
 }
 
 fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
@@ -1957,6 +2012,7 @@ where
             Key::Char(character) => {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.push(character);
+                    refresh_dialog_query_action(dialog);
                 }
                 self.reset_dialog_selection();
                 Action::Render
@@ -1964,6 +2020,7 @@ where
             Key::Backspace => {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.pop();
+                    refresh_dialog_query_action(dialog);
                 }
                 self.reset_dialog_selection();
                 Action::Render
@@ -1973,6 +2030,7 @@ where
                     let boundary =
                         previous_word_boundary(&dialog.query, dialog.query.chars().count());
                     dialog.query.truncate(byte_index(&dialog.query, boundary));
+                    refresh_dialog_query_action(dialog);
                 }
                 self.reset_dialog_selection();
                 Action::Render
@@ -2012,6 +2070,7 @@ where
             {
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.clear();
+                    refresh_dialog_query_action(dialog);
                 }
                 self.reset_dialog_selection();
                 Action::Render
