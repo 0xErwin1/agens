@@ -61,6 +61,7 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "help",
     "model",
     "new",
+    "provider",
     "quit",
     "resume",
     "sessions",
@@ -74,6 +75,12 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("sessions", "List saved sessions", "", None),
     ("resume", "Resume a saved session", "<id>", None),
     ("agent", "List or select the primary agent", "[name]", None),
+    (
+        "provider",
+        "Select runtime provider",
+        "[name]",
+        Some("provider"),
+    ),
     ("model", "List or select the model", "[name]", Some("model")),
     (
         "effort",
@@ -1085,6 +1092,7 @@ struct TuiSessionContext {
     active_agent: Option<ActiveAgentRuntime>,
     pending_system_reminder: Option<String>,
     selection: Option<TuiModelSelector>,
+    provider: Option<TuiProvider>,
     selected_subagent: Option<String>,
     running: bool,
 }
@@ -1302,6 +1310,7 @@ impl TuiSessionContext {
             active_agent: Some(active_agent),
             pending_system_reminder: None,
             selection: None,
+            provider: None,
             selected_subagent: None,
             running: false,
         }
@@ -1347,6 +1356,102 @@ impl TuiSessionContext {
     }
 }
 
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TuiProvider {
+    OpenAiApi,
+    OpenAiChatGpt,
+}
+
+impl TuiProvider {
+    const ALL: [Self; 2] = [Self::OpenAiChatGpt, Self::OpenAiApi];
+
+    const fn identifier(self) -> &'static str {
+        ["openai-api", "openai-chatgpt"][self as usize]
+    }
+
+    const fn label(self) -> &'static str {
+        ["OpenAI API", "ChatGPT subscription"][self as usize]
+    }
+
+    const fn source(self) -> TuiModelSource {
+        [
+            TuiModelSource::OpenAiApi,
+            TuiModelSource::ChatGptSubscription,
+        ][self as usize]
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.identifier() == value)
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy)]
+enum TuiProviderStatus {
+    Ready,
+    RefreshRequired,
+    ConnectRequired,
+    CredentialRequired,
+}
+
+impl TuiProviderStatus {
+    const fn label(self) -> &'static str {
+        [
+            "ready",
+            "refresh required",
+            "connect required",
+            "credential required",
+        ][self as usize]
+    }
+
+    const fn available(self) -> bool {
+        matches!(self, Self::Ready | Self::RefreshRequired)
+    }
+}
+
+#[derive(Clone)]
+struct TuiCredentialResolver {
+    environment: Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>,
+}
+
+impl TuiCredentialResolver {
+    fn production() -> Self {
+        Self {
+            environment: Arc::new(|| std::env::vars().collect()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_environment(environment: BTreeMap<String, String>) -> Self {
+        Self {
+            environment: Arc::new(move || environment.clone()),
+        }
+    }
+
+    fn status(&self, path: &Path, provider: TuiProvider) -> TuiProviderStatus {
+        match provider {
+            TuiProvider::OpenAiChatGpt => {
+                match load_chatgpt_auth_state(path, std::time::SystemTime::now()) {
+                    Ok(ChatGptAuthState::Ready) => TuiProviderStatus::Ready,
+                    Ok(ChatGptAuthState::RefreshRequired) => TuiProviderStatus::RefreshRequired,
+                    Err(_) => TuiProviderStatus::ConnectRequired,
+                }
+            }
+            TuiProvider::OpenAiApi => {
+                let credentials = fs::read_to_string(path).ok();
+                if openai_api_key(credentials.as_deref(), &(self.environment)()).is_some() {
+                    TuiProviderStatus::Ready
+                } else {
+                    TuiProviderStatus::CredentialRequired
+                }
+            }
+        }
+    }
+}
+
 impl TuiEngine for ProductionTuiEngine {
     fn cancel(&mut self) {
         if let Ok(cancellation) = self.cancellation.lock()
@@ -1363,6 +1468,7 @@ struct TuiRuntimeRouter {
     session: Arc<Mutex<TuiSessionContext>>,
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
+    credentials: TuiCredentialResolver,
     commands: Arc<CommandCatalog>,
     skills: Arc<SkillCatalog>,
     palette: Arc<[PaletteEntry]>,
@@ -1401,6 +1507,7 @@ impl TuiRuntimeRouter {
             session,
             cancellation,
             auth,
+            credentials: TuiCredentialResolver::production(),
             commands,
             skills,
             palette,
@@ -1485,6 +1592,50 @@ impl TuiRuntimeRouter {
                     DialogEntry::cancel("Cancel"),
                 ],
             ),
+            "provider" => {
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let current = current_tui_provider(&bootstrap, &context);
+                let entries = TuiProvider::ALL
+                    .into_iter()
+                    .filter_map(|provider| {
+                        let status = self
+                            .credentials
+                            .status(&bootstrap.paths.credentials, provider);
+                        status.available().then(|| {
+                            let label = if Some(provider) == current {
+                                format!("{} (current)", provider.label())
+                            } else {
+                                provider.label().to_owned()
+                            };
+                            DialogEntry::action_with_detail(
+                                label,
+                                Some(status.label()),
+                                format!("provider:{}", provider.identifier()),
+                            )
+                        })
+                    })
+                    .collect();
+                let help = current.map_or_else(
+                    || "Current: not configured".to_owned(),
+                    |provider| {
+                        let status = self
+                            .credentials
+                            .status(&bootstrap.paths.credentials, provider);
+                        let remediation = matches!(status, TuiProviderStatus::ConnectRequired)
+                            .then_some(" · run /connect")
+                            .unwrap_or_default();
+                        format!(
+                            "Current: {} · {}{remediation}",
+                            provider.label(),
+                            status.label()
+                        )
+                    },
+                );
+                DialogView::selection("Choose provider", Some(help), entries)
+            }
             "model" => {
                 let context = self
                     .session
@@ -1497,9 +1648,9 @@ impl TuiRuntimeRouter {
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(&bootstrap))
                     .to_owned();
+                let source = tui_model_source(&bootstrap, &context);
                 drop(context);
-                let selector =
-                    TuiModelSelector::for_source(current.clone(), tui_model_source(&bootstrap));
+                let selector = TuiModelSelector::for_source(current.clone(), source);
                 let values = selector.models().map_err(CliError::unavailable)?;
                 let selected = values
                     .iter()
@@ -1545,7 +1696,7 @@ impl TuiRuntimeRouter {
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(&bootstrap));
                 let selector = context.selection.clone().unwrap_or_else(|| {
-                    TuiModelSelector::for_source(model, tui_model_source(&bootstrap))
+                    TuiModelSelector::for_source(model, tui_model_source(&bootstrap, &context))
                 });
                 let current = selector.reasoning_effort().unwrap_or("default");
                 let values = selector.reasoning_effort_values();
@@ -1679,6 +1830,8 @@ impl TuiRuntimeRouter {
                 apply_tui_model(&bootstrap, model, &self.session)?
             } else if let Some(model) = action_id.strip_prefix("model-custom:") {
                 apply_tui_unverified_model(&bootstrap, model, &self.session)?
+            } else if let Some(provider) = action_id.strip_prefix("provider:") {
+                self.apply_provider(&bootstrap, provider)?
             } else if let Some(effort) = action_id.strip_prefix("effort:") {
                 apply_tui_effort(&bootstrap, effort, &self.session)?
             } else if let Some(agent) = action_id.strip_prefix("agent:") {
@@ -1728,6 +1881,11 @@ impl TuiRuntimeRouter {
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
             "/disconnect" => self.open_dialog("disconnect")?,
+            "/provider" => self.open_dialog("provider")?,
+            command if command.starts_with("/provider ") => TuiSubmissionOutcome::ContextChanged {
+                message: self.apply_provider(&bootstrap, &command[10..])?,
+                presentation: self.presentation()?,
+            },
             "/new" => {
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
@@ -1836,14 +1994,13 @@ impl TuiRuntimeRouter {
             })
             .or_else(|| bootstrap.model())
             .unwrap_or_else(|| default_model(&bootstrap));
+        let provider = current_tui_provider(&bootstrap, &session)
+            .map(TuiProvider::identifier)
+            .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
         let label = session
             .identifier
             .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
-        Ok(TuiPresentation::new(
-            bootstrap.provider_type().unwrap_or("provider"),
-            model,
-            label,
-        ))
+        Ok(TuiPresentation::new(provider, model, label))
     }
 
     fn bootstrap(&self) -> Result<Bootstrap, CliError> {
@@ -1915,23 +2072,94 @@ impl TuiRuntimeRouter {
     }
 
     fn reconcile_provider(&self, connected: bool) -> Result<(), CliError> {
-        let mut bootstrap = self
-            .bootstrap
-            .lock()
-            .map_err(|_| CliError::storage("TUI provider state is unavailable"))?;
-        match (bootstrap.provider_source, connected) {
-            (ProviderSource::Auto, true) => {
-                bootstrap.provider_type = Some("openai-chatgpt".into());
+        let bootstrap = self.bootstrap()?;
+        if connected && bootstrap.provider_source != ProviderSource::ExplicitOther {
+            self.apply_provider(&bootstrap, "openai-chatgpt")?;
+        } else if !connected {
+            let context = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            let current = current_tui_provider(&bootstrap, &context);
+            drop(context);
+            if current == Some(TuiProvider::OpenAiChatGpt)
+                && self
+                    .credentials
+                    .status(&bootstrap.paths.credentials, TuiProvider::OpenAiApi)
+                    .available()
+            {
+                self.apply_provider(&bootstrap, "openai-api")?;
             }
-            (ProviderSource::Auto, false) => {
-                bootstrap.provider_type = resolve_current_auto_provider(&bootstrap)?;
-            }
-            (ProviderSource::ExplicitChatGpt, _) => {
-                bootstrap.provider_type = Some("openai-chatgpt".into());
-            }
-            (ProviderSource::ExplicitOther, _) => {}
         }
         Ok(())
+    }
+
+    fn apply_provider(&self, bootstrap: &Bootstrap, provider: &str) -> Result<String, CliError> {
+        let provider = TuiProvider::parse(provider)
+            .ok_or_else(|| CliError::usage("provider is not implemented"))?;
+        let mut context = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        if context.running {
+            return Err(CliError::runtime(HeadlessTurnError::State));
+        }
+        let status = self
+            .credentials
+            .status(&bootstrap.paths.credentials, provider);
+        if !status.available() {
+            let message = if provider == TuiProvider::OpenAiChatGpt {
+                "ChatGPT subscription requires connection; run /connect"
+            } else {
+                "OpenAI API credentials are unavailable"
+            };
+            return Err(CliError::authentication(message));
+        }
+
+        let current_model = context
+            .selection
+            .as_ref()
+            .map(TuiModelSelector::model)
+            .or_else(|| {
+                context
+                    .active_agent
+                    .as_ref()
+                    .and_then(|agent| agent.model.as_deref())
+            })
+            .or_else(|| bootstrap.model())
+            .unwrap_or_else(|| default_model(bootstrap));
+        let previous_effort = context
+            .selection
+            .as_ref()
+            .and_then(TuiModelSelector::reasoning_effort);
+        let mut next = TuiModelSelector::for_source(current_model, provider.source());
+        let compatible = next
+            .model_values()
+            .map_err(CliError::unavailable)?
+            .iter()
+            .any(|model| model == current_model);
+        let label = provider.label();
+        let message = if compatible {
+            let reset_effort =
+                previous_effort.is_some_and(|effort| next.apply_reasoning_effort(effort).is_err());
+            if reset_effort {
+                format!(
+                    "Provider: {label}. Model retained: {current_model}. Reasoning effort reset to Default."
+                )
+            } else {
+                format!("Provider: {label}. Model retained: {current_model}.")
+            }
+        } else {
+            let previous = current_model.to_owned();
+            let default = ["gpt-4.1", "gpt-5.5"][provider as usize];
+            next = TuiModelSelector::for_source(default, provider.source());
+            format!(
+                "Provider: {label}. Model reset to {default} and reasoning effort reset to Default because {previous} is unavailable."
+            )
+        };
+        context.provider = Some(provider);
+        context.selection = Some(next);
+        Ok(message)
     }
 }
 
@@ -2370,11 +2598,16 @@ fn complete_tui_turn(
     Ok(completion.text)
 }
 
-fn tui_model_source(bootstrap: &Bootstrap) -> TuiModelSource {
-    match bootstrap.provider_type() {
-        Some("openai-chatgpt") => TuiModelSource::ChatGptSubscription,
-        _ => TuiModelSource::OpenAiApi,
-    }
+fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> Option<TuiProvider> {
+    context
+        .provider
+        .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
+}
+
+fn tui_model_source(bootstrap: &Bootstrap, context: &TuiSessionContext) -> TuiModelSource {
+    current_tui_provider(bootstrap, context)
+        .unwrap_or(TuiProvider::OpenAiApi)
+        .source()
 }
 
 fn format_model_metadata(model: &model_registry::ModelMetadata) -> String {
@@ -2409,14 +2642,15 @@ fn select_tui_model(
 ) -> Result<String, CliError> {
     let model = command.strip_prefix("/model").unwrap_or_default().trim();
     if model.is_empty() {
-        let selector = TuiModelSelector::for_source("gpt-4.1", tui_model_source(bootstrap));
+        let context = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        let selector =
+            TuiModelSelector::for_source("gpt-4.1", tui_model_source(bootstrap, &context));
         let values = selector
             .model_values()
             .map_err(CliError::unavailable)?
             .join(", ");
-        let context = session
-            .lock()
-            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         let current = context
             .selection
             .as_ref()
@@ -2437,10 +2671,9 @@ fn apply_tui_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-    let mut selector = context
-        .selection
-        .clone()
-        .unwrap_or_else(|| TuiModelSelector::for_source(model, tui_model_source(bootstrap)));
+    let mut selector = context.selection.clone().unwrap_or_else(|| {
+        TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context))
+    });
     let previous_effort = selector.reasoning_effort();
     selector
         .apply_model(model)
@@ -2465,10 +2698,9 @@ fn apply_tui_unverified_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-    let mut selector = context
-        .selection
-        .clone()
-        .unwrap_or_else(|| TuiModelSelector::for_source(model, tui_model_source(bootstrap)));
+    let mut selector = context.selection.clone().unwrap_or_else(|| {
+        TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context))
+    });
     let reset_effort = selector.reasoning_effort().is_some();
     selector
         .apply_unverified_model(model)
@@ -2518,7 +2750,7 @@ fn apply_tui_effort(
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
         .unwrap_or_else(|| default_model(bootstrap));
-    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap));
+    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
@@ -2873,7 +3105,7 @@ fn required_flag_value(
         .ok_or_else(|| CliError::usage(format!("chat {flag} requires a value")))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ProviderSource {
     Auto,
     ExplicitChatGpt,
@@ -4656,24 +4888,6 @@ fn resolve_provider_type(
     None
 }
 
-fn resolve_current_auto_provider(bootstrap: &Bootstrap) -> Result<Option<String>, CliError> {
-    let credentials = match fs::read_to_string(&bootstrap.paths.credentials) {
-        Ok(credentials) => Some(credentials),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => return Err(CliError::storage("ChatGPT credentials are unavailable")),
-    };
-    let environment = bootstrap
-        .openai_api_key
-        .as_ref()
-        .map(|key| BTreeMap::from([("OPENAI_API_KEY".into(), key.clone())]))
-        .unwrap_or_default();
-    Ok(resolve_provider_type(
-        None,
-        credentials.as_deref(),
-        &environment,
-    ))
-}
-
 fn openai_api_key(
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
@@ -6042,6 +6256,7 @@ mod tests {
                 "sessions",
                 "resume",
                 "agent",
+                "provider",
                 "model",
                 "effort",
                 "help",
@@ -6299,6 +6514,23 @@ mod tests {
 
             std::fs::remove_dir_all(temporary).unwrap();
         }
+    }
+
+    #[test]
+    fn tui_provider_availability_uses_complete_current_credentials_without_exposing_them() {
+        let temporary = tui_session_directory("provider-status");
+        let credentials = temporary.join("auth.json");
+        std::fs::write(
+            &credentials,
+            r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let resolver = TuiCredentialResolver::with_environment(BTreeMap::new());
+
+        let statuses =
+            TuiProvider::ALL.map(|provider| resolver.status(&credentials, provider).label());
+        assert_eq!(statuses, ["ready", "credential required"]);
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -6834,31 +7066,25 @@ mod tests {
         ));
         assert_eq!(progress_rx.try_iter().count(), 1);
         assert_eq!(*flows.lock().unwrap(), vec![ChatGptAuthFlow::Device]);
-        assert_eq!(*session.lock().unwrap(), TuiSessionContext::fresh());
-        assert!(router.bootstrap().unwrap().provider_type() == Some("openai-chatgpt"));
+        let context = session.lock().unwrap();
+        assert_eq!(context.provider, Some(TuiProvider::OpenAiChatGpt));
+        assert!(context.messages.is_empty());
+        drop(context);
+        let configured = router.bootstrap().unwrap();
+        assert_eq!(configured.provider_type(), Some("openai-api"));
         let connected = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(connected.contains("new-access"));
 
         assert!(router.disconnect().is_ok());
-        assert!(router.bootstrap().unwrap().provider_type() == Some("openai-api"));
+        assert_eq!(
+            session.lock().unwrap().provider,
+            Some(TuiProvider::OpenAiApi)
+        );
         let stored = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(stored.contains("preserved"));
         assert!(stored.contains("kept"));
         assert!(!stored.contains("new-access"));
 
-        for (source, provider) in [
-            (ProviderSource::ExplicitChatGpt, "openai-chatgpt"),
-            (ProviderSource::ExplicitOther, "openai-api"),
-            (ProviderSource::ExplicitOther, "unrelated"),
-        ] {
-            let mut bootstrap = router.bootstrap.lock().unwrap();
-            bootstrap.provider_source = source;
-            bootstrap.provider_type = Some(provider.into());
-            drop(bootstrap);
-            router.reconcile_provider(true).unwrap();
-            router.reconcile_provider(false).unwrap();
-            assert_eq!(router.bootstrap().unwrap().provider_type(), Some(provider));
-        }
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
