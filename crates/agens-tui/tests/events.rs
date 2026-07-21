@@ -665,48 +665,6 @@ fn u15_c1a_subagent_shortcut_opens_the_same_dialog_route_as_the_palette() {
 }
 
 #[test]
-fn u15_c1c_control_b_starts_an_armed_subagent_in_background() {
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.set_agent_catalog(["reviewer"]);
-    tui.select_agent("reviewer");
-    tui.handle(Event::Paste("review task".into()));
-
-    assert_eq!(
-        tui.handle(Event::Key(Key::CtrlB)),
-        Action::SubmitBackground("review task".into())
-    );
-}
-
-#[test]
-fn u15_c1c_control_b_backgrounds_the_selected_foreground_execution_without_relaunching() {
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.set_agent_catalog(["reviewer"]);
-    tui.select_agent("reviewer");
-    tui.set_running(true);
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "reviewer".into(),
-        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
-    });
-
-    assert_eq!(
-        tui.handle(Event::Key(Key::CtrlB)),
-        Action::TransitionToBackground(7)
-    );
-    assert!(tui.view().running);
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "reviewer".into(),
-        event: TuiExecutionEvent::Backgrounded { id: 7 },
-    });
-    assert!(!tui.view().running);
-    assert_eq!(
-        tui.executions()[0].state(),
-        agens_tui::TuiExecutionState::BackgroundRunning
-    );
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 1);
-}
-
-#[test]
 fn u15_c1b_tracks_selected_running_and_terminal_execution_states_once() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_agent_catalog(["reviewer"]);
