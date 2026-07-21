@@ -997,6 +997,54 @@ fn u15_lifecycle_shared_id_modes_and_terminal_ownership() {
 }
 
 #[test]
+fn u15_lifecycle_terminal_follows_publication_winner_during_cancellation_and_deadline() {
+    for (context, expected, event, cancel) in [
+        (
+            ToolExecutionContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+            ToolOutput::failure("task: cancelled"),
+            TaskExecutionEvent::Cancelled as fn(_) -> _,
+            true,
+        ),
+        (
+            ToolExecutionContext::with_timeout(Duration::from_millis(50)),
+            ToolOutput::failure("task: timed out"),
+            TaskExecutionEvent::Failed as fn(_) -> _,
+            false,
+        ),
+    ] {
+        let (paused_sender, paused_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let observed = Arc::new(Mutex::new(None));
+        let cancellation = context.cancellation_handle();
+        let mut task = task_tool(PublicationPausedTaskRunner {
+            paused: paused_sender,
+            release: release_receiver,
+            observed: Arc::clone(&observed),
+        });
+        let call = thread::spawn(move || task.execute(&context, task_arguments()).unwrap());
+
+        paused_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        if cancel {
+            cancellation.store(true, Ordering::Release);
+        }
+
+        assert_eq!(call.join().unwrap(), expected);
+        release_sender.send(()).unwrap();
+
+        let lifecycle = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            lifecycle.events(),
+            vec![
+                TaskExecutionEvent::Admitted(lifecycle.id(), TaskLaunchMode::Foreground),
+                event(lifecycle.id()),
+            ]
+        );
+    }
+}
+
+#[test]
 fn effective_capabilities_normalize_aliases_globs_projects_and_last_matches() {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
@@ -1315,6 +1363,33 @@ struct LifecycleTaskRunner {
     calls: Arc<AtomicUsize>,
     observed: Arc<Mutex<Vec<TaskExecutionLifecycle>>>,
     terminal: Option<TaskRunnerError>,
+}
+
+struct PublicationPausedTaskRunner {
+    paused: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    observed: Arc<Mutex<Option<TaskExecutionLifecycle>>>,
+}
+
+impl TaskRunner for PublicationPausedTaskRunner {
+    fn run(
+        &mut self,
+        _: TaskTurnRequest,
+        context: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        let lifecycle = context.execution().cloned().expect("admitted lifecycle");
+        self.observed.lock().unwrap().replace(lifecycle);
+        let paused = self.paused.clone();
+        let release = std::mem::replace(&mut self.release, mpsc::channel().1);
+        context.set_before_publication_hook(move || {
+            paused.send(()).unwrap();
+            release.recv().unwrap();
+        });
+        Ok(TaskTurnResult {
+            output: "done".into(),
+            iterations: 1,
+        })
+    }
 }
 
 impl TaskRunner for LifecycleTaskRunner {

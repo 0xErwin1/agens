@@ -284,6 +284,7 @@ pub struct TaskRunContext {
     pub cancellation: Arc<std::sync::atomic::AtomicBool>,
     pub deadline: Instant,
     execution: Option<TaskExecutionLifecycle>,
+    before_publication: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 
 impl TaskRunContext {
@@ -292,6 +293,7 @@ impl TaskRunContext {
             cancellation: parent.cancellation_handle(),
             deadline: parent.deadline().min(Instant::now() + TASK_TIMEOUT),
             execution: None,
+            before_publication: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -302,6 +304,24 @@ impl TaskRunContext {
 
     pub fn execution(&self) -> Option<&TaskExecutionLifecycle> {
         self.execution.as_ref()
+    }
+
+    pub fn set_before_publication_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .before_publication
+            .lock()
+            .expect("task publication hook lock poisoned") = Some(Box::new(hook));
+    }
+
+    fn run_before_publication_hook(&self) {
+        if let Some(hook) = self
+            .before_publication
+            .lock()
+            .expect("task publication hook lock poisoned")
+            .take()
+        {
+            hook();
+        }
     }
 
     fn terminal_output(&self) -> Option<ToolOutput> {
@@ -508,25 +528,22 @@ impl<R: TaskRunner> TaskTool<R> {
                 result.unwrap_or_else(task_error_output)
             };
 
-            let terminal = task_terminal_state(&output);
-            if let Some(lifecycle) = worker_context.execution() {
-                lifecycle.finish(terminal);
-            }
+            worker_context.run_before_publication_hook();
 
             if worker_publication
                 .compare_exchange(OPEN, PUBLISHED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                if let Some(lifecycle) = worker_context.execution() {
+                    lifecycle.finish(task_terminal_state(&output));
+                }
                 let _ = sender.send(output);
             }
         });
 
         loop {
             if let Some(output) = context.terminal_output() {
-                let output = finish_task_call(&publication, &receiver, output);
-                if let Some(lifecycle) = context.execution() {
-                    lifecycle.finish(task_terminal_state(&output));
-                }
+                let output = finish_task_call(&publication, &receiver, output, context.execution());
                 return Ok(output);
             }
 
@@ -541,10 +558,8 @@ impl<R: TaskRunner> TaskTool<R> {
                         &publication,
                         &receiver,
                         task_terminal(HeadlessTaskTerminal::ChildFailure),
+                        context.execution(),
                     );
-                    if let Some(lifecycle) = context.execution() {
-                        lifecycle.finish(task_terminal_state(&output));
-                    }
                     return Ok(output);
                 }
             }
@@ -603,9 +618,16 @@ fn finish_task_call(
     publication: &AtomicU8,
     receiver: &mpsc::Receiver<ToolOutput>,
     terminal: ToolOutput,
+    lifecycle: Option<&TaskExecutionLifecycle>,
 ) -> ToolOutput {
     match publication.compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) | Err(CANCELLED) => terminal,
+        Ok(_) => {
+            if let Some(lifecycle) = lifecycle {
+                lifecycle.finish(task_terminal_state(&terminal));
+            }
+            terminal
+        }
+        Err(CANCELLED) => terminal,
         Err(PUBLISHED) => receiver
             .recv()
             .unwrap_or_else(|_| task_terminal(HeadlessTaskTerminal::ChildFailure)),
@@ -671,6 +693,7 @@ mod tests {
                 &publication,
                 &receiver,
                 task_terminal(HeadlessTaskTerminal::ChildFailure),
+                None,
             ),
             task_terminal(HeadlessTaskTerminal::ChildFailure)
         );
