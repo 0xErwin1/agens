@@ -46,6 +46,9 @@ use agens_tui::{
     run_with_default_progress_submit_with_permissions,
 };
 
+#[cfg(test)]
+use agens_tools::TaskLaunchMode;
+
 mod chatgpt_auth;
 mod model_registry;
 
@@ -2701,6 +2704,14 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            let task_runtime = match production_tui_task_runtime(
+                &runtime_bootstrap,
+                &router.skills,
+                prompt_bridge.clone(),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
             let result = run_tui_prompt_with(
                 &runtime_bootstrap,
                 &prompt,
@@ -2713,6 +2724,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                         &turn_cancellation,
                         Some(&sink),
                         Some(prompt_bridge.clone()),
+                        Some(&task_runtime),
                     )
                 },
             );
@@ -2772,6 +2784,7 @@ fn run_tui_prompt(
                 bootstrap,
                 cancellation,
                 progress,
+                None,
                 None,
             )
         }),
@@ -3710,7 +3723,7 @@ fn run_production_headless_chat(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None, None)
+    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None, None, None)
         .map(|completion| completion.text)
 }
 
@@ -3726,6 +3739,7 @@ fn run_production_headless_chat_with_progress(
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
     permission_bridge: Option<TuiPermissionBridge>,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
 ) -> Result<HeadlessChatCompletion, CliError> {
     match bootstrap.provider_type() {
         Some("openai-api") => {
@@ -3738,6 +3752,7 @@ fn run_production_headless_chat_with_progress(
                 cancellation,
                 progress,
                 permission_bridge,
+                task_runtime,
                 true,
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -3772,6 +3787,7 @@ fn run_production_headless_chat_with_progress(
                 cancellation,
                 progress,
                 permission_bridge,
+                task_runtime,
                 false,
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
@@ -3807,6 +3823,7 @@ fn run_production_headless_chat_with_provider<P>(
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
     permission_bridge: Option<TuiPermissionBridge>,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
     include_system_prompt: bool,
     build_provider: impl FnOnce(
         String,
@@ -3834,8 +3851,13 @@ where
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (provider_tools, tool_runtime) =
-        production_tool_runtime(bootstrap, project_root, request.skills.as_deref())?;
+    let (provider_tools, tool_runtime) = match task_runtime {
+        Some(task_runtime) => (
+            task_runtime.provider_tools.clone(),
+            Arc::clone(&task_runtime.dispatcher),
+        ),
+        None => production_tool_runtime(bootstrap, project_root, request.skills.as_deref())?,
+    };
     let project = project_root.display().to_string();
     let policy = permission_policy(
         bootstrap.permission_rules(),
@@ -4118,6 +4140,20 @@ fn production_tool_runtime(
     project_root: &Path,
     skills: Option<&SkillCatalog>,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_task_runner(
+        bootstrap,
+        project_root,
+        skills,
+        ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
+    )
+}
+
+fn production_tool_runtime_with_task_runner(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    task_runner: ProductionTaskRunner,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
         NativeTools::open(project_root)
             .map_err(|_| CliError::configuration("native tools are unavailable"))?,
@@ -4175,10 +4211,10 @@ fn production_tool_runtime(
 
     register_production_task_tool(
         bootstrap,
-        project_root,
         skills,
         &mut dispatcher,
         &mut provider_tools,
+        task_runner,
     )?;
 
     let mut runtime = ProductionMcpRuntime {
@@ -4198,12 +4234,102 @@ fn production_tool_runtime(
     Ok((provider_tools.into_values().collect(), runtime.dispatcher))
 }
 
+struct ProductionTuiTaskRuntime {
+    provider_tools: Vec<OpenAiFunctionTool>,
+    dispatcher: SharedToolDispatcher,
+    #[allow(dead_code)]
+    authorized: AuthorizedNativeTaskRuntime<ProductionPermissionPrompter>,
+}
+
+fn production_tui_task_runtime(
+    bootstrap: &Bootstrap,
+    skills: &SkillCatalog,
+    permission_bridge: TuiPermissionBridge,
+) -> Result<ProductionTuiTaskRuntime, CliError> {
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    production_tui_task_runtime_with_runner(
+        bootstrap,
+        skills,
+        permission_bridge,
+        ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
+    )
+}
+
+fn production_tui_task_runtime_with_runner(
+    bootstrap: &Bootstrap,
+    skills: &SkillCatalog,
+    permission_bridge: TuiPermissionBridge,
+    task_runner: ProductionTaskRunner,
+) -> Result<ProductionTuiTaskRuntime, CliError> {
+    let project_root = bootstrap
+        .project_root()
+        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+        bootstrap,
+        project_root,
+        Some(skills),
+        task_runner,
+    )?;
+    let project = project_root.display().to_string();
+    let policy = permission_policy(
+        bootstrap.permission_rules(),
+        &project,
+        PermissionMode::Edit,
+        &dispatcher,
+        None,
+    )?;
+    let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("permission grants are unavailable"))?;
+    let grants = grant_store
+        .grants_for_project(&project)
+        .map_err(|_| CliError::storage("permission grants are unavailable"))?;
+    let grants = Arc::new(Mutex::new(grants));
+    let session = PermissionSession::new();
+    let pending = Arc::new(Mutex::new(BTreeMap::new()));
+    let prompts = Arc::new(Mutex::new(BTreeMap::new()));
+    let gate = ProductionPermissionGate::new(
+        policy.clone(),
+        Arc::clone(&grants),
+        session,
+        project.clone(),
+        Arc::clone(&dispatcher),
+        Arc::clone(&pending),
+        Arc::clone(&prompts),
+    );
+    let resolver = ProductionPermissionResolver::new(
+        ProductionPermissionPrompter::Tui(permission_bridge),
+        grant_store,
+        grants,
+        prompts,
+        ProductionPromptAuthorization {
+            policy,
+            session: PermissionSession::new(),
+            project,
+            dispatcher: Arc::clone(&dispatcher),
+            allowed: Arc::clone(&pending),
+        },
+    );
+
+    Ok(ProductionTuiTaskRuntime {
+        provider_tools,
+        dispatcher: Arc::clone(&dispatcher),
+        authorized: AuthorizedNativeTaskRuntime {
+            gate,
+            resolver,
+            dispatcher: ProductionToolDispatcher::new(dispatcher, pending),
+            next_call_id: 0,
+        },
+    })
+}
+
 fn register_production_task_tool(
     bootstrap: &Bootstrap,
-    project_root: &Path,
     skills: &SkillCatalog,
     dispatcher: &mut ToolDispatcher,
     provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+    task_runner: ProductionTaskRunner,
 ) -> Result<(), CliError> {
     let validator = BundledModelValidator;
     let agents = tui_agent_catalog(bootstrap, &validator)?;
@@ -4223,10 +4349,7 @@ fn register_production_task_tool(
         skills.clone(),
         parent_model,
         validator,
-        ProductionTaskRunner {
-            bootstrap: bootstrap.clone(),
-            project_root: project_root.to_path_buf(),
-        },
+        task_runner,
     );
 
     provider_tools.insert(
@@ -4253,6 +4376,32 @@ fn default_model(bootstrap: &Bootstrap) -> &'static str {
 struct ProductionTaskRunner {
     bootstrap: Bootstrap,
     project_root: PathBuf,
+    #[cfg(test)]
+    probe: Option<Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>>,
+}
+
+impl ProductionTaskRunner {
+    fn new(bootstrap: Bootstrap, project_root: PathBuf) -> Self {
+        Self {
+            bootstrap,
+            project_root,
+            #[cfg(test)]
+            probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_probe(
+        bootstrap: Bootstrap,
+        project_root: PathBuf,
+        probe: Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>,
+    ) -> Self {
+        Self {
+            bootstrap,
+            project_root,
+            probe: Some(probe),
+        }
+    }
 }
 
 impl TaskRunner for ProductionTaskRunner {
@@ -4261,6 +4410,21 @@ impl TaskRunner for ProductionTaskRunner {
         request: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            let execution = context
+                .execution()
+                .expect("registered task has execution context");
+            probe.lock().expect("task probe lock").push((
+                execution.id(),
+                execution.mode(),
+                request.model().to_owned(),
+            ));
+            return Ok(TaskTurnResult {
+                output: "probe".into(),
+                iterations: 1,
+            });
+        }
         let cancellation = HeadlessTurnCancellation::with_cancellation_and_deadline(
             Arc::clone(&context.cancellation),
             Some(context.deadline),
@@ -5141,6 +5305,7 @@ struct TaskLaunchRequest<'a> {
     description: &'a str,
     background: bool,
 }
+
 #[derive(Debug, PartialEq, Eq)]
 enum TaskLaunchOutcome {
     Dispatched(HeadlessToolOutput),
@@ -9187,6 +9352,7 @@ mod tests {
             &HeadlessTurnCancellation::new(),
             None,
             None,
+            None,
         )
         .expect("resumed production turn should complete");
         let provider_request = worker.join().expect("mock provider should finish");
@@ -10351,6 +10517,80 @@ mod tests {
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {
+        let temporary = tui_session_directory("production-task-runtime");
+        let mut bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        bootstrap.model = Some("gpt-4o".into());
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            runtime
+                .provider_tools
+                .iter()
+                .any(|tool| tool.name() == "task")
+        );
+        let mut dispatcher = runtime.dispatcher.lock().unwrap();
+        assert_eq!(
+            dispatcher.canonical_identity("task"),
+            dispatcher.canonical_identity("native::task")
+        );
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::task",
+                    serde_json::json!({"agent":"reviewer","description":"probe"}),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("registered task should authorize");
+        };
+        let cancellation = HeadlessTurnCancellation::new();
+        let output = dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+            )
+            .unwrap();
+        assert_eq!(output.content, "probe");
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.len(), 1);
+        assert_eq!(probe[0].1, TaskLaunchMode::Foreground);
+        assert_eq!(probe[0].2, "gpt-4o");
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
