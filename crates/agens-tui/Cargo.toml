@@ -9,7 +9,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-agens-tools = { path = "../agens-tools" }
 agens-core = { path = "../agens-core" }
 crossterm = "0.29"
 pulldown-cmark = { version = "0.13.4", default-features = false }

@@ -1,11 +1,10 @@
 use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnState};
-use agens_tools::{TaskExecutionEvent, TaskExecutionId, TaskLaunchMode};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, Tui, TuiPermissionBridge, TuiPermissionReply, TuiPresentation,
-    TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
+    TranscriptEntry, Tui, TuiExecutionEvent, TuiPermissionBridge, TuiPermissionReply,
+    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -672,10 +671,7 @@ fn u15_c1b_tracks_selected_running_and_terminal_execution_states_once() {
     tui.select_agent("reviewer");
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Admitted(
-            TaskExecutionId::from_u64(1),
-            TaskLaunchMode::Foreground,
-        ),
+        event: TuiExecutionEvent::ForegroundStarted { id: 1 },
     });
     assert_eq!(
         tui.executions()[0].state(),
@@ -683,7 +679,7 @@ fn u15_c1b_tracks_selected_running_and_terminal_execution_states_once() {
     );
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Backgrounded(TaskExecutionId::from_u64(1)),
+        event: TuiExecutionEvent::Backgrounded { id: 1 },
     });
     assert_eq!(
         tui.executions()[0].state(),
@@ -691,26 +687,24 @@ fn u15_c1b_tracks_selected_running_and_terminal_execution_states_once() {
     );
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Completed(TaskExecutionId::from_u64(1)),
+        event: TuiExecutionEvent::Completed { id: 1 },
     });
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Failed(TaskExecutionId::from_u64(1)),
+        event: TuiExecutionEvent::Failed { id: 1 },
     });
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Admitted(
-            TaskExecutionId::from_u64(2),
-            TaskLaunchMode::Foreground,
-        ),
+        event: TuiExecutionEvent::ForegroundStarted { id: 2 },
     });
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Failed(TaskExecutionId::from_u64(2)),
+        event: TuiExecutionEvent::Failed { id: 2 },
     });
 
     assert_eq!(tui.agent_catalog(), ["main", "reviewer"]);
     assert_eq!(tui.selected_agent(), Some("reviewer"));
+    assert_eq!(tui.view().selected_agent, Some("reviewer"));
     assert_eq!(tui.executions().len(), 2);
     assert_eq!(
         tui.executions()[0].state(),
@@ -720,27 +714,26 @@ fn u15_c1b_tracks_selected_running_and_terminal_execution_states_once() {
         tui.executions()[1].state(),
         agens_tui::TuiExecutionState::CompletedRecent
     );
+    tui.tick(Duration::from_nanos(59_999_999_999));
+    assert_eq!(tui.executions().len(), 2);
+    tui.tick(Duration::from_secs(60));
+    assert!(tui.executions().is_empty());
+    assert_eq!(tui.agent_catalog(), ["main", "reviewer"]);
 }
-
 #[test]
-fn u15_c1b_sorts_execution_instances_newest_first_with_execution_id_ties() {
+fn u15_c1b_sorts_reexecutions_newest_first_with_execution_id_ties() {
     let mut tui = Tui::new(FakeEngine::default());
+    tui.set_agent_catalog(["reviewer"]);
     tui.tick(Duration::from_secs(7));
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
         agent: "reviewer".into(),
-        event: TaskExecutionEvent::Admitted(
-            TaskExecutionId::from_u64(1),
-            TaskLaunchMode::Foreground,
-        ),
+        event: TuiExecutionEvent::ForegroundStarted { id: 1 },
     });
     tui.tick(Duration::from_secs(9));
     for id in [2, 3] {
         tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
             agent: "reviewer".into(),
-            event: TaskExecutionEvent::Admitted(
-                TaskExecutionId::from_u64(id),
-                TaskLaunchMode::Foreground,
-            ),
+            event: TuiExecutionEvent::ForegroundStarted { id },
         });
     }
 
@@ -749,42 +742,9 @@ fn u15_c1b_sorts_execution_instances_newest_first_with_execution_id_ties() {
             .iter()
             .map(|execution| execution.id())
             .collect::<Vec<_>>(),
-        [
-            TaskExecutionId::from_u64(3),
-            TaskExecutionId::from_u64(2),
-            TaskExecutionId::from_u64(1)
-        ]
+        [3, 2, 1]
     );
-}
-
-#[test]
-fn u15_c1b_reexecution_moves_a_new_instance_to_the_front_without_catalog_duplicates() {
-    let mut tui = Tui::new(FakeEngine::default());
-    tui.set_agent_catalog(["reviewer"]);
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "reviewer".into(),
-        event: TaskExecutionEvent::Admitted(
-            TaskExecutionId::from_u64(1),
-            TaskLaunchMode::Foreground,
-        ),
-    });
-    tui.tick(Duration::from_secs(1));
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "reviewer".into(),
-        event: TaskExecutionEvent::Admitted(
-            TaskExecutionId::from_u64(2),
-            TaskLaunchMode::Foreground,
-        ),
-    });
-
     assert_eq!(tui.agent_catalog(), ["main", "reviewer"]);
-    assert_eq!(
-        tui.executions()
-            .iter()
-            .map(|execution| execution.id())
-            .collect::<Vec<_>>(),
-        [TaskExecutionId::from_u64(2), TaskExecutionId::from_u64(1)]
-    );
 }
 
 #[test]

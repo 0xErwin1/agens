@@ -9,7 +9,6 @@ use std::{
 };
 
 use agens_core::{HeadlessTurnCancellation, TurnState, Usage};
-use agens_tools::{TaskExecutionEvent, TaskExecutionId};
 
 use crate::DiffLine;
 
@@ -200,13 +199,22 @@ pub enum TuiRuntimeEvent {
     },
     TaskExecution {
         agent: String,
-        event: TaskExecutionEvent,
+        event: TuiExecutionEvent,
     },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiExecutionEvent {
+    ForegroundStarted { id: u64 },
+    BackgroundStarted { id: u64 },
+    Backgrounded { id: u64 },
+    Completed { id: u64 },
+    Failed { id: u64 },
+    Cancelled { id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiExecutionState {
-    Selected,
     ForegroundRunning,
     BackgroundRunning,
     CompletedRecent,
@@ -216,7 +224,7 @@ pub enum TuiExecutionState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiExecution {
-    pub(crate) id: TaskExecutionId,
+    pub(crate) id: u64,
     pub(crate) agent: String,
     pub(crate) state: TuiExecutionState,
     pub(crate) last_activity: Duration,
@@ -224,7 +232,7 @@ pub struct TuiExecution {
 }
 
 impl TuiExecution {
-    pub const fn id(&self) -> TaskExecutionId {
+    pub const fn id(&self) -> u64 {
         self.id
     }
 

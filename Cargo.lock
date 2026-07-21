@@ -83,7 +83,6 @@ name = "agens-tui"
 version = "0.1.0"
 dependencies = [
  "agens-core",
- "agens-tools",
  "crossterm",
  "pulldown-cmark",
  "ratatui",

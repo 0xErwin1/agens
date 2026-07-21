@@ -8,8 +8,9 @@ mod terminal;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
-    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionState,
-    TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, UiEnvelope,
+    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
+    TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
+    TuiRuntimeEvent, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -29,7 +30,6 @@ use std::{
 };
 
 use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
-use agens_tools::{TaskExecutionEvent, TaskLaunchMode};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -269,9 +269,8 @@ pub struct ViewState<'a> {
     pub dialog: Option<&'a DialogView>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
-    /// Permanent main and eligible agent catalog, separate from execution instances.
     pub agent_catalog: &'a [String],
-    /// Active and recent execution instances in deterministic recency order.
+    pub selected_agent: Option<&'a str>,
     pub executions: Vec<&'a TuiExecution>,
 }
 
@@ -678,7 +677,12 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(area, state.running);
+    let layout = screen_layout(
+        area,
+        state.running,
+        state.selected_agent.is_some(),
+        state.executions.len(),
+    );
 
     if layout.header.height > 0 {
         render_header(frame, layout.header, &state, layout.show_context);
@@ -1063,14 +1067,23 @@ struct ScreenLayout {
     show_context: bool,
 }
 
-fn screen_layout(area: Rect, running: bool) -> ScreenLayout {
+fn screen_layout(
+    area: Rect,
+    running: bool,
+    has_selected_agent: bool,
+    execution_count: usize,
+) -> ScreenLayout {
     let show_header = area.height >= 8;
+    let header_rows = 1_u16
+        .saturating_add(u16::from(has_selected_agent))
+        .saturating_add(execution_count.try_into().unwrap_or(u16::MAX))
+        .min(area.height.saturating_sub(6));
     let show_context = area.width >= 80 && area.height > 16;
     let show_footer = area.height >= 10;
     let show_status = running && area.height > 16;
     let composer_rows = if area.height < 8 { 2 } else { 3 };
     let chunks = Layout::vertical([
-        Constraint::Length(u16::from(show_header)),
+        Constraint::Length(u16::from(show_header) * header_rows),
         Constraint::Min(1),
         Constraint::Length(u16::from(show_status)),
         Constraint::Length(composer_rows),
@@ -1116,18 +1129,30 @@ fn render_header(
             format!("  ·  agents {}", state.agent_catalog.join(", ")),
             Style::default().fg(Color::Gray),
         ));
-        if let Some(execution) = state.executions.first() {
-            left.push(Span::styled(
+    }
+    let mut lines = vec![Line::from(left)];
+    if show_context {
+        if let Some(agent) = state.selected_agent {
+            lines.push(Line::styled(
+                format!(" selected {agent}"),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.extend(state.executions.iter().map(|execution| {
+            Line::styled(
                 format!(
-                    "  ·  {} · {}",
+                    " {} · {}",
                     execution.agent,
                     execution_label(execution.state())
                 ),
                 Style::default().fg(Color::Yellow),
-            ));
-        }
+            )
+        }));
     }
-    frame.render_widget(Paragraph::new(Line::from(left)), area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
     let state_width = state_label.len() as u16 + 1;
     if area.width > state_width {
         let state_area = Rect::new(area.right() - state_width, area.y, state_width, area.height);
@@ -1142,7 +1167,6 @@ fn render_header(
 
 fn execution_label(state: TuiExecutionState) -> &'static str {
     match state {
-        TuiExecutionState::Selected => "selected",
         TuiExecutionState::ForegroundRunning => "foreground running",
         TuiExecutionState::BackgroundRunning => "background running",
         TuiExecutionState::CompletedRecent => "completed recent",
@@ -1534,7 +1558,6 @@ where
         self.selected_agent.as_deref()
     }
 
-    /// Returns newest activity first; equal timestamps break by descending execution ID.
     pub fn executions(&self) -> Vec<&TuiExecution> {
         let mut executions = self.executions.iter().collect::<Vec<_>>();
         executions.sort_unstable_by(|left, right| {
@@ -1546,7 +1569,6 @@ where
         executions
     }
 
-    /// Advances injected monotonic event-loop time and prunes only expired terminal instances.
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
         self.executions.retain(|execution| {
@@ -1924,24 +1946,25 @@ where
                 selected: self.palette_selected,
             }),
             agent_catalog: &self.agent_catalog,
+            selected_agent: self.selected_agent.as_deref(),
             executions: self.executions(),
         }
     }
 
-    fn apply_task_execution_event(&mut self, agent: &str, event: TaskExecutionEvent) {
+    fn apply_task_execution_event(&mut self, agent: &str, event: TuiExecutionEvent) {
         let (id, state) = match event {
-            TaskExecutionEvent::Admitted(id, TaskLaunchMode::Foreground) => {
+            TuiExecutionEvent::ForegroundStarted { id } => {
                 self.add_execution(agent, id, TuiExecutionState::ForegroundRunning);
                 return;
             }
-            TaskExecutionEvent::Admitted(id, TaskLaunchMode::Background) => {
+            TuiExecutionEvent::BackgroundStarted { id } => {
                 self.add_execution(agent, id, TuiExecutionState::BackgroundRunning);
                 return;
             }
-            TaskExecutionEvent::Backgrounded(id) => (id, TuiExecutionState::BackgroundRunning),
-            TaskExecutionEvent::Completed(id) => (id, TuiExecutionState::CompletedRecent),
-            TaskExecutionEvent::Failed(id) => (id, TuiExecutionState::Failed),
-            TaskExecutionEvent::Cancelled(id) => (id, TuiExecutionState::Cancelled),
+            TuiExecutionEvent::Backgrounded { id } => (id, TuiExecutionState::BackgroundRunning),
+            TuiExecutionEvent::Completed { id } => (id, TuiExecutionState::CompletedRecent),
+            TuiExecutionEvent::Failed { id } => (id, TuiExecutionState::Failed),
+            TuiExecutionEvent::Cancelled { id } => (id, TuiExecutionState::Cancelled),
         };
         let Some(execution) = self
             .executions
@@ -1963,12 +1986,7 @@ where
         }
     }
 
-    fn add_execution(
-        &mut self,
-        agent: &str,
-        id: agens_tools::TaskExecutionId,
-        state: TuiExecutionState,
-    ) {
+    fn add_execution(&mut self, agent: &str, id: u64, state: TuiExecutionState) {
         if self.executions.iter().any(|execution| execution.id == id) {
             return;
         }
@@ -2242,7 +2260,12 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, self.running);
+        let layout = screen_layout(
+            area,
+            self.running,
+            self.selected_agent.is_some(),
+            self.executions.len(),
+        );
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         saturating_u16(
             transcript_rows(
@@ -2258,11 +2281,16 @@ where
 
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, self.running)
-            .transcript
-            .height
-            .saturating_sub(1)
-            .max(1)
+        screen_layout(
+            area,
+            self.running,
+            self.selected_agent.is_some(),
+            self.executions.len(),
+        )
+        .transcript
+        .height
+        .saturating_sub(1)
+        .max(1)
     }
 
     fn insert_text(&mut self, text: &str) {
