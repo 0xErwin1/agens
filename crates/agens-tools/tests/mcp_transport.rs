@@ -635,6 +635,7 @@ fn registry_status_snapshot_tracks_authoritative_lifecycle_without_forcing_disco
 
     let status = registry.status_handle();
     assert_eq!(attempts.load(Ordering::Acquire), 0);
+    assert_eq!(registry.configured_server_names(), ["files"]);
     assert_eq!(
         status.snapshot().server("disabled").unwrap().state(),
         McpLifecycleState::Disabled

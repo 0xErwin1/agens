@@ -2198,13 +2198,9 @@ impl McpRegistry {
                 "disabled MCP server must be disabled".into(),
             ));
         }
-        let timeout = descriptor.timeout();
-        self.insert_configuration(
-            descriptor,
-            None,
-            McpTimeouts::new(timeout, timeout, timeout)?,
-            McpLimits::default(),
-        )
+        validate_server_name(descriptor.name())?;
+        self.status.register(descriptor);
+        Ok(())
     }
 
     pub fn configure_server<F>(
