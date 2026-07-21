@@ -2691,7 +2691,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     run_with_default_progress_submit_with_permissions(
         &mut tui,
         move |request, progress| route_router.route_request(request, progress),
-        move |prompt, progress, metrics| {
+        move |prompt, background, progress, metrics| {
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
             let Ok(mut active) = cancellation.lock() else {
@@ -2731,10 +2731,17 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 &mut task_runtime,
                 &router.session,
                 &prompt,
-                false,
+                background,
                 &turn_cancellation,
             ) {
-                Ok(TuiSelectedTaskLaunch::NotSelected | TuiSelectedTaskLaunch::Dispatched) => {}
+                Ok(TuiSelectedTaskLaunch::NotSelected) => {}
+                Ok(TuiSelectedTaskLaunch::Dispatched) if background => {
+                    if let Ok(mut active) = cancellation.lock() {
+                        *active = None;
+                    }
+                    return TuiProviderOutcome::Backgrounded;
+                }
+                Ok(TuiSelectedTaskLaunch::Dispatched) => {}
                 Ok(TuiSelectedTaskLaunch::Rejected(outcome)) => {
                     return tui_provider_outcome(Err(selected_task_launch_error(outcome)));
                 }
@@ -10911,6 +10918,61 @@ mod tests {
         assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
         assert_ne!(probe[0].0, probe[1].0);
         assert!(reply.join().unwrap());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn u15_c1c_selected_background_launch_uses_a1b2_once_without_session_mutation() {
+        let temporary = tui_session_directory("selected-background-launch");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+
+        assert_eq!(
+            launch_selected_tui_task(
+                &mut runtime,
+                &session,
+                "review task",
+                true,
+                &HeadlessTurnCancellation::new(),
+            ),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.len(), 1);
+        assert_eq!(probe[0].1, TaskLaunchMode::Background);
+        let session = session.lock().unwrap();
+        assert!(session.messages.is_empty());
+        assert!(!session.running);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

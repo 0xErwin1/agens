@@ -93,6 +93,8 @@ pub enum Key {
     CtrlO,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
+    /// Starts or moves the selected subagent into background execution.
+    CtrlB,
     ShiftEnter,
     Left,
     Right,
@@ -118,6 +120,8 @@ pub enum Action {
     Render,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Send this prompt through the selected subagent's background path.
+    SubmitBackground(String),
     /// Ask the composition layer to resolve a palette dialog by stable route ID.
     OpenDialog(String),
     /// Dispatch the selected dialog action through the composition layer.
@@ -206,6 +210,7 @@ pub enum TuiProviderOutcome {
     Completed(String),
     Failed { message: String, action: String },
     Cancelled { message: String, action: String },
+    Backgrounded,
 }
 
 /// A visible conversation entry in chronological order.
@@ -1818,6 +1823,7 @@ where
                 self.active_tool = None;
                 self.add_error(message, action);
             }
+            TuiProviderOutcome::Backgrounded => self.set_running(false),
         }
     }
 
@@ -2086,6 +2092,13 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
+        if key == Key::CtrlB {
+            if self.dialog.is_some() {
+                return Action::Render;
+            }
+            return self.handle_background_key();
+        }
+
         if key == Key::CtrlShiftA {
             self.palette_open = false;
             return Action::OpenDialog("subagent".into());
@@ -2230,6 +2243,31 @@ where
 
         self.clamp_palette_selection();
         Some(Action::Render)
+    }
+
+    fn handle_background_key(&mut self) -> Action {
+        if let Some(id) = self.selected_agent.as_deref().and_then(|agent| {
+            self.executions
+                .iter()
+                .find(|execution| {
+                    execution.agent == agent
+                        && execution.state == TuiExecutionState::ForegroundRunning
+                })
+                .map(TuiExecution::id)
+        }) {
+            let agent = self.selected_agent.clone().unwrap_or_default();
+            self.apply_task_execution_event(&agent, TuiExecutionEvent::Backgrounded { id });
+            self.set_running(false);
+            return Action::Render;
+        }
+
+        if self.selected_agent.is_none() || self.input.trim().is_empty() {
+            return Action::Render;
+        }
+
+        self.palette_open = false;
+        self.input_cursor = 0;
+        Action::SubmitBackground(std::mem::take(&mut self.input))
     }
 
     fn scroll_up(&mut self, rows: u16) {
@@ -2857,6 +2895,7 @@ where
             Action::Quit => return Ok(()),
             Action::Render
             | Action::Submit(_)
+            | Action::SubmitBackground(_)
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -2900,6 +2939,7 @@ where
                 renderer.render(tui.view())?;
             }
             Action::Render
+            | Action::SubmitBackground(_)
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -2932,7 +2972,12 @@ pub fn run_with_default_progress_submit(
     + Send
     + Sync
     + 'static,
-    submit: impl Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+    submit: impl Fn(
+        String,
+        bool,
+        mpsc::Sender<TurnEvent>,
+        BridgeTx<TuiRuntimeEvent>,
+    ) -> TuiProviderOutcome
     + Send
     + Sync
     + 'static,
@@ -2952,7 +2997,7 @@ where
         + Send
         + Sync
         + 'static,
-    F: Fn(String, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+    F: Fn(String, bool, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
         + Send
         + Sync
         + 'static,
@@ -3002,7 +3047,7 @@ where
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
-                let outcome = submit(prompt, sender, metrics);
+                let outcome = submit(prompt, false, sender, metrics);
                 let _ = completion_sender.send(outcome);
             });
         }
@@ -3048,6 +3093,16 @@ where
                 thread::spawn(move || {
                     let outcome = route(TuiRouteRequest::Input(prompt), progress);
                     let _ = route_sender.send(outcome);
+                });
+            }
+            Action::SubmitBackground(prompt) => {
+                let submit = Arc::clone(&submit);
+                let sender = sender.clone();
+                let metrics = metrics_sender.clone();
+                let completion_sender = completion_sender.clone();
+                thread::spawn(move || {
+                    let outcome = submit(prompt, true, sender, metrics);
+                    let _ = completion_sender.send(outcome);
                 });
             }
             Action::OpenDialog(route_id) => {
@@ -3144,6 +3199,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         {
             Key::CtrlShiftA
         }
+        (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlB
+        }
         (KeyCode::Char('w' | 'W'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeletePreviousWord
         }
@@ -3158,9 +3216,6 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         }
         (KeyCode::Char('e' | 'E'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::LineEnd
-        }
-        (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::Left
         }
         (KeyCode::Char('f' | 'F'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::Right
@@ -3405,7 +3460,7 @@ mod runtime_tests {
             (KeyCode::Char('k'), ctrl, Key::DeleteToLineEnd),
             (KeyCode::Char('a'), ctrl, Key::LineStart),
             (KeyCode::Char('e'), ctrl, Key::LineEnd),
-            (KeyCode::Char('b'), ctrl, Key::Left),
+            (KeyCode::Char('b'), ctrl, Key::CtrlB),
             (KeyCode::Char('f'), ctrl, Key::Right),
             (KeyCode::Char('b'), alt, Key::PreviousWord),
             (KeyCode::Char('f'), alt, Key::NextWord),
