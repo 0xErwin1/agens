@@ -1532,7 +1532,14 @@ where
                     return None;
                 }
                 self.apply_presentation(presentation);
-                self.status = Some(message);
+                if message == "connect or choose provider" {
+                    self.show_dialog(
+                        "Action required",
+                        "Saved provider is unavailable.\nAction: connect or choose provider.",
+                    );
+                } else {
+                    self.status = Some(message);
+                }
                 None
             }
             TuiSubmissionOutcome::Dialog(dialog) => {

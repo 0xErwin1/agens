@@ -145,6 +145,10 @@ impl TuiModelSelector {
         self.reasoning_effort.map(ReasoningEffort::as_str)
     }
 
+    pub const fn reasoning_effort_value(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+
     pub const fn request_config(&self) -> &RequestConfig {
         &self.request_config
     }
