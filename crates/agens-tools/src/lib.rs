@@ -31,6 +31,7 @@ mod capabilities;
 mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
+mod mcp_status;
 mod stdio_mcp;
 mod task;
 
@@ -40,6 +41,11 @@ pub use agents::{
 };
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
+pub use mcp_status::{
+    MAX_MCP_STATUS_TOOL_NAMES, McpEndpointSummary, McpErrorCategory, McpLifecycleState,
+    McpServerDescriptor, McpServerSource, McpServerStatus, McpServerTransport, McpStatusError,
+    McpStatusHandle, McpStatusSnapshot,
+};
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
     TaskInvocation, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTool,
