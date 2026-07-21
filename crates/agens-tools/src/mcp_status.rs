@@ -224,6 +224,49 @@ impl McpStatusHandle {
         }
     }
 
+    pub(crate) fn register(&self, descriptor: McpServerDescriptor) {
+        let state = if descriptor.enabled {
+            McpLifecycleState::Idle
+        } else {
+            McpLifecycleState::Disabled
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                descriptor.name.clone(),
+                McpServerStatus {
+                    descriptor,
+                    state,
+                    tool_count: 0,
+                    tool_names: Vec::new(),
+                    last_error: None,
+                },
+            );
+    }
+
+    pub(crate) fn update(&self, name: &str, update: impl FnOnce(&mut McpServerStatus)) {
+        let mut statuses = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(status) = statuses.get_mut(name) {
+            update(status);
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        for status in self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values_mut()
+        {
+            if status.state != McpLifecycleState::Disabled {
+                status.state = McpLifecycleState::Closed;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

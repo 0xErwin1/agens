@@ -2126,6 +2126,7 @@ pub struct McpRegistry {
     diagnostics: BTreeMap<String, McpServerDiagnostic>,
     attempted: std::collections::BTreeSet<String>,
     closed: bool,
+    status: McpStatusHandle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2134,8 +2135,11 @@ pub struct McpServerDiagnostic {
     pub message: String,
 }
 
+type McpTransportFactory =
+    Box<dyn FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send>;
+
 struct ConfiguredMcpServer {
-    factory: Box<dyn FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send>,
+    factory: Option<McpTransportFactory>,
     timeouts: McpTimeouts,
     limits: McpLimits,
 }
@@ -2169,6 +2173,28 @@ impl McpRegistry {
         self.configured.keys().cloned().collect()
     }
 
+    pub fn status_handle(&self) -> McpStatusHandle {
+        self.status.clone()
+    }
+
+    pub fn register_disabled_server(
+        &mut self,
+        descriptor: McpServerDescriptor,
+    ) -> Result<(), McpTransportError> {
+        if descriptor.enabled() {
+            return Err(McpTransportError::Protocol(
+                "disabled MCP server must be disabled".into(),
+            ));
+        }
+        let timeout = descriptor.timeout();
+        self.insert_configuration(
+            descriptor,
+            None,
+            McpTimeouts::new(timeout, timeout, timeout)?,
+            McpLimits::default(),
+        )
+    }
+
     pub fn configure_server<F>(
         &mut self,
         server_name: &str,
@@ -2179,16 +2205,58 @@ impl McpRegistry {
     where
         F: FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send + 'static,
     {
-        validate_server_name(server_name)?;
+        self.configure_server_with_descriptor(
+            McpServerDescriptor::new(
+                server_name,
+                McpServerSource::Global,
+                McpServerTransport::Stdio,
+                true,
+                timeouts.connect,
+                None,
+            ),
+            factory,
+            timeouts,
+            limits,
+        )
+    }
+
+    pub fn configure_server_with_descriptor<F>(
+        &mut self,
+        descriptor: McpServerDescriptor,
+        factory: F,
+        timeouts: McpTimeouts,
+        limits: McpLimits,
+    ) -> Result<(), McpTransportError>
+    where
+        F: FnMut() -> Result<Box<dyn McpTransport>, McpTransportError> + Send + 'static,
+    {
+        if !descriptor.enabled() {
+            return Err(McpTransportError::Protocol(
+                "enabled MCP server must be enabled".into(),
+            ));
+        }
+        self.insert_configuration(descriptor, Some(Box::new(factory)), timeouts, limits)
+    }
+
+    fn insert_configuration(
+        &mut self,
+        descriptor: McpServerDescriptor,
+        factory: Option<McpTransportFactory>,
+        timeouts: McpTimeouts,
+        limits: McpLimits,
+    ) -> Result<(), McpTransportError> {
+        validate_server_name(descriptor.name())?;
+        let name = descriptor.name().to_owned();
+        self.status.register(descriptor);
         self.configured.insert(
-            server_name.into(),
+            name.clone(),
             ConfiguredMcpServer {
-                factory: Box::new(factory),
+                factory,
                 timeouts,
                 limits,
             },
         );
-        self.attempted.remove(server_name);
+        self.attempted.remove(&name);
         Ok(())
     }
 
@@ -2232,6 +2300,7 @@ impl McpRegistry {
         for (_, mut client) in std::mem::take(&mut self.clients) {
             client.close();
         }
+        self.status.close();
     }
 
     pub fn load_server<T: McpTransport + 'static>(
@@ -2243,6 +2312,7 @@ impl McpRegistry {
         limits: McpLimits,
         cancellation: Arc<AtomicBool>,
     ) -> McpServerReport {
+        let mut category = None;
         let report = match load_server_client(
             server_name,
             transport,
@@ -2259,30 +2329,34 @@ impl McpRegistry {
                 });
                 if conflicts || has_duplicate_qualified_name(&metadata) {
                     client.close();
-                    return McpServerReport::Failed {
+                    category = Some(McpErrorCategory::Protocol);
+                    McpServerReport::Failed {
                         server_name: server_name.into(),
                         message: "mcp server load failed; reload to retry".into(),
-                    };
+                    }
+                } else {
+                    let tool_count = metadata.len();
+                    self.tools.retain(|_, tool| tool.server_name != server_name);
+                    for tool in metadata {
+                        self.tools.insert(tool.qualified_name.clone(), tool);
+                    }
+                    if let Some(mut previous) =
+                        self.clients.insert(server_name.into(), Box::new(client))
+                    {
+                        previous.close();
+                    }
+                    McpServerReport::loaded(server_name, tool_count)
                 }
-
-                let tool_count = metadata.len();
-                self.tools.retain(|_, tool| tool.server_name != server_name);
-                for tool in metadata {
-                    self.tools.insert(tool.qualified_name.clone(), tool);
-                }
-                if let Some(mut previous) =
-                    self.clients.insert(server_name.into(), Box::new(client))
-                {
-                    previous.close();
-                }
-                McpServerReport::loaded(server_name, tool_count)
             }
-            Err(error) => McpServerReport::Failed {
-                server_name: server_name.into(),
-                message: sanitized_mcp_load_error(&error).into(),
-            },
+            Err(error) => {
+                category = Some(McpErrorCategory::from(&error));
+                McpServerReport::Failed {
+                    server_name: server_name.into(),
+                    message: sanitized_mcp_load_error(&error).into(),
+                }
+            }
         };
-        self.record_report(&report);
+        self.record_report(&report, category);
         report
     }
 
@@ -2334,12 +2408,22 @@ impl McpRegistry {
     }
 
     fn discover_or_reload(&mut self, server_name: &str) -> McpServerReport {
+        self.status.update(server_name, |status| {
+            status.state = McpLifecycleState::Connecting
+        });
         let Some(configured) = self.configured.get_mut(server_name) else {
             return self.failed(server_name);
         };
         let timeouts = configured.timeouts;
         let limits = configured.limits;
-        let transport = (configured.factory)();
+        let transport = configured.factory.as_mut().map_or_else(
+            || {
+                Err(McpTransportError::Transport(
+                    "MCP server is disabled".into(),
+                ))
+            },
+            |factory| factory(),
+        );
         let report = match transport {
             Ok(transport) => self.load_server(
                 server_name,
@@ -2354,12 +2438,16 @@ impl McpRegistry {
                 limits,
                 Arc::new(AtomicBool::new(false)),
             ),
-            Err(error) => McpServerReport::Failed {
-                server_name: server_name.into(),
-                message: sanitized_mcp_load_error(&error).into(),
-            },
+            Err(error) => {
+                let report = McpServerReport::Failed {
+                    server_name: server_name.into(),
+                    message: sanitized_mcp_load_error(&error).into(),
+                };
+                self.record_report(&report, Some(McpErrorCategory::from(&error)));
+                return report;
+            }
         };
-        self.record_report(&report);
+        self.record_report(&report, None);
         report
     }
 
@@ -2368,14 +2456,30 @@ impl McpRegistry {
             server_name: server_name.into(),
             message: "mcp server is unavailable".into(),
         };
-        self.record_report(&report);
+        self.record_report(&report, Some(McpErrorCategory::Unavailable));
         report
     }
 
-    fn record_report(&mut self, report: &McpServerReport) {
+    fn record_report(&mut self, report: &McpServerReport, category: Option<McpErrorCategory>) {
         match report {
-            McpServerReport::Loaded { server_name, .. } => {
+            McpServerReport::Loaded {
+                server_name,
+                tool_count,
+            } => {
                 self.diagnostics.remove(server_name);
+                let names = self
+                    .tools
+                    .values()
+                    .filter(|tool| tool.server_name == *server_name)
+                    .map(|tool| tool.tool_name.clone())
+                    .take(MAX_MCP_STATUS_TOOL_NAMES)
+                    .collect::<Vec<_>>();
+                self.status.update(server_name, |status| {
+                    status.state = McpLifecycleState::Ready;
+                    status.tool_count = *tool_count;
+                    status.tool_names = names;
+                    status.last_error = None;
+                });
             }
             McpServerReport::Failed {
                 server_name,
@@ -2388,6 +2492,19 @@ impl McpRegistry {
                         message: message.clone(),
                     },
                 );
+                let degraded = self.clients.contains_key(server_name);
+                let category = category.unwrap_or(McpErrorCategory::Unavailable);
+                self.status.update(server_name, |status| {
+                    status.state = if degraded {
+                        McpLifecycleState::Degraded
+                    } else {
+                        McpLifecycleState::Failed
+                    };
+                    status.last_error = Some(McpStatusError {
+                        category,
+                        message: message.clone(),
+                    });
+                });
             }
         }
     }

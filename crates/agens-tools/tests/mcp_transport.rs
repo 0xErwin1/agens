@@ -13,10 +13,12 @@ use std::{
 
 use agens_core::HeadlessTurnCancellation;
 use agens_tools::{
-    McpCallResult, McpClient, McpContentBlock, McpHttpTransport, McpInitialize,
-    McpInitializeResult, McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest,
-    McpResponse, McpServerReport, McpSseTransport, McpTimeouts, McpToolAnnotations,
-    McpToolDefinition, McpToolsPage, McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
+    MAX_MCP_STATUS_TOOL_NAMES, McpCallResult, McpClient, McpContentBlock, McpEndpointSummary,
+    McpErrorCategory, McpHttpTransport, McpInitialize, McpInitializeResult, McpLifecycleState,
+    McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest, McpResponse,
+    McpServerDescriptor, McpServerReport, McpServerSource, McpServerTransport, McpSseTransport,
+    McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage, McpTransport,
+    McpTransportError, RemoteToolAccess, ToolOutput,
 };
 use serde_json::json;
 
@@ -578,6 +580,149 @@ fn configured_servers_load_lazily_retry_only_on_reload_and_keep_working_tools() 
 
     drop(registry);
     assert_eq!(replacement_close_count.load(Ordering::Acquire), 1);
+}
+
+fn status_descriptor(
+    name: &str,
+    transport: McpServerTransport,
+    enabled: bool,
+) -> McpServerDescriptor {
+    McpServerDescriptor::new(
+        name,
+        McpServerSource::Global,
+        transport,
+        enabled,
+        Duration::from_secs(2),
+        (name == "files").then(|| McpEndpointSummary::stdio("/private/bin/files-server")),
+    )
+}
+
+#[test]
+fn registry_status_snapshot_tracks_authoritative_lifecycle_without_forcing_discovery() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_factory = Arc::clone(&attempts);
+    let (entered, entered_rx) = mpsc::sync_channel(1);
+    let (release, release_rx) = mpsc::sync_channel(1);
+    let mut registry = McpRegistry::new();
+    registry
+        .register_disabled_server(status_descriptor(
+            "disabled",
+            McpServerTransport::Stdio,
+            false,
+        ))
+        .unwrap();
+    registry
+        .configure_server_with_descriptor(
+            status_descriptor("files", McpServerTransport::Stdio, true),
+            move || {
+                attempts_factory.fetch_add(1, Ordering::AcqRel);
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Box::new(LocalTransport::with_responses([
+                    Ok(initialized()),
+                    Ok(page(
+                        (0..MAX_MCP_STATUS_TOOL_NAMES + 5)
+                            .map(|index| tool(&format!("tool-{index:02}"), Some(true)))
+                            .collect(),
+                        None,
+                    )),
+                ])) as Box<dyn McpTransport>)
+            },
+            timeouts(),
+            McpLimits::new(2, MAX_MCP_STATUS_TOOL_NAMES + 5).unwrap(),
+        )
+        .unwrap();
+
+    let status = registry.status_handle();
+    assert_eq!(attempts.load(Ordering::Acquire), 0);
+    assert_eq!(
+        status.snapshot().server("disabled").unwrap().state(),
+        McpLifecycleState::Disabled
+    );
+    assert_eq!(
+        status.snapshot().server("files").unwrap().state(),
+        McpLifecycleState::Idle
+    );
+
+    let worker = thread::spawn(move || {
+        let report = registry.discover_server("files");
+        (registry, report)
+    });
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        status.snapshot().server("files").unwrap().state(),
+        McpLifecycleState::Connecting
+    );
+    release.send(()).unwrap();
+    let (mut registry, report) = worker.join().unwrap();
+    assert_eq!(
+        report,
+        McpServerReport::loaded("files", MAX_MCP_STATUS_TOOL_NAMES + 5)
+    );
+
+    let ready = status.snapshot();
+    let files = ready.server("files").unwrap();
+    assert_eq!(
+        (files.state(), files.tool_count()),
+        (McpLifecycleState::Ready, 37)
+    );
+    assert_eq!(files.tool_names().len(), MAX_MCP_STATUS_TOOL_NAMES);
+    assert_eq!(files.endpoint().unwrap().as_str(), "files-server");
+
+    registry
+        .configure_server_with_descriptor(
+            files.descriptor().clone(),
+            || Err(McpTransportError::Transport("SENTINEL_SECRET body".into())),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert!(registry.reload_server("files").is_failed());
+    let degraded = status.snapshot();
+    let files = degraded.server("files").unwrap();
+    assert_eq!(files.state(), McpLifecycleState::Degraded);
+    assert_eq!(
+        files.last_error().unwrap().category(),
+        McpErrorCategory::Transport
+    );
+    assert!(!format!("{degraded:?}").contains("SENTINEL_SECRET"));
+
+    registry
+        .configure_server_with_descriptor(
+            status_descriptor("broken", McpServerTransport::Http, true),
+            || {
+                Err(McpTransportError::Protocol(
+                    "SENTINEL_SECRET response".into(),
+                ))
+            },
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert!(registry.discover_server("broken").is_failed());
+    let failed = status.snapshot();
+    let broken = failed.server("broken").unwrap();
+    assert_eq!(broken.state(), McpLifecycleState::Failed);
+    assert_eq!(
+        broken.last_error().unwrap().category(),
+        McpErrorCategory::Protocol
+    );
+    assert!(!format!("{failed:?}").contains("SENTINEL_SECRET"));
+
+    registry.close();
+    let closed = status.snapshot();
+    assert_eq!(
+        closed.server("files").unwrap().state(),
+        McpLifecycleState::Closed
+    );
+    assert_eq!(
+        closed.server("broken").unwrap().state(),
+        McpLifecycleState::Closed
+    );
+    assert_eq!(
+        closed.server("disabled").unwrap().state(),
+        McpLifecycleState::Disabled
+    );
 }
 
 #[test]
