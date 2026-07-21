@@ -9,6 +9,7 @@ fn reasoning_effort_accepts_provider_supported_values() {
         ("medium", ReasoningEffort::Medium),
         ("high", ReasoningEffort::High),
         ("xhigh", ReasoningEffort::XHigh),
+        ("max", ReasoningEffort::Max),
     ] {
         let config = RequestConfig::with_reasoning_effort(value).expect("value should be valid");
 

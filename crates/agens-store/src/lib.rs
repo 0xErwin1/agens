@@ -675,7 +675,7 @@ fn decode_pattern(
 }
 
 const SESSIONS_DATABASE: &str = "rust-sessions.db";
-const SESSIONS_SCHEMA_VERSION: i64 = 3;
+const SESSIONS_SCHEMA_VERSION: i64 = 4;
 const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
     0, "id", "INTEGER", false, None, 1,
 )];
@@ -838,7 +838,7 @@ impl SessionStore {
 
         match session_schema_version(&connection, &database_path)? {
             0 => {
-                initialize_v3_schema(&mut connection, &database_path)?;
+                initialize_v4_schema(&mut connection, &database_path)?;
                 connection
                     .pragma_update(None, "journal_mode", "WAL")
                     .map_err(|error| {
@@ -856,7 +856,8 @@ impl SessionStore {
                 return Ok(store);
             }
             2 => migrate_v2_on_open(&mut connection, &database_path)?,
-            3 => validate_v3_schema(&connection, &database_path)?,
+            3 => migrate_v3_on_open(&mut connection, &database_path)?,
+            4 => validate_v4_schema(&connection, &database_path)?,
             unsupported => {
                 return Err(SessionStoreError::operation(
                     "check schema version",
@@ -1082,7 +1083,11 @@ fn normalized_session_schema_v3() -> String {
     )
 }
 
-fn initialize_v3_schema(
+fn normalized_session_schema_v4() -> String {
+    normalized_session_schema_v3().replace("'xhigh'))", "'xhigh', 'max'))")
+}
+
+fn initialize_v4_schema(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
@@ -1095,12 +1100,12 @@ fn initialize_v3_schema(
     transaction
         .execute_batch(&format!(
             "{} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};",
-            normalized_session_schema_v3()
+            normalized_session_schema_v4()
         ))
         .map_err(|error| {
             SessionStoreError::operation("initialize v2 schema", database_path, error)
         })?;
-    validate_v3_schema(&transaction, database_path)?;
+    validate_v4_schema(&transaction, database_path)?;
     transaction.commit().map_err(|error| {
         SessionStoreError::operation("commit v2 initialization", database_path, error)
     })
@@ -1123,15 +1128,82 @@ fn migrate_v2_on_open(
          ALTER TABLE sessions ADD COLUMN model_id TEXT
              CHECK(model_id <> '' AND length(model_id) <= 64);
          ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT
-             CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh'));
-         PRAGMA user_version = 3;",
+             CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
+         PRAGMA user_version = 4;",
         )
         .map_err(|error| SessionStoreError::operation("migrate v2 schema", database_path, error))?;
     migration_fault("before-v3-commit", database_path)?;
-    validate_v3_schema(&transaction, database_path)?;
+    validate_v4_schema(&transaction, database_path)?;
     transaction
         .commit()
         .map_err(|error| SessionStoreError::operation("commit v2 migration", database_path, error))
+}
+
+fn migrate_v3_on_open(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_v3_schema(connection, database_path)?;
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|error| {
+            SessionStoreError::operation(
+                "disable foreign keys for v3 migration",
+                database_path,
+                error,
+            )
+        })?;
+
+    let migration = (|| {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation("start v3 migration", database_path, error)
+            })?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE sessions_v3_backup AS SELECT * FROM sessions;
+                 DROP TABLE sessions;
+                 CREATE TABLE sessions (
+                     id INTEGER PRIMARY KEY,
+                     project TEXT NOT NULL CHECK(project <> ''),
+                     title TEXT NOT NULL,
+                     active_agent TEXT NOT NULL CHECK(active_agent <> ''),
+                     created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_turn_count >= 0),
+                     resumable INTEGER NOT NULL DEFAULT 0 CHECK(resumable IN(0, 1)),
+                     provider_id TEXT CHECK(provider_id <> '' AND length(provider_id) <= 64),
+                     model_id TEXT CHECK(model_id <> '' AND length(model_id) <= 64),
+                     reasoning_effort TEXT CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')),
+                     CHECK(resumable = (completed_turn_count > 0))
+                 );
+                 INSERT INTO sessions SELECT * FROM sessions_v3_backup;
+                 DROP TABLE sessions_v3_backup;
+                 CREATE INDEX sessions_list ON sessions(resumable, updated_at DESC, id DESC);
+                 PRAGMA user_version = 4;",
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("migrate v3 schema", database_path, error)
+            })?;
+        migration_fault("before-v4-commit", database_path)?;
+        validate_v4_schema(&transaction, database_path)?;
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("commit v3 migration", database_path, error)
+        })
+    })();
+
+    let foreign_keys = connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| {
+            SessionStoreError::operation(
+                "restore foreign keys after v3 migration",
+                database_path,
+                error,
+            )
+        });
+    migration?;
+    foreign_keys
 }
 
 fn validate_v1_schema(
@@ -1219,7 +1291,7 @@ fn migrate_v1_on_open(
         .map_err(|error| {
             SessionStoreError::operation("reopen v2 migration", database_path, error)
         })?;
-    validate_v3_schema(&reopened, database_path)
+    validate_v4_schema(&reopened, database_path)
 }
 
 fn migration_fault(point: &str, database_path: &Path) -> Result<(), SessionStoreError> {
@@ -1421,14 +1493,14 @@ fn finalize_v2_migration(
             "{}
                  DROP TABLE completed_turn_events;
               DROP TABLE completed_turns;
-              PRAGMA user_version = 3;",
-            normalized_session_schema_v3()
+              PRAGMA user_version = 4;",
+            normalized_session_schema_v4()
         ))
         .map_err(|error| {
             SessionStoreError::operation("finalize v1 migration", database_path, error)
         })?;
 
-    validate_v3_schema(transaction, database_path)
+    validate_v4_schema(transaction, database_path)
 }
 
 fn validate_v2_schema(
@@ -1445,6 +1517,14 @@ fn validate_v3_schema(
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
     validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v3())
+}
+
+fn validate_v4_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_legacy_archive(connection, database_path)?;
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v4())
 }
 
 fn validate_normalized_session_schema(

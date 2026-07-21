@@ -165,8 +165,8 @@ fn subscription_reasoning_effort_is_sent_only_when_configured() {
     for (config, expected) in [
         (RequestConfig::default(), json!({"summary": "auto"})),
         (
-            RequestConfig::with_reasoning_effort("high").expect("effort should be valid"),
-            json!({"summary": "auto", "effort": "high"}),
+            RequestConfig::with_reasoning_effort("max").expect("effort should be valid"),
+            json!({"summary": "auto", "effort": "max"}),
         ),
     ] {
         let directory = temporary_directory("reasoning-effort");

@@ -522,7 +522,7 @@ fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundari
         active_agent: "primary".into(),
         provider_id: Some("openai-chatgpt".into()),
         model_id: Some("gpt-5.5".into()),
-        reasoning_effort: Some(ReasoningEffort::High),
+        reasoning_effort: Some(ReasoningEffort::Max),
         created_at: 10,
         updated_at: 20,
         completed_turn_count: 0,

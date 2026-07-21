@@ -300,7 +300,7 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
-fn opens_populated_wal_v1_as_v3_smoke() {
+fn opens_populated_wal_v1_as_v4_smoke() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
 
@@ -326,7 +326,7 @@ fn opens_populated_wal_v1_as_v3_smoke() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     drop(connection);
     drop(store);
@@ -338,7 +338,7 @@ fn opens_populated_wal_v1_as_v3_smoke() {
 }
 
 #[test]
-fn normalized_v3_schema() {
+fn normalized_v4_schema() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
 
@@ -363,7 +363,7 @@ fn normalized_v3_schema() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert!(schema.contains("CREATE TABLE sessions"));
     assert!(schema.contains("CREATE TABLE turns"));
@@ -537,7 +537,7 @@ fn migration_validates_schema_and_reopen_contract() {
         archive
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         archive
@@ -611,7 +611,7 @@ fn rejects_tampered_v1_before_destructive_finalization() {
 }
 
 #[test]
-fn migration_faults_preserve_v1_or_recover_only_a_committed_v3() {
+fn migration_faults_preserve_v1_or_recover_only_a_committed_v4() {
     for (point, commits) in [
         ("after-backup-step", false),
         ("after-backup-finalize", false),
@@ -641,7 +641,7 @@ fn migration_faults_preserve_v1_or_recover_only_a_committed_v3() {
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap();
         if commits {
-            assert_eq!(version, 3, "{point} may expose only a committed v3");
+            assert_eq!(version, 4, "{point} may expose only a committed v4");
             assert_eq!(archive_contents(&inspected), expected);
             assert!(
                 inspected
@@ -823,7 +823,7 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
 }
 
 #[test]
-fn fresh_v2_legacy_coexistence() {
+fn fresh_v4_legacy_coexistence() {
     let directory = data_directory();
     let first = completed_snapshot("first");
     let second = completed_snapshot("second");
@@ -837,7 +837,7 @@ fn fresh_v2_legacy_coexistence() {
             database
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             database

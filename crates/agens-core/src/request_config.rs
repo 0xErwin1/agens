@@ -6,6 +6,7 @@ pub enum ReasoningEffort {
     Medium,
     High,
     XHigh,
+    Max,
 }
 
 impl ReasoningEffort {
@@ -17,6 +18,7 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -35,6 +37,7 @@ impl RequestConfig {
             "medium" => ReasoningEffort::Medium,
             "high" => ReasoningEffort::High,
             "xhigh" => ReasoningEffort::XHigh,
+            "max" => ReasoningEffort::Max,
             _ => {
                 return Err(RequestConfigError::UnsupportedReasoningEffort(
                     value.to_owned(),

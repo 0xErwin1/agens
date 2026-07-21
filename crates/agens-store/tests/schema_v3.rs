@@ -86,12 +86,18 @@ fn populated_v2_migrates_losslessly_with_null_metadata_and_reopens_idempotently(
     let directory = populated_v2();
     let store = SessionStore::open(&directory).unwrap();
     let database = Connection::open(store.database_path()).unwrap();
+    assert_eq!(
+        database
+            .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
 
     assert_eq!(
         database
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     assert_eq!(
         database
@@ -182,5 +188,89 @@ fn interrupted_v2_migration_rolls_back_schema_version_and_values() {
     drop(connection);
 
     SessionStore::open(&directory).unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn populated_v3_migrates_selection_metadata_and_accepts_max_effort() {
+    let directory = std::env::temp_dir().join(format!(
+        "agens-store-v4-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+    ));
+    let store = SessionStore::open(&directory).unwrap();
+    let database_path = store.database_path();
+    drop(store);
+
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .pragma_update(None, "foreign_keys", "OFF")
+        .unwrap();
+    connection
+        .execute_batch(
+            "INSERT INTO sessions(id, project, title, active_agent, provider_id, model_id,
+                                  reasoning_effort, created_at, updated_at)
+                 VALUES(9, '/project/a', 'saved', 'primary', 'openai-chatgpt',
+                        'gpt-5.6-luna', 'xhigh', 10, 20);
+             BEGIN IMMEDIATE;
+             CREATE TABLE sessions_v4_backup AS SELECT * FROM sessions;
+             DROP TABLE sessions;
+             CREATE TABLE sessions (
+                 id INTEGER PRIMARY KEY,
+                 project TEXT NOT NULL CHECK(project <> ''),
+                 title TEXT NOT NULL,
+                 active_agent TEXT NOT NULL CHECK(active_agent <> ''),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_turn_count >= 0),
+                 resumable INTEGER NOT NULL DEFAULT 0 CHECK(resumable IN(0, 1)),
+                 provider_id TEXT CHECK(provider_id <> '' AND length(provider_id) <= 64),
+                 model_id TEXT CHECK(model_id <> '' AND length(model_id) <= 64),
+                 reasoning_effort TEXT CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh')),
+                 CHECK(resumable = (completed_turn_count > 0))
+             );
+             INSERT INTO sessions SELECT * FROM sessions_v4_backup;
+             DROP TABLE sessions_v4_backup;
+             CREATE INDEX sessions_list ON sessions(resumable, updated_at DESC, id DESC);
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let database = Connection::open(store.database_path()).unwrap();
+    assert_eq!(
+        database
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        database
+            .query_row(
+                "SELECT provider_id, model_id, reasoning_effort FROM sessions WHERE id = 9",
+                [],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+        (
+            "openai-chatgpt".to_owned(),
+            "gpt-5.6-luna".to_owned(),
+            "xhigh".to_owned()
+        )
+    );
+    database
+        .execute(
+            "UPDATE sessions SET reasoning_effort = 'max' WHERE id = 9",
+            [],
+        )
+        .unwrap();
+    drop(database);
+    drop(store);
     fs::remove_dir_all(directory).unwrap();
 }

@@ -203,8 +203,8 @@ fn reasoning_effort_is_sent_only_when_configured() {
     for (config, expected) in [
         (RequestConfig::default(), None),
         (
-            RequestConfig::with_reasoning_effort("high").expect("effort should be valid"),
-            Some(json!({"effort": "high"})),
+            RequestConfig::with_reasoning_effort("max").expect("effort should be valid"),
+            Some(json!({"effort": "max"})),
         ),
     ] {
         let mut server =
