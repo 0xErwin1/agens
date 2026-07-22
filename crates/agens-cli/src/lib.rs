@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -1105,6 +1105,15 @@ struct TuiSessionContext {
     resume_error: Option<String>,
     selected_subagent: Option<String>,
     running: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletedSubagentTurn {
+    id: u64,
+    agent: String,
+    task: String,
+    final_result: String,
+    tool_uses: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2663,6 +2672,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             presentation,
             messages: resumed.messages.clone(),
         });
+        for event in resumed_subagent_events(&resumed.messages) {
+            tui.apply_runtime_event(event);
+        }
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
@@ -2692,6 +2704,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         &mut tui,
         move |request, progress| route_router.route_request(request, progress),
         move |prompt, background, progress, metrics| {
+            let task_events = metrics.clone();
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
             let Ok(mut active) = cancellation.lock() else {
@@ -2704,8 +2717,6 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             *active = Some(turn_cancellation.clone());
             drop(active);
 
-            let lifecycle_bridge =
-                TuiTaskLifecycleBridge::new(metrics.clone(), task_controls.clone());
             let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
                 metrics,
                 BridgeCancel::new(),
@@ -2721,6 +2732,8 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            let lifecycle_bridge = TuiTaskLifecycleBridge::new(task_events, task_controls.clone())
+                .with_session_writer(runtime_bootstrap.clone(), Arc::clone(&router.session));
             let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
                 &router.skills,
@@ -4177,6 +4190,183 @@ fn completed_session_turn_from_events(
         .map_err(|_| CliError::storage("completed session could not be encoded"))
 }
 
+fn completed_subagent_session_turn(
+    turn: &CompletedSubagentTurn,
+) -> Result<CompletedSessionTurn, CliError> {
+    let call_id = format!("subagent:{}", turn.id);
+    let agent = sanitize_subagent_persistence(&turn.agent);
+    let task = sanitize_subagent_persistence(&turn.task);
+    let final_result = sanitize_subagent_persistence(&turn.final_result);
+    let input = serde_json::json!({
+        "agent": agent,
+        "description": task,
+    })
+    .to_string();
+    let messages = vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(task)],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::ToolCall {
+                    id: call_id.clone(),
+                    name: "native::task".into(),
+                    input,
+                },
+                MessagePart::Reasoning(format!("{} tool uses", turn.tool_uses)),
+            ],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: call_id,
+                content: final_result,
+                is_error: false,
+            }],
+        },
+    ];
+    let messages = messages
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .map_err(|_| CliError::storage("completed session could not be encoded"))?;
+    CompletedSessionTurn::new(messages)
+        .map_err(|_| CliError::storage("completed session could not be encoded"))
+}
+
+fn sanitize_subagent_persistence(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if ["api_key", "authorization", "password", "secret", "token"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        "[redacted]".into()
+    } else {
+        value.chars().take(256).collect()
+    }
+}
+
+fn persist_completed_subagent_turn(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<TuiSessionContext>>,
+    turn: CompletedSubagentTurn,
+) -> Result<(), CliError> {
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    let provider = context.provider.map(|provider| match provider {
+        TuiProvider::OpenAiApi => "openai-api".to_owned(),
+        TuiProvider::OpenAiChatGpt => "openai-chatgpt".to_owned(),
+    });
+    let model = context
+        .selection
+        .as_ref()
+        .map(|selection| selection.model().to_owned())
+        .or_else(|| bootstrap.model().map(ToOwned::to_owned))
+        .unwrap_or_else(|| default_model(bootstrap).to_owned());
+    let active_agent = context
+        .active_agent
+        .as_ref()
+        .map(|agent| agent.name.as_str());
+    let metadata = next_session_metadata(
+        bootstrap,
+        &turn.task,
+        context.metadata.as_ref(),
+        active_agent,
+        provider,
+        model,
+        None,
+    )?;
+    let mut store = SessionStore::open(bootstrap.data_directory())
+        .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let metadata = store
+        .persist_completed_session_turn(&metadata, &completed_subagent_session_turn(&turn)?)
+        .map_err(|_| CliError::storage("completed session could not be saved"))?;
+    let messages = store
+        .load_session_for_resume(metadata.id)
+        .map_err(|_| CliError::storage("completed session could not be loaded"))?
+        .messages;
+    context.identifier = Some(metadata.id);
+    context.metadata = Some(metadata);
+    context.messages = messages;
+    Ok(())
+}
+
+fn resumed_subagent_events(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
+    let mut events = Vec::new();
+    let mut restored = BTreeSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        let Some(Message {
+            role: Role::User,
+            parts: user_parts,
+        }) = index.checked_sub(1).and_then(|index| messages.get(index))
+        else {
+            continue;
+        };
+        let Some(MessagePart::ToolCall { id, name, input }) = message.parts.first() else {
+            continue;
+        };
+        let Some(id) = name
+            .eq("native::task")
+            .then(|| id.strip_prefix("subagent:"))
+            .flatten()
+            .and_then(|id| id.parse().ok())
+        else {
+            continue;
+        };
+        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(input) else {
+            continue;
+        };
+        let (Some(agent), Some(task)) = (
+            arguments.get("agent").and_then(serde_json::Value::as_str),
+            arguments
+                .get("description")
+                .and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let Some(MessagePart::Text(user_task)) = user_parts.first() else {
+            continue;
+        };
+        if task != user_task {
+            continue;
+        }
+        let Some(result) = messages[index + 1..].iter().find_map(|message| {
+            (message.role == Role::Tool)
+                .then_some(&message.parts)
+                .and_then(|parts| {
+                    parts.iter().find_map(|part| match part {
+                        MessagePart::ToolResult {
+                            tool_call_id,
+                            content,
+                            is_error: false,
+                        } if tool_call_id == &format!("subagent:{id}") => Some(content.as_str()),
+                        _ => None,
+                    })
+                })
+        }) else {
+            continue;
+        };
+        if !restored.insert(id) {
+            continue;
+        }
+        events.push(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(
+                id,
+                agent,
+                task,
+                agens_tui::TuiExecutionState::ForegroundRunning,
+            ),
+        ));
+        events.push(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, result),
+        ));
+    }
+    events
+}
+
 fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessagePart>) {
     if !parts.is_empty() {
         messages.push(Message {
@@ -4454,6 +4644,8 @@ struct TuiTaskLifecycleBridge {
     controls: TuiTaskControls,
     lifecycle: Arc<Mutex<Option<TaskExecutionLifecycle>>>,
     terminal_results: Arc<Mutex<BTreeMap<u64, String>>>,
+    completed_turns: Arc<Mutex<BTreeMap<u64, CompletedSubagentTurn>>>,
+    persist_completed: Option<Arc<dyn Fn(CompletedSubagentTurn) + Send + Sync>>,
 }
 
 impl TuiTaskLifecycleBridge {
@@ -4463,7 +4655,20 @@ impl TuiTaskLifecycleBridge {
             controls,
             lifecycle: Arc::new(Mutex::new(None)),
             terminal_results: Arc::new(Mutex::new(BTreeMap::new())),
+            completed_turns: Arc::new(Mutex::new(BTreeMap::new())),
+            persist_completed: None,
         }
+    }
+
+    fn with_session_writer(
+        mut self,
+        bootstrap: Bootstrap,
+        session: Arc<Mutex<TuiSessionContext>>,
+    ) -> Self {
+        self.persist_completed = Some(Arc::new(move |turn| {
+            let _ = persist_completed_subagent_turn(&bootstrap, &session, turn);
+        }));
+        self
     }
 
     fn mode(&self) -> Option<TaskLaunchMode> {
@@ -4484,6 +4689,18 @@ impl TuiTaskLifecycleBridge {
             TaskLaunchMode::Background => agens_tui::TuiExecutionState::BackgroundRunning,
         };
         let agent = request.agent_name().to_owned();
+        if let Ok(mut turns) = self.completed_turns.lock() {
+            turns.insert(
+                id,
+                CompletedSubagentTurn {
+                    id,
+                    agent: agent.clone(),
+                    task: request.description().to_owned(),
+                    final_result: String::new(),
+                    tool_uses: 0,
+                },
+            );
+        }
         self.publish(TuiRuntimeEvent::TaskExecution {
             agent: agent.clone(),
             event: match lifecycle.mode() {
@@ -4497,6 +4714,8 @@ impl TuiTaskLifecycleBridge {
         let events = self.events.clone();
         let controls = self.controls.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
+        let completed_turns = Arc::clone(&self.completed_turns);
+        let persist_completed = self.persist_completed.clone();
         std::thread::spawn(move || {
             let mut seen = 1;
             loop {
@@ -4556,6 +4775,16 @@ impl TuiTaskLifecycleBridge {
                             &BridgeCancel::new(),
                             None,
                         );
+                        let completed_turn = completed_turns
+                            .lock()
+                            .ok()
+                            .and_then(|mut turns| turns.remove(&id));
+                        if matches!(event, TuiExecutionEvent::Completed { .. })
+                            && let (Some(turn), Some(persist)) =
+                                (completed_turn, &persist_completed)
+                        {
+                            persist(turn);
+                        }
                         if let Ok(mut controls) = controls.0.lock() {
                             controls.remove(&id);
                         }
@@ -4569,6 +4798,12 @@ impl TuiTaskLifecycleBridge {
     }
 
     fn observe_progress(&self, id: u64, event: TurnEvent) {
+        if matches!(event, TurnEvent::ToolCallRequested { .. })
+            && let Ok(mut turns) = self.completed_turns.lock()
+            && let Some(turn) = turns.get_mut(&id)
+        {
+            turn.tool_uses += 1;
+        }
         let event = match event {
             TurnEvent::ToolCallRequested {
                 id: call_id,
@@ -4593,6 +4828,12 @@ impl TuiTaskLifecycleBridge {
         };
         if let Ok(mut results) = self.terminal_results.lock() {
             results.insert(id, final_result);
+        }
+        if let Ok(result) = result
+            && let Ok(mut turns) = self.completed_turns.lock()
+            && let Some(turn) = turns.get_mut(&id)
+        {
+            turn.final_result = result.into();
         }
     }
 
@@ -6561,6 +6802,125 @@ mod tests {
                     parts: vec![MessagePart::Text("after tool".into())],
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn p1c_completed_subagent_turn_persists_one_bounded_standard_turn() {
+        let temporary = tui_session_directory("p1c-completed-subagent");
+        let mut store = SessionStore::open(&temporary).unwrap();
+        let turn = CompletedSubagentTurn {
+            id: 7,
+            agent: "reviewer".into(),
+            task: "review this change".into(),
+            final_result: "approved".into(),
+            tool_uses: 2,
+        };
+        let metadata = persist_tui_session(&mut store, "project", "existing session");
+
+        let persisted = store
+            .persist_completed_session_turn(
+                &metadata,
+                &completed_subagent_session_turn(&turn).unwrap(),
+            )
+            .unwrap();
+        let reopened = store.load_session_for_resume(persisted.id).unwrap();
+
+        assert_eq!(persisted.completed_turn_count, 2);
+        assert_eq!(
+            reopened.messages[3..],
+            [
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("review this change".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        MessagePart::ToolCall {
+                            id: "subagent:7".into(),
+                            name: "native::task".into(),
+                            input: r#"{"agent":"reviewer","description":"review this change"}"#
+                                .into(),
+                        },
+                        MessagePart::Reasoning("2 tool uses".into()),
+                    ],
+                },
+                Message {
+                    role: Role::Tool,
+                    parts: vec![MessagePart::ToolResult {
+                        tool_call_id: "subagent:7".into(),
+                        content: "approved".into(),
+                        is_error: false,
+                    }],
+                },
+            ]
+        );
+        assert_eq!(
+            resumed_subagent_events(&reopened.messages),
+            vec![
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+                    7,
+                    "reviewer",
+                    "review this change",
+                    agens_tui::TuiExecutionState::ForegroundRunning,
+                )),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
+                    7,
+                    TuiSubagentStatus::Success,
+                    "approved",
+                )),
+            ]
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn p1c_resume_ignores_incomplete_and_duplicate_subagent_turns() {
+        let turn = CompletedSubagentTurn {
+            id: 9,
+            agent: "reviewer".into(),
+            task: "check safety".into(),
+            final_result: "complete".into(),
+            tool_uses: 0,
+        };
+        let complete = completed_subagent_session_turn(&turn).unwrap();
+        let mut incomplete = complete.messages().to_vec();
+        incomplete.pop();
+        let mut duplicated = complete.messages().to_vec();
+        duplicated.extend(complete.messages().iter().cloned());
+
+        assert!(resumed_subagent_events(&incomplete).is_empty());
+        assert_eq!(resumed_subagent_events(&duplicated).len(), 2);
+    }
+
+    #[test]
+    fn p1c_completed_subagent_turn_redacts_and_bounds_durable_content() {
+        let turn = CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: format!("authorization {}", "x".repeat(300)),
+            final_result: "token=result".into(),
+            tool_uses: 1,
+        };
+
+        let messages = completed_subagent_session_turn(&turn)
+            .unwrap()
+            .messages()
+            .to_vec();
+
+        assert_eq!(
+            messages[0].parts,
+            vec![MessagePart::Text("[redacted]".into())]
+        );
+        assert_eq!(
+            messages[2].parts,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "subagent:1".into(),
+                content: "[redacted]".into(),
+                is_error: false,
+            }]
         );
     }
 
