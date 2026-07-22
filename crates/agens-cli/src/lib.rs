@@ -292,6 +292,11 @@ impl CliError {
                 "permission",
                 "permission evaluation failed",
             ),
+            HeadlessTurnError::PermissionEvaluation => (
+                ExitStatus::Failure,
+                "permission",
+                "permission target could not be evaluated; correct the tool arguments and retry",
+            ),
             HeadlessTurnError::PermissionRequired => (
                 ExitStatus::Failure,
                 "permission",
@@ -11330,6 +11335,59 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("first", true), ("later", true)]
         );
+    }
+
+    #[test]
+    fn permission_error_mapping_is_sanitized_and_fails_closed() {
+        let secret_input = r#"{"command":"SENTINEL_COMMAND","token":"SENTINEL_TOKEN"}"#;
+        for (name, input) in [
+            ("native::read", "{malformed"),
+            ("native::read", secret_input),
+            ("native::unknown", r#"{"path":"SENTINEL_PATH"}"#),
+        ] {
+            let outcome = run_production_batch(
+                "permission-evaluation-invalid",
+                Vec::new(),
+                vec![MessagePart::ToolCall {
+                    id: "invalid".into(),
+                    name: name.into(),
+                    input: input.into(),
+                }],
+                None,
+                None,
+                false,
+            );
+
+            assert_eq!(outcome.result, Err(HeadlessTurnError::PermissionEvaluation));
+            assert!(outcome.executions.is_empty());
+        }
+
+        for (turn_error, expected) in [
+            (
+                HeadlessTurnError::Permission,
+                "permission: permission evaluation failed",
+            ),
+            (
+                HeadlessTurnError::PermissionRequired,
+                "permission: permission approval is required",
+            ),
+            (
+                HeadlessTurnError::PermissionEvaluation,
+                "permission: permission target could not be evaluated; correct the tool arguments and retry",
+            ),
+        ] {
+            let error = CliError::runtime(turn_error);
+            assert_eq!(error.category, "permission");
+            assert_eq!(error.to_string(), expected);
+            assert!(!error.to_string().contains("SENTINEL_COMMAND"));
+            assert!(!error.to_string().contains("SENTINEL_TOKEN"));
+
+            assert!(matches!(
+                tui_provider_outcome(Err(error)),
+                TuiProviderOutcome::Failed { message, action }
+                    if message == expected && action == TUI_ERROR_ACTION
+            ));
+        }
     }
 
     #[test]

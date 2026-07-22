@@ -915,6 +915,7 @@ pub enum HeadlessTurnError {
     ProviderServer,
     ProviderProtocol,
     Permission,
+    PermissionEvaluation,
     PermissionRequired,
     Tool,
     Store,
@@ -935,6 +936,7 @@ impl fmt::Display for HeadlessTurnError {
             Self::ProviderServer => "provider service failed",
             Self::ProviderProtocol => "provider response protocol failed",
             Self::Permission => "permission operation failed",
+            Self::PermissionEvaluation => "permission evaluation failed",
             Self::PermissionRequired => "permission required",
             Self::Tool => "tool operation failed",
             Self::Store => "completed turn could not be saved",
@@ -1108,7 +1110,11 @@ async fn run_headless_turn_with_iteration_limit(
                 .evaluate(&call, cancellation)
                 .await
                 .map_err(|error| {
-                    finish_port_error(&mut coordinator, error, HeadlessTurnError::Permission)
+                    finish_port_error(
+                        &mut coordinator,
+                        error,
+                        HeadlessTurnError::PermissionEvaluation,
+                    )
                 })?;
             check_cancelled(&mut coordinator, cancellation)?;
             let decision = resolve_permission_decision(
@@ -1192,7 +1198,9 @@ async fn resolve_permission_decision(
     permission_resolver
         .resolve(call, cancellation)
         .await
-        .map_err(|error| finish_port_error(coordinator, error, HeadlessTurnError::Permission))
+        .map_err(|error| {
+            finish_port_error(coordinator, error, HeadlessTurnError::PermissionEvaluation)
+        })
 }
 
 fn check_cancelled(

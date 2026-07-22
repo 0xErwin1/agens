@@ -428,7 +428,7 @@ fn expired_deadline_is_a_distinct_failure_and_never_persists_a_partial_turn() {
 }
 
 #[test]
-fn unresolved_permission_ask_fails_closed_without_exposing_tool_input() {
+fn permission_evaluation_distinguishes_unresolved_asks_without_exposing_tool_input() {
     let secret_input = "credential=do-not-expose";
     let mut provider = Provider {
         iterations: vec![Ok(vec![MessagePart::ToolCall {
@@ -510,13 +510,13 @@ fn denied_permissions_emit_sanitized_tool_results_and_continue_without_dispatch(
 }
 
 #[test]
-fn permission_port_errors_remain_distinct_from_unresolved_asks() {
+fn permission_evaluation_errors_remain_distinct_from_unresolved_asks() {
     for resolver_error in [false, true] {
         let mut provider = Provider {
             iterations: vec![Ok(vec![MessagePart::ToolCall {
                 id: "permission-error".into(),
                 name: "read".into(),
-                input: "file.txt".into(),
+                input: "credential=do-not-expose".into(),
             }])],
         };
         let mut repository = Repository::default();
@@ -575,7 +575,11 @@ fn permission_port_errors_remain_distinct_from_unresolved_asks() {
             ))
         };
 
-        assert_eq!(result, Err(HeadlessTurnError::Permission));
+        assert_eq!(result, Err(HeadlessTurnError::PermissionEvaluation));
+        assert_eq!(
+            HeadlessTurnError::PermissionEvaluation.to_string(),
+            "permission evaluation failed"
+        );
         assert!(repository.snapshots.is_empty());
     }
 }
