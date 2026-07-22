@@ -8608,6 +8608,7 @@ mod tests {
         let filtered = render_tui_test_backend(&tui, 90, 24);
         assert!(filtered.contains("files") && !filtered.contains("disabled  sse"));
         tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape));
+        tui.apply_submission_outcome(router.open_dialog("mcp").unwrap());
         tui.handle(agens_tui::Event::Key(agens_tui::Key::Down));
         tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter));
         let text = render_tui_test_backend(&tui, 90, 24);
@@ -9358,6 +9359,8 @@ mod tests {
         assert!(!agent_search.contains("Alpha"));
         assert!(!agent_search.contains("Beta"));
         tui.handle(Event::Key(Key::Escape));
+        tui.apply_submission_outcome(router.open_dialog("sessions").unwrap());
+        tui.handle(Event::Key(Key::LineStart));
         for character in "other-root".chars() {
             tui.handle(Event::Key(Key::Char(character)));
         }
@@ -9367,7 +9370,7 @@ mod tests {
         assert_eq!(*session.lock().unwrap(), original_context);
 
         tui.handle(Event::Key(Key::Escape));
-        tui.handle(Event::Key(Key::LineStart));
+        tui.apply_submission_outcome(router.open_dialog("sessions").unwrap());
         SessionStore::open(bootstrap.data_directory())
             .unwrap()
             .delete_session(current.id)
