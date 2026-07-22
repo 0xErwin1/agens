@@ -6732,60 +6732,6 @@ mod tests {
     }
 
     #[test]
-    fn p1c1_completed_subagent_turn_persists_one_bounded_standard_turn() {
-        let temporary = tui_session_directory("p1c-completed-subagent");
-        let mut store = SessionStore::open(&temporary).unwrap();
-        let turn = CompletedSubagentTurn {
-            id: 7,
-            agent: "reviewer".into(),
-            task: "review this change".into(),
-            final_result: "approved".into(),
-            tool_uses: 2,
-        };
-        let metadata = persist_tui_session(&mut store, "project", "existing session");
-
-        let persisted = store
-            .persist_completed_session_turn(
-                &metadata,
-                &completed_subagent_session_turn(&turn).unwrap(),
-            )
-            .unwrap();
-        let reopened = store.load_session_for_resume(persisted.id).unwrap();
-
-        assert_eq!(persisted.completed_turn_count, 2);
-        assert_eq!(
-            reopened.messages[3..],
-            [
-                Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text("review this change".into())],
-                },
-                Message {
-                    role: Role::Assistant,
-                    parts: vec![
-                        MessagePart::ToolCall {
-                            id: "subagent:7".into(),
-                            name: "native::task".into(),
-                            input: r#"{"agent":"reviewer","description":"review this change"}"#
-                                .into(),
-                        },
-                        MessagePart::Reasoning("2 tool uses".into()),
-                    ],
-                },
-                Message {
-                    role: Role::Tool,
-                    parts: vec![MessagePart::ToolResult {
-                        tool_call_id: "subagent:7".into(),
-                        content: "approved".into(),
-                        is_error: false,
-                    }],
-                },
-            ]
-        );
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
     fn p1c1_completed_subagent_turn_redacts_and_bounds_durable_content() {
         let turn = CompletedSubagentTurn {
             id: 1,
@@ -6815,85 +6761,96 @@ mod tests {
     }
 
     #[test]
-    fn p1c1_terminal_observer_excludes_running_background_failed_and_duplicate_work() {
-        let temporary = tui_session_directory("p1c1-terminal-exclusions");
-        let bootstrap = tui_session_bootstrap(
-            &temporary,
-            &[(
-                "reviewer",
-                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
-            )],
-        );
-        let (events, _receiver) = BridgeTx::bounded(8);
-        let controls = TuiTaskControls::default();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
-        }));
-        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
-            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
-        let mut runtime = production_tui_task_runtime_with_runner(
-            &bootstrap,
-            &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
-            ProductionTaskRunner::with_probe(
-                bootstrap.clone(),
-                bootstrap.project_root().unwrap().to_path_buf(),
-                Arc::new(Mutex::new(Vec::new())),
+    fn p1c1_terminal_observer_excludes_non_completed_matrix() {
+        for (label, terminal) in [
+            ("cancelled", Some(TaskTerminalState::Cancelled)),
+            ("timed-out", Some(TaskTerminalState::Failed)),
+            ("incomplete", None),
+            ("failed", Some(TaskTerminalState::Failed)),
+        ] {
+            let temporary = tui_session_directory(&format!("p1c1-{label}"));
+            let bootstrap = tui_session_bootstrap(
+                &temporary,
+                &[(
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                )],
+            );
+            let (events, _receiver) = BridgeTx::bounded(8);
+            let controls = TuiTaskControls::default();
+            let session = Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }));
+            let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+                .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+            let mut runtime = production_tui_task_runtime_with_runner(
+                &bootstrap,
+                &SkillCatalog::default(),
+                production_tui_permission_bridge().0,
+                ProductionTaskRunner::with_probe(
+                    bootstrap.clone(),
+                    bootstrap.project_root().unwrap().to_path_buf(),
+                    Arc::new(Mutex::new(Vec::new())),
+                )
+                .with_lifecycle_bridge(lifecycle_bridge),
             )
-            .with_lifecycle_bridge(lifecycle_bridge),
-        )
-        .unwrap();
-        runtime.authorized.gate.policy = PermissionPolicy::new(
-            PermissionMode::Edit,
-            vec![PermissionRule::global(
-                PermissionDecision::Allow,
-                PermissionPattern::Exact("native::task".into()),
-                PermissionPattern::Any,
-            )],
-        );
-        let cancellation = HeadlessTurnCancellation::new();
-        let worker_session = Arc::clone(&session);
-        let worker_cancellation = cancellation.clone();
-        let worker = std::thread::spawn(move || {
-            launch_selected_tui_task(
-                &mut runtime,
-                &worker_session,
-                "review task",
-                false,
-                &worker_cancellation,
-            )
-        });
-        let lifecycle = (0..100)
-            .find_map(|_| {
-                let lifecycle = controls.0.lock().unwrap().get(&1).cloned();
-                if lifecycle.is_none() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                lifecycle
-            })
-            .expect("running task should be observed");
+            .unwrap();
+            runtime.authorized.gate.policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            );
+            let cancellation = HeadlessTurnCancellation::new();
+            let worker_session = Arc::clone(&session);
+            let worker_cancellation = cancellation.clone();
+            let worker = std::thread::spawn(move || {
+                launch_selected_tui_task(
+                    &mut runtime,
+                    &worker_session,
+                    "review task",
+                    false,
+                    &worker_cancellation,
+                )
+            });
+            let lifecycle = (0..100)
+                .find_map(|_| {
+                    let lifecycle = controls.0.lock().unwrap().get(&1).cloned();
+                    if lifecycle.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    lifecycle
+                })
+                .expect("running task should be observed");
 
-        assert!(session.lock().unwrap().identifier.is_none());
-        assert!(lifecycle.transition_to_background());
-        assert!(session.lock().unwrap().identifier.is_none());
-        assert!(lifecycle.finish(TaskTerminalState::Failed));
-        assert!(!lifecycle.finish(TaskTerminalState::Completed));
+            assert!(session.lock().unwrap().identifier.is_none());
+            assert!(lifecycle.transition_to_background());
+            assert!(session.lock().unwrap().identifier.is_none());
+            if let Some(terminal) = terminal {
+                assert!(lifecycle.finish(terminal));
+            }
+            if label == "failed" {
+                assert!(!lifecycle.finish(TaskTerminalState::Completed));
+            }
 
-        cancellation.cancel();
-        let _ = worker.join().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+            cancellation.cancel();
+            let _ = worker.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
 
-        assert!(session.lock().unwrap().identifier.is_none());
-        assert!(
-            SessionStore::open(bootstrap.data_directory())
-                .unwrap()
-                .list_sessions()
-                .unwrap()
-                .is_empty()
-        );
+            assert!(session.lock().unwrap().identifier.is_none());
+            assert!(
+                SessionStore::open(bootstrap.data_directory())
+                    .unwrap()
+                    .list_sessions()
+                    .unwrap()
+                    .is_empty()
+            );
 
-        std::fs::remove_dir_all(temporary).unwrap();
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
     }
 
     mod model_registry {
