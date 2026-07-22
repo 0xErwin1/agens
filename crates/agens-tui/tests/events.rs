@@ -31,6 +31,210 @@ fn transcript_registry_model_starts_with_an_active_main_record() {
     );
 }
 
+#[test]
+fn transcript_admission_retention_keeps_terminal_records_after_cards_expire() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    for id in 1..=65 {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(
+                id,
+                "reviewer",
+                format!("review-{id}"),
+                TuiExecutionState::ForegroundRunning,
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Completed { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, format!("final-{id}")),
+        ));
+    }
+
+    tui.tick(Duration::from_secs(60));
+
+    assert!(tui.executions().is_empty());
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+    assert_eq!(tui.view().transcript_ids.len(), 65);
+    assert!(tui.transcript_record(&TranscriptId::Subagent(1)).is_none());
+    assert_eq!(
+        tui.transcript_record(&TranscriptId::Subagent(2))
+            .unwrap()
+            .id(),
+        &TranscriptId::Subagent(2)
+    );
+}
+
+#[test]
+fn transcript_admission_retention_ignores_out_of_order_and_post_terminal_updates() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.apply_runtime_event_with_ordinal(
+        10,
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+        },
+    );
+    tui.apply_runtime_event_with_ordinal(
+        9,
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Backgrounded { id: 7 },
+        },
+    );
+    tui.apply_runtime_event_with_ordinal(
+        11,
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "review",
+            TuiExecutionState::ForegroundRunning,
+        )),
+    );
+    tui.apply_runtime_event_with_ordinal(
+        12,
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Completed { id: 7 },
+        },
+    );
+    tui.apply_runtime_event_with_ordinal(
+        13,
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
+            7,
+            TuiSubagentStatus::Success,
+            "final",
+        )),
+    );
+    tui.apply_runtime_event_with_ordinal(
+        14,
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Backgrounded { id: 7 },
+        },
+    );
+
+    assert_eq!(
+        tui.executions()[0].state(),
+        TuiExecutionState::CompletedRecent
+    );
+    assert_eq!(tui.runtime_events().len(), 4);
+    assert_eq!(
+        tui.transcript_record(&TranscriptId::Subagent(7))
+            .unwrap()
+            .last_admitted_ordinal(),
+        Some(13)
+    );
+    assert!(
+        tui.transcript_record(&TranscriptId::Subagent(7))
+            .unwrap()
+            .is_terminal()
+    );
+    assert_eq!(
+        tui.view().transcript_ids,
+        vec![TranscriptId::Main, TranscriptId::Subagent(7)]
+    );
+}
+
+#[test]
+fn transcript_admission_retention_protects_active_child_and_falls_back_after_eviction() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    for id in 1..=65 {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(
+                id,
+                "reviewer",
+                format!("review-{id}"),
+                TuiExecutionState::ForegroundRunning,
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Completed { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, format!("final-{id}")),
+        ));
+
+        if id == 1 {
+            tui.select_transcript(TranscriptId::Subagent(id));
+        }
+    }
+
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(1));
+    assert!(tui.transcript_record(&TranscriptId::Subagent(1)).is_some());
+    assert!(tui.transcript_record(&TranscriptId::Subagent(2)).is_none());
+
+    tui.select_transcript(TranscriptId::Subagent(2));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+}
+
+#[test]
+fn transcript_admission_retention_clears_live_children_only_at_reset_boundaries() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::ContextChanged {
+        message: "Context updated.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session"),
+    });
+    assert!(tui.transcript_record(&TranscriptId::Subagent(7)).is_some());
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::ResetSucceeded {
+        message: "Started a new session.".into(),
+        presentation: TuiPresentation::new("provider", "model", "new session"),
+    });
+
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+    assert_eq!(tui.view().transcript_ids, vec![TranscriptId::Main]);
+}
+
+#[test]
+fn transcript_admission_retention_session_resume_keeps_restored_history_summary_only() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Resumed session 42.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #42"),
+        messages: vec![
+            agens_core::Message {
+                role: agens_core::Role::User,
+                parts: vec![MessagePart::Text("restored prompt".into())],
+            },
+            agens_core::Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![MessagePart::Text("restored summary".into())],
+            },
+        ],
+    });
+
+    let view = tui.view();
+    assert_eq!(view.active_transcript, TranscriptId::Main);
+    assert_eq!(view.transcript_ids, vec![TranscriptId::Main]);
+    assert_eq!(view.completed_conversations.len(), 1);
+    assert!(view.conversation.is_none());
+    assert!(tui.transcript_record(&TranscriptId::Subagent(7)).is_none());
+}
+
 impl Engine for FakeEngine {
     fn cancel(&mut self) {
         self.cancellations += 1;

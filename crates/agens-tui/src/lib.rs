@@ -52,6 +52,7 @@ use ratatui::{
 };
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
+const MAX_CHILD_TRANSCRIPTS: usize = 64;
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
 pub trait Engine {
@@ -253,6 +254,8 @@ pub struct TranscriptRecord {
     collapsed_tool_outputs: BTreeSet<String>,
     collapse_thinking: bool,
     focus: TranscriptFocus,
+    last_admitted_ordinal: Option<u64>,
+    terminal: bool,
 }
 
 impl TranscriptRecord {
@@ -267,11 +270,21 @@ impl TranscriptRecord {
             collapsed_tool_outputs: BTreeSet::new(),
             collapse_thinking: false,
             focus: TranscriptFocus::Composer,
+            last_admitted_ordinal: None,
+            terminal: false,
         }
     }
 
     pub const fn id(&self) -> &TranscriptId {
         &self.id
+    }
+
+    pub const fn last_admitted_ordinal(&self) -> Option<u64> {
+        self.last_admitted_ordinal
+    }
+
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
     }
 }
 
@@ -1485,6 +1498,7 @@ pub struct Tui<E> {
     selected_agent: Option<String>,
     executions: Vec<TuiExecution>,
     now: Duration,
+    next_runtime_ordinal: u64,
 }
 
 impl<E> Tui<E>
@@ -1526,6 +1540,7 @@ where
             selected_agent: None,
             executions: Vec::new(),
             now: Duration::ZERO,
+            next_runtime_ordinal: 0,
         }
     }
 
@@ -1889,6 +1904,7 @@ where
         self.set_running(false);
         self.turn_state = None;
         self.active_tool = None;
+        self.clear_current_session_transcripts();
     }
 
     pub fn replace_history(
@@ -1908,6 +1924,7 @@ where
         self.set_running(false);
         self.turn_state = None;
         self.active_tool = None;
+        self.clear_current_session_transcripts();
         Ok(())
     }
 
@@ -1920,8 +1937,28 @@ where
         self.transcripts.get(id)
     }
 
+    pub fn select_transcript(&mut self, id: TranscriptId) {
+        self.active_transcript = if self.transcripts.contains_key(&id) {
+            id
+        } else {
+            TranscriptId::Main
+        };
+    }
+
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
     pub fn apply_runtime_event(&mut self, event: TuiRuntimeEvent) {
+        let ordinal = self.next_runtime_ordinal;
+        self.next_runtime_ordinal = self.next_runtime_ordinal.saturating_add(1);
+        self.apply_runtime_event_with_ordinal(ordinal, event);
+    }
+
+    /// Retains typed runtime metrics in source order without altering turn persistence.
+    pub fn apply_runtime_event_with_ordinal(&mut self, ordinal: u64, event: TuiRuntimeEvent) {
+        self.next_runtime_ordinal = self.next_runtime_ordinal.max(ordinal.saturating_add(1));
+        if !self.admit_runtime_event(ordinal, &event) {
+            return;
+        }
+
         match &event {
             TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
             TuiRuntimeEvent::TurnEnded { status, duration } => {
@@ -1966,6 +2003,98 @@ where
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
+    }
+
+    fn admit_runtime_event(&mut self, ordinal: u64, event: &TuiRuntimeEvent) -> bool {
+        let id = match event {
+            TuiRuntimeEvent::TaskExecution { event, .. } => match event {
+                TuiExecutionEvent::ForegroundStarted { id }
+                | TuiExecutionEvent::BackgroundStarted { id } => {
+                    let id = TranscriptId::Subagent(*id);
+                    self.ensure_child_transcript(id);
+                    id
+                }
+                TuiExecutionEvent::Backgrounded { id }
+                | TuiExecutionEvent::Completed { id }
+                | TuiExecutionEvent::Failed { id }
+                | TuiExecutionEvent::Cancelled { id } => TranscriptId::Subagent(*id),
+            },
+            TuiRuntimeEvent::SubagentExecution(event) => TranscriptId::Subagent(event.id),
+            _ => TranscriptId::Main,
+        };
+
+        let Some(record) = self.transcripts.get_mut(&id) else {
+            return false;
+        };
+        if record.terminal
+            || record
+                .last_admitted_ordinal
+                .is_some_and(|last| ordinal <= last)
+        {
+            return false;
+        }
+
+        record.last_admitted_ordinal = Some(ordinal);
+        if matches!(
+            event,
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent {
+                update: bridge::TuiSubagentUpdate::Terminal { .. },
+                ..
+            })
+        ) {
+            record.terminal = true;
+            self.evict_terminal_transcripts();
+        }
+        true
+    }
+
+    fn ensure_child_transcript(&mut self, id: TranscriptId) {
+        if self.transcripts.contains_key(&id) {
+            return;
+        }
+
+        self.transcripts.insert(
+            id,
+            TranscriptRecord {
+                id,
+                transcript: Vec::new(),
+                conversation: None,
+                completed_conversations: Vec::new(),
+                following_bottom: true,
+                scroll_offset: 0,
+                collapsed_tool_outputs: BTreeSet::new(),
+                collapse_thinking: false,
+                focus: TranscriptFocus::Viewport,
+                last_admitted_ordinal: None,
+                terminal: false,
+            },
+        );
+        self.child_transcript_order.push(id);
+    }
+
+    fn evict_terminal_transcripts(&mut self) {
+        while self.child_transcript_order.len() > MAX_CHILD_TRANSCRIPTS {
+            let Some(index) = self.child_transcript_order.iter().position(|id| {
+                *id != self.active_transcript
+                    && self
+                        .transcripts
+                        .get(id)
+                        .is_some_and(|record| record.terminal)
+            }) else {
+                return;
+            };
+            let id = self.child_transcript_order.remove(index);
+            self.transcripts.remove(&id);
+        }
+    }
+
+    fn clear_current_session_transcripts(&mut self) {
+        self.transcripts.clear();
+        self.transcripts
+            .insert(TranscriptId::Main, TranscriptRecord::main());
+        self.active_transcript = TranscriptId::Main;
+        self.child_transcript_order.clear();
+        self.next_runtime_ordinal = 0;
     }
 
     /// Adds a typed event to the authoritative, lossless conversation projection.
@@ -3192,7 +3321,8 @@ where
             let Ok(envelope) = metrics_receiver.try_recv() else {
                 break;
             };
-            tui.apply_runtime_event(envelope.into_parts().1);
+            let (ordinal, event) = envelope.into_parts();
+            tui.apply_runtime_event_with_ordinal(ordinal, event);
         }
         while let Ok(event) = receiver.try_recv() {
             tui.apply_progress(event);
