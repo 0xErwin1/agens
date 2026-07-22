@@ -455,7 +455,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(parent.contains("Subagent reviewer"));
+    assert!(parent.contains("Subagent 7 · reviewer"));
     assert!(!parent.contains("child-reasoning"));
     assert!(!parent.contains("child-partial"));
     assert!(!parent.contains("result-a"));
@@ -1266,16 +1266,35 @@ fn p1a1_events_upsert_live_calls_pair_out_of_order_results_and_stop_after_c1_ter
     let cards = &tui.view().conversation.unwrap().subagent_cards;
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0].id, 7);
-    assert_eq!(cards[0].tool_calls.len(), 2);
-    assert_eq!(cards[0].tool_calls[0].call_id, "first");
+    assert_eq!(cards[0].tool_uses, 2);
+    assert!(cards[0].tool_calls.is_empty());
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    let child = tui.view().conversation.unwrap();
+    assert_eq!(child.tool_batches[0].calls.len(), 2);
+    assert_eq!(child.tool_batches[0].calls[0].call_id, "first");
     assert_eq!(
-        cards[0].tool_calls[0].result.as_ref().unwrap().output,
+        child.tool_batches[0].calls[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .output,
         "first result"
     );
-    assert!(cards[0].tool_calls[0].result.as_ref().unwrap().is_error);
-    assert_eq!(cards[0].tool_calls[1].call_id, "later");
+    assert!(
+        child.tool_batches[0].calls[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .is_error
+    );
+    assert_eq!(child.tool_batches[0].calls[1].call_id, "later");
     assert_eq!(
-        cards[0].tool_calls[1].result.as_ref().unwrap().output,
+        child.tool_batches[0].calls[1]
+            .result
+            .as_ref()
+            .unwrap()
+            .output,
         "later result"
     );
 }
@@ -1351,21 +1370,19 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
     for (card, (_, _, status)) in cards.iter().zip(cases) {
         assert_eq!(card.status, Some(status));
         assert_eq!(card.task_summary.chars().count(), 256);
-        assert_eq!(card.tool_calls.len(), 1);
-        assert_eq!(card.tool_calls[0].call_id.chars().count(), 256);
-        assert_eq!(card.tool_calls[0].name.chars().count(), 256);
-        assert_eq!(card.tool_calls[0].input.chars().count(), 256);
-        assert_eq!(
-            card.tool_calls[0]
-                .result
-                .as_ref()
-                .unwrap()
-                .output
-                .chars()
-                .count(),
-            256
-        );
+        assert_eq!(card.tool_uses, 1);
+        assert!(card.tool_calls.is_empty());
         assert_eq!(card.final_result.as_ref().unwrap().chars().count(), 256);
+    }
+
+    for id in [1, 2, 3] {
+        tui.select_transcript(TranscriptId::Subagent(id));
+        let child = tui.view().conversation.unwrap();
+        let call = &child.tool_batches[0].calls[0];
+        assert_eq!(call.call_id.chars().count(), 256);
+        assert_eq!(call.name.chars().count(), 256);
+        assert_eq!(call.input.chars().count(), 256);
+        assert_eq!(call.result.as_ref().unwrap().output.chars().count(), 256);
     }
 
     let mut redacted = Tui::new(FakeEngine::default());
@@ -1395,12 +1412,15 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
 
     let card = &redacted.view().conversation.unwrap().subagent_cards[0];
     assert_eq!(card.task_summary, "[redacted]");
-    assert_eq!(card.tool_calls[0].input, "[redacted]");
-    assert_eq!(
-        card.tool_calls[0].result.as_ref().unwrap().output,
-        "[redacted]"
-    );
+    assert_eq!(card.tool_uses, 1);
+    assert!(card.tool_calls.is_empty());
     assert_eq!(card.final_result.as_deref(), Some("[redacted]"));
+
+    redacted.select_transcript(TranscriptId::Subagent(4));
+    let child = redacted.view().conversation.unwrap();
+    let call = &child.tool_batches[0].calls[0];
+    assert_eq!(call.input, "[redacted]");
+    assert_eq!(call.result.as_ref().unwrap().output, "[redacted]");
 }
 
 #[test]

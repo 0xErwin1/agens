@@ -11182,6 +11182,58 @@ mod tests {
         metrics: Vec<TuiRuntimeEvent>,
     }
 
+    struct ProductionBatchInput<'a> {
+        directory_name: &'a str,
+        answers: Vec<PermissionPromptAnswer>,
+        calls: Vec<MessagePart>,
+        cancellation: Option<HeadlessTurnCancellation>,
+        provider_error: Option<HeadlessTurnPortError>,
+        fail_persistence: bool,
+        policy: PermissionPolicy,
+        bypass: bool,
+    }
+
+    impl<'a> ProductionBatchInput<'a> {
+        fn new(
+            directory_name: &'a str,
+            answers: Vec<PermissionPromptAnswer>,
+            calls: Vec<MessagePart>,
+        ) -> Self {
+            Self {
+                directory_name,
+                answers,
+                calls,
+                cancellation: None,
+                provider_error: None,
+                fail_persistence: false,
+                policy: batch_policy(),
+                bypass: false,
+            }
+        }
+
+        fn with_runtime(
+            mut self,
+            cancellation: Option<HeadlessTurnCancellation>,
+            provider_error: Option<HeadlessTurnPortError>,
+            fail_persistence: bool,
+        ) -> Self {
+            self.cancellation = cancellation;
+            self.provider_error = provider_error;
+            self.fail_persistence = fail_persistence;
+            self
+        }
+
+        fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+            self.policy = policy;
+            self
+        }
+
+        fn with_bypass(mut self) -> Self {
+            self.bypass = true;
+            self
+        }
+    }
+
     fn run_ready<T>(
         future: impl std::future::Future<Output = Result<T, HeadlessTurnError>>,
     ) -> Result<T, HeadlessTurnError> {
@@ -11203,27 +11255,25 @@ mod tests {
         fail_persistence: bool,
     ) -> BatchOutcome {
         run_production_batch_with_policy(
+            ProductionBatchInput::new(directory_name, answers, calls).with_runtime(
+                cancellation,
+                provider_error,
+                fail_persistence,
+            ),
+        )
+    }
+
+    fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) -> BatchOutcome {
+        let ProductionBatchInput {
             directory_name,
             answers,
             calls,
             cancellation,
             provider_error,
             fail_persistence,
-            batch_policy(),
-            false,
-        )
-    }
-
-    fn run_production_batch_with_policy(
-        directory_name: &str,
-        answers: Vec<PermissionPromptAnswer>,
-        calls: Vec<MessagePart>,
-        cancellation: Option<HeadlessTurnCancellation>,
-        provider_error: Option<HeadlessTurnPortError>,
-        fail_persistence: bool,
-        policy: PermissionPolicy,
-        bypass: bool,
-    ) -> BatchOutcome {
+            policy,
+            bypass,
+        } = input;
         let directory =
             std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -11427,19 +11477,17 @@ mod tests {
         };
 
         let allowed = run_production_batch_with_policy(
-            "grouped-native-allow-always",
-            vec![
-                PermissionPromptAnswer::AllowAlways,
-                PermissionPromptAnswer::AllowAlways,
-                PermissionPromptAnswer::AllowAlways,
-                PermissionPromptAnswer::AllowAlways,
-            ],
-            valid_calls(),
-            None,
-            None,
-            false,
-            ask_every_native_tool(),
-            false,
+            ProductionBatchInput::new(
+                "grouped-native-allow-always",
+                vec![
+                    PermissionPromptAnswer::AllowAlways,
+                    PermissionPromptAnswer::AllowAlways,
+                    PermissionPromptAnswer::AllowAlways,
+                    PermissionPromptAnswer::AllowAlways,
+                ],
+                valid_calls(),
+            )
+            .with_policy(ask_every_native_tool()),
         );
         assert!(allowed.result.is_ok());
         assert_eq!(
@@ -11462,46 +11510,42 @@ mod tests {
         );
 
         let partial = run_production_batch_with_policy(
-            "grouped-native-partial-grant",
-            vec![
-                PermissionPromptAnswer::AllowAlways,
-                PermissionPromptAnswer::DenyOnce,
-            ],
-            vec![
-                native_batch_call(
-                    "granted",
-                    "native::glob",
-                    serde_json::json!({"pattern":"src/**/*.rs"}),
-                ),
-                native_batch_call(
-                    "sibling",
-                    "native::glob",
-                    serde_json::json!({"pattern":"tests/**/*.rs"}),
-                ),
-            ],
-            None,
-            None,
-            false,
-            ask_every_native_tool(),
-            false,
+            ProductionBatchInput::new(
+                "grouped-native-partial-grant",
+                vec![
+                    PermissionPromptAnswer::AllowAlways,
+                    PermissionPromptAnswer::DenyOnce,
+                ],
+                vec![
+                    native_batch_call(
+                        "granted",
+                        "native::glob",
+                        serde_json::json!({"pattern":"src/**/*.rs"}),
+                    ),
+                    native_batch_call(
+                        "sibling",
+                        "native::glob",
+                        serde_json::json!({"pattern":"tests/**/*.rs"}),
+                    ),
+                ],
+            )
+            .with_policy(ask_every_native_tool()),
         );
         assert!(partial.result.is_ok());
         assert_eq!(partial.prompts, ["src/**/*.rs", "tests/**/*.rs"]);
         assert_eq!(partial.executions, ["src/**/*.rs"]);
 
         let ask = run_production_batch_with_policy(
-            "grouped-native-ask",
-            vec![PermissionPromptAnswer::Cancel],
-            vec![native_batch_call(
-                "ask",
-                "native::grep",
-                serde_json::json!({"pattern":"TODO", "path":"src"}),
-            )],
-            None,
-            None,
-            false,
-            ask_every_native_tool(),
-            false,
+            ProductionBatchInput::new(
+                "grouped-native-ask",
+                vec![PermissionPromptAnswer::Cancel],
+                vec![native_batch_call(
+                    "ask",
+                    "native::grep",
+                    serde_json::json!({"pattern":"TODO", "path":"src"}),
+                )],
+            )
+            .with_policy(ask_every_native_tool()),
         );
         assert_eq!(ask.result, Err(HeadlessTurnError::Cancelled));
         assert_eq!(ask.prompts, ["TODO"]);
@@ -11516,18 +11560,17 @@ mod tests {
             )],
         );
         let denied = run_production_batch_with_policy(
-            "grouped-native-deny-bypass",
-            vec![PermissionPromptAnswer::AllowAlways],
-            vec![native_batch_call(
-                "denied",
-                "native::webfetch",
-                serde_json::json!({"url":"https://example.test/blocked"}),
-            )],
-            None,
-            None,
-            false,
-            deny_policy,
-            true,
+            ProductionBatchInput::new(
+                "grouped-native-deny-bypass",
+                vec![PermissionPromptAnswer::AllowAlways],
+                vec![native_batch_call(
+                    "denied",
+                    "native::webfetch",
+                    serde_json::json!({"url":"https://example.test/blocked"}),
+                )],
+            )
+            .with_policy(deny_policy)
+            .with_bypass(),
         );
         assert!(denied.result.is_ok());
         assert!(denied.prompts.is_empty());
@@ -11543,18 +11586,17 @@ mod tests {
             ),
         ] {
             let invalid = run_production_batch_with_policy(
-                "grouped-native-invalid",
-                Vec::new(),
-                vec![MessagePart::ToolCall {
-                    id: "invalid".into(),
-                    name: name.into(),
-                    input: input.into(),
-                }],
-                None,
-                None,
-                false,
-                ask_every_native_tool(),
-                true,
+                ProductionBatchInput::new(
+                    "grouped-native-invalid",
+                    Vec::new(),
+                    vec![MessagePart::ToolCall {
+                        id: "invalid".into(),
+                        name: name.into(),
+                        input: input.into(),
+                    }],
+                )
+                .with_policy(ask_every_native_tool())
+                .with_bypass(),
             );
             assert_eq!(invalid.result, Err(HeadlessTurnError::PermissionEvaluation));
             assert!(invalid.prompts.is_empty());

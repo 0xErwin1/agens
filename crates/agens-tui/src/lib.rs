@@ -2515,11 +2515,17 @@ where
                 self.select_sibling(1);
                 return Action::Render;
             }
-            Key::Home => {
+            Key::Home
+                if self.active_transcript != TranscriptId::Main
+                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
+            {
                 self.scroll_to_start();
                 return Action::Render;
             }
-            Key::End => {
+            Key::End
+                if self.active_transcript != TranscriptId::Main
+                    || self.active_record_mut().focus == TranscriptFocus::Viewport =>
+            {
                 self.scroll_to_end();
                 return Action::Render;
             }
@@ -2685,19 +2691,8 @@ where
             Key::NextWord => self.input_cursor = next_word_boundary(&self.input, cursor),
             Key::LineStart => self.input_cursor = line_start(&self.input, cursor),
             Key::LineEnd => self.input_cursor = line_end(&self.input, cursor),
-            Key::Home => {
-                let record = self.active_record_mut();
-                record.following_bottom = false;
-                record.scroll_offset = 0;
-                self.input_cursor = line_start(&self.input, cursor);
-            }
-            Key::End => {
-                let scroll_offset = self.max_scroll_offset();
-                let record = self.active_record_mut();
-                record.following_bottom = true;
-                record.scroll_offset = scroll_offset;
-                self.input_cursor = line_end(&self.input, cursor);
-            }
+            Key::Home => self.input_cursor = line_start(&self.input, cursor),
+            Key::End => self.input_cursor = line_end(&self.input, cursor),
             Key::Backspace => {}
             _ => return None,
         }
