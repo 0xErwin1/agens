@@ -1,7 +1,7 @@
 use agens_core::{
     AttemptFinishOutcome, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
-    MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RequestConfig, Role,
-    SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary, SessionMetadata,
+    MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, RequestConfig,
+    Role, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary, SessionMetadata,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -347,6 +347,58 @@ impl SessionStore {
             })?,
             sessions,
         })
+    }
+
+    pub fn recover_running_attempt(
+        &mut self,
+        key: AttemptKey,
+        finished_at: i64,
+    ) -> Result<RecoveryOutcome, SessionStoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation("start attempt recovery", &self.database_path, error)
+            })?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_attempts SET status = 'interrupted', failure_kind = 'interrupted', finished_at = ?1
+                 WHERE id = ?2 AND session_id = ?3 AND status = 'running'",
+                params![finished_at, key.attempt_id(), key.session_id()],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("recover session attempt", &self.database_path, error)
+            })?;
+        if changed == 0 {
+            transaction.commit().map_err(|error| {
+                SessionStoreError::operation(
+                    "commit stale attempt recovery",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+            return Ok(RecoveryOutcome::Stale);
+        }
+        transaction
+            .execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                params![finished_at, key.session_id()],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("update recovered session", &self.database_path, error)
+            })?;
+        let summary = latest_attempt_summary(&transaction, &self.database_path, key.session_id())?
+            .ok_or_else(|| {
+                SessionStoreError::operation(
+                    "recover session attempt",
+                    &self.database_path,
+                    "recovered attempt is unavailable",
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("commit attempt recovery", &self.database_path, error)
+        })?;
+        Ok(RecoveryOutcome::Recovered(summary))
     }
 
     pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {

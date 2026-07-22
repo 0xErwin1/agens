@@ -5,8 +5,8 @@ use std::{
 
 use agens_core::{
     AttemptFinishOutcome, BeginSessionAttemptError, CompletedSessionTurn, MAX_RETRY_PROMPT_BYTES,
-    Message, MessagePart, ReasoningEffort, Role, SessionAttemptFailureKind, SessionAttemptStatus,
-    SessionMessage, SessionMetadata,
+    Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role, SessionAttemptFailureKind,
+    SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
 use agens_store::SessionStore;
 use rusqlite::Connection;
@@ -384,6 +384,67 @@ fn session_pages_and_load_are_read_only_complete_sorted_and_cross_64() {
     let running = loaded.latest_attempt.unwrap();
     assert!(loaded.messages.is_empty());
     assert_eq!(running.key().session_id(), 65);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 7,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "private".into())
+        .unwrap();
+
+    assert_eq!(
+        store.recover_running_attempt(attempt.key(), 30).unwrap(),
+        RecoveryOutcome::Recovered(
+            agens_core::SessionAttemptSummary::new(
+                attempt.key(),
+                1,
+                SessionAttemptStatus::Interrupted,
+                Some(SessionAttemptFailureKind::Interrupted),
+                20,
+                Some(30)
+            )
+            .unwrap()
+        )
+    );
+    assert_eq!(
+        store.recover_running_attempt(attempt.key(), 31).unwrap(),
+        RecoveryOutcome::Stale
+    );
+    assert_eq!(
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 32)
+            .unwrap(),
+        AttemptFinishOutcome::Stale
+    );
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 0, 0, 0));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, finished_at FROM session_attempts WHERE id = ?1",
+                [attempt.key().attempt_id()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+        ("interrupted".into(), 30)
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
