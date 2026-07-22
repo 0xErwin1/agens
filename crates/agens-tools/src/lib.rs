@@ -4702,13 +4702,10 @@ impl NativeToolCatalog {
         let output = match name {
             "native::read" => {
                 let mut input = ReadFileInput::new(string("path")?);
-                if let (Some(offset), Some(limit)) = (
-                    arguments.get("offset").and_then(Value::as_u64),
-                    arguments.get("limit").and_then(Value::as_u64),
-                ) {
-                    input = input.with_range(offset as usize, limit as usize);
-                } else if arguments.contains_key("offset") || arguments.contains_key("limit") {
-                    return Err(Error::Tool("native tool arguments are invalid".into()));
+                let offset = nonzero_read_bound(arguments, "offset")?;
+                let limit = nonzero_read_bound(arguments, "limit")?;
+                if offset.is_some() || limit.is_some() {
+                    input = input.with_range(offset.unwrap_or(1), limit.unwrap_or(usize::MAX));
                 }
                 self.tools.read_file(input)?
             }
@@ -4776,6 +4773,22 @@ impl NativeToolCatalog {
         }
         Ok(output)
     }
+}
+
+fn nonzero_read_bound(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<usize>, Error> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_u64().filter(|value| *value > 0) else {
+        return Err(Error::Tool("native tool arguments are invalid".into()));
+    };
+
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| Error::Tool("native tool arguments are invalid".into()))
 }
 
 fn native_metadata(
@@ -5163,6 +5176,7 @@ fn unified_edit_diff(
 mod native_tool_tests {
     use super::*;
     use std::{
+        os::unix::ffi::OsStrExt,
         os::unix::fs::symlink,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -5249,6 +5263,91 @@ mod native_tool_tests {
             "swapped"
         );
         assert!(!root.join(cancellation_temp).exists());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn native_read_independent_ranges_preserve_split_inclusive_semantics() {
+        let root = project_root();
+        let outside = project_root();
+        fs::write(root.join("AGENTS.md"), "first\nsecond\nthird\nlast").unwrap();
+        fs::write(outside.join("outside.txt"), "outside").unwrap();
+        fs::create_dir(root.join("directory")).unwrap();
+        symlink(outside.join("outside.txt"), root.join("link.txt")).unwrap();
+        unsafe {
+            assert_eq!(
+                libc::mkfifo(
+                    root.join("pipe").as_os_str().as_bytes().as_ptr().cast(),
+                    0o600
+                ),
+                0
+            );
+        }
+        fs::write(
+            root.join("large.txt"),
+            vec![b'x'; MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+        let context = ToolExecutionContext::with_timeout(Duration::from_secs(1));
+        let read = |arguments| catalog.execute("native::read", arguments, &context);
+
+        assert_eq!(
+            read(serde_json::json!({"path":"AGENTS.md","limit":200}))
+                .unwrap()
+                .content,
+            "first\nsecond\nthird\nlast"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path":"AGENTS.md","offset":3}))
+                .unwrap()
+                .content,
+            "third\nlast"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path":"AGENTS.md","offset":2,"limit":1}))
+                .unwrap()
+                .content,
+            "second\n"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path":"AGENTS.md"}))
+                .unwrap()
+                .content,
+            "first\nsecond\nthird\nlast"
+        );
+        assert_eq!(
+            read(serde_json::json!({"path":"AGENTS.md","offset":9}))
+                .unwrap()
+                .content,
+            ""
+        );
+
+        for arguments in [
+            serde_json::json!({"path":"AGENTS.md","offset":0}),
+            serde_json::json!({"path":"AGENTS.md","limit":0}),
+            serde_json::json!({"path":"AGENTS.md","offset":-1}),
+            serde_json::json!({"path":"AGENTS.md","limit":"1"}),
+            serde_json::from_str(r#"{"path":"AGENTS.md","offset":18446744073709551616}"#).unwrap(),
+        ] {
+            assert!(read(arguments).is_err());
+        }
+
+        for path in [
+            "../outside.txt",
+            "link.txt",
+            "directory",
+            "pipe",
+            "large.txt",
+        ] {
+            assert!(
+                read(serde_json::json!({"path":path})).unwrap().is_error,
+                "{path} must remain rejected"
+            );
+        }
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(outside).unwrap();
