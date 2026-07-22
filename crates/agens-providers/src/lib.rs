@@ -1129,7 +1129,16 @@ fn validate_chatgpt_replay_history(history: &[Value]) -> Result<(), ()> {
 }
 
 fn bounded_tool_output(content: &str) -> String {
-    content.chars().take(MAX_TOOL_OUTPUT_BYTES).collect()
+    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
+        return content.to_owned();
+    }
+
+    let mut end = MAX_TOOL_OUTPUT_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    content[..end].to_owned()
 }
 
 async fn decode_http_response_stream(
@@ -2449,6 +2458,28 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn provider_tool_and_replay_caps_count_utf8_bytes() {
+        let bounded = bounded_tool_output(&"€".repeat(MAX_TOOL_OUTPUT_BYTES));
+        assert_eq!(
+            bounded.len(),
+            MAX_TOOL_OUTPUT_BYTES - (MAX_TOOL_OUTPUT_BYTES % 3)
+        );
+        assert!(bounded.is_char_boundary(bounded.len()));
+
+        let exact = serde_json::json!({
+            "type": "function_call_output",
+            "output": "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES - 44),
+        });
+        let oversized = serde_json::json!({
+            "type": "function_call_output",
+            "output": "x".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES),
+        });
+
+        assert!(validate_chatgpt_replay_history(&[exact]).is_ok());
+        assert!(validate_chatgpt_replay_history(&[oversized]).is_err());
     }
 
     fn credentials() -> String {
