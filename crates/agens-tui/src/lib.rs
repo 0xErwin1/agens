@@ -2944,19 +2944,6 @@ where
                     None => Action::Render,
                 }
             }
-            Key::Escape
-                if self
-                    .dialog
-                    .as_ref()
-                    .is_some_and(|dialog| !dialog.query.is_empty()) =>
-            {
-                if let Some(dialog) = self.dialog.as_mut() {
-                    dialog.query.clear();
-                    refresh_dialog_query_action(dialog);
-                }
-                self.reset_dialog_selection();
-                Action::Render
-            }
             Key::Escape | Key::CtrlC => {
                 let action_id = self
                     .dialog
@@ -3319,6 +3306,12 @@ struct CrosstermControl {
     stdout: Stdout,
 }
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 impl TerminalControl for CrosstermControl {
     fn apply(&mut self, operation: TerminalOperation) -> io::Result<()> {
         match operation {
@@ -3343,9 +3336,7 @@ impl TerminalControl for CrosstermControl {
                 }
                 execute!(
                     self.stdout,
-                    PushKeyboardEnhancementFlags(
-                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    )
+                    PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
                 )
                 .map(|_| ())
             }
@@ -3711,6 +3702,10 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
 }
 
 fn map_key(event: KeyEvent) -> Option<Event> {
+    if event.kind != KeyEventKind::Press {
+        return None;
+    }
+
     let key = match (event.code, event.modifiers) {
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlC
@@ -3718,11 +3713,12 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
         }
-        (KeyCode::Char('a' | 'A'), modifiers)
+        (KeyCode::Char('a'), modifiers)
             if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
         {
             Key::CtrlShiftA
         }
+        (KeyCode::Char('A'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftA,
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlB
         }
@@ -3839,6 +3835,33 @@ mod runtime_tests {
         }
     }
 
+    struct QuitRuntime {
+        guard: TerminalModeGuard,
+        control: RecordingControl,
+    }
+
+    impl QuitRuntime {
+        fn new() -> (Self, Rc<RefCell<Vec<TerminalOperation>>>) {
+            let mut control = RecordingControl::default();
+            let calls = Rc::clone(&control.calls);
+            let guard = TerminalModeGuard::enter(&mut control).unwrap();
+
+            (Self { guard, control }, calls)
+        }
+    }
+
+    impl RuntimeTerminal for QuitRuntime {
+        fn poll(&mut self, _: Duration) -> io::Result<Option<Event>> {
+            Ok(Some(Event::Key(Key::CtrlC)))
+        }
+    }
+
+    impl Drop for QuitRuntime {
+        fn drop(&mut self) {
+            let _ = self.guard.restore(&mut self.control);
+        }
+    }
+
     struct NoopEngine;
 
     impl Engine for NoopEngine {
@@ -3909,6 +3932,30 @@ mod runtime_tests {
     }
 
     #[test]
+    fn terminal_setup_enables_exactly_the_required_keyboard_enhancement_flags() {
+        assert_eq!(
+            keyboard_enhancement_flags(),
+            KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        );
+    }
+
+    #[test]
+    fn runtime_restores_each_mode_once_after_successful_quit() {
+        let (terminal, calls) = QuitRuntime::new();
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = FailingRenderer {
+            fail_on_render: usize::MAX,
+            renders: 0,
+        };
+
+        run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
+
+        assert_eq!(*calls.borrow(), expected_terminal_calls());
+    }
+
+    #[test]
     fn maps_control_o_to_tool_output_toggle() {
         assert_eq!(
             map_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
@@ -3917,17 +3964,81 @@ mod runtime_tests {
     }
 
     #[test]
-    fn u15_c1a_maps_control_shift_a_to_the_subagent_dialog() {
-        let event = map_key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+    fn first_press_dialog_route_opens_once_for_grounded_ctrl_shift_a_encodings() {
+        let accepted = [
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::Char('A'), KeyModifiers::CONTROL),
+        ];
 
-        assert_eq!(event, Some(Event::Key(Key::CtrlShiftA)));
+        for (code, modifiers) in accepted {
+            let mut tui = Tui::new(NoopEngine);
+            let event = CrosstermEvent::Key(KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Press,
+            ));
+
+            assert_eq!(
+                map_event(event).map(|event| tui.handle(event)),
+                Some(Action::OpenDialog("subagent".into()))
+            );
+        }
+
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                kind,
+            );
+            assert_eq!(map_event(CrosstermEvent::Key(event)), None);
+            assert_eq!(map_key(event), None);
+        }
+
+        for (code, modifiers) in [
+            (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT | KeyModifiers::ALT,
+            ),
+            (
+                KeyCode::Char('A'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            let event = KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press);
+            assert_ne!(map_key(event), Some(Event::Key(Key::CtrlShiftA)));
+        }
+
         assert_eq!(
-            Tui::new(NoopEngine).handle(event.unwrap()),
-            Action::OpenDialog("subagent".into())
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )),
+            Some(Event::Key(Key::LineStart))
         );
+
+        let mut tui = Tui::new(NoopEngine);
+        tui.show_selection_dialog(DialogView::selection(
+            "Choose",
+            None::<String>,
+            vec![DialogEntry::action("Alpha", "alpha")],
+        ));
+        tui.handle(Event::Key(Key::Char('a')));
+
+        assert_eq!(
+            map_event(CrosstermEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )))
+            .map(|event| tui.handle(event)),
+            Some(Action::Render)
+        );
+        assert!(tui.view().dialog.is_none());
     }
 
     #[test]

@@ -1510,7 +1510,7 @@ fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
 }
 
 #[test]
-fn selection_dialog_search_edits_navigates_filtered_rows_and_clears_before_closing() {
+fn selection_dialog_search_edits_navigates_filtered_rows_and_closes_on_first_escape() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Resize {
         width: 24,
@@ -1554,8 +1554,6 @@ fn selection_dialog_search_edits_navigates_filtered_rows_and_clears_before_closi
         vec![DialogEntry::action("Alpha", "alpha")],
     ));
     tui.handle(Event::Key(Key::Char('a')));
-    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-    assert!(tui.view().dialog.is_some());
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert!(tui.view().dialog.is_none());
 }
