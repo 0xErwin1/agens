@@ -3,7 +3,7 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
+    TranscriptEntry, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
     TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
     TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
 };
@@ -16,6 +16,19 @@ use std::{
 #[derive(Default)]
 struct FakeEngine {
     cancellations: usize,
+}
+
+#[test]
+fn transcript_registry_model_starts_with_an_active_main_record() {
+    let tui = Tui::new(FakeEngine::default());
+    let view = tui.view();
+
+    assert_eq!(view.active_transcript, TranscriptId::Main);
+    assert_eq!(view.transcript_ids, vec![TranscriptId::Main]);
+    assert_eq!(
+        tui.transcript_record(&TranscriptId::Main).unwrap().id(),
+        &TranscriptId::Main
+    );
 }
 
 impl Engine for FakeEngine {

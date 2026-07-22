@@ -22,7 +22,7 @@ pub use terminal::{
 };
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{self, Stdout, Write},
     sync::{Arc, mpsc},
     thread,
@@ -230,9 +230,56 @@ pub enum TranscriptEntry {
     Tool(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TranscriptId {
+    Main,
+    Subagent(u64),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TranscriptFocus {
+    Composer,
+    Viewport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptRecord {
+    id: TranscriptId,
+    transcript: Vec<TranscriptEntry>,
+    conversation: Option<Conversation>,
+    completed_conversations: Vec<Conversation>,
+    following_bottom: bool,
+    scroll_offset: u16,
+    collapsed_tool_outputs: BTreeSet<String>,
+    collapse_thinking: bool,
+    focus: TranscriptFocus,
+}
+
+impl TranscriptRecord {
+    fn main() -> Self {
+        Self {
+            id: TranscriptId::Main,
+            transcript: Vec::new(),
+            conversation: None,
+            completed_conversations: Vec::new(),
+            following_bottom: true,
+            scroll_offset: 0,
+            collapsed_tool_outputs: BTreeSet::new(),
+            collapse_thinking: false,
+            focus: TranscriptFocus::Composer,
+        }
+    }
+
+    pub const fn id(&self) -> &TranscriptId {
+        &self.id
+    }
+}
+
 /// State passed to renderers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewState<'a> {
+    pub active_transcript: TranscriptId,
+    pub transcript_ids: Vec<TranscriptId>,
     /// The editable prompt text.
     pub input: &'a str,
     /// Current terminal dimensions.
@@ -1412,6 +1459,9 @@ pub struct Tui<E> {
     size: (u16, u16),
     running: bool,
     quit_armed: bool,
+    transcripts: BTreeMap<TranscriptId, TranscriptRecord>,
+    active_transcript: TranscriptId,
+    child_transcript_order: Vec<TranscriptId>,
     transcript: Vec<TranscriptEntry>,
     following_bottom: bool,
     scroll_offset: u16,
@@ -1450,6 +1500,9 @@ where
             size: (80, 24),
             running: false,
             quit_armed: false,
+            transcripts: BTreeMap::from([(TranscriptId::Main, TranscriptRecord::main())]),
+            active_transcript: TranscriptId::Main,
+            child_transcript_order: Vec::new(),
             transcript: Vec::new(),
             following_bottom: true,
             scroll_offset: 0,
@@ -1863,6 +1916,10 @@ where
         &self.transcript
     }
 
+    pub fn transcript_record(&self, id: &TranscriptId) -> Option<&TranscriptRecord> {
+        self.transcripts.get(id)
+    }
+
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
     pub fn apply_runtime_event(&mut self, event: TuiRuntimeEvent) {
         match &event {
@@ -1952,6 +2009,10 @@ where
     /// Returns an immutable snapshot for a renderer.
     pub fn view(&self) -> ViewState<'_> {
         ViewState {
+            active_transcript: self.active_transcript,
+            transcript_ids: std::iter::once(TranscriptId::Main)
+                .chain(self.child_transcript_order.iter().copied())
+                .collect(),
             input: &self.input,
             size: self.size,
             running: self.running,
