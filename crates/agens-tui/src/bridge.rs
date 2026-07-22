@@ -202,6 +202,13 @@ pub enum TuiRuntimeEvent {
         event: TuiExecutionEvent,
     },
     SubagentExecution(TuiSubagentEvent),
+    RestoredCompletedSubagent {
+        id: u64,
+        agent: String,
+        task_summary: String,
+        final_result: String,
+        tool_uses: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

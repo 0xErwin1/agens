@@ -133,7 +133,7 @@ pub(super) fn conversation_lines(
                 )));
                 let marker = format!("subagent:{}", card.id);
                 if collapsed_tool_outputs.contains(&marker) {
-                    lines.push(Line::from(format!("+{} tool uses", card.tool_calls.len())));
+                    lines.push(Line::from(format!("+{} tool uses", card.tool_uses)));
                 } else {
                     for call in &card.tool_calls {
                         lines.push(Line::from(format!("┌ {} · {}", call.name, call.call_id)));
@@ -228,7 +228,8 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::ToolEnded { .. }
             | TuiRuntimeEvent::Diff { .. }
             | TuiRuntimeEvent::TaskExecution { .. }
-            | TuiRuntimeEvent::SubagentExecution(_) => {}
+            | TuiRuntimeEvent::SubagentExecution(_)
+            | TuiRuntimeEvent::RestoredCompletedSubagent { .. } => {}
         }
     }
 

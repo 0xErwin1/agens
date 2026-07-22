@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -2674,6 +2674,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             presentation,
             messages: resumed.messages.clone(),
         });
+        for event in resumed_subagent_cards(&resumed.messages) {
+            tui.apply_runtime_event(event);
+        }
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
@@ -3477,6 +3480,83 @@ fn resume_tui_session(
     context.selection = selection;
     context.resume_error = resume_error;
     Ok(context)
+}
+
+const MAX_RESTORED_SUBAGENT_TOOL_USES: usize = 256;
+
+fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
+    let mut restored = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for window in messages.windows(3) {
+        let [user, assistant, tool] = window else {
+            continue;
+        };
+        let [MessagePart::Text(task)] = user.parts.as_slice() else {
+            continue;
+        };
+        let [
+            MessagePart::ToolCall { id, name, input },
+            MessagePart::Reasoning(reasoning),
+        ] = assistant.parts.as_slice()
+        else {
+            continue;
+        };
+        let [
+            MessagePart::ToolResult {
+                tool_call_id,
+                content: final_result,
+                is_error: false,
+            },
+        ] = tool.parts.as_slice()
+        else {
+            continue;
+        };
+        let Some(id) = id
+            .strip_prefix("subagent:")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|id| *id > 0)
+        else {
+            continue;
+        };
+        let Some((agent, description)) = (name == "native::task")
+            .then(|| serde_json::from_str::<serde_json::Value>(input).ok())
+            .flatten()
+            .and_then(|value| {
+                Some((
+                    value.get("agent")?.as_str()?.to_owned(),
+                    value.get("description")?.as_str()?.to_owned(),
+                ))
+            })
+        else {
+            continue;
+        };
+        let Some(tool_uses) = reasoning
+            .strip_suffix(" tool uses")
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|tool_uses| *tool_uses <= MAX_RESTORED_SUBAGENT_TOOL_USES)
+        else {
+            continue;
+        };
+        if task.is_empty()
+            || agent.is_empty()
+            || description != *task
+            || *tool_call_id != format!("subagent:{id}")
+            || !seen.insert(id)
+        {
+            continue;
+        }
+
+        restored.push(TuiRuntimeEvent::RestoredCompletedSubagent {
+            id,
+            agent: sanitize_subagent_persistence(&agent),
+            task_summary: sanitize_subagent_persistence(task),
+            final_result: sanitize_subagent_persistence(final_result),
+            tool_uses,
+        });
+    }
+
+    restored
 }
 
 fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
@@ -6758,6 +6838,77 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    #[test]
+    fn p1c2_resume_parser_restores_only_complete_standard_subagent_turns() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("review the patch".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: "subagent:42".into(),
+                        name: "native::task".into(),
+                        input: r#"{"agent":"reviewer","description":"review the patch"}"#.into(),
+                    },
+                    MessagePart::Reasoning("3 tool uses".into()),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "subagent:42".into(),
+                    content: "approved".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        assert_eq!(
+            resumed_subagent_cards(&messages),
+            vec![TuiRuntimeEvent::RestoredCompletedSubagent {
+                id: 42,
+                agent: "reviewer".into(),
+                task_summary: "review the patch".into(),
+                final_result: "approved".into(),
+                tool_uses: 3,
+            }]
+        );
+
+        let mut duplicate = messages.clone();
+        duplicate.extend(messages.clone());
+        assert_eq!(resumed_subagent_cards(&duplicate).len(), 1);
+
+        let mut failed = messages;
+        failed[2].parts = vec![MessagePart::ToolResult {
+            tool_call_id: "subagent:42".into(),
+            content: "failed".into(),
+            is_error: true,
+        }];
+        assert!(resumed_subagent_cards(&failed).is_empty());
+
+        let mut malformed = duplicate[..3].to_vec();
+        malformed[1].parts[0] = MessagePart::ToolCall {
+            id: "subagent:43".into(),
+            name: "native::task".into(),
+            input: "not json".into(),
+        };
+        assert!(resumed_subagent_cards(&malformed).is_empty());
+
+        let incomplete = duplicate[..2].to_vec();
+        assert!(resumed_subagent_cards(&incomplete).is_empty());
+
+        let mut transient = duplicate[..3].to_vec();
+        transient[2].parts = vec![MessagePart::ToolResult {
+            tool_call_id: "subagent:43".into(),
+            content: "cancelled".into(),
+            is_error: true,
+        }];
+        assert!(resumed_subagent_cards(&transient).is_empty());
     }
 
     #[test]

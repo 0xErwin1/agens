@@ -1890,6 +1890,22 @@ where
                         .apply_subagent(event.clone());
                 }
             }
+            TuiRuntimeEvent::RestoredCompletedSubagent {
+                id,
+                agent,
+                task_summary,
+                final_result,
+                tool_uses,
+            } => self
+                .conversation
+                .get_or_insert_with(|| Conversation::new(String::new()))
+                .restore_completed_subagent(
+                    *id,
+                    agent.clone(),
+                    task_summary.clone(),
+                    final_result.clone(),
+                    *tool_uses,
+                ),
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
@@ -2697,7 +2713,7 @@ where
                 self.conversation
                     .iter()
                     .flat_map(|conversation| conversation.subagent_cards.iter())
-                    .filter(|card| !card.tool_calls.is_empty())
+                    .filter(|card| card.tool_uses > 0)
                     .map(|card| format!("subagent:{}", card.id)),
             )
             .collect::<Vec<_>>();

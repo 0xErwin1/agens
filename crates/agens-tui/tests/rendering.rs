@@ -1263,3 +1263,29 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
     assert!(expanded.find("native::read").unwrap() < expanded.find("native::grep").unwrap());
     assert!(expanded.contains("first result"), "{expanded:?}");
 }
+
+#[test]
+fn p1c2_renderer_shows_restored_tool_count_without_fabricating_tool_details() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::RestoredCompletedSubagent {
+        id: 42,
+        agent: "reviewer".into(),
+        task_summary: "review the durable result".into(),
+        final_result: "approved".into(),
+        tool_uses: 3,
+    });
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let collapsed = rendered_text(&renderer);
+    assert!(collapsed.contains("reviewer · success · review the durable result"));
+    assert!(collapsed.contains("+3 tool uses"));
+    assert!(collapsed.contains("Final result: approved"));
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(!expanded.contains("┌ native::"));
+    assert!(expanded.contains("Final result: approved"));
+}

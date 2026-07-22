@@ -92,6 +92,7 @@ pub struct SubagentCard {
     pub task_summary: String,
     pub presentation: TuiExecutionState,
     pub tool_calls: Vec<ToolCall>,
+    pub tool_uses: usize,
     pub status: Option<TuiSubagentStatus>,
     pub final_result: Option<String>,
 }
@@ -351,6 +352,7 @@ impl Conversation {
                     task_summary,
                     presentation,
                     tool_calls: Vec::new(),
+                    tool_uses: 0,
                     status: None,
                     final_result: None,
                 });
@@ -373,6 +375,7 @@ impl Conversation {
                         input,
                         result: None,
                     });
+                    card.tool_uses += 1;
                 }
             }
             TuiSubagentUpdate::ToolResult {
@@ -411,6 +414,31 @@ impl Conversation {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn restore_completed_subagent(
+        &mut self,
+        id: u64,
+        agent: String,
+        task_summary: String,
+        final_result: String,
+        tool_uses: usize,
+    ) {
+        if self.subagent_cards.iter().any(|card| card.id == id) {
+            return;
+        }
+
+        self.subagent_cards.push(SubagentCard {
+            id,
+            agent,
+            task_summary,
+            presentation: TuiExecutionState::CompletedRecent,
+            tool_calls: Vec::new(),
+            tool_uses,
+            status: Some(TuiSubagentStatus::Success),
+            final_result: Some(final_result),
+        });
+        self.items.push(ConversationItem::SubagentCard(id));
     }
     fn find_call(&self, call_id: &str) -> Option<&ToolCall> {
         self.tool_batches

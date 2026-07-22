@@ -928,6 +928,36 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
 }
 
 #[test]
+fn p1c2_events_restore_completed_cards_without_live_execution_or_duplicates() {
+    let mut tui = Tui::new(FakeEngine::default());
+    let event = TuiRuntimeEvent::RestoredCompletedSubagent {
+        id: 42,
+        agent: "reviewer".into(),
+        task_summary: "review the durable result".into(),
+        final_result: "approved".into(),
+        tool_uses: 3,
+    };
+
+    tui.apply_runtime_event(event.clone());
+    tui.apply_runtime_event(event);
+
+    let conversation = tui.view().conversation.unwrap();
+    assert_eq!(conversation.subagent_cards.len(), 1);
+    assert_eq!(conversation.subagent_cards[0].agent, "reviewer");
+    assert_eq!(
+        conversation.subagent_cards[0].task_summary,
+        "review the durable result"
+    );
+    assert_eq!(
+        conversation.subagent_cards[0].final_result.as_deref(),
+        Some("approved")
+    );
+    assert_eq!(conversation.subagent_cards[0].tool_uses, 3);
+    assert!(conversation.subagent_cards[0].tool_calls.is_empty());
+    assert!(tui.executions().is_empty());
+}
+
+#[test]
 fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Key(Key::Char('d')));
