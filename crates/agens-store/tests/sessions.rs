@@ -389,6 +389,18 @@ fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
     SessionStore::open(&directory).unwrap();
     let connection = Connection::open(&database).unwrap();
     connection
+        .execute(
+            "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable) VALUES (91, 'project', 'title', 'primary', 1, 2, 1, 1)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO turns (session_id, sequence, completed_at) VALUES (91, 1, 2)",
+            [],
+        )
+        .unwrap();
+    connection
         .execute_batch(
             "DROP INDEX session_attempts_latest;
              DROP INDEX session_attempts_one_running;
@@ -478,6 +490,14 @@ fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
             ("session_attempts_one_running".into(), 1, "c".into()),
             ("session_attempts_session_sequence".into(), 1, "c".into()),
         ]
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM session_attempts", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
     );
     assert!(
         connection

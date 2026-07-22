@@ -4,8 +4,9 @@ use std::{
 };
 
 use agens_core::{
-    AttemptFinishOutcome, CompletedSessionTurn, Message, MessagePart, ReasoningEffort, Role,
-    SessionAttemptStatus, SessionMessage, SessionMetadata,
+    AttemptFinishOutcome, BeginSessionAttemptError, CompletedSessionTurn, MAX_RETRY_PROMPT_BYTES,
+    Message, MessagePart, ReasoningEffort, Role, SessionAttemptFailureKind, SessionAttemptStatus,
+    SessionMessage, SessionMetadata,
 };
 use agens_store::SessionStore;
 use rusqlite::Connection;
@@ -68,11 +69,10 @@ fn attempt_begin_and_finish_are_targeted_cas_transactions() {
     let attempt = store
         .begin_session_attempt(&metadata, "retry".into())
         .unwrap();
-    assert!(
-        store
-            .begin_session_attempt(&metadata, "again".into())
-            .is_err()
-    );
+    assert!(matches!(
+        store.begin_session_attempt(&metadata, "again".into()),
+        Err(BeginSessionAttemptError::AlreadyRunning(summary)) if summary.key() == attempt.key()
+    ));
     assert_eq!(
         store
             .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 21)
@@ -99,6 +99,256 @@ fn attempt_begin_and_finish_are_targeted_cas_transactions() {
     );
 
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn successful_attempt_finish_is_atomic_exact_and_private() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 7,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let completed = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("question".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: r#"{"query":"answer"}"#.into(),
+            }],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "answer".into(),
+                is_error: false,
+            }],
+        },
+    ]);
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "private-prompt-token".into())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(attempt.key(), &metadata, &completed, 21)
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(attempt.key(), &metadata, &completed, 22)
+            .unwrap(),
+        AttemptFinishOutcome::Stale
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 1, 3, 3));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, failure_kind, retry_prompt, completed_turn_sequence FROM session_attempts WHERE id = ?1",
+                [attempt.key().attempt_id()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<i64>>(3)?)),
+            )
+            .unwrap(),
+        ("completed".into(), None, None, Some(1))
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT completed_turn_count, resumable FROM sessions WHERE id = ?1",
+                [metadata.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap(),
+        (1, true)
+    );
+    assert!(!format!("{attempt:?}").contains("private-prompt-token"));
+    assert!(!format!("{:?}", BeginSessionAttemptError::Store).contains("private-prompt-token"));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn attempt_begin_bounds_prompts_allocates_zero_ids_and_preserves_other_sessions() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let existing = SessionMetadata {
+        id: 1,
+        project: "existing".into(),
+        title: "existing".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let existing_attempt = store
+        .begin_session_attempt(&existing, "existing-secret".into())
+        .unwrap();
+    let new_session = SessionMetadata {
+        id: 0,
+        project: "new".into(),
+        title: "new".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 30,
+        updated_at: 40,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let exact_limit = format!(
+        "{}abcd",
+        "✓".repeat((MAX_RETRY_PROMPT_BYTES - 4) / "✓".len())
+    );
+    assert_eq!(exact_limit.len(), MAX_RETRY_PROMPT_BYTES);
+    let allocated = store
+        .begin_session_attempt(&new_session, exact_limit.clone())
+        .unwrap();
+    assert_ne!(allocated.key().session_id(), existing.id);
+    assert!(matches!(
+        store.begin_session_attempt(&new_session, format!("{exact_limit}x")),
+        Err(BeginSessionAttemptError::Store)
+    ));
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, retry_prompt FROM session_attempts WHERE id = ?1",
+                [existing_attempt.key().attempt_id()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("running".into(), "existing-secret".into())
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM sessions WHERE id = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn terminal_attempt_cas_shapes_never_append_history() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    for (index, (status, kind)) in [
+        (
+            SessionAttemptStatus::Cancelled,
+            SessionAttemptFailureKind::Cancelled,
+        ),
+        (
+            SessionAttemptStatus::Failed,
+            SessionAttemptFailureKind::Failed,
+        ),
+        (
+            SessionAttemptStatus::ProviderError,
+            SessionAttemptFailureKind::ProviderError,
+        ),
+        (
+            SessionAttemptStatus::Interrupted,
+            SessionAttemptFailureKind::Interrupted,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let metadata = SessionMetadata {
+            id: (index + 10) as i64,
+            project: format!("project-{index}"),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let attempt = store
+            .begin_session_attempt(&metadata, format!("private-{index}"))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .finish_session_attempt(attempt.key(), status, 21)
+                .unwrap(),
+            AttemptFinishOutcome::Finished
+        );
+        assert_eq!(
+            store
+                .finish_session_attempt(attempt.key(), status, 22)
+                .unwrap(),
+            AttemptFinishOutcome::Stale
+        );
+
+        let connection = Connection::open(store.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status, failure_kind, finished_at, completed_turn_sequence FROM session_attempts WHERE id = ?1",
+                    [attempt.key().attempt_id()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?)),
+                )
+                .unwrap(),
+            (attempt_status(status).into(), attempt_failure_kind(kind).into(), 21, None)
+        );
+        assert_eq!(
+            normalized_counts(&connection),
+            ((index + 1) as i64, 0, 0, 0)
+        );
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+fn attempt_status(status: SessionAttemptStatus) -> &'static str {
+    match status {
+        SessionAttemptStatus::Running => "running",
+        SessionAttemptStatus::Completed => "completed",
+        SessionAttemptStatus::Cancelled => "cancelled",
+        SessionAttemptStatus::Failed => "failed",
+        SessionAttemptStatus::ProviderError => "provider_error",
+        SessionAttemptStatus::Interrupted => "interrupted",
+    }
+}
+
+fn attempt_failure_kind(kind: SessionAttemptFailureKind) -> &'static str {
+    match kind {
+        SessionAttemptFailureKind::Cancelled => "cancelled",
+        SessionAttemptFailureKind::Failed => "failed",
+        SessionAttemptFailureKind::ProviderError => "provider_error",
+        SessionAttemptFailureKind::Interrupted => "interrupted",
+    }
 }
 
 #[test]

@@ -31,35 +31,24 @@ impl SessionStore {
         if retry_prompt.is_empty() || retry_prompt.len() > MAX_RETRY_PROMPT_BYTES {
             return Err(BeginSessionAttemptError::Store);
         }
-        let mut metadata = metadata.clone();
-        if metadata.id == 0 {
-            metadata.id = 1;
-        }
-        metadata
-            .validate()
-            .map_err(|_| BeginSessionAttemptError::Store)?;
+        validate_attempt_metadata(metadata).map_err(|_| BeginSessionAttemptError::Store)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| BeginSessionAttemptError::Store)?;
-        transaction
-            .execute(
-                "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id, reasoning_effort, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
-                params![metadata.id, metadata.project, metadata.title, metadata.active_agent, metadata.provider_id, metadata.model_id, metadata.reasoning_effort.map(ReasoningEffort::as_str), metadata.created_at, metadata.updated_at],
-            )
+        let session_id = insert_attempt_session(&transaction, &self.database_path, metadata)
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let running = transaction
             .query_row(
                 "SELECT id, sequence, started_at FROM session_attempts WHERE session_id = ?1 AND status = 'running'",
-                [metadata.id],
+                [session_id],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
             )
             .optional()
             .map_err(|_| BeginSessionAttemptError::Store)?;
         if let Some((id, sequence, started_at)) = running {
             let summary = SessionAttemptSummary::new(
-                AttemptKey::new(metadata.id, id).map_err(|_| BeginSessionAttemptError::Store)?,
+                AttemptKey::new(session_id, id).map_err(|_| BeginSessionAttemptError::Store)?,
                 sequence
                     .try_into()
                     .map_err(|_| BeginSessionAttemptError::Store)?,
@@ -74,24 +63,24 @@ impl SessionStore {
         transaction
             .execute(
                 "UPDATE session_attempts SET retry_prompt = NULL WHERE session_id = ?1",
-                [metadata.id],
+                [session_id],
             )
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let sequence = next_sequence(
             &transaction,
             &self.database_path,
             "session_attempts",
-            metadata.id,
+            session_id,
         )
         .map_err(|_| BeginSessionAttemptError::Store)?;
         transaction
             .execute(
                 "INSERT INTO session_attempts(session_id, sequence, status, retry_prompt, started_at)
                  VALUES (?1, ?2, 'running', ?3, ?4)",
-                params![metadata.id, sequence, retry_prompt, metadata.updated_at],
+                params![session_id, sequence, retry_prompt, metadata.updated_at],
             )
             .map_err(|_| BeginSessionAttemptError::Store)?;
-        let key = AttemptKey::new(metadata.id, transaction.last_insert_rowid())
+        let key = AttemptKey::new(session_id, transaction.last_insert_rowid())
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let summary = SessionAttemptSummary::new(
             key,
@@ -174,6 +163,94 @@ impl SessionStore {
         } else {
             AttemptFinishOutcome::Stale
         })
+    }
+
+    pub fn persist_completed_session_attempt(
+        &mut self,
+        key: AttemptKey,
+        metadata: &SessionMetadata,
+        turn: &CompletedSessionTurn,
+        finished_at: i64,
+    ) -> Result<AttemptFinishOutcome, SessionStoreError> {
+        if metadata.id != key.session_id() {
+            return Err(SessionStoreError::operation(
+                "complete session attempt",
+                &self.database_path,
+                "attempt session does not match metadata",
+            ));
+        }
+        validate_metadata(metadata, &self.database_path)?;
+        let expected_turn_count =
+            i64::try_from(metadata.completed_turn_count).map_err(|error| {
+                SessionStoreError::operation(
+                    "validate session metadata",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "start completed session attempt",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        let running = transaction
+            .query_row(
+                "SELECT 1 FROM session_attempts WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
+                params![key.attempt_id(), key.session_id()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                SessionStoreError::operation("check completed session attempt", &self.database_path, error)
+            })?;
+        if running.is_none() {
+            transaction.commit().map_err(|error| {
+                SessionStoreError::operation(
+                    "commit stale session attempt",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+            return Ok(AttemptFinishOutcome::Stale);
+        }
+        let completed_turn_sequence = persist_completed_turn_in_transaction(
+            &transaction,
+            &self.database_path,
+            metadata,
+            expected_turn_count,
+            turn,
+            finished_at,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_attempts
+                 SET status = 'completed', retry_prompt = NULL, finished_at = ?1, completed_turn_sequence = ?2
+                 WHERE id = ?3 AND session_id = ?4 AND status = 'running'",
+                params![finished_at, completed_turn_sequence, key.attempt_id(), key.session_id()],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("complete session attempt", &self.database_path, error)
+            })?;
+        if changed != 1 {
+            return Err(SessionStoreError::operation(
+                "complete session attempt",
+                &self.database_path,
+                "running attempt changed during completion",
+            ));
+        }
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation(
+                "commit completed session attempt",
+                &self.database_path,
+                error,
+            )
+        })?;
+        Ok(AttemptFinishOutcome::Finished)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionStoreError> {
@@ -416,11 +493,7 @@ impl SessionStore {
         metadata: &SessionMetadata,
         turn: &CompletedSessionTurn,
     ) -> Result<SessionMetadata, SessionStoreError> {
-        let mut persisted_metadata = metadata.clone();
-        if persisted_metadata.id == 0 {
-            persisted_metadata.id = 1;
-        }
-        persisted_metadata.validate().map_err(|error| {
+        validate_attempt_metadata(metadata).map_err(|error| {
             SessionStoreError::operation(
                 "validate session metadata",
                 &self.database_path,
@@ -428,13 +501,14 @@ impl SessionStore {
             )
         })?;
         let expected_turn_count =
-            i64::try_from(persisted_metadata.completed_turn_count).map_err(|error| {
+            i64::try_from(metadata.completed_turn_count).map_err(|error| {
                 SessionStoreError::operation(
                     "validate session metadata",
                     &self.database_path,
                     error,
                 )
             })?;
+        let mut persisted_metadata = metadata.clone();
         persisted_metadata.completed_turn_count = persisted_metadata
             .completed_turn_count
             .checked_add(1)
@@ -453,111 +527,140 @@ impl SessionStore {
             .map_err(|error| {
                 SessionStoreError::operation("start session turn", &self.database_path, error)
             })?;
-        if metadata.id == 0 {
-            transaction
-                .execute(
-                    "INSERT INTO sessions (project, title, active_agent, provider_id, model_id,
-                                            reasoning_effort, created_at, updated_at)
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![
-                        metadata.project,
-                        metadata.title,
-                        metadata.active_agent,
-                        metadata.provider_id,
-                        metadata.model_id,
-                        metadata.reasoning_effort.map(ReasoningEffort::as_str),
-                        metadata.created_at,
-                        metadata.updated_at,
-                    ],
-                )
-                .map_err(|error| {
-                    SessionStoreError::operation("create session", &self.database_path, error)
-                })?;
-            persisted_metadata.id = transaction.last_insert_rowid();
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id,
-                                       reasoning_effort, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
-                    params![
-                        metadata.id,
-                        metadata.project,
-                        metadata.title,
-                        metadata.active_agent,
-                        metadata.provider_id,
-                        metadata.model_id,
-                        metadata.reasoning_effort.map(ReasoningEffort::as_str),
-                        metadata.created_at,
-                        metadata.updated_at
-                    ],
-                )
-                .map_err(|error| {
-                    SessionStoreError::operation("create session", &self.database_path, error)
-                })?;
-        }
+        persisted_metadata.id =
+            insert_attempt_session(&transaction, &self.database_path, metadata)?;
         let metadata = &persisted_metadata;
-        if transaction
-            .execute(
-                "UPDATE sessions SET active_agent = ?1, provider_id = ?2, model_id = ?3,
-                    reasoning_effort = ?4, updated_at = ?5,
-                    completed_turn_count = completed_turn_count + 1, resumable = 1
-             WHERE id = ?6 AND completed_turn_count = ?7",
-                params![
-                    metadata.active_agent,
-                    metadata.provider_id,
-                    metadata.model_id,
-                    metadata.reasoning_effort.map(ReasoningEffort::as_str),
-                    metadata.updated_at,
-                    metadata.id,
-                    expected_turn_count
-                ],
-            )
-            .map_err(|error| {
-                SessionStoreError::operation("update session", &self.database_path, error)
-            })?
-            != 1
-        {
-            return Err(SessionStoreError::operation(
-                "update session",
-                &self.database_path,
-                "completed turn count changed",
-            ));
-        }
-
-        let turn_sequence = next_sequence(&transaction, &self.database_path, "turns", metadata.id)?;
-        transaction
-            .execute(
-                "INSERT INTO turns (session_id, sequence, completed_at) VALUES (?1, ?2, ?3)",
-                params![metadata.id, turn_sequence, metadata.updated_at],
-            )
-            .map_err(|error| {
-                SessionStoreError::operation("create turn", &self.database_path, error)
-            })?;
-        let first_message_sequence =
-            next_sequence(&transaction, &self.database_path, "messages", metadata.id)?;
-        for (message_offset, message) in turn.messages().iter().enumerate() {
-            let message_sequence = first_message_sequence + message_offset as i64;
-            transaction.execute(
-                "INSERT INTO messages (session_id, sequence, turn_sequence, role) VALUES (?1, ?2, ?3, ?4)",
-                params![metadata.id, message_sequence, turn_sequence, encode_role(message.role)],
-            ).map_err(|error| SessionStoreError::operation("create message", &self.database_path, error))?;
-            for (part_sequence, part) in message.parts.iter().enumerate() {
-                insert_message_part(
-                    &transaction,
-                    &self.database_path,
-                    metadata.id,
-                    message_sequence,
-                    part_sequence as i64,
-                    part,
-                )?;
-            }
-        }
+        persist_completed_turn_in_transaction(
+            &transaction,
+            &self.database_path,
+            metadata,
+            expected_turn_count,
+            turn,
+            metadata.updated_at,
+        )?;
         transaction.commit().map_err(|error| {
             SessionStoreError::operation("commit session turn", &self.database_path, error)
         })?;
         Ok(persisted_metadata)
     }
+}
+
+fn validate_attempt_metadata(
+    metadata: &SessionMetadata,
+) -> Result<(), agens_core::SessionMetadataError> {
+    if metadata.id != 0 {
+        return metadata.validate();
+    }
+
+    SessionMetadata {
+        id: i64::MAX,
+        ..metadata.clone()
+    }
+    .validate()
+}
+
+fn insert_attempt_session(
+    transaction: &Transaction<'_>,
+    database_path: &std::path::Path,
+    metadata: &SessionMetadata,
+) -> Result<i64, SessionStoreError> {
+    if metadata.id == 0 {
+        transaction
+            .execute(
+                "INSERT INTO sessions (project, title, active_agent, provider_id, model_id,
+                                        reasoning_effort, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    metadata.project,
+                    metadata.title,
+                    metadata.active_agent,
+                    metadata.provider_id,
+                    metadata.model_id,
+                    metadata.reasoning_effort.map(ReasoningEffort::as_str),
+                    metadata.created_at,
+                    metadata.updated_at,
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("create session", database_path, error)
+            })?;
+        return Ok(transaction.last_insert_rowid());
+    }
+
+    transaction
+        .execute(
+            "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id, reasoning_effort, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+            params![metadata.id, metadata.project, metadata.title, metadata.active_agent, metadata.provider_id, metadata.model_id, metadata.reasoning_effort.map(ReasoningEffort::as_str), metadata.created_at, metadata.updated_at],
+        )
+        .map_err(|error| SessionStoreError::operation("create session", database_path, error))?;
+    Ok(metadata.id)
+}
+
+fn persist_completed_turn_in_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &std::path::Path,
+    metadata: &SessionMetadata,
+    expected_turn_count: i64,
+    turn: &CompletedSessionTurn,
+    completed_at: i64,
+) -> Result<i64, SessionStoreError> {
+    if transaction
+        .execute(
+            "UPDATE sessions SET active_agent = ?1, provider_id = ?2, model_id = ?3,
+                reasoning_effort = ?4, updated_at = ?5,
+                completed_turn_count = completed_turn_count + 1, resumable = 1
+             WHERE id = ?6 AND completed_turn_count = ?7",
+            params![
+                metadata.active_agent,
+                metadata.provider_id,
+                metadata.model_id,
+                metadata.reasoning_effort.map(ReasoningEffort::as_str),
+                completed_at,
+                metadata.id,
+                expected_turn_count
+            ],
+        )
+        .map_err(|error| SessionStoreError::operation("update session", database_path, error))?
+        != 1
+    {
+        return Err(SessionStoreError::operation(
+            "update session",
+            database_path,
+            "completed turn count changed",
+        ));
+    }
+
+    let turn_sequence = next_sequence(transaction, database_path, "turns", metadata.id)?;
+    transaction
+        .execute(
+            "INSERT INTO turns (session_id, sequence, completed_at) VALUES (?1, ?2, ?3)",
+            params![metadata.id, turn_sequence, completed_at],
+        )
+        .map_err(|error| SessionStoreError::operation("create turn", database_path, error))?;
+    let first_message_sequence =
+        next_sequence(transaction, database_path, "messages", metadata.id)?;
+    for (message_offset, message) in turn.messages().iter().enumerate() {
+        let message_sequence = first_message_sequence + message_offset as i64;
+        transaction
+            .execute(
+                "INSERT INTO messages (session_id, sequence, turn_sequence, role) VALUES (?1, ?2, ?3, ?4)",
+                params![metadata.id, message_sequence, turn_sequence, encode_role(message.role)],
+            )
+            .map_err(|error| SessionStoreError::operation("create message", database_path, error))?;
+        for (part_sequence, part) in message.parts.iter().enumerate() {
+            insert_message_part(
+                transaction,
+                database_path,
+                metadata.id,
+                message_sequence,
+                part_sequence as i64,
+                part,
+            )?;
+        }
+    }
+
+    Ok(turn_sequence)
 }
 
 fn attempt_status(status: SessionAttemptStatus) -> &'static str {
