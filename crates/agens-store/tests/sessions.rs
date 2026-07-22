@@ -300,7 +300,7 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
-fn opens_populated_wal_v1_as_v4_smoke() {
+fn opens_populated_wal_v1_as_v5_smoke() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
 
@@ -326,7 +326,7 @@ fn opens_populated_wal_v1_as_v4_smoke() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     drop(connection);
     drop(store);
@@ -338,7 +338,7 @@ fn opens_populated_wal_v1_as_v4_smoke() {
 }
 
 #[test]
-fn normalized_v4_schema() {
+fn normalized_v5_schema() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
 
@@ -348,8 +348,10 @@ fn normalized_v4_schema() {
         .prepare(
             "SELECT sql FROM sqlite_schema
              WHERE type IN ('table', 'index')
-               AND name IN ('sessions', 'turns', 'messages', 'message_parts',
-                            'sessions_list', 'messages_turn_order', 'parts_message_order')
+                AND name IN ('sessions', 'turns', 'messages', 'message_parts',
+                             'sessions_list', 'messages_turn_order', 'parts_message_order',
+                             'session_attempts', 'session_attempts_session_sequence',
+                             'session_attempts_one_running', 'session_attempts_latest')
              ORDER BY name",
         )
         .unwrap()
@@ -363,15 +365,129 @@ fn normalized_v4_schema() {
         connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert!(schema.contains("CREATE TABLE sessions"));
     assert!(schema.contains("CREATE TABLE turns"));
     assert!(schema.contains("CREATE TABLE messages"));
     assert!(schema.contains("CREATE TABLE message_parts"));
+    assert!(schema.contains("CREATE TABLE session_attempts"));
     assert!(schema.contains("CREATE INDEX sessions_list"));
     assert!(schema.contains("CREATE INDEX messages_turn_order"));
     assert!(schema.contains("CREATE INDEX parts_message_order"));
+    assert!(schema.contains("CREATE UNIQUE INDEX session_attempts_session_sequence"));
+    assert!(schema.contains("CREATE UNIQUE INDEX session_attempts_one_running"));
+    assert!(schema.contains("CREATE INDEX session_attempts_latest"));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
+    let directory = data_directory();
+    let database = directory.join("rust-sessions.db");
+    SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "DROP INDEX session_attempts_latest;
+             DROP INDEX session_attempts_one_running;
+             DROP INDEX session_attempts_session_sequence;
+             DROP TABLE session_attempts;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    drop(connection);
+    fs::write(
+        directory.join("alternate-session.json"),
+        "{\"ignored\":true}",
+    )
+    .unwrap();
+
+    let fault = MigrationFaultGuard::set(&database, "before-v5-commit");
+    assert!(SessionStore::open(&directory).is_err());
+
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        4
+    );
+    assert!(
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_attempts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_err()
+    );
+    drop(connection);
+    drop(fault);
+
+    let store = SessionStore::open(&directory).unwrap();
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        table_signature(&connection, "session_attempts"),
+        vec![
+            (0, "id".into(), "INTEGER".into(), 0, 1),
+            (1, "session_id".into(), "INTEGER".into(), 1, 0),
+            (2, "sequence".into(), "INTEGER".into(), 1, 0),
+            (3, "status".into(), "TEXT".into(), 1, 0),
+            (4, "failure_kind".into(), "TEXT".into(), 0, 0),
+            (5, "retry_prompt".into(), "TEXT".into(), 0, 0),
+            (6, "started_at".into(), "INTEGER".into(), 1, 0),
+            (7, "finished_at".into(), "INTEGER".into(), 0, 0),
+            (8, "completed_turn_sequence".into(), "INTEGER".into(), 0, 0),
+        ]
+    );
+    assert_eq!(
+        foreign_key_signature(&connection, "session_attempts"),
+        vec![
+            (
+                "turns".into(),
+                "session_id".into(),
+                "session_id".into(),
+                "SET NULL".into(),
+            ),
+            (
+                "turns".into(),
+                "completed_turn_sequence".into(),
+                "sequence".into(),
+                "SET NULL".into(),
+            ),
+            (
+                "sessions".into(),
+                "session_id".into(),
+                "id".into(),
+                "CASCADE".into(),
+            ),
+        ]
+    );
+    assert_eq!(
+        index_signature(&connection, "session_attempts"),
+        vec![
+            ("session_attempts_latest".into(), 0, "c".into()),
+            ("session_attempts_one_running".into(), 1, "c".into()),
+            ("session_attempts_session_sequence".into(), 1, "c".into()),
+        ]
+    );
+    assert!(
+        connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'alternate-session'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_err()
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -537,7 +653,7 @@ fn migration_validates_schema_and_reopen_contract() {
         archive
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         archive
@@ -823,7 +939,7 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
 }
 
 #[test]
-fn fresh_v4_legacy_coexistence() {
+fn fresh_v5_legacy_coexistence() {
     let directory = data_directory();
     let first = completed_snapshot("first");
     let second = completed_snapshot("second");
@@ -837,7 +953,7 @@ fn fresh_v4_legacy_coexistence() {
             database
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            4
+            5
         );
         assert_eq!(
             database

@@ -675,7 +675,7 @@ fn decode_pattern(
 }
 
 const SESSIONS_DATABASE: &str = "rust-sessions.db";
-const SESSIONS_SCHEMA_VERSION: i64 = 4;
+const SESSIONS_SCHEMA_VERSION: i64 = 5;
 const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
     0, "id", "INTEGER", false, None, 1,
 )];
@@ -838,7 +838,7 @@ impl SessionStore {
 
         match session_schema_version(&connection, &database_path)? {
             0 => {
-                initialize_v4_schema(&mut connection, &database_path)?;
+                initialize_v5_schema(&mut connection, &database_path)?;
                 connection
                     .pragma_update(None, "journal_mode", "WAL")
                     .map_err(|error| {
@@ -853,11 +853,19 @@ impl SessionStore {
                 };
                 store.create_verified_v1_backup()?;
                 migrate_v1_on_open(&mut store.connection, &store.database_path)?;
+                migrate_v4_on_open(&mut store.connection, &store.database_path)?;
                 return Ok(store);
             }
-            2 => migrate_v2_on_open(&mut connection, &database_path)?,
-            3 => migrate_v3_on_open(&mut connection, &database_path)?,
-            4 => validate_v4_schema(&connection, &database_path)?,
+            2 => {
+                migrate_v2_on_open(&mut connection, &database_path)?;
+                migrate_v4_on_open(&mut connection, &database_path)?;
+            }
+            3 => {
+                migrate_v3_on_open(&mut connection, &database_path)?;
+                migrate_v4_on_open(&mut connection, &database_path)?;
+            }
+            4 => migrate_v4_on_open(&mut connection, &database_path)?,
+            5 => validate_v5_schema(&connection, &database_path)?,
             unsupported => {
                 return Err(SessionStoreError::operation(
                     "check schema version",
@@ -1087,7 +1095,36 @@ fn normalized_session_schema_v4() -> String {
     normalized_session_schema_v3().replace("'xhigh'))", "'xhigh', 'max'))")
 }
 
-fn initialize_v4_schema(
+fn normalized_session_schema_v5() -> String {
+    format!(
+        "{}\
+         CREATE TABLE session_attempts (
+             id INTEGER PRIMARY KEY,
+             session_id INTEGER NOT NULL,
+             sequence INTEGER NOT NULL CHECK(sequence > 0),
+             status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+             failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+             retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
+             started_at INTEGER NOT NULL,
+             finished_at INTEGER,
+             completed_turn_sequence INTEGER,
+             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+             FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+             CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+                   (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+                   (status = 'cancelled' AND failure_kind = 'cancelled' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                   (status = 'failed' AND failure_kind = 'failed' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                   (status = 'provider_error' AND failure_kind = 'provider_error' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                   (status = 'interrupted' AND failure_kind = 'interrupted' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+         );
+         CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
+         CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
+         CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);",
+        normalized_session_schema_v4()
+    )
+}
+
+fn initialize_v5_schema(
     connection: &mut Connection,
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
@@ -1100,15 +1137,59 @@ fn initialize_v4_schema(
     transaction
         .execute_batch(&format!(
             "{} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};",
-            normalized_session_schema_v4()
+            normalized_session_schema_v5()
         ))
         .map_err(|error| {
             SessionStoreError::operation("initialize v2 schema", database_path, error)
         })?;
-    validate_v4_schema(&transaction, database_path)?;
+    validate_v5_schema(&transaction, database_path)?;
     transaction.commit().map_err(|error| {
         SessionStoreError::operation("commit v2 initialization", database_path, error)
     })
+}
+
+fn migrate_v4_on_open(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            SessionStoreError::operation("start v4 migration", database_path, error)
+        })?;
+    validate_v4_schema(&transaction, database_path)?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE session_attempts (
+                 id INTEGER PRIMARY KEY,
+                 session_id INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL CHECK(sequence > 0),
+                 status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+                 failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+                 retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
+                 started_at INTEGER NOT NULL,
+                 finished_at INTEGER,
+                 completed_turn_sequence INTEGER,
+                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                 FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+                 CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+                       (status = 'cancelled' AND failure_kind = 'cancelled' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'failed' AND failure_kind = 'failed' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'provider_error' AND failure_kind = 'provider_error' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'interrupted' AND failure_kind = 'interrupted' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+             );
+             CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
+             CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
+             CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);
+             PRAGMA user_version = 5;",
+        )
+        .map_err(|error| SessionStoreError::operation("migrate v4 schema", database_path, error))?;
+    migration_fault("before-v5-commit", database_path)?;
+    validate_v5_schema(&transaction, database_path)?;
+    transaction
+        .commit()
+        .map_err(|error| SessionStoreError::operation("commit v4 migration", database_path, error))
 }
 
 fn migrate_v2_on_open(
@@ -1527,18 +1608,33 @@ fn validate_v4_schema(
     validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v4())
 }
 
+fn validate_v5_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_legacy_archive(connection, database_path)?;
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v5())
+}
+
 fn validate_normalized_session_schema(
     connection: &Connection,
     database_path: &Path,
     expected_schema: &str,
 ) -> Result<(), SessionStoreError> {
+    let names = if expected_schema.contains("CREATE TABLE session_attempts") {
+        "'sessions', 'turns', 'messages', 'message_parts',
+         'sessions_list', 'messages_turn_order', 'parts_message_order',
+         'session_attempts', 'session_attempts_session_sequence',
+         'session_attempts_one_running', 'session_attempts_latest'"
+    } else {
+        "'sessions', 'turns', 'messages', 'message_parts',
+         'sessions_list', 'messages_turn_order', 'parts_message_order'"
+    };
     let mut statement = connection
-        .prepare(
+        .prepare(&format!(
             "SELECT sql FROM sqlite_schema
-             WHERE type IN ('table', 'index')
-               AND name IN ('sessions', 'turns', 'messages', 'message_parts',
-                            'sessions_list', 'messages_turn_order', 'parts_message_order')",
-        )
+             WHERE type IN ('table', 'index') AND name IN ({names})"
+        ))
         .map_err(|error| {
             SessionStoreError::operation("validate normalized schema", database_path, error)
         })?;

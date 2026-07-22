@@ -97,7 +97,7 @@ fn populated_v2_migrates_losslessly_with_null_metadata_and_reopens_idempotently(
         database
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         database
@@ -208,7 +208,11 @@ fn populated_v3_migrates_selection_metadata_and_accepts_max_effort() {
         .unwrap();
     connection
         .execute_batch(
-            "INSERT INTO sessions(id, project, title, active_agent, provider_id, model_id,
+            "DROP INDEX session_attempts_latest;
+             DROP INDEX session_attempts_one_running;
+             DROP INDEX session_attempts_session_sequence;
+             DROP TABLE session_attempts;
+             INSERT INTO sessions(id, project, title, active_agent, provider_id, model_id,
                                   reasoning_effort, created_at, updated_at)
                  VALUES(9, '/project/a', 'saved', 'primary', 'openai-chatgpt',
                         'gpt-5.6-luna', 'xhigh', 10, 20);
@@ -244,7 +248,7 @@ fn populated_v3_migrates_selection_metadata_and_accepts_max_effort() {
         database
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
         database
