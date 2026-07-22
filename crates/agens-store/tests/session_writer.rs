@@ -331,6 +331,63 @@ fn terminal_attempt_cas_shapes_never_append_history() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn session_pages_and_load_are_read_only_complete_sorted_and_cross_64() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    for id in 1..=65 {
+        let metadata = SessionMetadata {
+            id,
+            project: if id % 2 == 0 { "current" } else { "other" }.into(),
+            title: format!("session-{id}"),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: id,
+            updated_at: id,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        store
+            .begin_session_attempt(&metadata, format!("private-{id}"))
+            .unwrap();
+    }
+
+    let first = store.list_session_page(None, 0).unwrap();
+    let second = store.list_session_page(None, 64).unwrap();
+    let current = store.list_session_page(Some("current"), 0).unwrap();
+
+    assert_eq!(first.total_count, 65);
+    assert_eq!(first.sessions.len(), 64);
+    assert_eq!(first.sessions[0].metadata.id, 65);
+    assert_eq!(first.sessions[63].metadata.id, 2);
+    assert_eq!(second.sessions.len(), 1);
+    assert_eq!(second.sessions[0].metadata.id, 1);
+    assert_eq!(current.total_count, 32);
+    assert!(
+        current
+            .sessions
+            .iter()
+            .all(|session| session.metadata.project == "current")
+    );
+    assert!(first.sessions.iter().all(|session| {
+        session
+            .latest_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.status() == SessionAttemptStatus::Running)
+    }));
+    assert!(!format!("{first:?}").contains("private-"));
+
+    let loaded = store.load_session_for_resume(65).unwrap();
+    let running = loaded.latest_attempt.unwrap();
+    assert!(loaded.messages.is_empty());
+    assert_eq!(running.key().session_id(), 65);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn attempt_status(status: SessionAttemptStatus) -> &'static str {
     match status {
         SessionAttemptStatus::Running => "running",
@@ -749,6 +806,7 @@ fn session_store_crud_round_trips_normalized_context() {
         agens_store::StoredSession {
             metadata: updated.clone(),
             messages: expected_messages,
+            latest_attempt: None,
         }
     );
     drop(store);

@@ -20,6 +20,13 @@ type PersistedPart = (
 pub struct StoredSession {
     pub metadata: SessionMetadata,
     pub messages: Vec<Message>,
+    pub latest_attempt: Option<SessionAttemptSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionPage {
+    pub total_count: u64,
+    pub sessions: Vec<StoredSession>,
 }
 
 impl SessionStore {
@@ -275,13 +282,84 @@ impl SessionStore {
         Ok(sessions)
     }
 
+    pub fn list_session_page(
+        &self,
+        project: Option<&str>,
+        offset: u64,
+    ) -> Result<SessionPage, SessionStoreError> {
+        let transaction = self.connection.unchecked_transaction().map_err(|error| {
+            SessionStoreError::operation("start session page", &self.database_path, error)
+        })?;
+        let scope = project.map(str::to_owned);
+        let offset = i64::try_from(offset).map_err(|error| {
+            SessionStoreError::operation("validate session page offset", &self.database_path, error)
+        })?;
+        let count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM sessions
+                 WHERE (completed_turn_count > 0 OR EXISTS (
+                     SELECT 1 FROM session_attempts
+                     WHERE session_attempts.session_id = sessions.id
+                       AND session_attempts.retry_prompt IS NOT NULL
+                 )) AND (?1 IS NULL OR project = ?1)",
+                [scope.as_deref()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("count session page", &self.database_path, error)
+            })?;
+        let mut statement = transaction.prepare(
+            "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
+                    provider_id, model_id, reasoning_effort
+             FROM sessions
+             WHERE (completed_turn_count > 0 OR EXISTS (
+                 SELECT 1 FROM session_attempts
+                 WHERE session_attempts.session_id = sessions.id
+                   AND session_attempts.retry_prompt IS NOT NULL
+             )) AND (?1 IS NULL OR project = ?1)
+             ORDER BY updated_at DESC, id DESC LIMIT 64 OFFSET ?2",
+        ).map_err(|error| SessionStoreError::operation("prepare session page", &self.database_path, error))?;
+        let sessions = statement
+            .query_map(params![scope, offset], session_metadata)
+            .map_err(|error| {
+                SessionStoreError::operation("query session page", &self.database_path, error)
+            })?
+            .map(|row| {
+                let metadata = row.map_err(|error| {
+                    SessionStoreError::operation("read session page", &self.database_path, error)
+                })?;
+                let latest_attempt =
+                    latest_attempt_summary(&transaction, &self.database_path, metadata.id)?;
+                Ok(StoredSession {
+                    metadata,
+                    messages: Vec::new(),
+                    latest_attempt,
+                })
+            })
+            .collect::<Result<Vec<_>, SessionStoreError>>()?;
+        drop(statement);
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation("commit session page", &self.database_path, error)
+        })?;
+        Ok(SessionPage {
+            total_count: count.try_into().map_err(|error| {
+                SessionStoreError::operation("count session page", &self.database_path, error)
+            })?,
+            sessions,
+        })
+    }
+
     pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {
         let metadata = self
             .connection
             .query_row(
                 "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
                         provider_id, model_id, reasoning_effort
-                 FROM sessions WHERE id = ?1 AND resumable = 1",
+                 FROM sessions WHERE id = ?1 AND (resumable = 1 OR EXISTS (
+                     SELECT 1 FROM session_attempts
+                     WHERE session_attempts.session_id = sessions.id
+                       AND session_attempts.retry_prompt IS NOT NULL
+                 ))",
                 [id],
                 session_metadata,
             )
@@ -361,7 +439,12 @@ impl SessionStore {
                 )?);
         }
 
-        Ok(StoredSession { metadata, messages })
+        let latest_attempt = latest_attempt_summary(&self.connection, &self.database_path, id)?;
+        Ok(StoredSession {
+            metadata,
+            messages,
+            latest_attempt,
+        })
     }
 
     pub fn update_session(&mut self, metadata: &SessionMetadata) -> Result<(), SessionStoreError> {
@@ -557,6 +640,62 @@ fn validate_attempt_metadata(
         ..metadata.clone()
     }
     .validate()
+}
+
+fn latest_attempt_summary(
+    connection: &rusqlite::Connection,
+    database_path: &std::path::Path,
+    session_id: i64,
+) -> Result<Option<SessionAttemptSummary>, SessionStoreError> {
+    connection
+        .query_row(
+            "SELECT id, sequence, status, failure_kind, started_at, finished_at
+             FROM session_attempts WHERE session_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            [session_id],
+            |row| {
+                let status = decode_attempt_status(&row.get::<_, String>(2)?)?;
+                let failure_kind = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|value| decode_attempt_failure_kind(&value))
+                    .transpose()?;
+                SessionAttemptSummary::new(
+                    AttemptKey::new(session_id, row.get(0)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    row.get::<_, i64>(1)?
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    status,
+                    failure_kind,
+                    row.get(4)?,
+                    row.get(5)?,
+                )
+                .map_err(|_| rusqlite::Error::InvalidQuery)
+            },
+        )
+        .optional()
+        .map_err(|error| SessionStoreError::operation("load session attempt", database_path, error))
+}
+
+fn decode_attempt_status(value: &str) -> rusqlite::Result<SessionAttemptStatus> {
+    match value {
+        "running" => Ok(SessionAttemptStatus::Running),
+        "completed" => Ok(SessionAttemptStatus::Completed),
+        "cancelled" => Ok(SessionAttemptStatus::Cancelled),
+        "failed" => Ok(SessionAttemptStatus::Failed),
+        "provider_error" => Ok(SessionAttemptStatus::ProviderError),
+        "interrupted" => Ok(SessionAttemptStatus::Interrupted),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn decode_attempt_failure_kind(value: &str) -> rusqlite::Result<SessionAttemptFailureKind> {
+    match value {
+        "cancelled" => Ok(SessionAttemptFailureKind::Cancelled),
+        "failed" => Ok(SessionAttemptFailureKind::Failed),
+        "provider_error" => Ok(SessionAttemptFailureKind::ProviderError),
+        "interrupted" => Ok(SessionAttemptFailureKind::Interrupted),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
 }
 
 fn insert_attempt_session(
