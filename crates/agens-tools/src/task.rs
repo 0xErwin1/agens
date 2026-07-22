@@ -29,6 +29,8 @@ const OPEN: u8 = 0;
 const CANCELLED: u8 = 1;
 const PUBLISHED: u8 = 2;
 
+type BeforePublicationHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskExecutionId(u64);
 
@@ -301,7 +303,7 @@ pub struct TaskRunContext {
     pub cancellation: Arc<std::sync::atomic::AtomicBool>,
     pub deadline: Instant,
     execution: Option<TaskExecutionLifecycle>,
-    before_publication: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    before_publication: BeforePublicationHook,
 }
 
 impl TaskRunContext {
