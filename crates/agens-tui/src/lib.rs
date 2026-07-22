@@ -250,6 +250,7 @@ pub enum TranscriptFocus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptRecord {
     id: TranscriptId,
+    owner_label: String,
     transcript: Vec<TranscriptEntry>,
     conversation: Option<Conversation>,
     completed_conversations: Vec<Conversation>,
@@ -266,6 +267,7 @@ impl TranscriptRecord {
     fn main() -> Self {
         Self {
             id: TranscriptId::Main,
+            owner_label: "main".to_owned(),
             transcript: Vec::new(),
             conversation: None,
             completed_conversations: Vec::new(),
@@ -297,6 +299,8 @@ impl TranscriptRecord {
 pub struct ViewState<'a> {
     pub active_transcript: TranscriptId,
     pub transcript_ids: Vec<TranscriptId>,
+    /// Owner label for the active primary viewport.
+    pub owner_label: &'a str,
     /// The editable prompt text.
     pub input: &'a str,
     /// Current terminal dimensions.
@@ -811,6 +815,26 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_turn_status(frame, layout.status, &state);
     }
 
+    if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
+        frame.render_widget(
+            Paragraph::new(" Subagent transcript · read-only")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .title(Span::styled(
+                            " Viewport ",
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                ),
+            layout.composer,
+        );
+    }
+
     let composer_title = if state.running {
         " Compose · running "
     } else {
@@ -821,7 +845,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     } else {
         Color::Cyan
     };
-    if layout.composer.height > 0 {
+    if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
         let inner_width = usize::from(layout.composer.width.saturating_sub(2));
         let inner_height = usize::from(layout.composer.height.saturating_sub(2));
@@ -1393,18 +1417,21 @@ fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
-    let mut transcript = state
-        .completed_conversations
-        .iter()
-        .flat_map(|conversation| {
-            render::conversation_lines(
-                conversation,
-                &[],
-                state.collapsed_tool_outputs,
-                state.collapse_thinking,
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut transcript = transcript_provenance(state);
+    transcript.extend(
+        state
+            .completed_conversations
+            .iter()
+            .flat_map(|conversation| {
+                render::conversation_lines(
+                    conversation,
+                    &[],
+                    state.collapsed_tool_outputs,
+                    state.collapse_thinking,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
     if let Some(conversation) = state.conversation {
         transcript.extend(render::conversation_lines(
             conversation,
@@ -1423,6 +1450,26 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
         conversation_is_authoritative,
     ));
     transcript
+}
+
+fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
+    let owner = match state.active_transcript {
+        TranscriptId::Main => "Main · primary conversation".to_owned(),
+        TranscriptId::Subagent(id) => format!("Subagent {id} · {}", state.owner_label),
+    };
+    vec![
+        Line::styled(
+            owner,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "F5 select · F6 Main · F7/F8 sibling",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::default(),
+    ]
 }
 
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
@@ -2055,6 +2102,13 @@ where
     }
 
     fn apply_subagent_event(&mut self, event: &TuiSubagentEvent) {
+        if let bridge::TuiSubagentUpdate::Started { agent, .. } = &event.update {
+            self.transcripts
+                .get_mut(&TranscriptId::Subagent(event.id))
+                .expect("admitted child event has a transcript")
+                .owner_label
+                .clone_from(agent);
+        }
         self.transcripts
             .get_mut(&TranscriptId::Subagent(event.id))
             .expect("admitted child event has a transcript")
@@ -2119,6 +2173,7 @@ where
             id,
             TranscriptRecord {
                 id,
+                owner_label: String::new(),
                 transcript: Vec::new(),
                 conversation: None,
                 completed_conversations: Vec::new(),
@@ -2208,6 +2263,7 @@ where
             transcript_ids: std::iter::once(TranscriptId::Main)
                 .chain(self.child_transcript_order.iter().copied())
                 .collect(),
+            owner_label: &active.owner_label,
             input: &self.input,
             size: self.size,
             running: self.running,

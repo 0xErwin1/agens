@@ -3,8 +3,9 @@ use std::time::Duration;
 use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
-    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentStatus,
+    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, TranscriptId, Tui,
+    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent,
+    TuiSubagentStatus,
 };
 use ratatui::{
     Terminal,
@@ -1197,26 +1198,17 @@ fn p1a1_renderer_collapses_live_tool_uses_and_expands_ordered_details() {
         TuiSubagentEvent::tool_call(9, "grep", "native::grep", "bounded pattern"),
     );
 
-    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
-    let collapsed = rendered_text(&renderer);
+    let main = rendered_text(&renderer);
     assert!(
-        collapsed.contains("reviewer")
-            && collapsed.contains("foreground running")
-            && collapsed.contains("review the rendering")
-            && collapsed.contains("+2 tool uses"),
-        "{collapsed:?}"
+        main.contains("Subagent 9 · reviewer")
+            && main.contains("foreground running")
+            && main.contains("review the rendering")
+            && main.contains("2 tool uses"),
+        "{main:?}"
     );
-    assert!(!collapsed.contains("read result"), "{collapsed:?}");
-
-    tui.handle(Event::Key(Key::CtrlO));
-    renderer.render(tui.view()).unwrap();
-    let expanded = rendered_text(&renderer);
-    let read = expanded.find("native::read").unwrap();
-    assert!(
-        read < expanded.len() && expanded.contains("read result"),
-        "{expanded:?}"
-    );
+    assert!(!main.contains("native::read"), "{main:?}");
+    assert!(!main.contains("read result"), "{main:?}");
 }
 
 #[test]
@@ -1249,19 +1241,24 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
         TuiSubagentEvent::terminal(10, TuiSubagentStatus::Success, "terminal result"),
     );
 
-    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
-    let collapsed = rendered_text(&renderer);
-    assert!(collapsed.contains("success"), "{collapsed:?}");
-    assert!(collapsed.contains("terminal result"), "{collapsed:?}");
-    assert!(collapsed.contains("+2 tool uses"), "{collapsed:?}");
-    assert!(!collapsed.contains("first result"), "{collapsed:?}");
-
-    tui.handle(Event::Key(Key::CtrlO));
-    renderer.render(tui.view()).unwrap();
-    let expanded = rendered_text(&renderer);
-    assert!(expanded.find("native::read").unwrap() < expanded.find("native::grep").unwrap());
-    assert!(expanded.contains("first result"), "{expanded:?}");
+    let main = rendered_text(&renderer);
+    assert!(
+        main.contains("Subagent 10 · reviewer · success"),
+        "{main:?}"
+    );
+    assert!(main.contains("2 tool uses"), "{main:?}");
+    for child_row in [
+        "terminal result",
+        "native::read",
+        "native::grep",
+        "first result",
+    ] {
+        assert!(
+            !main.contains(child_row),
+            "duplicated {child_row:?}: {main:?}"
+        );
+    }
 }
 
 #[test]
@@ -1276,16 +1273,130 @@ fn p1c2_renderer_shows_restored_tool_count_without_fabricating_tool_details() {
         tool_uses: 3,
     });
 
-    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
-    let collapsed = rendered_text(&renderer);
-    assert!(collapsed.contains("reviewer · success · review the durable result"));
-    assert!(collapsed.contains("+3 tool uses"));
-    assert!(collapsed.contains("Final result: approved"));
+    let main = rendered_text(&renderer);
+    assert!(main.contains("Subagent 42 · reviewer · success · review the durable result"));
+    assert!(main.contains("3 tool uses"));
+    assert!(!main.contains("Final result: approved"));
+}
 
-    tui.handle(Event::Key(Key::CtrlO));
+#[test]
+fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navigation() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+    for event in [
+        TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "review the active transcript",
+            TuiExecutionState::ForegroundRunning,
+        ),
+        TuiSubagentEvent::reasoning(7, "child-reasoning-sentinel"),
+        TuiSubagentEvent::text(7, "child-text-sentinel"),
+        TuiSubagentEvent::tool_call(7, "child-call", "native::read", "child-input-sentinel"),
+        TuiSubagentEvent::tool_result(7, "child-call", "child-result-sentinel", false),
+        TuiSubagentEvent::error(7, TuiSubagentErrorKind::Tool),
+    ] {
+        apply_subagent(&mut tui, event);
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Failed { id: 7 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Failure, "child-final-sentinel"),
+    );
+
     renderer.render(tui.view()).unwrap();
-    let expanded = rendered_text(&renderer);
-    assert!(!expanded.contains("┌ native::"));
-    assert!(expanded.contains("Final result: approved"));
+    let main = rendered_text(&renderer);
+    assert!(main.contains("Main · primary conversation"), "{main:?}");
+    assert!(main.contains("Subagent 7 · reviewer"), "{main:?}");
+    for child_row in [
+        "child-reasoning-sentinel",
+        "child-text-sentinel",
+        "child-input-sentinel",
+        "child-result-sentinel",
+        "Subagent tool execution failed.",
+        "child-final-sentinel",
+    ] {
+        assert!(
+            !main.contains(child_row),
+            "duplicated {child_row:?}: {main:?}"
+        );
+    }
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    renderer.render(tui.view()).unwrap();
+    let child = rendered_text(&renderer);
+    assert!(child.contains("Subagent 7 · reviewer"), "{child:?}");
+    assert!(
+        child.contains("F5 select · F6 Main · F7/F8 sibling"),
+        "{child:?}"
+    );
+    assert!(
+        child.contains("Subagent transcript · read-only"),
+        "{child:?}"
+    );
+    assert!(!child.contains(" Compose "), "{child:?}");
+    for child_row in [
+        "child-reasoning-sentinel",
+        "child-text-sentinel",
+        "child-input-sentinel",
+        "child-result-sentinel",
+        "Subagent tool execution failed.",
+        "child-final-sentinel",
+    ] {
+        assert!(
+            child.contains(child_row),
+            "missing {child_row:?}: {child:?}"
+        );
+    }
+}
+
+#[test]
+fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_switches_siblings() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    for (id, agent, text) in [
+        (7, "reviewer", "expired-child-sentinel"),
+        (8, "writer", "sibling-child-sentinel"),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(id, agent, "task", TuiExecutionState::ForegroundRunning),
+        );
+        apply_subagent(&mut tui, TuiSubagentEvent::text(id, text));
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 7 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Success, "expired-final-sentinel"),
+    );
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    tui.tick(Duration::from_secs(60));
+    renderer.render(tui.view()).unwrap();
+    let expired = rendered_text(&renderer);
+    assert!(expired.contains("Subagent 7 · reviewer"), "{expired:?}");
+    assert!(expired.contains("expired-child-sentinel"), "{expired:?}");
+    assert!(expired.contains("expired-final-sentinel"), "{expired:?}");
+
+    tui.handle(Event::Key(Key::F8));
+    renderer.render(tui.view()).unwrap();
+    let sibling = rendered_text(&renderer);
+    assert!(sibling.contains("Subagent 8 · writer"), "{sibling:?}");
+    assert!(sibling.contains("sibling-child-sentinel"), "{sibling:?}");
+    assert!(!sibling.contains("expired-child-sentinel"), "{sibling:?}");
 }

@@ -128,23 +128,9 @@ pub(super) fn conversation_lines(
                     },
                 };
                 lines.push(Line::from(format!(
-                    "Subagent {} · {status} · {}",
-                    card.agent, card.task_summary
+                    "Subagent {} · {} · {status} · {} · {} tool uses",
+                    card.id, card.agent, card.task_summary, card.tool_uses
                 )));
-                let marker = format!("subagent:{}", card.id);
-                if collapsed_tool_outputs.contains(&marker) {
-                    lines.push(Line::from(format!("+{} tool uses", card.tool_uses)));
-                } else {
-                    for call in &card.tool_calls {
-                        lines.push(Line::from(format!("┌ {} · {}", call.name, call.call_id)));
-                        if let Some(result) = &call.result {
-                            lines.push(Line::from(format!("└ {}", result.output)));
-                        }
-                    }
-                }
-                if let Some(final_result) = &card.final_result {
-                    lines.push(Line::from(format!("Final result: {final_result}")));
-                }
                 lines.push(Line::default());
             }
         }
