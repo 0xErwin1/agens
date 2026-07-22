@@ -4412,11 +4412,11 @@ fn production_tool_runtime(
     )
 }
 
-fn production_tool_runtime_with_task_runner(
+fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
-    task_runner: ProductionTaskRunner,
+    task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
         NativeTools::open(project_root)
@@ -4590,12 +4590,12 @@ fn production_tui_task_runtime_with_runner(
     })
 }
 
-fn register_production_task_tool(
+fn register_production_task_tool<R: TaskRunner>(
     bootstrap: &Bootstrap,
     skills: &SkillCatalog,
     dispatcher: &mut ToolDispatcher,
     provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
-    task_runner: ProductionTaskRunner,
+    task_runner: R,
 ) -> Result<(), CliError> {
     let validator = BundledModelValidator;
     let agents = tui_agent_catalog(bootstrap, &validator)?;
@@ -4622,8 +4622,8 @@ fn register_production_task_tool(
         "task".into(),
         OpenAiFunctionTool::new(
             "task",
-            "Run an isolated subagent task",
-            TaskTool::<ProductionTaskRunner>::input_schema(),
+            "Dispatch an isolated eligible subagent task in the foreground or background",
+            TaskTool::<R>::input_schema(),
         )
         .map_err(|_| CliError::configuration("task tool is unavailable"))?,
     );
@@ -12156,6 +12156,141 @@ mod tests {
         assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn production_task_catalog_is_conditional_and_dispatches_requested_call() {
+        struct RecordingTaskRunner(Arc<Mutex<Vec<(String, TaskLaunchMode)>>>);
+
+        impl TaskRunner for RecordingTaskRunner {
+            fn run(
+                &mut self,
+                request: TaskTurnRequest,
+                context: &TaskRunContext,
+            ) -> Result<TaskTurnResult, TaskRunnerError> {
+                self.0.lock().unwrap().push((
+                    request.agent_name().to_owned(),
+                    context.execution().unwrap().mode(),
+                ));
+                Ok(TaskTurnResult {
+                    output: request.description().to_owned(),
+                    iterations: 1,
+                })
+            }
+        }
+
+        let temporary = tui_session_directory("conditional-task-catalog");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[
+                (
+                    "alpha",
+                    "---\nname: alpha\ndescription: default\nmode: subagent\npermissions: []\n---\nDefault work.\n",
+                ),
+                (
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: review\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                ),
+            ],
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+            &bootstrap,
+            bootstrap.project_root().unwrap(),
+            Some(&SkillCatalog::default()),
+            RecordingTaskRunner(Arc::clone(&calls)),
+        )
+        .unwrap();
+        let task = provider_tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("eligible catalog should expose task");
+        assert_eq!(
+            task.description(),
+            "Dispatch an isolated eligible subagent task in the foreground or background"
+        );
+        assert_eq!(
+            task.parameters(),
+            &serde_json::json!({
+                "type":"object",
+                "additionalProperties":false,
+                "required":["description"],
+                "properties":{
+                    "agent":{"type":"string","minLength":1,"maxLength":64},
+                    "background":{"type":"boolean"},
+                    "description":{"type":"string","minLength":1,"maxLength":16384},
+                    "model":{"type":"string","minLength":1,"maxLength":64},
+                    "skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}
+                }
+            })
+        );
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().unwrap();
+        for arguments in [
+            serde_json::json!({"agent":"reviewer","background":true,"description":"selected"}),
+            serde_json::json!({"description":"default"}),
+        ] {
+            let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+                .evaluate(
+                    &policy,
+                    &[],
+                    &PermissionSession::new(),
+                    ToolDispatchRequest::new("project", "task", arguments),
+                )
+                .unwrap()
+            else {
+                panic!("provider task call should authorize");
+            };
+            dispatcher.execute(handle, &context).unwrap();
+        }
+        drop(dispatcher);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("reviewer".to_owned(), TaskLaunchMode::Background),
+                ("alpha".to_owned(), TaskLaunchMode::Foreground),
+            ]
+        );
+
+        for (label, agents) in [
+            ("absent", Vec::new()),
+            (
+                "ineligible",
+                vec![(
+                    "primary",
+                    "---\nname: primary\ndescription: primary\nmode: primary\npermissions: []\n---\nPrimary work.\n",
+                )],
+            ),
+        ] {
+            let temporary = tui_session_directory(label);
+            let bootstrap = tui_session_bootstrap(&temporary, &agents);
+            let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+                &bootstrap,
+                bootstrap.project_root().unwrap(),
+                Some(&SkillCatalog::default()),
+                RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap();
+
+            assert!(provider_tools.iter().all(|tool| tool.name() != "task"));
+            let dispatcher = dispatcher.lock().unwrap();
+            assert_eq!(dispatcher.canonical_identity("task"), None);
+            assert_eq!(dispatcher.canonical_identity("native::task"), None);
+            drop(dispatcher);
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
