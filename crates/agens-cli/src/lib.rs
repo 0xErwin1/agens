@@ -5513,6 +5513,94 @@ fn remote_function_tool(
     .map_err(|_| CliError::configuration("MCP tool metadata is invalid"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum NativePermissionTarget {
+    Command(String),
+    Path(String),
+    Pattern(String),
+    Url(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NativePermissionTargetError {
+    UnknownTool,
+    ArgumentsNotObject,
+    InvalidField(&'static str),
+    FieldTooLong(&'static str),
+}
+
+impl fmt::Display for NativePermissionTargetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTool => formatter.write_str("unknown native tool"),
+            Self::ArgumentsNotObject => {
+                formatter.write_str("native tool arguments must be an object")
+            }
+            Self::InvalidField(field) => write!(formatter, "native tool {field} is invalid"),
+            Self::FieldTooLong(field) => {
+                write!(formatter, "native tool {field} exceeds size limit")
+            }
+        }
+    }
+}
+
+impl NativePermissionTarget {
+    fn parse(
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<Self, NativePermissionTargetError> {
+        let arguments = arguments
+            .as_object()
+            .ok_or(NativePermissionTargetError::ArgumentsNotObject)?;
+
+        let field = |field| native_permission_target_field(arguments, field);
+
+        match tool {
+            "native::bash" => field("command").map(Self::Command),
+            "native::read" | "native::write" | "native::edit" | "native::list"
+            | "native::search" => field("path").map(Self::Path),
+            "native::glob" => field("pattern").map(Self::Pattern),
+            "native::grep" => {
+                if arguments.contains_key("path") {
+                    field("path")?;
+                }
+
+                field("pattern").map(Self::Pattern)
+            }
+            "native::webfetch" => field("url").map(Self::Url),
+            _ => Err(NativePermissionTargetError::UnknownTool),
+        }
+    }
+
+    fn into_value(self) -> String {
+        match self {
+            Self::Command(value) | Self::Path(value) | Self::Pattern(value) | Self::Url(value) => {
+                value
+            }
+        }
+    }
+}
+
+fn native_permission_target_field(
+    arguments: &serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<String, NativePermissionTargetError> {
+    let value = arguments
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or(NativePermissionTargetError::InvalidField(field))?;
+
+    if value.trim().is_empty() {
+        return Err(NativePermissionTargetError::InvalidField(field));
+    }
+
+    if value.len() > agens_core::MAX_PERMISSION_TARGET_BYTES {
+        return Err(NativePermissionTargetError::FieldTooLong(field));
+    }
+
+    Ok(value.to_owned())
+}
+
 struct RegisteredNativeTool {
     name: String,
     catalog: Arc<Mutex<NativeToolCatalog>>,
@@ -5523,16 +5611,9 @@ impl DispatchTool for RegisteredNativeTool {
         &self,
         arguments: &serde_json::Value,
     ) -> Result<String, agens_core::Error> {
-        let field = if self.name == "native::bash" {
-            "command"
-        } else {
-            "path"
-        };
-        arguments
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| agens_core::Error::Tool("native tool arguments are invalid".into()))
+        NativePermissionTarget::parse(&self.name, arguments)
+            .map(NativePermissionTarget::into_value)
+            .map_err(|error| agens_core::Error::Tool(error.to_string()))
     }
 
     fn execute(
@@ -6518,6 +6599,157 @@ mod tests {
         assert_eq!(
             map_task_turn_error(HeadlessTurnError::Tool),
             TaskRunnerError::ChildFailure
+        );
+    }
+
+    #[test]
+    fn native_permission_target_projects_each_registered_tool_to_its_canonical_field() {
+        let cases = [
+            (
+                "native::bash",
+                serde_json::json!({"command": "git status"}),
+                NativePermissionTarget::Command("git status".into()),
+            ),
+            (
+                "native::read",
+                serde_json::json!({"path": "notes.md"}),
+                NativePermissionTarget::Path("notes.md".into()),
+            ),
+            (
+                "native::write",
+                serde_json::json!({"path": "notes.md", "content": "body"}),
+                NativePermissionTarget::Path("notes.md".into()),
+            ),
+            (
+                "native::edit",
+                serde_json::json!({"path": "notes.md", "old": "old", "new": "new"}),
+                NativePermissionTarget::Path("notes.md".into()),
+            ),
+            (
+                "native::list",
+                serde_json::json!({"path": "src"}),
+                NativePermissionTarget::Path("src".into()),
+            ),
+            (
+                "native::search",
+                serde_json::json!({"path": "src", "query": "permission"}),
+                NativePermissionTarget::Path("src".into()),
+            ),
+            (
+                "native::glob",
+                serde_json::json!({"pattern": "src/**/*.rs"}),
+                NativePermissionTarget::Pattern("src/**/*.rs".into()),
+            ),
+            (
+                "native::grep",
+                serde_json::json!({"pattern": "permission"}),
+                NativePermissionTarget::Pattern("permission".into()),
+            ),
+            (
+                "native::webfetch",
+                serde_json::json!({"url": "https://example.test/docs"}),
+                NativePermissionTarget::Url("https://example.test/docs".into()),
+            ),
+        ];
+
+        for (tool, arguments, expected) in cases {
+            assert_eq!(
+                NativePermissionTarget::parse(tool, &arguments),
+                Ok(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn native_permission_target_keeps_grep_path_separate_from_its_pattern() {
+        assert_eq!(
+            NativePermissionTarget::parse(
+                "native::grep",
+                &serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
+            ),
+            Ok(NativePermissionTarget::Pattern("TODO".into()))
+        );
+    }
+
+    #[test]
+    fn native_permission_target_rejects_invalid_target_fields_for_every_registered_tool() {
+        let too_long = "x".repeat(agens_core::MAX_PERMISSION_TARGET_BYTES + 1);
+
+        for (tool, field) in [
+            ("native::bash", "command"),
+            ("native::read", "path"),
+            ("native::write", "path"),
+            ("native::edit", "path"),
+            ("native::list", "path"),
+            ("native::search", "path"),
+            ("native::glob", "pattern"),
+            ("native::grep", "pattern"),
+            ("native::webfetch", "url"),
+        ] {
+            assert_eq!(
+                NativePermissionTarget::parse(tool, &serde_json::json!({})),
+                Err(NativePermissionTargetError::InvalidField(field))
+            );
+
+            for (value, expected) in [
+                (
+                    serde_json::json!(1),
+                    NativePermissionTargetError::InvalidField(field),
+                ),
+                (
+                    serde_json::json!(""),
+                    NativePermissionTargetError::InvalidField(field),
+                ),
+                (
+                    serde_json::json!(too_long.clone()),
+                    NativePermissionTargetError::FieldTooLong(field),
+                ),
+            ] {
+                let arguments = serde_json::Value::Object(serde_json::Map::from_iter([(
+                    field.to_owned(),
+                    value,
+                )]));
+
+                assert_eq!(
+                    NativePermissionTarget::parse(tool, &arguments),
+                    Err(expected)
+                );
+            }
+        }
+
+        for (value, expected) in [
+            (
+                serde_json::json!(1),
+                NativePermissionTargetError::InvalidField("path"),
+            ),
+            (
+                serde_json::json!(""),
+                NativePermissionTargetError::InvalidField("path"),
+            ),
+            (
+                serde_json::json!(too_long),
+                NativePermissionTargetError::FieldTooLong("path"),
+            ),
+        ] {
+            assert_eq!(
+                NativePermissionTarget::parse(
+                    "native::grep",
+                    &serde_json::json!({"pattern": "TODO", "path": value}),
+                ),
+                Err(expected)
+            );
+        }
+
+        assert_eq!(
+            NativePermissionTarget::parse("native::glob", &serde_json::json!([])),
+            Err(NativePermissionTargetError::ArgumentsNotObject)
+        );
+        assert_eq!(
+            NativePermissionTarget::parse(
+                "native::unknown",
+                &serde_json::json!({"path": "notes.md"}),
+            ),
+            Err(NativePermissionTargetError::UnknownTool)
         );
     }
 
