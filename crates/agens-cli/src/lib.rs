@@ -274,6 +274,11 @@ impl CliError {
                 "provider",
                 "ChatGPT request was rejected",
             ),
+            HeadlessTurnError::ProviderContext => (
+                ExitStatus::Failure,
+                "provider",
+                "request exceeds the model context window",
+            ),
             HeadlessTurnError::ProviderRateLimited => (
                 ExitStatus::Failure,
                 "provider",
@@ -281,6 +286,9 @@ impl CliError {
             ),
             HeadlessTurnError::ProviderServer => {
                 (ExitStatus::Failure, "provider", "ChatGPT service failed")
+            }
+            HeadlessTurnError::ProviderNetwork => {
+                (ExitStatus::Failure, "provider", "network request failed")
             }
             HeadlessTurnError::ProviderProtocol => (
                 ExitStatus::Failure,
@@ -2429,6 +2437,16 @@ fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome 
         Err(error) if error.category == "cancelled" => TuiProviderOutcome::Cancelled {
             message: error.to_string(),
             action: TUI_ERROR_ACTION.into(),
+        },
+        Err(error) if error.message == "request exceeds the model context window" => {
+            TuiProviderOutcome::Failed {
+                message: error.to_string(),
+                action: "Start a new session or shorten the prompt, then retry.".into(),
+            }
+        }
+        Err(error) if error.message == "network request failed" => TuiProviderOutcome::Failed {
+            message: error.to_string(),
+            action: "Check the network connection, then retry.".into(),
         },
         Err(error) => TuiProviderOutcome::Failed {
             message: error.to_string(),
@@ -11658,6 +11676,30 @@ mod tests {
                 tui_provider_outcome(Err(error)),
                 TuiProviderOutcome::Failed { message, action }
                     if message == expected && action == TUI_ERROR_ACTION
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_context_and_network_render_sanitized_actions() {
+        for (turn_error, expected_message, expected_action) in [
+            (
+                HeadlessTurnError::ProviderContext,
+                "provider: request exceeds the model context window",
+                "Start a new session or shorten the prompt, then retry.",
+            ),
+            (
+                HeadlessTurnError::ProviderNetwork,
+                "provider: network request failed",
+                "Check the network connection, then retry.",
+            ),
+        ] {
+            let error = CliError::runtime(turn_error);
+
+            assert!(matches!(
+                tui_provider_outcome(Err(error)),
+                TuiProviderOutcome::Failed { message, action }
+                    if message == expected_message && action == expected_action
             ));
         }
     }

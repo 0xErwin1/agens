@@ -810,8 +810,10 @@ pub enum HeadlessTurnPortError {
     Authentication,
     Provider,
     ProviderRejected,
+    ProviderContext,
     ProviderRateLimited,
     ProviderServer,
+    ProviderNetwork,
     ProviderProtocol,
     Permission,
     Tool,
@@ -934,8 +936,10 @@ pub enum HeadlessTurnError {
     Authentication,
     Provider,
     ProviderRejected,
+    ProviderContext,
     ProviderRateLimited,
     ProviderServer,
+    ProviderNetwork,
     ProviderProtocol,
     Permission,
     PermissionEvaluation,
@@ -955,8 +959,10 @@ impl fmt::Display for HeadlessTurnError {
             Self::Authentication => "authentication required",
             Self::Provider => "provider operation failed",
             Self::ProviderRejected => "provider rejected the request",
+            Self::ProviderContext => "provider rejected the request because it exceeds context",
             Self::ProviderRateLimited => "provider rate limited the request",
             Self::ProviderServer => "provider service failed",
+            Self::ProviderNetwork => "provider network request failed",
             Self::ProviderProtocol => "provider response protocol failed",
             Self::Permission => "permission operation failed",
             Self::PermissionEvaluation => "permission evaluation failed",
@@ -1269,13 +1275,7 @@ fn finish_port_error(
             .unwrap_or(HeadlessTurnError::State);
     }
 
-    let provider_failure = match error {
-        HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
-        HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
-        HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
-        HeadlessTurnPortError::ProviderProtocol => Some(HeadlessTurnError::ProviderProtocol),
-        _ => None,
-    };
+    let provider_failure = map_port_error(error);
     if let Some(provider_failure) = provider_failure {
         return coordinator
             .fail()
@@ -1294,6 +1294,18 @@ fn finish_port_error(
         HeadlessTurnError::State
     } else {
         failure
+    }
+}
+
+fn map_port_error(error: HeadlessTurnPortError) -> Option<HeadlessTurnError> {
+    match error {
+        HeadlessTurnPortError::ProviderRejected => Some(HeadlessTurnError::ProviderRejected),
+        HeadlessTurnPortError::ProviderContext => Some(HeadlessTurnError::ProviderContext),
+        HeadlessTurnPortError::ProviderRateLimited => Some(HeadlessTurnError::ProviderRateLimited),
+        HeadlessTurnPortError::ProviderServer => Some(HeadlessTurnError::ProviderServer),
+        HeadlessTurnPortError::ProviderNetwork => Some(HeadlessTurnError::ProviderNetwork),
+        HeadlessTurnPortError::ProviderProtocol => Some(HeadlessTurnError::ProviderProtocol),
+        _ => None,
     }
 }
 
