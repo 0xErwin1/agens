@@ -339,7 +339,7 @@ impl Conversation {
         self.last_was_tool_call = is_tool_call;
         Ok(())
     }
-    pub(crate) fn apply_subagent(&mut self, event: TuiSubagentEvent) {
+    pub(crate) fn apply_subagent_summary(&mut self, event: TuiSubagentEvent) {
         match event.update {
             TuiSubagentUpdate::Started {
                 agent,
@@ -358,47 +358,19 @@ impl Conversation {
                 });
                 self.items.push(ConversationItem::SubagentCard(event.id));
             }
-            TuiSubagentUpdate::ToolCall {
-                call_id,
-                name,
-                input,
-            } => {
+            TuiSubagentUpdate::ToolCall { .. } => {
                 if let Some(card) = self
                     .subagent_cards
                     .iter_mut()
                     .find(|card| card.id == event.id && card.status.is_none())
-                    && card.tool_calls.iter().all(|call| call.call_id != call_id)
                 {
-                    card.tool_calls.push(ToolCall {
-                        call_id,
-                        name,
-                        input,
-                        result: None,
-                    });
                     card.tool_uses += 1;
                 }
             }
-            TuiSubagentUpdate::ToolResult {
-                call_id,
-                output,
-                is_error,
-            } => {
-                if let Some(call) = self
-                    .subagent_cards
-                    .iter_mut()
-                    .find(|card| card.id == event.id)
-                    .and_then(|card| {
-                        card.status
-                            .is_none()
-                            .then_some(card)?
-                            .tool_calls
-                            .iter_mut()
-                            .find(|call| call.call_id == call_id && call.result.is_none())
-                    })
-                {
-                    call.result = Some(ToolResult { output, is_error });
-                }
-            }
+            TuiSubagentUpdate::Reasoning(_)
+            | TuiSubagentUpdate::Text(_)
+            | TuiSubagentUpdate::ToolResult { .. }
+            | TuiSubagentUpdate::Error { .. } => {}
             TuiSubagentUpdate::Terminal {
                 status,
                 final_result,
@@ -414,6 +386,44 @@ impl Conversation {
             }
             _ => {}
         }
+    }
+
+    pub(crate) fn apply_child_event(&mut self, event: TuiSubagentEvent) {
+        let result = match event.update {
+            TuiSubagentUpdate::Started { .. } => return,
+            TuiSubagentUpdate::Reasoning(delta) => {
+                self.apply(ConversationEvent::ReasoningDelta(delta))
+            }
+            TuiSubagentUpdate::Text(delta) => self.apply(ConversationEvent::MarkdownDelta(delta)),
+            TuiSubagentUpdate::ToolCall {
+                call_id,
+                name,
+                input,
+            } => self.apply(ConversationEvent::ToolCall {
+                call_id,
+                name,
+                input,
+            }),
+            TuiSubagentUpdate::ToolResult {
+                call_id,
+                output,
+                is_error,
+            } => self.apply(ConversationEvent::ToolResult {
+                call_id,
+                output,
+                is_error,
+            }),
+            TuiSubagentUpdate::Error { kind } => self.apply(ConversationEvent::Error {
+                message: kind.message().into(),
+                action: kind.action().into(),
+            }),
+            TuiSubagentUpdate::Terminal { final_result, .. } => {
+                self.final_markdown = Some(final_result.clone());
+                self.items.push(ConversationItem::Assistant(final_result));
+                Ok(())
+            }
+        };
+        let _ = result;
     }
 
     pub(crate) fn restore_completed_subagent(

@@ -4825,6 +4825,10 @@ impl TuiTaskLifecycleBridge {
             turn.tool_uses += 1;
         }
         let event = match event {
+            TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
+                TuiSubagentEvent::reasoning(id, delta)
+            }
+            TurnEvent::ProviderPart(MessagePart::Text(delta)) => TuiSubagentEvent::text(id, delta),
             TurnEvent::ToolCallRequested {
                 id: call_id,
                 name,
@@ -11783,6 +11787,8 @@ mod tests {
                 bootstrap.project_root().unwrap().to_path_buf(),
                 Arc::clone(&probe),
                 vec![
+                    TurnEvent::ProviderPart(MessagePart::Reasoning("inspect".into())),
+                    TurnEvent::ProviderPart(MessagePart::Text("partial".into())),
                     TurnEvent::ToolCallRequested {
                         id: "read-1".into(),
                         name: "native::read".into(),
@@ -11814,7 +11820,7 @@ mod tests {
         );
 
         let mut received = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..8 {
             match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
                 Ok(event) => received.push(event.into_parts().1),
                 Err(error) => {
@@ -11835,6 +11841,8 @@ mod tests {
                     "review task",
                     agens_tui::TuiExecutionState::ForegroundRunning,
                 )),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(1, "partial")),
                 TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
                     1,
                     "read-1",

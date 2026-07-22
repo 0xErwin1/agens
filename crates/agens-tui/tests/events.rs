@@ -5,7 +5,7 @@ use agens_tui::{
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
     TranscriptEntry, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
     TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -233,6 +233,142 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
     assert_eq!(view.completed_conversations.len(), 1);
     assert!(view.conversation.is_none());
     assert!(tui.transcript_record(&TranscriptId::Subagent(7)).is_none());
+}
+
+#[test]
+fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summaries() {
+    let mut tui = Tui::new(FakeEngine::default());
+    let (bridge, receiver) = BridgeTx::bounded(32);
+    let cancellation = BridgeCancel::new();
+    let events = [
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+        },
+        TuiRuntimeEvent::TaskExecution {
+            agent: "writer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id: 8 },
+        },
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "review task",
+            TuiExecutionState::ForegroundRunning,
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            8,
+            "writer",
+            "write task",
+            TuiExecutionState::ForegroundRunning,
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(7, "child-reasoning")),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(8, "other-child")),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(7, "child-partial")),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
+            7,
+            "call-a",
+            "native::read",
+            "alpha",
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
+            7,
+            "call-b",
+            "native::glob",
+            "beta",
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_result(
+            7, "call-b", "result-b", false,
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_result(
+            7, "call-a", "result-a", false,
+        )),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(7, TuiSubagentErrorKind::Tool)),
+        TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::Failed { id: 7 },
+        },
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
+            7,
+            TuiSubagentStatus::Failure,
+            "child-final",
+        )),
+    ];
+
+    for event in events {
+        let outcome = bridge.publish(event, &cancellation, None);
+        assert!(matches!(outcome, PublishOutcome::Published { .. }));
+    }
+    while let Ok(envelope) = receiver.try_recv() {
+        let (ordinal, event) = envelope.into_parts();
+        tui.apply_runtime_event_with_ordinal(ordinal, event);
+    }
+
+    tui.apply_runtime_event_with_ordinal(
+        99,
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(7, "late-child")),
+    );
+    tui.apply_runtime_event_with_ordinal(
+        100,
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
+            7,
+            TuiSubagentStatus::Failure,
+            "duplicate-final",
+        )),
+    );
+
+    let parent_card = &tui.view().conversation.unwrap().subagent_cards[0];
+    assert_eq!(parent_card.tool_uses, 2);
+    assert!(parent_card.tool_calls.is_empty());
+
+    let backend = TestBackend::new(120, 48);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    renderer.render(tui.view()).unwrap();
+    let parent = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(parent.contains("Subagent reviewer"));
+    assert!(!parent.contains("child-reasoning"));
+    assert!(!parent.contains("child-partial"));
+    assert!(!parent.contains("result-a"));
+    assert!(!parent.contains("Subagent tool execution failed."));
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    renderer.render(tui.view()).unwrap();
+    let child = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    let expected_child_rows = [
+        "child-reasoning",
+        "child-partial",
+        "call-a",
+        "call-b",
+        "result-b",
+        "result-a",
+        "Subagent tool execution failed.",
+        "child-final",
+    ];
+    let row_positions = expected_child_rows.map(|text| {
+        assert!(child.contains(text), "missing child row: {text}");
+        child.find(text).unwrap()
+    });
+
+    assert!(
+        row_positions.windows(2).all(|rows| rows[0] < rows[1]),
+        "child rows did not preserve source order: {expected_child_rows:?}",
+    );
+    assert!(!child.contains("late-child"));
+    assert!(!child.contains("duplicate-final"));
 }
 
 impl Engine for FakeEngine {

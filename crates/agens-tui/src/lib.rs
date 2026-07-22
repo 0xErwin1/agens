@@ -10,7 +10,7 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
     BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentStatus, UiEnvelope,
+    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -1979,9 +1979,7 @@ where
             }
             TuiRuntimeEvent::SubagentExecution(event) => {
                 if self.subagent_event_matches_execution(event) {
-                    self.conversation
-                        .get_or_insert_with(|| Conversation::new(String::new()))
-                        .apply_subagent(event.clone());
+                    self.apply_subagent_event(event);
                 }
             }
             TuiRuntimeEvent::RestoredCompletedSubagent {
@@ -2003,6 +2001,19 @@ where
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
+    }
+
+    fn apply_subagent_event(&mut self, event: &TuiSubagentEvent) {
+        self.transcripts
+            .get_mut(&TranscriptId::Subagent(event.id))
+            .expect("admitted child event has a transcript")
+            .conversation
+            .get_or_insert_with(|| Conversation::new(String::new()))
+            .apply_child_event(event.clone());
+
+        self.conversation
+            .get_or_insert_with(|| Conversation::new(String::new()))
+            .apply_subagent_summary(event.clone());
     }
 
     fn admit_runtime_event(&mut self, ordinal: u64, event: &TuiRuntimeEvent) -> bool {
@@ -2137,6 +2148,10 @@ where
 
     /// Returns an immutable snapshot for a renderer.
     pub fn view(&self) -> ViewState<'_> {
+        let active = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
         ViewState {
             active_transcript: self.active_transcript,
             transcript_ids: std::iter::once(TranscriptId::Main)
@@ -2146,9 +2161,9 @@ where
             size: self.size,
             running: self.running,
             quit_armed: self.quit_armed,
-            transcript: &self.transcript,
-            following_bottom: self.following_bottom,
-            scroll_offset: self.scroll_offset,
+            transcript: &active.transcript,
+            following_bottom: active.following_bottom,
+            scroll_offset: active.scroll_offset,
             provider_model: &self.provider_model,
             session: &self.session,
             turn_state: self.turn_state,
@@ -2158,10 +2173,26 @@ where
             turn_duration: self.turn_duration,
             latest_usage: self.latest_usage.as_ref(),
             status: self.status.as_deref(),
-            conversation: self.conversation.as_ref(),
-            completed_conversations: &self.completed_conversations,
-            collapsed_tool_outputs: &self.collapsed_tool_outputs,
-            collapse_thinking: self.collapse_thinking,
+            conversation: if self.active_transcript == TranscriptId::Main {
+                self.conversation.as_ref()
+            } else {
+                active.conversation.as_ref()
+            },
+            completed_conversations: if self.active_transcript == TranscriptId::Main {
+                &self.completed_conversations
+            } else {
+                &active.completed_conversations
+            },
+            collapsed_tool_outputs: if self.active_transcript == TranscriptId::Main {
+                &self.collapsed_tool_outputs
+            } else {
+                &active.collapsed_tool_outputs
+            },
+            collapse_thinking: if self.active_transcript == TranscriptId::Main {
+                self.collapse_thinking
+            } else {
+                active.collapse_thinking
+            },
             dialog: self.dialog.as_ref(),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
@@ -2257,8 +2288,11 @@ where
                         )
                     )
             }
-            bridge::TuiSubagentUpdate::ToolCall { .. }
-            | bridge::TuiSubagentUpdate::ToolResult { .. } => matches!(
+            bridge::TuiSubagentUpdate::Reasoning(_)
+            | bridge::TuiSubagentUpdate::Text(_)
+            | bridge::TuiSubagentUpdate::ToolCall { .. }
+            | bridge::TuiSubagentUpdate::ToolResult { .. }
+            | bridge::TuiSubagentUpdate::Error { .. } => matches!(
                 execution.state,
                 TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
             ),

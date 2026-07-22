@@ -224,6 +224,8 @@ pub(crate) enum TuiSubagentUpdate {
         task_summary: String,
         presentation: TuiExecutionState,
     },
+    Reasoning(String),
+    Text(String),
     ToolCall {
         call_id: String,
         name: String,
@@ -234,10 +236,38 @@ pub(crate) enum TuiSubagentUpdate {
         output: String,
         is_error: bool,
     },
+    Error {
+        kind: TuiSubagentErrorKind,
+    },
     Terminal {
         status: TuiSubagentStatus,
         final_result: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiSubagentErrorKind {
+    Provider,
+    Tool,
+    Runtime,
+}
+
+impl TuiSubagentErrorKind {
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::Provider => "Subagent provider request failed.",
+            Self::Tool => "Subagent tool execution failed.",
+            Self::Runtime => "Subagent runtime failed.",
+        }
+    }
+
+    pub(crate) const fn action(self) -> &'static str {
+        match self {
+            Self::Provider => "Retry the subagent request.",
+            Self::Tool => "Review the tool call and retry.",
+            Self::Runtime => "Retry the subagent request or inspect diagnostics.",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +308,20 @@ impl TuiSubagentEvent {
             },
         }
     }
+
+    pub fn reasoning(id: u64, delta: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Reasoning(sanitize_projection(delta.as_ref())),
+        }
+    }
+
+    pub fn text(id: u64, delta: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Text(sanitize_projection(delta.as_ref())),
+        }
+    }
     pub fn tool_result(
         id: u64,
         call_id: impl AsRef<str>,
@@ -291,6 +335,13 @@ impl TuiSubagentEvent {
                 output: sanitize_projection(output.as_ref()),
                 is_error,
             },
+        }
+    }
+
+    pub fn error(id: u64, kind: TuiSubagentErrorKind) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Error { kind },
         }
     }
 
