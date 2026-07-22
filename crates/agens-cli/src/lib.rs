@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -28,6 +28,8 @@ use agens_providers::{
     ProgressAwareProvider, load_chatgpt_auth_state,
 };
 use agens_store::{PermissionGrantStore, SessionStore};
+#[cfg(test)]
+use agens_tools::TaskTerminalState;
 use agens_tools::{
     AgentCatalog, AgentModelValidator, AuthorizedToolCall, CommandCatalog, CommandDefinition,
     DispatchTool, EffectiveCapabilitySet, McpEndpointSummary, McpHttpTransport, McpLimits,
@@ -2672,9 +2674,6 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             presentation,
             messages: resumed.messages.clone(),
         });
-        for event in resumed_subagent_events(&resumed.messages) {
-            tui.apply_runtime_event(event);
-        }
         *session.lock().map_err(|_| {
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
@@ -4292,79 +4291,6 @@ fn persist_completed_subagent_turn(
     context.metadata = Some(metadata);
     context.messages = messages;
     Ok(())
-}
-
-fn resumed_subagent_events(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
-    let mut events = Vec::new();
-    let mut restored = BTreeSet::new();
-    for (index, message) in messages.iter().enumerate() {
-        let Some(Message {
-            role: Role::User,
-            parts: user_parts,
-        }) = index.checked_sub(1).and_then(|index| messages.get(index))
-        else {
-            continue;
-        };
-        let Some(MessagePart::ToolCall { id, name, input }) = message.parts.first() else {
-            continue;
-        };
-        let Some(id) = name
-            .eq("native::task")
-            .then(|| id.strip_prefix("subagent:"))
-            .flatten()
-            .and_then(|id| id.parse().ok())
-        else {
-            continue;
-        };
-        let Ok(arguments) = serde_json::from_str::<serde_json::Value>(input) else {
-            continue;
-        };
-        let (Some(agent), Some(task)) = (
-            arguments.get("agent").and_then(serde_json::Value::as_str),
-            arguments
-                .get("description")
-                .and_then(serde_json::Value::as_str),
-        ) else {
-            continue;
-        };
-        let Some(MessagePart::Text(user_task)) = user_parts.first() else {
-            continue;
-        };
-        if task != user_task {
-            continue;
-        }
-        let Some(result) = messages[index + 1..].iter().find_map(|message| {
-            (message.role == Role::Tool)
-                .then_some(&message.parts)
-                .and_then(|parts| {
-                    parts.iter().find_map(|part| match part {
-                        MessagePart::ToolResult {
-                            tool_call_id,
-                            content,
-                            is_error: false,
-                        } if tool_call_id == &format!("subagent:{id}") => Some(content.as_str()),
-                        _ => None,
-                    })
-                })
-        }) else {
-            continue;
-        };
-        if !restored.insert(id) {
-            continue;
-        }
-        events.push(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::started(
-                id,
-                agent,
-                task,
-                agens_tui::TuiExecutionState::ForegroundRunning,
-            ),
-        ));
-        events.push(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, result),
-        ));
-    }
-    events
 }
 
 fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessagePart>) {
@@ -6806,7 +6732,7 @@ mod tests {
     }
 
     #[test]
-    fn p1c_completed_subagent_turn_persists_one_bounded_standard_turn() {
+    fn p1c1_completed_subagent_turn_persists_one_bounded_standard_turn() {
         let temporary = tui_session_directory("p1c-completed-subagent");
         let mut store = SessionStore::open(&temporary).unwrap();
         let turn = CompletedSubagentTurn {
@@ -6856,47 +6782,11 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(
-            resumed_subagent_events(&reopened.messages),
-            vec![
-                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
-                    7,
-                    "reviewer",
-                    "review this change",
-                    agens_tui::TuiExecutionState::ForegroundRunning,
-                )),
-                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
-                    7,
-                    TuiSubagentStatus::Success,
-                    "approved",
-                )),
-            ]
-        );
-
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
-    fn p1c_resume_ignores_incomplete_and_duplicate_subagent_turns() {
-        let turn = CompletedSubagentTurn {
-            id: 9,
-            agent: "reviewer".into(),
-            task: "check safety".into(),
-            final_result: "complete".into(),
-            tool_uses: 0,
-        };
-        let complete = completed_subagent_session_turn(&turn).unwrap();
-        let mut incomplete = complete.messages().to_vec();
-        incomplete.pop();
-        let mut duplicated = complete.messages().to_vec();
-        duplicated.extend(complete.messages().iter().cloned());
-
-        assert!(resumed_subagent_events(&incomplete).is_empty());
-        assert_eq!(resumed_subagent_events(&duplicated).len(), 2);
-    }
-
-    #[test]
-    fn p1c_completed_subagent_turn_redacts_and_bounds_durable_content() {
+    fn p1c1_completed_subagent_turn_redacts_and_bounds_durable_content() {
         let turn = CompletedSubagentTurn {
             id: 1,
             agent: "reviewer".into(),
@@ -6922,6 +6812,88 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    #[test]
+    fn p1c1_terminal_observer_excludes_running_background_failed_and_duplicate_work() {
+        let temporary = tui_session_directory("p1c1-terminal-exclusions");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let (events, _receiver) = BridgeTx::bounded(8);
+        let controls = TuiTaskControls::default();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .with_lifecycle_bridge(lifecycle_bridge),
+        )
+        .unwrap();
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+        let worker_session = Arc::clone(&session);
+        let worker_cancellation = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            launch_selected_tui_task(
+                &mut runtime,
+                &worker_session,
+                "review task",
+                false,
+                &worker_cancellation,
+            )
+        });
+        let lifecycle = (0..100)
+            .find_map(|_| {
+                let lifecycle = controls.0.lock().unwrap().get(&1).cloned();
+                if lifecycle.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                lifecycle
+            })
+            .expect("running task should be observed");
+
+        assert!(session.lock().unwrap().identifier.is_none());
+        assert!(lifecycle.transition_to_background());
+        assert!(session.lock().unwrap().identifier.is_none());
+        assert!(lifecycle.finish(TaskTerminalState::Failed));
+        assert!(!lifecycle.finish(TaskTerminalState::Completed));
+
+        cancellation.cancel();
+        let _ = worker.join().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        assert!(session.lock().unwrap().identifier.is_none());
+        assert!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .list_sessions()
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     mod model_registry {
@@ -11666,7 +11638,7 @@ mod tests {
     }
 
     #[test]
-    fn p1b_authorized_runner_projects_ordered_sanitized_child_events_once() {
+    fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
         let temporary = tui_session_directory("p1b-child-events");
         let bootstrap = tui_session_bootstrap(
             &temporary,
@@ -11678,7 +11650,12 @@ mod tests {
         let probe = Arc::new(Mutex::new(Vec::new()));
         let (events, receiver) = BridgeTx::bounded(16);
         let controls = TuiTaskControls::default();
-        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls);
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls)
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
             &SkillCatalog::default(),
@@ -11711,10 +11688,6 @@ mod tests {
                 PermissionPattern::Any,
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
-        }));
         let cancellation = HeadlessTurnCancellation::new();
 
         assert_eq!(
@@ -11768,6 +11741,29 @@ mod tests {
             ]
         );
         assert_eq!(probe.lock().unwrap().len(), 1);
+        let session_id = (0..100)
+            .find_map(|_| {
+                let identifier = session.lock().unwrap().identifier;
+                if identifier.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                identifier
+            })
+            .expect("completed terminal should persist exactly one durable turn");
+        let stored = SessionStore::open(bootstrap.data_directory())
+            .unwrap()
+            .load_session_for_resume(session_id)
+            .unwrap();
+        assert_eq!(stored.metadata.completed_turn_count, 1);
+        assert_eq!(stored.messages.len(), 3);
+        assert_eq!(
+            stored.messages[2].parts[0],
+            MessagePart::ToolResult {
+                tool_call_id: "subagent:1".into(),
+                content: "probe".into(),
+                is_error: false,
+            }
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
