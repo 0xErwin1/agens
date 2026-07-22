@@ -5,7 +5,7 @@ use agens_tui::{
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
     TranscriptEntry, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
     TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentEvent, TuiSubmissionOutcome,
+    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -802,6 +802,129 @@ fn p1a1_events_upsert_live_calls_pair_out_of_order_results_and_stop_after_c1_ter
         cards[0].tool_calls[1].result.as_ref().unwrap().output,
         "later result"
     );
+}
+
+#[test]
+fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutations() {
+    let mut tui = Tui::new(FakeEngine::default());
+    let long = "x".repeat(300);
+    let cases = [
+        (
+            1,
+            TuiExecutionEvent::Completed { id: 1 },
+            TuiSubagentStatus::Success,
+        ),
+        (
+            2,
+            TuiExecutionEvent::Failed { id: 2 },
+            TuiSubagentStatus::Failure,
+        ),
+        (
+            3,
+            TuiExecutionEvent::Cancelled { id: 3 },
+            TuiSubagentStatus::Cancelled,
+        ),
+    ];
+
+    for (id, terminal_execution, status) in cases {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(
+                id,
+                "reviewer",
+                format!("task-{long}"),
+                TuiExecutionState::ForegroundRunning,
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_call(
+                id,
+                format!("call-{long}"),
+                format!("tool-{long}"),
+                format!("input-{long}"),
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_result(
+                id,
+                format!("call-{long}"),
+                format!("output-{long}"),
+                false,
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: "reviewer".into(),
+            event: terminal_execution,
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::terminal(id, status, format!("final-{long}")),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, "late terminal"),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_call(id, "late-call", "native::bash", "late input"),
+        ));
+    }
+
+    let cards = &tui.view().conversation.unwrap().subagent_cards;
+    assert_eq!(cards.len(), 3);
+    for (card, (_, _, status)) in cards.iter().zip(cases) {
+        assert_eq!(card.status, Some(status));
+        assert_eq!(card.task_summary.chars().count(), 256);
+        assert_eq!(card.tool_calls.len(), 1);
+        assert_eq!(card.tool_calls[0].call_id.chars().count(), 256);
+        assert_eq!(card.tool_calls[0].name.chars().count(), 256);
+        assert_eq!(card.tool_calls[0].input.chars().count(), 256);
+        assert_eq!(
+            card.tool_calls[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .output
+                .chars()
+                .count(),
+            256
+        );
+        assert_eq!(card.final_result.as_ref().unwrap().chars().count(), 256);
+    }
+
+    let mut redacted = Tui::new(FakeEngine::default());
+    redacted.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 4 },
+    });
+    for event in [
+        TuiSubagentEvent::started(
+            4,
+            "reviewer",
+            "password=task-secret",
+            TuiExecutionState::ForegroundRunning,
+        ),
+        TuiSubagentEvent::tool_call(4, "call", "native::read", "Authorization: tool-secret"),
+        TuiSubagentEvent::tool_result(4, "call", "token=result-secret", false),
+    ] {
+        redacted.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(event));
+    }
+    redacted.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 4 },
+    });
+    redacted.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::terminal(4, TuiSubagentStatus::Success, "secret=final-secret"),
+    ));
+
+    let card = &redacted.view().conversation.unwrap().subagent_cards[0];
+    assert_eq!(card.task_summary, "[redacted]");
+    assert_eq!(card.tool_calls[0].input, "[redacted]");
+    assert_eq!(
+        card.tool_calls[0].result.as_ref().unwrap().output,
+        "[redacted]"
+    );
+    assert_eq!(card.final_result.as_deref(), Some("[redacted]"));
 }
 
 #[test]

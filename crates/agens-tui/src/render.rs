@@ -117,10 +117,15 @@ pub(super) fn conversation_lines(
                 else {
                     continue;
                 };
-                let status = match card.presentation {
-                    crate::TuiExecutionState::ForegroundRunning => "foreground running",
-                    crate::TuiExecutionState::BackgroundRunning => "background running",
-                    _ => "running",
+                let status = match card.status {
+                    Some(crate::TuiSubagentStatus::Success) => "success",
+                    Some(crate::TuiSubagentStatus::Failure) => "failure",
+                    Some(crate::TuiSubagentStatus::Cancelled) => "cancelled",
+                    None => match card.presentation {
+                        crate::TuiExecutionState::ForegroundRunning => "foreground running",
+                        crate::TuiExecutionState::BackgroundRunning => "background running",
+                        _ => "running",
+                    },
                 };
                 lines.push(Line::from(format!(
                     "Subagent {} · {status} · {}",
@@ -136,6 +141,9 @@ pub(super) fn conversation_lines(
                             lines.push(Line::from(format!("└ {}", result.output)));
                         }
                     }
+                }
+                if let Some(final_result) = &card.final_result {
+                    lines.push(Line::from(format!("Final result: {final_result}")));
                 }
                 lines.push(Line::default());
             }

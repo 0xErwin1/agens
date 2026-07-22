@@ -10,7 +10,7 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
     BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, TuiSubagentEvent, UiEnvelope,
+    TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentStatus, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -2051,10 +2051,20 @@ where
                         )
                     )
             }
-            _ => matches!(
+            bridge::TuiSubagentUpdate::ToolCall { .. }
+            | bridge::TuiSubagentUpdate::ToolResult { .. } => matches!(
                 execution.state,
                 TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
             ),
+            bridge::TuiSubagentUpdate::Terminal { status, .. } => {
+                status_matches_execution(*status, execution.state)
+                    && self.conversation.as_ref().is_some_and(|conversation| {
+                        conversation
+                            .subagent_cards
+                            .iter()
+                            .any(|card| card.id == event.id && card.status.is_none())
+                    })
+            }
         }
     }
 
@@ -2741,6 +2751,17 @@ where
             presentation.session,
         );
     }
+}
+
+fn status_matches_execution(status: TuiSubagentStatus, state: TuiExecutionState) -> bool {
+    matches!(
+        (status, state),
+        (
+            TuiSubagentStatus::Success,
+            TuiExecutionState::CompletedRecent
+        ) | (TuiSubagentStatus::Failure, TuiExecutionState::Failed)
+            | (TuiSubagentStatus::Cancelled, TuiExecutionState::Cancelled)
+    )
 }
 
 fn palette_matches<'a>(entries: &'a [PaletteEntry], input: &str) -> Vec<&'a PaletteEntry> {

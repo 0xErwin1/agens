@@ -227,6 +227,17 @@ pub(crate) enum TuiSubagentUpdate {
         output: String,
         is_error: bool,
     },
+    Terminal {
+        status: TuiSubagentStatus,
+        final_result: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiSubagentStatus {
+    Success,
+    Failure,
+    Cancelled,
 }
 
 impl TuiSubagentEvent {
@@ -272,6 +283,16 @@ impl TuiSubagentEvent {
                 call_id: sanitize_projection(call_id.as_ref()),
                 output: sanitize_projection(output.as_ref()),
                 is_error,
+            },
+        }
+    }
+
+    pub fn terminal(id: u64, status: TuiSubagentStatus, final_result: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Terminal {
+                status,
+                final_result: sanitize_projection(final_result.as_ref()),
             },
         }
     }

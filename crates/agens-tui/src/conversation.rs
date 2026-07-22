@@ -1,6 +1,6 @@
 //! Typed, lossless source projection for one visible conversation turn.
 
-use crate::{TuiExecutionState, TuiSubagentEvent, bridge::TuiSubagentUpdate};
+use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentStatus, bridge::TuiSubagentUpdate};
 use agens_core::{Message, MessagePart, Role};
 
 /// A source event accepted by the conversation projection.
@@ -92,6 +92,8 @@ pub struct SubagentCard {
     pub task_summary: String,
     pub presentation: TuiExecutionState,
     pub tool_calls: Vec<ToolCall>,
+    pub status: Option<TuiSubagentStatus>,
+    pub final_result: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -349,6 +351,8 @@ impl Conversation {
                     task_summary,
                     presentation,
                     tool_calls: Vec::new(),
+                    status: None,
+                    final_result: None,
                 });
                 self.items.push(ConversationItem::SubagentCard(event.id));
             }
@@ -360,7 +364,7 @@ impl Conversation {
                 if let Some(card) = self
                     .subagent_cards
                     .iter_mut()
-                    .find(|card| card.id == event.id)
+                    .find(|card| card.id == event.id && card.status.is_none())
                     && card.tool_calls.iter().all(|call| call.call_id != call_id)
                 {
                     card.tool_calls.push(ToolCall {
@@ -381,12 +385,28 @@ impl Conversation {
                     .iter_mut()
                     .find(|card| card.id == event.id)
                     .and_then(|card| {
-                        card.tool_calls
+                        card.status
+                            .is_none()
+                            .then_some(card)?
+                            .tool_calls
                             .iter_mut()
                             .find(|call| call.call_id == call_id && call.result.is_none())
                     })
                 {
                     call.result = Some(ToolResult { output, is_error });
+                }
+            }
+            TuiSubagentUpdate::Terminal {
+                status,
+                final_result,
+            } => {
+                if let Some(card) = self
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == event.id && card.status.is_none())
+                {
+                    card.status = Some(status);
+                    card.final_result = Some(final_result);
                 }
             }
             _ => {}

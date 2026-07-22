@@ -4,7 +4,7 @@ use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
+    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentStatus,
 };
 use ratatui::{
     Terminal,
@@ -1217,4 +1217,49 @@ fn p1a1_renderer_collapses_live_tool_uses_and_expands_ordered_details() {
         read < expanded.len() && expanded.contains("read result"),
         "{expanded:?}"
     );
+}
+
+#[test]
+fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 10 },
+    });
+    for event in [
+        TuiSubagentEvent::started(
+            10,
+            "reviewer",
+            "review terminal output",
+            TuiExecutionState::ForegroundRunning,
+        ),
+        TuiSubagentEvent::tool_call(10, "first", "native::read", "first input"),
+        TuiSubagentEvent::tool_result(10, "first", "first result", false),
+        TuiSubagentEvent::tool_call(10, "second", "native::grep", "second input"),
+    ] {
+        apply_subagent(&mut tui, event);
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 10 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(10, TuiSubagentStatus::Success, "terminal result"),
+    );
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let collapsed = rendered_text(&renderer);
+    assert!(collapsed.contains("success"), "{collapsed:?}");
+    assert!(collapsed.contains("terminal result"), "{collapsed:?}");
+    assert!(collapsed.contains("+2 tool uses"), "{collapsed:?}");
+    assert!(!collapsed.contains("first result"), "{collapsed:?}");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(expanded.find("native::read").unwrap() < expanded.find("native::grep").unwrap());
+    assert!(expanded.contains("first result"), "{expanded:?}");
 }
