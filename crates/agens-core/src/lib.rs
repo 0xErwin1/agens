@@ -281,6 +281,29 @@ pub enum TurnEvent {
     ToolResult(MessagePart),
 }
 
+const MAX_RETAINED_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
+fn bound_retained_tool_result(content: String) -> String {
+    if content.len() <= MAX_RETAINED_TOOL_RESULT_BYTES {
+        return content;
+    }
+
+    let mut retained_end = MAX_RETAINED_TOOL_RESULT_BYTES;
+    loop {
+        while !content.is_char_boundary(retained_end) {
+            retained_end -= 1;
+        }
+
+        let omitted_bytes = content.len() - retained_end;
+        let marker = format!("\n… [runtime truncated; {omitted_bytes} bytes omitted]");
+        if retained_end + marker.len() <= MAX_RETAINED_TOOL_RESULT_BYTES {
+            return format!("{}{marker}", &content[..retained_end]);
+        }
+
+        retained_end -= 1;
+    }
+}
+
 /// Observed provider usage values. Unavailable upstream or model metadata remains absent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -659,7 +682,7 @@ impl TurnCoordinator {
         self.events
             .push(TurnEvent::ToolResult(MessagePart::ToolResult {
                 tool_call_id: tool_call_id.into(),
-                content,
+                content: bound_retained_tool_result(content),
                 is_error,
             }));
 
@@ -1916,7 +1939,9 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::PermissionPattern;
+    use super::{
+        CompletedTurnSnapshot, MessagePart, PermissionPattern, TurnCoordinator, TurnEvent,
+    };
 
     #[test]
     fn validated_glob_source_is_available_read_only_for_persistence() {
@@ -1928,5 +1953,92 @@ mod tests {
             PermissionPattern::Exact("native::edit".into()).glob_source(),
             None
         );
+    }
+
+    #[test]
+    fn retained_tool_results_are_utf8_byte_bounded() {
+        const RETAINED_TOOL_RESULT_CAP_BYTES: usize = 64 * 1024;
+
+        let exact = "a".repeat(RETAINED_TOOL_RESULT_CAP_BYTES);
+        let one_byte_over = "b".repeat(RETAINED_TOOL_RESULT_CAP_BYTES + 1);
+        let multibyte = "😀".repeat((RETAINED_TOOL_RESULT_CAP_BYTES / 4) + 1);
+        let repeated = "c".repeat(RETAINED_TOOL_RESULT_CAP_BYTES + 1);
+        let one_byte_over_marker = "\n… [runtime truncated; 43 bytes omitted]";
+        let one_byte_over_expected = format!(
+            "{}{}",
+            "b".repeat(RETAINED_TOOL_RESULT_CAP_BYTES - one_byte_over_marker.len()),
+            one_byte_over_marker
+        );
+        let multibyte_marker = "\n… [runtime truncated; 48 bytes omitted]";
+        let multibyte_expected = format!(
+            "{}{}",
+            "😀".repeat((RETAINED_TOOL_RESULT_CAP_BYTES - multibyte_marker.len()) / 4),
+            multibyte_marker
+        );
+        let mut coordinator = TurnCoordinator::new();
+
+        coordinator.begin().unwrap();
+        for id in ["exact", "one-byte-over", "multibyte", "repeated-error"] {
+            coordinator
+                .accept_provider_part(MessagePart::ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    input: "{}".into(),
+                })
+                .unwrap();
+        }
+        coordinator.finish_provider_iteration().unwrap();
+
+        for (id, content, is_error) in [
+            ("exact", exact.clone(), false),
+            ("one-byte-over", one_byte_over, false),
+            ("multibyte", multibyte, false),
+            ("repeated-error", repeated, true),
+        ] {
+            coordinator
+                .accept_tool_result(id, content, is_error)
+                .unwrap();
+        }
+
+        let retained = coordinator
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error,
+                }) => Some((tool_call_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(retained.len(), 4);
+        assert_eq!(retained[0], ("exact", exact.as_str(), false));
+        assert_eq!(retained[0].1.len(), RETAINED_TOOL_RESULT_CAP_BYTES);
+        assert_eq!(
+            retained[1],
+            ("one-byte-over", one_byte_over_expected.as_str(), false)
+        );
+        assert_eq!(
+            retained[2],
+            ("multibyte", multibyte_expected.as_str(), false)
+        );
+        assert!(retained[3].1.ends_with(one_byte_over_marker));
+        assert!(retained[3].2);
+        assert!(
+            retained
+                .iter()
+                .all(|(_, content, _)| content.len() <= RETAINED_TOOL_RESULT_CAP_BYTES)
+        );
+
+        coordinator
+            .accept_provider_part(MessagePart::Text("complete".into()))
+            .unwrap();
+        coordinator.finish_provider_iteration().unwrap();
+
+        let snapshot =
+            CompletedTurnSnapshot::from_persisted_events(coordinator.events().to_vec()).unwrap();
+        assert_eq!(snapshot.events(), coordinator.events());
     }
 }
