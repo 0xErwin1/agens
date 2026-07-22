@@ -124,11 +124,20 @@ fn cancellation_wins_when_a_remote_error_completes_after_cancellation() {
 
 #[test]
 fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_provider_failures() {
-    for mode in [
-        ServerMode::MalformedFrame,
-        ServerMode::UnterminatedOversizedFrame,
-        ServerMode::OversizedFrame,
-        ServerMode::ErrorBody,
+    for (mode, expected) in [
+        (
+            ServerMode::MalformedFrame,
+            HeadlessTurnPortError::ProviderProtocol,
+        ),
+        (
+            ServerMode::UnterminatedOversizedFrame,
+            HeadlessTurnPortError::ProviderProtocol,
+        ),
+        (
+            ServerMode::OversizedFrame,
+            HeadlessTurnPortError::ProviderProtocol,
+        ),
+        (ServerMode::ErrorBody, HeadlessTurnPortError::ProviderServer),
     ] {
         let server = LocalResponsesServer::start(mode);
         let result = run_provider(
@@ -137,7 +146,65 @@ fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_pr
             Duration::from_secs(1),
         );
 
-        assert_eq!(result, Err(HeadlessTurnPortError::Provider));
+        assert_eq!(result, Err(expected));
+        server.join();
+    }
+}
+
+#[test]
+fn openai_transport_uses_frozen_failure_precedence() {
+    for (status, body, expected) in [
+        (
+            401,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::Authentication,
+        ),
+        (
+            403,
+            r#"{"error":{"type":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::Authentication,
+        ),
+        (
+            429,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::ProviderRateLimited,
+        ),
+        (
+            500,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::ProviderServer,
+        ),
+        (
+            400,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            400,
+            r#"{"error":{"type":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            400,
+            r#"{"error":{"code":"invalid_request"}}"#,
+            HeadlessTurnPortError::ProviderRejected,
+        ),
+        (
+            418,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+    ] {
+        let server = LocalResponsesServer::start_error_response(status, body);
+
+        assert_eq!(
+            run_provider(
+                server.base_url(),
+                HeadlessTurnCancellation::new(),
+                Duration::from_secs(1),
+            ),
+            Err(expected),
+        );
         server.join();
     }
 }
@@ -782,6 +849,37 @@ struct LocalResponsesServer {
 }
 
 impl LocalResponsesServer {
+    fn start_error_response(status: u16, body: &'static str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
+        let address = listener
+            .local_addr()
+            .expect("server address should be available");
+        let (observed_sender, observed_request) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("server should accept one request");
+            read_request(&stream);
+            observed_sender
+                .send(())
+                .expect("test should receive request observation");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .expect("error response should be written");
+        });
+
+        Self {
+            address,
+            observed_request: Some(observed_request),
+            observed_body: None,
+            worker,
+        }
+    }
+
     fn start(mode: ServerMode) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("server should bind");
         let address = listener

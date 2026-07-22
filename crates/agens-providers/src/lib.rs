@@ -345,18 +345,20 @@ impl OpenAiResponsesProvider {
             .header("Accept", "text/event-stream")
             .json(&payload)
             .build()
-            .map_err(|_| HeadlessTurnPortError::Provider)?;
+            .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
         let response = tokio::select! {
             response = self.client.execute(request) => {
                 stop_before_mapping(cancellation)?;
-                response.map_err(|_| HeadlessTurnPortError::Provider)?
+                response.map_err(|_| HeadlessTurnPortError::ProviderNetwork)?
             }
             stop = wait_for_stop(cancellation) => return Err(stop),
         };
 
         stop_before_mapping(cancellation)?;
         if !response.status().is_success() {
-            return Err(HeadlessTurnPortError::Provider);
+            let status = response.status().as_u16();
+            let context_exceeded = read_safe_openai_context_error(response, cancellation).await?;
+            return Err(classify_openai_response_status(status, context_exceeded));
         }
 
         decode_http_response_stream(
@@ -364,11 +366,53 @@ impl OpenAiResponsesProvider {
             cancellation,
             false,
             self.progress.as_ref(),
-            HeadlessTurnPortError::Provider,
+            HeadlessTurnPortError::ProviderProtocol,
             false,
         )
         .await
     }
+}
+
+fn classify_openai_response_status(status: u16, context_exceeded: bool) -> HeadlessTurnPortError {
+    match status {
+        401 | 403 => HeadlessTurnPortError::Authentication,
+        429 => HeadlessTurnPortError::ProviderRateLimited,
+        500..=599 => HeadlessTurnPortError::ProviderServer,
+        400..=499 if context_exceeded => HeadlessTurnPortError::ProviderContext,
+        400..=499 => HeadlessTurnPortError::ProviderRejected,
+        _ => HeadlessTurnPortError::ProviderProtocol,
+    }
+}
+
+async fn read_safe_openai_context_error(
+    mut response: reqwest::Response,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<bool, HeadlessTurnPortError> {
+    let mut body = Vec::new();
+    while body.len() < MAX_CHATGPT_ERROR_BODY_BYTES {
+        let chunk = tokio::select! {
+            chunk = response.chunk() => chunk,
+            stop = wait_for_stop(cancellation) => return Err(stop),
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => return Ok(false),
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_CHATGPT_ERROR_BODY_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    stop_before_mapping(cancellation)?;
+
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return Ok(false);
+    };
+    let error = body.get("error").unwrap_or(&body);
+    Ok(["code", "type"]
+        .into_iter()
+        .any(|field| error.get(field).and_then(Value::as_str) == Some("context_length_exceeded")))
 }
 
 impl ChatGptResponsesProvider {
