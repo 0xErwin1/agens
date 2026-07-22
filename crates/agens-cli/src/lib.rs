@@ -6031,12 +6031,17 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
             .allowed
             .lock()
             .map_err(|_| HeadlessTurnPortError::Tool)
-            .and_then(|mut allowed| allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool));
-        let output = allowed
-            .and_then(|allowed| {
-                if allowed.name != call.name || allowed.input != call.input {
+            .and_then(|mut allowed| {
+                let allowed_call = allowed.get(&call.id).ok_or(HeadlessTurnPortError::Tool)?;
+
+                if allowed_call.name != call.name || allowed_call.input != call.input {
                     return Err(HeadlessTurnPortError::Tool);
                 }
+
+                allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool)
+            });
+        let output = allowed
+            .and_then(|allowed| {
                 self.dispatcher
                     .lock()
                     .map_err(|_| HeadlessTurnPortError::Tool)?
@@ -11100,6 +11105,7 @@ mod tests {
     }
 
     struct BatchTool {
+        name: String,
         calls: Arc<Mutex<Vec<String>>>,
         cancellation: Option<HeadlessTurnCancellation>,
     }
@@ -11109,11 +11115,19 @@ mod tests {
             &self,
             arguments: &serde_json::Value,
         ) -> Result<String, agens_core::Error> {
-            arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| agens_core::Error::Tool("missing path".into()))
+            if arguments
+                .get("_inject_permission_evaluator_failure")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                return Err(agens_core::Error::Tool(
+                    "injected permission evaluator failure".into(),
+                ));
+            }
+
+            NativePermissionTarget::parse(&self.name, arguments)
+                .map(NativePermissionTarget::into_value)
+                .map_err(|error| agens_core::Error::Tool(error.to_string()))
         }
 
         fn execute(
@@ -11138,6 +11152,14 @@ mod tests {
             id: id.into(),
             name: "native::read".into(),
             input: format!(r#"{{"path":"{path}"}}"#),
+        }
+    }
+
+    fn native_batch_call(id: &str, name: &str, arguments: serde_json::Value) -> MessagePart {
+        MessagePart::ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::to_string(&arguments).expect("native test arguments should encode"),
         }
     }
 
@@ -11180,32 +11202,66 @@ mod tests {
         provider_error: Option<HeadlessTurnPortError>,
         fail_persistence: bool,
     ) -> BatchOutcome {
+        run_production_batch_with_policy(
+            directory_name,
+            answers,
+            calls,
+            cancellation,
+            provider_error,
+            fail_persistence,
+            batch_policy(),
+            false,
+        )
+    }
+
+    fn run_production_batch_with_policy(
+        directory_name: &str,
+        answers: Vec<PermissionPromptAnswer>,
+        calls: Vec<MessagePart>,
+        cancellation: Option<HeadlessTurnCancellation>,
+        provider_error: Option<HeadlessTurnPortError>,
+        fail_persistence: bool,
+        policy: PermissionPolicy,
+        bypass: bool,
+    ) -> BatchOutcome {
         let directory =
             std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let executions = Arc::new(Mutex::new(Vec::new()));
         let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
-        dispatcher
-            .lock()
-            .expect("dispatcher should be available")
-            .register_native(
-                "native::read",
-                agens_core::ToolAccess::ReadOnly,
-                BatchTool {
-                    calls: Arc::clone(&executions),
-                    cancellation: cancellation.clone(),
-                },
-            )
-            .expect("batch tool should register");
+        let mut dispatcher_guard = dispatcher.lock().expect("dispatcher should be available");
+        for name in [
+            "native::read",
+            "native::list",
+            "native::glob",
+            "native::grep",
+            "native::webfetch",
+        ] {
+            dispatcher_guard
+                .register_native(
+                    name,
+                    agens_core::ToolAccess::ReadOnly,
+                    BatchTool {
+                        name: name.into(),
+                        calls: Arc::clone(&executions),
+                        cancellation: cancellation.clone(),
+                    },
+                )
+                .expect("batch tool should register");
+        }
+        drop(dispatcher_guard);
         let grants = Arc::new(Mutex::new(Vec::new()));
         let allowed = Arc::new(Mutex::new(BTreeMap::new()));
         let pending_prompts = Arc::new(Mutex::new(BTreeMap::new()));
-        let policy = batch_policy();
         let mut gate = ProductionPermissionGate::new(
             policy.clone(),
             Arc::clone(&grants),
-            PermissionSession::new(),
+            if bypass {
+                PermissionSession::with_temporary_bypass()
+            } else {
+                PermissionSession::new()
+            },
             "project".into(),
             Arc::clone(&dispatcher),
             Arc::clone(&allowed),
@@ -11335,6 +11391,177 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("first", true), ("later", true)]
         );
+    }
+
+    #[test]
+    fn grouped_native_permission_regressions_preserve_native_target_boundaries() {
+        let ask_every_native_tool = || {
+            PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Ask,
+                    PermissionPattern::glob("native::*").expect("native glob should be valid"),
+                    PermissionPattern::Any,
+                )],
+            )
+        };
+        let valid_calls = || {
+            vec![
+                native_batch_call("list", "native::list", serde_json::json!({"path":"src"})),
+                native_batch_call(
+                    "glob",
+                    "native::glob",
+                    serde_json::json!({"pattern":"src/**/*.rs"}),
+                ),
+                native_batch_call(
+                    "grep",
+                    "native::grep",
+                    serde_json::json!({"pattern":"Permission", "path":"src"}),
+                ),
+                native_batch_call(
+                    "webfetch",
+                    "native::webfetch",
+                    serde_json::json!({"url":"https://example.test/docs"}),
+                ),
+            ]
+        };
+
+        let allowed = run_production_batch_with_policy(
+            "grouped-native-allow-always",
+            vec![
+                PermissionPromptAnswer::AllowAlways,
+                PermissionPromptAnswer::AllowAlways,
+                PermissionPromptAnswer::AllowAlways,
+                PermissionPromptAnswer::AllowAlways,
+            ],
+            valid_calls(),
+            None,
+            None,
+            false,
+            ask_every_native_tool(),
+            false,
+        );
+        assert!(allowed.result.is_ok());
+        assert_eq!(
+            allowed.prompts,
+            [
+                "src",
+                "src/**/*.rs",
+                "Permission",
+                "https://example.test/docs"
+            ]
+        );
+        assert_eq!(
+            allowed.executions,
+            [
+                "src",
+                "src/**/*.rs",
+                "Permission",
+                "https://example.test/docs"
+            ]
+        );
+
+        let partial = run_production_batch_with_policy(
+            "grouped-native-partial-grant",
+            vec![
+                PermissionPromptAnswer::AllowAlways,
+                PermissionPromptAnswer::DenyOnce,
+            ],
+            vec![
+                native_batch_call(
+                    "granted",
+                    "native::glob",
+                    serde_json::json!({"pattern":"src/**/*.rs"}),
+                ),
+                native_batch_call(
+                    "sibling",
+                    "native::glob",
+                    serde_json::json!({"pattern":"tests/**/*.rs"}),
+                ),
+            ],
+            None,
+            None,
+            false,
+            ask_every_native_tool(),
+            false,
+        );
+        assert!(partial.result.is_ok());
+        assert_eq!(partial.prompts, ["src/**/*.rs", "tests/**/*.rs"]);
+        assert_eq!(partial.executions, ["src/**/*.rs"]);
+
+        let ask = run_production_batch_with_policy(
+            "grouped-native-ask",
+            vec![PermissionPromptAnswer::Cancel],
+            vec![native_batch_call(
+                "ask",
+                "native::grep",
+                serde_json::json!({"pattern":"TODO", "path":"src"}),
+            )],
+            None,
+            None,
+            false,
+            ask_every_native_tool(),
+            false,
+        );
+        assert_eq!(ask.result, Err(HeadlessTurnError::Cancelled));
+        assert_eq!(ask.prompts, ["TODO"]);
+        assert!(ask.executions.is_empty());
+
+        let deny_policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::webfetch".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let denied = run_production_batch_with_policy(
+            "grouped-native-deny-bypass",
+            vec![PermissionPromptAnswer::AllowAlways],
+            vec![native_batch_call(
+                "denied",
+                "native::webfetch",
+                serde_json::json!({"url":"https://example.test/blocked"}),
+            )],
+            None,
+            None,
+            false,
+            deny_policy,
+            true,
+        );
+        assert!(denied.result.is_ok());
+        assert!(denied.prompts.is_empty());
+        assert!(denied.executions.is_empty());
+
+        for (name, input) in [
+            ("native::list", "{malformed"),
+            ("native::glob", r#"{}"#),
+            ("native::unknown", r#"{"path":"src"}"#),
+            (
+                "native::grep",
+                r#"{"pattern":"TODO","_inject_permission_evaluator_failure":true}"#,
+            ),
+        ] {
+            let invalid = run_production_batch_with_policy(
+                "grouped-native-invalid",
+                Vec::new(),
+                vec![MessagePart::ToolCall {
+                    id: "invalid".into(),
+                    name: name.into(),
+                    input: input.into(),
+                }],
+                None,
+                None,
+                false,
+                ask_every_native_tool(),
+                true,
+            );
+            assert_eq!(invalid.result, Err(HeadlessTurnError::PermissionEvaluation));
+            assert!(invalid.prompts.is_empty());
+            assert!(invalid.executions.is_empty());
+        }
+
+        production_prompt_decisions_authorize_only_allowed_calls();
     }
 
     #[test]
@@ -12770,20 +12997,20 @@ mod tests {
             match answer {
                 PermissionPromptAnswer::AllowOnce | PermissionPromptAnswer::AllowAlways => {
                     assert_eq!(decision, Ok(PermissionDecision::Allow));
-                    assert_eq!(
-                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
-                        Ok(HeadlessToolOutput::success("executed"))
-                    );
-                    assert_eq!(
-                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
-                        Err(HeadlessTurnPortError::Tool)
-                    );
                     let changed_call = HeadlessToolCall {
                         input: r#"{"path":"changed.md"}"#.into(),
                         ..call.clone()
                     };
                     assert_eq!(
                         run_ready(production_dispatcher.dispatch(changed_call, &cancellation)),
+                        Err(HeadlessTurnPortError::Tool)
+                    );
+                    assert_eq!(
+                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
+                        Ok(HeadlessToolOutput::success("executed"))
+                    );
+                    assert_eq!(
+                        run_ready(production_dispatcher.dispatch(call.clone(), &cancellation)),
                         Err(HeadlessTurnPortError::Tool)
                     );
                     if answer == PermissionPromptAnswer::AllowAlways {
