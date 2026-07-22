@@ -1,6 +1,7 @@
 use agens_core::{
-    CompletedSessionTurn, Message, MessagePart, ReasoningEffort, RequestConfig, Role,
-    SessionMetadata,
+    AttemptFinishOutcome, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
+    MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RequestConfig, Role,
+    SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary, SessionMetadata,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -22,6 +23,159 @@ pub struct StoredSession {
 }
 
 impl SessionStore {
+    pub fn begin_session_attempt(
+        &mut self,
+        metadata: &SessionMetadata,
+        retry_prompt: String,
+    ) -> Result<SessionAttemptSummary, BeginSessionAttemptError> {
+        if retry_prompt.is_empty() || retry_prompt.len() > MAX_RETRY_PROMPT_BYTES {
+            return Err(BeginSessionAttemptError::Store);
+        }
+        let mut metadata = metadata.clone();
+        if metadata.id == 0 {
+            metadata.id = 1;
+        }
+        metadata
+            .validate()
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        transaction
+            .execute(
+                "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id, reasoning_effort, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+                params![metadata.id, metadata.project, metadata.title, metadata.active_agent, metadata.provider_id, metadata.model_id, metadata.reasoning_effort.map(ReasoningEffort::as_str), metadata.created_at, metadata.updated_at],
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let running = transaction
+            .query_row(
+                "SELECT id, sequence, started_at FROM session_attempts WHERE session_id = ?1 AND status = 'running'",
+                [metadata.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+            )
+            .optional()
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        if let Some((id, sequence, started_at)) = running {
+            let summary = SessionAttemptSummary::new(
+                AttemptKey::new(metadata.id, id).map_err(|_| BeginSessionAttemptError::Store)?,
+                sequence
+                    .try_into()
+                    .map_err(|_| BeginSessionAttemptError::Store)?,
+                SessionAttemptStatus::Running,
+                None,
+                started_at,
+                None,
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+            return Err(BeginSessionAttemptError::AlreadyRunning(summary));
+        }
+        transaction
+            .execute(
+                "UPDATE session_attempts SET retry_prompt = NULL WHERE session_id = ?1",
+                [metadata.id],
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let sequence = next_sequence(
+            &transaction,
+            &self.database_path,
+            "session_attempts",
+            metadata.id,
+        )
+        .map_err(|_| BeginSessionAttemptError::Store)?;
+        transaction
+            .execute(
+                "INSERT INTO session_attempts(session_id, sequence, status, retry_prompt, started_at)
+                 VALUES (?1, ?2, 'running', ?3, ?4)",
+                params![metadata.id, sequence, retry_prompt, metadata.updated_at],
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let key = AttemptKey::new(metadata.id, transaction.last_insert_rowid())
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let summary = SessionAttemptSummary::new(
+            key,
+            sequence
+                .try_into()
+                .map_err(|_| BeginSessionAttemptError::Store)?,
+            SessionAttemptStatus::Running,
+            None,
+            metadata.updated_at,
+            None,
+        )
+        .map_err(|_| BeginSessionAttemptError::Store)?;
+        transaction
+            .commit()
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        Ok(summary)
+    }
+
+    pub fn finish_session_attempt(
+        &mut self,
+        key: AttemptKey,
+        status: SessionAttemptStatus,
+        finished_at: i64,
+    ) -> Result<AttemptFinishOutcome, SessionStoreError> {
+        let Some(failure_kind) = status.expected_failure_kind() else {
+            return Err(SessionStoreError::operation(
+                "finish session attempt",
+                &self.database_path,
+                "completed attempts require completed history",
+            ));
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "start session attempt finish",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_attempts SET status = ?1, failure_kind = ?2, finished_at = ?3
+             WHERE id = ?4 AND session_id = ?5 AND status = 'running'",
+                params![
+                    attempt_status(status),
+                    attempt_failure_kind(failure_kind),
+                    finished_at,
+                    key.attempt_id(),
+                    key.session_id()
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("finish session attempt", &self.database_path, error)
+            })?;
+        if changed == 1 {
+            transaction
+                .execute(
+                    "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+                    params![finished_at, key.session_id()],
+                )
+                .map_err(|error| {
+                    SessionStoreError::operation(
+                        "update session attempt",
+                        &self.database_path,
+                        error,
+                    )
+                })?;
+        }
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation(
+                "commit session attempt finish",
+                &self.database_path,
+                error,
+            )
+        })?;
+        Ok(if changed == 1 {
+            AttemptFinishOutcome::Finished
+        } else {
+            AttemptFinishOutcome::Stale
+        })
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionStoreError> {
         let mut statement = self
             .connection
@@ -403,6 +557,26 @@ impl SessionStore {
             SessionStoreError::operation("commit session turn", &self.database_path, error)
         })?;
         Ok(persisted_metadata)
+    }
+}
+
+fn attempt_status(status: SessionAttemptStatus) -> &'static str {
+    match status {
+        SessionAttemptStatus::Running => "running",
+        SessionAttemptStatus::Completed => "completed",
+        SessionAttemptStatus::Cancelled => "cancelled",
+        SessionAttemptStatus::Failed => "failed",
+        SessionAttemptStatus::ProviderError => "provider_error",
+        SessionAttemptStatus::Interrupted => "interrupted",
+    }
+}
+
+fn attempt_failure_kind(kind: SessionAttemptFailureKind) -> &'static str {
+    match kind {
+        SessionAttemptFailureKind::Cancelled => "cancelled",
+        SessionAttemptFailureKind::Failed => "failed",
+        SessionAttemptFailureKind::ProviderError => "provider_error",
+        SessionAttemptFailureKind::Interrupted => "interrupted",
     }
 }
 

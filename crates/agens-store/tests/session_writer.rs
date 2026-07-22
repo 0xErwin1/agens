@@ -4,8 +4,8 @@ use std::{
 };
 
 use agens_core::{
-    CompletedSessionTurn, Message, MessagePart, ReasoningEffort, Role, SessionMessage,
-    SessionMetadata,
+    AttemptFinishOutcome, CompletedSessionTurn, Message, MessagePart, ReasoningEffort, Role,
+    SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
 use agens_store::SessionStore;
 use rusqlite::Connection;
@@ -45,6 +45,60 @@ fn normalized_counts(connection: &Connection) -> (i64, i64, i64, i64) {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .unwrap()
+}
+
+#[test]
+fn attempt_begin_and_finish_are_targeted_cas_transactions() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 7,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+
+    let attempt = store
+        .begin_session_attempt(&metadata, "retry".into())
+        .unwrap();
+    assert!(
+        store
+            .begin_session_attempt(&metadata, "again".into())
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 21)
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+    assert_eq!(
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 22)
+            .unwrap(),
+        AttemptFinishOutcome::Stale
+    );
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 0, 0, 0));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, failure_kind FROM session_attempts WHERE id = ?1",
+                [attempt.key().attempt_id()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        ("failed".into(), "failed".into())
+    );
+
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
