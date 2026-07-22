@@ -108,13 +108,9 @@ enum ChatGptResponseError {
     Other(HeadlessTurnPortError),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SafeRemoteError {
-    InvalidRequest,
-    Authentication,
-    Permission,
-    RateLimit,
-    Server,
+    ContextLengthExceeded,
 }
 
 impl ChatGptResponseError {
@@ -583,11 +579,11 @@ impl ChatGptResponsesProvider {
             .header("session-id", &self.session_id)
             .json(&payload)
             .build()
-            .map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::Provider))?;
+            .map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::ProviderProtocol))?;
         let response = tokio::select! {
             response = self.client.execute(request) => {
                 stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
-                response.map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::Provider))?
+                response.map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::ProviderNetwork))?
             }
             stop = wait_for_stop(cancellation) => return Err(ChatGptResponseError::Other(stop)),
         };
@@ -595,13 +591,16 @@ impl ChatGptResponsesProvider {
         stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            let _metadata = read_safe_chatgpt_error(response, cancellation)
+            let safe_error = read_safe_chatgpt_error(response, cancellation)
                 .await
                 .map_err(ChatGptResponseError::Other)?;
             return Err(match status {
                 401 | 403 => ChatGptResponseError::Authentication(status),
                 429 => ChatGptResponseError::RateLimited,
                 500..=599 => ChatGptResponseError::Server,
+                400..=499 if safe_error == Some(SafeRemoteError::ContextLengthExceeded) => {
+                    ChatGptResponseError::Other(HeadlessTurnPortError::ProviderContext)
+                }
                 400..=499 => ChatGptResponseError::Rejected,
                 _ => ChatGptResponseError::Protocol,
             });
@@ -1299,15 +1298,7 @@ async fn read_safe_chatgpt_error(
 
 fn safe_remote_error(value: &str) -> Option<SafeRemoteError> {
     match value {
-        "invalid_request" | "invalid_request_error" | "context_length_exceeded" => {
-            Some(SafeRemoteError::InvalidRequest)
-        }
-        "authentication_error" | "invalid_api_key" => Some(SafeRemoteError::Authentication),
-        "permission_error" => Some(SafeRemoteError::Permission),
-        "rate_limit_error" | "rate_limit_exceeded" | "insufficient_quota" => {
-            Some(SafeRemoteError::RateLimit)
-        }
-        "server_error" => Some(SafeRemoteError::Server),
+        "context_length_exceeded" => Some(SafeRemoteError::ContextLengthExceeded),
         _ => None,
     }
 }

@@ -281,6 +281,40 @@ fn subscription_transport_sanitizes_structured_error_bodies() {
 }
 
 #[test]
+fn chatgpt_context_allowlist_is_exact_bounded_and_disposed() {
+    for (body, expected) in [
+        (
+            r#"{"error":{"code":"context_length_exceeded","message":"SENTINEL_REMOTE_ERROR_BODY"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"type":"context_length_exceeded","message":"SENTINEL_REMOTE_ERROR_BODY"}}"#,
+            HeadlessTurnPortError::ProviderContext,
+        ),
+        (
+            r#"{"error":{"code":"context_length_exceeded_extra","message":"SENTINEL_REMOTE_ERROR_BODY"}}"#,
+            HeadlessTurnPortError::ProviderRejected,
+        ),
+        (
+            r#"{"error":{"message":"context_length_exceeded SENTINEL_REMOTE_ERROR_BODY"}}"#,
+            HeadlessTurnPortError::ProviderRejected,
+        ),
+    ] {
+        let directory = temporary_directory("context-allowlist");
+        let credentials = write_credentials(&directory);
+        let server = ScriptedServer::start(vec![ScriptedResponse::Json(400, body.to_owned())]);
+        let mut provider = subscription_provider(&credentials, &server);
+
+        let result = run(&mut provider, HeadlessTurnCancellation::new());
+        assert_eq!(result, Err(expected));
+        assert!(!format!("{result:?}").contains(SECRET_BODY_SENTINEL));
+
+        assert_eq!(server.join().len(), 1);
+        fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+}
+
+#[test]
 fn subscription_transport_bounds_error_bodies_before_an_open_connection() {
     let directory = temporary_directory("bounded-error");
     let credentials = write_credentials(&directory);
