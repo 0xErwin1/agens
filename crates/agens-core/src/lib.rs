@@ -153,6 +153,208 @@ pub enum CompletedSessionTurnError {
     InvalidMessageOrder,
 }
 
+pub const MAX_RETRY_PROMPT_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAttemptStatus {
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+    ProviderError,
+    Interrupted,
+}
+
+impl SessionAttemptStatus {
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+
+    pub const fn expected_failure_kind(self) -> Option<SessionAttemptFailureKind> {
+        match self {
+            Self::Running | Self::Completed => None,
+            Self::Cancelled => Some(SessionAttemptFailureKind::Cancelled),
+            Self::Failed => Some(SessionAttemptFailureKind::Failed),
+            Self::ProviderError => Some(SessionAttemptFailureKind::ProviderError),
+            Self::Interrupted => Some(SessionAttemptFailureKind::Interrupted),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAttemptFailureKind {
+    Cancelled,
+    Failed,
+    ProviderError,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttemptKey {
+    session_id: i64,
+    attempt_id: i64,
+}
+
+impl AttemptKey {
+    pub fn new(session_id: i64, attempt_id: i64) -> Result<Self, AttemptKeyError> {
+        if session_id <= 0 {
+            return Err(AttemptKeyError::InvalidSessionId);
+        }
+
+        if attempt_id <= 0 {
+            return Err(AttemptKeyError::InvalidAttemptId);
+        }
+
+        Ok(Self {
+            session_id,
+            attempt_id,
+        })
+    }
+
+    pub const fn session_id(self) -> i64 {
+        self.session_id
+    }
+
+    pub const fn attempt_id(self) -> i64 {
+        self.attempt_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptKeyError {
+    InvalidSessionId,
+    InvalidAttemptId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionAttemptSummary {
+    key: AttemptKey,
+    sequence: u64,
+    status: SessionAttemptStatus,
+    failure_kind: Option<SessionAttemptFailureKind>,
+    started_at: i64,
+    finished_at: Option<i64>,
+}
+
+impl SessionAttemptSummary {
+    pub fn new(
+        key: AttemptKey,
+        sequence: u64,
+        status: SessionAttemptStatus,
+        failure_kind: Option<SessionAttemptFailureKind>,
+        started_at: i64,
+        finished_at: Option<i64>,
+    ) -> Result<Self, SessionAttemptSummaryError> {
+        if sequence == 0 {
+            return Err(SessionAttemptSummaryError::InvalidSequence);
+        }
+
+        if status.is_terminal() != finished_at.is_some() {
+            return Err(SessionAttemptSummaryError::InvalidTerminalTimestamp);
+        }
+
+        if status.expected_failure_kind() != failure_kind {
+            return Err(SessionAttemptSummaryError::InvalidStatusCategory);
+        }
+
+        Ok(Self {
+            key,
+            sequence,
+            status,
+            failure_kind,
+            started_at,
+            finished_at,
+        })
+    }
+
+    pub const fn key(&self) -> AttemptKey {
+        self.key
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn status(&self) -> SessionAttemptStatus {
+        self.status
+    }
+
+    pub const fn failure_kind(&self) -> Option<SessionAttemptFailureKind> {
+        self.failure_kind
+    }
+
+    pub const fn started_at(&self) -> i64 {
+        self.started_at
+    }
+
+    pub const fn finished_at(&self) -> Option<i64> {
+        self.finished_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionAttemptSummaryError {
+    InvalidSequence,
+    InvalidTerminalTimestamp,
+    InvalidStatusCategory,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RetryBoundary {
+    key: AttemptKey,
+    prompt: String,
+}
+
+impl RetryBoundary {
+    pub fn new(key: AttemptKey, prompt: String) -> Result<Self, RetryBoundaryError> {
+        if prompt.is_empty() || prompt.len() > MAX_RETRY_PROMPT_BYTES {
+            return Err(RetryBoundaryError::InvalidPrompt);
+        }
+
+        Ok(Self { key, prompt })
+    }
+
+    pub const fn key(&self) -> AttemptKey {
+        self.key
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryBoundaryError {
+    InvalidPrompt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BeginSessionAttemptError {
+    AlreadyRunning(SessionAttemptSummary),
+    Store,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptFinishOutcome {
+    Finished,
+    Stale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    Recovered(SessionAttemptSummary),
+    Stale,
+}
+
+impl RecoveryOutcome {
+    pub fn summary(&self) -> Option<&SessionAttemptSummary> {
+        match self {
+            Self::Recovered(summary) => Some(summary),
+            Self::Stale => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionMetadata {
     pub id: i64,
@@ -1952,8 +2154,65 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedTurnSnapshot, MessagePart, PermissionPattern, TurnCoordinator, TurnEvent,
+        AttemptKey, CompletedTurnSnapshot, MessagePart, PermissionPattern, RecoveryOutcome,
+        RetryBoundary, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary,
+        TurnCoordinator, TurnEvent,
     };
+
+    #[test]
+    fn session_attempt_domain_rejects_invalid_status_category_and_recovery_shapes() {
+        assert!(
+            SessionAttemptSummary::new(
+                AttemptKey::new(1, 1).unwrap(),
+                1,
+                SessionAttemptStatus::Running,
+                None,
+                10,
+                None,
+            )
+            .is_ok()
+        );
+        assert!(
+            SessionAttemptSummary::new(
+                AttemptKey::new(1, 1).unwrap(),
+                1,
+                SessionAttemptStatus::Running,
+                Some(SessionAttemptFailureKind::Failed),
+                10,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            SessionAttemptSummary::new(
+                AttemptKey::new(1, 1).unwrap(),
+                1,
+                SessionAttemptStatus::ProviderError,
+                Some(SessionAttemptFailureKind::Failed),
+                10,
+                Some(11),
+            )
+            .is_err()
+        );
+
+        let interrupted = SessionAttemptSummary::new(
+            AttemptKey::new(1, 2).unwrap(),
+            2,
+            SessionAttemptStatus::Interrupted,
+            Some(SessionAttemptFailureKind::Interrupted),
+            10,
+            Some(11),
+        )
+        .unwrap();
+        assert_eq!(
+            RecoveryOutcome::Recovered(interrupted.clone()).summary(),
+            Some(&interrupted)
+        );
+        assert_eq!(RecoveryOutcome::Stale.summary(), None);
+
+        assert!(RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), "retry".into()).is_ok());
+        assert!(RetryBoundary::new(AttemptKey::new(1, 2).unwrap(), String::new()).is_err());
+    }
 
     #[test]
     fn validated_glob_source_is_available_read_only_for_persistence() {
