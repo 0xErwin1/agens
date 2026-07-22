@@ -201,6 +201,113 @@ pub enum TuiRuntimeEvent {
         agent: String,
         event: TuiExecutionEvent,
     },
+    SubagentExecution(TuiSubagentEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiSubagentTerminal {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiSubagentEvent {
+    pub(crate) id: u64,
+    pub(crate) update: TuiSubagentUpdate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TuiSubagentUpdate {
+    Started {
+        agent: String,
+        task_summary: String,
+        presentation: TuiExecutionState,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        call_id: String,
+        output: String,
+        is_error: bool,
+    },
+    Terminal(TuiSubagentTerminal),
+}
+
+impl TuiSubagentEvent {
+    pub fn started(
+        id: u64,
+        agent: impl AsRef<str>,
+        task_summary: impl AsRef<str>,
+        presentation: TuiExecutionState,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Started {
+                agent: sanitize_projection(agent.as_ref()),
+                task_summary: sanitize_projection(task_summary.as_ref()),
+                presentation,
+            },
+        }
+    }
+    pub fn tool_call(
+        id: u64,
+        call_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+        input: impl AsRef<str>,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::ToolCall {
+                call_id: sanitize_projection(call_id.as_ref()),
+                name: sanitize_projection(name.as_ref()),
+                input: sanitize_projection(input.as_ref()),
+            },
+        }
+    }
+    pub fn tool_result(
+        id: u64,
+        call_id: impl AsRef<str>,
+        output: impl AsRef<str>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::ToolResult {
+                call_id: sanitize_projection(call_id.as_ref()),
+                output: sanitize_projection(output.as_ref()),
+                is_error,
+            },
+        }
+    }
+    pub const fn terminal(id: u64, terminal: TuiSubagentTerminal) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Terminal(terminal),
+        }
+    }
+}
+
+fn sanitize_projection(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "prompt:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        "[redacted]".into()
+    } else {
+        value.chars().take(256).collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

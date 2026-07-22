@@ -10,11 +10,11 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
     BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, UiEnvelope,
+    TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentTerminal, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
-    ToolBatch, ToolCall, ToolResult,
+    SubagentCard, ToolBatch, ToolCall, ToolResult,
 };
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
@@ -1883,6 +1883,17 @@ where
                     self.set_running(false);
                 }
             }
+            TuiRuntimeEvent::SubagentExecution(event) => {
+                if self.subagent_event_matches_execution(event) {
+                    self.conversation
+                        .get_or_insert_with(|| Conversation::new(String::new()))
+                        .apply_subagent(event.clone());
+                    if matches!(&event.update, bridge::TuiSubagentUpdate::Terminal(_)) {
+                        self.collapsed_tool_outputs
+                            .insert(format!("subagent:{}", event.id));
+                    }
+                }
+            }
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
@@ -1993,6 +2004,16 @@ where
         if !matches!(state, TuiExecutionState::BackgroundRunning) {
             execution.terminal_at = Some(self.now);
         }
+        if state == TuiExecutionState::BackgroundRunning
+            && let Some(card) = self.conversation.as_mut().and_then(|conversation| {
+                conversation
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == id)
+            })
+        {
+            card.presentation = TuiExecutionState::BackgroundRunning;
+        }
     }
 
     fn add_execution(&mut self, agent: &str, id: u64, state: TuiExecutionState) {
@@ -2006,6 +2027,44 @@ where
             last_activity: self.now,
             terminal_at: None,
         });
+    }
+
+    fn subagent_event_matches_execution(&self, event: &TuiSubagentEvent) -> bool {
+        let Some(execution) = self
+            .executions
+            .iter()
+            .find(|execution| execution.id == event.id)
+        else {
+            return false;
+        };
+        match &event.update {
+            bridge::TuiSubagentUpdate::Started {
+                agent,
+                presentation,
+                ..
+            } => {
+                execution.agent == *agent
+                    && matches!(
+                        (execution.state, presentation),
+                        (
+                            TuiExecutionState::ForegroundRunning,
+                            TuiExecutionState::ForegroundRunning
+                        ) | (
+                            TuiExecutionState::BackgroundRunning,
+                            TuiExecutionState::BackgroundRunning
+                        )
+                    )
+            }
+            bridge::TuiSubagentUpdate::Terminal(terminal) => matches!(
+                (execution.state, terminal),
+                (
+                    TuiExecutionState::CompletedRecent,
+                    TuiSubagentTerminal::Success
+                ) | (TuiExecutionState::Failed, TuiSubagentTerminal::Failure)
+                    | (TuiExecutionState::Cancelled, TuiSubagentTerminal::Cancelled)
+            ),
+            _ => true,
+        }
     }
 
     pub const fn following_bottom(&self) -> bool {
@@ -2633,6 +2692,13 @@ where
             .flat_map(|batch| &batch.calls)
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
+            .chain(
+                self.conversation
+                    .iter()
+                    .flat_map(|conversation| conversation.subagent_cards.iter())
+                    .filter(|card| card.terminal.is_some() && !card.tool_calls.is_empty())
+                    .map(|card| format!("subagent:{}", card.id)),
+            )
             .collect::<Vec<_>>();
 
         if completed_call_ids.is_empty() {

@@ -109,6 +109,41 @@ pub(super) fn conversation_lines(
                 )));
                 lines.push(Line::default());
             }
+            ConversationItem::SubagentCard(id) => {
+                let Some(card) = conversation
+                    .subagent_cards
+                    .iter()
+                    .find(|card| card.id == *id)
+                else {
+                    continue;
+                };
+                let status = match card.terminal {
+                    Some(crate::TuiSubagentTerminal::Success) => "completed",
+                    Some(crate::TuiSubagentTerminal::Failure) => "failed",
+                    Some(crate::TuiSubagentTerminal::Cancelled) => "cancelled",
+                    None => match card.presentation {
+                        crate::TuiExecutionState::ForegroundRunning => "foreground running",
+                        crate::TuiExecutionState::BackgroundRunning => "background running",
+                        _ => "running",
+                    },
+                };
+                lines.push(Line::from(format!(
+                    "Subagent {} · {status} · {}",
+                    card.agent, card.task_summary
+                )));
+                let marker = format!("subagent:{}", card.id);
+                if card.terminal.is_some() && collapsed_tool_outputs.contains(&marker) {
+                    lines.push(Line::from(format!("+{} tool uses", card.tool_calls.len())));
+                } else {
+                    for call in &card.tool_calls {
+                        lines.push(Line::from(format!("┌ {} · {}", call.name, call.call_id)));
+                        if let Some(result) = &call.result {
+                            lines.push(Line::from(format!("└ {}", result.output)));
+                        }
+                    }
+                }
+                lines.push(Line::default());
+            }
         }
     }
     lines
@@ -189,7 +224,8 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::ToolStarted { .. }
             | TuiRuntimeEvent::ToolEnded { .. }
             | TuiRuntimeEvent::Diff { .. }
-            | TuiRuntimeEvent::TaskExecution { .. } => {}
+            | TuiRuntimeEvent::TaskExecution { .. }
+            | TuiRuntimeEvent::SubagentExecution(_) => {}
         }
     }
 

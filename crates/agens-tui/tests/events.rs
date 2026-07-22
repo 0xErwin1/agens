@@ -3,8 +3,9 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, Tui, TuiExecutionEvent, TuiPermissionBridge, TuiPermissionReply,
-    TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent, TuiSubmissionOutcome,
+    TranscriptEntry, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
+    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
+    TuiSubagentEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -745,6 +746,21 @@ fn u15_c1b_sorts_reexecutions_newest_first_with_execution_id_ties() {
         [3, 2, 1]
     );
     assert_eq!(tui.agent_catalog(), ["main", "reviewer"]);
+}
+
+#[test]
+fn p1a_events_ignore_cards_without_a_matching_c1_execution() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "prompt: SENTINEL",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    ));
+
+    assert!(tui.view().conversation.is_none());
 }
 
 #[test]

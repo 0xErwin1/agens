@@ -4,7 +4,7 @@ use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
-    TuiExecutionEvent, TuiRuntimeEvent,
+    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentTerminal,
 };
 use ratatui::{
     Terminal,
@@ -28,6 +28,10 @@ fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+fn apply_subagent(tui: &mut Tui<FakeEngine>, event: TuiSubagentEvent) {
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(event));
 }
 
 fn cell_for_text<'a>(
@@ -1161,4 +1165,59 @@ fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
     assert!(text.contains("writer · background running"), "{text:?}");
     assert!(text.contains("tester · completed recent"), "{text:?}");
     assert!(text.contains("triage · failed"), "{text:?}");
+}
+
+#[test]
+fn p1a_renderer_collapses_completed_tool_uses_and_expands_ordered_details() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 9 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(
+            9,
+            "reviewer",
+            "review the rendering",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    );
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::tool_call(9, "read", "native::read", "bounded input"),
+    );
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::tool_result(9, "read", "read result", false),
+    );
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 9 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(9, TuiSubagentTerminal::Success),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let collapsed = rendered_text(&renderer);
+    assert!(
+        collapsed.contains("reviewer")
+            && collapsed.contains("completed")
+            && collapsed.contains("review the rendering")
+            && collapsed.contains("+1 tool uses"),
+        "{collapsed:?}"
+    );
+    assert!(!collapsed.contains("read result"), "{collapsed:?}");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    let read = expanded.find("native::read").unwrap();
+    assert!(
+        read < expanded.len() && expanded.contains("read result"),
+        "{expanded:?}"
+    );
 }

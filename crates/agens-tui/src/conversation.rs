@@ -1,5 +1,6 @@
 //! Typed, lossless source projection for one visible conversation turn.
 
+use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentTerminal, bridge::TuiSubagentUpdate};
 use agens_core::{Message, MessagePart, Role};
 
 /// A source event accepted by the conversation projection.
@@ -85,6 +86,16 @@ pub struct ToolBatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentCard {
+    pub id: u64,
+    pub agent: String,
+    pub task_summary: String,
+    pub presentation: TuiExecutionState,
+    pub terminal: Option<TuiSubagentTerminal>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationError {
     OrphanToolResult(String),
     DuplicateToolCall(String),
@@ -111,6 +122,7 @@ pub(super) enum ConversationItem {
     },
     Diff(Vec<DiffLine>),
     Error(ActionableError),
+    SubagentCard(u64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +135,7 @@ pub struct Conversation {
     pub tool_batches: Vec<ToolBatch>,
     pub diffs: Vec<DiffLine>,
     pub errors: Vec<ActionableError>,
+    pub subagent_cards: Vec<SubagentCard>,
     pub(super) items: Vec<ConversationItem>,
     last_was_tool_call: bool,
 }
@@ -143,6 +156,7 @@ impl Conversation {
             tool_batches: Vec::new(),
             diffs: Vec::new(),
             errors: Vec::new(),
+            subagent_cards: Vec::new(),
             last_was_tool_call: false,
         }
     }
@@ -322,6 +336,72 @@ impl Conversation {
         }
         self.last_was_tool_call = is_tool_call;
         Ok(())
+    }
+    pub(crate) fn apply_subagent(&mut self, event: TuiSubagentEvent) {
+        match event.update {
+            TuiSubagentUpdate::Started {
+                agent,
+                task_summary,
+                presentation,
+            } if self.subagent_cards.iter().all(|card| card.id != event.id) => {
+                self.subagent_cards.push(SubagentCard {
+                    id: event.id,
+                    agent,
+                    task_summary,
+                    presentation,
+                    terminal: None,
+                    tool_calls: Vec::new(),
+                });
+                self.items.push(ConversationItem::SubagentCard(event.id));
+            }
+            TuiSubagentUpdate::ToolCall {
+                call_id,
+                name,
+                input,
+            } => {
+                if let Some(card) = self
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == event.id && card.terminal.is_none())
+                    && card.tool_calls.iter().all(|call| call.call_id != call_id)
+                {
+                    card.tool_calls.push(ToolCall {
+                        call_id,
+                        name,
+                        input,
+                        result: None,
+                    });
+                }
+            }
+            TuiSubagentUpdate::ToolResult {
+                call_id,
+                output,
+                is_error,
+            } => {
+                if let Some(call) = self
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == event.id && card.terminal.is_none())
+                    .and_then(|card| {
+                        card.tool_calls
+                            .iter_mut()
+                            .find(|call| call.call_id == call_id && call.result.is_none())
+                    })
+                {
+                    call.result = Some(ToolResult { output, is_error });
+                }
+            }
+            TuiSubagentUpdate::Terminal(terminal) => {
+                if let Some(card) = self
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == event.id && card.terminal.is_none())
+                {
+                    card.terminal = Some(terminal);
+                }
+            }
+            _ => {}
+        }
     }
     fn find_call(&self, call_id: &str) -> Option<&ToolCall> {
         self.tool_batches
