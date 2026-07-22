@@ -45,8 +45,9 @@ use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
     Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiExecutionEvent,
     TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiPresentation,
-    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubagentEvent,
-    TuiSubagentStatus, TuiSubmissionOutcome, run_with_default_progress_submit_with_permissions,
+    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubagentErrorKind,
+    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    run_with_default_progress_submit_with_permissions,
 };
 
 mod chatgpt_auth;
@@ -4641,10 +4642,18 @@ struct ProductionTaskRunner {
     probe: Option<ProductionTaskProbe>,
     #[cfg(test)]
     progress_probe: Option<Vec<TurnEvent>>,
+    #[cfg(test)]
+    failure_probe: Option<TestTaskFailure>,
 }
 
 #[cfg(test)]
 type ProductionTaskProbe = Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>;
+
+#[cfg(test)]
+struct TestTaskFailure {
+    error: ChildRunError,
+    _source_detail: String,
+}
 
 #[derive(Clone, Default)]
 struct TuiTaskControls(Arc<Mutex<BTreeMap<u64, TaskExecutionLifecycle>>>);
@@ -4876,6 +4885,8 @@ impl ProductionTaskRunner {
             probe: None,
             #[cfg(test)]
             progress_probe: None,
+            #[cfg(test)]
+            failure_probe: None,
         }
     }
 
@@ -4891,6 +4902,7 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             probe: Some(probe),
             progress_probe: None,
+            failure_probe: None,
         }
     }
 
@@ -4907,6 +4919,27 @@ impl ProductionTaskRunner {
             lifecycle_bridge: None,
             probe: Some(probe),
             progress_probe: Some(progress),
+            failure_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_failure_probe(
+        bootstrap: Bootstrap,
+        project_root: PathBuf,
+        error: ChildRunError,
+        source_detail: &str,
+    ) -> Self {
+        Self {
+            bootstrap,
+            project_root,
+            lifecycle_bridge: None,
+            probe: None,
+            progress_probe: None,
+            failure_probe: Some(TestTaskFailure {
+                error,
+                _source_detail: source_detail.into(),
+            }),
         }
     }
 }
@@ -4987,6 +5020,21 @@ impl TaskRunner for ProductionTaskRunner {
                     as TurnProgressSink
             },
         );
+        #[cfg(test)]
+        let result = self
+            .failure_probe
+            .as_ref()
+            .map(|failure| Err(failure.error))
+            .unwrap_or_else(|| {
+                run_production_task(
+                    request,
+                    &self.bootstrap,
+                    &self.project_root,
+                    &cancellation,
+                    progress.as_ref(),
+                )
+            });
+        #[cfg(not(test))]
         let result = run_production_task(
             request,
             &self.bootstrap,
@@ -4994,6 +5042,16 @@ impl TaskRunner for ProductionTaskRunner {
             &cancellation,
             progress.as_ref(),
         );
+        if let (Some(lifecycle_bridge), Some(execution), Err(error)) =
+            (&self.lifecycle_bridge, context.execution(), &result)
+            && let Some(kind) = error.tui_kind()
+        {
+            lifecycle_bridge.publish(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                execution.id().value(),
+                kind,
+            )));
+        }
+        let result = result.map_err(ChildRunError::task_runner_error);
         if let (Some(lifecycle_bridge), Some(execution)) =
             (&self.lifecycle_bridge, context.execution())
         {
@@ -5009,6 +5067,7 @@ impl TaskRunner for ProductionTaskRunner {
     }
 }
 
+#[cfg(test)]
 fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
     match error {
         HeadlessTurnError::Cancelled => TaskRunnerError::Cancelled,
@@ -5023,13 +5082,59 @@ fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ChildRunError {
+    Cancelled,
+    TimedOut,
+    Provider,
+    Tool,
+    IterationLimit,
+    Runtime,
+}
+
+impl ChildRunError {
+    const fn tui_kind(self) -> Option<TuiSubagentErrorKind> {
+        match self {
+            Self::Cancelled | Self::TimedOut => None,
+            Self::Provider => Some(TuiSubagentErrorKind::Provider),
+            Self::Tool => Some(TuiSubagentErrorKind::Tool),
+            Self::IterationLimit | Self::Runtime => Some(TuiSubagentErrorKind::Runtime),
+        }
+    }
+
+    const fn task_runner_error(self) -> TaskRunnerError {
+        match self {
+            Self::Cancelled => TaskRunnerError::Cancelled,
+            Self::TimedOut => TaskRunnerError::TimedOut,
+            Self::Provider => TaskRunnerError::ProviderFailure,
+            Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
+            Self::IterationLimit => TaskRunnerError::IterationLimit,
+        }
+    }
+}
+
+fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
+    match error {
+        HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
+        HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
+        HeadlessTurnError::Provider
+        | HeadlessTurnError::ProviderRejected
+        | HeadlessTurnError::ProviderRateLimited
+        | HeadlessTurnError::ProviderServer
+        | HeadlessTurnError::ProviderProtocol => ChildRunError::Provider,
+        HeadlessTurnError::Tool => ChildRunError::Tool,
+        HeadlessTurnError::MaxIterations => ChildRunError::IterationLimit,
+        _ => ChildRunError::Runtime,
+    }
+}
+
 fn run_production_task(
     request: TaskTurnRequest,
     bootstrap: &Bootstrap,
     project_root: &Path,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-) -> Result<String, TaskRunnerError> {
+) -> Result<String, ChildRunError> {
     let messages = vec![
         Message {
             role: Role::System,
@@ -5040,15 +5145,15 @@ fn run_production_task(
             parts: vec![MessagePart::Text(request.description().to_owned())],
         },
     ];
-    let (provider_tools, tool_runtime) = production_read_only_tool_runtime(project_root)
-        .map_err(|_| TaskRunnerError::ChildFailure)?;
+    let (provider_tools, tool_runtime) =
+        production_read_only_tool_runtime(project_root).map_err(|_| ChildRunError::Runtime)?;
 
     match bootstrap.provider_type() {
         Some("openai-api") => {
             let api_key = bootstrap
                 .openai_api_key
                 .clone()
-                .ok_or(TaskRunnerError::ChildFailure)?;
+                .ok_or(ChildRunError::Runtime)?;
             let provider =
                 OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                     api_key,
@@ -5059,7 +5164,7 @@ fn run_production_task(
                     std::time::Duration::from_secs(120),
                 )
                 .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
-                .map_err(|_| TaskRunnerError::ChildFailure)?;
+                .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(provider, tool_runtime, project_root, cancellation, progress)
         }
         Some("openai-chatgpt") => {
@@ -5074,10 +5179,10 @@ fn run_production_task(
                 std::time::Duration::from_secs(120),
             )
             .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
-            .map_err(|_| TaskRunnerError::ChildFailure)?;
+            .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(provider, tool_runtime, project_root, cancellation, progress)
         }
-        _ => Err(TaskRunnerError::ChildFailure),
+        _ => Err(ChildRunError::Runtime),
     }
 }
 
@@ -5096,7 +5201,7 @@ fn run_isolated_task_turn<P>(
     project_root: &Path,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-) -> Result<String, TaskRunnerError>
+) -> Result<String, ChildRunError>
 where
     P: ProgressAwareProvider,
 {
@@ -5135,8 +5240,8 @@ where
         16,
         progress,
     ))
-    .map_err(|_| TaskRunnerError::ChildFailure)?
-    .map_err(map_task_turn_error)?;
+    .map_err(|_| ChildRunError::Runtime)?
+    .map_err(child_run_error)?;
 
     Ok(snapshot
         .events()
@@ -11892,6 +11997,156 @@ mod tests {
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn production_runner_error_publication_orders_sanitized_typed_failure_before_terminal() {
+        for (
+            source,
+            expected_error,
+            expected_kind,
+            expected_execution,
+            expected_status,
+            expected_result,
+        ) in [
+            (
+                ChildRunError::Provider,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Provider),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Tool,
+                TaskRunnerError::ChildFailure,
+                Some(TuiSubagentErrorKind::Tool),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Runtime,
+                TaskRunnerError::ChildFailure,
+                Some(TuiSubagentErrorKind::Runtime),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Cancelled,
+                TaskRunnerError::Cancelled,
+                None,
+                TuiExecutionEvent::Cancelled { id: 1 },
+                TuiSubagentStatus::Cancelled,
+                "cancelled",
+            ),
+            (
+                ChildRunError::TimedOut,
+                TaskRunnerError::TimedOut,
+                None,
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+        ] {
+            let temporary = tui_session_directory("runner-error-publication");
+            let bootstrap = tui_session_bootstrap(
+                &temporary,
+                &[(
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                )],
+            );
+            let (events, receiver) = BridgeTx::bounded(8);
+            let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default());
+            let mut runtime = production_tui_task_runtime_with_runner(
+                &bootstrap,
+                &SkillCatalog::default(),
+                production_tui_permission_bridge().0,
+                ProductionTaskRunner::with_failure_probe(
+                    bootstrap.clone(),
+                    bootstrap.project_root().unwrap().to_path_buf(),
+                    source,
+                    "provider-token=super-secret-error-detail",
+                )
+                .with_lifecycle_bridge(lifecycle_bridge),
+            )
+            .unwrap();
+            runtime.authorized.gate.policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            );
+            let session = Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }));
+
+            assert_eq!(
+                launch_selected_tui_task(
+                    &mut runtime,
+                    &session,
+                    "review task",
+                    false,
+                    &HeadlessTurnCancellation::new(),
+                ),
+                Err(CliError::runtime(HeadlessTurnError::Tool))
+            );
+
+            let mut expected = vec![
+                TuiRuntimeEvent::TaskExecution {
+                    agent: "reviewer".into(),
+                    event: TuiExecutionEvent::ForegroundStarted { id: 1 },
+                },
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+                    1,
+                    "reviewer",
+                    "review task",
+                    agens_tui::TuiExecutionState::ForegroundRunning,
+                )),
+            ];
+            if let Some(kind) = expected_kind {
+                expected.push(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                    1, kind,
+                )));
+            }
+            expected.push(TuiRuntimeEvent::TaskExecution {
+                agent: "reviewer".into(),
+                event: expected_execution,
+            });
+            expected.push(TuiRuntimeEvent::SubagentExecution(
+                TuiSubagentEvent::terminal(1, expected_status, expected_result),
+            ));
+
+            let received = (0..expected.len())
+                .map(|_| {
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .expect("runner failure should publish every bridge event")
+                        .into_parts()
+                        .1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(received, expected);
+            assert!(
+                received
+                    .iter()
+                    .all(|event| !format!("{event:?}").contains("super-secret"))
+            );
+            assert!(
+                receiver
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                    .is_err(),
+                "runner failure must publish exactly one terminal"
+            );
+            assert_eq!(expected_error, source.task_runner_error());
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
     }
 
     #[test]
