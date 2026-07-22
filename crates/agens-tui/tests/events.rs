@@ -3,9 +3,10 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
-    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
+    TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
+    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
+    TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -16,6 +17,13 @@ use std::{
 #[derive(Default)]
 struct FakeEngine {
     cancellations: usize,
+}
+
+fn start_child(tui: &mut Tui<FakeEngine>, id: u64) {
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id },
+    });
 }
 
 #[test]
@@ -233,6 +241,121 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
     assert_eq!(view.completed_conversations.len(), 1);
     assert!(view.conversation.is_none());
     assert!(tui.transcript_record(&TranscriptId::Subagent(7)).is_none());
+}
+
+#[test]
+fn transcript_navigation_restores_destination_focus_and_disables_child_composer() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for (id, call, output) in [(7, "seven", 40), (8, "eight", 80)] {
+        start_child(&mut tui, id);
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(id, "reviewer", "task", TuiExecutionState::ForegroundRunning),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_call(id, call, "tool", "input"),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_result(id, call, "output\n".repeat(output), false),
+        ));
+    }
+
+    assert_eq!(tui.handle(Event::Key(Key::F5)), Action::Render);
+    assert!(tui.view().dialog.is_some());
+    tui.handle(Event::Key(Key::Enter));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::F7));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::F8));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    tui.handle(Event::Key(Key::F8));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    tui.handle(Event::Key(Key::F6));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+    tui.select_transcript(TranscriptId::Subagent(7));
+    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    assert_eq!(tui.input(), "");
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    tui.set_collapse_thinking(true);
+    tui.handle(Event::Key(Key::PageUp));
+    tui.handle(Event::Key(Key::CtrlO));
+    assert!(tui.view().collapse_thinking);
+    assert!(tui.view().scroll_offset > 0);
+    assert!(tui.view().collapsed_tool_outputs.contains("seven"));
+    tui.handle(Event::Key(Key::Home));
+    let child_seven_offset = tui.view().scroll_offset;
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        None::<String>,
+        vec![DialogEntry::action("Close", "close")],
+    ));
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    tui.handle(Event::Key(Key::F6));
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+    assert!(!tui.view().collapse_thinking);
+    assert!(tui.view().following_bottom);
+    assert!(tui.view().collapsed_tool_outputs.is_empty());
+    tui.handle(Event::Key(Key::Char('m')));
+    assert_eq!(tui.input(), "m");
+
+    tui.handle(Event::Key(Key::F8));
+    assert!(tui.view().collapse_thinking);
+    assert!(!tui.view().following_bottom);
+    assert_eq!(tui.handle(Event::Paste(" blocked".into())), Action::Render);
+    assert_eq!(tui.input(), "m");
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.input(), "m");
+    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::PageUp));
+    tui.handle(Event::Key(Key::CtrlO));
+    let child_eight_offset = tui.view().scroll_offset;
+    assert_ne!(child_eight_offset, child_seven_offset);
+    assert!(tui.view().collapsed_tool_outputs.contains("eight"));
+    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+
+    tui.handle(Event::Key(Key::F7));
+    assert_eq!(tui.view().scroll_offset, child_seven_offset);
+    assert!(tui.view().collapsed_tool_outputs.contains("seven"));
+
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(
+            8,
+            "reviewer",
+            "inactive task",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    ));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    assert!(
+        tui.transcript_record(&TranscriptId::Subagent(8))
+            .unwrap()
+            .last_admitted_ordinal()
+            .is_some()
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 7 },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Success, "done"),
+    ));
+    tui.tick(Duration::from_secs(60));
+    assert!(tui.executions().iter().all(|execution| execution.id() != 7));
+    assert_eq!(tui.handle(Event::Key(Key::F5)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+
+    let mut restored = Tui::new(FakeEngine::default());
+    restored.apply_runtime_event(TuiRuntimeEvent::RestoredCompletedSubagent {
+        id: 42,
+        agent: "reviewer".into(),
+        task_summary: "restored".into(),
+        final_result: "done".into(),
+        tool_uses: 1,
+    });
+    assert_eq!(restored.handle(Event::Key(Key::F5)), Action::Render);
+    assert!(restored.view().dialog.is_none());
 }
 
 #[test]

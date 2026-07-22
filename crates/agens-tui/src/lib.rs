@@ -109,6 +109,10 @@ pub enum Key {
     PageDown,
     ScrollUp,
     ScrollDown,
+    F5,
+    F6,
+    F7,
+    F8,
     Up,
     Down,
     Tab,
@@ -330,6 +334,7 @@ pub struct ViewState<'a> {
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
     /// Whether complete reasoning is collapsed according to the UI setting.
     pub collapse_thinking: bool,
+    pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
     /// Slash palette metadata and current filtered selection.
@@ -413,6 +418,7 @@ pub struct PaletteView<'a> {
 enum DialogEntryAction {
     Dispatch(String),
     SafeDispatch(String),
+    SelectTranscript(TranscriptId),
     Cancel,
     ToggleDetails,
 }
@@ -427,6 +433,12 @@ pub struct DialogEntry {
 }
 
 impl DialogEntry {
+    fn transcript(label: impl AsRef<str>, id: TranscriptId) -> Self {
+        let mut entry = Self::action(label, "");
+        entry.action = Some(DialogEntryAction::SelectTranscript(id));
+        entry
+    }
+
     pub fn action(label: impl AsRef<str>, action_id: impl AsRef<str>) -> Self {
         Self::action_with_detail(label, None::<String>, action_id)
     }
@@ -1476,8 +1488,6 @@ pub struct Tui<E> {
     active_transcript: TranscriptId,
     child_transcript_order: Vec<TranscriptId>,
     transcript: Vec<TranscriptEntry>,
-    following_bottom: bool,
-    scroll_offset: u16,
     provider_model: String,
     session: String,
     turn_state: Option<TurnState>,
@@ -1488,8 +1498,6 @@ pub struct Tui<E> {
     status: Option<String>,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
-    collapsed_tool_outputs: BTreeSet<String>,
-    collapse_thinking: bool,
     dialog: Option<DialogView>,
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
@@ -1518,8 +1526,6 @@ where
             active_transcript: TranscriptId::Main,
             child_transcript_order: Vec::new(),
             transcript: Vec::new(),
-            following_bottom: true,
-            scroll_offset: 0,
             provider_model: "provider / model".to_owned(),
             session: "new session".to_owned(),
             turn_state: None,
@@ -1530,8 +1536,6 @@ where
             status: None,
             completed_conversations: Vec::new(),
             conversation: None,
-            collapsed_tool_outputs: BTreeSet::new(),
-            collapse_thinking: false,
             dialog: None,
             palette_entries: Vec::new(),
             palette_open: false,
@@ -1557,10 +1561,11 @@ where
             }
             Event::Key(key) => self.handle_key(key),
             Event::Paste(text) => {
-                if self
-                    .dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.interactive)
+                if self.active_transcript != TranscriptId::Main
+                    || self
+                        .dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.interactive)
                 {
                     Action::Render
                 } else {
@@ -1594,7 +1599,7 @@ where
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
-        self.collapse_thinking = collapse;
+        self.active_record_mut().collapse_thinking = collapse;
     }
 
     pub fn set_agent_catalog<I, S>(&mut self, eligible: I)
@@ -1691,7 +1696,7 @@ where
         self.latest_usage = None;
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
         self.conversation = Some(Conversation::new(prompt));
-        self.collapsed_tool_outputs.clear();
+        self.active_record_mut().collapsed_tool_outputs.clear();
         self.set_running(true);
     }
 
@@ -1900,7 +1905,7 @@ where
         self.transcript.clear();
         self.completed_conversations.clear();
         self.conversation = None;
-        self.collapsed_tool_outputs.clear();
+        self.active_record_mut().collapsed_tool_outputs.clear();
         self.set_running(false);
         self.turn_state = None;
         self.active_tool = None;
@@ -1915,12 +1920,10 @@ where
         self.transcript.clear();
         self.completed_conversations = conversations;
         self.conversation = None;
-        self.collapsed_tool_outputs.clear();
+        self.active_record_mut().collapsed_tool_outputs.clear();
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
-        self.following_bottom = true;
-        self.scroll_offset = 0;
         self.set_running(false);
         self.turn_state = None;
         self.active_tool = None;
@@ -1943,6 +1946,54 @@ where
         } else {
             TranscriptId::Main
         };
+    }
+
+    fn active_record_mut(&mut self) -> &mut TranscriptRecord {
+        self.transcripts
+            .get_mut(&self.active_transcript)
+            .expect("active transcript always exists")
+    }
+
+    fn show_transcript_dialog(&mut self) {
+        let entries: Vec<_> = self
+            .child_transcript_order
+            .iter()
+            .copied()
+            .filter(|id| self.transcripts.contains_key(id))
+            .filter_map(|id| match id {
+                TranscriptId::Main => None,
+                TranscriptId::Subagent(id_value) => {
+                    Some(DialogEntry::transcript(format!("Subagent {id_value}"), id))
+                }
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        self.show_selection_dialog(DialogView::selection(
+            "Select transcript",
+            Some("Enter select | Esc cancel"),
+            entries,
+        ));
+    }
+
+    fn select_sibling(&mut self, direction: isize) {
+        let sibling = if self.active_transcript == TranscriptId::Main {
+            if direction.is_negative() {
+                self.child_transcript_order.last().copied()
+            } else {
+                self.child_transcript_order.first().copied()
+            }
+        } else {
+            self.child_transcript_order
+                .iter()
+                .position(|id| *id == self.active_transcript)
+                .and_then(|index| index.checked_add_signed(direction))
+                .and_then(|index| self.child_transcript_order.get(index).copied())
+        };
+        if let Some(id) = sibling.filter(|id| self.transcripts.contains_key(id)) {
+            self.select_transcript(id);
+        }
     }
 
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
@@ -2183,16 +2234,9 @@ where
             } else {
                 &active.completed_conversations
             },
-            collapsed_tool_outputs: if self.active_transcript == TranscriptId::Main {
-                &self.collapsed_tool_outputs
-            } else {
-                &active.collapsed_tool_outputs
-            },
-            collapse_thinking: if self.active_transcript == TranscriptId::Main {
-                self.collapse_thinking
-            } else {
-                active.collapse_thinking
-            },
+            collapsed_tool_outputs: &active.collapsed_tool_outputs,
+            collapse_thinking: active.collapse_thinking,
+            focus: active.focus,
             dialog: self.dialog.as_ref(),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
@@ -2308,8 +2352,11 @@ where
         }
     }
 
-    pub const fn following_bottom(&self) -> bool {
-        self.following_bottom
+    pub fn following_bottom(&self) -> bool {
+        self.transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .following_bottom
     }
 
     /// Applies ordered runtime progress without changing completed persistence semantics.
@@ -2393,6 +2440,58 @@ where
             .is_some_and(|dialog| dialog.interactive)
         {
             return self.handle_selection_dialog_key(key);
+        }
+
+        match key {
+            Key::F5 => {
+                self.show_transcript_dialog();
+                return Action::Render;
+            }
+            Key::F6 => {
+                self.select_transcript(TranscriptId::Main);
+                return Action::Render;
+            }
+            Key::F7 => {
+                self.select_sibling(-1);
+                return Action::Render;
+            }
+            Key::F8 => {
+                self.select_sibling(1);
+                return Action::Render;
+            }
+            Key::Home => {
+                self.scroll_to_start();
+                return Action::Render;
+            }
+            Key::End => {
+                self.scroll_to_end();
+                return Action::Render;
+            }
+            _ => {}
+        }
+
+        if self.active_transcript != TranscriptId::Main
+            && (matches!(
+                key,
+                Key::Char(_)
+                    | Key::ShiftEnter
+                    | Key::Backspace
+                    | Key::Delete
+                    | Key::DeletePreviousWord
+                    | Key::DeleteToLineStart
+                    | Key::DeleteToLineEnd
+                    | Key::Left
+                    | Key::Right
+                    | Key::PreviousWord
+                    | Key::NextWord
+                    | Key::LineStart
+                    | Key::LineEnd
+                    | Key::Enter
+                    | Key::CtrlB
+            ) || (key == Key::CtrlC && !self.input.is_empty())
+                || (key == Key::Tab && self.palette_open))
+        {
+            return Action::Render;
         }
 
         if key == Key::CtrlB {
@@ -2531,13 +2630,16 @@ where
             Key::LineStart => self.input_cursor = line_start(&self.input, cursor),
             Key::LineEnd => self.input_cursor = line_end(&self.input, cursor),
             Key::Home => {
-                self.following_bottom = false;
-                self.scroll_offset = 0;
+                let record = self.active_record_mut();
+                record.following_bottom = false;
+                record.scroll_offset = 0;
                 self.input_cursor = line_start(&self.input, cursor);
             }
             Key::End => {
-                self.following_bottom = true;
-                self.scroll_offset = self.max_scroll_offset();
+                let scroll_offset = self.max_scroll_offset();
+                let record = self.active_record_mut();
+                record.following_bottom = true;
+                record.scroll_offset = scroll_offset;
                 self.input_cursor = line_end(&self.input, cursor);
             }
             Key::Backspace => {}
@@ -2545,6 +2647,7 @@ where
         }
 
         self.clamp_palette_selection();
+        self.active_record_mut().focus = TranscriptFocus::Composer;
         Some(Action::Render)
     }
 
@@ -2572,27 +2675,47 @@ where
 
     fn scroll_up(&mut self, rows: u16) {
         let bottom = self.max_scroll_offset();
-        let current = if self.following_bottom {
+        let record = self.active_record_mut();
+        let current = if record.following_bottom {
             bottom
         } else {
-            self.scroll_offset.min(bottom)
+            record.scroll_offset.min(bottom)
         };
-        self.following_bottom = false;
-        self.scroll_offset = current.saturating_sub(rows);
+        record.following_bottom = false;
+        record.scroll_offset = current.saturating_sub(rows);
+        record.focus = TranscriptFocus::Viewport;
     }
 
     fn scroll_down(&mut self, rows: u16) {
         let bottom = self.max_scroll_offset();
-        self.scroll_offset = self.scroll_offset.saturating_add(rows).min(bottom);
-        self.following_bottom = self.scroll_offset == bottom;
+        let record = self.active_record_mut();
+        record.scroll_offset = record.scroll_offset.saturating_add(rows).min(bottom);
+        record.following_bottom = record.scroll_offset == bottom;
+        record.focus = TranscriptFocus::Viewport;
+    }
+
+    fn scroll_to_start(&mut self) {
+        let record = self.active_record_mut();
+        record.following_bottom = false;
+        record.scroll_offset = 0;
+        record.focus = TranscriptFocus::Viewport;
+    }
+
+    fn scroll_to_end(&mut self) {
+        let scroll_offset = self.max_scroll_offset();
+        let record = self.active_record_mut();
+        record.following_bottom = true;
+        record.scroll_offset = scroll_offset;
+        record.focus = TranscriptFocus::Viewport;
     }
 
     fn clamp_scroll_offset(&mut self) {
         let bottom = self.max_scroll_offset();
-        if self.following_bottom {
-            self.scroll_offset = bottom;
+        let record = self.active_record_mut();
+        if record.following_bottom {
+            record.scroll_offset = bottom;
         } else {
-            self.scroll_offset = self.scroll_offset.min(bottom);
+            record.scroll_offset = record.scroll_offset.min(bottom);
         }
     }
 
@@ -2746,6 +2869,11 @@ where
                     Some(DialogEntryAction::SafeDispatch(action_id)) => {
                         self.dialog = None;
                         Action::SafeDialogAction(action_id)
+                    }
+                    Some(DialogEntryAction::SelectTranscript(id)) => {
+                        self.dialog = None;
+                        self.select_transcript(id);
+                        Action::Render
                     }
                     Some(DialogEntryAction::Cancel) => {
                         self.dialog = None;
@@ -2925,35 +3053,39 @@ where
     }
 
     fn toggle_tool_output_expansion(&mut self) {
-        let completed_call_ids = self
-            .completed_conversations
+        let active = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
+        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
+            (&self.completed_conversations, self.conversation.as_ref())
+        } else {
+            (
+                &active.completed_conversations,
+                active.conversation.as_ref(),
+            )
+        };
+        let completed_call_ids = completed
             .iter()
-            .chain(self.conversation.iter())
+            .chain(conversation)
             .flat_map(|conversation| &conversation.tool_batches)
             .flat_map(|batch| &batch.calls)
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
-            .chain(
-                self.conversation
-                    .iter()
-                    .flat_map(|conversation| conversation.subagent_cards.iter())
-                    .filter(|card| card.tool_uses > 0)
-                    .map(|card| format!("subagent:{}", card.id)),
-            )
             .collect::<Vec<_>>();
-
         if completed_call_ids.is_empty() {
             return;
         }
 
+        let collapsed = &mut self.active_record_mut().collapsed_tool_outputs;
         if completed_call_ids
             .iter()
-            .all(|call_id| !self.collapsed_tool_outputs.contains(call_id))
+            .all(|call_id| !collapsed.contains(call_id))
         {
-            self.collapsed_tool_outputs.extend(completed_call_ids);
+            collapsed.extend(completed_call_ids);
         } else {
             for call_id in completed_call_ids {
-                self.collapsed_tool_outputs.remove(&call_id);
+                collapsed.remove(&call_id);
             }
         }
     }
@@ -3584,6 +3716,10 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::End, _) => Key::End,
         (KeyCode::PageUp, _) => Key::PageUp,
         (KeyCode::PageDown, _) => Key::PageDown,
+        (KeyCode::F(5), _) => Key::F5,
+        (KeyCode::F(6), _) => Key::F6,
+        (KeyCode::F(7), _) => Key::F7,
+        (KeyCode::F(8), _) => Key::F8,
         (KeyCode::Up, _) => Key::Up,
         (KeyCode::Down, _) => Key::Down,
         (KeyCode::Tab, _) => Key::Tab,
