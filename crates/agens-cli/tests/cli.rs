@@ -2742,7 +2742,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "error: provider: provider request failed\n",
+            "error: provider: ChatGPT response protocol failed\n",
             "{name}"
         );
         assert!(!side_effect.exists(), "{name} call must not dispatch");
@@ -2983,7 +2983,7 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(diagnostics, "error: provider: provider request failed\n");
+    assert_eq!(diagnostics, "error: provider: ChatGPT service failed\n");
     for secret in [
         "SENTINEL_OPENAI_API_KEY",
         "SENTINEL_REMOTE_ERROR_HEADER",
@@ -3676,7 +3676,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
 
 #[test]
 fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_items() {
-    for (name, responses, expected_calls) in [
+    for (name, responses, expected_calls, expected_error) in [
         (
             "duplicate provider call ID replay",
             vec![
@@ -3701,6 +3701,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
                 },
             ],
             Some("1"),
+            "error: provider: provider request failed\n",
         ),
         (
             "mismatched item arguments",
@@ -3713,6 +3714,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
                 ]),
             }],
             None,
+            "error: provider: ChatGPT response protocol failed\n",
         ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-mcp-integrity-{name}"));
@@ -3747,7 +3749,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            "error: provider: provider request failed\n",
+            expected_error,
             "{name}"
         );
         assert_eq!(
