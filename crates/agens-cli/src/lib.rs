@@ -12,13 +12,13 @@ use agens_config::{
     mcp_servers, merge_toml_documents, parse_toml_document, resolve_paths, validate_toml_document,
 };
 use agens_core::{
-    AgentDefinition, CompletedSessionTurn, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
-    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
-    HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SessionMessage,
-    SessionMetadata, TurnEvent, TurnProgressSink, TurnState,
-    run_headless_turn_with_max_iterations_and_progress,
+    AgentDefinition, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
+    CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
+    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
+    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
+    Message, MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
+    PermissionRule, PermissionSession, Role, SessionMessage, SessionMetadata, TurnEvent,
+    TurnProgressSink, TurnState, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
@@ -947,6 +947,42 @@ fn run_tui(dependencies: &CliDependencies, resume: Option<i64>) -> Result<String
 
 struct ProductionTuiEngine {
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct AttemptActivityRegistry {
+    active: Mutex<Vec<AttemptKey>>,
+}
+
+#[allow(dead_code)]
+impl AttemptActivityRegistry {
+    fn begin_and_register(
+        &self,
+        store: &mut SessionStore,
+        metadata: &SessionMetadata,
+        prompt: String,
+    ) -> Result<agens_core::SessionAttemptSummary, BeginSessionAttemptError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| BeginSessionAttemptError::Store)?;
+        let attempt = store.begin_session_attempt(metadata, prompt)?;
+        active.push(attempt.key());
+        Ok(attempt)
+    }
+
+    fn contains(&self, key: AttemptKey) -> bool {
+        self.active.lock().is_ok_and(|active| active.contains(&key))
+    }
+
+    fn unregister(&self, key: AttemptKey) {
+        if let Ok(mut active) = self.active.lock()
+            && let Some(index) = active.iter().position(|active_key| *active_key == key)
+        {
+            active.remove(index);
+        }
+    }
 }
 
 struct TuiMetricsPublisher {
@@ -13588,4 +13624,45 @@ fn production_chatgpt_login_errors_render_fixed_sanitized_stages() {
         assert!(!result.stderr.contains("detail"));
         assert_ne!(result.stderr, "error: auth: ChatGPT login failed\n");
     }
+}
+
+#[test]
+fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors() {
+    let directory =
+        std::env::temp_dir().join(format!("agens-attempt-registry-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 1,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let registry = AttemptActivityRegistry::default();
+    let attempt = registry
+        .begin_and_register(&mut store, &metadata, "prompt".into())
+        .unwrap();
+    let provider_calls = std::sync::atomic::AtomicUsize::new(0);
+
+    let second = registry.begin_and_register(&mut store, &metadata, "second".into());
+    if second.is_ok() {
+        provider_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    assert!(matches!(
+        second,
+        Err(BeginSessionAttemptError::AlreadyRunning(_))
+    ));
+    assert_eq!(provider_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(registry.contains(attempt.key()));
+    registry.unregister(attempt.key());
+    assert!(!registry.contains(attempt.key()));
+    std::fs::remove_dir_all(directory).unwrap();
 }
