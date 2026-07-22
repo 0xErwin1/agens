@@ -204,13 +204,6 @@ pub enum TuiRuntimeEvent {
     SubagentExecution(TuiSubagentEvent),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TuiSubagentTerminal {
-    Success,
-    Failure,
-    Cancelled,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TuiSubagentEvent {
     pub(crate) id: u64,
@@ -234,7 +227,6 @@ pub(crate) enum TuiSubagentUpdate {
         output: String,
         is_error: bool,
     },
-    Terminal(TuiSubagentTerminal),
 }
 
 impl TuiSubagentEvent {
@@ -281,12 +273,6 @@ impl TuiSubagentEvent {
                 output: sanitize_projection(output.as_ref()),
                 is_error,
             },
-        }
-    }
-    pub const fn terminal(id: u64, terminal: TuiSubagentTerminal) -> Self {
-        Self {
-            id,
-            update: TuiSubagentUpdate::Terminal(terminal),
         }
     }
 }

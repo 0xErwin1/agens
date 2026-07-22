@@ -117,22 +117,17 @@ pub(super) fn conversation_lines(
                 else {
                     continue;
                 };
-                let status = match card.terminal {
-                    Some(crate::TuiSubagentTerminal::Success) => "completed",
-                    Some(crate::TuiSubagentTerminal::Failure) => "failed",
-                    Some(crate::TuiSubagentTerminal::Cancelled) => "cancelled",
-                    None => match card.presentation {
-                        crate::TuiExecutionState::ForegroundRunning => "foreground running",
-                        crate::TuiExecutionState::BackgroundRunning => "background running",
-                        _ => "running",
-                    },
+                let status = match card.presentation {
+                    crate::TuiExecutionState::ForegroundRunning => "foreground running",
+                    crate::TuiExecutionState::BackgroundRunning => "background running",
+                    _ => "running",
                 };
                 lines.push(Line::from(format!(
                     "Subagent {} · {status} · {}",
                     card.agent, card.task_summary
                 )));
                 let marker = format!("subagent:{}", card.id);
-                if card.terminal.is_some() && collapsed_tool_outputs.contains(&marker) {
+                if collapsed_tool_outputs.contains(&marker) {
                     lines.push(Line::from(format!("+{} tool uses", card.tool_calls.len())));
                 } else {
                     for call in &card.tool_calls {

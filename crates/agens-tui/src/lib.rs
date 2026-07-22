@@ -10,7 +10,7 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
     BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentTerminal, UiEnvelope,
+    TuiRuntimeEvent, TuiSubagentEvent, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -1888,10 +1888,6 @@ where
                     self.conversation
                         .get_or_insert_with(|| Conversation::new(String::new()))
                         .apply_subagent(event.clone());
-                    if matches!(&event.update, bridge::TuiSubagentUpdate::Terminal(_)) {
-                        self.collapsed_tool_outputs
-                            .insert(format!("subagent:{}", event.id));
-                    }
                 }
             }
             TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
@@ -2055,15 +2051,10 @@ where
                         )
                     )
             }
-            bridge::TuiSubagentUpdate::Terminal(terminal) => matches!(
-                (execution.state, terminal),
-                (
-                    TuiExecutionState::CompletedRecent,
-                    TuiSubagentTerminal::Success
-                ) | (TuiExecutionState::Failed, TuiSubagentTerminal::Failure)
-                    | (TuiExecutionState::Cancelled, TuiSubagentTerminal::Cancelled)
+            _ => matches!(
+                execution.state,
+                TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
             ),
-            _ => true,
         }
     }
 
@@ -2696,7 +2687,7 @@ where
                 self.conversation
                     .iter()
                     .flat_map(|conversation| conversation.subagent_cards.iter())
-                    .filter(|card| card.terminal.is_some() && !card.tool_calls.is_empty())
+                    .filter(|card| !card.tool_calls.is_empty())
                     .map(|card| format!("subagent:{}", card.id)),
             )
             .collect::<Vec<_>>();

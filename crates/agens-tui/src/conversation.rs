@@ -1,6 +1,6 @@
 //! Typed, lossless source projection for one visible conversation turn.
 
-use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentTerminal, bridge::TuiSubagentUpdate};
+use crate::{TuiExecutionState, TuiSubagentEvent, bridge::TuiSubagentUpdate};
 use agens_core::{Message, MessagePart, Role};
 
 /// A source event accepted by the conversation projection.
@@ -91,7 +91,6 @@ pub struct SubagentCard {
     pub agent: String,
     pub task_summary: String,
     pub presentation: TuiExecutionState,
-    pub terminal: Option<TuiSubagentTerminal>,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -349,7 +348,6 @@ impl Conversation {
                     agent,
                     task_summary,
                     presentation,
-                    terminal: None,
                     tool_calls: Vec::new(),
                 });
                 self.items.push(ConversationItem::SubagentCard(event.id));
@@ -362,7 +360,7 @@ impl Conversation {
                 if let Some(card) = self
                     .subagent_cards
                     .iter_mut()
-                    .find(|card| card.id == event.id && card.terminal.is_none())
+                    .find(|card| card.id == event.id)
                     && card.tool_calls.iter().all(|call| call.call_id != call_id)
                 {
                     card.tool_calls.push(ToolCall {
@@ -381,7 +379,7 @@ impl Conversation {
                 if let Some(call) = self
                     .subagent_cards
                     .iter_mut()
-                    .find(|card| card.id == event.id && card.terminal.is_none())
+                    .find(|card| card.id == event.id)
                     .and_then(|card| {
                         card.tool_calls
                             .iter_mut()
@@ -389,15 +387,6 @@ impl Conversation {
                     })
                 {
                     call.result = Some(ToolResult { output, is_error });
-                }
-            }
-            TuiSubagentUpdate::Terminal(terminal) => {
-                if let Some(card) = self
-                    .subagent_cards
-                    .iter_mut()
-                    .find(|card| card.id == event.id && card.terminal.is_none())
-                {
-                    card.terminal = Some(terminal);
                 }
             }
             _ => {}

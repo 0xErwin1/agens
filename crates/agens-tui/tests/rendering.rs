@@ -4,7 +4,7 @@ use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent, TuiSubagentTerminal,
+    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 use ratatui::{
     Terminal,
@@ -1168,7 +1168,7 @@ fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
 }
 
 #[test]
-fn p1a_renderer_collapses_completed_tool_uses_and_expands_ordered_details() {
+fn p1a1_renderer_collapses_live_tool_uses_and_expands_ordered_details() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
@@ -1192,22 +1192,19 @@ fn p1a_renderer_collapses_completed_tool_uses_and_expands_ordered_details() {
         &mut tui,
         TuiSubagentEvent::tool_result(9, "read", "read result", false),
     );
-    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
-        agent: "reviewer".into(),
-        event: TuiExecutionEvent::Completed { id: 9 },
-    });
     apply_subagent(
         &mut tui,
-        TuiSubagentEvent::terminal(9, TuiSubagentTerminal::Success),
+        TuiSubagentEvent::tool_call(9, "grep", "native::grep", "bounded pattern"),
     );
 
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
     assert!(
         collapsed.contains("reviewer")
-            && collapsed.contains("completed")
+            && collapsed.contains("foreground running")
             && collapsed.contains("review the rendering")
-            && collapsed.contains("+1 tool uses"),
+            && collapsed.contains("+2 tool uses"),
         "{collapsed:?}"
     );
     assert!(!collapsed.contains("read result"), "{collapsed:?}");

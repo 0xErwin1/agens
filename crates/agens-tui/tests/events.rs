@@ -749,18 +749,59 @@ fn u15_c1b_sorts_reexecutions_newest_first_with_execution_id_ties() {
 }
 
 #[test]
-fn p1a_events_ignore_cards_without_a_matching_c1_execution() {
+fn p1a1_events_upsert_live_calls_pair_out_of_order_results_and_stop_after_c1_terminal() {
     let mut tui = Tui::new(FakeEngine::default());
-    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+
+    for event in [
+        TuiSubagentEvent::started(99, "other", "ignored", TuiExecutionState::ForegroundRunning),
         TuiSubagentEvent::started(
             7,
             "reviewer",
-            "prompt: SENTINEL",
+            "review this change",
             TuiExecutionState::ForegroundRunning,
         ),
+        TuiSubagentEvent::tool_result(7, "later", "orphan result", false),
+        TuiSubagentEvent::tool_call(7, "first", "native::read", "first input"),
+        TuiSubagentEvent::tool_call(7, "later", "native::grep", "later input"),
+        TuiSubagentEvent::tool_result(7, "later", "later result", false),
+        TuiSubagentEvent::tool_result(7, "first", "first result", true),
+        TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "duplicate card",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(event));
+    }
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 7 },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::tool_call(7, "late", "native::bash", "must not appear"),
     ));
 
-    assert!(tui.view().conversation.is_none());
+    let cards = &tui.view().conversation.unwrap().subagent_cards;
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].id, 7);
+    assert_eq!(cards[0].tool_calls.len(), 2);
+    assert_eq!(cards[0].tool_calls[0].call_id, "first");
+    assert_eq!(
+        cards[0].tool_calls[0].result.as_ref().unwrap().output,
+        "first result"
+    );
+    assert!(cards[0].tool_calls[0].result.as_ref().unwrap().is_error);
+    assert_eq!(cards[0].tool_calls[1].call_id, "later");
+    assert_eq!(
+        cards[0].tool_calls[1].result.as_ref().unwrap().output,
+        "later result"
+    );
 }
 
 #[test]
