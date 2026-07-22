@@ -630,6 +630,26 @@ fn device_code_login_rejects_unavailable_and_invalid_user_code_responses_without
 
 #[test]
 fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_requests() {
+    let idle_listener = TcpListener::bind("127.0.0.1:0").expect("idle listener should bind");
+    let idle_endpoint = format!(
+        "http://{}/usercode",
+        idle_listener.local_addr().expect("idle address")
+    );
+    let idle_server = spawn_bounded_server(idle_listener, Duration::from_millis(50), |_| {
+        panic!("an expired login must not send a user-code request");
+    });
+    let mut expired_options = ChatGptDeviceCodeLoginOptions::for_test(
+        &idle_endpoint,
+        "http://127.0.0.1:1/token",
+        "http://127.0.0.1:1/token",
+    );
+    expired_options.timeout = Duration::ZERO;
+    assert_eq!(
+        device_code_login(expired_options, LoginCancellation::new()),
+        Err(LoginError::TimedOut)
+    );
+    idle_server.expect_no_request();
+
     let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
     let user_endpoint = format!(
         "http://{}/usercode",
@@ -641,19 +661,17 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         poll_listener.local_addr().expect("address")
     );
     let (poll_finished_send, poll_finished_receive) = mpsc::sync_channel(1);
-    let user_server = thread::spawn(move || {
-        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
-        let _ = read_http_request(&mut stream);
+    let user_server = spawn_bounded_server(user_listener, Duration::from_secs(1), |stream| {
+        let _ = read_http_request(stream);
         write_http_response(
-            &mut stream,
+            stream,
             200,
             r#"{"device_auth_id":"private-device-id","user_code":"code","interval":"10"}"#,
         );
     });
-    let poll_server = thread::spawn(move || {
-        let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
-        let _ = read_http_request(&mut stream);
-        write_http_response(&mut stream, 403, "{}");
+    let poll_server = spawn_bounded_server(poll_listener, Duration::from_secs(1), move |stream| {
+        let _ = read_http_request(stream);
+        write_http_response(stream, 403, "{}");
         poll_finished_send
             .send(())
             .expect("test should observe the pending poll");
@@ -668,8 +686,8 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         cancellation,
         poll_finished_receive,
     );
-    user_server.join().expect("user server should finish");
-    poll_server.join().expect("poll server should finish");
+    user_server.join();
+    poll_server.join();
 
     let user_listener = TcpListener::bind("127.0.0.1:0").expect("user listener should bind");
     let user_endpoint = format!(
@@ -681,19 +699,17 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         "http://{}/token",
         poll_listener.local_addr().expect("address")
     );
-    let user_server = thread::spawn(move || {
-        let (mut stream, _) = user_listener.accept().expect("user request should arrive");
-        let _ = read_http_request(&mut stream);
+    let user_server = spawn_bounded_server(user_listener, Duration::from_secs(1), |stream| {
+        let _ = read_http_request(stream);
         write_http_response(
-            &mut stream,
+            stream,
             200,
             r#"{"device_auth_id":"private-device-id","user_code":"code","interval":"1"}"#,
         );
     });
-    let poll_server = thread::spawn(move || {
-        let (mut stream, _) = poll_listener.accept().expect("poll request should arrive");
-        let _ = read_http_request(&mut stream);
-        write_http_response(&mut stream, 404, "{}");
+    let poll_server = spawn_bounded_server(poll_listener, Duration::from_secs(1), |stream| {
+        let _ = read_http_request(stream);
+        write_http_response(stream, 404, "{}");
     });
     let mut options = ChatGptDeviceCodeLoginOptions::for_test(
         &user_endpoint,
@@ -705,8 +721,8 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
         device_code_login(options, LoginCancellation::new()),
         Err(LoginError::TimedOut)
     );
-    user_server.join().expect("user server should finish");
-    poll_server.join().expect("poll server should finish");
+    user_server.join();
+    poll_server.join();
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let endpoint = format!(
@@ -715,14 +731,13 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
     );
     let (request_started_send, request_started_receive) = mpsc::sync_channel(1);
     let (request_closed_send, request_closed_receive) = mpsc::sync_channel(1);
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("request should arrive");
-        let _ = read_http_request(&mut stream);
+    let server = spawn_bounded_server(listener, Duration::from_secs(1), move |stream| {
+        let _ = read_http_request(stream);
         request_started_send
             .send(())
             .expect("test should observe the user-code request");
         request_closed_send
-            .send(client_closed_before_late_response(&mut stream, 200, "{}"))
+            .send(client_closed_before_late_response(stream, 200, "{}"))
             .expect("test should observe whether cancellation closed the request");
     });
     let cancellation = LoginCancellation::new();
@@ -741,7 +756,7 @@ fn device_code_login_handles_pending_timeout_and_cancellation_during_sleep_and_r
             .expect("user-code server should finish after cancellation"),
         "cancellation must close the blocked user-code socket"
     );
-    server.join().expect("server should finish");
+    server.join();
 }
 
 #[test]
@@ -1545,8 +1560,77 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 }
 
 fn write_http_response(stream: &mut TcpStream, status: u16, body: &str) {
+    stream
+        .set_write_timeout(Some(Duration::from_secs(1)))
+        .expect("response timeout should be set");
     write!(stream, "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response should be written");
     stream.flush().expect("response should flush");
+}
+
+struct BoundedServer {
+    completed: mpsc::Receiver<bool>,
+    worker: thread::JoinHandle<()>,
+    timeout: Duration,
+}
+
+impl BoundedServer {
+    fn join(self) {
+        assert!(
+            self.completed
+                .recv_timeout(self.timeout + Duration::from_millis(50))
+                .expect("server should report completion"),
+            "server should receive its expected request"
+        );
+        self.worker.join().expect("server should finish");
+    }
+
+    fn expect_no_request(self) {
+        assert!(
+            !self
+                .completed
+                .recv_timeout(self.timeout + Duration::from_millis(50))
+                .expect("idle server should report completion"),
+            "expired login must not send a request"
+        );
+        self.worker.join().expect("idle server should finish");
+    }
+}
+
+fn spawn_bounded_server(
+    listener: TcpListener,
+    timeout: Duration,
+    handle: impl FnOnce(&mut TcpStream) + Send + 'static,
+) -> BoundedServer {
+    let (completed_send, completed) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        listener
+            .set_nonblocking(true)
+            .expect("server listener should become nonblocking");
+        let deadline = Instant::now() + timeout;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("server accept should succeed: {error}"),
+            }
+        };
+        if let Some(stream) = stream.as_mut() {
+            handle(stream);
+        }
+        completed_send
+            .send(stream.is_some())
+            .expect("test should observe server completion");
+    });
+    BoundedServer {
+        completed,
+        worker,
+        timeout,
+    }
 }
 
 fn assert_login_cancels_after_request_starts(
