@@ -3876,6 +3876,15 @@ struct HeadlessChatCompletion {
     messages: Vec<Message>,
 }
 
+struct HeadlessProviderContext<'a> {
+    bootstrap: &'a Bootstrap,
+    cancellation: &'a HeadlessTurnCancellation,
+    progress: Option<&'a TurnProgressSink>,
+    permission_bridge: Option<TuiPermissionBridge>,
+    task_runtime: Option<&'a ProductionTuiTaskRuntime>,
+    include_system_prompt: bool,
+}
+
 fn run_production_headless_chat_with_progress(
     request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
@@ -3891,12 +3900,14 @@ fn run_production_headless_chat_with_progress(
             })?;
             run_production_headless_chat_with_provider(
                 request,
-                bootstrap,
-                cancellation,
-                progress,
-                permission_bridge,
-                task_runtime,
-                true,
+                HeadlessProviderContext {
+                    bootstrap,
+                    cancellation,
+                    progress,
+                    permission_bridge,
+                    task_runtime,
+                    include_system_prompt: true,
+                },
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
@@ -3926,12 +3937,14 @@ fn run_production_headless_chat_with_progress(
                 .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned());
             run_production_headless_chat_with_provider(
                 request,
-                bootstrap,
-                cancellation,
-                progress,
-                permission_bridge,
-                task_runtime,
-                false,
+                HeadlessProviderContext {
+                    bootstrap,
+                    cancellation,
+                    progress,
+                    permission_bridge,
+                    task_runtime,
+                    include_system_prompt: false,
+                },
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
@@ -3962,12 +3975,7 @@ fn run_production_headless_chat_with_progress(
 
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
-    bootstrap: &Bootstrap,
-    cancellation: &HeadlessTurnCancellation,
-    progress: Option<&TurnProgressSink>,
-    permission_bridge: Option<TuiPermissionBridge>,
-    task_runtime: Option<&ProductionTuiTaskRuntime>,
-    include_system_prompt: bool,
+    context: HeadlessProviderContext<'_>,
     build_provider: impl FnOnce(
         String,
         Vec<Message>,
@@ -3981,35 +3989,38 @@ where
     let model = request
         .model
         .clone()
-        .or_else(|| bootstrap.model().map(ToOwned::to_owned))
-        .unwrap_or_else(|| match bootstrap.provider_type() {
+        .or_else(|| context.bootstrap.model().map(ToOwned::to_owned))
+        .unwrap_or_else(|| match context.bootstrap.provider_type() {
             Some("openai-chatgpt") => "gpt-5.5".to_owned(),
             _ => "gpt-4.1".to_owned(),
         });
-    let session_provider = bootstrap.provider_type().map(str::to_owned);
+    let session_provider = context.bootstrap.provider_type().map(str::to_owned);
     let session_model = model.clone();
     let session_effort = request
         .session_reasoning_effort
         .or_else(|| request.request_config.reasoning_effort());
-    let project_root = bootstrap
+    let project_root = context
+        .bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (provider_tools, tool_runtime) = match task_runtime {
+    let (provider_tools, tool_runtime) = match context.task_runtime {
         Some(task_runtime) => (
             task_runtime.provider_tools.clone(),
             Arc::clone(&task_runtime.dispatcher),
         ),
-        None => production_tool_runtime(bootstrap, project_root, request.skills.as_deref())?,
+        None => {
+            production_tool_runtime(context.bootstrap, project_root, request.skills.as_deref())?
+        }
     };
     let project = project_root.display().to_string();
     let policy = permission_policy(
-        bootstrap.permission_rules(),
+        context.bootstrap.permission_rules(),
         &project,
         request.mode,
         &tool_runtime,
         request.effective_capabilities.as_ref(),
     )?;
-    let grant_store = PermissionGrantStore::open(bootstrap.data_directory())
+    let grant_store = PermissionGrantStore::open(context.bootstrap.data_directory())
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
     let grants = grant_store
         .grants_for_project(&project)
@@ -4024,14 +4035,14 @@ where
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let mut provider = build_provider(
         model,
-        provider_messages(&request, include_system_prompt),
+        provider_messages(&request, context.include_system_prompt),
         provider_tools,
         request.request_config.clone(),
     )?;
-    if let Some(progress) = progress {
+    if let Some(progress) = context.progress {
         provider = provider.with_progress_sink(Arc::clone(progress));
     }
-    cancellation_result(cancellation)?;
+    cancellation_result(context.cancellation)?;
     let mut repository = DiscardCompletedTurnRepository;
     let mut gate = ProductionPermissionGate::new(
         policy.clone(),
@@ -4043,7 +4054,7 @@ where
         Arc::clone(&prompts),
     );
     let mut resolver = ProductionPermissionResolver::new(
-        permission_bridge.map_or(
+        context.permission_bridge.map_or(
             ProductionPermissionPrompter::Tty(TtyPermissionPrompter),
             ProductionPermissionPrompter::Tui,
         ),
@@ -4059,7 +4070,7 @@ where
         },
     );
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = match request.max_iterations.or(bootstrap.max_iterations) {
+    let snapshot = match request.max_iterations.or(context.bootstrap.max_iterations) {
         Some(max_iterations) => {
             block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
                 &mut provider,
@@ -4067,9 +4078,9 @@ where
                 &mut resolver,
                 &mut dispatcher,
                 &mut repository,
-                cancellation,
+                context.cancellation,
                 max_iterations,
-                progress,
+                context.progress,
             ))
         }
         None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
@@ -4078,8 +4089,8 @@ where
             &mut resolver,
             &mut dispatcher,
             &mut repository,
-            cancellation,
-            progress,
+            context.cancellation,
+            context.progress,
         )),
     }?
     .map_err(CliError::runtime)?;
@@ -4089,10 +4100,10 @@ where
         &snapshot,
         request.pending_system_reminder.as_deref(),
     )?;
-    let mut store = SessionStore::open(bootstrap.data_directory())
+    let mut store = SessionStore::open(context.bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let metadata = next_session_metadata(
-        bootstrap,
+        context.bootstrap,
         &request.prompt,
         request.session.as_ref(),
         request.active_agent.as_deref(),
@@ -4627,10 +4638,13 @@ struct ProductionTaskRunner {
     project_root: PathBuf,
     lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
     #[cfg(test)]
-    probe: Option<Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>>,
+    probe: Option<ProductionTaskProbe>,
     #[cfg(test)]
     progress_probe: Option<Vec<TurnEvent>>,
 }
+
+#[cfg(test)]
+type ProductionTaskProbe = Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>;
 
 #[derive(Clone, Default)]
 struct TuiTaskControls(Arc<Mutex<BTreeMap<u64, TaskExecutionLifecycle>>>);
@@ -4866,11 +4880,7 @@ impl ProductionTaskRunner {
         self
     }
     #[cfg(test)]
-    fn with_probe(
-        bootstrap: Bootstrap,
-        project_root: PathBuf,
-        probe: Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>,
-    ) -> Self {
+    fn with_probe(bootstrap: Bootstrap, project_root: PathBuf, probe: ProductionTaskProbe) -> Self {
         Self {
             bootstrap,
             project_root,
@@ -4884,7 +4894,7 @@ impl ProductionTaskRunner {
     fn with_progress_probe(
         bootstrap: Bootstrap,
         project_root: PathBuf,
-        probe: Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>,
+        probe: ProductionTaskProbe,
         progress: Vec<TurnEvent>,
     ) -> Self {
         Self {
