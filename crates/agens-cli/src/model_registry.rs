@@ -204,7 +204,10 @@ fn valid_model_id(model: &str) -> bool {
 /// Returns `None` when the model is unknown or has no recorded window.
 /// Never invents a default size.
 pub(crate) fn context_window_for(model_id: &str) -> Option<u64> {
-    for source in [TuiModelSource::OpenAiApi, TuiModelSource::ChatGptSubscription] {
+    for source in [
+        TuiModelSource::OpenAiApi,
+        TuiModelSource::ChatGptSubscription,
+    ] {
         if let Ok(models) = source_models(source)
             && let Some(model) = models.iter().find(|model| model.id == model_id)
         {

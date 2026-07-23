@@ -153,12 +153,7 @@ fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::default());
 }
 
-fn thinking_lines(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    collapsed: bool,
-    streaming: bool,
-) {
+fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool, streaming: bool) {
     let mode = ThinkingBlock::mode(streaming, collapsed);
     lines.push(ThinkingBlock::title(mode));
     if mode.shows_body() {

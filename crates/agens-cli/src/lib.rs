@@ -13232,8 +13232,7 @@ mod tests {
     fn tui_metrics_publisher_enriches_context_window_from_registry_for_known_model() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
         let cancellation = agens_tui::BridgeCancel::new();
-        let mut publisher =
-            TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
 
         publisher.observe(&TurnEvent::Usage(agens_core::Usage {
             input_tokens: Some(11),
@@ -13263,8 +13262,7 @@ mod tests {
     fn tui_metrics_publisher_leaves_context_window_none_for_unknown_model() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
         let cancellation = agens_tui::BridgeCancel::new();
-        let mut publisher =
-            TuiMetricsPublisher::new(bridge, cancellation, "not-a-real-model-xyz");
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "not-a-real-model-xyz");
 
         publisher.observe(&TurnEvent::Usage(agens_core::Usage {
             input_tokens: Some(3),
@@ -13293,8 +13291,7 @@ mod tests {
     fn tui_metrics_publisher_preserves_provider_context_window_when_present() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
         let cancellation = agens_tui::BridgeCancel::new();
-        let mut publisher =
-            TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
 
         publisher.observe(&TurnEvent::Usage(agens_core::Usage {
             input_tokens: Some(1),

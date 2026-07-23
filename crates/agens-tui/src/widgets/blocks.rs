@@ -88,24 +88,19 @@ mod tests {
 
     #[test]
     fn thinking_mode_streams_then_collapses_unless_expanded() {
-        assert_eq!(
-            ThinkingBlock::mode(true, true),
-            ExpandMode::Streaming
-        );
-        assert_eq!(
-            ThinkingBlock::mode(false, true),
-            ExpandMode::Collapsed
-        );
-        assert_eq!(
-            ThinkingBlock::mode(false, false),
-            ExpandMode::Expanded
-        );
+        assert_eq!(ThinkingBlock::mode(true, true), ExpandMode::Streaming);
+        assert_eq!(ThinkingBlock::mode(false, true), ExpandMode::Collapsed);
+        assert_eq!(ThinkingBlock::mode(false, false), ExpandMode::Expanded);
     }
 
     #[test]
     fn tool_row_header_is_name_only_without_call_id() {
         let line = ToolRow::header("native::read");
-        let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
         assert_eq!(text, "┌ native::read");
         assert!(!text.contains("call"));
         assert!(!text.contains("read-1"));
@@ -114,7 +109,11 @@ mod tests {
     #[test]
     fn tool_row_args_and_collapsed_marker_are_stable() {
         let args = ToolRow::args("src/lib.rs");
-        let args_text: String = args.spans.iter().map(|span| span.content.as_ref()).collect();
+        let args_text: String = args
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
         assert!(args_text.contains("input"));
         assert!(args_text.contains("src/lib.rs"));
 

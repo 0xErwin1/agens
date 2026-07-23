@@ -522,7 +522,10 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     renderer.render(tui.view()).unwrap();
     let reexpanded = rendered_text(&renderer);
     assert!(reexpanded.contains("THOUGHTTOKEN"), "{reexpanded:?}");
-    assert!(!reexpanded.contains("Thinking · collapsed"), "{reexpanded:?}");
+    assert!(
+        !reexpanded.contains("Thinking · collapsed"),
+        "{reexpanded:?}"
+    );
     assert!(!tui.view().collapse_thinking);
 
     // Pin: a later finish path must not re-collapse user-expanded thinking.
@@ -571,7 +574,10 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let expanded = rendered_text(&renderer);
-    assert!(expanded.contains("secret-tool-body-sentinel"), "{expanded:?}");
+    assert!(
+        expanded.contains("secret-tool-body-sentinel"),
+        "{expanded:?}"
+    );
     assert!(expanded.contains("native::read"), "{expanded:?}");
     assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
 }

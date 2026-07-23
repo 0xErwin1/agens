@@ -89,8 +89,7 @@ mod tests {
     #[test]
     fn decorate_status_spins_only_when_active() {
         let active_early = StatusGlyph::decorate_status(true, "Waiting", Duration::from_millis(0));
-        let active_later =
-            StatusGlyph::decorate_status(true, "Waiting", Duration::from_millis(80));
+        let active_later = StatusGlyph::decorate_status(true, "Waiting", Duration::from_millis(80));
         let idle_early = StatusGlyph::decorate_status(false, "Ready", Duration::from_millis(0));
         let idle_later = StatusGlyph::decorate_status(false, "Ready", Duration::from_millis(800));
 
