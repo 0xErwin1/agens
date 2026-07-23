@@ -10609,8 +10609,8 @@ mod tests {
         let restored_render = render_tui_test_backend(&tui, 120, 50);
         for expected in [
             "previous request",
-            "previous reasoning",
-            "read · resume-call",
+            "Thinking · collapsed",
+            "read",
             "previous answer",
             "persisted reminder",
             "second request",
@@ -10628,7 +10628,15 @@ mod tests {
             "{restored_render:?}"
         );
         assert!(
+            !restored_render.contains("previous reasoning"),
+            "{restored_render:?}"
+        );
+        assert!(
             !restored_render.contains("previous result"),
+            "{restored_render:?}"
+        );
+        assert!(
+            !restored_render.contains("resume-call"),
             "{restored_render:?}"
         );
 
@@ -10637,6 +10645,26 @@ mod tests {
             tui.view().following_bottom,
             tui.view().scroll_offset,
             tui.view().focus,
+        );
+
+        // Ctrl+O is thinking-first: expand collapsed reasoning before tool bodies.
+        tui.handle(Event::Key(Key::CtrlO));
+        assert_eq!(
+            (
+                tui.view().following_bottom,
+                tui.view().scroll_offset,
+                tui.view().focus,
+            ),
+            restored_anchor
+        );
+        let thinking_expanded = render_tui_test_backend(&tui, 120, 50);
+        assert!(
+            thinking_expanded.contains("previous reasoning"),
+            "{thinking_expanded:?}"
+        );
+        assert!(
+            !thinking_expanded.contains("previous result"),
+            "{thinking_expanded:?}"
         );
 
         tui.handle(Event::Key(Key::CtrlO));
@@ -10648,10 +10676,10 @@ mod tests {
             ),
             restored_anchor
         );
-        let expanded_restore = render_tui_test_backend(&tui, 120, 50);
+        let tools_expanded = render_tui_test_backend(&tui, 120, 50);
         assert!(
-            expanded_restore.contains("previous result"),
-            "{expanded_restore:?}"
+            tools_expanded.contains("previous result"),
+            "{tools_expanded:?}"
         );
 
         tui.handle(Event::Key(Key::CtrlO));
