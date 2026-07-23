@@ -120,6 +120,68 @@ fn responsive_layout_saturates_heights_one_through_six() {
 }
 
 #[test]
+fn conversational_surface_centers_and_header_degrades_deterministically() {
+    for (width, expected_x) in [(80, 0), (100, 0), (120, 10)] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, 12)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.set_presentation("openai-api", "gpt-4.1", "session #42");
+        tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            total_tokens: Some(8),
+            context_window: Some(128),
+        }));
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        assert_eq!(
+            rendered_column(&renderer, "agens"),
+            expected_x + 1,
+            "{text:?}"
+        );
+        if width == 120 {
+            for expected in [
+                "project agens",
+                "session #42",
+                "openai-api / gpt-4.1",
+                "agent main",
+                "ctx 8/128",
+                "Ready",
+            ] {
+                assert!(text.contains(expected), "{expected}: {text:?}");
+            }
+        }
+    }
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(40, 7)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_presentation("openai-api", "gpt-4.1", "session #42");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(5),
+        total_tokens: Some(8),
+        context_window: Some(128),
+    }));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("agens"), "{text:?}");
+    assert!(text.contains("Ready"), "{text:?}");
+    for omitted in [
+        "project agens",
+        "session #42",
+        "openai-api / gpt-4.1",
+        "agent main",
+        "ctx 8/128",
+    ] {
+        assert!(!text.contains(omitted), "{text:?}");
+    }
+}
+
+#[test]
 fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 100)).unwrap());
     let mut tui = Tui::new(FakeEngine);

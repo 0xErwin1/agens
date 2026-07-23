@@ -315,6 +315,8 @@ pub struct ViewState<'a> {
     pub provider_model: &'a str,
     /// Active session label supplied by the CLI composition root.
     pub session: &'a str,
+    /// Project label displayed in the semantic terminal header.
+    pub project: &'a str,
     /// Current active-turn state for the dedicated status row.
     pub turn_state: Option<TurnState>,
     /// Tool name currently being dispatched, when known.
@@ -893,13 +895,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     if let Some(palette) = state.palette {
-        render_palette(frame, area, layout.composer, state.input, palette);
+        render_palette(frame, layout.composer, state.input, palette);
     }
 }
 
 fn render_palette(
     frame: &mut ratatui::Frame<'_>,
-    area: Rect,
     composer: Rect,
     input: &str,
     palette: PaletteView<'_>,
@@ -907,10 +908,10 @@ fn render_palette(
     let matches = palette_matches(palette.entries, input);
     let content_rows = matches.len().clamp(1, 6) as u16;
     let height = content_rows.saturating_add(2).min(composer.y);
-    if height < 3 || area.width == 0 {
+    if height < 3 || composer.width == 0 {
         return;
     }
-    let palette_area = Rect::new(area.x, composer.y - height, area.width, height);
+    let palette_area = Rect::new(composer.x, composer.y - height, composer.width, height);
     let items = if matches.is_empty() {
         vec![ListItem::new(" No matching commands")]
     } else {
@@ -1154,9 +1155,17 @@ struct ScreenLayout {
     show_context: bool,
 }
 
+fn conversation_surface(area: Rect) -> Rect {
+    let width = area.width.min(100);
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+
+    Rect::new(x, area.y, width, area.height)
+}
+
 fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+    let area = conversation_surface(area);
     let header_rows = u16::from(area.height >= 7);
-    let show_context = area.width >= 80 && area.height > 16;
+    let show_context = area.width >= 92;
     let footer_rows = u16::from(area.height >= 12);
     let composer_rows = match area.height {
         0 => 0,
@@ -1203,8 +1212,17 @@ fn render_header(
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     )];
-    if show_context {
+    if show_context && state.executions.is_empty() {
         left.push(Span::styled("  ", Style::default()));
+        left.push(Span::styled(
+            "project ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        left.push(Span::styled(
+            state.project,
+            Style::default().fg(Color::Gray),
+        ));
+        left.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
         left.push(Span::styled(
             state.provider_model,
             Style::default().fg(Color::Gray),
@@ -1219,33 +1237,11 @@ fn render_header(
             Style::default().fg(Color::Gray),
         ));
         left.push(Span::styled(
-            format!("  ·  {} agents", state.agent_catalog.len()),
+            context_budget(state.latest_usage),
             Style::default().fg(Color::Gray),
         ));
-        if !state.executions.is_empty() {
-            let mut foreground = 0;
-            let mut background = 0;
-            let mut completed = 0;
-            let mut failed = 0;
-            let mut cancelled = 0;
-
-            for execution in &state.executions {
-                match execution.state() {
-                    TuiExecutionState::ForegroundRunning => foreground += 1,
-                    TuiExecutionState::BackgroundRunning => background += 1,
-                    TuiExecutionState::CompletedRecent => completed += 1,
-                    TuiExecutionState::Failed => failed += 1,
-                    TuiExecutionState::Cancelled => cancelled += 1,
-                }
-            }
-
-            left.push(Span::styled(
-                format!(
-                    "  ·  fg {foreground} bg {background} done {completed} failed {failed} cancelled {cancelled}"
-                ),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
+    } else if !state.executions.is_empty() {
+        append_execution_summary(&mut left, state);
     }
     frame.render_widget(
         Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
@@ -1262,6 +1258,50 @@ fn render_header(
             state_area,
         );
     }
+}
+
+fn context_budget(usage: Option<&Usage>) -> String {
+    let tokens = usage
+        .and_then(|usage| usage.total_tokens)
+        .map_or_else(|| "?".into(), |tokens| tokens.to_string());
+    let context = usage
+        .and_then(|usage| usage.context_window)
+        .map_or_else(|| "?".into(), |context| context.to_string());
+
+    format!("  ·  ctx {tokens}/{context}")
+}
+
+fn append_execution_summary(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
+    let mut foreground = 0;
+    let mut background = 0;
+    let mut completed = 0;
+    let mut failed = 0;
+    let mut cancelled = 0;
+
+    for execution in &state.executions {
+        match execution.state() {
+            TuiExecutionState::ForegroundRunning => foreground += 1,
+            TuiExecutionState::BackgroundRunning => background += 1,
+            TuiExecutionState::CompletedRecent => completed += 1,
+            TuiExecutionState::Failed => failed += 1,
+            TuiExecutionState::Cancelled => cancelled += 1,
+        }
+    }
+
+    left.push(Span::styled(
+        format!("  ·  agent {}", state.selected_agent.unwrap_or("main")),
+        Style::default().fg(Color::Gray),
+    ));
+    left.push(Span::styled(
+        format!("  ·  {} agents", state.agent_catalog.len()),
+        Style::default().fg(Color::Gray),
+    ));
+    left.push(Span::styled(
+        format!(
+            "  ·  fg {foreground} bg {background} done {completed} failed {failed} cancelled {cancelled}"
+        ),
+        Style::default().fg(Color::Yellow),
+    ));
 }
 
 fn turn_state_label(state: Option<TurnState>, running: bool) -> &'static str {
@@ -1492,6 +1532,7 @@ pub struct Tui<E> {
     transcript: Vec<TranscriptEntry>,
     provider_model: String,
     session: String,
+    project: String,
     turn_state: Option<TurnState>,
     active_tool: Option<String>,
     runtime_events: Vec<TuiRuntimeEvent>,
@@ -1530,6 +1571,7 @@ where
             transcript: Vec::new(),
             provider_model: "provider / model".to_owned(),
             session: "new session".to_owned(),
+            project: "agens".to_owned(),
             turn_state: None,
             active_tool: None,
             runtime_events: Vec::new(),
@@ -1683,6 +1725,11 @@ where
     ) {
         self.provider_model = format!("{} / {}", provider.as_ref(), model.as_ref());
         self.session = session.into();
+    }
+
+    /// Sets the project identity displayed in the semantic terminal header.
+    pub fn set_project(&mut self, project: impl Into<String>) {
+        self.project = project.into();
     }
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
@@ -2259,6 +2306,7 @@ where
             scroll_offset: active.scroll_offset,
             provider_model: &self.provider_model,
             session: &self.session,
+            project: &self.project,
             turn_state: self.turn_state,
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
