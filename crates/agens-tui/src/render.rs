@@ -11,7 +11,7 @@ use ratatui::{
 use std::collections::BTreeSet;
 
 use crate::conversation::ConversationItem;
-use crate::widgets::{ExpandMode, ExpandableBody, RolePalette};
+use crate::widgets::{RolePalette, ThinkingBlock, ToolRow};
 use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
@@ -22,6 +22,7 @@ pub(super) fn conversation_lines(
     events: &[TuiRuntimeEvent],
     collapsed_tool_outputs: &BTreeSet<String>,
     collapse_thinking: bool,
+    thinking_streaming: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -33,10 +34,10 @@ pub(super) fn conversation_lines(
                 markdown_lines(&mut lines, text, Style::default(), "");
             }
             ConversationItem::Reasoning(text) => {
-                thinking_lines(&mut lines, text, collapse_thinking);
+                thinking_lines(&mut lines, text, collapse_thinking, thinking_streaming);
             }
             ConversationItem::ToolCall {
-                call_id,
+                call_id: _,
                 name,
                 input,
                 batch,
@@ -49,21 +50,8 @@ pub(super) fn conversation_lines(
                             .add_modifier(Modifier::BOLD),
                     )));
                 }
-                lines.push(Line::from(vec![
-                    Span::styled("┌ ", Style::default().fg(RolePalette::tool())),
-                    Span::styled(
-                        name.to_owned(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" · {call_id}"),
-                        Style::default().fg(RolePalette::muted()),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("│ input ", Style::default().fg(RolePalette::muted())),
-                    Span::raw(input.to_owned()),
-                ]));
+                lines.push(ToolRow::header(name));
+                lines.push(ToolRow::args(input));
             }
             ConversationItem::ToolResult {
                 call_id,
@@ -72,22 +60,10 @@ pub(super) fn conversation_lines(
             } => {
                 let (result_state, duration) = tool_state(events, call_id, *is_error);
                 let color = result_color(result_state);
-                lines.push(Line::from(vec![
-                    Span::styled("└ ", Style::default().fg(color)),
-                    Span::styled(
-                        call_id.to_owned(),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" · {result_state:?}{}", duration_label(duration)),
-                        Style::default().fg(color),
-                    ),
-                ]));
+                let status = format!("{result_state:?}{}", duration_label(duration));
+                lines.push(ToolRow::result_footer(&status, color));
                 if collapsed_tool_outputs.contains(call_id) {
-                    lines.push(Line::from(Span::styled(
-                        "output collapsed; expand to recover",
-                        Style::default().fg(RolePalette::chrome()),
-                    )));
+                    lines.push(ToolRow::collapsed_output());
                     lines.push(Line::default());
                 } else {
                     markdown_lines(
@@ -177,24 +153,15 @@ fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::default());
 }
 
-fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
-    let body = ExpandableBody::new(if collapsed {
-        ExpandMode::Collapsed
-    } else {
-        ExpandMode::Expanded
-    });
-    let title = if body.is_visible() {
-        "Thinking"
-    } else {
-        "Thinking · collapsed"
-    };
-    lines.push(Line::from(Span::styled(
-        title,
-        Style::default()
-            .fg(RolePalette::thinking())
-            .add_modifier(Modifier::BOLD),
-    )));
-    if body.is_visible() {
+fn thinking_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    collapsed: bool,
+    streaming: bool,
+) {
+    let mode = ThinkingBlock::mode(streaming, collapsed);
+    lines.push(ThinkingBlock::title(mode));
+    if mode.shows_body() {
         markdown_lines(lines, text, Style::default().fg(RolePalette::chrome()), "");
     } else {
         lines.push(Line::default());

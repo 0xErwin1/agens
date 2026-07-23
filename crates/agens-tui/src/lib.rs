@@ -91,8 +91,20 @@ pub enum Key {
     Escape,
     /// Cancels an active turn, clears input, or arms quitting.
     CtrlC,
-    /// Collapses or expands completed tool outputs in the visible conversation.
+    /// Collapses or expands detail (thinking-first, else tool outputs).
     CtrlO,
+    /// Scrolls the transcript timeline down (composer-safe).
+    CtrlJ,
+    /// Scrolls the transcript timeline up (composer-safe).
+    CtrlK,
+    /// Jumps the transcript viewport to the top.
+    CtrlG,
+    /// Jumps the transcript viewport to the bottom.
+    CtrlShiftG,
+    /// Jumps to the last user message in the transcript.
+    CtrlN,
+    /// Jumps to the previous user message in the transcript.
+    CtrlShiftN,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
     /// Toggles the visible dangerous-mode session state through the composition layer.
@@ -268,6 +280,8 @@ pub struct TranscriptRecord {
     scroll_offset: u16,
     collapsed_tool_outputs: BTreeSet<String>,
     collapse_thinking: bool,
+    /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+O).
+    thinking_user_pinned: bool,
     focus: TranscriptFocus,
     last_admitted_ordinal: Option<u64>,
     terminal: bool,
@@ -285,6 +299,7 @@ impl TranscriptRecord {
             scroll_offset: 0,
             collapsed_tool_outputs: BTreeSet::new(),
             collapse_thinking: false,
+            thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
             last_admitted_ordinal: None,
             terminal: false,
@@ -1408,6 +1423,7 @@ fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
 
 fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
     let mut transcript = transcript_provenance(state);
+    let thinking_streaming = state.running;
     transcript.extend(
         state
             .completed_conversations
@@ -1418,6 +1434,7 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
                     &[],
                     state.collapsed_tool_outputs,
                     state.collapse_thinking,
+                    false,
                 )
             })
             .collect::<Vec<_>>(),
@@ -1428,6 +1445,7 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
             state.runtime_events,
             state.collapsed_tool_outputs,
             state.collapse_thinking,
+            thinking_streaming,
         ));
     }
     let conversation_is_authoritative =
@@ -1443,23 +1461,25 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
 }
 
 fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
-    let owner = match state.active_transcript {
-        TranscriptId::Main => "Main · primary conversation".to_owned(),
-        TranscriptId::Subagent(id) => format!("Subagent {id} · {}", state.owner_label),
-    };
-    vec![
-        Line::styled(
-            owner,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "g select · m Main · h/l sibling",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Line::default(),
-    ]
+    match state.active_transcript {
+        TranscriptId::Main => {
+            // Quiet main provenance: no debug "primary conversation" chrome.
+            Vec::new()
+        }
+        TranscriptId::Subagent(id) => vec![
+            Line::styled(
+                format!("Subagent {id} · {}", state.owner_label),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "g select · m Main · h/l sibling",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Line::default(),
+        ],
+    }
 }
 
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
@@ -1640,7 +1660,9 @@ where
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
-        self.active_record_mut().collapse_thinking = collapse;
+        let record = self.active_record_mut();
+        record.collapse_thinking = collapse;
+        record.thinking_user_pinned = !collapse;
     }
 
     pub fn set_agent_catalog<I, S>(&mut self, eligible: I)
@@ -1699,6 +1721,7 @@ where
 
     /// Updates active-turn state after the composition layer starts or finishes a turn.
     pub fn set_running(&mut self, running: bool) {
+        let finishing = self.running && !running;
         self.running = running;
         if running {
             self.palette_open = false;
@@ -1711,6 +1734,22 @@ where
             self.turn_state = None;
             self.active_tool = None;
         }
+        if finishing {
+            self.auto_collapse_thinking_on_finish();
+        }
+    }
+
+    fn auto_collapse_thinking_on_finish(&mut self) {
+        let record = self.active_record_mut();
+        let mode = if record.thinking_user_pinned {
+            widgets::ExpandMode::Expanded
+        } else if record.collapse_thinking {
+            widgets::ExpandMode::Collapsed
+        } else {
+            widgets::ExpandMode::Streaming
+        };
+        record.collapse_thinking =
+            matches!(mode.finish_stream(), widgets::ExpandMode::Collapsed);
     }
 
     /// Supplies concise provider, model, and active-session context for the terminal surface.
@@ -1747,7 +1786,12 @@ where
         self.latest_usage = None;
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
         self.conversation = Some(Conversation::new(prompt));
-        self.active_record_mut().collapsed_tool_outputs.clear();
+        {
+            let record = self.active_record_mut();
+            record.collapsed_tool_outputs.clear();
+            record.collapse_thinking = false;
+            record.thinking_user_pinned = false;
+        }
         self.set_running(true);
     }
 
@@ -1936,15 +1980,23 @@ where
                 self.set_running(false);
             }
             TuiProviderOutcome::Failed { message, action } => {
+                let finishing = self.running;
                 self.running = false;
                 self.turn_state = Some(TurnState::Failed);
                 self.active_tool = None;
+                if finishing {
+                    self.auto_collapse_thinking_on_finish();
+                }
                 self.add_error(message, action);
             }
             TuiProviderOutcome::Cancelled { message, action } => {
+                let finishing = self.running;
                 self.running = false;
                 self.turn_state = Some(TurnState::Cancelled);
                 self.active_tool = None;
+                if finishing {
+                    self.auto_collapse_thinking_on_finish();
+                }
                 self.add_error(message, action);
             }
             TuiProviderOutcome::Backgrounded => self.set_running(false),
@@ -1978,7 +2030,6 @@ where
         self.transcript.clear();
         self.completed_conversations = conversations;
         self.conversation = None;
-        self.active_record_mut().collapsed_tool_outputs.clear();
         self.runtime_events.clear();
         self.turn_duration = None;
         self.latest_usage = None;
@@ -1986,9 +2037,14 @@ where
         self.turn_state = None;
         self.active_tool = None;
         self.clear_current_session_transcripts();
-        self.active_record_mut()
-            .collapsed_tool_outputs
-            .extend(completed_tool_call_ids);
+        {
+            let record = self.active_record_mut();
+            record.collapsed_tool_outputs.clear();
+            record.collapsed_tool_outputs.extend(completed_tool_call_ids);
+            // Restored history is finished: collapse thinking unless the user re-expands.
+            record.collapse_thinking = true;
+            record.thinking_user_pinned = false;
+        }
         Ok(())
     }
 
@@ -2074,10 +2130,14 @@ where
         match &event {
             TuiRuntimeEvent::TurnStarted => self.turn_state = Some(TurnState::Requesting),
             TuiRuntimeEvent::TurnEnded { status, duration } => {
+                let finishing = self.running;
                 self.running = false;
                 self.turn_state = Some(*status);
                 self.turn_duration = *duration;
                 self.active_tool = None;
+                if finishing {
+                    self.auto_collapse_thinking_on_finish();
+                }
             }
             TuiRuntimeEvent::Usage(usage) => self.latest_usage = Some(usage.clone()),
             TuiRuntimeEvent::Diff { lines, .. } => {
@@ -2139,6 +2199,18 @@ where
                 .expect("admitted child event has a transcript")
                 .collapsed_tool_outputs
                 .insert(call_id);
+        }
+        if matches!(
+            &event.update,
+            bridge::TuiSubagentUpdate::Terminal { .. }
+        ) {
+            let record = self
+                .transcripts
+                .get_mut(&TranscriptId::Subagent(event.id))
+                .expect("admitted child event has a transcript");
+            if !record.thinking_user_pinned {
+                record.collapse_thinking = true;
+            }
         }
 
         self.conversation
@@ -2206,6 +2278,7 @@ where
                 scroll_offset: 0,
                 collapsed_tool_outputs: BTreeSet::new(),
                 collapse_thinking: false,
+                thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
                 last_admitted_ordinal: None,
                 terminal: false,
@@ -2508,9 +2581,13 @@ where
             }
             TurnEvent::StateChanged(TurnState::Completed) => self.set_running(false),
             TurnEvent::StateChanged(state @ (TurnState::Cancelled | TurnState::Failed)) => {
+                let finishing = self.running;
                 self.running = false;
                 self.turn_state = Some(state);
                 self.active_tool = None;
+                if finishing {
+                    self.auto_collapse_thinking_on_finish();
+                }
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
             _ => {}
@@ -2624,7 +2701,31 @@ where
 
         match key {
             Key::CtrlO => {
-                self.toggle_tool_output_expansion();
+                self.toggle_detail_expansion();
+                Action::Render
+            }
+            Key::CtrlJ => {
+                self.scroll_down(3);
+                Action::Render
+            }
+            Key::CtrlK => {
+                self.scroll_up(3);
+                Action::Render
+            }
+            Key::CtrlG => {
+                self.scroll_to_start();
+                Action::Render
+            }
+            Key::CtrlShiftG => {
+                self.scroll_to_end();
+                Action::Render
+            }
+            Key::CtrlN => {
+                self.jump_to_user_message(false);
+                Action::Render
+            }
+            Key::CtrlShiftN => {
+                self.jump_to_user_message(true);
                 Action::Render
             }
             Key::PageUp => {
@@ -3133,6 +3234,91 @@ where
             .and_then(|entry| entry.dialog_id.clone())
     }
 
+    /// Shared Ctrl+O detail path: expand/collapse finished thinking first, else tool outputs.
+    fn toggle_detail_expansion(&mut self) {
+        if self.has_finished_thinking() {
+            let thinking_collapsed = self
+                .transcripts
+                .get(&self.active_transcript)
+                .expect("active transcript always exists")
+                .collapse_thinking;
+            if thinking_collapsed {
+                self.toggle_thinking_expansion();
+                return;
+            }
+
+            let has_completed_tools = self.completed_tool_call_ids().next().is_some();
+            if !has_completed_tools {
+                self.toggle_thinking_expansion();
+                return;
+            }
+        }
+        self.toggle_tool_output_expansion();
+    }
+
+    fn completed_tool_call_ids(&self) -> impl Iterator<Item = String> + '_ {
+        let active = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
+        let (completed, conversation): (&[Conversation], Option<&Conversation>) =
+            if self.active_transcript == TranscriptId::Main {
+                (
+                    self.completed_conversations.as_slice(),
+                    self.conversation.as_ref(),
+                )
+            } else {
+                (
+                    active.completed_conversations.as_slice(),
+                    active.conversation.as_ref(),
+                )
+            };
+        completed
+            .iter()
+            .chain(conversation)
+            .flat_map(|conversation| &conversation.tool_batches)
+            .flat_map(|batch| &batch.calls)
+            .filter(|call| call.result.is_some())
+            .map(|call| call.call_id.clone())
+    }
+
+    fn has_finished_thinking(&self) -> bool {
+        if self.running {
+            return false;
+        }
+        let active = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
+        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
+            (
+                self.completed_conversations.as_slice(),
+                self.conversation.as_ref(),
+            )
+        } else {
+            (
+                active.completed_conversations.as_slice(),
+                active.conversation.as_ref(),
+            )
+        };
+        completed
+            .iter()
+            .chain(conversation)
+            .any(|conversation| !conversation.reasoning.is_empty())
+    }
+
+    fn toggle_thinking_expansion(&mut self) {
+        let record = self.active_record_mut();
+        let current = widgets::ExpandableBody::new(if record.collapse_thinking {
+            widgets::ExpandMode::Collapsed
+        } else {
+            widgets::ExpandMode::Expanded
+        });
+        let next = current.toggle_detail();
+        record.collapse_thinking = !next.is_visible();
+        record.thinking_user_pinned = next.is_visible();
+    }
+
     fn toggle_tool_output_expansion(&mut self) {
         let active = self
             .transcripts
@@ -3168,6 +3354,60 @@ where
             for call_id in completed_call_ids {
                 collapsed.remove(&call_id);
             }
+        }
+    }
+
+    fn jump_to_user_message(&mut self, previous: bool) {
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let layout = screen_layout(area, &self.input);
+        let content_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .max(1);
+        let lines = rendered_transcript(&self.view());
+        let mut user_offsets = Vec::new();
+        let mut row = 0usize;
+        for line in &lines {
+            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            if text == "You" {
+                user_offsets.push(saturating_u16(row));
+            }
+            row += line.width().div_ceil(usize::from(content_width)).max(1);
+        }
+        if user_offsets.is_empty() {
+            return;
+        }
+
+        let current = {
+            let record = self
+                .transcripts
+                .get(&self.active_transcript)
+                .expect("active transcript always exists");
+            if record.following_bottom {
+                self.max_scroll_offset()
+            } else {
+                record.scroll_offset
+            }
+        };
+
+        let target = if previous {
+            user_offsets
+                .iter()
+                .rev()
+                .find(|offset| **offset < current)
+                .copied()
+                .or_else(|| user_offsets.first().copied())
+        } else {
+            user_offsets.last().copied()
+        };
+
+        if let Some(offset) = target {
+            let bottom = self.max_scroll_offset();
+            let record = self.active_record_mut();
+            record.following_bottom = false;
+            record.scroll_offset = offset.min(bottom);
+            record.focus = TranscriptFocus::Viewport;
         }
     }
 
@@ -3752,6 +3992,30 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
         }
+        (KeyCode::Char('j' | 'J'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlJ
+        }
+        (KeyCode::Char('k' | 'K'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlK
+        }
+        (KeyCode::Char('g'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftG
+        }
+        (KeyCode::Char('G'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftG,
+        (KeyCode::Char('g' | 'G'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlG
+        }
+        (KeyCode::Char('n'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftN
+        }
+        (KeyCode::Char('N'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftN,
+        (KeyCode::Char('n' | 'N'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlN
+        }
         (KeyCode::Char('a'), modifiers)
             if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
         {
@@ -3772,9 +4036,6 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         }
         (KeyCode::Char('u' | 'U'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::DeleteToLineStart
-        }
-        (KeyCode::Char('k' | 'K'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-            Key::DeleteToLineEnd
         }
         (KeyCode::Char('a' | 'A'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::LineStart
@@ -4176,7 +4437,12 @@ mod runtime_tests {
             (KeyCode::Enter, KeyModifiers::SHIFT, Key::ShiftEnter),
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
             (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
-            (KeyCode::Char('k'), ctrl, Key::DeleteToLineEnd),
+            (KeyCode::Char('j'), ctrl, Key::CtrlJ),
+            (KeyCode::Char('k'), ctrl, Key::CtrlK),
+            (KeyCode::Char('g'), ctrl, Key::CtrlG),
+            (KeyCode::Char('G'), ctrl, Key::CtrlShiftG),
+            (KeyCode::Char('n'), ctrl, Key::CtrlN),
+            (KeyCode::Char('N'), ctrl, Key::CtrlShiftN),
             (KeyCode::Char('a'), ctrl, Key::LineStart),
             (KeyCode::Char('e'), ctrl, Key::LineEnd),
             (KeyCode::Char('b'), ctrl, Key::CtrlB),
@@ -4227,7 +4493,8 @@ mod runtime_tests {
         assert_eq!(tui.input(), "café!");
 
         press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
-        press(&mut tui, KeyCode::Char('k'), KeyModifiers::CONTROL);
+        // Ctrl+k is timeline scroll; kill-to-end remains available as DeleteToLineEnd.
+        tui.handle(Event::Key(Key::DeleteToLineEnd));
         assert_eq!(tui.input(), "");
         tui.handle(map_event(CrosstermEvent::Paste("café!".into())).unwrap());
 

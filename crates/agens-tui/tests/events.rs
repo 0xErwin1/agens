@@ -624,6 +624,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     assert!(!parent.contains("Subagent tool execution failed."));
 
     tui.select_transcript(TranscriptId::Subagent(7));
+    // Thinking-first detail path, then tool outputs.
+    tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = renderer
@@ -637,8 +639,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     let expected_child_rows = [
         "child-reasoning",
         "child-partial",
-        "call-a",
-        "call-b",
+        "native::read",
+        "native::glob",
         "result-b",
         "result-a",
         "Subagent tool execution failed.",
@@ -653,6 +655,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         row_positions.windows(2).all(|rows| rows[0] < rows[1]),
         "child rows did not preserve source order: {expected_child_rows:?}",
     );
+    assert!(!child.contains("call-a"), "{child:?}");
+    assert!(!child.contains("call-b"), "{child:?}");
     assert!(!child.contains("late-child"));
     assert!(!child.contains("duplicate-final"));
 }
@@ -2370,4 +2374,102 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(failed.contains("Failed"));
+}
+
+#[test]
+fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 48,
+        height: 12,
+    });
+
+    tui.begin_submission("first-user-message-anchor");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "assistant-block-one\n".repeat(30),
+    )));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done-one".into()));
+
+    tui.begin_submission("second-user-message-anchor");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "assistant-block-two\n".repeat(30),
+    )));
+    tui.finish_provider_turn(TuiProviderOutcome::Completed("done-two".into()));
+
+    // Plain j/k remain insert characters in the composer.
+    assert_eq!(tui.handle(Event::Key(Key::Char('j'))), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('k'))), Action::Render);
+    assert_eq!(tui.input(), "jk");
+    assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+
+    let before_scroll = tui.view().scroll_offset;
+    assert_eq!(tui.handle(Event::Key(Key::CtrlK)), Action::Render);
+    assert!(
+        !tui.view().following_bottom || tui.view().scroll_offset < before_scroll
+            || tui.view().scroll_offset > 0
+            || !tui.view().following_bottom,
+        "Ctrl+k must scroll the timeline up"
+    );
+    assert!(!tui.view().following_bottom);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.input(), "jk");
+
+    let after_up = tui.view().scroll_offset;
+    assert_eq!(tui.handle(Event::Key(Key::CtrlJ)), Action::Render);
+    assert!(
+        tui.view().scroll_offset >= after_up || tui.view().following_bottom,
+        "Ctrl+j must scroll the timeline down"
+    );
+    assert_eq!(tui.input(), "jk");
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlG)), Action::Render);
+    assert_eq!(tui.view().scroll_offset, 0);
+    assert!(!tui.view().following_bottom);
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlShiftG)), Action::Render);
+    assert!(tui.view().following_bottom);
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlN)), Action::Render);
+    let last_user_offset = tui.view().scroll_offset;
+    assert!(!tui.view().following_bottom);
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlShiftN)), Action::Render);
+    let previous_user_offset = tui.view().scroll_offset;
+    assert!(
+        previous_user_offset <= last_user_offset,
+        "Ctrl+N jumps toward an earlier user message ({previous_user_offset} <= {last_user_offset})"
+    );
+    assert_eq!(tui.input(), "jk");
+}
+
+#[test]
+fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(7, "reviewer", "task", TuiExecutionState::ForegroundRunning),
+    ));
+    start_child(&mut tui, 8);
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(8, "writer", "task", TuiExecutionState::ForegroundRunning),
+    ));
+
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert!(tui.view().dialog.is_some());
+    tui.handle(Event::Key(Key::Escape));
+
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    tui.handle(Event::Key(Key::Char('h')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::Char('m')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+
+    // Ctrl timeline keys must not steal plain owner navigation characters.
+    tui.handle(Event::Key(Key::Char('j')));
+    assert_eq!(tui.input(), "j");
 }

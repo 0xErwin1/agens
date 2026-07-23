@@ -19,13 +19,11 @@ impl ExpandMode {
     }
 
     /// Mode when a stream starts (thinking/assistant detail).
-    #[allow(dead_code)]
     pub(crate) const fn begin_stream() -> Self {
         Self::Streaming
     }
 
     /// Auto-collapse when streaming finishes. User-pinned Expanded is preserved.
-    #[allow(dead_code)]
     pub(crate) const fn finish_stream(self) -> Self {
         match self {
             Self::Streaming => Self::Collapsed,
@@ -34,7 +32,6 @@ impl ExpandMode {
     }
 
     /// Shared Ctrl+O detail path. Streaming is left alone (still live).
-    #[allow(dead_code)]
     pub(crate) const fn toggle_detail(self) -> Self {
         match self {
             Self::Collapsed => Self::Expanded,
@@ -59,14 +56,12 @@ impl ExpandableBody {
         self.mode.shows_body()
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn finish_stream(self) -> Self {
         Self {
             mode: self.mode.finish_stream(),
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) const fn toggle_detail(self) -> Self {
         Self {
             mode: self.mode.toggle_detail(),

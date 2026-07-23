@@ -320,8 +320,10 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     for expected in [
         "inspect the workspace",
         "inspect typed events",
-        "native::read · read-1",
-        "native::grep · grep-2",
+        "native::read",
+        "native::grep",
+        "src/lib.rs",
+        "needle",
         "read preview",
         "grep preview",
         "Success · 12ms",
@@ -332,6 +334,8 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     ] {
         assert_eq!(text.matches(expected).count(), 1, "{expected}: {text:?}");
     }
+    assert!(!text.contains("native::read · read-1"), "{text:?}");
+    assert!(!text.contains("native::grep · grep-2"), "{text:?}");
 }
 
 #[test]
@@ -438,6 +442,9 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             },
         ])
         .unwrap();
+        // Finished restored history: thinking-first, then tools.
+        tui.handle(Event::Key(Key::CtrlO));
+        tui.handle(Event::Key(Key::CtrlO));
     } else {
         tui.begin_submission("USER_BODY");
         tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
@@ -454,9 +461,10 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             is_error: false,
         }));
         tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(markdown)));
+        // Live turn: Ctrl+O expands tools while thinking stays streaming-expanded.
+        tui.handle(Event::Key(Key::CtrlO));
     }
 
-    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
@@ -481,7 +489,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
 }
 
 #[test]
-fn thinking_renders_markdown_expanded_by_default_and_honors_collapse_setting() {
+fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     let terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
@@ -490,25 +498,82 @@ fn thinking_renders_markdown_expanded_by_default_and_honors_collapse_setting() {
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
         "**THOUGHTTOKEN**\n\n- inspect\n- verify".into(),
     )));
-    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
 
     renderer.render(tui.view()).unwrap();
-    let expanded = rendered_text(&renderer);
-    assert_eq!(expanded.matches("Thinking").count(), 1, "{expanded:?}");
-    assert!(!expanded.contains("THINKING"), "{expanded:?}");
-    assert!(!expanded.contains("**"), "{expanded:?}");
-    assert!(expanded.contains("THOUGHTTOKEN"), "{expanded:?}");
+    let streaming = rendered_text(&renderer);
+    assert_eq!(streaming.matches("Thinking").count(), 1, "{streaming:?}");
+    assert!(!streaming.contains("Thinking · collapsed"), "{streaming:?}");
+    assert!(streaming.contains("THOUGHTTOKEN"), "{streaming:?}");
+    assert!(!streaming.contains("**"), "{streaming:?}");
     assert!(
         cell_for_text(&renderer, "THOUGHTTOKEN")
             .modifier
             .contains(Modifier::BOLD)
     );
 
-    tui.set_collapse_thinking(true);
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
     assert!(collapsed.contains("Thinking · collapsed"), "{collapsed:?}");
     assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
+    assert!(tui.view().collapse_thinking);
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let reexpanded = rendered_text(&renderer);
+    assert!(reexpanded.contains("THOUGHTTOKEN"), "{reexpanded:?}");
+    assert!(!reexpanded.contains("Thinking · collapsed"), "{reexpanded:?}");
+    assert!(!tui.view().collapse_thinking);
+
+    // Pin: a later finish path must not re-collapse user-expanded thinking.
+    tui.set_running(true);
+    tui.set_running(false);
+    assert!(!tui.view().collapse_thinking);
+    renderer.render(tui.view()).unwrap();
+    let pinned = rendered_text(&renderer);
+    assert!(pinned.contains("THOUGHTTOKEN"), "{pinned:?}");
+}
+
+#[test]
+fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "src/lib.rs".into(),
+    })
+    .unwrap();
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "read-1".into(),
+        output: "secret-tool-body-sentinel".into(),
+        is_error: false,
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("native::read"), "{text:?}");
+    assert!(text.contains("src/lib.rs"), "{text:?}");
+    assert!(text.contains("output collapsed"), "{text:?}");
+    assert!(!text.contains("secret-tool-body-sentinel"), "{text:?}");
+    assert!(
+        !text.contains("native::read · read-1"),
+        "call_id must stay off the scan path: {text:?}"
+    );
+    assert!(
+        !text.contains("┌ read-1"),
+        "call_id must not be the primary result label: {text:?}"
+    );
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(expanded.contains("secret-tool-body-sentinel"), "{expanded:?}");
+    assert!(expanded.contains("native::read"), "{expanded:?}");
+    assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
 }
 
 #[test]
@@ -675,9 +740,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     for expected in [
         "final markdown",
         "inspect every changed line",
-        "native::read · read-1",
+        "native::read",
+        "src/render.rs",
         "read result",
-        "native::write · write-2",
+        "native::write",
         "write result",
         "12ms",
         "8 + new line",
@@ -692,9 +758,11 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(!text.contains("**"), "{text:?}");
     assert!(!text.contains("```"), "{text:?}");
+    assert!(!text.contains("native::read · read-1"), "{text:?}");
+    assert!(!text.contains("native::write · write-2"), "{text:?}");
     assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
     assert_eq!(text.matches("Error").count(), 1, "{text:?}");
-    assert!(text.find("read-1").unwrap() < text.find("write-2").unwrap());
+    assert!(text.find("native::read").unwrap() < text.find("native::write").unwrap());
 }
 
 #[test]
@@ -854,13 +922,16 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
     for expected in [
         "first-user-sentinel",
         "first-reasoning-sentinel",
-        "first-call",
+        "native::read",
+        "first-input",
         "first-result-sentinel",
         "first-answer-sentinel",
     ] {
         assert!(history.contains(expected), "missing {expected:?}");
     }
+    assert!(!history.contains("first-call"), "{history:?}");
 
+    // While the next turn is streaming, Ctrl+O targets tools (thinking is live).
     tui.handle(Event::Key(Key::CtrlO));
     let mut collapsed = String::new();
     for _ in 0..30 {
@@ -953,16 +1024,19 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
         message(Role::Assistant, text("second answer")),
     ];
     tui.replace_history(&messages).unwrap();
+    // Thinking-first then tools for restored finished history.
+    tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    let order = "first user|first reasoning|read · c1|first answer|first result|persisted reminder|second user|second answer";
+    let order = "first user|first reasoning|read|first answer|first result|persisted reminder|second user|second answer";
     let mut offset = 0;
     for expected in order.split('|') {
         let position = text[offset..].find(expected).expect(expected);
         offset += position + expected.len();
     }
+    assert!(!text.contains("read · c1"), "{text:?}");
     assert_eq!(text.matches("You").count(), 2, "{text:?}");
     assert_eq!(text.matches("Thinking").count(), 1, "{text:?}");
     for label in ["USER", "ASSISTANT", "THINKING"] {
@@ -1720,7 +1794,10 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
 
     renderer.render(tui.view()).unwrap();
     let main = rendered_text(&renderer);
-    assert!(main.contains("Main · primary conversation"), "{main:?}");
+    assert!(
+        !main.contains("Main · primary conversation"),
+        "main provenance should be quiet: {main:?}"
+    );
     assert!(main.contains("Subagent 7 · reviewer"), "{main:?}");
     for child_row in [
         "child-reasoning-sentinel",
@@ -1737,6 +1814,8 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     }
 
     tui.select_transcript(TranscriptId::Subagent(7));
+    // Ctrl+O is thinking-first, then tools.
+    tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = rendered_text(&renderer);
