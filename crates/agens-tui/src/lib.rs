@@ -804,12 +804,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         render_header(frame, layout.header, &state, layout.show_context);
     }
 
-    let transcript = rendered_transcript(&state);
-    let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
     let transcript_width = layout
         .transcript
         .width
         .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
+    let transcript = rendered_transcript(&state, transcript_width);
+    let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
     let bottom_scroll =
         saturating_u16(transcript_rows(&transcript, transcript_width).saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
@@ -1430,7 +1430,7 @@ fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
         .sum()
 }
 
-fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
+fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'static>> {
     let mut transcript = transcript_provenance(state);
     let thinking_streaming = state.running;
     transcript.extend(
@@ -1444,6 +1444,7 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
                     state.collapsed_tool_outputs,
                     state.collapse_thinking,
                     false,
+                    content_width,
                 )
             })
             .collect::<Vec<_>>(),
@@ -1455,6 +1456,7 @@ fn rendered_transcript(state: &ViewState<'_>) -> Vec<Line<'static>> {
             state.collapsed_tool_outputs,
             state.collapse_thinking,
             thinking_streaming,
+            content_width,
         ));
     }
     let conversation_is_authoritative =
@@ -2954,13 +2956,14 @@ where
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let layout = screen_layout(area, &self.input);
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
+        let content_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
         saturating_u16(
             transcript_rows(
-                &rendered_transcript(&self.view()),
-                layout
-                    .transcript
-                    .width
-                    .saturating_sub(TRANSCRIPT_CONTENT_INDENT),
+                &rendered_transcript(&self.view(), content_width),
+                content_width,
             )
             .saturating_sub(visible_rows),
         )
@@ -3421,7 +3424,7 @@ where
             .width
             .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
             .max(1);
-        let lines = rendered_transcript(&self.view());
+        let lines = rendered_transcript(&self.view(), content_width);
         let mut user_offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
@@ -3430,7 +3433,7 @@ where
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            if text == "You" {
+            if text.starts_with('❯') {
                 user_offsets.push(saturating_u16(row));
             }
             row += line.width().div_ceil(usize::from(content_width)).max(1);

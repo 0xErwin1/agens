@@ -23,8 +23,10 @@ pub(super) fn conversation_lines(
     collapsed_tool_outputs: &BTreeSet<String>,
     collapse_thinking: bool,
     thinking_streaming: bool,
+    content_width: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let content_width = usize::from(content_width.max(1));
 
     for item in &conversation.items {
         match item {
@@ -36,11 +38,18 @@ pub(super) fn conversation_lines(
                     text,
                     Style::default().fg(RolePalette::assistant()),
                     "",
+                    content_width,
                 );
                 lines.push(Line::default());
             }
             ConversationItem::Reasoning(text) => {
-                thinking_lines(&mut lines, text, collapse_thinking, thinking_streaming);
+                thinking_lines(
+                    &mut lines,
+                    text,
+                    collapse_thinking,
+                    thinking_streaming,
+                    content_width,
+                );
             }
             ConversationItem::ToolCall {
                 call_id: _,
@@ -82,6 +91,7 @@ pub(super) fn conversation_lines(
                         &bounded_visible_tool_output(output),
                         Style::default().fg(RolePalette::chrome()),
                         "",
+                        content_width,
                     );
                 }
             }
@@ -184,11 +194,23 @@ fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::default());
 }
 
-fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool, streaming: bool) {
+fn thinking_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    collapsed: bool,
+    streaming: bool,
+    content_width: usize,
+) {
     let mode = ThinkingBlock::mode(streaming, collapsed);
     lines.push(ThinkingBlock::title(mode));
     if mode.shows_body() {
-        markdown_lines(lines, text, Style::default().fg(RolePalette::chrome()), "");
+        markdown_lines(
+            lines,
+            text,
+            Style::default().fg(RolePalette::chrome()),
+            "",
+            content_width,
+        );
     } else {
         lines.push(Line::default());
     }
@@ -246,12 +268,18 @@ pub(super) fn detail_lines(
     lines
 }
 
-fn markdown_lines(lines: &mut Vec<Line<'static>>, markdown: &str, base_style: Style, prefix: &str) {
+fn markdown_lines(
+    lines: &mut Vec<Line<'static>>,
+    markdown: &str,
+    base_style: Style,
+    prefix: &str,
+    content_width: usize,
+) {
     if markdown.is_empty() {
         return;
     }
 
-    lines.extend(MarkdownRenderer::new(base_style, prefix).render(markdown));
+    lines.extend(MarkdownRenderer::new(base_style, prefix, content_width).render(markdown));
     lines.push(Line::default());
 }
 
@@ -264,13 +292,16 @@ struct MarkdownRenderer {
     emphasis: usize,
     heading: Option<HeadingLevel>,
     code_block: bool,
+    /// Current line is a code panel row (body or chrome) and must pad bg to full width.
+    code_panel_line: bool,
+    content_width: usize,
     quote_depth: usize,
     lists: Vec<Option<u64>>,
     links: Vec<String>,
 }
 
 impl MarkdownRenderer {
-    fn new(base_style: Style, prefix: &str) -> Self {
+    fn new(base_style: Style, prefix: &str, content_width: usize) -> Self {
         Self {
             lines: Vec::new(),
             spans: Vec::new(),
@@ -280,6 +311,8 @@ impl MarkdownRenderer {
             emphasis: 0,
             heading: None,
             code_block: false,
+            code_panel_line: false,
+            content_width: content_width.max(1),
             quote_depth: 0,
             lists: Vec::new(),
             links: Vec::new(),
@@ -360,6 +393,7 @@ impl MarkdownRenderer {
                 };
                 self.push_code_chrome(&format!("── {language} "));
                 self.code_block = true;
+                self.code_panel_line = true;
             }
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
             Tag::Paragraph
@@ -397,7 +431,9 @@ impl MarkdownRenderer {
                 self.finish_line();
                 // Footer after clearing the body gutter flag.
                 self.code_block = false;
+                self.code_panel_line = true;
                 self.push_code_chrome("────");
+                self.code_panel_line = false;
                 self.blank_line();
             }
             TagEnd::Link => {
@@ -433,6 +469,9 @@ impl MarkdownRenderer {
                 self.finish_line();
             }
             self.start_line();
+            if self.code_block {
+                self.code_panel_line = true;
+            }
             if !segment.is_empty() {
                 self.spans.push(Span::styled(segment.to_owned(), style));
             }
@@ -484,6 +523,7 @@ impl MarkdownRenderer {
     }
 
     fn push_code_chrome(&mut self, label: &str) {
+        self.code_panel_line = true;
         self.start_line();
         self.spans.push(Span::styled(
             label.to_owned(),
@@ -496,9 +536,27 @@ impl MarkdownRenderer {
     }
 
     fn finish_line(&mut self) {
-        if !self.spans.is_empty() {
-            self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        if self.spans.is_empty() {
+            return;
         }
+        if self.code_panel_line || self.code_block {
+            self.pad_code_panel_background();
+        }
+        self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        // Keep panel flag while body is active so blank body lines still pad.
+        self.code_panel_line = self.code_block;
+    }
+
+    /// Ratatui only paints Span backgrounds under glyphs; pad spaces to fill the panel width.
+    fn pad_code_panel_background(&mut self) {
+        let used = Line::from(self.spans.clone()).width();
+        if used >= self.content_width {
+            return;
+        }
+        self.spans.push(Span::styled(
+            " ".repeat(self.content_width - used),
+            Style::default().bg(code_block_background()),
+        ));
     }
 
     fn finish_block(&mut self) {

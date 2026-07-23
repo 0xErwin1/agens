@@ -625,6 +625,48 @@ fn fenced_code_block_chrome_does_not_nest_body_gutter_on_header() {
 }
 
 #[test]
+fn fenced_code_block_background_pads_to_transcript_content_width() {
+    let width = 48_u16;
+    let terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "```bash\nshort\n```\n".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+
+    let buffer = renderer.terminal().backend().buffer();
+    let panel = Color::Rgb(0x1a, 0x1f, 0x29);
+    // Find the body row containing "short" and assert trailing cells keep panel bg.
+    let mut found_padded_row = false;
+    for y in 0..buffer.area.height {
+        let mut row = String::new();
+        for x in 0..buffer.area.width {
+            row.push_str(buffer[(x, y)].symbol());
+        }
+        if !row.contains("short") {
+            continue;
+        }
+        // Content is left-padded by transcript indent (4); panel should fill to near edge.
+        let mut panel_cells = 0u16;
+        for x in 0..buffer.area.width {
+            if buffer[(x, y)].bg == panel {
+                panel_cells += 1;
+            }
+        }
+        assert!(
+            panel_cells >= 20,
+            "code body row should paint a wide panel background, got {panel_cells} cells: {row:?}"
+        );
+        found_padded_row = true;
+        break;
+    }
+    assert!(found_padded_row, "missing code body row with 'short'");
+}
+
+#[test]
 fn renderer_renders_practical_markdown_semantics() {
     let terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
