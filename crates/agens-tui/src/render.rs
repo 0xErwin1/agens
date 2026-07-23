@@ -13,6 +13,9 @@ use std::collections::BTreeSet;
 use crate::conversation::ConversationItem;
 use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
+const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
+const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
+
 pub(super) fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
@@ -86,7 +89,12 @@ pub(super) fn conversation_lines(
                     )));
                     lines.push(Line::default());
                 } else {
-                    markdown_lines(&mut lines, output, Style::default().fg(Color::Gray), "");
+                    markdown_lines(
+                        &mut lines,
+                        &bounded_visible_tool_output(output),
+                        Style::default().fg(Color::Gray),
+                        "",
+                    );
                 }
             }
             ConversationItem::Diff(diff) => {
@@ -136,6 +144,21 @@ pub(super) fn conversation_lines(
         }
     }
     lines
+}
+
+fn bounded_visible_tool_output(output: &str) -> String {
+    if output.len() <= MAX_VISIBLE_TOOL_OUTPUT_BYTES {
+        return output.to_owned();
+    }
+
+    let content_limit =
+        MAX_VISIBLE_TOOL_OUTPUT_BYTES.saturating_sub(VISIBLE_TOOL_OUTPUT_MARKER.len());
+    let mut end = content_limit;
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    format!("{}{}", &output[..end], VISIBLE_TOOL_OUTPUT_MARKER)
 }
 
 fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {

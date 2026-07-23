@@ -1960,6 +1960,13 @@ where
         messages: &[agens_core::Message],
     ) -> Result<(), ConversationError> {
         let conversations = Conversation::from_messages(messages)?;
+        let completed_tool_call_ids = conversations
+            .iter()
+            .flat_map(|conversation| &conversation.tool_batches)
+            .flat_map(|batch| &batch.calls)
+            .filter(|call| call.result.is_some())
+            .map(|call| call.call_id.clone())
+            .collect::<Vec<_>>();
         self.transcript.clear();
         self.completed_conversations = conversations;
         self.conversation = None;
@@ -1971,6 +1978,9 @@ where
         self.turn_state = None;
         self.active_tool = None;
         self.clear_current_session_transcripts();
+        self.active_record_mut()
+            .collapsed_tool_outputs
+            .extend(completed_tool_call_ids);
         Ok(())
     }
 
@@ -2098,6 +2108,10 @@ where
     }
 
     fn apply_subagent_event(&mut self, event: &TuiSubagentEvent) {
+        let completed_tool_call = match &event.update {
+            bridge::TuiSubagentUpdate::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        };
         if let bridge::TuiSubagentUpdate::Started { agent, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
@@ -2111,6 +2125,13 @@ where
             .conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply_child_event(event.clone());
+        if let Some(call_id) = completed_tool_call {
+            self.transcripts
+                .get_mut(&TranscriptId::Subagent(event.id))
+                .expect("admitted child event has a transcript")
+                .collapsed_tool_outputs
+                .insert(call_id);
+        }
 
         self.conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
@@ -2215,9 +2236,19 @@ where
         &mut self,
         event: ConversationEvent,
     ) -> Result<(), ConversationError> {
+        let completed_tool_call = match &event {
+            ConversationEvent::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        };
         self.conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
-            .apply(event)
+            .apply(event)?;
+        if let Some(call_id) = completed_tool_call {
+            self.active_record_mut()
+                .collapsed_tool_outputs
+                .insert(call_id);
+        }
+        Ok(())
     }
 
     /// Opens a generic bounded dialog without changing the underlying conversation.

@@ -153,6 +153,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(markdown)));
     }
 
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
@@ -364,6 +365,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         context_window: Some(128),
     }));
 
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
@@ -441,8 +443,6 @@ fn renderer_recovers_collapsed_long_tool_output_in_a_bounded_viewport() {
         is_error: false,
     })
     .unwrap();
-    tui.handle(Event::Key(Key::CtrlO));
-
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
     assert!(collapsed.contains("output collapsed"), "{collapsed:?}");
@@ -485,6 +485,7 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
     })
     .unwrap();
 
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("output-end-sentinel"));
 
@@ -647,6 +648,7 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
         message(Role::Assistant, text("second answer")),
     ];
     tui.replace_history(&messages).unwrap();
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
@@ -1034,6 +1036,7 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         context_window: Some(128),
     }));
 
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = renderer
         .terminal()
@@ -1331,6 +1334,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     }
 
     tui.select_transcript(TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = rendered_text(&renderer);
     assert!(child.contains("Subagent 7 · reviewer"), "{child:?}");

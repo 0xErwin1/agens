@@ -277,11 +277,11 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     assert_eq!(tui.input(), "");
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     tui.set_collapse_thinking(true);
-    tui.handle(Event::Key(Key::PageUp));
     tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::PageUp));
     assert!(tui.view().collapse_thinking);
     assert!(tui.view().scroll_offset > 0);
-    assert!(tui.view().collapsed_tool_outputs.contains("seven"));
+    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
     tui.handle(Event::Key(Key::Home));
     let child_seven_offset = tui.view().scroll_offset;
     tui.show_selection_dialog(DialogView::selection(
@@ -309,16 +309,16 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     assert_eq!(tui.input(), "m");
     tui.handle(Event::Key(Key::Char('l')));
-    tui.handle(Event::Key(Key::PageUp));
     tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
     assert_ne!(child_eight_offset, child_seven_offset);
-    assert!(tui.view().collapsed_tool_outputs.contains("eight"));
+    assert!(!tui.view().collapsed_tool_outputs.contains("eight"));
     assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
 
     tui.handle(Event::Key(Key::Char('h')));
     assert_eq!(tui.view().scroll_offset, child_seven_offset);
-    assert!(tui.view().collapsed_tool_outputs.contains("seven"));
+    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
 
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
         TuiSubagentEvent::started(
@@ -407,8 +407,8 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     tui.handle(Event::Key(Key::Escape));
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::PageUp));
     tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::PageUp));
     let child_seven = (
         tui.view().following_bottom,
         tui.view().scroll_offset,
@@ -421,8 +421,8 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
     assert!(tui.view().following_bottom);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
-    tui.handle(Event::Key(Key::PageUp));
     tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
 
     tui.handle(Event::Key(Key::Char('h')));
@@ -439,10 +439,85 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
 
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().scroll_offset, child_eight_offset);
-    assert!(tui.view().collapsed_tool_outputs.contains("eight"));
+    assert!(!tui.view().collapsed_tool_outputs.contains("eight"));
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+}
+
+#[test]
+fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 48,
+        height: 12,
+    });
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "before-anchor\n".repeat(80),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "large.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: format!(
+            "visible-start\n{}\nretained-tail-sentinel",
+            "visible-middle\n".repeat(1_000)
+        ),
+        is_error: false,
+    }));
+
+    assert!(tui.view().collapsed_tool_outputs.contains("read-1"));
+    tui.handle(Event::Key(Key::PageUp));
+    let anchor = (
+        tui.view().following_bottom,
+        tui.view().scroll_offset,
+        tui.view().focus,
+    );
+    assert!(!anchor.0);
+    assert!(anchor.1 > 0);
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(
+        (
+            tui.view().following_bottom,
+            tui.view().scroll_offset,
+            tui.view().focus,
+        ),
+        anchor
+    );
+    assert!(!tui.view().collapsed_tool_outputs.contains("read-1"));
+    assert!(
+        tui.view().conversation.unwrap().tool_batches[0].calls[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .output
+            .contains("retained-tail-sentinel")
+    );
+
+    tui.handle(Event::Key(Key::End));
+
+    let backend = TestBackend::new(48, 12);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    renderer.render(tui.view()).unwrap();
+    let expanded = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(expanded.contains("visible output truncated"));
+    assert!(!expanded.contains("retained-tail-sentinel"));
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert!(tui.view().collapsed_tool_outputs.contains("read-1"));
 }
 
 #[test]
@@ -549,6 +624,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     assert!(!parent.contains("Subagent tool execution failed."));
 
     tui.select_transcript(TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = renderer
         .terminal()
