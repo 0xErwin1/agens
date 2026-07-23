@@ -3042,6 +3042,12 @@ fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
     .with_empty_message("No MCP servers configured.")
 }
 
+fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap: &Bootstrap) {
+    if let Some(project_root) = bootstrap.project_root() {
+        tui.set_project(project_root.display().to_string());
+    }
+}
+
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
@@ -3050,6 +3056,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         cancellation: Arc::clone(&cancellation),
     };
     let mut tui = Tui::new(engine);
+    configure_tui_project_identity(&mut tui, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     let skills = start_tui_skills(&mut tui, bootstrap)?;
     if let Some(identifier) = resume {
@@ -7930,6 +7937,79 @@ mod tests {
         reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
 
         assert_eq!(context, TuiSessionContext::fresh());
+    }
+
+    #[test]
+    fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()
+     {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-u18-project-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temporary);
+        let project_root = temporary.join("non-agens-project");
+        std::fs::create_dir_all(project_root.join(".git")).unwrap();
+        let config_home = temporary.join("config");
+        let project_bootstrap = bootstrap(&CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                format!(
+                    "[options]\ndata_dir = \"{}\"\n",
+                    temporary.join("data").display()
+                ),
+            )]),
+        ))
+        .unwrap();
+        let project = project_root.display().to_string();
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+
+        configure_tui_project_identity(&mut tui, &project_bootstrap);
+        assert_eq!(tui.view().project, project);
+        tui.set_presentation("openai-api", "gpt-4.1", "new session");
+        let new_session_header = render_tui_test_backend(&tui, 120, 24);
+        assert!(
+            new_session_header.contains("non-agens-project"),
+            "{new_session_header:?}"
+        );
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+            message: "Resumed session 7".into(),
+            presentation: TuiPresentation::new("openai-api", "gpt-4.1", "session #7"),
+            messages: Vec::new(),
+        });
+        let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
+        assert!(
+            resumed_session_header.contains("non-agens-project"),
+            "{resumed_session_header:?}"
+        );
+
+        let no_project_directory = temporary.join("no-project");
+        std::fs::create_dir_all(&no_project_directory).unwrap();
+        let no_project_bootstrap = bootstrap(&CliDependencies::for_test(
+            no_project_directory,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::new(),
+        ))
+        .unwrap();
+        let mut fallback_tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+
+        configure_tui_project_identity(&mut fallback_tui, &no_project_bootstrap);
+        assert_eq!(fallback_tui.view().project, "agens");
+        assert!(render_tui_test_backend(&fallback_tui, 120, 24).contains("project agens"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
