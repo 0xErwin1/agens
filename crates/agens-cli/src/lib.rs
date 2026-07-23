@@ -3207,6 +3207,20 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 &router.session,
                 Some(Arc::clone(&router.skills)),
                 |request| {
+                    let project_root = runtime_bootstrap.project_root().ok_or_else(|| {
+                        CliError::configuration("native tools require a project root")
+                    })?;
+                    let task_runtime = production_tui_task_runtime_with_runner(
+                        &runtime_bootstrap,
+                        &router.skills,
+                        prompt_bridge.clone(),
+                        ProductionTaskRunner::new(
+                            runtime_bootstrap.clone(),
+                            project_root.to_path_buf(),
+                        )
+                        .with_lifecycle_bridge(lifecycle_bridge.clone())
+                        .with_dangerous_mode(request.dangerous_mode),
+                    )?;
                     run_production_headless_chat_with_progress(
                         request,
                         &runtime_bootstrap,
@@ -5092,6 +5106,7 @@ fn default_model(bootstrap: &Bootstrap) -> &'static str {
 struct ProductionTaskRunner {
     bootstrap: Bootstrap,
     project_root: PathBuf,
+    dangerous_mode: bool,
     lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
     #[cfg(test)]
     probe: Option<ProductionTaskProbe>,
@@ -5335,6 +5350,7 @@ impl ProductionTaskRunner {
         Self {
             bootstrap,
             project_root,
+            dangerous_mode: false,
             lifecycle_bridge: None,
             #[cfg(test)]
             probe: None,
@@ -5349,11 +5365,17 @@ impl ProductionTaskRunner {
         self.lifecycle_bridge = Some(lifecycle_bridge);
         self
     }
+
+    fn with_dangerous_mode(mut self, dangerous_mode: bool) -> Self {
+        self.dangerous_mode = dangerous_mode;
+        self
+    }
     #[cfg(test)]
     fn with_probe(bootstrap: Bootstrap, project_root: PathBuf, probe: ProductionTaskProbe) -> Self {
         Self {
             bootstrap,
             project_root,
+            dangerous_mode: false,
             lifecycle_bridge: None,
             probe: Some(probe),
             progress_probe: None,
@@ -5371,6 +5393,7 @@ impl ProductionTaskRunner {
         Self {
             bootstrap,
             project_root,
+            dangerous_mode: false,
             lifecycle_bridge: None,
             probe: Some(probe),
             progress_probe: Some(progress),
@@ -5388,6 +5411,7 @@ impl ProductionTaskRunner {
         Self {
             bootstrap,
             project_root,
+            dangerous_mode: false,
             lifecycle_bridge: None,
             probe: None,
             progress_probe: None,
@@ -5485,6 +5509,7 @@ impl TaskRunner for ProductionTaskRunner {
                     request,
                     &self.bootstrap,
                     &self.project_root,
+                    self.dangerous_mode,
                     &cancellation,
                     progress.as_ref(),
                 )
@@ -5494,6 +5519,7 @@ impl TaskRunner for ProductionTaskRunner {
             request,
             &self.bootstrap,
             &self.project_root,
+            self.dangerous_mode,
             &cancellation,
             progress.as_ref(),
         );
@@ -5587,6 +5613,7 @@ fn run_production_task(
     request: TaskTurnRequest,
     bootstrap: &Bootstrap,
     project_root: &Path,
+    dangerous_mode: bool,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
 ) -> Result<String, ChildRunError> {
@@ -5601,7 +5628,8 @@ fn run_production_task(
         },
     ];
     let (provider_tools, tool_runtime) =
-        production_read_only_tool_runtime(project_root).map_err(|_| ChildRunError::Runtime)?;
+        production_child_tool_runtime(project_root, dangerous_mode)
+            .map_err(|_| ChildRunError::Runtime)?;
 
     match bootstrap.provider_type() {
         Some("openai-api") => {
@@ -5748,6 +5776,69 @@ fn production_read_only_tool_runtime(
         .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
 
     Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
+}
+
+const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 9] = [
+    "native::read",
+    "native::list",
+    "native::search",
+    "native::glob",
+    "native::grep",
+    "native::write",
+    "native::edit",
+    "native::bash",
+    "native::webfetch",
+];
+
+fn production_dangerous_child_tool_runtime(
+    project_root: &Path,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
+        NativeTools::open(project_root)
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+    )));
+    let metadata = NativeToolCatalog::metadata();
+    let mut provider_tools = Vec::with_capacity(DANGEROUS_CHILD_NATIVE_TOOLS.len());
+    let mut dispatcher = ToolDispatcher::new();
+
+    for name in DANGEROUS_CHILD_NATIVE_TOOLS {
+        let metadata = metadata
+            .iter()
+            .find(|metadata| metadata.qualified_name == name)
+            .ok_or_else(|| CliError::configuration("dangerous child native tool is unavailable"))?;
+        let model_name = native_model_tool_name(&metadata.qualified_name)?;
+        provider_tools.push(
+            OpenAiFunctionTool::new(
+                model_name,
+                metadata.description.clone(),
+                metadata.input_schema.clone(),
+            )
+            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
+        );
+        dispatcher
+            .register_native(
+                metadata.qualified_name.clone(),
+                metadata.access,
+                RegisteredNativeTool {
+                    name: metadata.qualified_name.clone(),
+                    catalog: Arc::clone(&catalog),
+                },
+            )
+            .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    }
+
+    Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
+}
+
+fn production_child_tool_runtime(
+    project_root: &Path,
+    dangerous_mode: bool,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    if dangerous_mode {
+        production_dangerous_child_tool_runtime(project_root)
+    } else {
+        production_read_only_tool_runtime(project_root)
+    }
 }
 
 struct ProductionMcpRuntime {
@@ -8035,6 +8126,89 @@ mod tests {
         });
         assert!(result.is_ok());
         assert!(!session.lock().unwrap().dangerous_mode);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn dangerous_child_catalog_is_exact_and_never_recursive() {
+        let temporary = tui_session_directory("dangerous-child-catalog");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let (provider_tools, dispatcher) =
+            production_dangerous_child_tool_runtime(&project_root).unwrap();
+        let provider_names = provider_tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_names,
+            [
+                "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch",
+            ]
+        );
+
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in [
+            "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch",
+        ] {
+            assert_eq!(
+                dispatcher.canonical_identity(name),
+                dispatcher.canonical_identity(&format!("native::{name}")),
+                "{name} must have one native dispatcher identity"
+            );
+        }
+        for rejected in [
+            "task",
+            "native::task",
+            "skill",
+            "native::skill",
+            "files::first",
+            "native::unregistered",
+        ] {
+            assert_eq!(
+                dispatcher.canonical_identity(rejected),
+                None,
+                "{rejected} must be rejected before execution"
+            );
+            assert!(
+                dispatcher
+                    .evaluate(
+                        &PermissionPolicy::new(
+                            PermissionMode::Edit,
+                            vec![PermissionRule::global(
+                                PermissionDecision::Allow,
+                                PermissionPattern::Any,
+                                PermissionPattern::Any,
+                            )],
+                        ),
+                        &[],
+                        &PermissionSession::new(),
+                        ToolDispatchRequest::new("project", rejected, serde_json::json!({})),
+                    )
+                    .is_err(),
+                "{rejected} must fail dispatcher evaluation before execution"
+            );
+        }
+        drop(dispatcher);
+
+        let (mode_off_tools, mode_off_dispatcher) =
+            production_child_tool_runtime(&project_root, false).unwrap();
+        assert_eq!(
+            mode_off_tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            ["read"]
+        );
+        assert!(
+            mode_off_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::read")
+                .is_some()
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
