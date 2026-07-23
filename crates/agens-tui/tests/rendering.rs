@@ -1335,7 +1335,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     let child = rendered_text(&renderer);
     assert!(child.contains("Subagent 7 · reviewer"), "{child:?}");
     assert!(
-        child.contains("F5 select · F6 Main · F7/F8 sibling"),
+        child.contains("g select · m Main · h/l sibling"),
         "{child:?}"
     );
     assert!(
@@ -1393,7 +1393,7 @@ fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_swi
     assert!(expired.contains("expired-child-sentinel"), "{expired:?}");
     assert!(expired.contains("expired-final-sentinel"), "{expired:?}");
 
-    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::Char('l')));
     renderer.render(tui.view()).unwrap();
     let sibling = rendered_text(&renderer);
     assert!(sibling.contains("Subagent 8 · writer"), "{sibling:?}");

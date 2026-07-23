@@ -109,10 +109,6 @@ pub enum Key {
     PageDown,
     ScrollUp,
     ScrollDown,
-    F5,
-    F6,
-    F7,
-    F8,
     Up,
     Down,
     Tab,
@@ -1465,7 +1461,7 @@ fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            "F5 select · F6 Main · F7/F8 sibling",
+            "g select · m Main · h/l sibling",
             Style::default().fg(Color::DarkGray),
         ),
         Line::default(),
@@ -2499,20 +2495,27 @@ where
         }
 
         match key {
-            Key::F5 => {
+            Key::Char('g') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.show_transcript_dialog();
                 return Action::Render;
             }
-            Key::F6 => {
+            Key::Char('m') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.select_transcript(TranscriptId::Main);
                 return Action::Render;
             }
-            Key::F7 => {
+            Key::Char('h') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.select_sibling(-1);
                 return Action::Render;
             }
-            Key::F8 => {
+            Key::Char('l') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.select_sibling(1);
+                return Action::Render;
+            }
+            Key::Char('i')
+                if self.active_transcript == TranscriptId::Main
+                    && self.active_record_mut().focus == TranscriptFocus::Viewport =>
+            {
+                self.active_record_mut().focus = TranscriptFocus::Composer;
                 return Action::Render;
             }
             Key::Home
@@ -2648,7 +2651,10 @@ where
                 self.dialog = None;
                 Action::Render
             }
-            Key::Escape => Action::Render,
+            Key::Escape => {
+                self.active_record_mut().focus = TranscriptFocus::Viewport;
+                Action::Render
+            }
             Key::CtrlC if self.running || self.has_active_execution() => self.cancel_running(),
             Key::CtrlC if !self.input.is_empty() => {
                 self.input.clear();
@@ -3763,10 +3769,6 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::End, _) => Key::End,
         (KeyCode::PageUp, _) => Key::PageUp,
         (KeyCode::PageDown, _) => Key::PageDown,
-        (KeyCode::F(5), _) => Key::F5,
-        (KeyCode::F(6), _) => Key::F6,
-        (KeyCode::F(7), _) => Key::F7,
-        (KeyCode::F(8), _) => Key::F8,
         (KeyCode::Up, _) => Key::Up,
         (KeyCode::Down, _) => Key::Down,
         (KeyCode::Tab, _) => Key::Tab,

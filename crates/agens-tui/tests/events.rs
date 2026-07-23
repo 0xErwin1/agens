@@ -259,17 +259,18 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
         ));
     }
 
-    assert_eq!(tui.handle(Event::Key(Key::F5)), Action::Render);
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
     assert!(tui.view().dialog.is_some());
     tui.handle(Event::Key(Key::Enter));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::F7));
+    tui.handle(Event::Key(Key::Char('h')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
-    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
-    tui.handle(Event::Key(Key::F6));
+    tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
     tui.select_transcript(TranscriptId::Subagent(7));
     assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
@@ -290,7 +291,8 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     ));
     tui.handle(Event::Key(Key::Escape));
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
-    tui.handle(Event::Key(Key::F6));
+    tui.handle(Event::Key(Key::Char('m')));
+    tui.handle(Event::Key(Key::Char('i')));
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
     assert!(tui.view().following_bottom);
@@ -298,14 +300,15 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
-    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('l')));
     assert!(tui.view().collapse_thinking);
     assert!(!tui.view().following_bottom);
     assert_eq!(tui.handle(Event::Paste(" blocked".into())), Action::Render);
     assert_eq!(tui.input(), "m");
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     assert_eq!(tui.input(), "m");
-    tui.handle(Event::Key(Key::F8));
+    tui.handle(Event::Key(Key::Char('l')));
     tui.handle(Event::Key(Key::PageUp));
     tui.handle(Event::Key(Key::CtrlO));
     let child_eight_offset = tui.view().scroll_offset;
@@ -313,7 +316,7 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     assert!(tui.view().collapsed_tool_outputs.contains("eight"));
     assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
 
-    tui.handle(Event::Key(Key::F7));
+    tui.handle(Event::Key(Key::Char('h')));
     assert_eq!(tui.view().scroll_offset, child_seven_offset);
     assert!(tui.view().collapsed_tool_outputs.contains("seven"));
 
@@ -342,7 +345,7 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     ));
     tui.tick(Duration::from_secs(60));
     assert!(tui.executions().iter().all(|execution| execution.id() != 7));
-    assert_eq!(tui.handle(Event::Key(Key::F5)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
 
@@ -354,8 +357,35 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
         final_result: "done".into(),
         tool_uses: 1,
     });
-    assert_eq!(restored.handle(Event::Key(Key::F5)), Action::Render);
+    restored.handle(Event::Key(Key::Escape));
+    assert_eq!(restored.handle(Event::Key(Key::Char('g'))), Action::Render);
     assert!(restored.view().dialog.is_none());
+}
+
+#[test]
+fn vim_modes_remove_all_function_key_routes() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for id in [7, 8] {
+        start_child(&mut tui, id);
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(id, "reviewer", "task", TuiExecutionState::ForegroundRunning),
+        ));
+    }
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    assert!(tui.view().dialog.is_some());
+    tui.handle(Event::Key(Key::Escape));
+
+    assert_eq!(tui.handle(Event::Key(Key::Char('l'))), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    assert_eq!(tui.handle(Event::Key(Key::Char('h'))), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    assert_eq!(tui.handle(Event::Key(Key::Char('m'))), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+
+    tui.handle(Event::Key(Key::Char('m')));
+    assert_eq!(tui.input(), "m");
 }
 
 #[test]
