@@ -754,12 +754,7 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(
-        area,
-        state.running,
-        state.selected_agent.is_some(),
-        state.executions.len(),
-    );
+    let layout = screen_layout(area, state.input);
 
     if layout.header.height > 0 {
         render_header(frame, layout.header, &state, layout.show_context);
@@ -805,10 +800,6 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .scroll((scroll, 0)),
             layout.transcript,
         );
-    }
-
-    if layout.status.height > 0 {
-        render_turn_status(frame, layout.status, &state);
     }
 
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
@@ -1158,42 +1149,43 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
 struct ScreenLayout {
     header: Rect,
     transcript: Rect,
-    status: Rect,
     composer: Rect,
     footer: Rect,
     show_context: bool,
 }
 
-fn screen_layout(
-    area: Rect,
-    running: bool,
-    has_selected_agent: bool,
-    execution_count: usize,
-) -> ScreenLayout {
-    let show_header = area.height >= 8;
-    let header_rows = 1_u16
-        .saturating_add(u16::from(has_selected_agent))
-        .saturating_add(execution_count.try_into().unwrap_or(u16::MAX))
-        .min(area.height.saturating_sub(6));
+fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+    let header_rows = u16::from(area.height >= 7);
     let show_context = area.width >= 80 && area.height > 16;
-    let show_footer = area.height >= 10;
-    let show_status = running && area.height > 16;
-    let composer_rows = if area.height < 8 { 2 } else { 3 };
+    let footer_rows = u16::from(area.height >= 12);
+    let composer_rows = match area.height {
+        0 => 0,
+        1 => 1,
+        2..=6 => 2,
+        7..=11 => 3,
+        _ => {
+            let input_lines = input.chars().filter(|character| *character == '\n').count() + 1;
+            saturating_u16(input_lines.saturating_add(2)).clamp(3, 8)
+        }
+    };
+    let transcript_rows = area
+        .height
+        .saturating_sub(header_rows)
+        .saturating_sub(composer_rows)
+        .saturating_sub(footer_rows);
     let chunks = Layout::vertical([
-        Constraint::Length(u16::from(show_header) * header_rows),
-        Constraint::Min(1),
-        Constraint::Length(u16::from(show_status)),
+        Constraint::Length(header_rows),
+        Constraint::Length(transcript_rows),
         Constraint::Length(composer_rows),
-        Constraint::Length(u16::from(show_footer)),
+        Constraint::Length(footer_rows),
     ])
     .split(area);
 
     ScreenLayout {
         header: chunks[0],
         transcript: chunks[1],
-        status: chunks[2],
-        composer: chunks[3],
-        footer: chunks[4],
+        composer: chunks[2],
+        footer: chunks[3],
         show_context,
     }
 }
@@ -1269,36 +1261,6 @@ fn execution_label(state: TuiExecutionState) -> &'static str {
         TuiExecutionState::CompletedRecent => "completed recent",
         TuiExecutionState::Failed => "failed",
         TuiExecutionState::Cancelled => "cancelled",
-    }
-}
-
-fn render_turn_status(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
-    let label = match (state.turn_state, state.active_tool) {
-        (Some(TurnState::Dispatching), Some(tool)) => {
-            format!(" {} Tool: {tool}", activity_marker(state))
-        }
-        _ => format!(
-            " {} {}",
-            activity_marker(state),
-            turn_state_label(state.turn_state, state.running)
-        ),
-    };
-    frame.render_widget(
-        Paragraph::new(label)
-            .style(Style::default().fg(turn_state_color(state.turn_state, state.running))),
-        area,
-    );
-}
-
-fn activity_marker(state: &ViewState<'_>) -> &'static str {
-    match state.turn_state {
-        Some(TurnState::Requesting) => "·",
-        Some(TurnState::Streaming) => "~",
-        Some(TurnState::Dispatching) => "*",
-        Some(TurnState::Cancelled) => "·",
-        Some(TurnState::Failed) => "!",
-        _ if state.running => "~",
-        _ => "·",
     }
 }
 
@@ -2809,12 +2771,7 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(
-            area,
-            self.running,
-            self.selected_agent.is_some(),
-            self.executions.len(),
-        );
+        let layout = screen_layout(area, &self.input);
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         saturating_u16(
             transcript_rows(
@@ -2830,16 +2787,11 @@ where
 
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(
-            area,
-            self.running,
-            self.selected_agent.is_some(),
-            self.executions.len(),
-        )
-        .transcript
-        .height
-        .saturating_sub(1)
-        .max(1)
+        screen_layout(area, &self.input)
+            .transcript
+            .height
+            .saturating_sub(1)
+            .max(1)
     }
 
     fn insert_text(&mut self, text: &str) {

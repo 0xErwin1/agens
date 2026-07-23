@@ -62,6 +62,64 @@ fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
 }
 
 #[test]
+fn responsive_layout_saturates_heights_one_through_six() {
+    for (height, expected_metadata_y, expects_header, expects_footer) in [
+        (1, None, false, false),
+        (2, Some(1), false, false),
+        (3, Some(2), false, false),
+        (4, Some(3), false, false),
+        (5, Some(4), false, false),
+        (6, Some(5), false, false),
+        (7, Some(6), true, false),
+        (11, Some(10), true, false),
+        (12, Some(10), true, true),
+    ] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(40, height)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Key(Key::Char('x')));
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        assert_eq!(
+            text.contains("agens"),
+            expects_header,
+            "height {height}: {text:?}"
+        );
+        assert_eq!(
+            text.contains("Enter send"),
+            expects_footer,
+            "height {height}: {text:?}"
+        );
+
+        if let Some(expected_metadata_y) = expected_metadata_y {
+            assert_eq!(
+                rendered_row(&renderer, "1 lines"),
+                expected_metadata_y,
+                "height {height}: {text:?}"
+            );
+        }
+    }
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(40, 12)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    for character in (0..10)
+        .map(|line| format!("line-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+    {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    assert_eq!(rendered_row(&renderer, "line-04"), 4, "{text:?}");
+    assert_eq!(rendered_row(&renderer, "10 lines"), 10, "{text:?}");
+}
+
+#[test]
 fn multiline_wrapped_user_message_uses_one_accented_identity() {
     let terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
