@@ -4558,6 +4558,15 @@ where
                 provider_tools,
                 request.request_config.clone(),
             )?;
+            // Live SSE already emits ProviderPart/Usage through the provider sink.
+            // Headless flush_progress would re-send those and double TUI text/tools.
+            let headless_progress = context.progress.map(|progress| {
+                let progress = Arc::clone(progress);
+                Arc::new(move |event: TurnEvent| match event {
+                    TurnEvent::ProviderPart(_) | TurnEvent::Usage(_) => {}
+                    other => progress(other),
+                }) as TurnProgressSink
+            });
             if let Some(progress) = context.progress {
                 provider = provider.with_progress_sink(Arc::clone(progress));
             }
@@ -4572,7 +4581,7 @@ where
                         &mut repository,
                         context.cancellation,
                         max_iterations,
-                        context.progress,
+                        headless_progress.as_ref(),
                     ))
                 }
                 None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
@@ -4582,7 +4591,7 @@ where
                     &mut dispatcher,
                     &mut repository,
                     context.cancellation,
-                    context.progress,
+                    headless_progress.as_ref(),
                 )),
             }?
             .map_err(CliError::runtime)?;

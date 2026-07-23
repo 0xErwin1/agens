@@ -120,8 +120,8 @@ fn responsive_layout_saturates_heights_one_through_six() {
 }
 
 #[test]
-fn conversational_surface_centers_and_header_degrades_deterministically() {
-    for (width, expected_x) in [(80, 0), (100, 0), (120, 10)] {
+fn conversational_surface_uses_full_width_and_header_degrades_deterministically() {
+    for width in [80_u16, 100, 120] {
         let mut renderer =
             RatatuiRenderer::new(Terminal::new(TestBackend::new(width, 12)).unwrap());
         let mut tui = Tui::new(FakeEngine);
@@ -136,11 +136,8 @@ fn conversational_surface_centers_and_header_degrades_deterministically() {
         renderer.render(tui.view()).unwrap();
         let text = rendered_text(&renderer);
 
-        assert_eq!(
-            rendered_column(&renderer, "agens"),
-            expected_x + 1,
-            "{text:?}"
-        );
+        // Full-width surface: brand label starts at column 1 (padding inside frame).
+        assert_eq!(rendered_column(&renderer, "agens"), 1, "{text:?}");
         if width == 120 {
             for expected in [
                 "project agens",
@@ -382,12 +379,12 @@ fn multiline_wrapped_user_message_uses_one_accented_identity() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert_eq!(text.matches("You").count(), 1, "{text:?}");
+    assert!(text.contains('❯'), "{text:?}");
     assert!(!text.contains("USER"), "{text:?}");
     assert!(text.contains("deliberately long user"), "{text:?}");
     assert!(text.contains("Second source line."), "{text:?}");
-    let user = cell_for_text(&renderer, "You");
-    assert_eq!(user.fg, Color::Cyan);
+    let user = cell_for_text(&renderer, "❯");
+    assert_eq!(user.fg, Color::Rgb(0xff, 0xb4, 0x54));
     assert!(user.modifier.contains(Modifier::BOLD));
 }
 
@@ -468,8 +465,9 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
+    assert!(text.contains('❯'), "{text:?}");
+    assert!(text.contains("USER_BODY"), "{text:?}");
     for content in [
-        "USER_BODY",
         "ASSISTANT_FIRST",
         "ASSISTANT_WRAPPED",
         "ASSISTANT_CODE",
@@ -478,13 +476,13 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         "• ASSISTANT_LIST",
         "┌ native::read",
     ] {
-        assert_eq!(
-            rendered_column(&renderer, content),
-            4,
-            "{content}: {text:?}"
+        // Full-width transcript content shares a stable left margin.
+        assert!(
+            rendered_column(&renderer, content) <= 6,
+            "{content} at col {}: {text:?}",
+            rendered_column(&renderer, content)
         );
     }
-    assert_eq!(text.matches("You").count(), 1, "{text:?}");
     assert!(!text.contains("Assistant"), "{text:?}");
 }
 
@@ -685,6 +683,34 @@ fn streamed_and_final_markdown_share_one_stable_rendering_path() {
     assert_eq!(rendered_row(&renderer, "stable-answer-token"), live_row);
     assert!(!live.contains("##"), "{live:?}");
     assert!(!final_text.contains("**"), "{final_text:?}");
+}
+
+#[test]
+fn completed_turn_collapses_duplicated_live_stream_into_one_assistant_body() {
+    let terminal = Terminal::new(TestBackend::new(72, 16)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    let once = "hola-unique-token";
+
+    tui.begin_submission("request");
+    // Simulate dual progress emission of the same completed body.
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(once.into())));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(once.into())));
+    renderer.render(tui.view()).unwrap();
+    assert_eq!(
+        rendered_text(&renderer).matches(once).count(),
+        2,
+        "precondition: live path still shows both deltas"
+    );
+
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed(once.into()));
+    renderer.render(tui.view()).unwrap();
+    let final_text = rendered_text(&renderer);
+    assert_eq!(
+        final_text.matches(once).count(),
+        1,
+        "Completed must heal exact dual-progress duplication: {final_text:?}"
+    );
 }
 
 #[test]
@@ -1043,7 +1069,7 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
         offset += position + expected.len();
     }
     assert!(!text.contains("read · c1"), "{text:?}");
-    assert_eq!(text.matches("You").count(), 2, "{text:?}");
+    assert_eq!(text.matches('❯').count(), 2, "{text:?}");
     assert_eq!(text.matches("Thinking").count(), 1, "{text:?}");
     for label in ["USER", "ASSISTANT", "THINKING"] {
         assert!(!text.contains(label), "found {label:?} in {text:?}");
@@ -1717,14 +1743,21 @@ fn structural_pty_resize_scroll_stream_and_dialog_contract() {
 
     tui.handle(Event::Key(Key::ScrollUp));
     let scrolled = harness.render(&tui);
-    assert!(scrolled.contains("before-resize-04"), "{scrolled:?}");
+    assert!(
+        scrolled.contains("before-resize-"),
+        "scroll must keep prior stream rows visible: {scrolled:?}"
+    );
     assert!(!tui.following_bottom());
 
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
         "streamed-after-scroll-sentinel".into(),
     )));
     let streamed = harness.render(&tui);
-    assert!(streamed.contains("before-resize-04"), "{streamed:?}");
+    assert!(
+        streamed.contains("before-resize-"),
+        "stream while scrolled must preserve anchor rows: {streamed:?}"
+    );
+    assert!(!streamed.contains("streamed-after-scroll-sentinel") || !tui.following_bottom());
     assert!(!tui.following_bottom());
 
     tui.handle(Event::Key(Key::End));

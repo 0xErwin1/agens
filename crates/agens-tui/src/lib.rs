@@ -872,9 +872,9 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         " Compose "
     };
     let composer_color = if state.running {
-        Color::Yellow
+        widgets::RolePalette::warning()
     } else {
-        Color::Cyan
+        widgets::RolePalette::brand()
     };
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
@@ -1059,7 +1059,9 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                     _ => format!("  {}", entry.label),
                 };
                 let style = if selected {
-                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(widgets::RolePalette::brand())
                 } else if entry.action.is_none() {
                     Style::default().fg(Color::DarkGray)
                 } else {
@@ -1100,11 +1102,11 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(widgets::RolePalette::brand()))
                 .title(Span::styled(
                     format!(" {} ", dialog.title),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(widgets::RolePalette::brand())
                         .add_modifier(Modifier::BOLD),
                 )),
         ),
@@ -1203,10 +1205,8 @@ struct ScreenLayout {
 }
 
 fn conversation_surface(area: Rect) -> Rect {
-    let width = area.width.min(100);
-    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
-
-    Rect::new(x, area.y, width, area.height)
+    // Full terminal width — do not center a narrow column.
+    area
 }
 
 fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
@@ -1262,9 +1262,9 @@ fn render_header(
         format!(" agens {mode_label} "),
         Style::default()
             .fg(if state.dangerous_mode {
-                Color::Yellow
+                widgets::RolePalette::warning()
             } else {
-                Color::Cyan
+                widgets::RolePalette::brand()
             })
             .add_modifier(Modifier::BOLD),
     )];
@@ -1272,7 +1272,7 @@ fn render_header(
         left.push(Span::styled("  ", Style::default()));
         left.push(Span::styled(
             "project ",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(widgets::RolePalette::muted()),
         ));
         left.push(Span::styled(
             state.project,
@@ -1973,17 +1973,29 @@ where
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) {
         match outcome {
             TuiProviderOutcome::Completed(output) => {
-                if self
-                    .conversation
-                    .as_ref()
-                    .is_some_and(|conversation| conversation.live_markdown.is_empty())
-                {
-                    self.project_conversation(ConversationEvent::MarkdownFinal(output.clone()));
-                } else if let Some(conversation) = self.conversation.as_mut() {
-                    conversation.final_markdown = Some(output.clone());
-                }
-                if !matches!(self.transcript.last(), Some(TranscriptEntry::Assistant(_))) {
-                    self.transcript.push(TranscriptEntry::Assistant(output));
+                // Prefer the live stream body when present; heal exact dual-progress
+                // duplication (live == output+output) using the completed string once.
+                let body = match self.conversation.as_ref() {
+                    Some(conversation) if !conversation.live_markdown.is_empty() => {
+                        let live = &conversation.live_markdown;
+                        if !output.is_empty()
+                            && (live.as_str() == format!("{output}{output}")
+                                || (live.len() == output.len().saturating_mul(2)
+                                    && live.starts_with(&output)
+                                    && live.ends_with(&output)))
+                        {
+                            output.clone()
+                        } else {
+                            live.clone()
+                        }
+                    }
+                    _ => output.clone(),
+                };
+                self.project_conversation(ConversationEvent::MarkdownFinal(body.clone()));
+                if let Some(TranscriptEntry::Assistant(text)) = self.transcript.last_mut() {
+                    *text = body;
+                } else {
+                    self.transcript.push(TranscriptEntry::Assistant(body));
                 }
                 self.set_running(false);
             }

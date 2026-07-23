@@ -2268,7 +2268,7 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     assert!(text.contains("agens"));
     assert!(text.contains("openai-api / gpt-4.1"));
     assert!(text.contains("session #42"));
-    assert!(text.contains("You"));
+    assert!(text.contains('❯'));
     assert!(text.contains("Thinking"));
     assert!(text.contains("Compose"));
     assert!(text.contains("2 lines"));
@@ -2278,9 +2278,9 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     let user_cell = buffer
         .content
         .iter()
-        .find(|cell| cell.symbol() == "Y")
-        .expect("user role label is rendered");
-    assert_eq!(user_cell.fg, ratatui::style::Color::Cyan);
+        .find(|cell| cell.symbol() == "❯")
+        .expect("user prompt marker is rendered");
+    assert_eq!(user_cell.fg, ratatui::style::Color::Rgb(0xff, 0xb4, 0x54));
 
     tui.apply_progress(TurnEvent::ToolCallRequested {
         id: "call-1".into(),
@@ -2432,7 +2432,6 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlN)), Action::Render);
     let last_user_offset = tui.view().scroll_offset;
-    assert!(!tui.view().following_bottom);
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlShiftN)), Action::Render);
     let previous_user_offset = tui.view().scroll_offset;

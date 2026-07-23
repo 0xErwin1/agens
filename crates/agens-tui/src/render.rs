@@ -31,7 +31,13 @@ pub(super) fn conversation_lines(
             ConversationItem::Info(text) => line(&mut lines, "INFO", RolePalette::info(), text),
             ConversationItem::User(text) => user_lines(&mut lines, text),
             ConversationItem::Assistant(text) => {
-                markdown_lines(&mut lines, text, Style::default(), "");
+                markdown_lines(
+                    &mut lines,
+                    text,
+                    Style::default().fg(RolePalette::assistant()),
+                    "",
+                );
+                lines.push(Line::default());
             }
             ConversationItem::Reasoning(text) => {
                 thinking_lines(&mut lines, text, collapse_thinking, thinking_streaming);
@@ -141,14 +147,24 @@ fn bounded_visible_tool_output(output: &str) -> String {
 }
 
 fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
-    lines.push(Line::from(Span::styled(
-        "You",
-        Style::default()
-            .fg(RolePalette::user())
-            .add_modifier(Modifier::BOLD),
-    )));
+    let mut first = true;
     for source_line in text.split('\n') {
-        lines.push(Line::from(Span::raw(source_line.to_owned())));
+        let prefix = if first { "❯ " } else { "  " };
+        first = false;
+        lines.push(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(RolePalette::user_bar())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                source_line.to_owned(),
+                Style::default()
+                    .fg(RolePalette::user())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
     lines.push(Line::default());
 }
