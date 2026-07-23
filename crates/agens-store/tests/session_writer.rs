@@ -427,14 +427,9 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
         store.recover_running_attempt(attempt.key(), 31).unwrap(),
         RecoveryOutcome::Stale
     );
-    assert_eq!(
-        store
-            .load_retry_boundary(attempt.key())
-            .unwrap()
-            .unwrap()
-            .prompt(),
-        "private"
-    );
+    let recovered_boundary = store.load_retry_boundary(attempt.key()).unwrap().unwrap();
+    assert_eq!(recovered_boundary.prompt(), "private");
+    let recovered_session = store.load_session_for_resume(metadata.id).unwrap();
     assert!(
         store
             .load_retry_boundary(AttemptKey::new(7, attempt.key().attempt_id() + 1).unwrap())
@@ -447,8 +442,67 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
             .unwrap(),
         AttemptFinishOutcome::Stale
     );
+
+    let unrelated_metadata = SessionMetadata {
+        id: 8,
+        project: "unrelated".into(),
+        title: "unrelated".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let unrelated = store
+        .begin_session_attempt(&unrelated_metadata, "unrelated-private".into())
+        .unwrap();
+    let retried = store
+        .begin_session_attempt(
+            &recovered_session.metadata,
+            recovered_boundary.prompt().to_owned(),
+        )
+        .unwrap();
+
+    assert!(store.load_retry_boundary(attempt.key()).unwrap().is_none());
+    assert_eq!(
+        store
+            .load_retry_boundary(retried.key())
+            .unwrap()
+            .unwrap()
+            .prompt(),
+        "private"
+    );
+    assert_eq!(
+        store
+            .load_retry_boundary(unrelated.key())
+            .unwrap()
+            .unwrap()
+            .prompt(),
+        "unrelated-private"
+    );
+    assert!(matches!(
+        store.begin_session_attempt(&recovered_session.metadata, "replacement-private".into()),
+        Err(BeginSessionAttemptError::AlreadyRunning(summary)) if summary.key() == retried.key()
+    ));
+    assert_eq!(
+        store
+            .load_retry_boundary(retried.key())
+            .unwrap()
+            .unwrap()
+            .prompt(),
+        "private"
+    );
+    assert_eq!(
+        store
+            .finish_session_attempt(retried.key(), SessionAttemptStatus::Failed, 33)
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
     let connection = Connection::open(store.database_path()).unwrap();
-    assert_eq!(normalized_counts(&connection), (1, 0, 0, 0));
+    assert_eq!(normalized_counts(&connection), (2, 0, 0, 0));
     assert_eq!(
         connection
             .query_row(

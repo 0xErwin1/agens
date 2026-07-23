@@ -865,7 +865,11 @@ impl SessionStore {
                 migrate_v4_on_open(&mut connection, &database_path)?;
             }
             4 => migrate_v4_on_open(&mut connection, &database_path)?,
-            5 => validate_v5_schema(&connection, &database_path)?,
+            5 => {
+                if validate_v5_schema(&connection, &database_path).is_err() {
+                    migrate_v5_retry_prompt_retention_on_open(&mut connection, &database_path)?;
+                }
+            }
             unsupported => {
                 return Err(SessionStoreError::operation(
                     "check schema version",
@@ -1096,6 +1100,14 @@ fn normalized_session_schema_v4() -> String {
 }
 
 fn normalized_session_schema_v5() -> String {
+    normalized_session_schema_v5_with_required_terminal_retry_prompts()
+        .replace(
+            "(status = 'cancelled' AND failure_kind = 'cancelled' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'failed' AND failure_kind = 'failed' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'provider_error' AND failure_kind = 'provider_error' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'interrupted' AND failure_kind = 'interrupted' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL)",
+            "(status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR\n                   (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL)",
+        )
+}
+
+fn normalized_session_schema_v5_with_required_terminal_retry_prompts() -> String {
     format!(
         "{}\
          CREATE TABLE session_attempts (
@@ -1174,10 +1186,10 @@ fn migrate_v4_on_open(
                  FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
                  CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
                        (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
-                       (status = 'cancelled' AND failure_kind = 'cancelled' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'failed' AND failure_kind = 'failed' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'provider_error' AND failure_kind = 'provider_error' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'interrupted' AND failure_kind = 'interrupted' AND retry_prompt IS NOT NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+                       (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
              );
              CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
              CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
@@ -1190,6 +1202,61 @@ fn migrate_v4_on_open(
     transaction
         .commit()
         .map_err(|error| SessionStoreError::operation("commit v4 migration", database_path, error))
+}
+
+fn migrate_v5_retry_prompt_retention_on_open(
+    connection: &mut Connection,
+    database_path: &Path,
+) -> Result<(), SessionStoreError> {
+    validate_legacy_archive(connection, database_path)?;
+    validate_normalized_session_schema(
+        connection,
+        database_path,
+        &normalized_session_schema_v5_with_required_terminal_retry_prompts(),
+    )?;
+
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            SessionStoreError::operation("start v5 retry prompt migration", database_path, error)
+        })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE session_attempts RENAME TO session_attempts_previous;
+             CREATE TABLE session_attempts (
+                 id INTEGER PRIMARY KEY,
+                 session_id INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL CHECK(sequence > 0),
+                 status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+                 failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+                 retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
+                 started_at INTEGER NOT NULL,
+                 finished_at INTEGER,
+                 completed_turn_sequence INTEGER,
+                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                 FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+                 CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+                       (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+                       (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+             );
+             INSERT INTO session_attempts
+             SELECT id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at, completed_turn_sequence
+             FROM session_attempts_previous;
+             DROP TABLE session_attempts_previous;
+             CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
+             CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
+             CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);",
+        )
+        .map_err(|error| {
+            SessionStoreError::operation("migrate v5 retry prompt retention", database_path, error)
+        })?;
+    validate_v5_schema(&transaction, database_path)?;
+    transaction.commit().map_err(|error| {
+        SessionStoreError::operation("commit v5 retry prompt migration", database_path, error)
+    })
 }
 
 fn migrate_v2_on_open(

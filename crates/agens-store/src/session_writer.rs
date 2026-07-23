@@ -68,6 +68,13 @@ impl SessionStore {
             .map_err(|_| BeginSessionAttemptError::Store)?;
             return Err(BeginSessionAttemptError::AlreadyRunning(summary));
         }
+        transaction
+            .execute(
+                "UPDATE session_attempts SET retry_prompt = NULL
+                 WHERE session_id = ?1 AND retry_prompt IS NOT NULL",
+                [session_id],
+            )
+            .map_err(|_| BeginSessionAttemptError::Store)?;
         let sequence = next_sequence(
             &transaction,
             &self.database_path,
