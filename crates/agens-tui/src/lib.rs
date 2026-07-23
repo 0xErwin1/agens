@@ -94,6 +94,8 @@ pub enum Key {
     CtrlO,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
+    /// Toggles the visible dangerous-mode session state through the composition layer.
+    CtrlShiftD,
     /// Starts or moves the selected subagent into background execution.
     CtrlB,
     ShiftEnter,
@@ -139,6 +141,7 @@ pub struct TuiPresentation {
     provider: String,
     model: String,
     session: String,
+    dangerous_mode: bool,
 }
 
 impl TuiPresentation {
@@ -151,7 +154,13 @@ impl TuiPresentation {
             provider: provider.into(),
             model: model.into(),
             session: session.into(),
+            dangerous_mode: false,
         }
+    }
+
+    pub fn with_dangerous_mode(mut self, enabled: bool) -> Self {
+        self.dangerous_mode = enabled;
+        self
     }
 }
 
@@ -319,6 +328,8 @@ pub struct ViewState<'a> {
     pub project: &'a str,
     /// Current active-turn state for the dedicated status row.
     pub turn_state: Option<TurnState>,
+    /// Whether the next submitted turn will carry dangerous-mode context.
+    pub dangerous_mode: bool,
     /// Tool name currently being dispatched, when known.
     pub active_tool: Option<&'a str>,
     /// Current character cursor position in the editable prompt.
@@ -1206,10 +1217,19 @@ fn render_header(
     show_context: bool,
 ) {
     let state_label = turn_state_label(state.turn_state, state.running);
+    let mode_label = if state.dangerous_mode {
+        "danger"
+    } else {
+        "safe"
+    };
     let mut left = vec![Span::styled(
-        " agens ",
+        format!(" agens {mode_label} "),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(if state.dangerous_mode {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            })
             .add_modifier(Modifier::BOLD),
     )];
     if show_context && state.executions.is_empty() {
@@ -1222,12 +1242,12 @@ fn render_header(
             state.project,
             Style::default().fg(Color::Gray),
         ));
-        left.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        left.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         left.push(Span::styled(
             state.provider_model,
             Style::default().fg(Color::Gray),
         ));
-        left.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+        left.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
         left.push(Span::styled(
             state.session,
             Style::default().fg(Color::Gray),
@@ -1547,6 +1567,7 @@ pub struct Tui<E> {
     palette_selected: usize,
     agent_catalog: Vec<String>,
     selected_agent: Option<String>,
+    dangerous_mode: bool,
     executions: Vec<TuiExecution>,
     now: Duration,
     next_runtime_ordinal: u64,
@@ -1586,6 +1607,7 @@ where
             palette_selected: 0,
             agent_catalog: vec!["main".into()],
             selected_agent: None,
+            dangerous_mode: false,
             executions: Vec::new(),
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
@@ -1730,6 +1752,11 @@ where
     /// Sets the project identity displayed in the semantic terminal header.
     pub fn set_project(&mut self, project: impl Into<String>) {
         self.project = project.into();
+    }
+
+    /// Sets the dangerous-mode state displayed for the next submitted turn.
+    pub fn set_dangerous_mode(&mut self, enabled: bool) {
+        self.dangerous_mode = enabled;
     }
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
@@ -2308,6 +2335,7 @@ where
             session: &self.session,
             project: &self.project,
             turn_state: self.turn_state,
+            dangerous_mode: self.dangerous_mode,
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
             runtime_events: &self.runtime_events,
@@ -2607,6 +2635,11 @@ where
         if key == Key::CtrlShiftA {
             self.palette_open = false;
             return Action::OpenDialog("subagent".into());
+        }
+
+        if key == Key::CtrlShiftD {
+            self.palette_open = false;
+            return Action::OpenDialog("dangerous".into());
         }
 
         if let Some(action) = self.handle_composer_key(key) {
@@ -3194,6 +3227,7 @@ where
             presentation.model,
             presentation.session,
         );
+        self.set_dangerous_mode(presentation.dangerous_mode);
     }
 }
 
@@ -3748,6 +3782,12 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::CtrlShiftA
         }
         (KeyCode::Char('A'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftA,
+        (KeyCode::Char('d'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftD
+        }
+        (KeyCode::Char('D'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftD,
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlB
         }
@@ -4064,6 +4104,45 @@ mod runtime_tests {
             Some(Action::Render)
         );
         assert!(tui.view().dialog.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_d_routes_only_press_events_to_dangerous_mode() {
+        for (code, modifiers) in [
+            (
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::Char('D'), KeyModifiers::CONTROL),
+        ] {
+            let mut tui = Tui::new(NoopEngine);
+            let event = KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press);
+
+            assert_eq!(
+                map_event(CrosstermEvent::Key(event)).map(|event| tui.handle(event)),
+                Some(Action::OpenDialog("dangerous".into()))
+            );
+        }
+
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                kind,
+            );
+
+            assert_eq!(map_event(CrosstermEvent::Key(event)), None);
+            assert_eq!(map_key(event), None);
+        }
+
+        assert_eq!(
+            map_key(KeyEvent::new_with_kind(
+                KeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press,
+            )),
+            Some(Event::Key(Key::Delete))
+        );
     }
 
     #[test]

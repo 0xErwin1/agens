@@ -363,6 +363,7 @@ pub struct HeadlessChatRequest {
     pub max_iterations: Option<usize>,
     pub mode: PermissionMode,
     pub dangerously_allow_all: bool,
+    pub dangerous_mode: bool,
     request_config: agens_core::RequestConfig,
     session_reasoning_effort: Option<agens_core::ReasoningEffort>,
     session: Option<SessionMetadata>,
@@ -1362,6 +1363,7 @@ struct TuiSessionContext {
     chatgpt_unavailable: bool,
     resume_error: Option<String>,
     selected_subagent: Option<String>,
+    dangerous_mode: bool,
     running: bool,
 }
 
@@ -1670,6 +1672,7 @@ impl TuiSessionContext {
             chatgpt_unavailable: false,
             resume_error: None,
             selected_subagent: None,
+            dangerous_mode: false,
             running: false,
         }
     }
@@ -1692,6 +1695,7 @@ impl TuiSessionContext {
     }
 
     fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
+        request.dangerous_mode = self.dangerous_mode;
         if self.identifier.is_some() {
             request.history = self.messages.clone();
             request.session = self.metadata.clone();
@@ -1994,6 +1998,7 @@ impl TuiRuntimeRouter {
     fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
         let dialog = match route_id {
+            "dangerous" => return self.toggle_dangerous_mode(),
             "connect" => DialogView::selection(
                 "Connect to ChatGPT",
                 Some("Choose an authentication flow"),
@@ -2424,6 +2429,7 @@ impl TuiRuntimeRouter {
         let arguments = arguments.trim();
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
+            "/dangerous" => return self.toggle_dangerous_mode(),
             "/help" => self.open_dialog("help")?,
             "/mcp" => self.open_dialog("mcp")?,
             "/select" => self.open_dialog("select")?,
@@ -2556,7 +2562,26 @@ impl TuiRuntimeRouter {
         let label = session
             .identifier
             .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
-        Ok(TuiPresentation::new(provider, model, label))
+        Ok(
+            TuiPresentation::new(provider, model, label)
+                .with_dangerous_mode(session.dangerous_mode),
+        )
+    }
+
+    fn toggle_dangerous_mode(&self) -> Result<TuiSubmissionOutcome, CliError> {
+        let enabled = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            session.dangerous_mode = !session.dangerous_mode;
+            session.dangerous_mode
+        };
+
+        Ok(TuiSubmissionOutcome::ContextChanged {
+            message: format!("Dangerous mode: {}.", if enabled { "on" } else { "off" }),
+            presentation: self.presentation()?,
+        })
     }
 
     fn bootstrap(&self) -> Result<Bootstrap, CliError> {
@@ -3280,6 +3305,7 @@ fn run_tui_prompt_with(
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            dangerous_mode: false,
             request_config: agens_core::RequestConfig::default(),
             session_reasoning_effort: None,
             session: None,
@@ -4021,6 +4047,7 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         max_iterations: None,
         mode: PermissionMode::Edit,
         dangerously_allow_all: false,
+        dangerous_mode: false,
         request_config: agens_core::RequestConfig::default(),
         session_reasoning_effort: None,
         session: None,
@@ -7340,6 +7367,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            dangerous_mode: false,
             request_config: agens_core::RequestConfig::default(),
             session_reasoning_effort: None,
             session: None,
@@ -7937,6 +7965,78 @@ mod tests {
         reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
 
         assert_eq!(context, TuiSessionContext::fresh());
+    }
+
+    #[test]
+    fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
+        let temporary = tui_session_directory("dangerous-mode");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        tui.set_presentation("openai-api", "gpt-4.1", "new session");
+
+        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
+
+        let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::CtrlShiftD)) else {
+            panic!("Ctrl+Shift+D should route through the dangerous-mode router path");
+        };
+        assert_eq!(route_id, "dangerous");
+        assert!(
+            tui.apply_submission_outcome(router.route_request(
+                TuiRouteRequest::OpenDialog(route_id),
+                std::sync::mpsc::channel().0,
+            ))
+            .is_none()
+        );
+        assert!(session.lock().unwrap().dangerous_mode);
+        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens danger"));
+
+        assert!(
+            tui.apply_submission_outcome(router.route("/dangerous".into()))
+                .is_none()
+        );
+        assert!(!session.lock().unwrap().dangerous_mode);
+        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
+
+        tui.apply_submission_outcome(router.route("/dangerous".into()));
+        let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, |request| {
+            assert!(request.dangerous_mode);
+            assert!(matches!(
+                router.route("/dangerous".into()),
+                TuiSubmissionOutcome::ContextChanged { .. }
+            ));
+            assert!(request.dangerous_mode);
+            Ok(HeadlessChatCompletion {
+                text: "captured".into(),
+                metadata: SessionMetadata {
+                    id: 1,
+                    project: "project".into(),
+                    title: "captured".into(),
+                    active_agent: "primary".into(),
+                    provider_id: None,
+                    model_id: None,
+                    reasoning_effort: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    completed_turn_count: 1,
+                    resumable: true,
+                },
+                messages: Vec::new(),
+            })
+        });
+        assert!(result.is_ok());
+        assert!(!session.lock().unwrap().dangerous_mode);
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -11168,6 +11268,7 @@ mod tests {
                 max_iterations: None,
                 mode: PermissionMode::Edit,
                 dangerously_allow_all: false,
+                dangerous_mode: false,
                 request_config: agens_core::RequestConfig::default(),
                 session_reasoning_effort: None,
                 session: None,
@@ -11342,6 +11443,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            dangerous_mode: false,
             request_config: agens_core::RequestConfig::default(),
             session_reasoning_effort: None,
             session: None,
@@ -11427,6 +11529,7 @@ mod tests {
             max_iterations: None,
             mode: PermissionMode::Edit,
             dangerously_allow_all: false,
+            dangerous_mode: false,
             request_config: agens_core::RequestConfig::default(),
             session_reasoning_effort: None,
             session: None,
