@@ -550,10 +550,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(8, "other-child")),
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(7, "child-partial")),
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
-            7,
-            "call-a",
-            "native::read",
-            "alpha",
+            7, "call-a", "read", "alpha",
         )),
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
             7,
@@ -639,8 +636,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     let expected_child_rows = [
         "child-reasoning",
         "child-partial",
-        "native::read",
-        "native::glob",
+        "read",
+        "glob",
         "result-b",
         "result-a",
         "Subagent tool execution failed.",
@@ -2297,7 +2294,7 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(tool_text.contains("Tools"));
-    assert!(tool_text.contains("native::read"));
+    assert!(tool_text.contains("read"));
 
     let backend = TestBackend::new(50, 14);
     let terminal = Terminal::new(backend).unwrap();

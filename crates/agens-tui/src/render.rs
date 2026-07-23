@@ -66,10 +66,15 @@ pub(super) fn conversation_lines(
             } => {
                 let (result_state, duration) = tool_state(events, call_id, *is_error);
                 let color = result_color(result_state);
+                let tool_name = tool_name_for_call(conversation, call_id);
                 let status = format!("{result_state:?}{}", duration_label(duration));
-                lines.push(ToolRow::result_footer(&status, color));
+                lines.push(ToolRow::result_footer(&tool_name, &status, color));
                 if collapsed_tool_outputs.contains(call_id) {
-                    lines.push(ToolRow::collapsed_output());
+                    if *is_error {
+                        lines.push(ToolRow::collapsed_failure(output));
+                    } else {
+                        lines.push(ToolRow::collapsed_output());
+                    }
                     lines.push(Line::default());
                 } else {
                     markdown_lines(
@@ -129,6 +134,16 @@ pub(super) fn conversation_lines(
         }
     }
     lines
+}
+
+fn tool_name_for_call(conversation: &Conversation, call_id: &str) -> String {
+    conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .find(|call| call.call_id == call_id)
+        .map(|call| call.name.clone())
+        .unwrap_or_else(|| "tool".into())
 }
 
 fn bounded_visible_tool_output(output: &str) -> String {
@@ -292,8 +307,9 @@ impl MarkdownRenderer {
             Event::Code(code) => self.text(
                 &code,
                 self.current_style()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
+                    .fg(RolePalette::warning())
+                    .bg(code_block_background())
+                    .add_modifier(Modifier::BOLD),
             ),
             Event::SoftBreak | Event::HardBreak => self.finish_line(),
             Event::Rule => {
@@ -336,12 +352,20 @@ impl MarkdownRenderer {
             Tag::CodeBlock(kind) => {
                 self.finish_line();
                 self.code_block = true;
-                if let CodeBlockKind::Fenced(language) = kind
-                    && !language.is_empty()
-                {
-                    self.text(&language, self.base_style.fg(Color::DarkGray));
-                    self.finish_line();
-                }
+                let language = match kind {
+                    CodeBlockKind::Fenced(language) if !language.is_empty() => {
+                        language.into_string()
+                    }
+                    _ => "code".to_owned(),
+                };
+                self.text(
+                    &format!("╭ {language} "),
+                    Style::default()
+                        .fg(RolePalette::muted())
+                        .bg(code_block_background())
+                        .add_modifier(Modifier::BOLD),
+                );
+                self.finish_line();
             }
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
             Tag::Paragraph
@@ -376,6 +400,13 @@ impl MarkdownRenderer {
                 self.lists.pop();
             }
             TagEnd::CodeBlock => {
+                self.finish_line();
+                self.text(
+                    "╰────",
+                    Style::default()
+                        .fg(RolePalette::muted())
+                        .bg(code_block_background()),
+                );
                 self.finish_line();
                 self.code_block = false;
                 self.blank_line();
@@ -431,7 +462,7 @@ impl MarkdownRenderer {
             style = style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
         }
         if self.code_block {
-            style = style.fg(Color::Gray);
+            style = style.fg(RolePalette::success()).bg(code_block_background());
         }
         style
     }
@@ -444,6 +475,14 @@ impl MarkdownRenderer {
             self.spans.push(Span::styled(
                 self.prefix.clone(),
                 self.base_style.fg(Color::DarkGray),
+            ));
+        }
+        if self.code_block {
+            self.spans.push(Span::styled(
+                "│ ",
+                Style::default()
+                    .fg(RolePalette::muted())
+                    .bg(code_block_background()),
             ));
         }
         if self.quote_depth > 0 {
@@ -471,6 +510,11 @@ impl MarkdownRenderer {
             self.lines.push(Line::default());
         }
     }
+}
+
+/// Panel background for fenced/inline code — slightly elevated over the default terminal bg.
+const fn code_block_background() -> Color {
+    Color::Rgb(0x1a, 0x1f, 0x29)
 }
 
 fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, text: &str) {

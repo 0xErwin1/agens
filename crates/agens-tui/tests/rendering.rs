@@ -317,8 +317,6 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     for expected in [
         "inspect the workspace",
         "inspect typed events",
-        "native::read",
-        "native::grep",
         "src/lib.rs",
         "needle",
         "read preview",
@@ -331,6 +329,10 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     ] {
         assert_eq!(text.matches(expected).count(), 1, "{expected}: {text:?}");
     }
+    assert!(text.contains("┌ read"), "{text:?}");
+    assert!(text.contains("┌ grep"), "{text:?}");
+    assert!(text.contains("└ read · Success"), "{text:?}");
+    assert!(text.contains("└ grep · Failure"), "{text:?}");
     assert!(!text.contains("native::read · read-1"), "{text:?}");
     assert!(!text.contains("native::grep · grep-2"), "{text:?}");
 }
@@ -474,7 +476,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         "THINKING_BODY",
         "TOOL_BODY",
         "• ASSISTANT_LIST",
-        "┌ native::read",
+        "┌ read",
     ] {
         // Full-width transcript content shares a stable left margin.
         assert!(
@@ -556,7 +558,10 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("native::read"), "{text:?}");
+    assert!(
+        text.contains("┌ read") || text.contains(" read "),
+        "{text:?}"
+    );
     assert!(text.contains("src/lib.rs"), "{text:?}");
     assert!(text.contains("output collapsed"), "{text:?}");
     assert!(!text.contains("secret-tool-body-sentinel"), "{text:?}");
@@ -576,7 +581,7 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
         expanded.contains("secret-tool-body-sentinel"),
         "{expanded:?}"
     );
-    assert!(expanded.contains("native::read"), "{expanded:?}");
+    assert!(expanded.contains("read"), "{expanded:?}");
     assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
 }
 
@@ -651,7 +656,10 @@ fn renderer_renders_practical_markdown_semantics() {
             .modifier
             .contains(Modifier::ITALIC)
     );
-    assert_eq!(cell_for_text(&renderer, "INLINE_TOKEN").fg, Color::Yellow);
+    assert_eq!(
+        cell_for_text(&renderer, "INLINE_TOKEN").fg,
+        Color::Rgb(0xe6, 0xb4, 0x50)
+    );
     let link = cell_for_text(&renderer, "LINKTOKEN");
     assert_eq!(link.fg, Color::Blue);
     assert!(link.modifier.contains(Modifier::UNDERLINED));
@@ -772,10 +780,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     for expected in [
         "final markdown",
         "inspect every changed line",
-        "native::read",
+        "read",
         "src/render.rs",
         "read result",
-        "native::write",
+        "write",
         "write result",
         "12ms",
         "8 + new line",
@@ -794,7 +802,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     assert!(!text.contains("native::write · write-2"), "{text:?}");
     assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
     assert_eq!(text.matches("Error").count(), 1, "{text:?}");
-    assert!(text.find("native::read").unwrap() < text.find("native::write").unwrap());
+    assert!(text.find("┌ read").unwrap() < text.find("┌ write").unwrap());
 }
 
 #[test]
@@ -954,7 +962,7 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
     for expected in [
         "first-user-sentinel",
         "first-reasoning-sentinel",
-        "native::read",
+        "read",
         "first-input",
         "first-result-sentinel",
         "first-answer-sentinel",
@@ -1461,7 +1469,7 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
     for expected in [
         "inspect every changed line",
         "live markdown stays visible",
-        "native::read",
+        "read",
         "first line",
         "second line",
         "12ms",
@@ -1659,12 +1667,7 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
         "{main:?}"
     );
     assert!(main.contains("2 tool uses"), "{main:?}");
-    for child_row in [
-        "terminal result",
-        "native::read",
-        "native::grep",
-        "first result",
-    ] {
+    for child_row in ["terminal result", "read", "native::grep", "first result"] {
         assert!(
             !main.contains(child_row),
             "duplicated {child_row:?}: {main:?}"
