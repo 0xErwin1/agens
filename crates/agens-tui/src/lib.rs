@@ -1215,52 +1215,52 @@ fn render_header(
             Style::default().fg(Color::Gray),
         ));
         left.push(Span::styled(
-            format!("  ·  agents {}", state.agent_catalog.join(", ")),
+            format!("  ·  agent {}", state.selected_agent.unwrap_or("main")),
             Style::default().fg(Color::Gray),
         ));
-    }
-    let mut lines = vec![Line::from(left)];
-    if show_context {
-        if let Some(agent) = state.selected_agent {
-            lines.push(Line::styled(
-                format!(" selected {agent}"),
+        left.push(Span::styled(
+            format!("  ·  {} agents", state.agent_catalog.len()),
+            Style::default().fg(Color::Gray),
+        ));
+        if !state.executions.is_empty() {
+            let mut foreground = 0;
+            let mut background = 0;
+            let mut completed = 0;
+            let mut failed = 0;
+            let mut cancelled = 0;
+
+            for execution in &state.executions {
+                match execution.state() {
+                    TuiExecutionState::ForegroundRunning => foreground += 1,
+                    TuiExecutionState::BackgroundRunning => background += 1,
+                    TuiExecutionState::CompletedRecent => completed += 1,
+                    TuiExecutionState::Failed => failed += 1,
+                    TuiExecutionState::Cancelled => cancelled += 1,
+                }
+            }
+
+            left.push(Span::styled(
+                format!(
+                    "  ·  fg {foreground} bg {background} done {completed} failed {failed} cancelled {cancelled}"
+                ),
                 Style::default().fg(Color::Yellow),
             ));
         }
-        lines.extend(state.executions.iter().map(|execution| {
-            Line::styled(
-                format!(
-                    " {} · {}",
-                    execution.agent,
-                    execution_label(execution.state())
-                ),
-                Style::default().fg(Color::Yellow),
-            )
-        }));
     }
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
         area,
     );
-    let state_width = state_label.len() as u16 + 1;
+    let status = state.status.unwrap_or(state_label);
+    let state_width = status.len() as u16 + 1;
     if area.width > state_width {
         let state_area = Rect::new(area.right() - state_width, area.y, state_width, area.height);
         frame.render_widget(
-            Paragraph::new(state_label)
+            Paragraph::new(status)
                 .style(Style::default().fg(turn_state_color(state.turn_state, state.running)))
                 .alignment(Alignment::Right),
             state_area,
         );
-    }
-}
-
-fn execution_label(state: TuiExecutionState) -> &'static str {
-    match state {
-        TuiExecutionState::ForegroundRunning => "foreground running",
-        TuiExecutionState::BackgroundRunning => "background running",
-        TuiExecutionState::CompletedRecent => "completed recent",
-        TuiExecutionState::Failed => "failed",
-        TuiExecutionState::Cancelled => "cancelled",
     }
 }
 
@@ -1294,9 +1294,6 @@ fn composer_metadata(input: &str) -> String {
 }
 
 fn footer_text(width: u16, state: &ViewState<'_>) -> String {
-    if let Some(status) = state.status {
-        return format!(" {status}");
-    }
     let duration = state.turn_duration.map_or_else(String::new, |value| {
         if value.as_secs() > 0 {
             format!(" · {}s", value.as_secs())

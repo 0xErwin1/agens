@@ -188,6 +188,36 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
 }
 
 #[test]
+fn composer_dock_and_footer_degrade_without_detached_bands() {
+    for (height, expects_footer, composer_y) in [(10, false, 7), (12, true, 8)] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Key(Key::Char('d')));
+        tui.add_info("compact-status-sentinel");
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        assert_eq!(
+            text.matches("compact-status-sentinel").count(),
+            1,
+            "height {height}: {text:?}"
+        );
+        assert_eq!(
+            text.contains("Enter send"),
+            expects_footer,
+            "height {height}: {text:?}"
+        );
+        assert_eq!(rendered_row(&renderer, "Compose"), composer_y);
+        assert!(!text.contains("F5"), "{text:?}");
+        assert!(!text.contains("F6"), "{text:?}");
+        assert!(!text.contains("TURN"), "{text:?}");
+        assert!(!text.contains("USAGE"), "{text:?}");
+    }
+}
+
+#[test]
 fn multiline_wrapped_user_message_uses_one_accented_identity() {
     let terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
@@ -1238,7 +1268,7 @@ fn renderer_scrolls_multiline_unicode_composer_and_keeps_cursor_visible() {
     renderer.render(tui.view()).unwrap();
 
     let cursor = renderer.terminal().backend().cursor_position();
-    assert_eq!((cursor.x, cursor.y), (4, 7));
+    assert_eq!((cursor.x, cursor.y), (4, 8));
     assert!(rendered_text(&renderer).contains("2 lines · 8 chars"));
 
     let terminal = Terminal::new(TestBackend::new(5, 8)).unwrap();
@@ -1286,15 +1316,12 @@ fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
+    assert!(text.contains("agent reviewer"), "{text:?}");
+    assert!(text.contains("5 agents"), "{text:?}");
     assert!(
-        text.contains("agents main, reviewer, tester, triage, writer"),
+        text.contains("fg 1 bg 1 done 1 failed 1 cancelled 0"),
         "{text:?}"
     );
-    assert!(text.contains("selected reviewer"), "{text:?}");
-    assert!(text.contains("reviewer · foreground running"), "{text:?}");
-    assert!(text.contains("writer · background running"), "{text:?}");
-    assert!(text.contains("tester · completed recent"), "{text:?}");
-    assert!(text.contains("triage · failed"), "{text:?}");
 }
 
 #[test]
