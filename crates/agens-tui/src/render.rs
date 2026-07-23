@@ -351,21 +351,15 @@ impl MarkdownRenderer {
             }
             Tag::CodeBlock(kind) => {
                 self.finish_line();
-                self.code_block = true;
+                // Header is written before code_block=true so it does not get the body gutter.
                 let language = match kind {
                     CodeBlockKind::Fenced(language) if !language.is_empty() => {
                         language.into_string()
                     }
                     _ => "code".to_owned(),
                 };
-                self.text(
-                    &format!("╭ {language} "),
-                    Style::default()
-                        .fg(RolePalette::muted())
-                        .bg(code_block_background())
-                        .add_modifier(Modifier::BOLD),
-                );
-                self.finish_line();
+                self.push_code_chrome(&format!("── {language} "));
+                self.code_block = true;
             }
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
             Tag::Paragraph
@@ -401,14 +395,9 @@ impl MarkdownRenderer {
             }
             TagEnd::CodeBlock => {
                 self.finish_line();
-                self.text(
-                    "╰────",
-                    Style::default()
-                        .fg(RolePalette::muted())
-                        .bg(code_block_background()),
-                );
-                self.finish_line();
+                // Footer after clearing the body gutter flag.
                 self.code_block = false;
+                self.push_code_chrome("────");
                 self.blank_line();
             }
             TagEnd::Link => {
@@ -478,6 +467,7 @@ impl MarkdownRenderer {
             ));
         }
         if self.code_block {
+            // Stable two-cell gutter; avoid nested box corners that break in many fonts.
             self.spans.push(Span::styled(
                 "│ ",
                 Style::default()
@@ -491,6 +481,18 @@ impl MarkdownRenderer {
                 self.base_style.fg(Color::DarkGray),
             ));
         }
+    }
+
+    fn push_code_chrome(&mut self, label: &str) {
+        self.start_line();
+        self.spans.push(Span::styled(
+            label.to_owned(),
+            Style::default()
+                .fg(RolePalette::muted())
+                .bg(code_block_background())
+                .add_modifier(Modifier::BOLD),
+        ));
+        self.finish_line();
     }
 
     fn finish_line(&mut self) {

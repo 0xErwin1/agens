@@ -603,6 +603,28 @@ fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
 }
 
 #[test]
+fn fenced_code_block_chrome_does_not_nest_body_gutter_on_header() {
+    let terminal = Terminal::new(TestBackend::new(56, 16)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "Use:\n\n```bash\nagens chat \"hello\"\n```\n".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("── bash"), "{text:?}");
+    assert!(text.contains("agens chat"), "{text:?}");
+    assert!(text.contains("────"), "{text:?}");
+    // Header must not be "│ ── bash" (body gutter nested into chrome).
+    assert!(!text.contains("│ ── bash"), "{text:?}");
+    // Body lines keep a single gutter cell.
+    assert!(text.contains("│ agens chat"), "{text:?}");
+}
+
+#[test]
 fn renderer_renders_practical_markdown_semantics() {
     let terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
