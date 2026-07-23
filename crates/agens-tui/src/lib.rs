@@ -597,6 +597,7 @@ pub struct DialogView {
     details_open: bool,
     empty_message: Option<String>,
     cancellation_action: Option<String>,
+    overlay_kind: widgets::OverlayKind,
 }
 
 impl DialogView {
@@ -623,6 +624,7 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            overlay_kind: widgets::OverlayKind::Picker,
         }
     }
 
@@ -648,6 +650,12 @@ impl DialogView {
 
     pub fn with_cancellation_action(mut self, action_id: impl AsRef<str>) -> Self {
         self.cancellation_action = Some(bounded_dialog_text(action_id.as_ref(), 128));
+        self
+    }
+
+    /// Marks this dialog as a Confirm overlay (short keys a/d/A/D before query typing).
+    pub fn as_confirm(mut self) -> Self {
+        self.overlay_kind = widgets::OverlayKind::Confirm;
         self
     }
 
@@ -713,6 +721,7 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            overlay_kind: widgets::OverlayKind::Picker,
         }
     }
 }
@@ -1748,8 +1757,7 @@ where
         } else {
             widgets::ExpandMode::Streaming
         };
-        record.collapse_thinking =
-            matches!(mode.finish_stream(), widgets::ExpandMode::Collapsed);
+        record.collapse_thinking = matches!(mode.finish_stream(), widgets::ExpandMode::Collapsed);
     }
 
     /// Supplies concise provider, model, and active-session context for the terminal surface.
@@ -2040,7 +2048,9 @@ where
         {
             let record = self.active_record_mut();
             record.collapsed_tool_outputs.clear();
-            record.collapsed_tool_outputs.extend(completed_tool_call_ids);
+            record
+                .collapsed_tool_outputs
+                .extend(completed_tool_call_ids);
             // Restored history is finished: collapse thinking unless the user re-expands.
             record.collapse_thinking = true;
             record.thinking_user_pinned = false;
@@ -2200,10 +2210,7 @@ where
                 .collapsed_tool_outputs
                 .insert(call_id);
         }
-        if matches!(
-            &event.update,
-            bridge::TuiSubagentUpdate::Terminal { .. }
-        ) {
+        if matches!(&event.update, bridge::TuiSubagentUpdate::Terminal { .. }) {
             let record = self
                 .transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
@@ -2605,6 +2612,17 @@ where
             self.status = None;
         }
 
+        // Esc closes the topmost overlay first (palette before dialog).
+        if key == Key::Escape
+            && widgets::OverlayShell::topmost(
+                self.palette_open,
+                self.dialog.as_ref().map(|dialog| dialog.overlay_kind),
+            ) == Some(widgets::OverlayKind::Palette)
+        {
+            self.palette_open = false;
+            return Action::Render;
+        }
+
         if self
             .dialog
             .as_ref()
@@ -2789,10 +2807,6 @@ where
                 self.palette_open = false;
                 self.input_cursor = 0;
                 Action::Submit(std::mem::take(&mut self.input))
-            }
-            Key::Escape if self.palette_open => {
-                self.palette_open = false;
-                Action::Render
             }
             Key::Escape if self.running => self.cancel_running(),
             Key::Escape if self.dialog.is_some() => {
@@ -2992,6 +3006,33 @@ where
         })
     }
 
+    /// Confirm short keys a/d/A/D map to permission answers before query append.
+    fn try_confirm_shortcut(&mut self, character: char) -> Option<Action> {
+        let dialog = self.dialog.as_ref()?;
+        if dialog.overlay_kind != widgets::OverlayKind::Confirm {
+            return None;
+        }
+        let answer = widgets::OverlayShell::confirm_answer(character)?;
+        let matched = dialog
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.action {
+                Some(DialogEntryAction::Dispatch(action_id))
+                    if widgets::OverlayShell::action_matches_answer(action_id, answer) =>
+                {
+                    Some(Action::DialogAction(action_id.clone()))
+                }
+                Some(DialogEntryAction::SafeDispatch(action_id))
+                    if widgets::OverlayShell::action_matches_answer(action_id, answer) =>
+                {
+                    Some(Action::SafeDialogAction(action_id.clone()))
+                }
+                _ => None,
+            })?;
+        self.dialog = None;
+        Some(matched)
+    }
+
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
             Key::LineStart
@@ -3004,6 +3045,9 @@ where
                 Action::Render
             }
             Key::Char(character) => {
+                if let Some(action) = self.try_confirm_shortcut(character) {
+                    return action;
+                }
                 if character == 'r'
                     && self
                         .dialog
@@ -3369,7 +3413,11 @@ where
         let mut user_offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
-            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
             if text == "You" {
                 user_offsets.push(saturating_u16(row));
             }
@@ -3861,11 +3909,14 @@ where
                 DialogEntry::action(label, format!("permission:{}:{answer}", request.id()))
             })
             .collect();
-            tui.show_selection_dialog(DialogView::selection(
-                "Permission required",
-                Some(format!("{tool}\n{target}")),
-                entries,
-            ));
+            tui.show_selection_dialog(
+                DialogView::selection(
+                    "Permission required",
+                    Some(format!("{tool}\n{target}")),
+                    entries,
+                )
+                .as_confirm(),
+            );
         }
         renderer.render(tui.view())?;
         let Some(event) = runtime_terminal.poll(Duration::from_millis(25))? else {

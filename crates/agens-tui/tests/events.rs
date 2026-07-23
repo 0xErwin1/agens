@@ -2405,7 +2405,8 @@ fn plain_jk_insert_while_ctrl_timeline_nav_scrolls_and_jumps() {
     let before_scroll = tui.view().scroll_offset;
     assert_eq!(tui.handle(Event::Key(Key::CtrlK)), Action::Render);
     assert!(
-        !tui.view().following_bottom || tui.view().scroll_offset < before_scroll
+        !tui.view().following_bottom
+            || tui.view().scroll_offset < before_scroll
             || tui.view().scroll_offset > 0
             || !tui.view().following_bottom,
         "Ctrl+k must scroll the timeline up"
@@ -2472,4 +2473,170 @@ fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
     // Ctrl timeline keys must not steal plain owner navigation characters.
     tui.handle(Event::Key(Key::Char('j')));
     assert_eq!(tui.input(), "j");
+}
+
+fn permission_confirm_entries(request_id: u64) -> Vec<DialogEntry> {
+    [
+        ("Allow once", "allow-once"),
+        ("Always allow", "allow-always"),
+        ("Deny once", "deny-once"),
+        ("Always deny", "deny-always"),
+    ]
+    .into_iter()
+    .map(|(label, answer)| DialogEntry::action(label, format!("permission:{request_id}:{answer}")))
+    .collect()
+}
+
+#[test]
+fn permission_confirm_short_keys_dispatch_allow_deny_once_and_always() {
+    for (key, expected) in [
+        ('a', "permission:7:allow-once"),
+        ('d', "permission:7:deny-once"),
+        ('A', "permission:7:allow-always"),
+        ('D', "permission:7:deny-always"),
+    ] {
+        let mut tui = Tui::new(FakeEngine::default());
+        tui.show_selection_dialog(
+            DialogView::selection(
+                "Permission required",
+                Some("bash\nrm -rf /tmp/x"),
+                permission_confirm_entries(7),
+            )
+            .as_confirm(),
+        );
+
+        assert_eq!(
+            tui.handle(Event::Key(Key::Char(key))),
+            Action::DialogAction(expected.into()),
+            "short key {key}"
+        );
+        assert!(tui.view().dialog.is_none(), "short key {key} closes dialog");
+        assert_eq!(tui.engine().cancellations, 0);
+    }
+}
+
+#[test]
+fn permission_confirm_list_enter_dispatches_selected_choice() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(
+        DialogView::selection(
+            "Permission required",
+            Some("tool\ntarget"),
+            permission_confirm_entries(3),
+        )
+        .as_confirm(),
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("permission:3:allow-always".into())
+    );
+    assert!(tui.view().dialog.is_none());
+}
+
+#[test]
+fn permission_confirm_short_keys_do_not_append_to_query() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(
+        DialogView::selection(
+            "Permission required",
+            Some("tool\ntarget"),
+            permission_confirm_entries(1),
+        )
+        .as_confirm(),
+    );
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Char('a'))),
+        Action::DialogAction("permission:1:allow-once".into())
+    );
+    assert_eq!(tui.input(), "");
+}
+
+#[test]
+fn picker_overlay_still_types_query_for_plain_characters() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        Some("Pick"),
+        vec![
+            DialogEntry::action("alpha", "alpha"),
+            DialogEntry::action("delta", "delta"),
+        ],
+    ));
+
+    assert_eq!(tui.handle(Event::Key(Key::Char('d'))), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("delta".into())
+    );
+}
+
+#[test]
+fn escape_closes_topmost_palette_before_dialog() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_palette_entries(vec![PaletteEntry::new(
+        "/review",
+        "Review",
+        "",
+        PaletteEntryKind::BuiltIn,
+    )]);
+    tui.show_dialog("Notice", "Informational body");
+    tui.handle(Event::Key(Key::Char('/')));
+    assert!(tui.view().palette.is_some());
+    assert!(tui.view().dialog.is_some());
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().palette.is_none(), "palette is topmost");
+    assert!(
+        tui.view().dialog.is_some(),
+        "dialog remains until second Esc"
+    );
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().dialog.is_none());
+    assert_eq!(tui.engine().cancellations, 0);
+}
+
+#[test]
+fn safe_dialog_while_running_remains_usable_and_esc_does_not_cancel_turn() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_running(true);
+    tui.show_selection_dialog(
+        DialogView::selection(
+            "Select project file",
+            Some("Choose one approved file | Esc cancel"),
+            vec![DialogEntry::safe_action(
+                "src/main.rs",
+                "select:src/main.rs",
+            )],
+        )
+        .with_cancellation_action("select:cancel"),
+    );
+
+    assert!(tui.view().running);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SafeDialogAction("select:src/main.rs".into())
+    );
+    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().running);
+    assert_eq!(tui.engine().cancellations, 0);
+
+    tui.show_selection_dialog(
+        DialogView::selection(
+            "Select project file",
+            Some("Choose one approved file | Esc cancel"),
+            vec![DialogEntry::safe_action("src/lib.rs", "select:src/lib.rs")],
+        )
+        .with_cancellation_action("select:cancel"),
+    );
+    assert_eq!(
+        tui.handle(Event::Key(Key::Escape)),
+        Action::SafeDialogAction("select:cancel".into())
+    );
+    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().running);
+    assert_eq!(tui.engine().cancellations, 0);
 }
