@@ -1,7 +1,8 @@
 use agens_core::{
     AttemptFinishOutcome, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
     MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, RequestConfig,
-    Role, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary, SessionMetadata,
+    RetryBoundary, Role, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary,
+    SessionMetadata,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
@@ -67,12 +68,6 @@ impl SessionStore {
             .map_err(|_| BeginSessionAttemptError::Store)?;
             return Err(BeginSessionAttemptError::AlreadyRunning(summary));
         }
-        transaction
-            .execute(
-                "UPDATE session_attempts SET retry_prompt = NULL WHERE session_id = ?1",
-                [session_id],
-            )
-            .map_err(|_| BeginSessionAttemptError::Store)?;
         let sequence = next_sequence(
             &transaction,
             &self.database_path,
@@ -399,6 +394,40 @@ impl SessionStore {
             SessionStoreError::operation("commit attempt recovery", &self.database_path, error)
         })?;
         Ok(RecoveryOutcome::Recovered(summary))
+    }
+
+    pub fn load_retry_boundary(
+        &self,
+        key: AttemptKey,
+    ) -> Result<Option<RetryBoundary>, SessionStoreError> {
+        let prompt = self
+            .connection
+            .query_row(
+                "SELECT retry_prompt FROM session_attempts WHERE id = ?1 AND session_id = ?2",
+                params![key.attempt_id(), key.session_id()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "load attempt retry boundary",
+                    &self.database_path,
+                    error,
+                )
+            })?
+            .flatten();
+
+        prompt
+            .map(|prompt| {
+                RetryBoundary::new(key, prompt).map_err(|error| {
+                    SessionStoreError::operation(
+                        "validate attempt retry boundary",
+                        &self.database_path,
+                        format!("{error:?}"),
+                    )
+                })
+            })
+            .transpose()
     }
 
     pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {

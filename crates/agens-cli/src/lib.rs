@@ -17,8 +17,8 @@ use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     Message, MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
-    PermissionRule, PermissionSession, Role, SessionMessage, SessionMetadata, TurnEvent,
-    TurnProgressSink, TurnState, run_headless_turn_with_max_iterations_and_progress,
+    PermissionRule, PermissionSession, RecoveryOutcome, Role, SessionMessage, SessionMetadata,
+    TurnEvent, TurnProgressSink, TurnState, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
@@ -989,6 +989,23 @@ impl AttemptActivityRegistry {
             active.remove(index);
         }
     }
+
+    fn recover_running_attempt(
+        &self,
+        store: &mut SessionStore,
+        key: AttemptKey,
+        finished_at: i64,
+    ) -> Result<Option<RecoveryOutcome>, ()> {
+        let active = self.active.lock().map_err(|_| ())?;
+        if active.contains(&key) {
+            return Ok(None);
+        }
+
+        store
+            .recover_running_attempt(key, finished_at)
+            .map(Some)
+            .map_err(|_| ())
+    }
 }
 
 struct RegisteredAttempt<'a> {
@@ -1013,6 +1030,74 @@ struct SessionAttemptCompletion {
     snapshot: CompletedTurnSnapshot,
     metadata: SessionMetadata,
     messages: Vec<Message>,
+}
+
+#[allow(dead_code)]
+enum ExplicitAttemptRecoveryOutcome {
+    LocallyActive,
+    Stale,
+    Recovered(Box<SessionAttemptCompletion>),
+}
+
+impl fmt::Debug for ExplicitAttemptRecoveryOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let status = match self {
+            Self::LocallyActive => "LocallyActive",
+            Self::Stale => "Stale",
+            Self::Recovered(_) => "Recovered",
+        };
+
+        formatter.write_str(status)
+    }
+}
+
+#[allow(dead_code)]
+fn recover_session_attempt_lifecycle(
+    registry: &AttemptActivityRegistry,
+    store: &mut SessionStore,
+    key: AttemptKey,
+    finished_at: i64,
+    runtime: impl FnOnce(
+        Vec<Message>,
+        &str,
+        &SessionMetadata,
+    ) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+) -> Result<ExplicitAttemptRecoveryOutcome, AttemptLifecycleError> {
+    let Some(recovery) = registry
+        .recover_running_attempt(store, key, finished_at)
+        .map_err(|_| {
+            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+        })?
+    else {
+        return Ok(ExplicitAttemptRecoveryOutcome::LocallyActive);
+    };
+    if recovery == RecoveryOutcome::Stale {
+        return Ok(ExplicitAttemptRecoveryOutcome::Stale);
+    }
+
+    let boundary = store
+        .load_retry_boundary(key)
+        .map_err(|_| AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed")))?
+        .ok_or_else(|| {
+            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+        })?;
+    let stored = store
+        .load_session_for_resume(key.session_id())
+        .map_err(|_| {
+            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+        })?;
+    let metadata = stored.metadata;
+    let runtime_metadata = metadata.clone();
+    let history = stored.messages;
+    let prompt = boundary.prompt().to_owned();
+    let completion =
+        run_session_attempt_lifecycle(registry, store, metadata, prompt.clone(), || {
+            runtime(history, &prompt, &runtime_metadata)
+        })?;
+
+    Ok(ExplicitAttemptRecoveryOutcome::Recovered(Box::new(
+        completion,
+    )))
 }
 
 fn run_session_attempt_lifecycle(
@@ -13886,5 +13971,146 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
             .status(),
         agens_core::SessionAttemptStatus::Completed
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
+    let directory =
+        std::env::temp_dir().join(format!("agens-explicit-recovery-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 9,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let registry = AttemptActivityRegistry::default();
+    let active = registry
+        .begin_and_register(&mut store, &metadata, "private retry prompt".into())
+        .unwrap();
+
+    assert!(matches!(
+        recover_session_attempt_lifecycle(&registry, &mut store, active.key(), 2, |_, _, _| {
+            unreachable!("a locally active attempt must not invoke retry runtime")
+        })
+        .unwrap(),
+        ExplicitAttemptRecoveryOutcome::LocallyActive
+    ));
+    assert_eq!(
+        store
+            .load_session_for_resume(metadata.id)
+            .unwrap()
+            .latest_attempt
+            .unwrap()
+            .status(),
+        agens_core::SessionAttemptStatus::Running
+    );
+
+    registry.unregister(active.key());
+    let recovered = recover_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        active.key(),
+        3,
+        |history, prompt, _| {
+            assert!(history.is_empty());
+            assert_eq!(prompt, "private retry prompt");
+            let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(MessagePart::Text("recovered answer".into())),
+                TurnEvent::StateChanged(TurnState::Completed),
+            ])
+            .unwrap();
+            let turn = completed_session_turn("private retry prompt", &snapshot, None).unwrap();
+
+            Ok((snapshot, turn))
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        recovered,
+        ExplicitAttemptRecoveryOutcome::Recovered(_)
+    ));
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(stored.metadata.completed_turn_count, 1);
+    assert_eq!(stored.messages.len(), 2);
+    assert_eq!(
+        store.recover_running_attempt(active.key(), 4).unwrap(),
+        agens_core::RecoveryOutcome::Stale
+    );
+    assert!(!registry.contains(active.key()));
+    assert!(!format!("{recovered:?}").contains("private retry prompt"));
+
+    let terminal_metadata = SessionMetadata { id: 10, ..metadata };
+    let terminal_error = run_session_attempt_lifecycle_with_terminal_writer(
+        &registry,
+        &mut store,
+        terminal_metadata.clone(),
+        "terminal retry prompt".into(),
+        || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
+        |_, _, _, _| Err(()),
+    )
+    .unwrap_err();
+    let terminal = store
+        .load_session_for_resume(terminal_metadata.id)
+        .unwrap()
+        .latest_attempt
+        .unwrap();
+
+    assert_eq!(
+        terminal_error,
+        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+    );
+    assert_eq!(terminal.status(), agens_core::SessionAttemptStatus::Running);
+    assert!(!registry.contains(terminal.key()));
+
+    drop(store);
+    let mut reopened = SessionStore::open(&directory).unwrap();
+    let empty_registry = AttemptActivityRegistry::default();
+    assert_eq!(
+        reopened
+            .load_session_for_resume(terminal_metadata.id)
+            .unwrap()
+            .latest_attempt
+            .unwrap()
+            .status(),
+        agens_core::SessionAttemptStatus::Running
+    );
+    assert!(matches!(
+        recover_session_attempt_lifecycle(
+            &empty_registry,
+            &mut reopened,
+            terminal.key(),
+            5,
+            |history, prompt, _| {
+                assert!(history.is_empty());
+                assert_eq!(prompt, "terminal retry prompt");
+                let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+                    TurnEvent::StateChanged(TurnState::Requesting),
+                    TurnEvent::StateChanged(TurnState::Streaming),
+                    TurnEvent::ProviderPart(MessagePart::Text("terminal answer".into())),
+                    TurnEvent::StateChanged(TurnState::Completed),
+                ])
+                .unwrap();
+                let turn =
+                    completed_session_turn("terminal retry prompt", &snapshot, None).unwrap();
+
+                Ok((snapshot, turn))
+            },
+        )
+        .unwrap(),
+        ExplicitAttemptRecoveryOutcome::Recovered(_)
+    ));
     std::fs::remove_dir_all(directory).unwrap();
 }

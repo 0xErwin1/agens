@@ -4,9 +4,9 @@ use std::{
 };
 
 use agens_core::{
-    AttemptFinishOutcome, BeginSessionAttemptError, CompletedSessionTurn, MAX_RETRY_PROMPT_BYTES,
-    Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role, SessionAttemptFailureKind,
-    SessionAttemptStatus, SessionMessage, SessionMetadata,
+    AttemptFinishOutcome, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
+    MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role,
+    SessionAttemptFailureKind, SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
 use agens_store::SessionStore;
 use rusqlite::Connection;
@@ -429,6 +429,20 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
     );
     assert_eq!(
         store
+            .load_retry_boundary(attempt.key())
+            .unwrap()
+            .unwrap()
+            .prompt(),
+        "private"
+    );
+    assert!(
+        store
+            .load_retry_boundary(AttemptKey::new(7, attempt.key().attempt_id() + 1).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
             .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 32)
             .unwrap(),
         AttemptFinishOutcome::Stale
@@ -445,6 +459,108 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
             .unwrap(),
         ("interrupted".into(), 30)
     );
+
+    let successful = store
+        .begin_session_attempt(&metadata, "successful history".into())
+        .unwrap();
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(
+                successful.key(),
+                &metadata,
+                &turn(vec![
+                    Message {
+                        role: Role::System,
+                        parts: vec![MessagePart::Text("system".into())],
+                    },
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text("successful history".into())],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text("history answer".into())],
+                    },
+                ]),
+                40,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+
+    let history = store.load_session_for_resume(metadata.id).unwrap();
+    let completion_first = store
+        .begin_session_attempt(&history.metadata, "completion first".into())
+        .unwrap();
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(
+                completion_first.key(),
+                &history.metadata,
+                &turn(vec![
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text("completion first".into())],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text("completion answer".into())],
+                    },
+                ]),
+                50,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+    assert_eq!(
+        store
+            .recover_running_attempt(completion_first.key(), 51)
+            .unwrap(),
+        RecoveryOutcome::Stale
+    );
+
+    let before_recovery = store.load_session_for_resume(metadata.id).unwrap();
+    let recovery_first = store
+        .begin_session_attempt(&before_recovery.metadata, "recovery first".into())
+        .unwrap();
+    assert!(matches!(
+        store
+            .recover_running_attempt(recovery_first.key(), 60)
+            .unwrap(),
+        RecoveryOutcome::Recovered(_)
+    ));
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(
+                recovery_first.key(),
+                &before_recovery.metadata,
+                &turn(vec![
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text("must not append".into())],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text("must not append".into())],
+                    },
+                ]),
+                61,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Stale
+    );
+    assert_eq!(
+        store
+            .recover_running_attempt(
+                AttemptKey::new(8, recovery_first.key().attempt_id()).unwrap(),
+                62,
+            )
+            .unwrap(),
+        RecoveryOutcome::Stale
+    );
+    let preserved = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(preserved.metadata.completed_turn_count, 2);
+    assert_eq!(preserved.messages.len(), 5);
 
     fs::remove_dir_all(directory).unwrap();
 }
