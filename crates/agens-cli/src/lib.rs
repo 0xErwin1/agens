@@ -10000,7 +10000,6 @@ mod tests {
             "previous reasoning",
             "read · resume-call",
             "previous answer",
-            "previous result",
             "persisted reminder",
             "second request",
             "second answer",
@@ -10012,6 +10011,49 @@ mod tests {
                 "{restored_render:?}"
             );
         }
+        assert!(
+            restored_render.contains("output collapsed; expand to recover"),
+            "{restored_render:?}"
+        );
+        assert!(
+            !restored_render.contains("previous result"),
+            "{restored_render:?}"
+        );
+
+        tui.handle(Event::Key(Key::PageUp));
+        let restored_anchor = (
+            tui.view().following_bottom,
+            tui.view().scroll_offset,
+            tui.view().focus,
+        );
+
+        tui.handle(Event::Key(Key::CtrlO));
+        assert_eq!(
+            (
+                tui.view().following_bottom,
+                tui.view().scroll_offset,
+                tui.view().focus,
+            ),
+            restored_anchor
+        );
+        let expanded_restore = render_tui_test_backend(&tui, 120, 50);
+        assert!(
+            expanded_restore.contains("previous result"),
+            "{expanded_restore:?}"
+        );
+
+        tui.handle(Event::Key(Key::CtrlO));
+        assert_eq!(
+            (
+                tui.view().following_bottom,
+                tui.view().scroll_offset,
+                tui.view().focus,
+            ),
+            restored_anchor
+        );
+        assert!(tui.view().collapsed_tool_outputs.contains("resume-call"));
+        tui.handle(Event::Key(Key::End));
+
         assert_eq!(tui.view().session, format!("session #{}", restored.id));
         assert!(tui.transcript().is_empty());
         assert!(!restored_render.contains("INFO      Resumed session"));
