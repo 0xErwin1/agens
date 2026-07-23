@@ -120,6 +120,74 @@ fn responsive_layout_saturates_heights_one_through_six() {
 }
 
 #[test]
+fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 100)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect the workspace");
+
+    for event in [
+        ConversationEvent::ReasoningDelta("inspect typed events".into()),
+        ConversationEvent::ToolCall {
+            call_id: "read-1".into(),
+            name: "native::read".into(),
+            input: "src/lib.rs".into(),
+        },
+        ConversationEvent::ToolCall {
+            call_id: "grep-2".into(),
+            name: "native::grep".into(),
+            input: "needle".into(),
+        },
+        ConversationEvent::ToolResult {
+            call_id: "grep-2".into(),
+            output: "grep preview".into(),
+            is_error: true,
+        },
+        ConversationEvent::ToolResult {
+            call_id: "read-1".into(),
+            output: format!("read preview\n{}", "long-output ".repeat(400)),
+            is_error: false,
+        },
+        ConversationEvent::Error {
+            message: "safe failure".into(),
+            action: "retry".into(),
+        },
+    ] {
+        tui.apply_conversation_event(event).unwrap();
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "read-1".into(),
+        duration: Some(Duration::from_millis(12)),
+        result: ToolResultState::Success,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "grep-2".into(),
+        duration: Some(Duration::from_secs(2)),
+        result: ToolResultState::Failure,
+    });
+    tui.handle(Event::Key(Key::CtrlO));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert_eq!(text.matches("Tools · batch 1").count(), 1, "{text:?}");
+    for expected in [
+        "inspect the workspace",
+        "inspect typed events",
+        "native::read · read-1",
+        "native::grep · grep-2",
+        "read preview",
+        "grep preview",
+        "Success · 12ms",
+        "Failure · 2s",
+        "visible output truncated",
+        "safe failure",
+        "Action: retry",
+    ] {
+        assert_eq!(text.matches(expected).count(), 1, "{expected}: {text:?}");
+    }
+}
+
+#[test]
 fn multiline_wrapped_user_message_uses_one_accented_identity() {
     let terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
