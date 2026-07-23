@@ -5648,7 +5648,14 @@ fn run_production_task(
                 )
                 .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
                 .map_err(|_| ChildRunError::Runtime)?;
-            run_isolated_task_turn(provider, tool_runtime, project_root, cancellation, progress)
+            run_isolated_task_turn(
+                provider,
+                tool_runtime,
+                project_root,
+                dangerous_mode,
+                cancellation,
+                progress,
+            )
         }
         Some("openai-chatgpt") => {
             let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
@@ -5663,7 +5670,14 @@ fn run_production_task(
             )
             .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
             .map_err(|_| ChildRunError::Runtime)?;
-            run_isolated_task_turn(provider, tool_runtime, project_root, cancellation, progress)
+            run_isolated_task_turn(
+                provider,
+                tool_runtime,
+                project_root,
+                dangerous_mode,
+                cancellation,
+                progress,
+            )
         }
         _ => Err(ChildRunError::Runtime),
     }
@@ -5682,6 +5696,7 @@ fn run_isolated_task_turn<P>(
     mut provider: P,
     tool_runtime: SharedToolDispatcher,
     project_root: &Path,
+    dangerous_mode: bool,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
 ) -> Result<String, ChildRunError>
@@ -5710,7 +5725,8 @@ where
         Arc::clone(&tool_runtime),
         Arc::clone(&pending),
         Arc::clone(&prompts),
-    );
+    )
+    .with_dangerous_override(dangerous_mode);
     let mut resolver = ChildPermissionResolver;
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let snapshot = block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
@@ -6224,6 +6240,7 @@ struct ProductionPermissionGate {
     dispatcher: SharedToolDispatcher,
     allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
     prompts: PendingPermissionPrompts,
+    dangerous_override: bool,
 }
 
 impl ProductionPermissionGate {
@@ -6244,8 +6261,20 @@ impl ProductionPermissionGate {
             dispatcher,
             allowed,
             prompts,
+            dangerous_override: false,
         }
     }
+
+    fn with_dangerous_override(mut self, dangerous_override: bool) -> Self {
+        self.dangerous_override = dangerous_override;
+        self
+    }
+}
+
+fn is_dangerous_child_native_tool(name: &str) -> bool {
+    DANGEROUS_CHILD_NATIVE_TOOLS.iter().any(|registered| {
+        name == *registered || name == registered.strip_prefix("native::").unwrap_or_default()
+    })
 }
 
 impl HeadlessPermissionGate for ProductionPermissionGate {
@@ -6265,7 +6294,7 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                     .map_err(|_| HeadlessTurnPortError::Permission)
                     .and_then(|dispatcher| {
                         dispatcher
-                            .evaluate(
+                            .evaluate_with_policy_override(
                                 &self.policy,
                                 &grants,
                                 &self.session,
@@ -6274,6 +6303,8 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                                     &call.name,
                                     parse_tool_input(call)?,
                                 ),
+                                self.dangerous_override
+                                    && is_dangerous_child_native_tool(&call.name),
                             )
                             .map_err(|_| HeadlessTurnPortError::Permission)
                     })
@@ -8210,6 +8241,200 @@ mod tests {
                 .is_some()
         );
 
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
+        let ordinary_deny = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::write".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let ordinary = run_production_batch_with_policy(
+            ProductionBatchInput::new(
+                "dangerous-ordinary-deny",
+                Vec::new(),
+                vec![native_batch_call(
+                    "ordinary",
+                    "native::write",
+                    serde_json::json!({"path":"notes.md","content":"allowed"}),
+                )],
+            )
+            .with_policy(ordinary_deny)
+            .with_dangerous_override(),
+        );
+        assert!(ordinary.result.is_ok());
+        assert!(ordinary.prompts.is_empty());
+        assert_eq!(ordinary.executions, ["notes.md"]);
+
+        let hard_global_deny = PermissionPolicy::with_safety_predicates(
+            PermissionMode::Edit,
+            Vec::new(),
+            vec![agens_core::SafetyPredicate::GlobalDeny(Box::new(
+                agens_core::GlobalDenyPredicate {
+                    tool: PermissionPattern::Exact("native::write".into()),
+                    target: PermissionPattern::Any,
+                },
+            ))],
+        );
+        let global = run_production_batch_with_policy(
+            ProductionBatchInput::new(
+                "dangerous-global-deny",
+                Vec::new(),
+                vec![native_batch_call(
+                    "global",
+                    "native::write",
+                    serde_json::json!({"path":"blocked.md","content":"blocked"}),
+                )],
+            )
+            .with_policy(hard_global_deny)
+            .with_dangerous_override(),
+        );
+        assert!(global.result.is_ok());
+        assert!(global.prompts.is_empty());
+        assert!(global.executions.is_empty());
+
+        let chat = run_production_batch_with_policy(
+            ProductionBatchInput::new(
+                "dangerous-chat-write",
+                Vec::new(),
+                vec![native_batch_call(
+                    "chat",
+                    "native::write",
+                    serde_json::json!({"path":"blocked.md","content":"blocked"}),
+                )],
+            )
+            .with_policy(PermissionPolicy::new(PermissionMode::Chat, Vec::new()))
+            .with_dangerous_override(),
+        );
+        assert!(chat.result.is_ok());
+        assert!(chat.prompts.is_empty());
+        assert!(chat.executions.is_empty());
+
+        for (name, input) in [
+            ("native::write", "{malformed"),
+            (
+                "native::task",
+                r#"{"agent":"worker","description":"recursive"}"#,
+            ),
+            ("mcp::server::tool", r#"{}"#),
+            ("native::unregistered", r#"{}"#),
+        ] {
+            let rejected = run_production_batch_with_policy(
+                ProductionBatchInput::new(
+                    "dangerous-invalid",
+                    Vec::new(),
+                    vec![MessagePart::ToolCall {
+                        id: "rejected".into(),
+                        name: name.into(),
+                        input: input.into(),
+                    }],
+                )
+                .with_dangerous_override(),
+            );
+            assert_eq!(
+                rejected.result,
+                Err(HeadlessTurnError::PermissionEvaluation),
+                "{name} must be rejected before policy bypass"
+            );
+            assert!(rejected.prompts.is_empty());
+            assert!(rejected.executions.is_empty());
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        dispatcher
+            .lock()
+            .unwrap()
+            .register_native(
+                "native::write",
+                ToolAccess::Write,
+                BatchTool {
+                    name: "native::write".into(),
+                    calls: Arc::clone(&calls),
+                    cancellation: None,
+                },
+            )
+            .unwrap();
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut gate = ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+            Arc::new(Mutex::new(Vec::new())),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .with_dangerous_override(true);
+        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+        let call = HeadlessToolCall {
+            id: "once".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"once.md","content":"once"}"#.into(),
+        };
+        let cancellation = HeadlessTurnCancellation::default();
+
+        assert_eq!(
+            poll_permission_port(gate.evaluate(&call, &cancellation)),
+            Ok(PermissionDecision::Allow)
+        );
+        assert!(
+            poll_permission_port(tool_dispatcher.dispatch(call.clone(), &cancellation)).is_ok()
+        );
+        assert_eq!(
+            poll_permission_port(tool_dispatcher.dispatch(call, &cancellation)),
+            Err(HeadlessTurnPortError::Tool)
+        );
+        assert_eq!(*calls.lock().unwrap(), ["once.md"]);
+
+        let oversized = "x".repeat(agens_core::MAX_PERMISSION_TARGET_BYTES + 1);
+        let oversized_call = HeadlessToolCall {
+            id: "oversized".into(),
+            name: "native::write".into(),
+            input: serde_json::json!({"path": oversized, "content": "blocked"}).to_string(),
+        };
+        assert_eq!(
+            poll_permission_port(gate.evaluate(&oversized_call, &cancellation)),
+            Err(HeadlessTurnPortError::Permission)
+        );
+
+        let temporary = tui_session_directory("dangerous-confined-write");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let (_, dispatcher) = production_dangerous_child_tool_runtime(&project_root).unwrap();
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut gate = ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+            Arc::new(Mutex::new(Vec::new())),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+        .with_dangerous_override(true);
+        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+        let escape = HeadlessToolCall {
+            id: "escape".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"../escape.txt","content":"blocked"}"#.into(),
+        };
+
+        assert_eq!(
+            poll_permission_port(gate.evaluate(&escape, &cancellation)),
+            Ok(PermissionDecision::Allow)
+        );
+        assert!(
+            poll_permission_port(tool_dispatcher.dispatch(escape, &cancellation))
+                .expect("confined dispatcher should return a sanitized tool failure")
+                .is_error
+        );
+        assert!(!temporary.join("escape.txt").exists());
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -12155,6 +12380,7 @@ mod tests {
         fail_persistence: bool,
         policy: PermissionPolicy,
         bypass: bool,
+        dangerous_override: bool,
     }
 
     impl<'a> ProductionBatchInput<'a> {
@@ -12172,6 +12398,7 @@ mod tests {
                 fail_persistence: false,
                 policy: batch_policy(),
                 bypass: false,
+                dangerous_override: false,
             }
         }
 
@@ -12194,6 +12421,11 @@ mod tests {
 
         fn with_bypass(mut self) -> Self {
             self.bypass = true;
+            self
+        }
+
+        fn with_dangerous_override(mut self) -> Self {
+            self.dangerous_override = true;
             self
         }
     }
@@ -12237,6 +12469,7 @@ mod tests {
             fail_persistence,
             policy,
             bypass,
+            dangerous_override,
         } = input;
         let directory =
             std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
@@ -12251,11 +12484,16 @@ mod tests {
             "native::glob",
             "native::grep",
             "native::webfetch",
+            "native::write",
         ] {
             dispatcher_guard
                 .register_native(
                     name,
-                    agens_core::ToolAccess::ReadOnly,
+                    if name == "native::write" {
+                        agens_core::ToolAccess::Write
+                    } else {
+                        agens_core::ToolAccess::ReadOnly
+                    },
                     BatchTool {
                         name: name.into(),
                         calls: Arc::clone(&executions),
@@ -12280,7 +12518,8 @@ mod tests {
             Arc::clone(&dispatcher),
             Arc::clone(&allowed),
             Arc::clone(&pending_prompts),
-        );
+        )
+        .with_dangerous_override(dangerous_override);
         let mut resolver = ProductionPermissionResolver::new(
             RecordingPrompt {
                 answers,

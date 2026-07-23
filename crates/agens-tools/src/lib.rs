@@ -3202,6 +3202,19 @@ impl ToolDispatcher {
         session: &PermissionSession,
         request: ToolDispatchRequest,
     ) -> Result<ToolEvaluationOutcome, Error> {
+        self.evaluate_with_policy_override(policy, grants, session, request, false)
+    }
+
+    /// Evaluates identity, arguments, target projection, and hard safety before an optional
+    /// caller-owned override of ordinary policy decisions.
+    pub fn evaluate_with_policy_override(
+        &self,
+        policy: &PermissionPolicy,
+        grants: &[ProjectPermissionGrant],
+        session: &PermissionSession,
+        request: ToolDispatchRequest,
+        override_ordinary_policy: bool,
+    ) -> Result<ToolEvaluationOutcome, Error> {
         let identity = self
             .aliases
             .get(&request.qualified_tool_name)
@@ -3227,6 +3240,22 @@ impl ToolDispatcher {
         } else {
             &grants
         };
+
+        if !policy.hard_safety_allows(&permission) {
+            return Ok(ToolEvaluationOutcome::Denied);
+        }
+
+        if override_ordinary_policy {
+            return Ok(ToolEvaluationOutcome::Authorized(AuthorizedToolCall {
+                dispatcher_id: self.dispatcher_id,
+                registration_version: registered.version,
+                identity: identity.clone(),
+                projected_target: permission.target,
+                access: permission.access,
+                arguments_digest: digest_arguments(&request.arguments),
+                arguments: request.arguments,
+            }));
+        }
 
         match policy.evaluate(&permission, grants, session) {
             PermissionDecision::Deny => Ok(ToolEvaluationOutcome::Denied),

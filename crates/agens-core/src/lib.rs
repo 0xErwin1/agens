@@ -2019,15 +2019,7 @@ impl PermissionPolicy {
         session_grants: &[ProjectPermissionGrant],
         session: &PermissionSession,
     ) -> PermissionDecision {
-        if self.safety_predicates.iter().any(|predicate| {
-            matches!(predicate, SafetyPredicate::WorktreeEscape) && request.outside_worktree
-                || matches!(predicate, SafetyPredicate::ChatWrite)
-                    && self.mode == PermissionMode::Chat
-                    && request.access == ToolAccess::Write
-                || matches!(predicate, SafetyPredicate::GlobalDeny(global_deny)
-                    if global_deny.tool.matches(&request.tool)
-                        && global_deny.target.matches(&request.target))
-        }) {
+        if !self.hard_safety_allows(request) {
             return PermissionDecision::Deny;
         }
 
@@ -2052,6 +2044,18 @@ impl PermissionPolicy {
             .unwrap_or(PermissionDecision::Ask);
 
         Self::resolve_ask(decision, session)
+    }
+
+    pub fn hard_safety_allows(&self, request: &PermissionRequest) -> bool {
+        !self.safety_predicates.iter().any(|predicate| {
+            matches!(predicate, SafetyPredicate::WorktreeEscape) && request.outside_worktree
+                || matches!(predicate, SafetyPredicate::ChatWrite)
+                    && self.mode == PermissionMode::Chat
+                    && request.access == ToolAccess::Write
+                || matches!(predicate, SafetyPredicate::GlobalDeny(global_deny)
+                    if global_deny.tool.matches(&request.tool)
+                        && global_deny.target.matches(&request.target))
+        })
     }
 
     fn resolve_ask(
