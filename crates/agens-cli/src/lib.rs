@@ -1195,15 +1195,21 @@ fn attempt_failure_status(error: &CliError) -> agens_core::SessionAttemptStatus 
 struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
     cancellation: BridgeCancel,
+    model_id: String,
     turn_started_at: Option<std::time::Instant>,
     tools: BTreeMap<String, (String, std::time::Instant)>,
 }
 
 impl TuiMetricsPublisher {
-    fn new(bridge: BridgeTx<TuiRuntimeEvent>, cancellation: BridgeCancel) -> Self {
+    fn new(
+        bridge: BridgeTx<TuiRuntimeEvent>,
+        cancellation: BridgeCancel,
+        model_id: impl Into<String>,
+    ) -> Self {
         Self {
             bridge,
             cancellation,
+            model_id: model_id.into(),
             turn_started_at: None,
             tools: BTreeMap::new(),
         }
@@ -1229,7 +1235,13 @@ impl TuiMetricsPublisher {
             TurnEvent::StateChanged(
                 TurnState::Completed | TurnState::Cancelled | TurnState::Failed,
             ) => None,
-            TurnEvent::Usage(usage) => Some(TuiRuntimeEvent::Usage(usage.clone())),
+            TurnEvent::Usage(usage) => {
+                let mut usage = usage.clone();
+                if usage.context_window.is_none() {
+                    usage.context_window = model_registry::context_window_for(&self.model_id);
+                }
+                Some(TuiRuntimeEvent::Usage(usage))
+            }
             TurnEvent::ToolCallRequested { id, name, input } => {
                 self.tools.insert(id.clone(), (name.clone(), now));
                 Some(TuiRuntimeEvent::ToolStarted {
@@ -3161,9 +3173,14 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             *active = Some(turn_cancellation.clone());
             drop(active);
 
+            let model_id = router
+                .presentation()
+                .map(|presentation| presentation.model().to_owned())
+                .unwrap_or_default();
             let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
                 metrics,
                 BridgeCancel::new(),
+                model_id,
             )));
             let metrics_progress = Arc::clone(&metrics);
             let sink: TurnProgressSink = Arc::new(move |event| {
@@ -8027,6 +8044,22 @@ mod tests {
         }
 
         #[test]
+        fn context_window_for_returns_registry_value_or_none() {
+            assert_eq!(
+                crate::model_registry::context_window_for("gpt-4.1"),
+                Some(1_047_576)
+            );
+            assert_eq!(
+                crate::model_registry::context_window_for("gpt-5.5"),
+                Some(272_000)
+            );
+            assert_eq!(
+                crate::model_registry::context_window_for("not-a-real-model-xyz"),
+                None
+            );
+        }
+
+        #[test]
         fn models_command_uses_the_bundled_registry() {
             let result = execute_strings(
                 vec!["models".to_owned()],
@@ -12552,6 +12585,7 @@ mod tests {
         let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
             metrics_sender,
             BridgeCancel::new(),
+            "test-model",
         )));
         let progress: TurnProgressSink = {
             let progress_events = Arc::clone(&progress_events);
@@ -13048,7 +13082,7 @@ mod tests {
     fn tui_metrics_production_publication_preserves_usage_tools_and_diffs_in_source_order() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(16);
         let cancellation = agens_tui::BridgeCancel::new();
-        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation);
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "unknown-model");
 
         for event in [
             TurnEvent::StateChanged(TurnState::Requesting),
@@ -13130,7 +13164,7 @@ mod tests {
     fn tui_metrics_production_publication_keeps_missing_timing_and_failed_tool_state() {
         let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
         let cancellation = agens_tui::BridgeCancel::new();
-        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation);
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "unknown-model");
 
         publisher.observe(&TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id: "unknown".into(),
@@ -13192,6 +13226,96 @@ mod tests {
             }
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn tui_metrics_publisher_enriches_context_window_from_registry_for_known_model() {
+        let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
+        let cancellation = agens_tui::BridgeCancel::new();
+        let mut publisher =
+            TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
+
+        publisher.observe(&TurnEvent::Usage(agens_core::Usage {
+            input_tokens: Some(11),
+            output_tokens: None,
+            total_tokens: Some(17),
+            context_window: None,
+        }));
+
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap()
+            .into_parts()
+            .1;
+
+        assert!(matches!(
+            event,
+            agens_tui::TuiRuntimeEvent::Usage(agens_core::Usage {
+                input_tokens: Some(11),
+                output_tokens: None,
+                total_tokens: Some(17),
+                context_window: Some(1_047_576),
+            })
+        ));
+    }
+
+    #[test]
+    fn tui_metrics_publisher_leaves_context_window_none_for_unknown_model() {
+        let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
+        let cancellation = agens_tui::BridgeCancel::new();
+        let mut publisher =
+            TuiMetricsPublisher::new(bridge, cancellation, "not-a-real-model-xyz");
+
+        publisher.observe(&TurnEvent::Usage(agens_core::Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            total_tokens: Some(8),
+            context_window: None,
+        }));
+
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap()
+            .into_parts()
+            .1;
+
+        assert!(matches!(
+            event,
+            agens_tui::TuiRuntimeEvent::Usage(agens_core::Usage {
+                total_tokens: Some(8),
+                context_window: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tui_metrics_publisher_preserves_provider_context_window_when_present() {
+        let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
+        let cancellation = agens_tui::BridgeCancel::new();
+        let mut publisher =
+            TuiMetricsPublisher::new(bridge, cancellation, "gpt-4.1");
+
+        publisher.observe(&TurnEvent::Usage(agens_core::Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            total_tokens: Some(3),
+            context_window: Some(42),
+        }));
+
+        let event = receiver
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap()
+            .into_parts()
+            .1;
+
+        assert!(matches!(
+            event,
+            agens_tui::TuiRuntimeEvent::Usage(agens_core::Usage {
+                context_window: Some(42),
+                ..
+            })
+        ));
     }
 
     #[test]

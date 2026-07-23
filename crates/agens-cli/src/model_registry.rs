@@ -199,6 +199,22 @@ fn valid_model_id(model: &str) -> bool {
         })
 }
 
+/// Looks up a known model's context window from the registry.
+///
+/// Returns `None` when the model is unknown or has no recorded window.
+/// Never invents a default size.
+pub(crate) fn context_window_for(model_id: &str) -> Option<u64> {
+    for source in [TuiModelSource::OpenAiApi, TuiModelSource::ChatGptSubscription] {
+        if let Ok(models) = source_models(source)
+            && let Some(model) = models.iter().find(|model| model.id == model_id)
+        {
+            return model.context;
+        }
+    }
+
+    None
+}
+
 fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
     let mut models = match source {
         TuiModelSource::OpenAiApi => {

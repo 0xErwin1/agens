@@ -147,11 +147,18 @@ fn conversational_surface_centers_and_header_degrades_deterministically() {
                 "session #42",
                 "openai-api / gpt-4.1",
                 "agent main",
-                "ctx 8/128",
                 "Ready",
             ] {
                 assert!(text.contains(expected), "{expected}: {text:?}");
             }
+            assert!(
+                !text.contains("ctx 8/128"),
+                "header must not show context pair: {text:?}"
+            );
+            assert!(
+                text.contains("tokens 8/128"),
+                "footer must show used/window: {text:?}"
+            );
         }
     }
 
@@ -179,6 +186,47 @@ fn conversational_surface_centers_and_header_degrades_deterministically() {
     ] {
         assert!(!text.contains(omitted), "{text:?}");
     }
+}
+
+#[test]
+fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_presentation("openai-api", "gpt-4.1", "session #1");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        total_tokens: Some(15),
+        context_window: Some(8_192),
+    }));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("tokens 15/8192"), "{text:?}");
+    assert!(!text.contains("ctx 15/8192"), "{text:?}");
+    assert!(!text.contains("context 8192"), "{text:?}");
+    assert!(!text.contains("unavailable"), "{text:?}");
+}
+
+#[test]
+fn footer_shows_tokens_used_only_when_window_unknown_without_unavailable() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(4),
+        output_tokens: Some(6),
+        total_tokens: Some(10),
+        context_window: None,
+    }));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("tokens 10"), "{text:?}");
+    assert!(!text.contains("tokens 10/"), "{text:?}");
+    assert!(!text.contains("unavailable"), "{text:?}");
+    assert!(!text.contains("context "), "{text:?}");
 }
 
 #[test]
@@ -596,13 +644,14 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         "write result",
         "12ms",
         "8 + new line",
-        "tokens 8",
-        "context 128",
+        "tokens 8/128",
         "Request failed safely",
         "Action: Check credentials and retry.",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
+    assert!(!text.contains("unavailable"), "{text:?}");
+    assert!(!text.contains("context 128"), "{text:?}");
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(!text.contains("**"), "{text:?}");
     assert!(!text.contains("```"), "{text:?}");
@@ -637,8 +686,9 @@ fn lifecycle_metrics_render_in_footer_without_transcript_rows() {
     assert!(!text.contains("USAGE"));
     assert!(text.contains("Completed"));
     assert!(text.contains("25ms"));
-    assert!(text.contains("tokens 15"));
-    assert!(text.contains("context 8192"));
+    assert!(text.contains("tokens 15/8192"), "{text:?}");
+    assert!(!text.contains("context 8192"), "{text:?}");
+    assert!(!text.contains("unavailable"), "{text:?}");
 }
 
 #[test]
@@ -1274,11 +1324,11 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         "12ms",
         "7 - old line",
         "8 + new line",
-        "tokens 8",
-        "context 128",
+        "tokens 8/128",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
+    assert!(!text.contains("context 128"), "{text:?}");
 }
 
 #[test]

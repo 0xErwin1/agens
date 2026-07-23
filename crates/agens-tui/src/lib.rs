@@ -5,6 +5,7 @@ mod bridge;
 mod conversation;
 mod render;
 mod terminal;
+mod widgets;
 
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
@@ -156,6 +157,10 @@ impl TuiPresentation {
             session: session.into(),
             dangerous_mode: false,
         }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn with_dangerous_mode(mut self, enabled: bool) -> Self {
@@ -895,8 +900,13 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     if layout.footer.height > 0 {
         frame.render_widget(
-            Paragraph::new(footer_text(area.width, &state))
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(widgets::MetricFooter::text(
+                area.width,
+                turn_state_label(state.turn_state, state.running),
+                state.turn_duration,
+                state.latest_usage,
+            ))
+            .style(Style::default().fg(Color::DarkGray)),
             layout.footer,
         );
     }
@@ -1256,10 +1266,6 @@ fn render_header(
             format!("  ·  agent {}", state.selected_agent.unwrap_or("main")),
             Style::default().fg(Color::Gray),
         ));
-        left.push(Span::styled(
-            context_budget(state.latest_usage),
-            Style::default().fg(Color::Gray),
-        ));
     } else if !state.executions.is_empty() {
         append_execution_summary(&mut left, state);
     }
@@ -1278,17 +1284,6 @@ fn render_header(
             state_area,
         );
     }
-}
-
-fn context_budget(usage: Option<&Usage>) -> String {
-    let tokens = usage
-        .and_then(|usage| usage.total_tokens)
-        .map_or_else(|| "?".into(), |tokens| tokens.to_string());
-    let context = usage
-        .and_then(|usage| usage.context_window)
-        .map_or_else(|| "?".into(), |context| context.to_string());
-
-    format!("  ·  ctx {tokens}/{context}")
 }
 
 fn append_execution_summary(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
@@ -1351,36 +1346,6 @@ fn turn_state_color(state: Option<TurnState>, running: bool) -> Color {
 fn composer_metadata(input: &str) -> String {
     let lines = input.chars().filter(|character| *character == '\n').count() + 1;
     format!(" {lines} lines · {} chars ", input.chars().count())
-}
-
-fn footer_text(width: u16, state: &ViewState<'_>) -> String {
-    let duration = state.turn_duration.map_or_else(String::new, |value| {
-        if value.as_secs() > 0 {
-            format!(" · {}s", value.as_secs())
-        } else {
-            format!(" · {}ms", value.as_millis())
-        }
-    });
-    let usage = state.latest_usage.map_or_else(String::new, |usage| {
-        let tokens = usage
-            .total_tokens
-            .map_or_else(|| "unavailable".into(), |value| value.to_string());
-        let context = usage
-            .context_window
-            .map_or_else(|| "unavailable".into(), |value| value.to_string());
-        format!(" · tokens {tokens} · context {context}")
-    });
-    let metrics = format!(
-        " {}{duration}{usage}",
-        turn_state_label(state.turn_state, state.running)
-    );
-    if width < 60 {
-        format!("{metrics}  ·  Enter send  ·  Ctrl+C cancel/quit")
-    } else {
-        format!(
-            "{metrics}  ·  Enter send  ·  Shift+Enter newline  ·  Ctrl+O output  ·  Ctrl+C cancel/quit  ·  PgUp/PgDn scroll  ·  End follow"
-        )
-    }
 }
 
 fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
