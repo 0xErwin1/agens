@@ -15,7 +15,7 @@ pub(crate) struct FooterContext<'a> {
     pub dangerous: bool,
 }
 
-/// Formats the metric footer line: model · effort · project · ctx · status.
+/// Formats the metric footer line: model · effort · usage · project · status.
 pub(crate) struct MetricFooter;
 
 impl MetricFooter {
@@ -38,13 +38,13 @@ impl MetricFooter {
             parts.push(effort.to_owned());
         }
 
+        if let Some(usage) = ctx.usage.and_then(Self::format_usage) {
+            parts.push(usage);
+        }
+
         let project = short_project(ctx.project);
         if !project.is_empty() && width >= 70 {
             parts.push(project);
-        }
-
-        if let Some(usage) = ctx.usage.and_then(Self::format_usage) {
-            parts.push(usage);
         }
 
         let mut status = ctx.turn_label.to_owned();
@@ -199,5 +199,13 @@ mod tests {
         assert!(!line.contains("Enter send"));
         assert!(!line.contains("Ctrl+C"));
         assert!(!line.contains("unavailable"));
+        // Claude-like order: model · effort · usage · project · status
+        let model_at = line.find("gpt-5.6-sol").expect("model");
+        let effort_at = line.find("high").expect("effort");
+        let usage_at = line.find("15k/200k").expect("usage");
+        let project_at = line.find("agens").expect("project");
+        let status_at = line.find("Ready").expect("status");
+        assert!(model_at < effort_at && effort_at < usage_at);
+        assert!(usage_at < project_at && project_at < status_at);
     }
 }

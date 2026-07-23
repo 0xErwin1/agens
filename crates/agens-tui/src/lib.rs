@@ -808,7 +808,7 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(area, state.input);
+    let layout = screen_layout(area, state.input, header_should_show(&state));
 
     if layout.header.height > 0 {
         render_header(frame, layout.header, &state);
@@ -1198,9 +1198,10 @@ fn conversation_surface(area: Rect) -> Rect {
     area
 }
 
-fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str, show_header: bool) -> ScreenLayout {
     let area = conversation_surface(area);
-    let header_rows = u16::from(area.height >= 7);
+    // Reclaim a row when idle chrome would be empty (no danger / status / executions / run).
+    let header_rows = u16::from(area.height >= 7 && show_header);
     let footer_rows = u16::from(area.height >= 12);
     let composer_rows = match area.height {
         0 => 0,
@@ -1231,6 +1232,13 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
         composer: chunks[2],
         footer: chunks[3],
     }
+}
+
+fn header_should_show(state: &ViewState<'_>) -> bool {
+    state.dangerous_mode
+        || state.running
+        || !state.executions.is_empty()
+        || state.status.is_some_and(|value| !value.is_empty())
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
@@ -1297,19 +1305,26 @@ fn append_execution_summary(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
         }
     }
 
+    let agent = state.selected_agent.unwrap_or("main");
     left.push(Span::styled(
-        format!("  ·  agent {}", state.selected_agent.unwrap_or("main")),
-        Style::default().fg(Color::Gray),
+        format!(" {agent}"),
+        Style::default().fg(widgets::RolePalette::tool()),
     ));
+
+    let mut parts = vec![
+        format!("fg {foreground}"),
+        format!("bg {background}"),
+        format!("done {completed}"),
+    ];
+    if failed > 0 {
+        parts.push(format!("failed {failed}"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("cancelled {cancelled}"));
+    }
     left.push(Span::styled(
-        format!("  ·  {} agents", state.agent_catalog.len()),
-        Style::default().fg(Color::Gray),
-    ));
-    left.push(Span::styled(
-        format!(
-            "  ·  fg {foreground} bg {background} done {completed} failed {failed} cancelled {cancelled}"
-        ),
-        Style::default().fg(Color::Yellow),
+        format!(" · {}", parts.join(" ")),
+        Style::default().fg(widgets::RolePalette::warning()),
     ));
 }
 
@@ -2921,7 +2936,7 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input);
+        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         let content_width = layout
             .transcript
@@ -2938,7 +2953,7 @@ where
 
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input)
+        screen_layout(area, &self.input, header_should_show(&self.view()))
             .transcript
             .height
             .saturating_sub(1)
@@ -3385,7 +3400,7 @@ where
 
     fn jump_to_user_message(&mut self, previous: bool) {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input);
+        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
         let content_width = layout
             .transcript
             .width

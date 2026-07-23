@@ -574,13 +574,19 @@ fn fenced_code_block_chrome_does_not_nest_body_gutter_on_header() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("╭ bash"), "{text:?}");
+    assert!(text.contains("╭─ bash"), "{text:?}");
     assert!(text.contains("agens chat"), "{text:?}");
-    assert!(text.contains("╰────"), "{text:?}");
-    // Header must not be "│ ╭ bash" (body gutter nested into chrome).
-    assert!(!text.contains("│ ╭ bash"), "{text:?}");
-    // Body lines keep a single gutter cell.
+    assert!(text.contains('╰'), "{text:?}");
+    // Header must not nest the body gutter into chrome.
+    assert!(!text.contains("│ ╭"), "{text:?}");
+    assert!(!text.contains("│╭"), "{text:?}");
+    // Body lines keep a single gutter cell; rails join ╭─ / │ / ╰─.
     assert!(text.contains("│ agens chat"), "{text:?}");
+    // Full-width rule continues past the language label.
+    assert!(
+        text.contains("╭─ bash ─") || text.matches('─').count() >= 8,
+        "expected continuous header rule: {text:?}"
+    );
 }
 
 #[test]
@@ -690,6 +696,26 @@ fn renderer_renders_practical_markdown_semantics() {
         cell_for_text(&renderer, "STRONGTOKEN").fg,
         Color::Rgb(0xff, 0xb4, 0x54)
     );
+    assert_eq!(
+        cell_for_text(&renderer, "Result").fg,
+        Color::Rgb(0xff, 0xb4, 0x54),
+        "H1 should use strong accent"
+    );
+    assert!(
+        cell_for_text(&renderer, "Result")
+            .modifier
+            .contains(Modifier::UNDERLINED),
+        "H1 should underline for hierarchy"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "EMPHASISTOKEN").fg,
+        Color::Rgb(0xd2, 0xa6, 0xff)
+    );
+    // List markers use tool accent, not base gray.
+    assert_eq!(
+        cell_for_text(&renderer, "•").fg,
+        Color::Rgb(0x59, 0xc2, 0xff)
+    );
 }
 
 #[test]
@@ -715,7 +741,12 @@ fn streamed_and_final_markdown_share_one_stable_rendering_path() {
         1,
         "{final_text:?}"
     );
-    assert_eq!(rendered_row(&renderer, "stable-answer-token"), live_row);
+    // Idle header collapses after the turn ends (reclaims one row); markdown path stays stable.
+    let final_row = rendered_row(&renderer, "stable-answer-token");
+    assert!(
+        final_row == live_row || final_row + 1 == live_row,
+        "live_row={live_row} final_row={final_row}"
+    );
     assert!(!live.contains("##"), "{live:?}");
     assert!(!final_text.contains("**"), "{final_text:?}");
 }
@@ -1597,12 +1628,16 @@ fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("agent reviewer"), "{text:?}");
-    assert!(text.contains("5 agents"), "{text:?}");
+    assert!(text.contains("reviewer"), "{text:?}");
     assert!(
-        text.contains("fg 1 bg 1 done 1 failed 1 cancelled 0"),
+        !text.contains("agents"),
+        "catalog count laundry removed: {text:?}"
+    );
+    assert!(
+        text.contains("fg 1") && text.contains("bg 1") && text.contains("done 1"),
         "{text:?}"
     );
+    assert!(text.contains("failed 1"), "{text:?}");
 }
 
 #[test]

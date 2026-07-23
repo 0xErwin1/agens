@@ -8169,7 +8169,7 @@ mod tests {
             .is_none()
         );
         assert!(session.lock().unwrap().dangerous_mode);
-        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens danger"));
+        assert!(render_tui_test_backend(&tui, 120, 24).contains("danger"));
 
         assert!(
             tui.apply_submission_outcome(router.route("/dangerous".into()))
@@ -8555,7 +8555,9 @@ mod tests {
 
         configure_tui_project_identity(&mut fallback_tui, &no_project_bootstrap);
         assert_eq!(fallback_tui.view().project, "agens");
-        assert!(render_tui_test_backend(&fallback_tui, 120, 24).contains("project agens"));
+        let fallback_render = render_tui_test_backend(&fallback_tui, 120, 24);
+        // Project basename lives in the operational footer (not "project …" header chrome).
+        assert!(fallback_render.contains("agens"), "{fallback_render:?}");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -10626,7 +10628,6 @@ mod tests {
         for expected in [
             "previous request",
             "Thinking · collapsed",
-            "read",
             "previous answer",
             "persisted reminder",
             "second request",
@@ -10639,8 +10640,15 @@ mod tests {
                 "{restored_render:?}"
             );
         }
+        // Tool name appears on header and result footer; assert the card chrome once.
+        assert!(restored_render.contains("┌ read"), "{restored_render:?}");
+        assert_eq!(
+            restored_render.matches("┌ read").count(),
+            1,
+            "{restored_render:?}"
+        );
         assert!(
-            restored_render.contains("output collapsed; expand to recover"),
+            restored_render.contains("output collapsed"),
             "{restored_render:?}"
         );
         assert!(

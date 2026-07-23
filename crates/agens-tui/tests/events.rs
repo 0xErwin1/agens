@@ -2229,10 +2229,15 @@ fn ratatui_layout_degrades_without_overlapping_at_standard_narrow_and_short_size
 
         renderer.render(tui.view()).unwrap();
         let buffer = renderer.terminal().backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
 
         assert_eq!(buffer.area.width, width);
         assert_eq!(buffer.area.height, height);
-        assert!(buffer.content.iter().any(|cell| cell.symbol() == "a"));
+        // Idle chrome is minimal (no brand header); still paint band rules and/or footer.
+        assert!(
+            text.contains('─') || text.contains("Ready") || text.contains("model"),
+            "height {height}: expected layout chrome, got {text:?}"
+        );
     }
 }
 

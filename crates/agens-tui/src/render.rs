@@ -350,9 +350,12 @@ impl MarkdownRenderer {
                 self.text("────────────────", self.base_style.fg(Color::DarkGray));
                 self.finish_line();
             }
-            Event::TaskListMarker(checked) => {
-                self.text(if checked { "[x] " } else { "[ ] " }, self.base_style)
-            }
+            Event::TaskListMarker(checked) => self.text(
+                if checked { "[x] " } else { "[ ] " },
+                self.base_style
+                    .fg(RolePalette::tool())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
                 self.text(&text, self.current_style())
             }
@@ -380,7 +383,12 @@ impl MarkdownRenderer {
                     }
                     _ => "• ".to_owned(),
                 };
-                self.text(&format!("{}{marker}", "  ".repeat(depth)), self.base_style);
+                self.text(
+                    &format!("{}{marker}", "  ".repeat(depth)),
+                    self.base_style
+                        .fg(RolePalette::tool())
+                        .add_modifier(Modifier::BOLD),
+                );
             }
             Tag::CodeBlock(kind) => {
                 self.finish_line();
@@ -391,7 +399,7 @@ impl MarkdownRenderer {
                     }
                     _ => "code".to_owned(),
                 };
-                self.push_code_chrome(&format!("╭ {language} "));
+                self.push_code_chrome(&format!("╭─ {language} "));
                 self.code_block = true;
                 self.code_panel_line = true;
             }
@@ -431,9 +439,7 @@ impl MarkdownRenderer {
                 self.finish_line();
                 // Footer after clearing the body gutter flag.
                 self.code_block = false;
-                self.code_panel_line = true;
-                self.push_code_chrome("╰────");
-                self.code_panel_line = false;
+                self.push_code_chrome("╰");
                 self.blank_line();
             }
             TagEnd::Link => {
@@ -488,6 +494,9 @@ impl MarkdownRenderer {
                     _ => RolePalette::tool(),
                 })
                 .add_modifier(Modifier::BOLD);
+            if matches!(level, HeadingLevel::H1) {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
         }
         if self.strong > 0 {
             style = style
@@ -521,7 +530,7 @@ impl MarkdownRenderer {
             ));
         }
         if self.code_block {
-            // Stable two-cell gutter; avoid nested box corners that break in many fonts.
+            // Stable two-cell gutter; joins continuously with ╭─ / ╰─ chrome.
             self.spans.push(Span::styled(
                 "│ ",
                 Style::default()
@@ -532,22 +541,30 @@ impl MarkdownRenderer {
         if self.quote_depth > 0 {
             self.spans.push(Span::styled(
                 "│ ".repeat(self.quote_depth),
-                self.base_style.fg(Color::DarkGray),
+                self.base_style.fg(RolePalette::chrome()),
             ));
         }
     }
 
+    /// Full-width joined frame: `╭─ lang ────` / `╰───────────` (no nested body gutter).
     fn push_code_chrome(&mut self, label: &str) {
-        self.code_panel_line = true;
         self.start_line();
-        self.spans.push(Span::styled(
-            label.to_owned(),
-            Style::default()
-                .fg(RolePalette::muted())
-                .bg(code_block_background())
-                .add_modifier(Modifier::BOLD),
-        ));
-        self.finish_line();
+        let rail = Style::default()
+            .fg(RolePalette::muted())
+            .bg(code_block_background())
+            .add_modifier(Modifier::BOLD);
+        self.spans.push(Span::styled(label.to_owned(), rail));
+        let used = Line::from(self.spans.clone()).width();
+        if used < self.content_width {
+            self.spans.push(Span::styled(
+                "─".repeat(self.content_width - used),
+                Style::default()
+                    .fg(RolePalette::muted())
+                    .bg(code_block_background()),
+            ));
+        }
+        self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        self.code_panel_line = false;
     }
 
     fn finish_line(&mut self) {
