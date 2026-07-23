@@ -657,6 +657,90 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     assert!(!child.contains("duplicate-final"));
 }
 
+#[test]
+fn main_and_child_hierarchy_renders_each_event_once() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for (id, agent, event_text) in [
+        (7, "reviewer", "child-seven-sentinel"),
+        (8, "writer", "child-eight-sentinel"),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(
+                id,
+                agent,
+                format!("task-{id}"),
+                TuiExecutionState::ForegroundRunning,
+            ),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(
+            id, event_text,
+        )));
+    }
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 48)).unwrap());
+    renderer.render(tui.view()).unwrap();
+    let main = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(main.matches("Subagent 7 · reviewer").count(), 1, "{main:?}");
+    assert_eq!(main.matches("Subagent 8 · writer").count(), 1, "{main:?}");
+    assert!(!main.contains("child-seven-sentinel"), "{main:?}");
+    assert!(!main.contains("child-eight-sentinel"), "{main:?}");
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    renderer.render(tui.view()).unwrap();
+    let child_seven = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(
+        child_seven.matches("child-seven-sentinel").count(),
+        1,
+        "{child_seven:?}"
+    );
+    assert!(
+        !child_seven.contains("child-eight-sentinel"),
+        "{child_seven:?}"
+    );
+
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    renderer.render(tui.view()).unwrap();
+    let child_eight = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert_eq!(
+        child_eight.matches("child-eight-sentinel").count(),
+        1,
+        "{child_eight:?}"
+    );
+    assert!(
+        !child_eight.contains("child-seven-sentinel"),
+        "{child_eight:?}"
+    );
+
+    tui.handle(Event::Key(Key::Char('m')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+}
+
 impl Engine for FakeEngine {
     fn cancel(&mut self) {
         self.cancellations += 1;
