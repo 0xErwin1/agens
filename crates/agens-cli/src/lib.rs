@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::sync::{Arc, Mutex, OnceLock, mpsc::Receiver};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
@@ -955,6 +955,12 @@ struct AttemptActivityRegistry {
     active: Mutex<Vec<AttemptKey>>,
 }
 
+static ACTIVE_SESSION_ATTEMPTS: OnceLock<AttemptActivityRegistry> = OnceLock::new();
+
+fn active_session_attempts() -> &'static AttemptActivityRegistry {
+    ACTIVE_SESSION_ATTEMPTS.get_or_init(AttemptActivityRegistry::default)
+}
+
 #[allow(dead_code)]
 impl AttemptActivityRegistry {
     fn begin_and_register(
@@ -982,6 +988,121 @@ impl AttemptActivityRegistry {
         {
             active.remove(index);
         }
+    }
+}
+
+struct RegisteredAttempt<'a> {
+    registry: &'a AttemptActivityRegistry,
+    key: AttemptKey,
+}
+
+impl Drop for RegisteredAttempt<'_> {
+    fn drop(&mut self) {
+        self.registry.unregister(self.key);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptLifecycleError {
+    Begin(BeginSessionAttemptError),
+    Runtime(CliError),
+}
+
+#[derive(Debug)]
+struct SessionAttemptCompletion {
+    snapshot: CompletedTurnSnapshot,
+    metadata: SessionMetadata,
+    messages: Vec<Message>,
+}
+
+fn run_session_attempt_lifecycle(
+    registry: &AttemptActivityRegistry,
+    store: &mut SessionStore,
+    metadata: SessionMetadata,
+    prompt: String,
+    runtime: impl FnOnce() -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
+    run_session_attempt_lifecycle_with_terminal_writer(
+        registry,
+        store,
+        metadata,
+        prompt,
+        runtime,
+        |store, key, status, finished_at| {
+            store
+                .finish_session_attempt(key, status, finished_at)
+                .map(|_| ())
+                .map_err(|_| ())
+        },
+    )
+}
+
+fn run_session_attempt_lifecycle_with_terminal_writer(
+    registry: &AttemptActivityRegistry,
+    store: &mut SessionStore,
+    mut metadata: SessionMetadata,
+    prompt: String,
+    runtime: impl FnOnce() -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+    terminal_writer: impl FnOnce(
+        &mut SessionStore,
+        AttemptKey,
+        agens_core::SessionAttemptStatus,
+        i64,
+    ) -> Result<(), ()>,
+) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
+    let attempt = registry
+        .begin_and_register(store, &metadata, prompt)
+        .map_err(AttemptLifecycleError::Begin)?;
+    let _registered = RegisteredAttempt {
+        registry,
+        key: attempt.key(),
+    };
+    metadata.id = attempt.key().session_id();
+
+    let (snapshot, turn) = match runtime() {
+        Ok(completion) => completion,
+        Err(error) => {
+            let status = attempt_failure_status(&error);
+            let _ = terminal_writer(store, attempt.key(), status, current_session_timestamp());
+            return Err(AttemptLifecycleError::Runtime(error));
+        }
+    };
+
+    match store
+        .persist_completed_session_attempt(
+            attempt.key(),
+            &metadata,
+            &turn,
+            current_session_timestamp(),
+        )
+        .map_err(|_| CliError::storage("completed session could not be saved"))
+        .map_err(AttemptLifecycleError::Runtime)?
+    {
+        agens_core::AttemptFinishOutcome::Finished => {}
+        agens_core::AttemptFinishOutcome::Stale => {
+            return Err(AttemptLifecycleError::Runtime(CliError::storage(
+                "completed session could not be saved",
+            )));
+        }
+    }
+
+    let stored = store
+        .load_session_for_resume(metadata.id)
+        .map_err(|_| CliError::storage("completed session could not be loaded"))
+        .map_err(AttemptLifecycleError::Runtime)?;
+
+    Ok(SessionAttemptCompletion {
+        snapshot,
+        metadata: stored.metadata,
+        messages: stored.messages,
+    })
+}
+
+fn attempt_failure_status(error: &CliError) -> agens_core::SessionAttemptStatus {
+    match error.category {
+        "cancelled" | "timeout" => agens_core::SessionAttemptStatus::Cancelled,
+        "auth" | "provider" => agens_core::SessionAttemptStatus::ProviderError,
+        _ => agens_core::SessionAttemptStatus::Failed,
     }
 }
 
@@ -4093,16 +4214,6 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut provider = build_provider(
-        model,
-        provider_messages(&request, context.include_system_prompt),
-        provider_tools,
-        request.request_config.clone(),
-    )?;
-    if let Some(progress) = context.progress {
-        provider = provider.with_progress_sink(Arc::clone(progress));
-    }
-    cancellation_result(context.cancellation)?;
     let mut repository = DiscardCompletedTurnRepository;
     let mut gate = ProductionPermissionGate::new(
         policy.clone(),
@@ -4130,36 +4241,6 @@ where
         },
     );
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = match request.max_iterations.or(context.bootstrap.max_iterations) {
-        Some(max_iterations) => {
-            block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
-                &mut provider,
-                &mut gate,
-                &mut resolver,
-                &mut dispatcher,
-                &mut repository,
-                context.cancellation,
-                max_iterations,
-                context.progress,
-            ))
-        }
-        None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
-            &mut provider,
-            &mut gate,
-            &mut resolver,
-            &mut dispatcher,
-            &mut repository,
-            context.cancellation,
-            context.progress,
-        )),
-    }?
-    .map_err(CliError::runtime)?;
-
-    let turn = completed_session_turn(
-        &request.prompt,
-        &snapshot,
-        request.pending_system_reminder.as_deref(),
-    )?;
     let mut store = SessionStore::open(context.bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
     let metadata = next_session_metadata(
@@ -4171,15 +4252,67 @@ where
         session_model,
         session_effort,
     )?;
-    let metadata = store
-        .persist_completed_session_turn(&metadata, &turn)
-        .map_err(|_| CliError::storage("completed session could not be saved"))?;
-    let messages = store
-        .load_session_for_resume(metadata.id)
-        .map_err(|_| CliError::storage("completed session could not be loaded"))?
-        .messages;
+    let completion = run_session_attempt_lifecycle(
+        active_session_attempts(),
+        &mut store,
+        metadata,
+        request.prompt.clone(),
+        || {
+            let mut provider = build_provider(
+                model,
+                provider_messages(&request, context.include_system_prompt),
+                provider_tools,
+                request.request_config.clone(),
+            )?;
+            if let Some(progress) = context.progress {
+                provider = provider.with_progress_sink(Arc::clone(progress));
+            }
+            cancellation_result(context.cancellation)?;
+            let snapshot = match request.max_iterations.or(context.bootstrap.max_iterations) {
+                Some(max_iterations) => {
+                    block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
+                        &mut provider,
+                        &mut gate,
+                        &mut resolver,
+                        &mut dispatcher,
+                        &mut repository,
+                        context.cancellation,
+                        max_iterations,
+                        context.progress,
+                    ))
+                }
+                None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
+                    &mut provider,
+                    &mut gate,
+                    &mut resolver,
+                    &mut dispatcher,
+                    &mut repository,
+                    context.cancellation,
+                    context.progress,
+                )),
+            }?
+            .map_err(CliError::runtime)?;
+            let turn = completed_session_turn(
+                &request.prompt,
+                &snapshot,
+                request.pending_system_reminder.as_deref(),
+            )?;
 
-    let text = snapshot
+            Ok((snapshot, turn))
+        },
+    )
+    .map_err(|error| match error {
+        AttemptLifecycleError::Begin(BeginSessionAttemptError::AlreadyRunning(_)) => {
+            CliError::runtime(HeadlessTurnError::State)
+        }
+        AttemptLifecycleError::Begin(BeginSessionAttemptError::Store) => {
+            CliError::storage("session attempt could not be started")
+        }
+        AttemptLifecycleError::Runtime(error) => error,
+    })?;
+
+    let text = completion
+        .snapshot
         .events()
         .iter()
         .filter_map(|event| match event {
@@ -4193,14 +4326,14 @@ where
     if text.is_empty() {
         Ok(HeadlessChatCompletion {
             text: "completed".to_owned(),
-            metadata,
-            messages,
+            metadata: completion.metadata,
+            messages: completion.messages,
         })
     } else {
         Ok(HeadlessChatCompletion {
             text,
-            metadata,
-            messages,
+            metadata: completion.metadata,
+            messages: completion.messages,
         })
     }
 }
@@ -13646,23 +13779,112 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
     };
     let mut store = SessionStore::open(&directory).unwrap();
     let registry = AttemptActivityRegistry::default();
+    let provider_calls = std::sync::atomic::AtomicUsize::new(0);
+
     let attempt = registry
         .begin_and_register(&mut store, &metadata, "prompt".into())
         .unwrap();
-    let provider_calls = std::sync::atomic::AtomicUsize::new(0);
-
-    let second = registry.begin_and_register(&mut store, &metadata, "second".into());
-    if second.is_ok() {
-        provider_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    let second = run_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        metadata.clone(),
+        "second".into(),
+        || {
+            provider_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(CliError::runtime(HeadlessTurnError::Provider))
+        },
+    );
 
     assert!(matches!(
         second,
-        Err(BeginSessionAttemptError::AlreadyRunning(_))
+        Err(AttemptLifecycleError::Begin(
+            BeginSessionAttemptError::AlreadyRunning(_)
+        ))
     ));
     assert_eq!(provider_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(registry.contains(attempt.key()));
     registry.unregister(attempt.key());
     assert!(!registry.contains(attempt.key()));
+
+    let mut unrelated = metadata.clone();
+    unrelated.id = 2;
+    let primary_error =
+        run_session_attempt_lifecycle(&registry, &mut store, unrelated, "unrelated".into(), || {
+            Err(CliError::runtime(HeadlessTurnError::Provider))
+        })
+        .unwrap_err();
+
+    assert_eq!(
+        primary_error,
+        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Provider))
+    );
+    assert!(!registry.contains(attempt.key()));
+    assert_eq!(
+        store
+            .load_session_for_resume(2)
+            .unwrap()
+            .latest_attempt
+            .unwrap()
+            .status(),
+        agens_core::SessionAttemptStatus::ProviderError
+    );
+
+    let mut terminal_failure = metadata.clone();
+    terminal_failure.id = 3;
+    let terminal_error = run_session_attempt_lifecycle_with_terminal_writer(
+        &registry,
+        &mut store,
+        terminal_failure,
+        "terminal failure".into(),
+        || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
+        |_, _, _, _| Err(()),
+    )
+    .unwrap_err();
+    let running = store
+        .load_session_for_resume(3)
+        .unwrap()
+        .latest_attempt
+        .unwrap();
+
+    assert_eq!(
+        terminal_error,
+        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+    );
+    assert_eq!(running.status(), agens_core::SessionAttemptStatus::Running);
+    assert!(!registry.contains(running.key()));
+
+    let mut successful = metadata.clone();
+    successful.id = 4;
+    let completion = run_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        successful,
+        "successful".into(),
+        || {
+            let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(MessagePart::Text("answer".into())),
+                TurnEvent::StateChanged(TurnState::Completed),
+            ])
+            .unwrap();
+            let turn = completed_session_turn("successful", &snapshot, None).unwrap();
+
+            Ok((snapshot, turn))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(completion.metadata.completed_turn_count, 1);
+    assert_eq!(completion.messages.len(), 2);
+    assert_eq!(
+        store
+            .load_session_for_resume(4)
+            .unwrap()
+            .latest_attempt
+            .unwrap()
+            .status(),
+        agens_core::SessionAttemptStatus::Completed
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }

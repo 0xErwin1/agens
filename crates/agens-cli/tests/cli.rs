@@ -3434,7 +3434,9 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
         assert_no_saved_sessions(&project_root, &config_home);
-        assert_sqlite_has_no_rows(&data_directory.join("rust-sessions.db"));
+        assert_sqlite_has_terminal_attempt_without_history(
+            &data_directory.join("rust-sessions.db"),
+        );
 
         server.join();
     }
@@ -4510,28 +4512,25 @@ fn sqlite_text_values(database: &std::path::Path) -> Vec<(String, String)> {
     sqlite_values
 }
 
-fn assert_sqlite_has_no_rows(database: &std::path::Path) {
+fn assert_sqlite_has_terminal_attempt_without_history(database: &std::path::Path) {
     assert!(database.exists(), "session database should exist");
 
     let connection = rusqlite::Connection::open(database).expect("session database should open");
-    let mut tables = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-        .expect("tables should be queryable");
-    let tables = tables
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("table query should run")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("table names should be readable");
+    let attempts = connection
+        .query_row(
+            "SELECT COUNT(*) FROM session_attempts WHERE status != 'running'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("attempt status should be queryable");
+    assert_eq!(attempts, 1, "one terminal attempt should be retained");
 
-    for table in tables {
-        let quoted_table = table.replace('"', "\"\"");
+    for table in ["turns", "messages", "message_parts"] {
         let row_count = connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM \"{quoted_table}\""),
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("table row count should be readable");
-        assert_eq!(row_count, 0, "{table} should have no persisted rows");
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("history row count should be readable");
+        assert_eq!(row_count, 0, "{table} should have no partial history");
     }
 }
