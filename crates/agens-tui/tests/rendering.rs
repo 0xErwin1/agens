@@ -1498,6 +1498,107 @@ fn p1c2_renderer_shows_restored_tool_count_without_fabricating_tool_details() {
     assert!(!main.contains("Final result: approved"));
 }
 
+struct FixedPtyHarness {
+    width: u16,
+    height: u16,
+    renderer: RatatuiRenderer<TestBackend>,
+}
+
+impl FixedPtyHarness {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            width,
+            height,
+            renderer: Self::renderer(width, height),
+        }
+    }
+
+    fn resize(&mut self, tui: &mut Tui<FakeEngine>, width: u16, height: u16) {
+        tui.handle(Event::Resize { width, height });
+        self.width = width;
+        self.height = height;
+        self.renderer = Self::renderer(width, height);
+    }
+
+    fn render(&mut self, tui: &Tui<FakeEngine>) -> String {
+        self.renderer.render(tui.view()).unwrap();
+        rendered_text(&self.renderer)
+    }
+
+    fn cursor(&self) -> ratatui::layout::Position {
+        self.renderer.terminal().backend().cursor_position()
+    }
+
+    fn renderer(width: u16, height: u16) -> RatatuiRenderer<TestBackend> {
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap())
+    }
+}
+
+#[test]
+fn structural_pty_resize_scroll_stream_and_dialog_contract() {
+    let mut harness = FixedPtyHarness::new(52, 14);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("streaming request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        (0..24)
+            .map(|line| format!("before-resize-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )));
+    harness.render(&tui);
+
+    tui.handle(Event::Key(Key::ScrollUp));
+    let scrolled = harness.render(&tui);
+    assert!(scrolled.contains("before-resize-04"), "{scrolled:?}");
+    assert!(!tui.following_bottom());
+
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "streamed-after-scroll-sentinel".into(),
+    )));
+    let streamed = harness.render(&tui);
+    assert!(streamed.contains("before-resize-04"), "{streamed:?}");
+    assert!(!tui.following_bottom());
+
+    tui.handle(Event::Key(Key::End));
+    let refollowed = harness.render(&tui);
+    assert!(refollowed.contains("streamed-after-scroll-sentinel"));
+    assert!(tui.following_bottom());
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Recover interrupted attempt",
+        Some("This may invalidate an attempt still running in another process."),
+        vec![DialogEntry::action("Recover", "recover:7")],
+    ));
+    let dialog = harness.render(&tui);
+    assert!(dialog.contains("Recover interrupted attempt"), "{dialog:?}");
+    assert!(dialog.contains("still running"), "{dialog:?}");
+    assert!(!dialog.contains("streaming request"), "{dialog:?}");
+
+    tui.handle(Event::Key(Key::Escape));
+    for character in "composer\né🙂".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    harness.resize(&mut tui, 24, 8);
+    let resized = harness.render(&tui);
+    assert!(resized.contains("2 lines"), "{resized:?}");
+    let cursor = harness.cursor();
+    assert!(cursor.x < 24 && cursor.y < 8, "{cursor:?}");
+
+    for height in 1..=12 {
+        harness.resize(&mut tui, 40, height);
+        let surface = harness.render(&tui);
+        assert_eq!(surface.chars().count(), 40 * usize::from(height));
+        assert_eq!(surface.contains("agens"), height >= 7, "height {height}");
+        assert_eq!(
+            surface.contains("Enter send"),
+            height >= 12,
+            "height {height}"
+        );
+    }
+}
+
 #[test]
 fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navigation() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
