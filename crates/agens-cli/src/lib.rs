@@ -27,7 +27,7 @@ use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
     ProgressAwareProvider, load_chatgpt_auth_state,
 };
-use agens_store::{PermissionGrantStore, SessionStore};
+use agens_store::{PermissionGrantStore, SessionStore, StoredSession};
 #[cfg(test)]
 use agens_tools::TaskTerminalState;
 use agens_tools::{
@@ -1492,66 +1492,133 @@ fn current_session_timestamp() -> i64 {
     session_timestamp().unwrap_or_default()
 }
 
+fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
+    let mut parts = action_id.split(':');
+    let (Some("session"), Some("recover"), Some(session_id), Some(attempt_id), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+
+    AttemptKey::new(session_id.parse().ok()?, attempt_id.parse().ok()?).ok()
+}
+
 fn session_dialog_entry(
-    session: &SessionMetadata,
+    session: &StoredSession,
     current_session: Option<i64>,
     all_projects: bool,
     now: i64,
 ) -> DialogEntry {
-    let age = session_relative_age(session.updated_at, now);
-    let turns = if session.completed_turn_count == 1 {
+    let metadata = &session.metadata;
+    let age = session_relative_age(metadata.updated_at, now);
+    let turns = if metadata.completed_turn_count == 1 {
         "1 turn".to_owned()
     } else {
-        format!("{} turns", session.completed_turn_count)
+        format!("{} turns", metadata.completed_turn_count)
     };
-    let current = (current_session == Some(session.id)).then_some(" · current");
-    let root = all_projects.then(|| format!(" · root={}", compact_session_root(&session.project)));
+    let current = (current_session == Some(metadata.id)).then_some(" · current");
+    let root = all_projects.then(|| format!(" · root={}", compact_session_root(&metadata.project)));
+    let attempt_status = session
+        .latest_attempt
+        .as_ref()
+        .map(|attempt| format!(" · {}", session_attempt_status_label(attempt.status())))
+        .unwrap_or_default();
     let row_detail = if let Some(root) = root.as_deref() {
         format!(
-            "{turns}{root} · {age} · {}{}",
-            session.active_agent,
-            current.unwrap_or_default()
+            "{turns}{root} · {age} · {}{}{}",
+            metadata.active_agent,
+            current.unwrap_or_default(),
+            attempt_status,
         )
     } else {
         format!(
-            "{turns} · {age} · {}{}",
-            session.active_agent,
-            current.unwrap_or_default()
+            "{turns} · {age} · {}{}{}",
+            metadata.active_agent,
+            current.unwrap_or_default(),
+            attempt_status,
         )
     };
     let selected_detail = format!(
         "Turns: {} · Agent: {}{}\nProvider: {} · Model: {}\nEffort: {} · Updated: {} ({}){} · ID: {} · {}",
-        session.completed_turn_count,
-        session.active_agent,
+        metadata.completed_turn_count,
+        metadata.active_agent,
         current.unwrap_or_default(),
-        session.provider_id.as_deref().unwrap_or("current runtime"),
-        session.model_id.as_deref().unwrap_or("current runtime"),
-        session
+        metadata.provider_id.as_deref().unwrap_or("current runtime"),
+        metadata.model_id.as_deref().unwrap_or("current runtime"),
+        metadata
             .reasoning_effort
             .map(agens_core::ReasoningEffort::as_str)
             .unwrap_or_else(|| {
-                if session.provider_id.is_some() || session.model_id.is_some() {
+                if metadata.provider_id.is_some() || metadata.model_id.is_some() {
                     "Default"
                 } else {
                     "current runtime"
                 }
             }),
-        session.updated_at,
+        metadata.updated_at,
         age,
         root.as_deref().unwrap_or_default(),
-        session.id,
-        session.title,
+        metadata.id,
+        metadata.title,
     );
 
     DialogEntry::action_with_metadata(
-        format!("#{} {}", session.id, session.title),
+        format!("#{} {}", metadata.id, metadata.title),
         row_detail,
         format!(
             "{} {} {} {}",
-            session.id, session.title, session.project, session.active_agent
+            metadata.id, metadata.title, metadata.project, metadata.active_agent
         ),
         selected_detail,
-        format!("session:{}", session.id),
+        format!("session:{}", metadata.id),
+    )
+}
+
+fn session_attempt_status_label(status: agens_core::SessionAttemptStatus) -> &'static str {
+    match status {
+        agens_core::SessionAttemptStatus::Running => "running",
+        agens_core::SessionAttemptStatus::Completed => "completed",
+        agens_core::SessionAttemptStatus::Cancelled => "cancelled",
+        agens_core::SessionAttemptStatus::Failed => "failed",
+        agens_core::SessionAttemptStatus::ProviderError => "provider error",
+        agens_core::SessionAttemptStatus::Interrupted => "interrupted",
+    }
+}
+
+fn recovery_confirmation_dialog(
+    metadata: &SessionMetadata,
+    attempt: &agens_core::SessionAttemptSummary,
+    refusal: Option<&str>,
+) -> DialogView {
+    let mut help = format!(
+        "Session: {} · ID: {}\nStatus: running\nStarted: {}\nThis may invalidate an attempt still running in another process.",
+        metadata.title,
+        metadata.id,
+        attempt.started_at(),
+    );
+    if let Some(refusal) = refusal {
+        help.push('\n');
+        help.push_str(refusal);
+    }
+
+    DialogView::selection(
+        "Recover interrupted attempt",
+        Some(help),
+        vec![
+            DialogEntry::action(
+                "Recover interrupted attempt",
+                format!(
+                    "session:recover:{}:{}",
+                    attempt.key().session_id(),
+                    attempt.key().attempt_id()
+                ),
+            ),
+            DialogEntry::cancel("Cancel"),
+        ],
     )
 }
 
@@ -2102,21 +2169,23 @@ impl TuiRuntimeRouter {
                 let project = tui_project_identifier(&bootstrap)?;
                 let store = SessionStore::open(bootstrap.data_directory())
                     .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-                let sessions = store
-                    .list_sessions()
-                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
                 let current_session = self
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?
                     .identifier;
                 let now = (self.clock)();
-                let current_project = sessions
+                let current_project = store
+                    .list_session_page(Some(&project), 0)
+                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
+                    .sessions
                     .iter()
-                    .filter(|session| session.project == project)
                     .map(|session| session_dialog_entry(session, current_session, false, now))
                     .collect();
-                let all_projects = sessions
+                let all_projects = store
+                    .list_session_page(None, 0)
+                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
+                    .sessions
                     .into_iter()
                     .map(|session| session_dialog_entry(&session, current_session, true, now))
                     .collect();
@@ -2199,10 +2268,32 @@ impl TuiRuntimeRouter {
                     TuiSubmissionOutcome::SelectionInfo(format!("Selected file: {path}"))
                 });
             }
+            if let Some(key) = parse_recovery_action(action_id) {
+                return self.recover_tui_session_attempt(&bootstrap, key);
+            }
             if let Some(identifier) = action_id.strip_prefix("session:") {
                 let identifier = identifier
                     .parse()
                     .map_err(|_| CliError::usage("session action is invalid"))?;
+                let store = SessionStore::open(bootstrap.data_directory())
+                    .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+                let stored = store
+                    .load_session_for_resume(identifier)
+                    .map_err(|_| CliError::storage("saved session is unavailable"))?;
+                if stored.metadata.project != tui_project_identifier(&bootstrap)? {
+                    return Err(CliError::storage("saved session is unavailable"));
+                }
+                if let Some(attempt) = stored
+                    .latest_attempt
+                    .as_ref()
+                    .filter(|attempt| attempt.status() == agens_core::SessionAttemptStatus::Running)
+                {
+                    return Ok(TuiSubmissionOutcome::Dialog(recovery_confirmation_dialog(
+                        &stored.metadata,
+                        attempt,
+                        None,
+                    )));
+                }
                 let resumed =
                     resume_tui_session(&bootstrap, identifier, &self.skills, &self.credentials)?;
                 let message = resumed.note();
@@ -2255,6 +2346,59 @@ impl TuiRuntimeRouter {
                 action: TUI_ERROR_ACTION.into(),
             },
         }
+    }
+
+    fn recover_tui_session_attempt(
+        &self,
+        bootstrap: &Bootstrap,
+        key: AttemptKey,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
+        let mut store = SessionStore::open(bootstrap.data_directory())
+            .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+        let stored = store
+            .load_session_for_resume(key.session_id())
+            .map_err(|_| CliError::storage("saved session is unavailable"))?;
+        if stored.metadata.project != tui_project_identifier(bootstrap)? {
+            return Err(CliError::storage("saved session is unavailable"));
+        }
+        let Some(attempt) = stored.latest_attempt.as_ref().filter(|attempt| {
+            attempt.key() == key && attempt.status() == agens_core::SessionAttemptStatus::Running
+        }) else {
+            return self.open_dialog("sessions");
+        };
+
+        let recovery = active_session_attempts()
+            .recover_running_attempt(&mut store, key, current_session_timestamp())
+            .map_err(|_| CliError::storage("attempt recovery failed"))?;
+        let Some(recovery) = recovery else {
+            return Ok(TuiSubmissionOutcome::Dialog(recovery_confirmation_dialog(
+                &stored.metadata,
+                attempt,
+                Some("Recovery was refused because this attempt is active in this process."),
+            )));
+        };
+        if recovery == RecoveryOutcome::Stale {
+            return self.open_dialog("sessions");
+        }
+
+        let boundary = store
+            .load_retry_boundary(key)
+            .map_err(|_| CliError::storage("attempt recovery failed"))?
+            .ok_or_else(|| CliError::storage("attempt recovery failed"))?;
+        drop(store);
+
+        let resumed =
+            resume_tui_session(bootstrap, key.session_id(), &self.skills, &self.credentials)?;
+        let prompt = boundary.prompt().to_owned();
+        *self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))? = resumed;
+
+        Ok(TuiSubmissionOutcome::ProviderTurn {
+            display: "Retrying recovered attempt.".into(),
+            prompt,
+        })
     }
 
     fn palette_entries(&self) -> &[PaletteEntry] {
@@ -8752,6 +8896,140 @@ mod tests {
     }
 
     #[test]
+    fn dialog_recovery_is_confirmed_private_local_safe_and_retryable() {
+        let temporary = tui_session_directory("recovery-dialog");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = Arc::new(Mutex::new(None));
+        let router = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            Arc::clone(&cancellation),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+        let metadata = SessionMetadata {
+            id: 1,
+            project: tui_project(&temporary),
+            title: "Interrupted session".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 7,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let attempt = store
+            .begin_session_attempt(&metadata, "SENTINEL_PRIVATE_RETRY".into())
+            .unwrap();
+        drop(store);
+
+        let confirmation = router.route_dialog_action("session:1", std::sync::mpsc::channel().0);
+        let confirmation_debug = format!("{confirmation:?}");
+        let mut tui = Tui::new(ProductionTuiEngine { cancellation });
+        assert!(tui.apply_submission_outcome(confirmation).is_none());
+        let confirmation_text = render_tui_test_backend(&tui, 100, 24);
+        assert!(confirmation_text.contains("Recover interrupted attempt"));
+        assert!(confirmation_text.contains("Interrupted session"));
+        assert!(confirmation_text.contains("ID: 1"));
+        assert!(confirmation_text.contains("Status: running"));
+        assert!(confirmation_text.contains("Started: 7"));
+        assert!(
+            confirmation_debug
+                .contains("This may invalidate an attempt still running in another process.")
+        );
+        assert!(!confirmation_debug.contains("SENTINEL_PRIVATE_RETRY"));
+
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        assert_eq!(
+            store
+                .load_session_for_resume(1)
+                .unwrap()
+                .latest_attempt
+                .unwrap()
+                .status(),
+            agens_core::SessionAttemptStatus::Running
+        );
+        drop(store);
+
+        let locally_active_metadata = SessionMetadata {
+            id: 2,
+            ..metadata.clone()
+        };
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let locally_active = active_session_attempts()
+            .begin_and_register(
+                &mut store,
+                &locally_active_metadata,
+                "local private retry".into(),
+            )
+            .unwrap();
+        drop(store);
+        let local_refusal = router.route_dialog_action(
+            &format!(
+                "session:recover:{}:{}",
+                locally_active.key().session_id(),
+                locally_active.key().attempt_id()
+            ),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(matches!(local_refusal, TuiSubmissionOutcome::Dialog(_)));
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        assert_eq!(
+            store
+                .load_session_for_resume(locally_active.key().session_id())
+                .unwrap()
+                .latest_attempt
+                .unwrap()
+                .status(),
+            agens_core::SessionAttemptStatus::Running
+        );
+        drop(store);
+        active_session_attempts().unregister(locally_active.key());
+
+        let recovered = router.route_dialog_action(
+            &format!(
+                "session:recover:{}:{}",
+                attempt.key().session_id(),
+                attempt.key().attempt_id()
+            ),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(matches!(
+            recovered,
+            TuiSubmissionOutcome::ProviderTurn { ref display, ref prompt }
+                if display == "Retrying recovered attempt." && prompt == "SENTINEL_PRIVATE_RETRY"
+        ));
+        assert_eq!(session.lock().unwrap().identifier, Some(1));
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        assert_eq!(
+            store
+                .load_session_for_resume(1)
+                .unwrap()
+                .latest_attempt
+                .unwrap()
+                .status(),
+            agens_core::SessionAttemptStatus::Interrupted
+        );
+
+        let stale = router.route_dialog_action(
+            &format!(
+                "session:recover:{}:{}",
+                attempt.key().session_id(),
+                attempt.key().attempt_id()
+            ),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(matches!(stale, TuiSubmissionOutcome::Dialog(_)));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn tui_model_effort_and_help_palette_routes_open_local_overlays_and_dispatch_once() {
         let temporary = tui_session_directory("local-overlays");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
@@ -9603,7 +9881,19 @@ mod tests {
         assert!(project_rows.contains("reviewer · current"));
         assert!(project_rows.contains("Provider: openai-chatgpt · Model: gpt-5.5"));
         assert!(project_rows.contains("Effort: high · Updated: 9950 (50s ago)"));
-        let old_details = format!("{:?}", session_dialog_entry(&old, None, false, 10_000));
+        let old_details = format!(
+            "{:?}",
+            session_dialog_entry(
+                &StoredSession {
+                    metadata: old.clone(),
+                    messages: Vec::new(),
+                    latest_attempt: None,
+                },
+                None,
+                false,
+                10_000,
+            )
+        );
         assert!(old_details.contains("Provider: current runtime"));
         assert!(old_details.contains("Model: current runtime"));
         assert!(old_details.contains("Effort: current runtime"));
