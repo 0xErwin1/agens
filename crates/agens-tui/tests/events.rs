@@ -389,6 +389,63 @@ fn vim_modes_remove_all_function_key_routes() {
 }
 
 #[test]
+fn viewport_vim_routes_preserve_per_transcript_state() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for (id, call, output_lines) in [(7, "seven", 40), (8, "eight", 80)] {
+        start_child(&mut tui, id);
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(id, "reviewer", "task", TuiExecutionState::ForegroundRunning),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_call(id, call, "tool", "input"),
+        ));
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::tool_result(id, call, "output\n".repeat(output_lines), false),
+        ));
+    }
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    tui.handle(Event::Key(Key::PageUp));
+    tui.handle(Event::Key(Key::CtrlO));
+    let child_seven = (
+        tui.view().following_bottom,
+        tui.view().scroll_offset,
+        tui.view().focus,
+        tui.view().collapsed_tool_outputs.contains("seven"),
+    );
+
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    assert!(tui.view().following_bottom);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+    tui.handle(Event::Key(Key::PageUp));
+    tui.handle(Event::Key(Key::CtrlO));
+    let child_eight_offset = tui.view().scroll_offset;
+
+    tui.handle(Event::Key(Key::Char('h')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(7));
+    assert_eq!(
+        (
+            tui.view().following_bottom,
+            tui.view().scroll_offset,
+            tui.view().focus,
+            tui.view().collapsed_tool_outputs.contains("seven"),
+        ),
+        child_seven
+    );
+
+    tui.handle(Event::Key(Key::Char('l')));
+    assert_eq!(tui.view().scroll_offset, child_eight_offset);
+    assert!(tui.view().collapsed_tool_outputs.contains("eight"));
+    tui.handle(Event::Key(Key::Char('m')));
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+}
+
+#[test]
 fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summaries() {
     let mut tui = Tui::new(FakeEngine::default());
     let (bridge, receiver) = BridgeTx::bounded(32);
