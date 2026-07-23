@@ -9,7 +9,7 @@ mod role_palette;
 
 pub(crate) use blocks::{ThinkingBlock, ToolRow};
 pub(crate) use expand::{ExpandMode, ExpandableBody};
-pub(crate) use footer::MetricFooter;
+pub(crate) use footer::{FooterContext, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
 pub(crate) use overlay::{OverlayKind, OverlayShell};
 pub(crate) use role_palette::RolePalette;

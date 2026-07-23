@@ -154,6 +154,7 @@ pub struct TuiPresentation {
     provider: String,
     model: String,
     session: String,
+    effort: Option<String>,
     dangerous_mode: bool,
 }
 
@@ -167,12 +168,19 @@ impl TuiPresentation {
             provider: provider.into(),
             model: model.into(),
             session: session.into(),
+            effort: None,
             dangerous_mode: false,
         }
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        let effort = effort.into();
+        self.effort = (!effort.is_empty()).then_some(effort);
+        self
     }
 
     pub fn with_dangerous_mode(mut self, enabled: bool) -> Self {
@@ -342,9 +350,11 @@ pub struct ViewState<'a> {
     pub scroll_offset: u16,
     /// Current provider and model selected by the CLI composition root.
     pub provider_model: &'a str,
+    /// Optional reasoning effort label for the footer.
+    pub reasoning_effort: Option<&'a str>,
     /// Active session label supplied by the CLI composition root.
     pub session: &'a str,
-    /// Project label displayed in the semantic terminal header.
+    /// Project label displayed in the operational footer.
     pub project: &'a str,
     /// Current active-turn state for the dedicated status row.
     pub turn_state: Option<TurnState>,
@@ -801,7 +811,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let layout = screen_layout(area, state.input);
 
     if layout.header.height > 0 {
-        render_header(frame, layout.header, &state, layout.show_context);
+        render_header(frame, layout.header, &state);
     }
 
     let transcript_width = layout
@@ -830,10 +840,6 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                         .borders(Borders::TOP)
                         .padding(Padding::left(TRANSCRIPT_CONTENT_INDENT))
                         .border_style(Style::default().fg(Color::DarkGray))
-                        .title(Span::styled(
-                            " transcript ",
-                            Style::default().fg(Color::DarkGray),
-                        ))
                         .title_bottom(Span::styled(
                             scroll_label,
                             Style::default().fg(Color::DarkGray),
@@ -852,59 +858,41 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .style(Style::default().fg(Color::DarkGray))
                 .block(
                     Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title(Span::styled(
-                            " Viewport ",
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::BOLD),
-                        )),
+                        .borders(Borders::TOP)
+                        .border_style(Style::default().fg(Color::DarkGray)),
                 ),
             layout.composer,
         );
     }
 
-    let composer_title = if state.running {
-        " Compose · running "
-    } else {
-        " Compose "
-    };
     let composer_color = if state.running {
         widgets::RolePalette::warning()
     } else {
-        widgets::RolePalette::brand()
+        widgets::RolePalette::muted()
     };
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
-        let inner_width = usize::from(layout.composer.width.saturating_sub(2));
-        let inner_height = usize::from(layout.composer.height.saturating_sub(2));
+        // TOP border only: one row reserved for the rule, full width for text.
+        let inner_width = usize::from(layout.composer.width.max(1));
+        let inner_height = usize::from(layout.composer.height.saturating_sub(1).max(1));
         let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
         let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
+        let mut composer = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(composer_color));
+        if state.running {
+            composer = composer.title(Span::styled(
+                " running ",
+                Style::default()
+                    .fg(composer_color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         frame.render_widget(
-            Paragraph::new(state.input)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(composer_color))
-                        .title(Span::styled(
-                            composer_title,
-                            Style::default()
-                                .fg(composer_color)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                        .title_bottom(Span::styled(
-                            composer_metadata(state.input),
-                            Style::default().fg(Color::DarkGray),
-                        ))
-                        .title_alignment(Alignment::Right),
-                )
-                .scroll((
-                    saturating_u16(vertical_scroll),
-                    saturating_u16(horizontal_scroll),
-                )),
+            Paragraph::new(state.input).block(composer).scroll((
+                saturating_u16(vertical_scroll),
+                saturating_u16(horizontal_scroll),
+            )),
             layout.composer,
         );
         if inner_width > 0 && inner_height > 0 {
@@ -913,13 +901,9 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .y
                 .saturating_add(1)
                 .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
-            let cursor_x = layout
-                .composer
-                .x
-                .saturating_add(1)
-                .saturating_add(saturating_u16(
-                    cursor_column.saturating_sub(horizontal_scroll),
-                ));
+            let cursor_x = layout.composer.x.saturating_add(saturating_u16(
+                cursor_column.saturating_sub(horizontal_scroll),
+            ));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
     }
@@ -928,11 +912,17 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         frame.render_widget(
             Paragraph::new(widgets::MetricFooter::text(
                 area.width,
-                turn_state_label(state.turn_state, state.running),
-                state.turn_duration,
-                state.latest_usage,
+                widgets::FooterContext {
+                    model: state.provider_model,
+                    effort: state.reasoning_effort,
+                    project: state.project,
+                    turn_label: turn_state_label(state.turn_state, state.running),
+                    duration: state.turn_duration,
+                    usage: state.latest_usage,
+                    dangerous: state.dangerous_mode,
+                },
             ))
-            .style(Style::default().fg(Color::DarkGray)),
+            .style(Style::default().fg(widgets::RolePalette::chrome())),
             layout.footer,
         );
     }
@@ -1201,7 +1191,6 @@ struct ScreenLayout {
     transcript: Rect,
     composer: Rect,
     footer: Rect,
-    show_context: bool,
 }
 
 fn conversation_surface(area: Rect) -> Rect {
@@ -1212,7 +1201,6 @@ fn conversation_surface(area: Rect) -> Rect {
 fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     let area = conversation_surface(area);
     let header_rows = u16::from(area.height >= 7);
-    let show_context = area.width >= 92;
     let footer_rows = u16::from(area.height >= 12);
     let composer_rows = match area.height {
         0 => 0,
@@ -1242,66 +1230,42 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
         transcript: chunks[1],
         composer: chunks[2],
         footer: chunks[3],
-        show_context,
     }
 }
 
-fn render_header(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    state: &ViewState<'_>,
-    show_context: bool,
-) {
+fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
     let state_label = turn_state_label(state.turn_state, state.running);
-    let mode_label = if state.dangerous_mode {
-        "danger"
-    } else {
-        "safe"
-    };
-    let mut left = vec![Span::styled(
-        format!(" agens {mode_label} "),
-        Style::default()
-            .fg(if state.dangerous_mode {
-                widgets::RolePalette::warning()
-            } else {
-                widgets::RolePalette::brand()
-            })
-            .add_modifier(Modifier::BOLD),
-    )];
-    if show_context && state.executions.is_empty() {
-        left.push(Span::styled("  ", Style::default()));
+    let mut left = Vec::new();
+    if state.dangerous_mode {
         left.push(Span::styled(
-            "project ",
+            " danger ",
+            Style::default()
+                .fg(widgets::RolePalette::warning())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if !state.executions.is_empty() {
+        append_execution_summary(&mut left, state);
+    } else if let Some(status) = state.status.filter(|value| !value.is_empty()) {
+        // Transient context messages (e.g. resume notices) live here — not model/project.
+        left.push(Span::styled(
+            format!(" {status} "),
             Style::default().fg(widgets::RolePalette::muted()),
         ));
-        left.push(Span::styled(
-            state.project,
-            Style::default().fg(Color::Gray),
-        ));
-        left.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        left.push(Span::styled(
-            state.provider_model,
-            Style::default().fg(Color::Gray),
-        ));
-        left.push(Span::styled(" · ", Style::default().fg(Color::DarkGray)));
-        left.push(Span::styled(
-            state.session,
-            Style::default().fg(Color::Gray),
-        ));
-        left.push(Span::styled(
-            format!("  ·  agent {}", state.selected_agent.unwrap_or("main")),
-            Style::default().fg(Color::Gray),
-        ));
-    } else if !state.executions.is_empty() {
-        append_execution_summary(&mut left, state);
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
-        area,
-    );
+    if !left.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
+            area,
+        );
+    }
     let status = widgets::StatusGlyph::decorate_status(
         state.running,
-        state.status.unwrap_or(state_label),
+        if state.status.is_some() && state.executions.is_empty() {
+            state_label
+        } else {
+            state.status.unwrap_or(state_label)
+        },
         state.now,
     );
     let state_width = status.chars().count() as u16 + 1;
@@ -1371,11 +1335,6 @@ fn turn_state_color(state: Option<TurnState>, running: bool) -> Color {
         _ if running => Color::Cyan,
         _ => Color::DarkGray,
     }
-}
-
-fn composer_metadata(input: &str) -> String {
-    let lines = input.chars().filter(|character| *character == '\n').count() + 1;
-    format!(" {lines} lines · {} chars ", input.chars().count())
 }
 
 fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
@@ -1557,6 +1516,7 @@ pub struct Tui<E> {
     child_transcript_order: Vec<TranscriptId>,
     transcript: Vec<TranscriptEntry>,
     provider_model: String,
+    reasoning_effort: Option<String>,
     session: String,
     project: String,
     turn_state: Option<TurnState>,
@@ -1597,6 +1557,7 @@ where
             child_transcript_order: Vec::new(),
             transcript: Vec::new(),
             provider_model: "provider / model".to_owned(),
+            reasoning_effort: None,
             session: "new session".to_owned(),
             project: "agens".to_owned(),
             turn_state: None,
@@ -1771,6 +1732,11 @@ where
     ) {
         self.provider_model = format!("{} / {}", provider.as_ref(), model.as_ref());
         self.session = session.into();
+    }
+
+    /// Sets the reasoning-effort label shown in the operational footer.
+    pub fn set_reasoning_effort(&mut self, effort: Option<impl Into<String>>) {
+        self.reasoning_effort = effort.map(Into::into);
     }
 
     /// Sets the project identity displayed in the semantic terminal header.
@@ -2401,6 +2367,7 @@ where
             following_bottom: active.following_bottom,
             scroll_offset: active.scroll_offset,
             provider_model: &self.provider_model,
+            reasoning_effort: self.reasoning_effort.as_deref(),
             session: &self.session,
             project: &self.project,
             turn_state: self.turn_state,
@@ -3506,6 +3473,7 @@ where
             presentation.model,
             presentation.session,
         );
+        self.set_reasoning_effort(presentation.effort);
         self.set_dangerous_mode(presentation.dangerous_mode);
     }
 }

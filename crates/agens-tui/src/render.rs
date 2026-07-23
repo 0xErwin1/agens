@@ -391,7 +391,7 @@ impl MarkdownRenderer {
                     }
                     _ => "code".to_owned(),
                 };
-                self.push_code_chrome(&format!("── {language} "));
+                self.push_code_chrome(&format!("╭ {language} "));
                 self.code_block = true;
                 self.code_panel_line = true;
             }
@@ -432,7 +432,7 @@ impl MarkdownRenderer {
                 // Footer after clearing the body gutter flag.
                 self.code_block = false;
                 self.code_panel_line = true;
-                self.push_code_chrome("────");
+                self.push_code_chrome("╰────");
                 self.code_panel_line = false;
                 self.blank_line();
             }
@@ -480,14 +480,29 @@ impl MarkdownRenderer {
 
     fn current_style(&self) -> Style {
         let mut style = self.base_style;
-        if self.strong > 0 || self.heading.is_some() {
-            style = style.add_modifier(Modifier::BOLD);
+        if let Some(level) = self.heading {
+            style = style
+                .fg(match level {
+                    HeadingLevel::H1 => RolePalette::user_bar(),
+                    HeadingLevel::H2 => RolePalette::brand(),
+                    _ => RolePalette::tool(),
+                })
+                .add_modifier(Modifier::BOLD);
+        }
+        if self.strong > 0 {
+            style = style
+                .fg(RolePalette::user_bar())
+                .add_modifier(Modifier::BOLD);
         }
         if self.emphasis > 0 {
-            style = style.add_modifier(Modifier::ITALIC);
+            style = style
+                .fg(RolePalette::thinking())
+                .add_modifier(Modifier::ITALIC);
         }
         if !self.links.is_empty() {
-            style = style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+            style = style
+                .fg(RolePalette::tool())
+                .add_modifier(Modifier::UNDERLINED);
         }
         if self.code_block {
             style = style.fg(RolePalette::success()).bg(code_block_background());

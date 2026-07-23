@@ -2262,15 +2262,15 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
         .map(|cell| cell.symbol())
         .collect::<String>();
 
-    assert!(text.contains("agens"));
-    assert!(text.contains("openai-api / gpt-4.1"));
-    assert!(text.contains("session #42"));
+    // Footer carries model/project; header no longer says "agens safe".
+    assert!(!text.contains("agens safe"));
+    assert!(text.contains("gpt-4.1"));
     assert!(text.contains('❯'));
     assert!(text.contains("Thinking"));
-    assert!(text.contains("Compose"));
-    assert!(text.contains("2 lines"));
-    assert!(text.contains("Shift+Enter"));
-    assert!(text.contains("LIVE"));
+    assert!(text.contains("Ready") || text.contains("Responding"));
+    assert!(!text.contains("Compose"));
+    assert!(!text.contains("Enter send"));
+    assert!(text.contains("LIVE") || text.contains("SCROLL"));
 
     let user_cell = buffer
         .content
@@ -2309,10 +2309,9 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
         .map(|cell| cell.symbol())
         .collect::<String>();
 
-    assert!(narrow_text.contains("agens"));
-    assert!(narrow_text.contains("Enter"));
-    assert!(!narrow_text.contains("Shift+Enter"));
-    assert!(narrow_text.contains("Compose"));
+    assert!(narrow_text.contains("gpt-4.1") || narrow_text.contains("Ready"));
+    assert!(!narrow_text.contains("Enter send"));
+    assert!(!narrow_text.contains("Compose"));
 }
 
 #[test]

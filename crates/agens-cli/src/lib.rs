@@ -2574,10 +2574,17 @@ impl TuiRuntimeRouter {
         let label = session
             .identifier
             .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
-        Ok(
-            TuiPresentation::new(provider, model, label)
-                .with_dangerous_mode(session.dangerous_mode),
-        )
+        let effort = session
+            .selection
+            .as_ref()
+            .and_then(TuiModelSelector::reasoning_effort)
+            .map(str::to_owned);
+        let mut presentation = TuiPresentation::new(provider, model, label)
+            .with_dangerous_mode(session.dangerous_mode);
+        if let Some(effort) = effort {
+            presentation = presentation.with_effort(effort);
+        }
+        Ok(presentation)
     }
 
     fn toggle_dangerous_mode(&self) -> Result<TuiSubmissionOutcome, CliError> {
@@ -8148,7 +8155,7 @@ mod tests {
         });
         tui.set_presentation("openai-api", "gpt-4.1", "new session");
 
-        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
+        assert!(!render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
 
         let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::CtrlShiftD)) else {
             panic!("Ctrl+Shift+D should route through the dangerous-mode router path");
@@ -8169,7 +8176,7 @@ mod tests {
                 .is_none()
         );
         assert!(!session.lock().unwrap().dangerous_mode);
-        assert!(render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
+        assert!(!render_tui_test_backend(&tui, 120, 24).contains("agens safe"));
 
         tui.apply_submission_outcome(router.route("/dangerous".into()));
         let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, |request| {
