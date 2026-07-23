@@ -56,12 +56,6 @@ impl ExpandableBody {
         self.mode.shows_body()
     }
 
-    pub(crate) const fn finish_stream(self) -> Self {
-        Self {
-            mode: self.mode.finish_stream(),
-        }
-    }
-
     pub(crate) const fn toggle_detail(self) -> Self {
         Self {
             mode: self.mode.toggle_detail(),
@@ -100,7 +94,7 @@ mod tests {
         let streaming = ExpandableBody::new(ExpandMode::Streaming);
         assert!(streaming.is_visible());
 
-        let finished = streaming.finish_stream();
+        let finished = ExpandableBody::new(streaming.mode.finish_stream());
         assert_eq!(finished.mode, ExpandMode::Collapsed);
         assert!(!finished.is_visible());
 
