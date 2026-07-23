@@ -15042,3 +15042,228 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
     ));
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[cfg(test)]
+#[test]
+fn reliability_integration_bounds_recovers_attempts_and_sanitizes_failures() {
+    let directory = std::env::temp_dir().join(format!(
+        "agens-reliability-integration-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let registry = AttemptActivityRegistry::default();
+    let metadata = reliability_integration_metadata(7, 20);
+
+    let failure = run_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        metadata.clone(),
+        "SENTINEL_PRIVATE_PROVIDER_RETRY".into(),
+        || Err(CliError::runtime(HeadlessTurnError::ProviderServer)),
+    )
+    .unwrap_err();
+    let failed = store.load_session_for_resume(metadata.id).unwrap();
+
+    assert_eq!(
+        failure,
+        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::ProviderServer))
+    );
+    assert!(failed.messages.is_empty());
+    assert_eq!(
+        failed.latest_attempt.as_ref().unwrap().status(),
+        agens_core::SessionAttemptStatus::ProviderError
+    );
+    assert!(!format!("{failed:?}").contains("SENTINEL_PRIVATE_PROVIDER_RETRY"));
+
+    let completed_metadata = reliability_integration_metadata(8, 21);
+    let completed = run_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        completed_metadata.clone(),
+        "bounded successful prompt".into(),
+        || {
+            Ok(reliability_integration_completion(
+                "bounded successful prompt",
+                "answer",
+            ))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(completed.metadata.completed_turn_count, 1);
+    assert_eq!(completed.messages.len(), 2);
+    assert_eq!(
+        store
+            .load_session_for_resume(completed_metadata.id)
+            .unwrap()
+            .latest_attempt
+            .unwrap()
+            .status(),
+        agens_core::SessionAttemptStatus::Completed
+    );
+
+    let recovery_metadata = reliability_integration_metadata(9, 22);
+    let active = registry
+        .begin_and_register(
+            &mut store,
+            &recovery_metadata,
+            "SENTINEL_PRIVATE_RECOVERY_RETRY".into(),
+        )
+        .unwrap();
+    registry.unregister(active.key());
+    let recovery = recover_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        active.key(),
+        23,
+        |history, prompt, _| {
+            assert!(history.is_empty());
+            assert_eq!(prompt, "SENTINEL_PRIVATE_RECOVERY_RETRY");
+            Ok(reliability_integration_completion(
+                prompt,
+                "recovered answer",
+            ))
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        recovery,
+        ExplicitAttemptRecoveryOutcome::Recovered(_)
+    ));
+    assert_eq!(
+        store
+            .load_session_for_resume(recovery_metadata.id)
+            .unwrap()
+            .metadata
+            .completed_turn_count,
+        1
+    );
+
+    for id in 10..76 {
+        let metadata = reliability_integration_metadata(id, id);
+        store
+            .begin_session_attempt(&metadata, format!("SENTINEL_PRIVATE_PAGE_{id}"))
+            .unwrap();
+    }
+    let first_page = store.list_session_page(None, 0).unwrap();
+    let second_page = store.list_session_page(None, 64).unwrap();
+
+    assert_eq!(first_page.total_count, 69);
+    assert_eq!(first_page.sessions.len(), 64);
+    assert_eq!(second_page.sessions.len(), 5);
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| session.latest_attempt.is_some())
+    );
+    assert!(!format!("{first_page:?}").contains("SENTINEL_PRIVATE_PAGE_"));
+
+    for error in [
+        HeadlessTurnError::ProviderContext,
+        HeadlessTurnError::ProviderNetwork,
+        HeadlessTurnError::ProviderRateLimited,
+        HeadlessTurnError::ProviderServer,
+        HeadlessTurnError::ProviderProtocol,
+        HeadlessTurnError::Cancelled,
+        HeadlessTurnError::TimedOut,
+    ] {
+        let error = CliError::runtime(error);
+        let rendered = tui_provider_outcome(Err(error));
+        assert!(!format!("{rendered:?}").contains("SENTINEL_REMOTE_SECRET"));
+    }
+
+    let project_root = directory.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let (catalog, dispatcher) = production_dangerous_child_tool_runtime(&project_root).unwrap();
+    assert_eq!(
+        catalog.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
+        [
+            "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch"
+        ]
+    );
+    assert!(
+        dispatcher
+            .lock()
+            .unwrap()
+            .canonical_identity("native::task")
+            .is_none()
+    );
+
+    let mut tui = Tui::new(ReliabilityTuiEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "owner hierarchy",
+            agens_tui::TuiExecutionState::ForegroundRunning,
+        ),
+    ));
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(
+        7,
+        "child-only-sentinel",
+    )));
+    assert!(
+        tui.view().conversation.unwrap().subagent_cards[0]
+            .tool_calls
+            .is_empty()
+    );
+    tui.select_transcript(agens_tui::TranscriptId::Subagent(7));
+    assert!(
+        tui.view()
+            .conversation
+            .unwrap()
+            .live_markdown
+            .contains("child-only-sentinel")
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(test)]
+struct ReliabilityTuiEngine;
+
+#[cfg(test)]
+impl TuiEngine for ReliabilityTuiEngine {
+    fn cancel(&mut self) {}
+}
+
+#[cfg(test)]
+fn reliability_integration_metadata(id: i64, updated_at: i64) -> SessionMetadata {
+    SessionMetadata {
+        id,
+        project: "reliability".into(),
+        title: format!("session-{id}"),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: updated_at,
+        updated_at,
+        completed_turn_count: 0,
+        resumable: false,
+    }
+}
+
+#[cfg(test)]
+fn reliability_integration_completion(
+    prompt: &str,
+    answer: &str,
+) -> (CompletedTurnSnapshot, CompletedSessionTurn) {
+    let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
+        TurnEvent::StateChanged(TurnState::Requesting),
+        TurnEvent::StateChanged(TurnState::Streaming),
+        TurnEvent::ProviderPart(MessagePart::Text(answer.into())),
+        TurnEvent::StateChanged(TurnState::Completed),
+    ])
+    .unwrap();
+    let turn = completed_session_turn(prompt, &snapshot, None).unwrap();
+
+    (snapshot, turn)
+}
