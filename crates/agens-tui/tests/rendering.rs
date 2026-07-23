@@ -210,6 +210,43 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
 }
 
 #[test]
+fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.tick(Duration::from_millis(0));
+    renderer.render(tui.view()).unwrap();
+    let idle_early = rendered_text(&renderer);
+    tui.tick(Duration::from_millis(80 * 5));
+    renderer.render(tui.view()).unwrap();
+    let idle_later = rendered_text(&renderer);
+
+    assert!(idle_early.contains("Ready"), "{idle_early:?}");
+    assert!(idle_later.contains("Ready"), "{idle_later:?}");
+    assert!(!idle_early.contains("⠋"), "{idle_early:?}");
+    assert!(!idle_later.contains("⠼"), "{idle_later:?}");
+    assert_eq!(
+        idle_early.matches('·').count(),
+        idle_later.matches('·').count(),
+        "idle chrome must not spin"
+    );
+
+    tui.begin_submission("glyph probe");
+    tui.tick(Duration::from_millis(0));
+    renderer.render(tui.view()).unwrap();
+    let active_early = rendered_text(&renderer);
+    tui.tick(Duration::from_millis(80));
+    renderer.render(tui.view()).unwrap();
+    let active_later = rendered_text(&renderer);
+
+    assert!(active_early.contains("⠋"), "{active_early:?}");
+    assert!(active_early.contains("Waiting"), "{active_early:?}");
+    assert!(active_later.contains("⠙"), "{active_later:?}");
+    assert!(active_later.contains("Waiting"), "{active_later:?}");
+    assert_ne!(active_early, active_later);
+}
+
+#[test]
 fn footer_shows_tokens_used_only_when_window_unknown_without_unavailable() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
     let mut tui = Tui::new(FakeEngine);

@@ -344,6 +344,8 @@ pub struct ViewState<'a> {
     pub turn_duration: Option<Duration>,
     pub latest_usage: Option<&'a Usage>,
     pub status: Option<&'a str>,
+    /// Monotonic clock advanced by [`Tui::tick`] for active-state glyphs.
+    pub now: Duration,
     /// Authoritative typed conversation projection, when a turn is active or completed.
     pub conversation: Option<&'a Conversation>,
     /// Completed typed conversations retained before the active turn.
@@ -1273,8 +1275,12 @@ fn render_header(
         Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
         area,
     );
-    let status = state.status.unwrap_or(state_label);
-    let state_width = status.len() as u16 + 1;
+    let status = widgets::StatusGlyph::decorate_status(
+        state.running,
+        state.status.unwrap_or(state_label),
+        state.now,
+    );
+    let state_width = status.chars().count() as u16 + 1;
     if area.width > state_width {
         let state_area = Rect::new(area.right() - state_width, area.y, state_width, area.height);
         frame.render_widget(
@@ -1352,11 +1358,15 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
         let (label, color, text, card) = match entry {
-            TranscriptEntry::User(text) => ("USER", Color::Green, text, false),
-            TranscriptEntry::Assistant(text) => ("ASSISTANT", Color::Cyan, text, false),
-            TranscriptEntry::Reasoning(text) => ("THINKING", Color::Blue, text, false),
-            TranscriptEntry::Error(text) => ("ERROR", Color::Red, text, true),
-            TranscriptEntry::Info(text) => ("INFO", Color::Yellow, text, false),
+            TranscriptEntry::User(text) => ("USER", widgets::RolePalette::success(), text, false),
+            TranscriptEntry::Assistant(text) => {
+                ("ASSISTANT", widgets::RolePalette::assistant(), text, false)
+            }
+            TranscriptEntry::Reasoning(text) => {
+                ("THINKING", widgets::RolePalette::thinking(), text, false)
+            }
+            TranscriptEntry::Error(text) => ("ERROR", widgets::RolePalette::error(), text, true),
+            TranscriptEntry::Info(text) => ("INFO", widgets::RolePalette::info(), text, false),
             TranscriptEntry::Tool(text) => ("TOOL", Color::Magenta, text, true),
         };
         let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
@@ -2307,6 +2317,7 @@ where
             turn_duration: self.turn_duration,
             latest_usage: self.latest_usage.as_ref(),
             status: self.status.as_deref(),
+            now: self.now,
             conversation: if self.active_transcript == TranscriptId::Main {
                 self.conversation.as_ref()
             } else {

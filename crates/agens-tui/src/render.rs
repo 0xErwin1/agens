@@ -11,6 +11,7 @@ use ratatui::{
 use std::collections::BTreeSet;
 
 use crate::conversation::ConversationItem;
+use crate::widgets::{ExpandMode, ExpandableBody, RolePalette};
 use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
@@ -26,7 +27,7 @@ pub(super) fn conversation_lines(
 
     for item in &conversation.items {
         match item {
-            ConversationItem::Info(text) => line(&mut lines, "INFO", Color::Yellow, text),
+            ConversationItem::Info(text) => line(&mut lines, "INFO", RolePalette::info(), text),
             ConversationItem::User(text) => user_lines(&mut lines, text),
             ConversationItem::Assistant(text) => {
                 markdown_lines(&mut lines, text, Style::default(), "");
@@ -44,23 +45,23 @@ pub(super) fn conversation_lines(
                     lines.push(Line::from(Span::styled(
                         format!("Tools · batch {batch}"),
                         Style::default()
-                            .fg(Color::Magenta)
+                            .fg(RolePalette::tool())
                             .add_modifier(Modifier::BOLD),
                     )));
                 }
                 lines.push(Line::from(vec![
-                    Span::styled("┌ ", Style::default().fg(Color::Magenta)),
+                    Span::styled("┌ ", Style::default().fg(RolePalette::tool())),
                     Span::styled(
                         name.to_owned(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!(" · {call_id}"),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(RolePalette::muted()),
                     ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("│ input ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("│ input ", Style::default().fg(RolePalette::muted())),
                     Span::raw(input.to_owned()),
                 ]));
             }
@@ -85,14 +86,14 @@ pub(super) fn conversation_lines(
                 if collapsed_tool_outputs.contains(call_id) {
                     lines.push(Line::from(Span::styled(
                         "output collapsed; expand to recover",
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(RolePalette::chrome()),
                     )));
                     lines.push(Line::default());
                 } else {
                     markdown_lines(
                         &mut lines,
                         &bounded_visible_tool_output(output),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(RolePalette::chrome()),
                         "",
                     );
                 }
@@ -105,15 +106,17 @@ pub(super) fn conversation_lines(
             ConversationItem::Error(error) => {
                 lines.push(Line::from(Span::styled(
                     "┌ Error",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(RolePalette::error())
+                        .add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::Red)),
+                    Span::styled("│ ", Style::default().fg(RolePalette::error())),
                     Span::raw(error.message.clone()),
                 ]));
                 lines.push(Line::from(Span::styled(
                     format!("└ Action: {}", error.action),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(RolePalette::warning()),
                 )));
                 lines.push(Line::default());
             }
@@ -165,7 +168,7 @@ fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     lines.push(Line::from(Span::styled(
         "You",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(RolePalette::user())
             .add_modifier(Modifier::BOLD),
     )));
     for source_line in text.split('\n') {
@@ -175,21 +178,26 @@ fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
 }
 
 fn thinking_lines(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
-    let title = if collapsed {
-        "Thinking · collapsed"
+    let body = ExpandableBody::new(if collapsed {
+        ExpandMode::Collapsed
     } else {
+        ExpandMode::Expanded
+    });
+    let title = if body.is_visible() {
         "Thinking"
+    } else {
+        "Thinking · collapsed"
     };
     lines.push(Line::from(Span::styled(
         title,
         Style::default()
-            .fg(Color::Magenta)
+            .fg(RolePalette::thinking())
             .add_modifier(Modifier::BOLD),
     )));
-    if collapsed {
-        lines.push(Line::default());
+    if body.is_visible() {
+        markdown_lines(lines, text, Style::default().fg(RolePalette::chrome()), "");
     } else {
-        markdown_lines(lines, text, Style::default().fg(Color::Gray), "");
+        lines.push(Line::default());
     }
 }
 
@@ -553,7 +561,7 @@ fn duration_label(duration: Option<Duration>) -> String {
 
 fn result_color(result: ToolResultState) -> Color {
     match result {
-        ToolResultState::Success => Color::Green,
-        ToolResultState::Failure => Color::Red,
+        ToolResultState::Success => RolePalette::success(),
+        ToolResultState::Failure => RolePalette::error(),
     }
 }
