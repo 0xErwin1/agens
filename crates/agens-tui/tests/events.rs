@@ -1,18 +1,28 @@
-use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnState};
+use agens_core::{
+    HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
+};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
-    ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
-    Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    SessionDialogCursor, SessionDialogRequest, SessionDialogScope, TranscriptEntry,
-    TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
-    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
-    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, DisplayMode,
+    Effect, Engine, Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer,
+    Renderer, Runtime, SessionDialogCursor, SessionDialogRequest, SessionDialogScope,
+    TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
+    TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
+    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
+    TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
+    collections::BTreeMap,
     thread,
     time::{Duration, Instant},
 };
+
+/// Mirrors `BlockContent::default_mode` (Collapsed): a call with no explicit
+/// mode entry renders collapsed, same as an explicit `Collapsed` entry.
+fn is_collapsed(modes: &BTreeMap<String, DisplayMode>, call_id: &str) -> bool {
+    matches!(modes.get(call_id), None | Some(DisplayMode::Collapsed))
+}
 
 #[derive(Default)]
 struct FakeEngine {
@@ -517,7 +527,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::PageUp));
     assert!(tui.view().collapse_thinking);
     assert!(tui.view().scroll_offset > 0);
-    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "seven"));
     tui.handle(Event::Key(Key::Home));
     let child_seven_offset = tui.view().scroll_offset;
     tui.show_selection_dialog(DialogView::selection(
@@ -532,7 +542,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     assert_eq!(tui.view().focus, TranscriptFocus::Composer);
     assert!(!tui.view().collapse_thinking);
     assert!(tui.view().following_bottom);
-    assert!(tui.view().collapsed_tool_outputs.is_empty());
+    assert!(tui.view().tool_display_modes.is_empty());
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.input(), "m");
 
@@ -556,12 +566,14 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
     assert_ne!(child_eight_offset, child_seven_offset);
-    assert!(!tui.view().collapsed_tool_outputs.contains("eight"));
-    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "eight"));
+    // "seven" belongs to a different transcript's own record; it is simply
+    // absent here (state isolation), not a "seven" collapse claim.
+    assert!(!tui.view().tool_display_modes.contains_key("seven"));
 
     tui.handle(Event::Key(Key::Char('h')));
     assert_eq!(tui.view().scroll_offset, child_seven_offset);
-    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "seven"));
 
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
         TuiSubagentEvent::started(
@@ -750,14 +762,16 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
         tui.view().following_bottom,
         tui.view().scroll_offset,
         tui.view().focus,
-        tui.view().collapsed_tool_outputs.contains("seven"),
+        is_collapsed(tui.view().tool_display_modes, "seven"),
     );
 
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
     assert!(tui.view().following_bottom);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
-    assert!(!tui.view().collapsed_tool_outputs.contains("seven"));
+    // "seven" belongs to a different transcript's own record; it is simply
+    // absent here (state isolation), not a "seven" collapse claim.
+    assert!(!tui.view().tool_display_modes.contains_key("seven"));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;
@@ -769,14 +783,14 @@ fn viewport_vim_routes_preserve_per_transcript_state() {
             tui.view().following_bottom,
             tui.view().scroll_offset,
             tui.view().focus,
-            tui.view().collapsed_tool_outputs.contains("seven"),
+            is_collapsed(tui.view().tool_display_modes, "seven"),
         ),
         child_seven
     );
 
     tui.handle(Event::Key(Key::Char('l')));
     assert_eq!(tui.view().scroll_offset, child_eight_offset);
-    assert!(!tui.view().collapsed_tool_outputs.contains("eight"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "eight"));
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
@@ -807,7 +821,7 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
         is_error: false,
     }));
 
-    assert!(tui.view().collapsed_tool_outputs.contains("read-1"));
+    assert!(is_collapsed(tui.view().tool_display_modes, "read-1"));
     tui.handle(Event::Key(Key::PageUp));
     let anchor = (
         tui.view().following_bottom,
@@ -826,7 +840,7 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
         ),
         anchor
     );
-    assert!(!tui.view().collapsed_tool_outputs.contains("read-1"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "read-1"));
     assert!(
         tui.view().conversation.unwrap().tool_batches[0].calls[0]
             .result
@@ -853,8 +867,15 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
     assert!(expanded.contains("visible output truncated"));
     assert!(!expanded.contains("retained-tail-sentinel"));
 
+    // Second Ctrl+O: Truncated -> Expanded. S1 renders both modes
+    // identically (real truncation is S2 scope), so it stays not collapsed.
     tui.handle(Event::Key(Key::CtrlO));
-    assert!(tui.view().collapsed_tool_outputs.contains("read-1"));
+    assert!(!is_collapsed(tui.view().tool_display_modes, "read-1"));
+
+    // Third Ctrl+O completes the Collapsed -> Truncated -> Expanded ->
+    // Collapsed cycle.
+    tui.handle(Event::Key(Key::CtrlO));
+    assert!(is_collapsed(tui.view().tool_display_modes, "read-1"));
 }
 
 #[test]
@@ -1188,6 +1209,10 @@ fn tool_call(id: &str) -> ConversationEvent {
         call_id: id.into(),
         name: id.into(),
         input: id.into(),
+        parsed: agens_core::ToolInput::Other {
+            name: id.into(),
+            raw: id.into(),
+        },
     }
 }
 
@@ -3064,4 +3089,133 @@ fn safe_dialog_while_running_remains_usable_and_esc_does_not_cancel_turn() {
     assert!(tui.view().dialog.is_none());
     assert!(tui.view().running);
     assert_eq!(tui.engine().cancellations, 0);
+}
+
+#[test]
+fn parsed_tool_input_reaches_live_projection_via_tool_started_enrichment() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "read".into(),
+        input: "src/lib.rs".into(),
+    });
+
+    let placeholder = tui.view().conversation.unwrap().tool_batches[0].calls[0]
+        .parsed
+        .clone();
+    assert_eq!(
+        placeholder,
+        ToolInput::Other {
+            name: "read".into(),
+            raw: "src/lib.rs".into(),
+        }
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "read-1".into(),
+        name: "read".into(),
+        input: "src/lib.rs".into(),
+        parsed: ToolInput::Read {
+            path: "src/lib.rs".into(),
+        },
+    });
+
+    let enriched = tui.view().conversation.unwrap().tool_batches[0].calls[0]
+        .parsed
+        .clone();
+    assert_eq!(
+        enriched,
+        ToolInput::Read {
+            path: "src/lib.rs".into(),
+        }
+    );
+}
+
+#[test]
+fn parsed_tool_input_reaches_subagent_tool_call_update() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(7, "reviewer", "task", TuiExecutionState::ForegroundRunning),
+    ));
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::tool_call_with_parsed(
+            7,
+            "child-call",
+            "grep",
+            "needle",
+            ToolInput::Grep {
+                pattern: "needle".into(),
+                path: None,
+            },
+        ),
+    ));
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    let parsed = tui.view().conversation.unwrap().tool_batches[0].calls[0]
+        .parsed
+        .clone();
+    assert_eq!(
+        parsed,
+        ToolInput::Grep {
+            pattern: "needle".into(),
+            path: None,
+        }
+    );
+}
+
+#[test]
+fn parsed_tool_input_reaches_restore_with_qualified_name_stripped() {
+    let messages = [
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("restore me".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "native::read".into(),
+                input: "src/lib.rs".into(),
+            }],
+        },
+    ];
+
+    // Default `from_messages` cannot parse (no parser at this crate
+    // boundary) and degrades every restored call to `Other`.
+    let degraded = Conversation::from_messages(&messages).unwrap();
+    assert_eq!(
+        degraded[0].tool_batches[0].calls[0].parsed,
+        ToolInput::Other {
+            name: "native::read".into(),
+            raw: "src/lib.rs".into(),
+        }
+    );
+
+    // `from_messages_with_parser` receives the qualified restored name
+    // (`native::read`), matching the live path's bare `read`; the caller's
+    // closure must strip the prefix before parsing.
+    let parsed = Conversation::from_messages_with_parser(&messages, |name, input| {
+        let bare = name
+            .strip_prefix("native::")
+            .or_else(|| name.strip_prefix("mcp::"))
+            .unwrap_or(name);
+        match bare {
+            "read" => ToolInput::Read {
+                path: input.to_owned(),
+            },
+            _ => ToolInput::Other {
+                name: name.to_owned(),
+                raw: input.to_owned(),
+            },
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        parsed[0].tool_batches[0].calls[0].parsed,
+        ToolInput::Read {
+            path: "src/lib.rs".into(),
+        }
+    );
 }

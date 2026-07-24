@@ -21,6 +21,7 @@ pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
 };
+pub use widgets::DisplayMode;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -391,7 +392,7 @@ pub struct TranscriptRecord {
     completed_conversations: Vec<Conversation>,
     following_bottom: bool,
     scroll_offset: u16,
-    collapsed_tool_outputs: BTreeSet<String>,
+    tool_display_modes: BTreeMap<String, widgets::DisplayMode>,
     collapse_thinking: bool,
     /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+O).
     thinking_user_pinned: bool,
@@ -414,7 +415,7 @@ impl TranscriptRecord {
             completed_conversations: Vec::new(),
             following_bottom: true,
             scroll_offset: 0,
-            collapsed_tool_outputs: BTreeSet::new(),
+            tool_display_modes: BTreeMap::new(),
             collapse_thinking: false,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
@@ -499,8 +500,8 @@ pub struct ViewState<'a> {
     /// Completed typed conversations retained before the active turn.
     pub completed_conversations: &'a [Conversation],
     pub highlight_restored_syntax: bool,
-    /// Tool outputs collapsed only for presentation; their source output remains retained.
-    pub collapsed_tool_outputs: &'a BTreeSet<String>,
+    /// Per-call presentation mode; their source output remains retained regardless of mode.
+    pub tool_display_modes: &'a BTreeMap<String, widgets::DisplayMode>,
     /// Whether complete reasoning is collapsed according to the UI setting.
     pub collapse_thinking: bool,
     pub focus: TranscriptFocus,
@@ -1720,7 +1721,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
                 render::conversation_lines(
                     conversation,
                     &[],
-                    state.collapsed_tool_outputs,
+                    state.tool_display_modes,
                     content_width,
                     render::ConversationRenderState {
                         collapse_thinking: state.collapse_thinking,
@@ -1736,7 +1737,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
         transcript.extend(render::conversation_lines(
             conversation,
             state.runtime_events,
-            state.collapsed_tool_outputs,
+            state.tool_display_modes,
             content_width,
             render::ConversationRenderState {
                 collapse_thinking: state.collapse_thinking,
@@ -2448,7 +2449,7 @@ where
         self.conversation = Some(Conversation::new(prompt));
         {
             let record = self.active_record_mut();
-            record.collapsed_tool_outputs.clear();
+            record.tool_display_modes.clear();
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
         }
@@ -2727,7 +2728,7 @@ where
         self.transcript.clear();
         self.completed_conversations.clear();
         self.conversation = None;
-        self.active_record_mut().collapsed_tool_outputs.clear();
+        self.active_record_mut().tool_display_modes.clear();
         self.set_running(false);
         self.turn_state = None;
         self.active_tool = None;
@@ -2763,10 +2764,12 @@ where
         self.clear_current_session_transcripts();
         {
             let record = self.active_record_mut();
-            record.collapsed_tool_outputs.clear();
-            record
-                .collapsed_tool_outputs
-                .extend(completed_tool_call_ids);
+            record.tool_display_modes.clear();
+            record.tool_display_modes.extend(
+                completed_tool_call_ids
+                    .into_iter()
+                    .map(|call_id| (call_id, widgets::DisplayMode::Collapsed)),
+            );
             // Restored history is finished: collapse thinking unless the user re-expands.
             record.collapse_thinking = true;
             record.thinking_user_pinned = false;
@@ -2990,7 +2993,14 @@ where
                     final_result.clone(),
                     *tool_uses,
                 ),
-            TuiRuntimeEvent::ToolStarted { .. } | TuiRuntimeEvent::ToolEnded { .. } => {}
+            TuiRuntimeEvent::ToolStarted {
+                call_id, parsed, ..
+            } => {
+                if let Some(conversation) = self.conversation.as_mut() {
+                    conversation.enrich_parsed_tool_input(call_id, parsed.clone());
+                }
+            }
+            TuiRuntimeEvent::ToolEnded { .. } => {}
         }
         self.runtime_events.push(event);
     }
@@ -3008,10 +3018,6 @@ where
                 execution.terminal_at = Some(self.now);
             }
         }
-        let completed_tool_call = match &event.update {
-            bridge::TuiSubagentUpdate::ToolResult { call_id, .. } => Some(call_id.clone()),
-            _ => None,
-        };
         if let bridge::TuiSubagentUpdate::Started { agent, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
@@ -3025,12 +3031,12 @@ where
             .conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply_child_event(event.clone());
-        if let Some(call_id) = completed_tool_call {
+        if let bridge::TuiSubagentUpdate::ToolResult { call_id, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript")
-                .collapsed_tool_outputs
-                .insert(call_id);
+                .tool_display_modes
+                .insert(call_id.clone(), widgets::DisplayMode::Collapsed);
         }
         if matches!(&event.update, bridge::TuiSubagentUpdate::Terminal { .. }) {
             let record = self
@@ -3105,7 +3111,7 @@ where
                 completed_conversations: Vec::new(),
                 following_bottom: true,
                 scroll_offset: 0,
-                collapsed_tool_outputs: BTreeSet::new(),
+                tool_display_modes: BTreeMap::new(),
                 collapse_thinking: false,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
@@ -3160,8 +3166,8 @@ where
             .apply(event)?;
         if let Some(call_id) = completed_tool_call {
             self.active_record_mut()
-                .collapsed_tool_outputs
-                .insert(call_id);
+                .tool_display_modes
+                .insert(call_id, widgets::DisplayMode::Collapsed);
         }
         Ok(())
     }
@@ -3251,7 +3257,7 @@ where
                 &active.completed_conversations
             },
             highlight_restored_syntax: self.highlight_restored_syntax,
-            collapsed_tool_outputs: &active.collapsed_tool_outputs,
+            tool_display_modes: &active.tool_display_modes,
             collapse_thinking: active.collapse_thinking,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
@@ -3524,6 +3530,13 @@ where
                     call_id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
+                    // No parser is available on the raw live-event path; the
+                    // typed `TuiRuntimeEvent::ToolStarted` carrier corrects
+                    // this in `apply_runtime_event_with_ordinal`.
+                    parsed: agens_core::ToolInput::Other {
+                        name: name.clone(),
+                        raw: input.clone(),
+                    },
                 });
                 self.turn_state = Some(TurnState::Dispatching);
                 self.active_tool = (!hidden_task).then_some(name.clone());
@@ -4603,16 +4616,20 @@ where
             return;
         }
 
-        let collapsed = &mut self.active_record_mut().collapsed_tool_outputs;
-        if completed_call_ids
-            .iter()
-            .all(|call_id| !collapsed.contains(call_id))
-        {
-            collapsed.extend(completed_call_ids);
-        } else {
-            for call_id in completed_call_ids {
-                collapsed.remove(&call_id);
-            }
+        // All completed calls always advance together, so they share one
+        // current mode; sampling the first call's mode (or the shared
+        // fallback for a call cleared by a new submission) keeps the whole
+        // group synchronized on every press. The fallback matches
+        // `ToolResultBlock::default_mode()` so the sampled "current" state
+        // agrees with what is actually on screen.
+        let modes = &mut self.active_record_mut().tool_display_modes;
+        let current = completed_call_ids
+            .first()
+            .and_then(|call_id| modes.get(call_id).copied())
+            .unwrap_or(widgets::DisplayMode::Expanded);
+        let next = current.next();
+        for call_id in completed_call_ids {
+            modes.insert(call_id, next);
         }
     }
 

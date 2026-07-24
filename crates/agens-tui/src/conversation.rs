@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentStatus, bridge::TuiSubagentUpdate};
-use agens_core::{Message, MessagePart, Role};
+use agens_core::{Message, MessagePart, Role, ToolInput};
 
 /// A source event accepted by the conversation projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,6 +16,7 @@ pub enum ConversationEvent {
         call_id: String,
         name: String,
         input: String,
+        parsed: ToolInput,
     },
     ToolResult {
         call_id: String,
@@ -79,6 +80,7 @@ pub struct ToolCall {
     pub call_id: String,
     pub name: String,
     pub input: String,
+    pub parsed: ToolInput,
     pub result: Option<ToolResult>,
 }
 
@@ -121,6 +123,7 @@ pub(super) enum ConversationItem {
         call_id: String,
         name: String,
         input: String,
+        parsed: ToolInput,
         batch: Option<usize>,
     },
     ToolResult {
@@ -168,7 +171,29 @@ impl Conversation {
             last_was_tool_call: false,
         }
     }
+    /// Reconstructs completed conversations from persisted messages.
+    ///
+    /// Restored tool calls degrade `parsed` to [`ToolInput::Other`] since no
+    /// authoritative parser is available at this crate boundary. Use
+    /// [`Self::from_messages_with_parser`] when an accurate `parsed` value is
+    /// required (the production restore path in `agens-cli`).
     pub fn from_messages(messages: &[Message]) -> Result<Vec<Self>, ConversationError> {
+        Self::from_messages_with_parser(messages, |name, input| ToolInput::Other {
+            name: name.to_owned(),
+            raw: input.to_owned(),
+        })
+    }
+
+    /// Reconstructs completed conversations from persisted messages, deriving
+    /// `parsed` for each restored tool call via `parse_tool_input`.
+    ///
+    /// Restored tool call names are qualified (e.g. `native::read`), unlike
+    /// the bare names carried by the live event stream; callers that reuse a
+    /// bare-name parser must strip the `native::`/`mcp::` prefix themselves.
+    pub fn from_messages_with_parser(
+        messages: &[Message],
+        parse_tool_input: impl Fn(&str, &str) -> ToolInput,
+    ) -> Result<Vec<Self>, ConversationError> {
         let mut conversations = Vec::new();
         let mut current: Option<Self> = None;
         let mut pending_system = Vec::new();
@@ -220,6 +245,7 @@ impl Conversation {
                                     call_id: id.clone(),
                                     name: name.clone(),
                                     input: input.clone(),
+                                    parsed: parse_tool_input(name, input),
                                 }
                             }
                             MessagePart::ToolResult { .. } => {
@@ -284,6 +310,7 @@ impl Conversation {
                 call_id,
                 name,
                 input,
+                parsed,
             } => {
                 if self.find_call(&call_id).is_some() {
                     return Err(ConversationError::DuplicateToolCall(call_id));
@@ -302,12 +329,14 @@ impl Conversation {
                         call_id: call_id.clone(),
                         name: name.clone(),
                         input: input.clone(),
+                        parsed: parsed.clone(),
                         result: None,
                     });
                 self.items.push(ConversationItem::ToolCall {
                     call_id,
                     name,
                     input,
+                    parsed,
                     batch,
                 });
             }
@@ -424,10 +453,12 @@ impl Conversation {
                 call_id,
                 name,
                 input,
+                parsed,
             } => self.apply(ConversationEvent::ToolCall {
                 call_id,
                 name,
                 input,
+                parsed,
             }),
             TuiSubagentUpdate::ToolResult {
                 call_id,
@@ -482,6 +513,31 @@ impl Conversation {
         });
         self.items.push(ConversationItem::SubagentCard(id));
     }
+    /// Corrects a live tool call's `parsed` value once the typed
+    /// `TuiRuntimeEvent::ToolStarted` carrier arrives for `call_id`.
+    ///
+    /// The live projection path (raw `TurnEvent`) has no parser available, so
+    /// it records a placeholder `ToolInput::Other` at call time; this is the
+    /// single point that ever writes an authoritative `parsed` value for a
+    /// live call.
+    pub(crate) fn enrich_parsed_tool_input(&mut self, call_id: &str, parsed: ToolInput) {
+        if let Some(call) = self.find_call_mut(call_id) {
+            call.parsed = parsed.clone();
+        }
+        for item in &mut self.items {
+            if let ConversationItem::ToolCall {
+                call_id: id,
+                parsed: slot,
+                ..
+            } = item
+                && id == call_id
+            {
+                *slot = parsed;
+                break;
+            }
+        }
+    }
+
     fn find_call(&self, call_id: &str) -> Option<&ToolCall> {
         self.tool_batches
             .iter()

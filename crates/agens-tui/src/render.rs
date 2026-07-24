@@ -1,7 +1,7 @@
 //! Rich presentation of typed runtime details without mutating their source data.
 
 use std::{
-    collections::{BTreeSet, VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     mem::size_of,
     sync::{Arc, Mutex, OnceLock},
@@ -21,7 +21,9 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
-use crate::widgets::{RolePalette, ThinkingBlock, ToolRow};
+use crate::widgets::{
+    BlockContent, DisplayMode, RolePalette, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow,
+};
 use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
@@ -42,7 +44,7 @@ pub(super) struct ConversationRenderState {
 pub(super) fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
-    collapsed_tool_outputs: &BTreeSet<String>,
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
     state: ConversationRenderState,
 ) -> Vec<Line<'static>> {
@@ -77,21 +79,23 @@ pub(super) fn conversation_lines(
                 call_id: _,
                 name,
                 input,
+                parsed: _,
                 batch,
             } => {
                 if is_task_tool_name(name) {
                     continue;
                 }
-                if let Some(batch) = batch {
-                    lines.push(Line::from(Span::styled(
-                        format!("Tools · batch {batch}"),
-                        Style::default()
-                            .fg(RolePalette::tool())
-                            .add_modifier(Modifier::BOLD),
-                    )));
-                }
-                lines.push(ToolRow::header(name));
-                lines.push(ToolRow::args(input));
+                let block = ToolCallBlock {
+                    name,
+                    input,
+                    batch: *batch,
+                };
+                lines.extend(
+                    block
+                        .lines(block.default_mode())
+                        .into_iter()
+                        .map(|block_line| block_line.line),
+                );
             }
             ConversationItem::ToolResult {
                 call_id,
@@ -105,22 +109,38 @@ pub(super) fn conversation_lines(
                 let color = result_color(result_state);
                 let tool_name = tool_name_for_call(conversation, call_id);
                 let status = format!("{result_state:?}{}", duration_label(duration));
-                lines.push(ToolRow::result_footer(&tool_name, &status, color));
-                if collapsed_tool_outputs.contains(call_id) {
-                    if *is_error {
-                        lines.push(ToolRow::collapsed_failure(output));
-                    } else {
-                        lines.push(ToolRow::collapsed_output());
-                    }
-                    lines.push(Line::default());
+                let collapsed_body = if *is_error {
+                    vec![ToolRow::collapsed_failure(output)]
                 } else {
-                    markdown_lines(
-                        &mut lines,
-                        &bounded_visible_tool_output(output),
-                        Style::default().fg(RolePalette::chrome()),
-                        "",
-                        content_width,
-                    );
+                    vec![ToolRow::collapsed_output()]
+                };
+                let mut full_body = Vec::new();
+                markdown_lines(
+                    &mut full_body,
+                    &bounded_visible_tool_output(output),
+                    Style::default().fg(RolePalette::chrome()),
+                    "",
+                    content_width,
+                );
+                let block = ToolResultBlock {
+                    footer: ToolRow::result_footer(&tool_name, &status, color),
+                    collapsed_body,
+                    full_body,
+                    accent: color,
+                };
+                let mode = tool_display_modes
+                    .get(call_id)
+                    .copied()
+                    .unwrap_or_else(|| block.default_mode());
+                let is_collapsed = mode == DisplayMode::Collapsed;
+                lines.extend(
+                    block
+                        .lines(mode)
+                        .into_iter()
+                        .map(|block_line| block_line.line),
+                );
+                if is_collapsed {
+                    lines.push(Line::default());
                 }
             }
             ConversationItem::Diff(diff) => {
@@ -1446,7 +1466,7 @@ mod tests {
             let _ = conversation_lines(
                 &conversation,
                 &[],
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 80,
                 conversation_state(true),
             );
@@ -1460,7 +1480,7 @@ mod tests {
         let _ = conversation_lines(
             &conversation,
             &[],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             80,
             conversation_state(false),
         );
@@ -1469,7 +1489,7 @@ mod tests {
         let _ = conversation_lines(
             &conversation,
             &[],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             80,
             conversation_state(false),
         );
@@ -1492,7 +1512,7 @@ mod tests {
         let _ = conversation_lines(
             &restored,
             &[],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             80,
             conversation_state(true),
         );
@@ -1502,7 +1522,7 @@ mod tests {
             let _ = conversation_lines(
                 &restored,
                 &[],
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 80,
                 conversation_state(false),
             );
@@ -1524,7 +1544,7 @@ mod tests {
         let completed_lines = conversation_lines(
             &completed,
             &[],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             80,
             conversation_state(false),
         );
@@ -1537,7 +1557,7 @@ mod tests {
         let _ = conversation_lines(
             &streaming,
             &[],
-            &BTreeSet::new(),
+            &BTreeMap::new(),
             80,
             conversation_state(true),
         );

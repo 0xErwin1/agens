@@ -231,6 +231,7 @@ pub(crate) enum TuiSubagentUpdate {
         call_id: String,
         name: String,
         input: String,
+        parsed: agens_core::ToolInput,
     },
     ToolResult {
         call_id: String,
@@ -316,11 +317,38 @@ impl TuiSubagentEvent {
             },
         }
     }
+    /// Records a child tool call with an unknown/default `parsed` payload.
+    ///
+    /// Prefer [`Self::tool_call_with_parsed`] when an accurate typed input is
+    /// available at the call site; this constructor exists for callers that
+    /// only need the raw name/input (e.g. most tests).
     pub fn tool_call(
         id: u64,
         call_id: impl AsRef<str>,
         name: impl AsRef<str>,
         input: impl AsRef<str>,
+    ) -> Self {
+        let name = name.as_ref();
+        let input = input.as_ref();
+        Self::tool_call_with_parsed(
+            id,
+            call_id,
+            name,
+            input,
+            agens_core::ToolInput::Other {
+                name: name.to_owned(),
+                raw: input.to_owned(),
+            },
+        )
+    }
+
+    /// Records a child tool call with a caller-supplied typed `parsed` input.
+    pub fn tool_call_with_parsed(
+        id: u64,
+        call_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+        input: impl AsRef<str>,
+        parsed: agens_core::ToolInput,
     ) -> Self {
         Self {
             id,
@@ -328,6 +356,7 @@ impl TuiSubagentEvent {
                 call_id: sanitize_projection(call_id.as_ref()),
                 name: sanitize_projection(name.as_ref()),
                 input: sanitize_projection(input.as_ref()),
+                parsed,
             },
         }
     }

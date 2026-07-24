@@ -41,6 +41,33 @@ impl ExpandMode {
     }
 }
 
+/// Three-state presentation mode for a conversation block's body.
+///
+/// Replaces the binary collapsed/expanded fold for tool output blocks so a
+/// block can distinguish a bounded preview (`Truncated`) from its full body
+/// (`Expanded`) while still supporting a fully hidden state (`Collapsed`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DisplayMode {
+    /// Body is hidden; a single summary/reason line remains visible.
+    #[default]
+    Collapsed,
+    /// A bounded preview of the body is visible.
+    Truncated,
+    /// The full body is visible.
+    Expanded,
+}
+
+impl DisplayMode {
+    /// Advances Collapsed → Truncated → Expanded → Collapsed.
+    pub(crate) const fn next(self) -> Self {
+        match self {
+            Self::Collapsed => Self::Truncated,
+            Self::Truncated => Self::Expanded,
+            Self::Expanded => Self::Collapsed,
+        }
+    }
+}
+
 /// Thin holder for expand mode on a presentation block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ExpandableBody {
@@ -87,6 +114,14 @@ mod tests {
         assert_eq!(ExpandMode::Expanded.toggle_detail(), ExpandMode::Collapsed);
         assert_eq!(ExpandMode::Streaming.toggle_detail(), ExpandMode::Streaming);
         assert_eq!(ExpandMode::begin_stream(), ExpandMode::Streaming);
+    }
+
+    #[test]
+    fn display_mode_next_cycles_collapsed_truncated_expanded() {
+        assert_eq!(DisplayMode::Collapsed.next(), DisplayMode::Truncated);
+        assert_eq!(DisplayMode::Truncated.next(), DisplayMode::Expanded);
+        assert_eq!(DisplayMode::Expanded.next(), DisplayMode::Collapsed);
+        assert_eq!(DisplayMode::default(), DisplayMode::Collapsed);
     }
 
     #[test]

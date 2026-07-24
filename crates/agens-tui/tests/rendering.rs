@@ -348,11 +348,19 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
             call_id: "read-1".into(),
             name: "native::read".into(),
             input: "src/lib.rs".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::read".into(),
+                raw: "src/lib.rs".into(),
+            },
         },
         ConversationEvent::ToolCall {
             call_id: "grep-2".into(),
             name: "native::grep".into(),
             input: "needle".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::grep".into(),
+                raw: "needle".into(),
+            },
         },
         ConversationEvent::ToolResult {
             call_id: "grep-2".into(),
@@ -622,6 +630,10 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
         call_id: "read-1".into(),
         name: "native::read".into(),
         input: "src/lib.rs".into(),
+        parsed: agens_core::ToolInput::Other {
+            name: "native::read".into(),
+            raw: "src/lib.rs".into(),
+        },
     })
     .unwrap();
     tui.apply_conversation_event(ConversationEvent::ToolResult {
@@ -989,11 +1001,19 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
             call_id: "read-1".into(),
             name: "native::read".into(),
             input: "src/render.rs".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::read".into(),
+                raw: "src/render.rs".into(),
+            },
         },
         ConversationEvent::ToolCall {
             call_id: "write-2".into(),
             name: "native::write".into(),
             input: "src/render.rs".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::write".into(),
+                raw: "src/render.rs".into(),
+            },
         },
         ConversationEvent::ToolResult {
             call_id: "write-2".into(),
@@ -1100,6 +1120,10 @@ fn renderer_recovers_collapsed_long_tool_output_in_a_bounded_viewport() {
         call_id: "read-1".into(),
         name: "native::read".into(),
         input: "large.log".into(),
+        parsed: agens_core::ToolInput::Other {
+            name: "native::read".into(),
+            raw: "large.log".into(),
+        },
     })
     .unwrap();
     tui.apply_conversation_event(ConversationEvent::ToolResult {
@@ -1135,6 +1159,10 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
         call_id: "read-1".into(),
         name: "native::read".into(),
         input: "large.log".into(),
+        parsed: agens_core::ToolInput::Other {
+            name: "native::read".into(),
+            raw: "large.log".into(),
+        },
     })
     .unwrap();
     tui.apply_conversation_event(ConversationEvent::ToolResult {

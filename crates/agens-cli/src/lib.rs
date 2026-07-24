@@ -4891,7 +4891,14 @@ fn prepare_loaded_tui_session_resume(
     }
     #[cfg(test)]
     TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let restored_history = Conversation::from_messages(&session.messages)
+    let restored_history =
+        Conversation::from_messages_with_parser(&session.messages, |name, input| {
+            let bare = name
+                .strip_prefix("native::")
+                .or_else(|| name.strip_prefix("mcp::"))
+                .unwrap_or(name);
+            agens_core::ToolInput::parse(bare, input)
+        })
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(TuiProvider::parse);
@@ -6579,7 +6586,13 @@ impl TuiTaskLifecycleBridge {
                 id: call_id,
                 name,
                 input,
-            } => TuiSubagentEvent::tool_call(id, call_id, name, input),
+            } => {
+                // Parse the sanitized input so a redacted secret never
+                // survives inside `parsed`'s `Other { raw, .. }` fallback.
+                let sanitized_input = sanitize_tui_metric(&input);
+                let parsed = agens_core::ToolInput::parse(&name, &sanitized_input);
+                TuiSubagentEvent::tool_call_with_parsed(id, call_id, name, input, parsed)
+            }
             TurnEvent::ToolResult(MessagePart::ToolResult {
                 tool_call_id,
                 content,
@@ -13496,7 +13509,21 @@ mod tests {
             ),
             restored_anchor
         );
-        assert!(tui.view().collapsed_tool_outputs.contains("resume-call"));
+        // Completes the Collapsed -> Truncated -> Expanded -> Collapsed
+        // cycle (S1 renders Truncated and Expanded identically).
+        tui.handle(Event::Key(Key::CtrlO));
+        assert_eq!(
+            (
+                tui.view().following_bottom,
+                tui.view().scroll_offset,
+                tui.view().focus,
+            ),
+            restored_anchor
+        );
+        assert_eq!(
+            tui.view().tool_display_modes.get("resume-call"),
+            Some(&agens_tui::DisplayMode::Collapsed)
+        );
         tui.handle(Event::Key(Key::End));
 
         assert_eq!(tui.view().session, format!("session #{}", restored.id));

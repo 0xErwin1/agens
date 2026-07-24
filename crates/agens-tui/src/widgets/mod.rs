@@ -7,7 +7,8 @@ mod glyph;
 mod overlay;
 mod role_palette;
 
-pub(crate) use blocks::{ThinkingBlock, ToolRow};
+pub(crate) use blocks::{BlockContent, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow};
+pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
 pub(crate) use footer::{FooterContext, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
