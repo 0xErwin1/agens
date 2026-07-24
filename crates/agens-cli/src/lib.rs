@@ -12632,7 +12632,7 @@ mod tests {
                 )
                 .is_none()
             );
-            let text = render_tui_test_backend(&tui, 80, 60);
+            let text = render_tui_test_backend(&tui, 140, 60);
 
             assert!(text.contains(source), "{provider}: {text:?}");
             assert!(text.contains("gpt-5.5 (current)"), "{provider}: {text:?}");
@@ -12816,10 +12816,8 @@ mod tests {
             overlay.contains("Current: OpenAI API · credential required"),
             "{overlay:?}"
         );
-        assert!(
-            overlay.contains("ChatGPT subscription - ready"),
-            "{overlay:?}"
-        );
+        assert!(overlay.contains("❯ ChatGPT subscription"), "{overlay:?}");
+        assert!(overlay.contains("ready"), "{overlay:?}");
         assert!(!overlay.contains("OpenAI API (current)"), "{overlay:?}");
         assert!(!overlay.contains("secret-"), "{overlay:?}");
 
