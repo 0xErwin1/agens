@@ -1041,6 +1041,79 @@ fn grep_and_glob_enforce_exact_default_scan_result_depth_and_timeout_bounds() {
 }
 
 #[test]
+fn glob_excludes_gitignored_trees_before_consuming_the_scan_budget() {
+    let root = project_root();
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".gitignore"), "/target/\n/references/\n").unwrap();
+    fs::write(root.join("README.md"), "visible\n").unwrap();
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    fs::write(root.join("notes.md"), "visible\n").unwrap();
+    for directory in ["target", "references"] {
+        fs::create_dir(root.join(directory)).unwrap();
+        for index in 0..8 {
+            fs::write(
+                root.join(directory).join(format!("ignored-{index}.md")),
+                "ignored\n",
+            )
+            .unwrap();
+        }
+    }
+    let tools = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            max_search_entries: 5,
+            ..NativeToolLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        tools.glob(GlobInput::new("**/README*")).unwrap(),
+        ToolOutput::success("README.md\n")
+    );
+    assert_eq!(
+        tools.glob(GlobInput::new("**/package.json")).unwrap(),
+        ToolOutput::success("package.json\n")
+    );
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.md")).unwrap(),
+        ToolOutput::success("README.md\nnotes.md\n")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glob_applies_local_ignore_rules_safely_outside_git_repositories() {
+    let root = project_root();
+    fs::write(root.join(".gitignore"), "cache/\n").unwrap();
+    fs::write(root.join("README.md"), "visible\n").unwrap();
+    fs::create_dir(root.join("cache")).unwrap();
+    for index in 0..8 {
+        fs::write(
+            root.join("cache").join(format!("ignored-{index}.md")),
+            "ignored\n",
+        )
+        .unwrap();
+    }
+    let tools = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            max_search_entries: 2,
+            ..NativeToolLimits::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        tools.glob(GlobInput::new("**/*.md")).unwrap(),
+        ToolOutput::success("README.md\n")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn glob_and_list_enforce_the_exact_default_entry_cap() {
     let root = project_root();
     for index in 0..=1_000 {

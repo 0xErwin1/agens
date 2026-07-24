@@ -223,7 +223,7 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
     tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
         message: "Resumed session 42.".into(),
         presentation: TuiPresentation::new("provider", "model", "session #42"),
-        messages: vec![
+        history: Conversation::from_messages(&[
             agens_core::Message {
                 role: agens_core::Role::User,
                 parts: vec![MessagePart::Text("restored prompt".into())],
@@ -232,7 +232,8 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
                 role: agens_core::Role::Assistant,
                 parts: vec![MessagePart::Text("restored summary".into())],
             },
-        ],
+        ])
+        .unwrap(),
     });
 
     let view = tui.view();
@@ -241,6 +242,93 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
     assert_eq!(view.completed_conversations.len(), 1);
     assert!(view.conversation.is_none());
     assert!(tui.transcript_record(&TranscriptId::Subagent(7)).is_none());
+}
+
+#[test]
+fn session_loading_is_local_preserves_visible_state_and_escape_cancels() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_presentation("old-provider", "old-model", "session #1");
+    tui.begin_submission("old prompt");
+    tui.finish_submission(Ok("old answer".into()));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(agens_core::Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(5),
+        total_tokens: Some(8),
+        context_window: Some(128),
+    }));
+    tui.show_selection_dialog(DialogView::selection(
+        "Resume session · Current project",
+        None::<String>,
+        vec![DialogEntry::action("Session 2", "session:2")],
+    ));
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("session:2".into())
+    );
+    assert!(tui.view().dialog.is_some());
+    assert!(tui.begin_session_load());
+
+    let loading = tui.view();
+    assert!(loading.session_loading);
+    assert!(!loading.running);
+    assert_eq!(loading.provider_model, "old-provider / old-model");
+    assert_eq!(loading.latest_usage.unwrap().total_tokens, Some(8));
+    assert_eq!(loading.conversation.unwrap().user, "old prompt");
+    assert!(loading.dialog.is_some());
+    assert!(loading.executions.is_empty());
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
+    tui.cancel_session_load();
+    let cancelled = tui.view();
+    assert!(!cancelled.session_loading);
+    assert!(!cancelled.running);
+    assert_eq!(cancelled.provider_model, "old-provider / old-model");
+    assert_eq!(cancelled.latest_usage.unwrap().total_tokens, Some(8));
+    assert_eq!(cancelled.conversation.unwrap().user, "old prompt");
+}
+
+#[test]
+fn session_resume_success_replaces_prepared_state_in_one_outcome() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_presentation("old-provider", "old-model", "session #1");
+    tui.begin_submission("old prompt");
+    tui.finish_submission(Ok("old answer".into()));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(agens_core::Usage {
+        input_tokens: Some(3),
+        output_tokens: Some(5),
+        total_tokens: Some(8),
+        context_window: Some(128),
+    }));
+    assert!(tui.begin_session_load());
+    let history = Conversation::from_messages(&[
+        agens_core::Message {
+            role: agens_core::Role::User,
+            parts: vec![MessagePart::Text("restored prompt".into())],
+        },
+        agens_core::Message {
+            role: agens_core::Role::Assistant,
+            parts: vec![MessagePart::Text("restored answer".into())],
+        },
+    ])
+    .unwrap();
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Resumed session 2.".into(),
+        presentation: TuiPresentation::new("new-provider", "new-model", "session #2"),
+        history,
+    });
+
+    let resumed = tui.view();
+    assert!(!resumed.session_loading);
+    assert!(!resumed.running);
+    assert_eq!(resumed.provider_model, "new-provider / new-model");
+    assert_eq!(resumed.session, "session #2");
+    assert!(resumed.latest_usage.is_none());
+    assert!(resumed.runtime_events.is_empty());
+    assert_eq!(resumed.completed_conversations.len(), 1);
+    assert_eq!(resumed.completed_conversations[0].user, "restored prompt");
 }
 
 #[test]
@@ -564,7 +652,11 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_result(
             7, "call-a", "result-a", false,
         )),
-        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(7, TuiSubagentErrorKind::Tool)),
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error_with_reference(
+            7,
+            TuiSubagentErrorKind::Tool,
+            "abc12345",
+        )),
         TuiRuntimeEvent::TaskExecution {
             agent: "reviewer".into(),
             event: TuiExecutionEvent::Failed { id: 7 },
@@ -641,6 +733,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         "result-b",
         "result-a",
         "Subagent tool execution failed.",
+        "ref: abc12345",
         "child-final",
     ];
     let row_positions = expected_child_rows.map(|text| {
@@ -961,7 +1054,7 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, Instant::now())),
-        vec![Effect::CancelTurn]
+        vec![Effect::ExitWarning]
     );
     assert_eq!(app.dialog(), Some(&Dialog::Command));
 
@@ -974,29 +1067,11 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 }
 
 #[test]
-fn command_control_c_follows_running_composer_warning_exit_and_disarm_states() {
-    let mut app = AppState::new(1);
+fn command_control_c_arms_in_every_state_then_cancels_and_quits() {
     let now = Instant::now();
+
+    let mut app = AppState::new(1);
     app.reduce(AppEvent::SubmitPrompt("running".into()));
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::CancelTurn]
-    );
-    app.reduce(AppEvent::TurnCancelled);
-    app.set_composer("draft");
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::Render]
-    );
-    assert_eq!(app.composer(), "");
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    assert_eq!(
-        app.reduce(AppEvent::Command(Command::Navigate, now)),
-        vec![Effect::Render]
-    );
     assert_eq!(
         app.reduce(AppEvent::Command(Command::ControlC, now)),
         vec![Effect::ExitWarning]
@@ -1006,23 +1081,45 @@ fn command_control_c_follows_running_composer_warning_exit_and_disarm_states() {
             Command::ControlC,
             now + Duration::from_secs(1)
         )),
-        vec![Effect::Quit]
+        vec![Effect::CancelTurn, Effect::Quit]
     );
+
+    let mut composer = AppState::new(1);
+    composer.set_composer("draft");
     assert_eq!(
-        app.reduce(AppEvent::Command(
-            Command::ControlC,
-            now + Duration::from_secs(3)
-        )),
+        composer.reduce(AppEvent::Command(Command::ControlC, now)),
         vec![Effect::ExitWarning]
     );
+    assert_eq!(composer.composer(), "draft");
     assert_eq!(
-        app.reduce(AppEvent::TimerTick(now + Duration::from_secs(6))),
+        composer.reduce(AppEvent::Command(Command::Navigate, now)),
         vec![Effect::Render]
     );
     assert_eq!(
-        app.reduce(AppEvent::Command(
+        composer.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::ExitWarning]
+    );
+    assert_eq!(
+        composer.reduce(AppEvent::Command(
             Command::ControlC,
-            now + Duration::from_secs(6)
+            now + Duration::from_secs(1)
+        )),
+        vec![Effect::Quit]
+    );
+
+    let mut timeout = AppState::new(1);
+    assert_eq!(
+        timeout.reduce(AppEvent::Command(Command::ControlC, now)),
+        vec![Effect::ExitWarning]
+    );
+    assert_eq!(
+        timeout.reduce(AppEvent::TimerTick(now + Duration::from_secs(2))),
+        vec![Effect::Render]
+    );
+    assert_eq!(
+        timeout.reduce(AppEvent::Command(
+            Command::ControlC,
+            now + Duration::from_secs(2)
         )),
         vec![Effect::ExitWarning]
     );
@@ -1331,8 +1428,7 @@ fn slash_palette_uses_only_the_name_prefix_and_escape_preserves_composer_and_bac
     assert_eq!(tui.engine().cancellations, 0);
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.input(), "");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.input(), "/res 42");
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
 }
 
@@ -1861,19 +1957,28 @@ fn session_dialog_toggles_scope_preserves_search_and_dispatches_the_filtered_sel
 }
 
 #[test]
-fn selection_dialog_escape_control_c_empty_and_disabled_states_never_dispatch() {
-    for cancel_key in [Key::Escape, Key::CtrlC] {
-        let mut tui = Tui::new(FakeEngine::default());
-        tui.show_selection_dialog(DialogView::selection(
-            "Confirm",
-            None::<String>,
-            vec![DialogEntry::action("Proceed", "proceed")],
-        ));
+fn selection_dialog_escape_and_control_c_preserve_distinct_cancel_and_exit_paths() {
+    let mut escape = Tui::new(FakeEngine::default());
+    escape.show_selection_dialog(DialogView::selection(
+        "Confirm",
+        None::<String>,
+        vec![DialogEntry::action("Proceed", "proceed")],
+    ));
+    assert_eq!(escape.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(escape.view().dialog.is_none());
+    assert_eq!(escape.engine().cancellations, 0);
 
-        assert_eq!(tui.handle(Event::Key(cancel_key)), Action::Render);
-        assert!(tui.view().dialog.is_none());
-        assert_eq!(tui.engine().cancellations, 0);
-    }
+    let mut control_c = Tui::new(FakeEngine::default());
+    control_c.show_selection_dialog(DialogView::selection(
+        "Confirm",
+        None::<String>,
+        vec![DialogEntry::action("Proceed", "proceed")],
+    ));
+    assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert!(control_c.view().dialog.is_some());
+    assert!(control_c.view().quit_armed);
+    assert_eq!(control_c.engine().cancellations, 0);
+    assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Quit);
 
     for entries in [
         Vec::new(),
@@ -1973,7 +2078,9 @@ fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
     assert!(text.contains("https://auth.example/device"));
     assert!(text.contains("ABCD-EFGH"));
     assert!(tui.transcript().is_empty());
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.engine().cancellations, 0);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
 
     tui.apply_submission_outcome(TuiSubmissionOutcome::LocalActionableError {
@@ -2058,7 +2165,7 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
 }
 
 #[test]
-fn submission_start_resets_footer_metrics() {
+fn submission_start_keeps_usage_and_resets_turn_duration() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.apply_runtime_event(TuiRuntimeEvent::Usage(agens_core::Usage {
         input_tokens: Some(10),
@@ -2078,7 +2185,7 @@ fn submission_start_resets_footer_metrics() {
         prompt: "next".into(),
     });
 
-    assert!(tui.view().latest_usage.is_none());
+    assert_eq!(tui.view().latest_usage.unwrap().total_tokens, Some(15));
     assert!(tui.view().turn_duration.is_none());
 }
 
@@ -2097,7 +2204,9 @@ fn second_submission_is_rejected_while_a_turn_owns_cancellation() {
             agens_tui::TranscriptEntry::Info("A response is already in progress.".into()),
         ]
     );
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.engine().cancellations, 0);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
 }
 
@@ -2116,22 +2225,75 @@ fn resize_updates_the_render_state() {
 }
 
 #[test]
-fn control_c_cancels_a_running_turn_before_quitting() {
+fn control_c_arms_before_cancelling_and_quitting_a_running_turn() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_running(true);
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert!(tui.view().quit_armed);
+    assert_eq!(tui.engine().cancellations, 0);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
-    assert_eq!(tui.engine().cancellations, 2);
 }
 
 #[test]
-fn repeated_control_c_quits_only_when_idle_and_input_is_empty() {
+fn control_c_timeout_and_normal_keys_disarm_without_clearing_input() {
     let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Key(Key::Char('x')));
 
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.input(), "x");
+    tui.tick(Duration::from_secs(2));
+    assert!(!tui.view().quit_armed);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::Char('y'))), Action::Render);
+    assert!(!tui.view().quit_armed);
+    assert_eq!(tui.input(), "xy");
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+}
+
+#[test]
+fn escape_cancels_running_without_arming_quit() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_running(true);
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
+    assert!(!tui.view().quit_armed);
+}
+
+#[test]
+fn permission_first_control_c_keeps_pending_and_second_closes_fail_closed() {
+    let (bridge, requests) = TuiPermissionBridge::channel();
+    let worker_bridge = bridge.clone();
+    let worker = thread::spawn(move || {
+        worker_bridge.wait_for_reply(
+            "native::write",
+            "notes.md",
+            &HeadlessTurnCancellation::new(),
+        )
+    });
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_running(true);
+    tui.show_selection_dialog(DialogView::selection(
+        "Permission required",
+        None::<String>,
+        vec![DialogEntry::action(
+            "Allow once",
+            format!("permission:{}:allow-once", request.id()),
+        )],
+    ));
+
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert!(bridge.is_pending(request.id()));
+    assert!(tui.view().dialog.is_some());
+    assert_eq!(tui.engine().cancellations, 0);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    assert_eq!(tui.engine().cancellations, 1);
+    assert!(bridge.close());
+    assert_eq!(worker.join().unwrap(), TuiPermissionReply::Cancelled);
 }
 
 #[test]
@@ -2352,7 +2514,7 @@ fn ratatui_active_turn_row_distinguishes_waiting_responding_cancelling_and_failu
         .collect::<String>();
     assert!(responding.contains("Responding"));
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Cancel);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     renderer.render(tui.view()).unwrap();
     let cancelling = renderer
         .terminal()

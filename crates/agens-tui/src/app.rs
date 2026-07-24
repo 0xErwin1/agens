@@ -1,13 +1,9 @@
 //! Pure prompt-queue state and effects for the terminal application.
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Instant};
 
 use crate::Key;
 
-const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
 const RUNNING_REFUSAL: &str = "This command is unavailable while a response is in progress.";
 
 /// Whether the application currently owns an active runtime turn.
@@ -319,23 +315,17 @@ impl AppState {
     }
 
     fn control_c(&mut self, now: Instant) -> Vec<Effect> {
-        if self.runtime == Runtime::Running {
-            self.disarm_exit();
-            return vec![Effect::CancelTurn];
-        }
-
-        if !self.composer.is_empty() {
-            self.disarm_exit();
-            self.composer.clear();
-            return vec![Effect::Render];
-        }
-
         if self.exit_armed_until.is_some_and(|until| now < until) {
             self.disarm_exit();
-            return vec![Effect::Quit];
+            let mut effects = Vec::with_capacity(2);
+            if self.runtime == Runtime::Running {
+                effects.push(Effect::CancelTurn);
+            }
+            effects.push(Effect::Quit);
+            return effects;
         }
 
-        self.exit_armed_until = Some(now + EXIT_WARNING_WINDOW);
+        self.exit_armed_until = Some(now + crate::EXIT_WARNING_WINDOW);
         vec![Effect::ExitWarning]
     }
 
@@ -372,7 +362,7 @@ mod tests {
         ] {
             let mut app = AppState::new(1);
             app.runtime = Runtime::Running;
-            app.exit_armed_until = Some(now + EXIT_WARNING_WINDOW);
+            app.exit_armed_until = Some(now + crate::EXIT_WARNING_WINDOW);
             let before = app.clone();
 
             assert_eq!(

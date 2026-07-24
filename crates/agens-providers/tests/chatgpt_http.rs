@@ -261,6 +261,25 @@ fn subscription_transport_maps_auth_provider_and_semantic_stream_failures_withou
 }
 
 #[test]
+fn subscription_transport_retries_network_and_server_failures_then_succeeds() {
+    let directory = temporary_directory("transient-retry");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Disconnect,
+        ScriptedResponse::Status(500),
+        ScriptedResponse::Sse(completed_text_sse("recovered")),
+    ]);
+    let mut recovered_provider = provider(&credentials, &server.responses_base_url());
+
+    assert_eq!(
+        run(&mut recovered_provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("recovered".to_owned())])
+    );
+    assert_eq!(server.join().len(), 3);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
 fn subscription_transport_sanitizes_structured_error_bodies() {
     let directory = temporary_directory("structured-error");
     let credentials = write_credentials(&directory);
@@ -562,6 +581,51 @@ fn subscription_transport_refreshes_once_after_401_then_retries_responses_once()
     );
     assert_eq!(persisted["openai-chatgpt"]["account_id"], "account_123");
 
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_transport_retries_transient_oauth_refresh_failures_with_one_budget() {
+    let directory = temporary_directory("oauth-retry-budget");
+    let credentials = directory.join("auth.json");
+    fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE3ODQyODg4MDB9.signature","refresh_token":"synthetic-refresh","account_id":"account_123","expires_at":"2030-07-17T13:00:00Z"}}"#,
+    )
+    .expect("credentials should be written");
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Json(503, r#"{"error":"temporary"}"#.to_owned()),
+        ScriptedResponse::Json(429, r#"{"error":"rate_limited"}"#.to_owned()),
+        ScriptedResponse::Json(
+            200,
+            r#"{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature"}"#.to_owned(),
+        ),
+        ScriptedResponse::Sse(completed_text_sse("refreshed after retry")),
+    ]);
+    let mut provider = ChatGptResponsesProvider::from_credentials_with_timeout_and_auth_url(
+        &credentials,
+        Some(&server.responses_base_url()),
+        Some(&server.oauth_url()),
+        "test-model".to_owned(),
+        "test instructions".to_owned(),
+        "test input".to_owned(),
+        Duration::from_secs(3),
+    )
+    .expect("provider should be configured");
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Ok(vec![MessagePart::Text("refreshed after retry".to_owned())])
+    );
+
+    let requests = server.join();
+    assert_eq!(requests.len(), 4);
+    assert!(
+        requests[..3]
+            .iter()
+            .all(|request| request.path == "/oauth/token")
+    );
+    assert_eq!(requests[3].path, "/backend-api/codex/responses");
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
@@ -1102,7 +1166,8 @@ fn subscription_refresh_honors_the_provider_request_timeout() {
         run(&mut provider, HeadlessTurnCancellation::new()),
         Err(HeadlessTurnPortError::Provider)
     );
-    assert!(started.elapsed() < Duration::from_millis(250));
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert!(started.elapsed() < Duration::from_secs(2));
 
     oauth.join();
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
@@ -2354,6 +2419,7 @@ impl ControlledOAuthServer {
 }
 
 enum ScriptedResponse {
+    Disconnect,
     Status(u16),
     Json(u16, String),
     Raw(u16, String),
@@ -2380,6 +2446,7 @@ impl ScriptedServer {
                     .expect("scripted server should accept a request");
                 requests.push(read_request(&stream));
                 match response {
+                    ScriptedResponse::Disconnect => {}
                     ScriptedResponse::Status(status) => write_status(&mut stream, status),
                     ScriptedResponse::Json(status, body) => write_json(&mut stream, status, &body),
                     ScriptedResponse::Raw(status, body) => write_raw(&mut stream, status, &body),

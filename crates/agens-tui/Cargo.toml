@@ -10,6 +10,32 @@ workspace = true
 
 [dependencies]
 agens-core = { path = "../agens-core" }
+arborium = { version = "2.18.1", default-features = false, features = [
+  "lang-bash",
+  "lang-c",
+  "lang-c-sharp",
+  "lang-cpp",
+  "lang-css",
+  "lang-diff",
+  "lang-go",
+  "lang-html",
+  "lang-java",
+  "lang-javascript",
+  "lang-json",
+  "lang-markdown",
+  "lang-nix",
+  "lang-python",
+  "lang-rust",
+  "lang-sql",
+  "lang-toml",
+  "lang-tsx",
+  "lang-typescript",
+  "lang-yaml",
+] }
+arborium-highlight = { version = "2.18.1", default-features = false }
+arborium-theme = { version = "2.18.1", default-features = false }
+base64 = "0.22"
 crossterm = "0.29"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
+unicode-width = "0.2"

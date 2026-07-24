@@ -4,8 +4,8 @@ use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
     ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, TranscriptId, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent,
-    TuiSubagentStatus,
+    TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentErrorKind,
+    TuiSubagentEvent, TuiSubagentStatus,
 };
 use ratatui::{
     Terminal,
@@ -47,6 +47,15 @@ fn rendered_row(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
     cell_index(renderer, text) / usize::from(renderer.terminal().backend().buffer().area.width)
 }
 
+fn rendered_line(renderer: &RatatuiRenderer<TestBackend>, row: usize) -> String {
+    let buffer = renderer.terminal().backend().buffer();
+    let width = usize::from(buffer.area.width);
+    buffer.content[row * width..(row + 1) * width]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
 fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
     cell_index(renderer, text) % usize::from(renderer.terminal().backend().buffer().area.width)
 }
@@ -59,6 +68,62 @@ fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
         .windows(width)
         .position(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == text)
         .expect("text should be rendered")
+}
+
+#[test]
+fn transcript_drag_selection_paints_exact_cells_and_preserves_original_text() {
+    let terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "alpha café 🙂 omega".into(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let row = rendered_row(&renderer, "café") as u16;
+    let column = rendered_column(&renderer, "café") as u16;
+    tui.handle(Event::MouseDown { column, row });
+    tui.handle(Event::MouseDrag {
+        column: column + 3,
+        row,
+    });
+    tui.handle(Event::MouseUp {
+        column: column + 3,
+        row,
+    });
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(tui.selected_text(), Some("café"));
+    for offset in 0..4 {
+        assert_eq!(
+            renderer.terminal().backend().buffer()[(column + offset, row)].bg,
+            Color::Rgb(0x95, 0xe6, 0xcb)
+        );
+    }
+    let rendered = rendered_text(&renderer);
+    assert!(rendered.contains("alpha café"), "{rendered:?}");
+    assert!(rendered.contains("omega"), "{rendered:?}");
+}
+
+#[test]
+fn empty_composer_renders_a_complete_dock() {
+    let width = 72_u16;
+    let height = 14_u16;
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let tui = Tui::new(FakeEngine);
+
+    renderer.render(tui.view()).unwrap();
+
+    let buffer = renderer.terminal().backend().buffer();
+    let composer_top = height - 4;
+    let composer_bottom = height - 2;
+    assert_eq!(buffer[(0, composer_top)].symbol(), "┌");
+    assert_eq!(buffer[(width - 1, composer_top)].symbol(), "┐");
+    assert_eq!(buffer[(0, composer_bottom)].symbol(), "└");
+    assert_eq!(buffer[(width - 1, composer_bottom)].symbol(), "┘");
 }
 
 #[test]
@@ -160,6 +225,57 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
     assert!(!text.contains("ctx 15/8192"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
+}
+
+#[test]
+fn footer_keeps_five_fields_and_usage_across_submission_start() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_presentation(
+        TuiPresentation::new("openai-api", "gpt-4.1", "session #1")
+            .with_effort("high")
+            .with_context_window(Some(200_000)),
+    );
+    tui.set_project("/home/iperez/dev/personal/agens");
+
+    renderer.render(tui.view()).unwrap();
+    let before_usage = rendered_text(&renderer);
+    assert!(
+        before_usage.contains("gpt-4.1 · high · 0/200k (0%) · agens · Ready"),
+        "{before_usage:?}"
+    );
+    assert!(!before_usage.contains("model · default · ctx —"));
+
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(70_000),
+        output_tokens: Some(1_000),
+        total_tokens: Some(71_000),
+        context_window: None,
+    }));
+    tui.begin_submission("next turn");
+
+    assert_eq!(
+        tui.view().latest_usage.and_then(|usage| usage.total_tokens),
+        Some(71_000)
+    );
+    renderer.render(tui.view()).unwrap();
+    let next_turn = rendered_text(&renderer);
+    assert!(
+        next_turn.contains("gpt-4.1 · high · 71k/200k (36%) · agens"),
+        "{next_turn:?}"
+    );
+}
+
+#[test]
+fn footer_uses_explicit_fallbacks_without_inventing_values() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
+    let tui = Tui::new(FakeEngine);
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("model — · effort — · ctx —"), "{text:?}");
+    assert!(!text.contains("model · default · ctx —"), "{text:?}");
 }
 
 #[test]
@@ -590,7 +706,7 @@ fn fenced_code_block_chrome_does_not_nest_body_gutter_on_header() {
 }
 
 #[test]
-fn fenced_code_block_background_pads_to_transcript_content_width() {
+fn fenced_code_block_is_compact_and_has_no_trailing_empty_body_row() {
     let width = 48_u16;
     let terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
@@ -602,33 +718,110 @@ fn fenced_code_block_background_pads_to_transcript_content_width() {
     )));
     renderer.render(tui.view()).unwrap();
 
+    let header_row = rendered_row(&renderer, "╭─ bash");
+    let body_row = rendered_row(&renderer, "short");
+    let footer_row = rendered_row(&renderer, "╰");
+    assert_eq!(body_row, header_row + 1);
+    assert_eq!(footer_row, body_row + 1);
+
+    let header = rendered_line(&renderer, header_row);
+    let body = rendered_line(&renderer, body_row);
+    let footer = rendered_line(&renderer, footer_row);
+    assert!(header.contains("╭─ bash ╮"), "{header:?}");
+    assert!(body.contains("│ short │"), "{body:?}");
+    assert!(footer.contains("╰───────╯"), "{footer:?}");
+
+    let borders =
+        [(&header, '╭', '╮'), (&body, '│', '│'), (&footer, '╰', '╯')].map(|(line, left, right)| {
+            let left = line
+                .chars()
+                .position(|character| character == left)
+                .expect("left code border");
+            let right = line
+                .chars()
+                .enumerate()
+                .filter_map(|(index, character)| (character == right).then_some(index))
+                .last()
+                .expect("right code border");
+            (left, right, right - left + 1)
+        });
+    assert!(
+        borders.iter().all(|border| *border == borders[0]),
+        "borders={borders:?} header={header:?} body={body:?} footer={footer:?}"
+    );
+    assert!(borders[0].1 < usize::from(width - 1));
+
     let buffer = renderer.terminal().backend().buffer();
     let panel = Color::Rgb(0x1a, 0x1f, 0x29);
-    // Find the body row containing "short" and assert trailing cells keep panel bg.
-    let mut found_padded_row = false;
-    for y in 0..buffer.area.height {
-        let mut row = String::new();
-        for x in 0..buffer.area.width {
-            row.push_str(buffer[(x, y)].symbol());
+    let panel_cells = (0..buffer.area.width)
+        .filter(|x| buffer[(*x, body_row as u16)].bg == panel)
+        .count();
+    assert_eq!(panel_cells, 9);
+}
+
+#[test]
+fn fenced_javascript_uses_token_specific_foregrounds() {
+    let terminal = Terminal::new(TestBackend::new(72, 18)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "```js\nconst answer = \"value\"; // note\nlet count = 42;\n```\n".into(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let colors =
+        ["const", "\"value\"", "// note", "42"].map(|token| cell_for_text(&renderer, token).fg);
+    let unique = colors.iter().fold(Vec::new(), |mut unique, color| {
+        if !unique.contains(color) {
+            unique.push(*color);
         }
-        if !row.contains("short") {
-            continue;
-        }
-        // Content is left-padded by transcript indent (4); panel should fill to near edge.
-        let mut panel_cells = 0u16;
-        for x in 0..buffer.area.width {
-            if buffer[(x, y)].bg == panel {
-                panel_cells += 1;
-            }
-        }
-        assert!(
-            panel_cells >= 20,
-            "code body row should paint a wide panel background, got {panel_cells} cells: {row:?}"
-        );
-        found_padded_row = true;
-        break;
-    }
-    assert!(found_padded_row, "missing code body row with 'short'");
+        unique
+    });
+
+    assert!(unique.len() >= 3, "foregrounds: {colors:?}");
+    assert!(
+        colors
+            .iter()
+            .any(|color| *color != Color::Rgb(0xaa, 0xd9, 0x4c)),
+        "code block stayed uniformly success-green: {colors:?}"
+    );
+}
+
+#[test]
+fn unknown_fence_language_uses_neutral_panel_style() {
+    let terminal = Terminal::new(TestBackend::new(48, 14)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "```not-a-language\nmystery_token 42\n```\n".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+
+    let cell = cell_for_text(&renderer, "mystery_token");
+    assert_eq!(cell.fg, Color::Rgb(0xbf, 0xbd, 0xb6));
+    assert_eq!(cell.bg, Color::Rgb(0x1a, 0x1f, 0x29));
+}
+
+#[test]
+fn paragraph_to_fence_has_one_blank_transition_row() {
+    let terminal = Terminal::new(TestBackend::new(48, 14)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "Lead paragraph.\n\n```bash\nshort\n```\n".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+
+    let paragraph_row = rendered_row(&renderer, "Lead paragraph.");
+    let fence_row = rendered_row(&renderer, "╭─ bash");
+    assert_eq!(fence_row, paragraph_row + 2);
 }
 
 #[test]
@@ -1281,14 +1474,14 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     let mut tui = Tui::new(FakeEngine);
     let current = DialogEntry::action_with_metadata(
         "#7 Alpha",
-        "2 turns · 5m ago · primary · current",
+        "2 turns · 5m ago",
         "7 Alpha /work/alpha primary",
         "ID: 7 · Alpha\nTurns: 2 · Agent: primary\nUpdated: 100 (5m ago)",
         "session:7",
     );
     let other = DialogEntry::action_with_metadata(
         "#9 Beta",
-        "4 turns · 1h ago · reviewer · root=/work/beta",
+        "4 turns · 1h ago",
         "9 Beta /work/beta reviewer",
         "ID: 9 · Beta\nTurns: 4 · Agent: reviewer\nUpdated: 90 (1h ago) · Root: /work/beta",
         "session:9",
@@ -1306,8 +1499,16 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     );
     assert!(project.contains("Ctrl+A All projects"), "{project:?}");
     assert!(project.contains("#7 Alpha"), "{project:?}");
-    assert!(project.contains("Updated: 100 (5m ago)"), "{project:?}");
+    assert!(project.contains("2 turns · 5m ago"), "{project:?}");
+    assert!(!project.contains("Agent: primary"), "{project:?}");
+    assert!(!project.contains("Updated: 100"), "{project:?}");
     assert!(!project.contains("#9 Beta"), "{project:?}");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let details = rendered_text(&renderer);
+    assert!(details.contains("Agent: primary"), "{details:?}");
+    assert!(details.contains("Updated: 100 (5m ago)"), "{details:?}");
 
     tui.handle(Event::Key(Key::LineStart));
     renderer.render(tui.view()).unwrap();
@@ -1316,7 +1517,9 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
         global.contains("Resume session · All projects"),
         "{global:?}"
     );
-    assert!(global.contains("root=/work/beta"), "{global:?}");
+    assert!(global.contains("4 turns · 1h ago"), "{global:?}");
+    assert!(!global.contains("root=/work/beta"), "{global:?}");
+    assert!(!global.contains("Agent: primary"), "{global:?}");
 
     for character in "missing".chars() {
         tui.handle(Event::Key(Key::Char(character)));
@@ -1336,14 +1539,14 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
 }
 
 #[test]
-fn short_session_dialog_keeps_search_selected_row_and_compact_details_visible() {
+fn short_session_dialog_keeps_search_and_selected_row_visible_without_default_details() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(34, 7)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     let entries = (0..12)
         .map(|id| {
             DialogEntry::action_with_metadata(
                 format!("#{id} Session {id}"),
-                "2 turns · now · primary",
+                "2 turns · now",
                 format!("{id} Session {id} /work/alpha primary"),
                 format!("Turns: 2 · Agent: primary\nID: {id} · Session {id}"),
                 format!("session:{id}"),
@@ -1363,7 +1566,8 @@ fn short_session_dialog_keeps_search_selected_row_and_compact_details_visible() 
     let text = rendered_text(&renderer);
     assert!(text.contains("Search:"), "{text:?}");
     assert!(text.contains("#8 Session 8"), "{text:?}");
-    assert!(text.contains("Turns: 2"), "{text:?}");
+    assert!(text.contains("2 turns"), "{text:?}");
+    assert!(!text.contains("Agent: primary"), "{text:?}");
     assert!(!text.contains("#0 Session 0"), "{text:?}");
 }
 
@@ -1439,6 +1643,19 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     assert!(palette.contains("commands"), "{palette:?}");
     assert!(palette.contains("/review"), "{palette:?}");
     assert!(palette.contains("/resume"), "{palette:?}");
+    assert!(palette.contains("/review [scope]"), "{palette:?}");
+    assert!(!palette.contains("Review the patch"), "{palette:?}");
+    assert!(!palette.contains("Resume a session"), "{palette:?}");
+    assert!(!palette.contains("[command]"), "{palette:?}");
+    assert!(!palette.contains("[built-in]"), "{palette:?}");
+    assert_eq!(
+        cell_for_text(&renderer, "commands").fg,
+        Color::Rgb(0x95, 0xe6, 0xcb)
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "/review").bg,
+        Color::Rgb(0x95, 0xe6, 0xcb)
+    );
     assert!(!palette.contains("/connect"), "{palette:?}");
     assert_ne!(before, palette);
 
@@ -1596,6 +1813,104 @@ fn renderer_scrolls_multiline_unicode_composer_and_keeps_cursor_visible() {
         cursor.x < 5,
         "cursor must remain inside the composer: {cursor:?}"
     );
+}
+
+#[test]
+fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Key(Key::Char('x')));
+
+    renderer.render(tui.view()).unwrap();
+    assert!(renderer.terminal().backend().cursor_visible());
+
+    tui.handle(Event::Key(Key::PageUp));
+    for _ in 0..3 {
+        renderer.render(tui.view()).unwrap();
+        assert!(!renderer.terminal().backend().cursor_visible());
+    }
+    tui.handle(Event::Key(Key::ScrollUp));
+    renderer.render(tui.view()).unwrap();
+    assert!(!renderer.terminal().backend().cursor_visible());
+
+    tui.handle(Event::Key(Key::Char('i')));
+    renderer.render(tui.view()).unwrap();
+    assert!(renderer.terminal().backend().cursor_visible());
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Permission required",
+        None::<String>,
+        vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
+    ));
+    renderer.render(tui.view()).unwrap();
+    assert!(!renderer.terminal().backend().cursor_visible());
+    tui.handle(Event::Key(Key::Escape));
+
+    tui.set_palette_entries(vec![PaletteEntry::new(
+        "help",
+        "Help",
+        "",
+        PaletteEntryKind::BuiltIn,
+    )]);
+    tui.handle(Event::Key(Key::LineStart));
+    tui.handle(Event::Key(Key::DeleteToLineEnd));
+    tui.handle(Event::Key(Key::Char('/')));
+    renderer.render(tui.view()).unwrap();
+    assert!(!renderer.terminal().backend().cursor_visible());
+    tui.handle(Event::Key(Key::Escape));
+
+    tui.set_running(true);
+    renderer.render(tui.view()).unwrap();
+    assert!(!renderer.terminal().backend().cursor_visible());
+    tui.set_running(false);
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 7 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(
+            7,
+            "explore",
+            "inspect",
+            agens_tui::TuiExecutionState::ForegroundRunning,
+        ),
+    );
+    tui.select_transcript(TranscriptId::Subagent(7));
+    renderer.render(tui.view()).unwrap();
+    assert!(!renderer.terminal().backend().cursor_visible());
+}
+
+#[test]
+fn armed_quit_warning_is_visible_with_exact_copy() {
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlC)),
+        agens_tui::Action::Render
+    );
+    renderer.render(tui.view()).unwrap();
+
+    assert!(rendered_text(&renderer).contains("Press Ctrl+C again to exit"));
+}
+
+#[test]
+fn session_loading_uses_exact_local_state_without_running_the_composer() {
+    let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    assert!(tui.begin_session_load());
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+    assert!(rendered.contains("Loading session…"), "{rendered:?}");
+    assert!(!rendered.contains("Working"), "{rendered:?}");
+    assert!(!rendered.contains(" running "), "{rendered:?}");
+    assert!(!tui.view().running);
 }
 
 #[test]

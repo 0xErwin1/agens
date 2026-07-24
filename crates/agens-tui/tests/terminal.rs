@@ -31,6 +31,8 @@ impl TerminalControl for Control {
             TerminalOperation::DisableRaw => "raw-off",
             TerminalOperation::EnterAlternate => "alternate-on",
             TerminalOperation::LeaveAlternate => "alternate-off",
+            TerminalOperation::HideCursor => "cursor-hide",
+            TerminalOperation::ShowCursor => "cursor-show",
             TerminalOperation::EnableMouse => "mouse-on",
             TerminalOperation::DisableMouse => "mouse-off",
             TerminalOperation::EnableKeyboardEnhancement => "keyboard-on",
@@ -40,6 +42,19 @@ impl TerminalControl for Control {
         })
     }
 }
+
+#[derive(Default)]
+struct CleanupFailureControl;
+
+impl TerminalControl for CleanupFailureControl {
+    fn apply(&mut self, operation: TerminalOperation) -> io::Result<()> {
+        match operation {
+            TerminalOperation::DisablePaste => Err(io::Error::other("paste cleanup")),
+            TerminalOperation::ShowCursor => Err(io::Error::other("cursor cleanup")),
+            _ => Ok(()),
+        }
+    }
+}
 fn assert_calls(control: &Control, expected: &str) {
     assert_eq!(control.calls.join(","), expected);
 }
@@ -47,21 +62,20 @@ fn assert_calls(control: &Control, expected: &str) {
 fn teardown_guards_reverse_activated_modes_and_clean_partial_setup() {
     let mut control = Control::default();
     let mut guard = TerminalModeGuard::enter(&mut control).unwrap();
-    control.fail = Some("mouse-off");
-    assert!(guard.restore(&mut control).is_err());
+    guard.restore(&mut control).unwrap();
     assert_calls(
         &control,
-        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,paste-off,keyboard-off,mouse-off,alternate-off,raw-off",
+        "raw-on,alternate-on,cursor-hide,mouse-on,keyboard-on,paste-on,paste-off,keyboard-off,mouse-off,cursor-show,alternate-off,raw-off",
     );
 
     let mut control = Control {
         calls: Vec::new(),
-        fail: Some("mouse-on"),
+        fail: Some("cursor-hide"),
     };
     assert!(TerminalModeGuard::enter(&mut control).is_err());
     assert_calls(
         &control,
-        "raw-on,alternate-on,mouse-on,alternate-off,raw-off",
+        "raw-on,alternate-on,cursor-hide,cursor-show,alternate-off,raw-off",
     );
 
     let mut control = Control {
@@ -71,7 +85,36 @@ fn teardown_guards_reverse_activated_modes_and_clean_partial_setup() {
     assert!(TerminalModeGuard::enter(&mut control).is_err());
     assert_calls(
         &control,
-        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,keyboard-off,mouse-off,alternate-off,raw-off",
+        "raw-on,alternate-on,cursor-hide,mouse-on,keyboard-on,paste-on,keyboard-off,mouse-off,cursor-show,alternate-off,raw-off",
+    );
+}
+
+#[test]
+fn mouse_capture_is_enabled_at_startup_and_disabled_once_during_cleanup() {
+    let mut control = Control::default();
+    let mut guard = TerminalModeGuard::enter(&mut control).unwrap();
+
+    guard.restore(&mut control).unwrap();
+    guard.restore(&mut control).unwrap();
+
+    assert_calls(
+        &control,
+        "raw-on,alternate-on,cursor-hide,mouse-on,keyboard-on,paste-on,paste-off,keyboard-off,mouse-off,cursor-show,alternate-off,raw-off",
+    );
+}
+
+#[test]
+fn failed_mouse_enable_restores_prior_modes_without_disabling_inactive_capture() {
+    let mut control = Control {
+        calls: Vec::new(),
+        fail: Some("mouse-on"),
+    };
+
+    assert!(TerminalModeGuard::enter(&mut control).is_err());
+
+    assert_calls(
+        &control,
+        "raw-on,alternate-on,cursor-hide,mouse-on,cursor-show,alternate-off,raw-off",
     );
 }
 
@@ -87,8 +130,36 @@ fn unsupported_keyboard_enhancement_does_not_break_startup_or_restoration() {
 
     assert_calls(
         &control,
-        "raw-on,alternate-on,mouse-on,keyboard-on,paste-on,paste-off,mouse-off,alternate-off,raw-off",
+        "raw-on,alternate-on,cursor-hide,mouse-on,keyboard-on,paste-on,paste-off,mouse-off,cursor-show,alternate-off,raw-off",
     );
+}
+
+#[test]
+fn cursor_is_restored_exactly_once_after_repeated_cleanup() {
+    let mut control = Control::default();
+    let mut guard = TerminalModeGuard::enter(&mut control).unwrap();
+
+    guard.restore(&mut control).unwrap();
+    guard.restore(&mut control).unwrap();
+
+    assert_eq!(
+        control
+            .calls
+            .iter()
+            .filter(|operation| **operation == "cursor-show")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cleanup_preserves_the_first_error_while_restoring_later_modes() {
+    let mut control = CleanupFailureControl;
+    let mut guard = TerminalModeGuard::enter(&mut control).unwrap();
+
+    let error = guard.restore(&mut control).unwrap_err();
+
+    assert_eq!(error.to_string(), "paste cleanup");
 }
 #[test]
 fn teardown_wakes_blocked_publishers_after_receiver_invalidation() {

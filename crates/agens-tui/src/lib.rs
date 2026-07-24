@@ -23,15 +23,21 @@ pub use terminal::{
 };
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Stdout, Write},
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use agens_core::{Message, MessagePart, TurnEvent, TurnState, Usage};
+use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
+    cursor::{Hide as HideCursor, Show as ShowCursor},
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -51,9 +57,15 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
     },
 };
+use unicode_width::UnicodeWidthStr;
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
+const PROGRESS_CHANNEL_BUDGET: usize = 32;
+const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
+const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
+const MAX_SELECTION_COPY_BYTES: usize = 64 * 1024;
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
 pub trait Engine {
@@ -66,12 +78,31 @@ pub trait Engine {
 pub enum Event {
     /// A key that participates in normal interaction.
     Key(Key),
+    MouseWheel(MouseWheelDirection),
+    MouseDown {
+        column: u16,
+        row: u16,
+    },
+    MouseDrag {
+        column: u16,
+        row: u16,
+    },
+    MouseUp {
+        column: u16,
+        row: u16,
+    },
     Paste(String),
     /// A terminal resize in columns and rows.
     Resize {
         width: u16,
         height: u16,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseWheelDirection {
+    Up,
+    Down,
 }
 
 /// Keys handled by the TUI engine boundary.
@@ -145,6 +176,10 @@ pub enum Action {
     SafeDialogAction(String),
     /// An active engine turn was asked to cancel.
     Cancel,
+    /// Copies bounded selected transcript text through an explicit terminal clipboard action.
+    CopySelection(String),
+    /// A local route was cancelled before its result could be applied.
+    CancelRoute,
     /// End the terminal event loop.
     Quit,
 }
@@ -155,6 +190,7 @@ pub struct TuiPresentation {
     model: String,
     session: String,
     effort: Option<String>,
+    context_window: Option<u64>,
     dangerous_mode: bool,
 }
 
@@ -169,6 +205,7 @@ impl TuiPresentation {
             model: model.into(),
             session: session.into(),
             effort: None,
+            context_window: None,
             dangerous_mode: false,
         }
     }
@@ -180,6 +217,11 @@ impl TuiPresentation {
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
         let effort = effort.into();
         self.effort = (!effort.is_empty()).then_some(effort);
+        self
+    }
+
+    pub fn with_context_window(mut self, context_window: Option<u64>) -> Self {
+        self.context_window = context_window.filter(|window| *window > 0);
         self
     }
 
@@ -211,12 +253,13 @@ pub enum TuiSubmissionOutcome {
     SessionResumed {
         message: String,
         presentation: TuiPresentation,
-        messages: Vec<Message>,
+        history: Vec<Conversation>,
     },
     Dialog(DialogView),
     SafeDialog(DialogView),
     SelectionInfo(String),
     SelectionCancelled,
+    RouteCancelled,
     SelectionError {
         message: String,
         action: String,
@@ -238,6 +281,45 @@ pub enum TuiRouteProgress {
         verification_url: String,
         user_code: String,
     },
+}
+
+const ROUTE_ACTIVE: u8 = 0;
+const ROUTE_CANCELLED: u8 = 1;
+const ROUTE_COMMITTED: u8 = 2;
+
+#[derive(Clone, Debug, Default)]
+pub struct TuiRouteCancellation(Arc<AtomicU8>);
+
+impl TuiRouteCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                ROUTE_ACTIVE,
+                ROUTE_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ROUTE_CANCELLED
+    }
+
+    pub fn try_commit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                ROUTE_ACTIVE,
+                ROUTE_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +359,18 @@ pub enum TranscriptFocus {
     Viewport,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TranscriptPosition {
+    pub row: usize,
+    pub column: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptSelection {
+    pub anchor: TranscriptPosition,
+    pub head: TranscriptPosition,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptRecord {
     id: TranscriptId,
@@ -291,6 +385,10 @@ pub struct TranscriptRecord {
     /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+O).
     thinking_user_pinned: bool,
     focus: TranscriptFocus,
+    selection: Option<TranscriptSelection>,
+    selection_text: Option<String>,
+    selection_too_large: bool,
+    selecting: bool,
     last_admitted_ordinal: Option<u64>,
     terminal: bool,
 }
@@ -309,6 +407,10 @@ impl TranscriptRecord {
             collapse_thinking: false,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
+            selection: None,
+            selection_text: None,
+            selection_too_large: false,
+            selecting: false,
             last_admitted_ordinal: None,
             terminal: false,
         }
@@ -340,7 +442,11 @@ pub struct ViewState<'a> {
     pub size: (u16, u16),
     /// Whether the composed engine has an active turn.
     pub running: bool,
-    /// Whether an idle second Ctrl+C will quit.
+    /// Whether a local session restore is being prepared without starting a provider turn.
+    pub session_loading: bool,
+    /// Whether the current assistant item can still receive ordered text deltas.
+    pub assistant_streaming: bool,
+    /// Whether a second Ctrl+C inside the active warning window will quit.
     pub quit_armed: bool,
     /// Conversation entries rendered in the order they occurred.
     pub transcript: &'a [TranscriptEntry],
@@ -348,10 +454,14 @@ pub struct ViewState<'a> {
     pub following_bottom: bool,
     /// The manual transcript offset when bottom following is disabled.
     pub scroll_offset: u16,
+    /// Absolute wrapped transcript anchors used to paint application-owned mouse selection.
+    pub selection: Option<TranscriptSelection>,
     /// Current provider and model selected by the CLI composition root.
     pub provider_model: &'a str,
     /// Optional reasoning effort label for the footer.
     pub reasoning_effort: Option<&'a str>,
+    /// Known model context window supplied by the CLI composition root.
+    pub context_window: Option<u64>,
     /// Active session label supplied by the CLI composition root.
     pub session: &'a str,
     /// Project label displayed in the operational footer.
@@ -375,6 +485,7 @@ pub struct ViewState<'a> {
     pub conversation: Option<&'a Conversation>,
     /// Completed typed conversations retained before the active turn.
     pub completed_conversations: &'a [Conversation],
+    pub highlight_restored_syntax: bool,
     /// Tool outputs collapsed only for presentation; their source output remains retained.
     pub collapsed_tool_outputs: &'a BTreeSet<String>,
     /// Whether complete reasoning is collapsed according to the UI setting.
@@ -818,10 +929,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         .transcript
         .width
         .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
-    let transcript = rendered_transcript(&state, transcript_width);
+    let transcript = SelectableTranscript::from_lines(
+        &rendered_transcript(&state, transcript_width),
+        transcript_width,
+    );
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
-    let bottom_scroll =
-        saturating_u16(transcript_rows(&transcript, transcript_width).saturating_sub(visible_rows));
+    let bottom_scroll = saturating_u16(transcript.rows.len().saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
@@ -834,7 +947,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     };
     if layout.transcript.height > 0 {
         frame.render_widget(
-            Paragraph::new(Text::from(transcript))
+            Paragraph::new(Text::from(transcript.render_lines(state.selection)))
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
@@ -846,7 +959,6 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                         ))
                         .title_alignment(Alignment::Right),
                 )
-                .wrap(Wrap { trim: false })
                 .scroll((scroll, 0)),
             layout.transcript,
         );
@@ -872,13 +984,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     };
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
-        // TOP border only: one row reserved for the rule, full width for text.
-        let inner_width = usize::from(layout.composer.width.max(1));
-        let inner_height = usize::from(layout.composer.height.saturating_sub(1).max(1));
+        let inner_width = usize::from(layout.composer.width.saturating_sub(2).max(1));
+        let inner_height = usize::from(layout.composer.height.saturating_sub(2).max(1));
         let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
         let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
         let mut composer = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
             .border_style(Style::default().fg(composer_color));
         if state.running {
             composer = composer.title(Span::styled(
@@ -895,14 +1006,23 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             )),
             layout.composer,
         );
-        if inner_width > 0 && inner_height > 0 {
+        if inner_width > 0
+            && inner_height > 0
+            && state.focus == TranscriptFocus::Composer
+            && !state.running
+            && !state.session_loading
+            && state.dialog.is_none()
+            && state.palette.is_none()
+        {
             let cursor_y = layout
                 .composer
                 .y
                 .saturating_add(1)
                 .saturating_add(saturating_u16(cursor_line.saturating_sub(vertical_scroll)));
             let cursor_x = layout.composer.x.saturating_add(saturating_u16(
-                cursor_column.saturating_sub(horizontal_scroll),
+                cursor_column
+                    .saturating_sub(horizontal_scroll)
+                    .saturating_add(1),
             ));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
@@ -915,8 +1035,13 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 widgets::FooterContext {
                     model: state.provider_model,
                     effort: state.reasoning_effort,
+                    context_window: state.context_window,
                     project: state.project,
-                    turn_label: turn_state_label(state.turn_state, state.running),
+                    turn_label: turn_state_label(
+                        state.turn_state,
+                        state.running,
+                        state.session_loading,
+                    ),
                     duration: state.turn_duration,
                     usage: state.latest_usage,
                     dangerous: state.dangerous_mode,
@@ -955,13 +1080,11 @@ fn render_palette(
         matches
             .iter()
             .map(|entry| {
-                ListItem::new(format!(
-                    " /{} {}  {}  [{}]",
-                    entry.name,
-                    entry.argument_hint,
-                    entry.description,
-                    entry.kind.label()
-                ))
+                ListItem::new(
+                    format!(" /{} {}", entry.name, entry.argument_hint)
+                        .trim_end()
+                        .to_owned(),
+                )
             })
             .collect()
     };
@@ -976,18 +1099,19 @@ fn render_palette(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(widgets::RolePalette::brand()))
                     .title(Span::styled(
                         " commands ",
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(widgets::RolePalette::brand())
                             .add_modifier(Modifier::BOLD),
                     )),
             )
+            .style(Style::default().fg(widgets::RolePalette::assistant()))
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(widgets::RolePalette::brand())
                     .add_modifier(Modifier::BOLD),
             ),
         palette_area,
@@ -1069,15 +1193,6 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                 .and_then(|(_, entry)| entry.selected_detail.as_deref())
         })
         .flatten()
-        .or_else(|| {
-            matches
-                .iter()
-                .find(|(index, entry)| {
-                    *index == dialog.selected
-                        && !matches!(entry.action, Some(DialogEntryAction::ToggleDetails))
-                })
-                .and_then(|(_, entry)| entry.selected_detail.as_deref())
-        })
     {
         lines.extend(
             detail
@@ -1109,13 +1224,15 @@ fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
     let content_rows = usize::from(dialog.help.is_some())
         .saturating_add(usize::from(dialog.interactive))
         .saturating_add(dialog_matches(dialog).len().max(1))
-        .saturating_add(
+        .saturating_add(if dialog.details_open {
             dialog
                 .entries
                 .get(dialog.selected)
                 .and_then(|entry| entry.selected_detail.as_deref())
-                .map_or(0, |detail| detail.lines().count().min(3)),
-        )
+                .map_or(0, |detail| detail.lines().count().min(3))
+        } else {
+            0
+        })
         .saturating_add(2) as u16;
     let height = content_rows
         .min(if dialog.session_entries.is_some() {
@@ -1144,17 +1261,21 @@ struct DialogContentLayout {
 fn dialog_content_layout(dialog: &DialogView, height: u16) -> DialogContentLayout {
     let inner_rows = usize::from(height.saturating_sub(2));
     let search_rows = usize::from(dialog.interactive);
-    let detail_rows = dialog
-        .entries
-        .get(dialog.selected)
-        .and_then(|entry| entry.selected_detail.as_deref())
-        .map_or(0, |detail| {
-            detail
-                .lines()
-                .count()
-                .min(3)
-                .min(inner_rows.saturating_sub(search_rows.saturating_add(1)))
-        });
+    let detail_rows = if dialog.details_open {
+        dialog
+            .entries
+            .get(dialog.selected)
+            .and_then(|entry| entry.selected_detail.as_deref())
+            .map_or(0, |detail| {
+                detail
+                    .lines()
+                    .count()
+                    .min(3)
+                    .min(inner_rows.saturating_sub(search_rows.saturating_add(1)))
+            })
+    } else {
+        0
+    };
     let show_help = dialog.help.is_some()
         && inner_rows > search_rows.saturating_add(detail_rows).saturating_add(1);
     let entry_rows = inner_rows
@@ -1235,16 +1356,25 @@ fn screen_layout(area: Rect, input: &str, show_header: bool) -> ScreenLayout {
 }
 
 fn header_should_show(state: &ViewState<'_>) -> bool {
-    state.dangerous_mode
+    state.quit_armed
+        || state.dangerous_mode
         || state.running
+        || state.session_loading
         || !state.executions.is_empty()
         || state.status.is_some_and(|value| !value.is_empty())
 }
 
 fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
-    let state_label = turn_state_label(state.turn_state, state.running);
+    let state_label = turn_state_label(state.turn_state, state.running, state.session_loading);
     let mut left = Vec::new();
-    if state.dangerous_mode {
+    if state.quit_armed {
+        left.push(Span::styled(
+            " Press Ctrl+C again to exit ",
+            Style::default()
+                .fg(widgets::RolePalette::warning())
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if state.dangerous_mode {
         left.push(Span::styled(
             " danger ",
             Style::default()
@@ -1328,7 +1458,15 @@ fn append_execution_summary(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
     ));
 }
 
-fn turn_state_label(state: Option<TurnState>, running: bool) -> &'static str {
+fn turn_state_label(
+    state: Option<TurnState>,
+    running: bool,
+    session_loading: bool,
+) -> &'static str {
+    if session_loading {
+        return "Loading session…";
+    }
+
     match state {
         Some(TurnState::Requesting) => "Waiting",
         Some(TurnState::Streaming) => "Responding",
@@ -1396,14 +1534,6 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     lines
 }
 
-fn transcript_rows(lines: &[Line<'_>], width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| line.width().div_ceil(width).max(1))
-        .sum()
-}
-
 fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'static>> {
     let mut transcript = transcript_provenance(state);
     let thinking_streaming = state.running;
@@ -1418,6 +1548,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
                     state.collapsed_tool_outputs,
                     state.collapse_thinking,
                     false,
+                    !state.highlight_restored_syntax,
                     content_width,
                 )
             })
@@ -1430,6 +1561,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
             state.collapsed_tool_outputs,
             state.collapse_thinking,
             thinking_streaming,
+            state.assistant_streaming,
             content_width,
         ));
     }
@@ -1443,6 +1575,242 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
         conversation_is_authoritative,
     ));
     transcript
+}
+
+#[derive(Clone, Debug)]
+struct SelectableCell {
+    text: String,
+    column: u16,
+    width: u16,
+    style: Style,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SelectableRow {
+    cells: Vec<SelectableCell>,
+    hard_break_after: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SelectableTranscript {
+    rows: Vec<SelectableRow>,
+}
+
+impl SelectableTranscript {
+    fn from_lines(lines: &[Line<'_>], width: u16) -> Self {
+        let width = width.max(1);
+        let mut rows = Vec::new();
+
+        for line in lines {
+            let cells = line
+                .styled_graphemes(Style::default())
+                .map(|grapheme| SelectableCell {
+                    text: grapheme.symbol.to_owned(),
+                    column: 0,
+                    width: saturating_u16(grapheme.symbol.width()),
+                    style: grapheme.style,
+                })
+                .collect();
+            let wrapped = wrap_selectable_line(cells, width);
+            let last = wrapped.len().saturating_sub(1);
+            rows.extend(
+                wrapped
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, cells)| selectable_row(cells, index == last)),
+            );
+        }
+
+        Self { rows }
+    }
+
+    fn position_at(&self, row: usize, column: u16) -> Option<TranscriptPosition> {
+        let cells = &self.rows.get(row)?.cells;
+        let cell = cells
+            .iter()
+            .find(|cell| column < cell.column.saturating_add(cell.width))
+            .or_else(|| cells.last())?;
+        Some(TranscriptPosition {
+            row,
+            column: cell.column,
+        })
+    }
+
+    fn selected_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
+        let (start, end) = ordered_selection(selection);
+        if start == end {
+            return Ok(String::new());
+        }
+
+        let mut text = String::new();
+        for row_index in start.row..=end.row {
+            let Some(row) = self.rows.get(row_index) else {
+                break;
+            };
+            for cell in &row.cells {
+                let position = TranscriptPosition {
+                    row: row_index,
+                    column: cell.column,
+                };
+                if position < start || position > end {
+                    continue;
+                }
+                append_bounded_selection(&mut text, &cell.text)?;
+            }
+            if row_index < end.row && row.hard_break_after {
+                append_bounded_selection(&mut text, "\n")?;
+            }
+        }
+        Ok(text)
+    }
+
+    fn render_lines(&self, selection: Option<TranscriptSelection>) -> Vec<Line<'static>> {
+        let selection = selection.map(ordered_selection);
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(row, line)| {
+                let mut spans = Vec::new();
+                let mut current_text = String::new();
+                let mut current_style = None;
+                for cell in &line.cells {
+                    let position = TranscriptPosition {
+                        row,
+                        column: cell.column,
+                    };
+                    let selected =
+                        selection.is_some_and(|(start, end)| position >= start && position <= end);
+                    let style = if selected {
+                        cell.style.patch(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(widgets::RolePalette::brand()),
+                        )
+                    } else {
+                        cell.style
+                    };
+                    if let Some(current) = current_style
+                        && current != style
+                    {
+                        spans.push(Span::styled(std::mem::take(&mut current_text), current));
+                    }
+                    current_style = Some(style);
+                    current_text.push_str(&cell.text);
+                }
+                if let Some(style) = current_style {
+                    spans.push(Span::styled(current_text, style));
+                }
+                Line::from(spans)
+            })
+            .collect()
+    }
+}
+
+fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<SelectableCell>> {
+    let mut rows = Vec::new();
+    let mut line = Vec::new();
+    let mut line_width = 0_u16;
+    let mut word = Vec::new();
+    let mut word_width = 0_u16;
+    let mut whitespace: VecDeque<SelectableCell> = VecDeque::new();
+    let mut whitespace_width = 0_u16;
+    let mut previous_was_text = false;
+
+    for cell in cells {
+        if cell.width > width {
+            continue;
+        }
+        let is_whitespace = selectable_cell_is_whitespace(&cell);
+        let word_finished = previous_was_text && is_whitespace;
+        let segment_overflow = line.is_empty()
+            && word_width
+                .saturating_add(whitespace_width)
+                .saturating_add(cell.width)
+                > width;
+        if word_finished || segment_overflow {
+            line.extend(whitespace.drain(..));
+            line_width = line_width.saturating_add(whitespace_width);
+            line.append(&mut word);
+            line_width = line_width.saturating_add(word_width);
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= width;
+        let word_overflow = cell.width > 0
+            && line_width
+                .saturating_add(whitespace_width)
+                .saturating_add(word_width)
+                >= width;
+        if line_full || word_overflow {
+            let mut remaining = width.saturating_sub(line_width);
+            rows.push(std::mem::take(&mut line));
+            line_width = 0;
+            while let Some(pending) = whitespace.front() {
+                if pending.width > remaining {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(pending.width);
+                remaining = remaining.saturating_sub(pending.width);
+                whitespace.pop_front();
+            }
+            if is_whitespace && whitespace.is_empty() {
+                previous_was_text = false;
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width = whitespace_width.saturating_add(cell.width);
+            whitespace.push_back(cell);
+        } else {
+            word_width = word_width.saturating_add(cell.width);
+            word.push(cell);
+        }
+        previous_was_text = !is_whitespace;
+    }
+
+    line.extend(whitespace);
+    line.append(&mut word);
+    if !line.is_empty() {
+        rows.push(line);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
+fn selectable_cell_is_whitespace(cell: &SelectableCell) -> bool {
+    cell.text == "\u{200b}" || cell.text != "\u{00a0}" && cell.text.chars().all(char::is_whitespace)
+}
+
+fn selectable_row(mut cells: Vec<SelectableCell>, hard_break_after: bool) -> SelectableRow {
+    let mut column = 0;
+    for cell in &mut cells {
+        cell.column = column;
+        column = column.saturating_add(cell.width);
+    }
+    SelectableRow {
+        cells,
+        hard_break_after,
+    }
+}
+
+fn ordered_selection(selection: TranscriptSelection) -> (TranscriptPosition, TranscriptPosition) {
+    if selection.anchor <= selection.head {
+        (selection.anchor, selection.head)
+    } else {
+        (selection.head, selection.anchor)
+    }
+}
+
+fn append_bounded_selection(output: &mut String, value: &str) -> Result<(), ()> {
+    if output.len().saturating_add(value.len()) > MAX_SELECTION_COPY_BYTES {
+        return Err(());
+    }
+    output.push_str(value);
+    Ok(())
 }
 
 fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
@@ -1525,13 +1893,16 @@ pub struct Tui<E> {
     input_cursor: usize,
     size: (u16, u16),
     running: bool,
-    quit_armed: bool,
+    session_loading: bool,
+    assistant_streaming: bool,
+    quit_armed_until: Option<Duration>,
     transcripts: BTreeMap<TranscriptId, TranscriptRecord>,
     active_transcript: TranscriptId,
     child_transcript_order: Vec<TranscriptId>,
     transcript: Vec<TranscriptEntry>,
     provider_model: String,
     reasoning_effort: Option<String>,
+    context_window: Option<u64>,
     session: String,
     project: String,
     turn_state: Option<TurnState>,
@@ -1540,6 +1911,8 @@ pub struct Tui<E> {
     turn_duration: Option<Duration>,
     latest_usage: Option<Usage>,
     status: Option<String>,
+    restored_syntax_ready_at: Option<Duration>,
+    highlight_restored_syntax: bool,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     dialog: Option<DialogView>,
@@ -1566,13 +1939,16 @@ where
             input_cursor: 0,
             size: (80, 24),
             running: false,
-            quit_armed: false,
+            session_loading: false,
+            assistant_streaming: false,
+            quit_armed_until: None,
             transcripts: BTreeMap::from([(TranscriptId::Main, TranscriptRecord::main())]),
             active_transcript: TranscriptId::Main,
             child_transcript_order: Vec::new(),
             transcript: Vec::new(),
-            provider_model: "provider / model".to_owned(),
+            provider_model: String::new(),
             reasoning_effort: None,
+            context_window: None,
             session: "new session".to_owned(),
             project: "agens".to_owned(),
             turn_state: None,
@@ -1581,6 +1957,8 @@ where
             turn_duration: None,
             latest_usage: None,
             status: None,
+            restored_syntax_ready_at: None,
+            highlight_restored_syntax: true,
             completed_conversations: Vec::new(),
             conversation: None,
             dialog: None,
@@ -1601,13 +1979,19 @@ where
         match event {
             Event::Resize { width, height } => {
                 self.size = (width, height);
-                self.quit_armed = false;
                 self.clamp_palette_selection();
                 self.clamp_scroll_offset();
                 self.ensure_dialog_selection_visible();
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
+            Event::MouseWheel(direction) => self.handle_key(match direction {
+                MouseWheelDirection::Up => Key::ScrollUp,
+                MouseWheelDirection::Down => Key::ScrollDown,
+            }),
+            Event::MouseDown { column, row } => self.begin_mouse_selection(column, row),
+            Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
+            Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
             Event::Paste(text) => {
                 if self.active_transcript != TranscriptId::Main
                     || self
@@ -1617,7 +2001,7 @@ where
                 {
                     Action::Render
                 } else {
-                    self.quit_armed = false;
+                    self.quit_armed_until = None;
                     self.status = None;
                     self.insert_text(&text);
                     Action::Render
@@ -1699,6 +2083,16 @@ where
 
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
+        if self.quit_armed_until.is_some_and(|until| now >= until) {
+            self.quit_armed_until = None;
+        }
+        if self
+            .restored_syntax_ready_at
+            .is_some_and(|ready_at| now >= ready_at)
+        {
+            self.restored_syntax_ready_at = None;
+            self.highlight_restored_syntax = true;
+        }
         self.executions.retain(|execution| {
             execution
                 .terminal_at
@@ -1712,7 +2106,6 @@ where
         self.running = running;
         if running {
             self.palette_open = false;
-            self.quit_armed = false;
             self.turn_state = Some(TurnState::Requesting);
         } else if !matches!(
             self.turn_state,
@@ -1720,6 +2113,9 @@ where
         ) {
             self.turn_state = None;
             self.active_tool = None;
+        }
+        if !running {
+            self.assistant_streaming = false;
         }
         if finishing {
             self.auto_collapse_thinking_on_finish();
@@ -1745,7 +2141,11 @@ where
         model: impl AsRef<str>,
         session: impl Into<String>,
     ) {
-        self.provider_model = format!("{} / {}", provider.as_ref(), model.as_ref());
+        let provider_model = format!("{} / {}", provider.as_ref(), model.as_ref());
+        if self.provider_model != provider_model {
+            self.latest_usage = None;
+        }
+        self.provider_model = provider_model;
         self.session = session.into();
     }
 
@@ -1774,7 +2174,6 @@ where
         }
         self.runtime_events.clear();
         self.turn_duration = None;
-        self.latest_usage = None;
         self.transcript.push(TranscriptEntry::User(prompt.clone()));
         self.conversation = Some(Conversation::new(prompt));
         {
@@ -1784,6 +2183,7 @@ where
             record.thinking_user_pinned = false;
         }
         self.set_running(true);
+        self.assistant_streaming = true;
     }
 
     pub fn begin_route(&mut self) {
@@ -1794,8 +2194,27 @@ where
         self.latest_usage = None;
         self.dialog = None;
         self.running = true;
+        self.assistant_streaming = false;
         self.turn_state = None;
-        self.quit_armed = false;
+        self.quit_armed_until = None;
+    }
+
+    pub fn begin_session_load(&mut self) -> bool {
+        if self.running || self.session_loading {
+            return false;
+        }
+
+        self.session_loading = true;
+        true
+    }
+
+    pub fn finish_session_load(&mut self) {
+        self.session_loading = false;
+    }
+
+    pub fn cancel_session_load(&mut self) {
+        self.session_loading = false;
+        self.dialog = None;
     }
 
     pub fn apply_route_progress(&mut self, progress: TuiRouteProgress) {
@@ -1905,16 +2324,14 @@ where
             TuiSubmissionOutcome::SessionResumed {
                 message,
                 presentation,
-                messages,
+                history,
             } => {
-                if self.replace_history(&messages).is_err() {
-                    self.show_dialog(
-                        "Action required",
-                        "Saved session history is invalid.\nAction: Choose another session.",
-                    );
-                    return None;
-                }
+                self.finish_session_load();
+                self.replace_projected_history(history);
                 self.apply_presentation(presentation);
+                self.highlight_restored_syntax = false;
+                self.restored_syntax_ready_at =
+                    Some(self.now.saturating_add(ACTIVE_FRAME_HEARTBEAT));
                 if message == "connect or choose provider" {
                     self.show_dialog(
                         "Action required",
@@ -1940,6 +2357,10 @@ where
             }
             TuiSubmissionOutcome::SelectionCancelled => {
                 self.add_info("File selection cancelled.");
+                None
+            }
+            TuiSubmissionOutcome::RouteCancelled => {
+                self.finish_session_load();
                 None
             }
             TuiSubmissionOutcome::SelectionError { message, action } => {
@@ -1985,6 +2406,7 @@ where
             TuiProviderOutcome::Failed { message, action } => {
                 let finishing = self.running;
                 self.running = false;
+                self.assistant_streaming = false;
                 self.turn_state = Some(TurnState::Failed);
                 self.active_tool = None;
                 if finishing {
@@ -1995,6 +2417,7 @@ where
             TuiProviderOutcome::Cancelled { message, action } => {
                 let finishing = self.running;
                 self.running = false;
+                self.assistant_streaming = false;
                 self.turn_state = Some(TurnState::Cancelled);
                 self.active_tool = None;
                 if finishing {
@@ -2023,6 +2446,11 @@ where
         messages: &[agens_core::Message],
     ) -> Result<(), ConversationError> {
         let conversations = Conversation::from_messages(messages)?;
+        self.replace_projected_history(conversations);
+        Ok(())
+    }
+
+    fn replace_projected_history(&mut self, conversations: Vec<Conversation>) {
         let completed_tool_call_ids = conversations
             .iter()
             .flat_map(|conversation| &conversation.tool_batches)
@@ -2050,7 +2478,6 @@ where
             record.collapse_thinking = true;
             record.thinking_user_pinned = false;
         }
-        Ok(())
     }
 
     /// Returns the visible conversation for composition and focused tests.
@@ -2282,6 +2709,10 @@ where
                 collapse_thinking: false,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
+                selection: None,
+                selection_text: None,
+                selection_too_large: false,
+                selecting: false,
                 last_admitted_ordinal: None,
                 terminal: false,
             },
@@ -2353,7 +2784,6 @@ where
             dialog.details_open = current.details_open;
         }
         self.palette_open = false;
-        self.quit_armed = false;
         self.dialog = Some(dialog);
         self.ensure_dialog_selection_visible();
     }
@@ -2377,12 +2807,16 @@ where
             input: &self.input,
             size: self.size,
             running: self.running,
-            quit_armed: self.quit_armed,
+            session_loading: self.session_loading,
+            assistant_streaming: self.assistant_streaming,
+            quit_armed: self.quit_is_armed(),
             transcript: &active.transcript,
             following_bottom: active.following_bottom,
             scroll_offset: active.scroll_offset,
+            selection: active.selection,
             provider_model: &self.provider_model,
             reasoning_effort: self.reasoning_effort.as_deref(),
+            context_window: self.context_window,
             session: &self.session,
             project: &self.project,
             turn_state: self.turn_state,
@@ -2404,6 +2838,7 @@ where
             } else {
                 &active.completed_conversations
             },
+            highlight_restored_syntax: self.highlight_restored_syntax,
             collapsed_tool_outputs: &active.collapsed_tool_outputs,
             collapse_thinking: active.collapse_thinking,
             focus: active.focus,
@@ -2529,6 +2964,129 @@ where
             .following_bottom
     }
 
+    pub fn selected_text(&self) -> Option<&str> {
+        self.transcripts
+            .get(&self.active_transcript)
+            .and_then(|record| record.selection_text.as_deref())
+    }
+
+    fn begin_mouse_selection(&mut self, column: u16, row: u16) -> Action {
+        let Some(position) = self.mouse_selection_position(column, row) else {
+            return Action::Render;
+        };
+        let record = self.active_record_mut();
+        record.focus = TranscriptFocus::Viewport;
+        record.selection = Some(TranscriptSelection {
+            anchor: position,
+            head: position,
+        });
+        record.selection_text = None;
+        record.selection_too_large = false;
+        record.selecting = true;
+        Action::Render
+    }
+
+    fn update_mouse_selection(&mut self, column: u16, row: u16, dragging: bool) -> Action {
+        if !self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists")
+            .selecting
+        {
+            return Action::Render;
+        }
+        let Some(position) = self.mouse_selection_position(column, row) else {
+            if !dragging {
+                self.active_record_mut().selecting = false;
+            }
+            return Action::Render;
+        };
+        let selection = {
+            let record = self.active_record_mut();
+            let Some(selection) = record.selection.as_mut() else {
+                return Action::Render;
+            };
+            selection.head = position;
+            record.selecting = dragging;
+            *selection
+        };
+        let selected_text = self.selection_text(selection);
+        let record = self.active_record_mut();
+        match selected_text {
+            Ok(text) if !text.is_empty() => {
+                record.selection_text = Some(text);
+                record.selection_too_large = false;
+            }
+            Ok(_) => {
+                record.selection = None;
+                record.selection_text = None;
+                record.selection_too_large = false;
+            }
+            Err(()) => {
+                record.selection_text = None;
+                record.selection_too_large = true;
+            }
+        }
+        Action::Render
+    }
+
+    fn mouse_selection_position(&self, column: u16, row: u16) -> Option<TranscriptPosition> {
+        if self.dialog.is_some() || self.palette_open {
+            return None;
+        }
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let view = self.view();
+        let layout = screen_layout(area, &self.input, header_should_show(&view));
+        let content_y = layout.transcript.y.saturating_add(1);
+        let content_x = layout
+            .transcript
+            .x
+            .saturating_add(TRANSCRIPT_CONTENT_INDENT);
+        if row < content_y
+            || row >= layout.transcript.bottom()
+            || column < content_x
+            || column >= layout.transcript.right()
+        {
+            return None;
+        }
+
+        let content_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .max(1);
+        let transcript = SelectableTranscript::from_lines(
+            &rendered_transcript(&view, content_width),
+            content_width,
+        );
+        let bottom = saturating_u16(
+            transcript
+                .rows
+                .len()
+                .saturating_sub(usize::from(layout.transcript.height.saturating_sub(1))),
+        );
+        let scroll = if view.following_bottom {
+            bottom
+        } else {
+            view.scroll_offset.min(bottom)
+        };
+        let absolute_row = usize::from(scroll.saturating_add(row.saturating_sub(content_y)));
+        transcript.position_at(absolute_row, column.saturating_sub(content_x))
+    }
+
+    fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let view = self.view();
+        let layout = screen_layout(area, &self.input, header_should_show(&view));
+        let content_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .max(1);
+        SelectableTranscript::from_lines(&rendered_transcript(&view, content_width), content_width)
+            .selected_text(selection)
+    }
+
     /// Applies ordered runtime progress without changing completed persistence semantics.
     pub fn apply_progress(&mut self, event: TurnEvent) {
         match event {
@@ -2586,6 +3144,7 @@ where
             TurnEvent::StateChanged(state @ (TurnState::Cancelled | TurnState::Failed)) => {
                 let finishing = self.running;
                 self.running = false;
+                self.assistant_streaming = false;
                 self.turn_state = Some(state);
                 self.active_tool = None;
                 if finishing {
@@ -2599,7 +3158,30 @@ where
 
     fn handle_key(&mut self, key: Key) -> Action {
         if key != Key::CtrlC {
-            self.quit_armed = false;
+            self.quit_armed_until = None;
+        }
+        if key == Key::CtrlC {
+            return self.handle_control_c();
+        }
+        if key == Key::Escape && self.session_loading {
+            return Action::CancelRoute;
+        }
+        if self.session_loading
+            && !matches!(
+                key,
+                Key::PageUp
+                    | Key::PageDown
+                    | Key::ScrollUp
+                    | Key::ScrollDown
+                    | Key::Home
+                    | Key::End
+                    | Key::CtrlJ
+                    | Key::CtrlK
+                    | Key::CtrlG
+                    | Key::CtrlShiftG
+            )
+        {
+            return Action::Render;
         }
         if !matches!(
             key,
@@ -2686,8 +3268,7 @@ where
                     | Key::LineEnd
                     | Key::Enter
                     | Key::CtrlB
-            ) || (key == Key::CtrlC && !self.input.is_empty())
-                || (key == Key::Tab && self.palette_open))
+            ) || (key == Key::Tab && self.palette_open))
         {
             return Action::Render;
         }
@@ -2777,7 +3358,7 @@ where
                 Action::Render
             }
             Key::Up | Key::Down | Key::Tab => Action::Render,
-            Key::Enter if self.input.is_empty() => Action::Render,
+            Key::Enter if self.input.is_empty() || self.session_loading => Action::Render,
             Key::Enter if self.running && self.input.trim() == "/select" => {
                 self.palette_open = false;
                 self.input.clear();
@@ -2813,18 +3394,7 @@ where
                 self.active_record_mut().focus = TranscriptFocus::Viewport;
                 Action::Render
             }
-            Key::CtrlC if self.running || self.has_active_execution() => self.cancel_running(),
-            Key::CtrlC if !self.input.is_empty() => {
-                self.input.clear();
-                self.input_cursor = 0;
-                self.palette_open = false;
-                Action::Render
-            }
-            Key::CtrlC if self.quit_armed => Action::Quit,
-            Key::CtrlC => {
-                self.quit_armed = true;
-                Action::Render
-            }
+            Key::CtrlC => unreachable!("Ctrl+C is handled before focused input"),
             _ => unreachable!("composer keys are handled before global keys"),
         }
     }
@@ -2942,13 +3512,11 @@ where
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
-        saturating_u16(
-            transcript_rows(
-                &rendered_transcript(&self.view(), content_width),
-                content_width,
-            )
-            .saturating_sub(visible_rows),
-        )
+        let transcript = SelectableTranscript::from_lines(
+            &rendered_transcript(&self.view(), content_width),
+            content_width,
+        );
+        saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
     }
 
     fn transcript_page_rows(&self) -> u16 {
@@ -2989,9 +3557,41 @@ where
     fn cancel_running(&mut self) -> Action {
         self.palette_open = false;
         self.engine.cancel();
-        self.quit_armed = false;
+        self.quit_armed_until = None;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
+    }
+
+    fn handle_control_c(&mut self) -> Action {
+        let record = self
+            .transcripts
+            .get(&self.active_transcript)
+            .expect("active transcript always exists");
+        if let Some(text) = record.selection_text.clone() {
+            self.quit_armed_until = None;
+            return Action::CopySelection(text);
+        }
+        if record.selection_too_large {
+            self.quit_armed_until = None;
+            self.status = Some("Selection exceeds the 64 KiB copy limit.".into());
+            return Action::Render;
+        }
+
+        if self.quit_is_armed() {
+            self.quit_armed_until = None;
+            if self.running || self.has_active_execution() {
+                self.engine.cancel();
+                self.turn_state = Some(TurnState::Cancelled);
+            }
+            return Action::Quit;
+        }
+
+        self.quit_armed_until = Some(self.now.saturating_add(EXIT_WARNING_WINDOW));
+        Action::Render
+    }
+
+    fn quit_is_armed(&self) -> bool {
+        self.quit_armed_until.is_some_and(|until| self.now < until)
     }
 
     fn has_active_execution(&self) -> bool {
@@ -3032,6 +3632,17 @@ where
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
+            Key::CtrlO => {
+                if let Some(dialog) = self.dialog.as_mut()
+                    && dialog
+                        .entries
+                        .get(dialog.selected)
+                        .is_some_and(|entry| entry.selected_detail.is_some())
+                {
+                    dialog.details_open = !dialog.details_open;
+                }
+                Action::Render
+            }
             Key::LineStart
                 if self
                     .dialog
@@ -3091,6 +3702,9 @@ where
                 Action::Render
             }
             Key::Enter => {
+                if self.session_loading {
+                    return Action::Render;
+                }
                 let action = self.dialog.as_ref().and_then(|dialog| {
                     dialog_matches(dialog)
                         .into_iter()
@@ -3099,7 +3713,9 @@ where
                 });
                 match action {
                     Some(DialogEntryAction::Dispatch(action_id)) => {
-                        self.dialog = None;
+                        if !is_session_resume_action(&action_id) {
+                            self.dialog = None;
+                        }
                         Action::DialogAction(action_id)
                     }
                     Some(DialogEntryAction::SafeDispatch(action_id)) => {
@@ -3482,13 +4098,15 @@ where
         self.transcript.push(TranscriptEntry::Error(message));
     }
 
-    fn apply_presentation(&mut self, presentation: TuiPresentation) {
+    /// Applies composition-owned model, effort, context, session, and safety presentation state.
+    pub fn apply_presentation(&mut self, presentation: TuiPresentation) {
         self.set_presentation(
             presentation.provider,
             presentation.model,
             presentation.session,
         );
         self.set_reasoning_effort(presentation.effort);
+        self.context_window = presentation.context_window;
         self.set_dangerous_mode(presentation.dangerous_mode);
     }
 }
@@ -3621,6 +4239,13 @@ impl Terminal {
         Ok(map_event(event::read()?))
     }
 
+    fn copy_selection(&mut self, text: &str) -> io::Result<()> {
+        self.control
+            .stdout
+            .write_all(osc52_copy_sequence(text).as_bytes())?;
+        self.control.stdout.flush()
+    }
+
     /// Restores the main screen and normal terminal mode. It is safe to call repeatedly.
     pub fn restore(&mut self) -> io::Result<()> {
         self.guard.restore(&mut self.control)
@@ -3648,6 +4273,8 @@ impl TerminalControl for CrosstermControl {
             TerminalOperation::LeaveAlternate => {
                 execute!(self.stdout, LeaveAlternateScreen).map(|_| ())
             }
+            TerminalOperation::HideCursor => execute!(self.stdout, HideCursor).map(|_| ()),
+            TerminalOperation::ShowCursor => execute!(self.stdout, ShowCursor).map(|_| ()),
             TerminalOperation::EnableMouse => execute!(self.stdout, EnableMouseCapture).map(|_| ()),
             TerminalOperation::DisableMouse => {
                 execute!(self.stdout, DisableMouseCapture).map(|_| ())
@@ -3686,12 +4313,23 @@ impl Drop for Terminal {
 
 trait RuntimeTerminal {
     fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
+    fn copy_selection(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl RuntimeTerminal for Terminal {
     fn poll(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
         Self::poll(self, timeout)
     }
+
+    fn copy_selection(&mut self, text: &str) -> io::Result<()> {
+        Self::copy_selection(self, text)
+    }
+}
+
+fn osc52_copy_sequence(text: &str) -> String {
+    format!("\u{1b}]52;c;{}\u{7}", BASE64_STANDARD.encode(text))
 }
 
 /// Runs a terminal event loop and hands rendering to the caller-owned renderer.
@@ -3715,15 +4353,27 @@ where
     R: Renderer,
     T: RuntimeTerminal,
 {
+    let started = Instant::now();
     renderer.render(tui.view())?;
 
     loop {
+        let quit_armed = tui.quit_is_armed();
+        let status = tui.status.clone();
+        tui.tick(started.elapsed());
+        if quit_armed && !tui.quit_is_armed() || status != tui.status {
+            renderer.render(tui.view())?;
+        }
         let Some(event) = terminal.poll(Duration::from_millis(100))? else {
             continue;
         };
 
-        match tui.handle(event) {
+        let action = tui.handle(event);
+        match action {
             Action::Quit => return Ok(()),
+            Action::CopySelection(text) => {
+                terminal.copy_selection(&text)?;
+                renderer.render(tui.view())?;
+            }
             Action::Render
             | Action::Submit(_)
             | Action::SubmitBackground(_)
@@ -3731,7 +4381,8 @@ where
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
-            | Action::Cancel => renderer.render(tui.view())?,
+            | Action::Cancel
+            | Action::CancelRoute => renderer.render(tui.view())?,
         }
     }
 }
@@ -3748,8 +4399,15 @@ where
     let mut terminal = Terminal::enter()?;
     sync_terminal_size(tui)?;
     renderer.render(tui.view())?;
+    let started = Instant::now();
 
     loop {
+        let quit_armed = tui.quit_is_armed();
+        let status = tui.status.clone();
+        tui.tick(started.elapsed());
+        if quit_armed && !tui.quit_is_armed() || status != tui.status {
+            renderer.render(tui.view())?;
+        }
         while let Ok(result) = receiver.try_recv() {
             tui.finish_submission(result);
             renderer.render(tui.view())?;
@@ -3759,8 +4417,13 @@ where
             continue;
         };
 
-        match tui.handle(event) {
+        let action = tui.handle(event);
+        match action {
             Action::Quit => return Ok(()),
+            Action::CopySelection(text) => {
+                terminal.copy_selection(&text)?;
+                renderer.render(tui.view())?;
+            }
             Action::Submit(prompt) => {
                 tui.begin_submission(prompt.clone());
                 let submit = Arc::clone(&submit);
@@ -3776,7 +4439,8 @@ where
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
-            | Action::Cancel => renderer.render(tui.view())?,
+            | Action::Cancel
+            | Action::CancelRoute => renderer.render(tui.view())?,
         }
     }
 }
@@ -3799,6 +4463,150 @@ impl Drop for PermissionBridgeTeardown {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FrameSchedule {
+    last_render: Option<Duration>,
+}
+
+impl FrameSchedule {
+    fn heartbeat_due(self, now: Duration, running: bool) -> bool {
+        running
+            && self
+                .last_render
+                .is_none_or(|last| now.saturating_sub(last) >= ACTIVE_FRAME_HEARTBEAT)
+    }
+
+    fn mark_rendered(&mut self, now: Duration) {
+        self.last_render = Some(now);
+    }
+
+    fn poll_timeout(self, now: Duration, running: bool, backlog: bool) -> Duration {
+        if backlog {
+            return Duration::ZERO;
+        }
+        if !running {
+            return TERMINAL_POLL_INTERVAL;
+        }
+
+        let heartbeat_wait = self.last_render.map_or(Duration::ZERO, |last| {
+            ACTIVE_FRAME_HEARTBEAT.saturating_sub(now.saturating_sub(last))
+        });
+        TERMINAL_POLL_INTERVAL.min(heartbeat_wait)
+    }
+}
+
+fn render_progress_frame<E, R>(
+    tui: &mut Tui<E>,
+    renderer: &mut R,
+    schedule: &mut FrameSchedule,
+    now: Duration,
+    dirty: bool,
+) -> io::Result<bool>
+where
+    E: Engine,
+    R: Renderer,
+{
+    let execution_count = tui.executions.len();
+    let quit_armed = tui.quit_is_armed();
+    let restored_syntax_ready = tui.highlight_restored_syntax;
+    let status = tui.status.clone();
+    tui.tick(now);
+    let expired_execution = tui.executions.len() != execution_count;
+    let expired_quit_warning = quit_armed && !tui.quit_is_armed();
+    let restored_syntax_became_ready = !restored_syntax_ready && tui.highlight_restored_syntax;
+    let status_changed = status != tui.status;
+    if !dirty
+        && !expired_execution
+        && !expired_quit_warning
+        && !restored_syntax_became_ready
+        && !status_changed
+        && !schedule.heartbeat_due(now, tui.running)
+    {
+        return Ok(false);
+    }
+
+    renderer.render(tui.view())?;
+    schedule.mark_rendered(now);
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ChannelDrain {
+    processed: usize,
+    caught_up: bool,
+}
+
+impl ChannelDrain {
+    fn dirty(self) -> bool {
+        self.processed > 0
+    }
+
+    fn backlog(self) -> bool {
+        !self.caught_up
+    }
+}
+
+fn drain_channel<T>(receiver: &mpsc::Receiver<T>, mut apply: impl FnMut(T)) -> ChannelDrain {
+    let mut processed = 0;
+    while processed < PROGRESS_CHANNEL_BUDGET {
+        match receiver.try_recv() {
+            Ok(value) => {
+                apply(value);
+                processed += 1;
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                return ChannelDrain {
+                    processed,
+                    caught_up: true,
+                };
+            }
+        }
+    }
+
+    ChannelDrain {
+        processed,
+        caught_up: false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ProviderDrain {
+    dirty: bool,
+    backlog: bool,
+}
+
+fn drain_provider_channels<E: Engine>(
+    tui: &mut Tui<E>,
+    metrics_receiver: &mpsc::Receiver<UiEnvelope<TuiRuntimeEvent>>,
+    progress_receiver: &mpsc::Receiver<TurnEvent>,
+    completion_receiver: &mpsc::Receiver<TuiProviderOutcome>,
+) -> ProviderDrain {
+    let progress = drain_channel(progress_receiver, |event| tui.apply_progress(event));
+    let metrics = if progress.caught_up {
+        drain_channel(metrics_receiver, |envelope| {
+            let (ordinal, event) = envelope.into_parts();
+            tui.apply_runtime_event_with_ordinal(ordinal, event);
+        })
+    } else {
+        ChannelDrain::default()
+    };
+    let completion = if metrics.caught_up && progress.caught_up {
+        drain_channel(completion_receiver, |outcome| {
+            tui.finish_provider_turn(outcome)
+        })
+    } else {
+        ChannelDrain::default()
+    };
+
+    ProviderDrain {
+        dirty: progress.dirty() || metrics.dirty() || completion.dirty(),
+        backlog: progress.backlog()
+            || metrics.backlog()
+            || completion.backlog()
+            || !(metrics.caught_up && progress.caught_up),
+    }
+}
+
 pub fn run_with_default_progress_submit(
     tui: &mut Tui<impl Engine + Send>,
     route: impl Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
@@ -3815,7 +4623,13 @@ pub fn run_with_default_progress_submit(
     + Sync
     + 'static,
 ) -> io::Result<()> {
-    run_with_default_progress_submit_with_permissions(tui, route, submit, |_| false, None)
+    run_with_default_progress_submit_with_permissions(
+        tui,
+        move |request, progress, _| route(request, progress),
+        submit,
+        |_| false,
+        None,
+    )
 }
 
 pub fn run_with_default_progress_submit_with_permissions<E, R, F, C>(
@@ -3827,7 +4641,11 @@ pub fn run_with_default_progress_submit_with_permissions<E, R, F, C>(
 ) -> io::Result<()>
 where
     E: Engine + Send,
-    R: Fn(TuiRouteRequest, mpsc::Sender<TuiRouteProgress>) -> TuiSubmissionOutcome
+    R: Fn(
+            TuiRouteRequest,
+            mpsc::Sender<TuiRouteProgress>,
+            TuiRouteCancellation,
+        ) -> TuiSubmissionOutcome
         + Send
         + Sync
         + 'static,
@@ -3852,42 +4670,64 @@ where
     sync_terminal_size(tui)?;
     let terminal = RatatuiTerminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut renderer = RatatuiRenderer::new(terminal);
-    renderer.render(tui.view())?;
+    let started = Instant::now();
+    let mut frame_schedule = FrameSchedule::default();
+    let mut render_requested = true;
+    let mut next_route_id = 0_u64;
+    let mut active_route: Option<(u64, TuiRouteCancellation, bool)> = None;
 
     loop {
-        for _ in 0..32 {
-            let Ok(envelope) = metrics_receiver.try_recv() else {
-                break;
-            };
-            let (ordinal, event) = envelope.into_parts();
-            tui.apply_runtime_event_with_ordinal(ordinal, event);
-        }
-        while let Ok(event) = receiver.try_recv() {
-            tui.apply_progress(event);
-        }
-        while let Ok(progress) = route_progress_receiver.try_recv() {
-            tui.apply_route_progress(progress);
-        }
-        while let Ok(outcome) = completion_receiver.try_recv() {
-            tui.finish_provider_turn(outcome);
-        }
-        while let Ok(outcome) = route_receiver.try_recv() {
-            let quit = matches!(outcome, TuiSubmissionOutcome::Quit);
-            let Some(prompt) = tui.apply_submission_outcome(outcome) else {
-                if quit {
-                    return Ok(());
+        let now = started.elapsed();
+        let provider =
+            drain_provider_channels(tui, &metrics_receiver, &receiver, &completion_receiver);
+        let mut dirty = std::mem::take(&mut render_requested) || provider.dirty;
+        let mut backlog = provider.backlog;
+        let route_progress = drain_channel(&route_progress_receiver, |progress| {
+            tui.apply_route_progress(progress)
+        });
+        dirty |= route_progress.dirty();
+        backlog |= route_progress.backlog();
+        let mut should_quit = false;
+        let routes = if route_progress.caught_up {
+            drain_channel(&route_receiver, |(route_id, outcome)| {
+                if should_quit {
+                    return;
                 }
-                continue;
-            };
-            let submit = Arc::clone(&submit);
-            let sender = sender.clone();
-            let metrics = metrics_sender.clone();
-            let completion_sender = completion_sender.clone();
-            thread::spawn(move || {
-                let outcome = submit(prompt, false, sender, metrics);
-                let _ = completion_sender.send(outcome);
-            });
+                let Some((active_id, cancellation, session_load)) = active_route.as_ref() else {
+                    return;
+                };
+                if *active_id != route_id || cancellation.is_cancelled() {
+                    return;
+                }
+                let session_load = *session_load;
+                active_route = None;
+                if session_load {
+                    tui.finish_session_load();
+                }
+                let quit = matches!(outcome, TuiSubmissionOutcome::Quit);
+                let Some(prompt) = tui.apply_submission_outcome(outcome) else {
+                    if quit {
+                        should_quit = true;
+                    }
+                    return;
+                };
+                let submit = Arc::clone(&submit);
+                let sender = sender.clone();
+                let metrics = metrics_sender.clone();
+                let completion_sender = completion_sender.clone();
+                thread::spawn(move || {
+                    let outcome = submit(prompt, false, sender, metrics);
+                    let _ = completion_sender.send(outcome);
+                });
+            })
+        } else {
+            ChannelDrain::default()
+        };
+        if should_quit {
+            return Ok(());
         }
+        dirty |= routes.dirty();
+        backlog |= routes.backlog();
         if active_permission.is_none()
             && let (Some(permission_bridge), Some(permission_requests)) =
                 (permission_bridge.as_ref(), permission_requests.as_ref())
@@ -3915,24 +4755,44 @@ where
                 )
                 .as_confirm(),
             );
+            dirty = true;
         }
-        renderer.render(tui.view())?;
-        let Some(event) = runtime_terminal.poll(Duration::from_millis(25))? else {
+        render_progress_frame(tui, &mut renderer, &mut frame_schedule, now, dirty)?;
+        let timeout = frame_schedule.poll_timeout(now, tui.running, backlog);
+        let Some(event) = runtime_terminal.poll(timeout)? else {
             continue;
         };
-        let cancel_permission = matches!(event, Event::Key(Key::Escape | Key::CtrlC));
+        let cancel_permission = matches!(event, Event::Key(Key::Escape));
         match tui.handle(event) {
             Action::Quit => {
+                if let Some((_, cancellation, session_load)) = active_route.take()
+                    && cancellation.cancel()
+                    && session_load
+                {
+                    tui.cancel_session_load();
+                }
                 return Ok(());
             }
             Action::Submit(prompt) => {
-                tui.begin_route();
+                let request = TuiRouteRequest::Input(prompt);
+                let session_load = is_session_resume_request(&request);
+                if session_load {
+                    if !tui.begin_session_load() {
+                        continue;
+                    }
+                } else {
+                    tui.begin_route();
+                }
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let route_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((route_id, cancellation.clone(), session_load));
                 let route = Arc::clone(&route);
                 let route_sender = route_sender.clone();
                 let progress = route_progress_sender.clone();
                 thread::spawn(move || {
-                    let outcome = route(TuiRouteRequest::Input(prompt), progress);
-                    let _ = route_sender.send(outcome);
+                    let outcome = route(request, progress, cancellation);
+                    let _ = route_sender.send((route_id, outcome));
                 });
             }
             Action::SubmitBackground(prompt) => {
@@ -3949,11 +4809,16 @@ where
                 let _ = transition(id);
             }
             Action::OpenDialog(route_id) => {
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let active_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((active_id, cancellation.clone(), false));
                 let outcome = route(
                     TuiRouteRequest::OpenDialog(route_id),
                     route_progress_sender.clone(),
+                    cancellation,
                 );
-                let _ = route_sender.send(outcome);
+                let _ = route_sender.send((active_id, outcome));
             }
             Action::DialogAction(action_id) => {
                 if let Some((id, reply)) = parse_permission_reply(&action_id) {
@@ -3961,23 +4826,53 @@ where
                         let _ = permission_bridge.reply(id, reply);
                     }
                     active_permission = None;
+                    render_requested = true;
                     continue;
                 }
-                tui.begin_route();
+                let request = TuiRouteRequest::DialogAction(action_id);
+                let session_load = is_session_resume_request(&request);
+                if session_load {
+                    if !tui.begin_session_load() {
+                        continue;
+                    }
+                } else {
+                    tui.begin_route();
+                }
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let route_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((route_id, cancellation.clone(), session_load));
                 let route = Arc::clone(&route);
                 let route_sender = route_sender.clone();
                 let progress = route_progress_sender.clone();
                 thread::spawn(move || {
-                    let outcome = route(TuiRouteRequest::DialogAction(action_id), progress);
-                    let _ = route_sender.send(outcome);
+                    let outcome = route(request, progress, cancellation);
+                    let _ = route_sender.send((route_id, outcome));
                 });
             }
             Action::SafeDialogAction(action_id) => {
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let active_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((active_id, cancellation.clone(), false));
                 let outcome = route(
                     TuiRouteRequest::DialogAction(action_id),
                     route_progress_sender.clone(),
+                    cancellation,
                 );
-                let _ = route_sender.send(outcome);
+                let _ = route_sender.send((active_id, outcome));
+            }
+            Action::CancelRoute => {
+                if active_route
+                    .as_ref()
+                    .is_some_and(|(_, cancellation, _)| cancellation.cancel())
+                {
+                    active_route = None;
+                    tui.cancel_session_load();
+                }
+            }
+            Action::CopySelection(text) => {
+                runtime_terminal.copy_selection(&text)?;
             }
             Action::Render | Action::Cancel => {
                 if cancel_permission
@@ -3988,6 +4883,7 @@ where
                 }
             }
         }
+        render_requested = true;
     }
 }
 
@@ -4008,6 +4904,23 @@ fn parse_permission_reply(action_id: &str) -> Option<(u64, TuiPermissionReply)> 
     id.parse().ok().map(|id| (id, reply))
 }
 
+fn is_session_resume_action(action_id: &str) -> bool {
+    action_id
+        .strip_prefix("session:")
+        .is_some_and(|identifier| identifier.parse::<i64>().is_ok())
+}
+
+fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
+    match request {
+        TuiRouteRequest::Input(input) => input
+            .trim()
+            .strip_prefix("/resume ")
+            .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
+        TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
+        TuiRouteRequest::OpenDialog(_) => false,
+    }
+}
+
 fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
     let (width, height) = crossterm_terminal::size()?;
     tui.handle(Event::Resize { width, height });
@@ -4019,10 +4932,34 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
         CrosstermEvent::Resize(width, height) => Some(Event::Resize { width, height }),
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => map_key(key),
         CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
-            Some(Event::Key(Key::ScrollUp))
+            Some(Event::MouseWheel(MouseWheelDirection::Up))
         }
         CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollDown => {
-            Some(Event::Key(Key::ScrollDown))
+            Some(Event::MouseWheel(MouseWheelDirection::Down))
+        }
+        CrosstermEvent::Mouse(mouse)
+            if mouse.kind == MouseEventKind::Down(crossterm::event::MouseButton::Left) =>
+        {
+            Some(Event::MouseDown {
+                column: mouse.column,
+                row: mouse.row,
+            })
+        }
+        CrosstermEvent::Mouse(mouse)
+            if mouse.kind == MouseEventKind::Drag(crossterm::event::MouseButton::Left) =>
+        {
+            Some(Event::MouseDrag {
+                column: mouse.column,
+                row: mouse.row,
+            })
+        }
+        CrosstermEvent::Mouse(mouse)
+            if mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left) =>
+        {
+            Some(Event::MouseUp {
+                column: mouse.column,
+                row: mouse.row,
+            })
         }
         CrosstermEvent::Paste(text) => Some(Event::Paste(text)),
         _ => None,
@@ -4137,7 +5074,7 @@ fn map_key(event: KeyEvent) -> Option<Event> {
 mod runtime_tests {
     use super::*;
     use crate::terminal::{TerminalControl, TerminalModeGuard, TerminalOperation};
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     #[derive(Default)]
     struct RecordingControl {
@@ -4213,6 +5150,57 @@ mod runtime_tests {
         }
     }
 
+    struct EventRuntime {
+        guard: TerminalModeGuard,
+        control: RecordingControl,
+        events: VecDeque<Event>,
+        terminal_error: Option<io::ErrorKind>,
+    }
+
+    impl EventRuntime {
+        fn new(
+            events: impl IntoIterator<Item = Event>,
+        ) -> (Self, Rc<RefCell<Vec<TerminalOperation>>>) {
+            let mut control = RecordingControl::default();
+            let calls = Rc::clone(&control.calls);
+            let guard = TerminalModeGuard::enter(&mut control).unwrap();
+            (
+                Self {
+                    guard,
+                    control,
+                    events: events.into_iter().collect(),
+                    terminal_error: None,
+                },
+                calls,
+            )
+        }
+
+        fn failing_after(
+            events: impl IntoIterator<Item = Event>,
+            terminal_error: io::ErrorKind,
+        ) -> (Self, Rc<RefCell<Vec<TerminalOperation>>>) {
+            let (mut runtime, calls) = Self::new(events);
+            runtime.terminal_error = Some(terminal_error);
+            (runtime, calls)
+        }
+    }
+
+    impl RuntimeTerminal for EventRuntime {
+        fn poll(&mut self, _: Duration) -> io::Result<Option<Event>> {
+            if let Some(event) = self.events.pop_front() {
+                return Ok(Some(event));
+            }
+            self.terminal_error
+                .map_or(Ok(None), |kind| Err(io::Error::from(kind)))
+        }
+    }
+
+    impl Drop for EventRuntime {
+        fn drop(&mut self) {
+            let _ = self.guard.restore(&mut self.control);
+        }
+    }
+
     struct NoopEngine;
 
     impl Engine for NoopEngine {
@@ -4235,19 +5223,143 @@ mod runtime_tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct RecordedFrame {
+        now: Duration,
+        running: bool,
+        quit_armed: bool,
+        turn_state: Option<TurnState>,
+        markdown: String,
+        spinner: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        frames: Vec<RecordedFrame>,
+    }
+
+    impl Renderer for RecordingRenderer {
+        fn render(&mut self, state: ViewState<'_>) -> io::Result<()> {
+            self.frames.push(RecordedFrame {
+                now: state.now,
+                running: state.running,
+                quit_armed: state.quit_armed,
+                turn_state: state.turn_state,
+                markdown: state
+                    .conversation
+                    .map(|conversation| conversation.live_markdown.clone())
+                    .unwrap_or_default(),
+                spinner: widgets::StatusGlyph::char(state.running, state.now).to_owned(),
+            });
+            Ok(())
+        }
+    }
+
     fn expected_terminal_calls() -> Vec<TerminalOperation> {
         vec![
             TerminalOperation::EnableRaw,
             TerminalOperation::EnterAlternate,
+            TerminalOperation::HideCursor,
             TerminalOperation::EnableMouse,
             TerminalOperation::EnableKeyboardEnhancement,
             TerminalOperation::EnablePaste,
             TerminalOperation::DisablePaste,
             TerminalOperation::DisableKeyboardEnhancement,
             TerminalOperation::DisableMouse,
+            TerminalOperation::ShowCursor,
             TerminalOperation::LeaveAlternate,
             TerminalOperation::DisableRaw,
         ]
+    }
+
+    #[test]
+    fn runtime_keeps_mouse_capture_enabled_until_exactly_once_cleanup() {
+        let (terminal, calls) = EventRuntime::new([Event::Key(Key::CtrlC), Event::Key(Key::CtrlC)]);
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+
+        run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
+
+        let mouse_operations = calls
+            .borrow()
+            .iter()
+            .copied()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    TerminalOperation::EnableMouse | TerminalOperation::DisableMouse
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mouse_operations,
+            [
+                TerminalOperation::EnableMouse,
+                TerminalOperation::DisableMouse,
+            ]
+        );
+    }
+
+    #[test]
+    fn osc52_copy_is_explicit_bounded_and_contains_only_base64_selection_text() {
+        assert_eq!(
+            osc52_copy_sequence("café 🙂"),
+            "\u{1b}]52;c;Y2Fmw6kg8J+Zgg==\u{7}"
+        );
+    }
+
+    #[test]
+    fn captured_mouse_cleanup_restores_mouse_cursor_and_terminal_after_render_or_poll_error() {
+        let expected = vec![
+            TerminalOperation::EnableRaw,
+            TerminalOperation::EnterAlternate,
+            TerminalOperation::HideCursor,
+            TerminalOperation::EnableMouse,
+            TerminalOperation::EnableKeyboardEnhancement,
+            TerminalOperation::EnablePaste,
+            TerminalOperation::DisablePaste,
+            TerminalOperation::DisableKeyboardEnhancement,
+            TerminalOperation::DisableMouse,
+            TerminalOperation::ShowCursor,
+            TerminalOperation::LeaveAlternate,
+            TerminalOperation::DisableRaw,
+        ];
+
+        let (terminal, calls) = EventRuntime::new([Event::Resize {
+            width: 100,
+            height: 30,
+        }]);
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = FailingRenderer {
+            fail_on_render: 2,
+            renders: 0,
+        };
+        assert!(run_with_runtime_terminal(&mut tui, &mut renderer, terminal).is_err());
+        assert_eq!(*calls.borrow(), expected);
+
+        let (terminal, calls) = EventRuntime::failing_after([], io::ErrorKind::UnexpectedEof);
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+        assert_eq!(
+            run_with_runtime_terminal(&mut tui, &mut renderer, terminal)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(*calls.borrow(), expected);
+    }
+
+    #[test]
+    fn crossterm_mouse_commands_emit_standard_enable_and_disable_sequences() {
+        let mut enabled = Vec::new();
+        execute!(enabled, EnableMouseCapture).unwrap();
+        let mut disabled = Vec::new();
+        execute!(disabled, DisableMouseCapture).unwrap();
+
+        assert!(enabled.starts_with(b"\x1b[?1000h"));
+        assert!(enabled.windows(8).any(|window| window == b"\x1b[?1006h"));
+        assert!(disabled.starts_with(b"\x1b[?1006l"));
+        assert!(disabled.ends_with(b"\x1b[?1000l"));
     }
 
     #[test]
@@ -4304,6 +5416,355 @@ mod runtime_tests {
         run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
 
         assert_eq!(*calls.borrow(), expected_terminal_calls());
+    }
+
+    #[test]
+    fn production_frame_clock_ticks_working_spinner_without_terminal_input() {
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
+        tui.begin_submission("request");
+
+        assert!(
+            render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true,)
+                .unwrap()
+        );
+        assert!(
+            !render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                Duration::from_millis(79),
+                false,
+            )
+            .unwrap()
+        );
+        assert!(
+            render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                Duration::from_millis(80),
+                false,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(renderer.frames.len(), 2);
+        assert_ne!(renderer.frames[0].spinner, renderer.frames[1].spinner);
+        assert_eq!(renderer.frames[0].now, Duration::ZERO);
+        assert_eq!(renderer.frames[1].now, ACTIVE_FRAME_HEARTBEAT);
+    }
+
+    #[test]
+    fn production_frame_clock_removes_expired_quit_warning_without_input() {
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+
+        assert!(
+            render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true)
+                .unwrap()
+        );
+        assert!(
+            !render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                EXIT_WARNING_WINDOW - Duration::from_millis(1),
+                false,
+            )
+            .unwrap()
+        );
+        assert!(
+            render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                EXIT_WARNING_WINDOW,
+                false,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(renderer.frames.len(), 2);
+        assert!(renderer.frames[0].quit_armed);
+        assert!(!renderer.frames[1].quit_armed);
+    }
+
+    #[test]
+    fn begin_submission_renders_working_frame_before_first_provider_delta() {
+        let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
+        tui.begin_submission("request");
+
+        render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true)
+            .unwrap();
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("delta".into())));
+        render_progress_frame(
+            &mut tui,
+            &mut renderer,
+            &mut schedule,
+            Duration::from_millis(1),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(renderer.frames[0].turn_state, Some(TurnState::Requesting));
+        assert!(renderer.frames[0].running);
+        assert_eq!(renderer.frames[0].markdown, "");
+        assert_eq!(renderer.frames[1].markdown, "delta");
+    }
+
+    #[test]
+    fn restored_fence_highlights_on_the_next_idle_heartbeat_only() {
+        let _guard = render::SYNTAX_CACHE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        render::reset_syntax_highlight_test_state();
+        let mut tui = Tui::new(NoopEngine);
+        let history = Conversation::from_messages(&[
+            agens_core::Message {
+                role: agens_core::Role::User,
+                parts: vec![MessagePart::Text("restored prompt".into())],
+            },
+            agens_core::Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![MessagePart::Text(
+                    "```js\nconst restored = true;\n```\n".into(),
+                )],
+            },
+        ])
+        .unwrap();
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+            message: "Resumed session 2.".into(),
+            presentation: TuiPresentation::new("provider", "model", "session #2"),
+            history,
+        });
+        let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        let mut schedule = FrameSchedule::default();
+
+        assert!(
+            render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true,)
+                .unwrap()
+        );
+        assert_eq!(render::syntax_highlight_test_calls(), 0);
+        assert!(
+            !render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                ACTIVE_FRAME_HEARTBEAT - Duration::from_millis(1),
+                false,
+            )
+            .unwrap()
+        );
+        assert_eq!(render::syntax_highlight_test_calls(), 0);
+        assert!(
+            render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                ACTIVE_FRAME_HEARTBEAT,
+                false,
+            )
+            .unwrap()
+        );
+        assert_eq!(render::syntax_highlight_test_calls(), 1);
+        assert!(
+            render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                ACTIVE_FRAME_HEARTBEAT * 2,
+                true,
+            )
+            .unwrap()
+        );
+        assert_eq!(render::syntax_highlight_test_calls(), 1);
+    }
+
+    #[test]
+    fn blocked_producer_exposes_first_delta_before_later_progress_and_completion() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.begin_submission("request");
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
+        render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true)
+            .unwrap();
+        let (_metrics_sender, metrics_receiver) = BridgeTx::bounded(4);
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        let (first_sent, first_received) = mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let producer_barrier = Arc::clone(&barrier);
+        let producer = thread::spawn(move || {
+            progress_sender
+                .send(TurnEvent::ProviderPart(MessagePart::Text("delta1".into())))
+                .unwrap();
+            first_sent.send(()).unwrap();
+            producer_barrier.wait();
+            progress_sender
+                .send(TurnEvent::ProviderPart(MessagePart::Text("delta2".into())))
+                .unwrap();
+            progress_sender
+                .send(TurnEvent::StateChanged(TurnState::Completed))
+                .unwrap();
+            completion_sender
+                .send(TuiProviderOutcome::Completed("delta1delta2".into()))
+                .unwrap();
+        });
+        first_received.recv().unwrap();
+
+        let first = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+        assert!(first.dirty);
+        render_progress_frame(
+            &mut tui,
+            &mut renderer,
+            &mut schedule,
+            Duration::from_millis(1),
+            first.dirty,
+        )
+        .unwrap();
+        assert_eq!(renderer.frames[1].markdown, "delta1");
+        assert!(renderer.frames[1].running);
+
+        barrier.wait();
+        producer.join().unwrap();
+        let second = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+        render_progress_frame(
+            &mut tui,
+            &mut renderer,
+            &mut schedule,
+            Duration::from_millis(2),
+            second.dirty,
+        )
+        .unwrap();
+
+        assert_eq!(renderer.frames[2].markdown, "delta1delta2");
+        assert!(!renderer.frames[2].running);
+    }
+
+    #[test]
+    fn provider_backlog_is_bounded_per_frame_and_preserves_fifo_before_completion() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.begin_submission("request");
+        let (metrics_sender, metrics_receiver) = BridgeTx::bounded(4);
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let (completion_sender, completion_receiver) = mpsc::channel();
+        assert!(matches!(
+            metrics_sender.publish(
+                TuiRuntimeEvent::Usage(Usage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(5),
+                    total_tokens: Some(8),
+                    context_window: Some(128),
+                }),
+                &BridgeCancel::new(),
+                None,
+            ),
+            PublishOutcome::Published { .. }
+        ));
+        assert!(matches!(
+            metrics_sender.publish(
+                TuiRuntimeEvent::TurnEnded {
+                    status: TurnState::Completed,
+                    duration: Some(Duration::from_millis(12)),
+                },
+                &BridgeCancel::new(),
+                None,
+            ),
+            PublishOutcome::Published { .. }
+        ));
+        let deltas = (0..PROGRESS_CHANNEL_BUDGET + 2)
+            .map(|index| format!("{index},"))
+            .collect::<Vec<_>>();
+        for delta in &deltas {
+            progress_sender
+                .send(TurnEvent::ProviderPart(MessagePart::Text(delta.clone())))
+                .unwrap();
+        }
+        progress_sender
+            .send(TurnEvent::StateChanged(TurnState::Completed))
+            .unwrap();
+        completion_sender
+            .send(TuiProviderOutcome::Completed(deltas.concat()))
+            .unwrap();
+
+        let first = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
+        render_progress_frame(
+            &mut tui,
+            &mut renderer,
+            &mut schedule,
+            Duration::from_millis(1),
+            first.dirty,
+        )
+        .unwrap();
+
+        assert!(first.dirty);
+        assert!(first.backlog);
+        assert_eq!(
+            tui.view().conversation.unwrap().live_markdown,
+            deltas[..PROGRESS_CHANNEL_BUDGET].concat()
+        );
+        assert!(tui.view().running);
+        assert!(tui.view().latest_usage.is_none());
+        assert_eq!(
+            renderer.frames[0].markdown,
+            deltas[..PROGRESS_CHANNEL_BUDGET].concat()
+        );
+        assert_eq!(
+            FrameSchedule::default().poll_timeout(Duration::ZERO, true, first.backlog),
+            Duration::ZERO
+        );
+
+        let second = drain_provider_channels(
+            &mut tui,
+            &metrics_receiver,
+            &progress_receiver,
+            &completion_receiver,
+        );
+        render_progress_frame(
+            &mut tui,
+            &mut renderer,
+            &mut schedule,
+            Duration::from_millis(2),
+            second.dirty,
+        )
+        .unwrap();
+
+        assert!(second.dirty);
+        assert!(!second.backlog);
+        assert_eq!(
+            tui.view().conversation.unwrap().final_markdown.as_deref(),
+            Some(deltas.concat().as_str())
+        );
+        assert!(!tui.view().running);
+        assert_eq!(
+            tui.view().latest_usage.and_then(|usage| usage.total_tokens),
+            Some(8)
+        );
+        assert_eq!(renderer.frames[1].markdown, deltas.concat());
     }
 
     #[test]
@@ -4447,11 +5908,14 @@ mod runtime_tests {
 
     #[test]
     fn maps_real_mouse_wheel_events_to_scroll_keys() {
-        for (kind, key) in [
-            (crossterm::event::MouseEventKind::ScrollUp, Key::ScrollUp),
+        for (kind, direction) in [
+            (
+                crossterm::event::MouseEventKind::ScrollUp,
+                MouseWheelDirection::Up,
+            ),
             (
                 crossterm::event::MouseEventKind::ScrollDown,
-                Key::ScrollDown,
+                MouseWheelDirection::Down,
             ),
         ] {
             assert_eq!(
@@ -4461,9 +5925,197 @@ mod runtime_tests {
                     row: 2,
                     modifiers: KeyModifiers::NONE,
                 })),
-                Some(Event::Key(key))
+                Some(Event::MouseWheel(direction))
             );
         }
+    }
+
+    #[test]
+    fn maps_left_mouse_drag_lifecycle_with_screen_coordinates() {
+        for (kind, expected) in [
+            (
+                MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                Event::MouseDown { column: 7, row: 3 },
+            ),
+            (
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                Event::MouseDrag { column: 7, row: 3 },
+            ),
+            (
+                MouseEventKind::Up(crossterm::event::MouseButton::Left),
+                Event::MouseUp { column: 7, row: 3 },
+            ),
+        ] {
+            assert_eq!(
+                map_event(CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column: 7,
+                    row: 3,
+                    modifiers: KeyModifiers::NONE,
+                })),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn left_drag_selects_exact_unicode_text_and_control_c_copies_without_arming_quit() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 12,
+        });
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("alpha café 🙂 omega".into()));
+
+        assert_eq!(
+            tui.handle(Event::MouseDown { column: 24, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(
+            tui.handle(Event::MouseDrag { column: 30, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(
+            tui.handle(Event::MouseUp { column: 30, row: 1 }),
+            Action::Render
+        );
+        assert_eq!(tui.selected_text(), Some("café 🙂"));
+        assert_eq!(
+            tui.handle(Event::Key(Key::CtrlC)),
+            Action::CopySelection("café 🙂".into())
+        );
+        assert!(!tui.view().quit_armed);
+    }
+
+    #[test]
+    fn real_mouse_wheel_scrolls_immediately_while_selection_anchors_remain_absolute() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 40,
+            height: 8,
+        });
+        tui.begin_submission("prompt");
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+            (0..80).map(|index| format!("line {index}\n")).collect(),
+        )));
+        tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+        let wheel = map_event(CrosstermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .expect("mouse wheel should map");
+
+        assert!(tui.following_bottom());
+        assert_eq!(tui.handle(wheel.clone()), Action::Render);
+        assert!(!tui.following_bottom());
+
+        let scroll_offset = tui
+            .transcripts
+            .get(&TranscriptId::Main)
+            .unwrap()
+            .scroll_offset;
+        let transcript_row = screen_layout(
+            Rect::new(0, 0, tui.size.0, tui.size.1),
+            &tui.input,
+            header_should_show(&tui.view()),
+        )
+        .transcript
+        .y
+        .saturating_add(1);
+        tui.handle(Event::MouseDown {
+            column: TRANSCRIPT_CONTENT_INDENT,
+            row: transcript_row,
+        });
+        tui.handle(Event::MouseDrag {
+            column: TRANSCRIPT_CONTENT_INDENT + 5,
+            row: transcript_row,
+        });
+        tui.handle(Event::MouseUp {
+            column: TRANSCRIPT_CONTENT_INDENT + 5,
+            row: transcript_row,
+        });
+        let selection = tui.selected_text().map(str::to_owned);
+        assert!(selection.is_some());
+
+        assert_eq!(tui.handle(wheel), Action::Render);
+        assert!(
+            tui.transcripts
+                .get(&TranscriptId::Main)
+                .unwrap()
+                .scroll_offset
+                < scroll_offset
+        );
+        assert_eq!(tui.selected_text(), selection.as_deref());
+    }
+
+    #[test]
+    fn selected_text_never_exceeds_the_osc52_copy_limit() {
+        let line = Line::raw("x".repeat(MAX_SELECTION_COPY_BYTES + 1));
+        let transcript = SelectableTranscript::from_lines(&[line], 80);
+        let last_row = transcript.rows.len() - 1;
+        let last_column = transcript.rows[last_row].cells.last().unwrap().column;
+
+        assert_eq!(
+            transcript.selected_text(TranscriptSelection {
+                anchor: TranscriptPosition { row: 0, column: 0 },
+                head: TranscriptPosition {
+                    row: last_row,
+                    column: last_column,
+                },
+            }),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn selectable_transcript_preserves_word_wrapping_and_indentation() {
+        let transcript =
+            SelectableTranscript::from_lines(&[Line::raw("AAA AAA AAAAA AA AAAAAA")], 10);
+        let rows = transcript
+            .render_lines(None)
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows, ["AAA AAA", "AAAAA AA", "AAAAAA"]);
+    }
+
+    #[test]
+    fn overlays_reject_drag_selection_and_printable_input_can_return_to_the_composer() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.active_record_mut()
+            .transcript
+            .push(TranscriptEntry::Info("selectable transcript".into()));
+        tui.show_selection_dialog(
+            DialogView::selection(
+                "Permission required",
+                Some("native::read"),
+                vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
+            )
+            .as_confirm(),
+        );
+
+        tui.handle(Event::MouseDown { column: 4, row: 1 });
+        tui.handle(Event::MouseDrag { column: 12, row: 1 });
+        tui.handle(Event::MouseUp { column: 12, row: 1 });
+        assert_eq!(tui.selected_text(), None);
+
+        tui.handle(Event::Key(Key::Escape));
+        tui.handle(Event::MouseDown { column: 4, row: 1 });
+        assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+        assert_eq!(tui.handle(Event::Key(Key::Char('i'))), Action::Render);
+        assert_eq!(tui.view().focus, TranscriptFocus::Composer);
+        assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+        assert_eq!(tui.input(), "x");
     }
 
     fn press<E: Engine>(tui: &mut Tui<E>, code: KeyCode, modifiers: KeyModifiers) -> Action {

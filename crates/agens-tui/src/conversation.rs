@@ -413,8 +413,11 @@ impl Conversation {
                 output,
                 is_error,
             }),
-            TuiSubagentUpdate::Error { kind } => self.apply(ConversationEvent::Error {
-                message: kind.message().into(),
+            TuiSubagentUpdate::Error { kind, reference } => self.apply(ConversationEvent::Error {
+                message: reference.map_or_else(
+                    || kind.message().into(),
+                    |reference| format!("{} [ref: {reference}]", kind.message()),
+                ),
                 action: kind.action().into(),
             }),
             TuiSubagentUpdate::Terminal { final_result, .. } => {

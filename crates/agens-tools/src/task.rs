@@ -1,4 +1,4 @@
-use agens_core::{AgentDefinition, AgentMode, Error, HeadlessTaskTerminal};
+use agens_core::{AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, RequestConfig};
 use serde_json::Value;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -23,6 +23,8 @@ const MAX_TASK_SKILL_NAME_CHARS: usize = 64;
 const MAX_TASK_ITERATIONS: usize = 16;
 const MAX_TASK_OUTPUT_CHARS: usize = 65_536;
 const MAX_TASK_CONCURRENCY: usize = 4;
+const MAX_TASK_AGENT_SCHEMA_DESCRIPTION_CHARS: usize = 160;
+const MAX_TASK_MODEL_SCHEMA_ENTRIES: usize = 256;
 const TASK_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const OPEN: u8 = 0;
@@ -30,6 +32,8 @@ const CANCELLED: u8 = 1;
 const PUBLISHED: u8 = 2;
 
 type BeforePublicationHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+type ModelResolutionDiagnostics =
+    Arc<dyn Fn(TaskModelResolutionError) -> Option<String> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskExecutionId(u64);
@@ -254,6 +258,7 @@ pub struct TaskTurnRequest {
     agent_description: String,
     system_prompt: String,
     model: String,
+    request_config: RequestConfig,
     skills: Vec<TaskSkill>,
     description: String,
 }
@@ -273,6 +278,10 @@ impl TaskTurnRequest {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    pub const fn request_config(&self) -> &RequestConfig {
+        &self.request_config
     }
 
     pub fn skills(&self) -> &[TaskSkill] {
@@ -296,6 +305,11 @@ pub enum TaskRunnerError {
     ProviderFailure,
     IterationLimit,
     ChildFailure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskModelResolutionError {
+    ModelUnavailable,
 }
 
 #[derive(Clone)]
@@ -366,7 +380,10 @@ pub struct TaskTool<R> {
     agents: AgentCatalog,
     skills: SkillCatalog,
     parent_model: String,
+    parent_request_config: RequestConfig,
+    available_models: Vec<String>,
     model_validator: Arc<dyn AgentModelValidator + Send + Sync>,
+    model_resolution_diagnostics: Option<ModelResolutionDiagnostics>,
     runner: Arc<Mutex<R>>,
     active: Arc<AtomicUsize>,
     execution_ids: Arc<AtomicU64>,
@@ -378,7 +395,10 @@ impl<R> Clone for TaskTool<R> {
             agents: self.agents.clone(),
             skills: self.skills.clone(),
             parent_model: self.parent_model.clone(),
+            parent_request_config: self.parent_request_config.clone(),
+            available_models: self.available_models.clone(),
             model_validator: Arc::clone(&self.model_validator),
+            model_resolution_diagnostics: self.model_resolution_diagnostics.clone(),
             runner: Arc::clone(&self.runner),
             active: Arc::clone(&self.active),
             execution_ids: Arc::clone(&self.execution_ids),
@@ -394,19 +414,90 @@ impl<R> TaskTool<R> {
         model_validator: impl AgentModelValidator + Send + Sync + 'static,
         runner: R,
     ) -> Self {
+        Self::from_catalogs_with_parent_config(
+            agents,
+            skills,
+            parent_model,
+            RequestConfig::default(),
+            Vec::new(),
+            model_validator,
+            runner,
+        )
+    }
+
+    pub fn from_catalogs_with_parent_config(
+        agents: AgentCatalog,
+        skills: SkillCatalog,
+        parent_model: impl Into<String>,
+        parent_request_config: RequestConfig,
+        available_models: Vec<String>,
+        model_validator: impl AgentModelValidator + Send + Sync + 'static,
+        runner: R,
+    ) -> Self {
+        let mut available_models = available_models
+            .into_iter()
+            .filter(|model| is_safe_model_identifier(model))
+            .collect::<Vec<_>>();
+        available_models.sort();
+        available_models.dedup();
+        available_models.truncate(MAX_TASK_MODEL_SCHEMA_ENTRIES);
         Self {
             agents,
             skills,
             parent_model: parent_model.into(),
+            parent_request_config,
+            available_models,
             model_validator: Arc::new(model_validator),
+            model_resolution_diagnostics: None,
             runner: Arc::new(Mutex::new(runner)),
             active: Arc::new(AtomicUsize::new(0)),
             execution_ids: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    pub fn with_model_resolution_diagnostics(
+        mut self,
+        diagnostics: impl Fn(TaskModelResolutionError) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        self.model_resolution_diagnostics = Some(Arc::new(diagnostics));
+        self
+    }
+
     pub fn input_schema() -> Value {
         serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
+    }
+
+    pub fn catalog_input_schema(&self) -> Value {
+        let mut agents = self
+            .agents
+            .subagents()
+            .filter(|agent| agent.mode == AgentMode::Subagent)
+            .map(|agent| {
+                (
+                    agent.name.clone(),
+                    sanitized_schema_description(&agent.description),
+                )
+            })
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let names = agents
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let descriptions = agents
+            .iter()
+            .map(|(name, description)| format!("- {name}: {description}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let agent_description = format!("Eligible subagents:\n{descriptions}");
+
+        let mut schema = Self::input_schema();
+        let agent = &mut schema["properties"]["agent"];
+        agent["enum"] = Value::from(names);
+        agent["description"] = Value::from(agent_description);
+        schema["properties"]["model"]["enum"] = Value::from(self.available_models.clone());
+        schema
     }
 
     fn resolve_agent(&self, requested: Option<&str>) -> Result<&AgentDefinition, ToolOutput> {
@@ -430,13 +521,24 @@ impl<R> TaskTool<R> {
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let model = invocation
-            .model
-            .or_else(|| agent.model.clone())
-            .unwrap_or_else(|| self.parent_model.clone());
-        if self.model_validator.validate_model(&model).is_err() {
-            return Err(task_terminal(HeadlessTaskTerminal::ModelUnavailable));
-        }
+        let explicit_model = invocation.model.or_else(|| agent.model.clone());
+        let (model, request_config) = match explicit_model {
+            Some(model) => {
+                if self.model_validator.validate_model(&model).is_err() {
+                    return Err(self.model_unavailable_output());
+                }
+                let request_config = if model == self.parent_model {
+                    self.parent_request_config.clone()
+                } else {
+                    RequestConfig::default()
+                };
+                (model, request_config)
+            }
+            None => (
+                self.parent_model.clone(),
+                self.parent_request_config.clone(),
+            ),
+        };
 
         let skills = self.resolve_skills(agent, invocation.skills.as_deref())?;
         Ok(TaskTurnRequest {
@@ -444,9 +546,25 @@ impl<R> TaskTool<R> {
             agent_description: agent.description.clone(),
             system_prompt: agent.system_prompt.clone(),
             model,
+            request_config,
             skills,
             description: invocation.description,
         })
+    }
+
+    fn model_unavailable_output(&self) -> ToolOutput {
+        let mut output = task_terminal(HeadlessTaskTerminal::ModelUnavailable);
+        let reference = self
+            .model_resolution_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics(TaskModelResolutionError::ModelUnavailable))
+            .filter(|reference| is_diagnostic_reference(reference));
+        if let Some(reference) = reference {
+            output.content.push_str(" [ref: ");
+            output.content.push_str(&reference);
+            output.content.push(']');
+        }
+        output
     }
 
     fn resolve_skills(
@@ -477,6 +595,22 @@ impl<R> TaskTool<R> {
             })
             .collect()
     }
+}
+
+fn sanitized_schema_description(description: &str) -> String {
+    let normalized = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = normalized.to_ascii_lowercase();
+    if ["api_key", "authorization", "password", "secret", "token"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return "[redacted]".into();
+    }
+
+    normalized
+        .chars()
+        .take(MAX_TASK_AGENT_SCHEMA_DESCRIPTION_CHARS)
+        .collect()
 }
 
 impl<R: TaskRunner> DispatchTool for TaskTool<R> {
@@ -665,6 +799,21 @@ fn finish_task_call(
 
 fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
     ToolOutput::task_terminal(terminal)
+}
+
+fn is_diagnostic_reference(reference: &str) -> bool {
+    reference.len() == 8
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_safe_model_identifier(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_TASK_MODEL_CHARS
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
 }
 
 struct TaskPermit {

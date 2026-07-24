@@ -12,14 +12,16 @@ use std::{
 
 use agens_core::{
     AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ReasoningEffort,
+    RequestConfig, ToolAccess,
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskExecutionEvent,
-    TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode, TaskRunContext, TaskRunner,
-    TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode, TaskModelResolutionError,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
+    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -592,6 +594,230 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
         TaskTool::<RecordingTaskRunner>::input_schema(),
         serde_json::json!({"type":"object","additionalProperties":false,"required":["description"],"properties":{"agent":{"type":"string","minLength":1,"maxLength":64},"background":{"type":"boolean"},"description":{"type":"string","minLength":1,"maxLength":16384},"model":{"type":"string","minLength":1,"maxLength":64},"skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}}})
     );
+    assert_eq!(
+        task.catalog_input_schema()["properties"]["agent"]["enum"],
+        serde_json::json!(["worker", "zfallback", "zmissing"])
+    );
+    assert_eq!(
+        task.catalog_input_schema()["properties"]["agent"]["description"],
+        "Eligible subagents:\n- worker: worker agent\n- zfallback: fallback agent\n- zmissing: missing skill"
+    );
+}
+
+#[test]
+fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let missing = temporary.path.join("missing");
+    fs::create_dir_all(&agents).unwrap();
+    write_agent(&agents, "inherited", "inherited agent", "subagent");
+    fs::write(
+        agents.join("explicit.md"),
+        "---\nname: explicit\ndescription: explicit agent\nmode: subagent\nmodel: worker-model\n---\nexplicit instructions\n",
+    )
+    .unwrap();
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let parent_config = RequestConfig::with_reasoning_effort("high").unwrap();
+    let mut task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        parent_config,
+        vec![
+            "worker-model".to_owned(),
+            "parent-model".to_owned(),
+            "override-model".to_owned(),
+        ],
+        TaskModels,
+        CapturingTaskRunner(Arc::clone(&calls)),
+    );
+    let context = task_context();
+
+    assert!(
+        !task
+            .execute(
+                &context,
+                serde_json::json!({"agent":"inherited","description":"inherit"}),
+            )
+            .unwrap()
+            .is_error
+    );
+    assert!(
+        !task
+            .execute(
+                &context,
+                serde_json::json!({"agent":"explicit","description":"override"}),
+            )
+            .unwrap()
+            .is_error
+    );
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![
+            ("parent-model".to_owned(), Some(ReasoningEffort::High)),
+            ("worker-model".to_owned(), None),
+        ]
+    );
+    assert_eq!(
+        task.catalog_input_schema()["properties"]["model"]["enum"],
+        serde_json::json!(["override-model", "parent-model", "worker-model"])
+    );
+}
+
+#[test]
+fn unavailable_explicit_task_model_reports_once_without_running_the_child() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let missing = temporary.path.join("missing");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(
+        agents.join("worker.md"),
+        "---\nname: worker\ndescription: worker agent\nmode: subagent\nmodel: unavailable\n---\nworker instructions\n",
+    )
+    .unwrap();
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let diagnostic_probe = Arc::clone(&diagnostics);
+    let mut task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::default(),
+        vec!["parent-model".to_owned(), "worker-model".to_owned()],
+        TaskModels,
+        CountingTaskRunner(Arc::clone(&calls)),
+    )
+    .with_model_resolution_diagnostics(move |error| {
+        diagnostic_probe.lock().unwrap().push(error);
+        Some("abc12345".to_owned())
+    });
+
+    let output = task
+        .execute(
+            &task_context(),
+            serde_json::json!({"agent":"worker","description":"reject"}),
+        )
+        .unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::failure("task: requested model is unavailable [ref: abc12345]")
+    );
+    assert_eq!(
+        output.terminal(),
+        Some(HeadlessTaskTerminal::ModelUnavailable)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        *diagnostics.lock().unwrap(),
+        vec![TaskModelResolutionError::ModelUnavailable]
+    );
+}
+
+#[test]
+fn task_schema_bounds_and_sanitizes_the_effective_model_catalog() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let missing = temporary.path.join("missing");
+    fs::create_dir_all(&agents).unwrap();
+    write_agent(&agents, "worker", "worker agent", "subagent");
+    let agents = AgentCatalog::discover(&[], &agents, &missing)
+        .unwrap()
+        .catalog()
+        .clone();
+    let mut models = (0..300)
+        .map(|index| format!("model-{index:03}"))
+        .collect::<Vec<_>>();
+    models.extend([
+        "model-001".to_owned(),
+        "unsafe model".to_owned(),
+        "token=PRIVATE_MODEL_SENTINEL".to_owned(),
+        "x".repeat(65),
+    ]);
+    let task = TaskTool::from_catalogs_with_parent_config(
+        agents,
+        SkillCatalog::default(),
+        "parent-model",
+        RequestConfig::default(),
+        models,
+        TaskModels,
+        CountingTaskRunner(Arc::new(AtomicUsize::new(0))),
+    );
+
+    let schema = task.catalog_input_schema();
+    let model_enum = schema["properties"]["model"]["enum"]
+        .as_array()
+        .expect("model catalog should be an enum");
+    assert_eq!(model_enum.len(), 256);
+    assert_eq!(model_enum[0], "model-000");
+    assert_eq!(model_enum[255], "model-255");
+    assert!(!schema.to_string().contains("PRIVATE_MODEL_SENTINEL"));
+}
+
+#[test]
+fn task_schema_exposes_only_sanitized_subagent_metadata() {
+    let temporary = TemporaryDirectory::new();
+    let agents = temporary.path.join("agents");
+    let skills = temporary.path.join("skills");
+    fs::create_dir_all(&agents).unwrap();
+    fs::create_dir_all(&skills).unwrap();
+    fs::write(
+        agents.join("alpha.md"),
+        "---\nname: alpha\ndescription: contains token=PRIVATE_SCHEMA_SENTINEL\nmode: subagent\nskills:\n  - internal\n---\nPRIVATE_PROMPT_SENTINEL\n",
+    )
+    .unwrap();
+    write_agent(&agents, "all", "all agent", "all");
+    write_agent(&agents, "primary", "primary agent", "primary");
+    write_agent(&agents, "zeta", &"z".repeat(256), "subagent");
+    fs::create_dir_all(skills.join("internal")).unwrap();
+    fs::write(
+        skills.join("internal/SKILL.md"),
+        "---\nname: internal\ndescription: INTERNAL_SKILL_SENTINEL\n---\nPRIVATE_SKILL_BODY_SENTINEL\n",
+    )
+    .unwrap();
+
+    let agents = AgentCatalog::discover(&[], &agents, &temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let skills = SkillCatalog::discover(&skills, temporary.path.join("missing"))
+        .unwrap()
+        .catalog()
+        .clone();
+    let task = TaskTool::from_catalogs_with_model_validator(
+        agents,
+        skills,
+        "parent-model",
+        TaskModels,
+        RecordingTaskRunner,
+    );
+
+    let schema = task.catalog_input_schema();
+    assert_eq!(
+        schema["properties"]["agent"]["enum"],
+        serde_json::json!(["alpha", "zeta"])
+    );
+    let rendered = schema.to_string();
+    for private in [
+        "PRIVATE_SCHEMA_SENTINEL",
+        "PRIVATE_PROMPT_SENTINEL",
+        "INTERNAL_SKILL_SENTINEL",
+        "PRIVATE_SKILL_BODY_SENTINEL",
+        temporary.path.to_str().unwrap(),
+    ] {
+        assert!(!rendered.contains(private), "schema leaked {private}");
+    }
+    assert!(rendered.contains("[redacted]"));
+    assert!(!rendered.contains(&"z".repeat(161)));
 }
 
 #[test]
@@ -1337,6 +1563,27 @@ impl TaskRunner for CountingTaskRunner {
         self.0.fetch_add(1, Ordering::AcqRel);
         Ok(TaskTurnResult {
             output: "unexpected child execution".into(),
+            iterations: 1,
+        })
+    }
+}
+
+type CapturedTaskModels = Arc<Mutex<Vec<(String, Option<ReasoningEffort>)>>>;
+
+struct CapturingTaskRunner(CapturedTaskModels);
+
+impl TaskRunner for CapturingTaskRunner {
+    fn run(
+        &mut self,
+        request: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.0.lock().unwrap().push((
+            request.model().to_owned(),
+            request.request_config().reasoning_effort(),
+        ));
+        Ok(TaskTurnResult {
+            output: "captured".into(),
             iterations: 1,
         })
     }

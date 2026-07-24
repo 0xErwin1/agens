@@ -3,8 +3,11 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc::Receiver};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
@@ -24,8 +27,10 @@ use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
 };
 use agens_providers::{
-    ChatGptAuthState, ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
-    ProgressAwareProvider, load_chatgpt_auth_state,
+    ChatGptAuthState, ChatGptResponsesProvider, DiagnosticRef, OpenAiFunctionTool,
+    OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
+    ProviderDiagnosticComponent, ProviderDiagnosticEvent, ProviderDiagnosticKind,
+    ProviderDiagnosticScope, ProviderDiagnostics, load_chatgpt_auth_state,
 };
 use agens_store::{PermissionGrantStore, SessionStore, StoredSession};
 #[cfg(test)]
@@ -37,16 +42,16 @@ use agens_tools::{
     McpStatusHandle, McpStatusSnapshot, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
     PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, SkillResourceTool,
-    TaskExecutionEvent, TaskExecutionLifecycle, TaskLaunchMode, TaskRunContext, TaskRunner,
-    TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
-    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskExecutionEvent, TaskExecutionLifecycle, TaskLaunchMode, TaskModelResolutionError,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
     Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiExecutionEvent,
     TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiPresentation,
-    TuiProviderOutcome, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubagentErrorKind,
-    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    TuiProviderOutcome, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent,
+    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
     run_with_default_progress_submit_with_permissions,
 };
 
@@ -59,10 +64,15 @@ pub use model_registry::{TuiModelSelector, TuiModelSource};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
+const DIAGNOSTIC_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
+const DIAGNOSTIC_FILE_COUNT_LIMIT: usize = 4;
+static DIAGNOSTIC_REFERENCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static DIAGNOSTIC_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
     "connect",
     "disconnect",
+    "diagnostics",
     "effort",
     "help",
     "mcp",
@@ -79,6 +89,12 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
 const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("connect", "Connect to ChatGPT", "[--device-auth]", None),
     ("disconnect", "Disconnect ChatGPT credentials", "", None),
+    (
+        "diagnostics",
+        "Show sanitized runtime diagnostics",
+        "",
+        Some("diagnostics"),
+    ),
     ("new", "Start a new session", "", None),
     ("sessions", "List saved sessions", "", None),
     ("resume", "Resume a saved session", "<id>", None),
@@ -101,6 +117,212 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("select", "Select a project file", "", Some("select")),
     ("quit", "Exit Agens", "", None),
 ];
+
+#[derive(Clone)]
+struct SafeDiagnosticStore {
+    directory: PathBuf,
+}
+
+impl SafeDiagnosticStore {
+    fn new(data_directory: PathBuf) -> Self {
+        Self {
+            directory: data_directory.join("diagnostics"),
+        }
+    }
+
+    fn record(&self, event: &ProviderDiagnosticEvent) {
+        let _guard = DIAGNOSTIC_FILE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = self.write(event);
+    }
+
+    fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
+        ensure_private_diagnostics_directory(&self.directory)?;
+        let line = diagnostic_json_line(event)?;
+        let active = self.active_path();
+        let existing_size = match fs::symlink_metadata(&active) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "diagnostics path is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if existing_size.saturating_add(line.len() as u64) > DIAGNOSTIC_FILE_LIMIT_BYTES {
+            self.rotate()?;
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(active)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&line)
+    }
+
+    fn active_path(&self) -> PathBuf {
+        self.directory
+            .join(format!("agens-{}.jsonl", std::process::id()))
+    }
+
+    fn rotated_path(&self, generation: usize) -> PathBuf {
+        self.directory
+            .join(format!("agens-{}.{}.jsonl", std::process::id(), generation))
+    }
+
+    fn rotate(&self) -> std::io::Result<()> {
+        let oldest = self.rotated_path(DIAGNOSTIC_FILE_COUNT_LIMIT - 1);
+        match fs::remove_file(oldest) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        for generation in (1..DIAGNOSTIC_FILE_COUNT_LIMIT - 1).rev() {
+            let source = self.rotated_path(generation);
+            let destination = self.rotated_path(generation + 1);
+            match fs::rename(source, destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match fs::rename(self.active_path(), self.rotated_path(1)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn ensure_private_diagnostics_directory(directory: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        }
+        Ok(_) => Err(std::io::Error::other("diagnostics path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(directory)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<u8>> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
+        "reference": event.reference.as_str(),
+        "scope": event.scope.as_str(),
+        "component": event.component.as_str(),
+        "event": event.event.as_str(),
+        "attempt": event.attempt,
+        "max_attempts": event.max_attempts,
+        "delay_ms": event.delay_ms,
+        "status": event.status,
+        "class": event.class.map(ProviderDiagnosticClass::as_str),
+    }))
+    .map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+struct OperationDiagnostics {
+    reference: String,
+    provider: ProviderDiagnostics,
+}
+
+fn operation_diagnostics(
+    bootstrap: &Bootstrap,
+    scope: ProviderDiagnosticScope,
+    reference: Option<&str>,
+) -> OperationDiagnostics {
+    let reference = reference.map_or_else(next_diagnostic_reference, str::to_owned);
+    let store = SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf());
+    let sink = Arc::new(move |event: ProviderDiagnosticEvent| store.record(&event));
+    let provider = ProviderDiagnostics::new(reference.clone(), scope, sink)
+        .expect("generated diagnostics references are valid");
+    OperationDiagnostics {
+        reference,
+        provider,
+    }
+}
+
+fn next_diagnostic_reference() -> String {
+    let sequence = DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mixed = timestamp
+        .rotate_left(17)
+        .wrapping_add(sequence.wrapping_mul(0x9e37_79b9))
+        ^ u64::from(std::process::id());
+    format!("{:08x}", mixed as u32)
+}
+
+fn record_subagent_terminal(
+    bootstrap: &Bootstrap,
+    reference: &str,
+    class: ProviderDiagnosticClass,
+) {
+    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
+        return;
+    };
+    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
+        &ProviderDiagnosticEvent {
+            reference,
+            scope: ProviderDiagnosticScope::Subagent,
+            component: ProviderDiagnosticComponent::Subagent,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(class),
+        },
+    );
+}
+
+fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
+    if error.message == agens_core::HeadlessTaskTerminal::ModelUnavailable.message() {
+        return;
+    }
+    let class = match error.category {
+        "auth" => ProviderDiagnosticClass::Authentication,
+        "cancelled" => ProviderDiagnosticClass::Cancelled,
+        "provider" => ProviderDiagnosticClass::Provider,
+        "timeout" => ProviderDiagnosticClass::Deadline,
+        "tool" => ProviderDiagnosticClass::Tool,
+        _ => ProviderDiagnosticClass::Runtime,
+    };
+    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
+        return;
+    };
+    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
+        &ProviderDiagnosticEvent {
+            reference,
+            scope: ProviderDiagnosticScope::Parent,
+            component: ProviderDiagnosticComponent::Responses,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(class),
+        },
+    );
+}
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
@@ -339,6 +561,13 @@ impl CliError {
             category,
             message: message.into(),
         }
+    }
+
+    fn with_diagnostic_reference(mut self, reference: &str) -> Self {
+        self.message.push_str(" [ref: ");
+        self.message.push_str(reference);
+        self.message.push(']');
+        self
     }
 }
 
@@ -1368,6 +1597,7 @@ struct TuiSessionContext {
     identifier: Option<i64>,
     metadata: Option<SessionMetadata>,
     messages: Vec<Message>,
+    restored_history: Vec<Conversation>,
     active_agent: Option<ActiveAgentRuntime>,
     pending_system_reminder: Option<String>,
     selection: Option<TuiModelSelector>,
@@ -1539,25 +1769,16 @@ fn session_dialog_entry(
     let attempt_status = session
         .latest_attempt
         .as_ref()
-        .map(|attempt| format!(" · {}", session_attempt_status_label(attempt.status())))
+        .map(|attempt| {
+            format!(
+                " · Attempt: {}",
+                session_attempt_status_label(attempt.status())
+            )
+        })
         .unwrap_or_default();
-    let row_detail = if let Some(root) = root.as_deref() {
-        format!(
-            "{turns}{root} · {age} · {}{}{}",
-            metadata.active_agent,
-            current.unwrap_or_default(),
-            attempt_status,
-        )
-    } else {
-        format!(
-            "{turns} · {age} · {}{}{}",
-            metadata.active_agent,
-            current.unwrap_or_default(),
-            attempt_status,
-        )
-    };
+    let row_detail = format!("{turns} · {age}");
     let selected_detail = format!(
-        "Turns: {} · Agent: {}{}\nProvider: {} · Model: {}\nEffort: {} · Updated: {} ({}){} · ID: {} · {}",
+        "Turns: {} · Agent: {}{}\nProvider: {} · Model: {}\nEffort: {} · Updated: {} ({}){} · ID: {} · {}{}",
         metadata.completed_turn_count,
         metadata.active_agent,
         current.unwrap_or_default(),
@@ -1578,6 +1799,7 @@ fn session_dialog_entry(
         root.as_deref().unwrap_or_default(),
         metadata.id,
         metadata.title,
+        attempt_status,
     );
 
     DialogEntry::action_with_metadata(
@@ -1667,6 +1889,7 @@ impl TuiSessionContext {
         Self::default()
     }
 
+    #[cfg(test)]
     fn resumed(
         identifier: i64,
         metadata: SessionMetadata,
@@ -1677,7 +1900,31 @@ impl TuiSessionContext {
             identifier: Some(identifier),
             metadata: Some(metadata),
             messages,
+            restored_history: Vec::new(),
             active_agent: Some(active_agent),
+            pending_system_reminder: None,
+            selection: None,
+            provider: None,
+            chatgpt_unavailable: false,
+            resume_error: None,
+            selected_subagent: None,
+            dangerous_mode: false,
+            running: false,
+        }
+    }
+
+    fn restored(
+        identifier: i64,
+        metadata: SessionMetadata,
+        messages: Vec<Message>,
+        restored_history: Vec<Conversation>,
+    ) -> Self {
+        Self {
+            identifier: Some(identifier),
+            metadata: Some(metadata),
+            messages,
+            restored_history,
+            active_agent: None,
             pending_system_reminder: None,
             selection: None,
             provider: None,
@@ -1896,7 +2143,9 @@ impl TuiRuntimeRouter {
         skills: Arc<SkillCatalog>,
         auth: ChatGptAuthCoordinator,
     ) -> Self {
-        let palette = resolved_tui_palette(&commands, &skills).into();
+        let has_subagents =
+            tui_subagent_catalog(&bootstrap).is_ok_and(|mut agents| agents.next().is_some());
+        let palette = resolved_tui_palette(&commands, &skills, has_subagents).into();
         let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
         let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
             &bootstrap,
@@ -1969,10 +2218,20 @@ impl TuiRuntimeRouter {
         self.route_with_progress(input, progress)
     }
 
+    #[cfg(test)]
     fn route_with_progress(
         &self,
         input: String,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> TuiSubmissionOutcome {
+        self.route_with_progress_cancellable(input, progress, TuiRouteCancellation::new())
+    }
+
+    fn route_with_progress_cancellable(
+        &self,
+        input: String,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+        cancellation: TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
         let command = input.trim();
         let auth = match command {
@@ -1982,23 +2241,39 @@ impl TuiRuntimeRouter {
         if let Some(result) = auth {
             return auth_route_outcome(result);
         }
-        self.resolve(input)
+        self.resolve_with_cancellation(input, &cancellation)
             .unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
                 message: error.to_string(),
                 action: TUI_ERROR_ACTION.into(),
             })
     }
 
+    #[cfg(test)]
     fn route_request(
         &self,
         request: TuiRouteRequest,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
     ) -> TuiSubmissionOutcome {
+        self.route_request_with_cancellation(request, progress, TuiRouteCancellation::new())
+    }
+
+    fn route_request_with_cancellation(
+        &self,
+        request: TuiRouteRequest,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+        cancellation: TuiRouteCancellation,
+    ) -> TuiSubmissionOutcome {
         let result = match request {
-            TuiRouteRequest::Input(input) => return self.route_with_progress(input, progress),
+            TuiRouteRequest::Input(input) => {
+                return self.route_with_progress_cancellable(input, progress, cancellation);
+            }
             TuiRouteRequest::OpenDialog(route_id) => self.open_dialog(&route_id),
             TuiRouteRequest::DialogAction(action_id) => {
-                return self.route_dialog_action(&action_id, progress);
+                return self.route_dialog_action_with_cancellation(
+                    &action_id,
+                    progress,
+                    &cancellation,
+                );
             }
         };
         result.unwrap_or_else(|error| TuiSubmissionOutcome::LocalActionableError {
@@ -2027,6 +2302,7 @@ impl TuiRuntimeRouter {
                     DialogEntry::cancel("Cancel"),
                 ],
             ),
+            "diagnostics" => diagnostics_dialog(bootstrap.data_directory()),
             "provider" => {
                 let context = self
                     .session
@@ -2239,17 +2515,13 @@ impl TuiRuntimeRouter {
                 DialogView::selection("Choose agent", Some("Eligible primary agents"), entries)
             }
             "subagent" => {
-                let entries =
-                    std::iter::once(DialogEntry::disabled("main", "Primary conversation agent"))
-                        .chain(tui_subagent_catalog(&bootstrap)?.map(|agent| {
-                            DialogEntry::action(&agent.name, format!("subagent:{}", agent.name))
-                        }))
-                        .collect();
-                DialogView::selection(
-                    "Choose subagent",
-                    Some("Eligible configured subagents"),
-                    entries,
-                )
+                let entries = tui_subagent_catalog(&bootstrap)?
+                    .map(|agent| {
+                        DialogEntry::action(&agent.name, format!("subagent:{}", agent.name))
+                    })
+                    .collect();
+                DialogView::selection("Choose subagent", Some("Eligible subagents"), entries)
+                    .with_empty_message("No eligible subagents are available.")
             }
             _ => return Err(CliError::usage("TUI dialog is unavailable")),
         };
@@ -2260,10 +2532,24 @@ impl TuiRuntimeRouter {
         }
     }
 
+    #[cfg(test)]
     fn route_dialog_action(
         &self,
         action_id: &str,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) -> TuiSubmissionOutcome {
+        self.route_dialog_action_with_cancellation(
+            action_id,
+            progress,
+            &TuiRouteCancellation::new(),
+        )
+    }
+
+    fn route_dialog_action_with_cancellation(
+        &self,
+        action_id: &str,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+        cancellation: &TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
         match action_id {
             "connect:browser" => {
@@ -2275,81 +2561,76 @@ impl TuiRuntimeRouter {
             "disconnect:confirm" => return auth_route_outcome(self.disconnect()),
             _ => {}
         }
-        let result = (|| {
-            let bootstrap = self.bootstrap()?;
-            if action_id == "select:cancel" {
-                return Ok(TuiSubmissionOutcome::SelectionCancelled);
-            }
-            if let Some(path) = action_id.strip_prefix("select:") {
-                return selected_tui_file(&bootstrap, path).map(|path| {
-                    TuiSubmissionOutcome::SelectionInfo(format!("Selected file: {path}"))
-                });
-            }
-            if let Some(key) = parse_recovery_action(action_id) {
-                return self.recover_tui_session_attempt(&bootstrap, key);
-            }
-            if let Some(identifier) = action_id.strip_prefix("session:") {
-                let identifier = identifier
-                    .parse()
-                    .map_err(|_| CliError::usage("session action is invalid"))?;
-                let store = SessionStore::open(bootstrap.data_directory())
-                    .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-                let stored = store
-                    .load_session_for_resume(identifier)
-                    .map_err(|_| CliError::storage("saved session is unavailable"))?;
-                if stored.metadata.project != tui_project_identifier(&bootstrap)? {
-                    return Err(CliError::storage("saved session is unavailable"));
+        let result =
+            (|| {
+                let bootstrap = self.bootstrap()?;
+                if action_id == "select:cancel" {
+                    return Ok(TuiSubmissionOutcome::SelectionCancelled);
                 }
-                if let Some(attempt) = stored
-                    .latest_attempt
-                    .as_ref()
-                    .filter(|attempt| attempt.status() == agens_core::SessionAttemptStatus::Running)
-                {
-                    return Ok(TuiSubmissionOutcome::Dialog(recovery_confirmation_dialog(
-                        &stored.metadata,
-                        attempt,
-                        None,
-                    )));
+                if let Some(path) = action_id.strip_prefix("select:") {
+                    return selected_tui_file(&bootstrap, path).map(|path| {
+                        TuiSubmissionOutcome::SelectionInfo(format!("Selected file: {path}"))
+                    });
                 }
-                let resumed =
-                    resume_tui_session(&bootstrap, identifier, &self.skills, &self.credentials)?;
-                let message = resumed.note();
-                let messages = resumed.messages.clone();
-                let mut session = self
-                    .session
-                    .lock()
-                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                if session.running {
-                    return Err(CliError::runtime(HeadlessTurnError::State));
+                if let Some(key) = parse_recovery_action(action_id) {
+                    return self.recover_tui_session_attempt(&bootstrap, key);
                 }
-                *session = resumed;
-                drop(session);
-                return Ok(TuiSubmissionOutcome::SessionResumed {
+                if let Some(identifier) = action_id.strip_prefix("session:") {
+                    let expected = self
+                        .session
+                        .lock()
+                        .map_err(|_| CliError::storage("TUI session is unavailable"))?
+                        .clone();
+                    let identifier = identifier
+                        .parse()
+                        .map_err(|_| CliError::usage("session action is invalid"))?;
+                    let stored = load_tui_session_for_resume(&bootstrap, identifier)?;
+                    if stored.metadata.project != tui_project_identifier(&bootstrap)? {
+                        return Err(CliError::storage("saved session is unavailable"));
+                    }
+                    if let Some(attempt) = stored.latest_attempt.as_ref().filter(|attempt| {
+                        attempt.status() == agens_core::SessionAttemptStatus::Running
+                    }) {
+                        return Ok(TuiSubmissionOutcome::Dialog(recovery_confirmation_dialog(
+                            &stored.metadata,
+                            attempt,
+                            None,
+                        )));
+                    }
+                    let resumed = prepare_loaded_tui_session_resume(
+                        &bootstrap,
+                        identifier,
+                        stored,
+                        &self.credentials,
+                    )?;
+                    return commit_tui_session_resume(
+                        &bootstrap,
+                        &self.session,
+                        &expected,
+                        resumed,
+                        cancellation,
+                    );
+                }
+                let message = if let Some(model) = action_id.strip_prefix("model:") {
+                    apply_tui_model(&bootstrap, model, &self.session)?
+                } else if let Some(model) = action_id.strip_prefix("model-custom:") {
+                    apply_tui_unverified_model(&bootstrap, model, &self.session)?
+                } else if let Some(provider) = action_id.strip_prefix("provider:") {
+                    self.apply_provider(&bootstrap, provider)?
+                } else if let Some(effort) = action_id.strip_prefix("effort:") {
+                    apply_tui_effort(&bootstrap, effort, &self.session)?
+                } else if let Some(agent) = action_id.strip_prefix("agent:") {
+                    rotate_tui_agent(&bootstrap, agent, &self.session, &self.skills)?
+                } else if let Some(agent) = action_id.strip_prefix("subagent:") {
+                    select_tui_subagent(&bootstrap, agent, &self.session)?
+                } else {
+                    return Err(CliError::usage("TUI dialog action is unavailable"));
+                };
+                Ok(TuiSubmissionOutcome::ContextChanged {
                     message,
                     presentation: self.presentation()?,
-                    messages,
-                });
-            }
-            let message = if let Some(model) = action_id.strip_prefix("model:") {
-                apply_tui_model(&bootstrap, model, &self.session)?
-            } else if let Some(model) = action_id.strip_prefix("model-custom:") {
-                apply_tui_unverified_model(&bootstrap, model, &self.session)?
-            } else if let Some(provider) = action_id.strip_prefix("provider:") {
-                self.apply_provider(&bootstrap, provider)?
-            } else if let Some(effort) = action_id.strip_prefix("effort:") {
-                apply_tui_effort(&bootstrap, effort, &self.session)?
-            } else if let Some(agent) = action_id.strip_prefix("agent:") {
-                rotate_tui_agent(&bootstrap, agent, &self.session, &self.skills)?
-            } else if let Some(agent) = action_id.strip_prefix("subagent:") {
-                select_tui_subagent(&bootstrap, agent, &self.session)?
-            } else {
-                return Err(CliError::usage("TUI dialog action is unavailable"));
-            };
-            Ok(TuiSubmissionOutcome::ContextChanged {
-                message,
-                presentation: self.presentation()?,
-            })
-        })();
+                })
+            })();
         match result {
             Ok(outcome) => outcome,
             Err(error) if action_id.starts_with("select:") => {
@@ -2422,7 +2703,16 @@ impl TuiRuntimeRouter {
         &self.palette
     }
 
+    #[cfg(test)]
     fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
+        self.resolve_with_cancellation(input, &TuiRouteCancellation::new())
+    }
+
+    fn resolve_with_cancellation(
+        &self,
+        input: String,
+        cancellation: &TuiRouteCancellation,
+    ) -> Result<TuiSubmissionOutcome, CliError> {
         if !input.starts_with('/') {
             return Ok(TuiSubmissionOutcome::ProviderTurn {
                 display: input.clone(),
@@ -2449,6 +2739,7 @@ impl TuiRuntimeRouter {
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
             "/disconnect" => self.open_dialog("disconnect")?,
+            "/diagnostics" => self.open_dialog("diagnostics")?,
             "/provider" => self.open_dialog("provider")?,
             command if command.starts_with("/provider ") => TuiSubmissionOutcome::ContextChanged {
                 message: self.apply_provider(&bootstrap, &command[10..])?,
@@ -2467,7 +2758,12 @@ impl TuiRuntimeRouter {
                 }
             }
             command if command.starts_with("/resume ") => {
-                if tui_session_is_running(&self.session)? {
+                let expected = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?
+                    .clone();
+                if expected.running {
                     return Err(CliError::runtime(HeadlessTurnError::State));
                 }
                 let identifier = command[8..]
@@ -2476,21 +2772,13 @@ impl TuiRuntimeRouter {
                     .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
                 let resumed =
                     resume_tui_session(&bootstrap, identifier, &self.skills, &self.credentials)?;
-                let message = resumed.note();
-                let messages = resumed.messages.clone();
-                let mut session = self.session.lock().map_err(|_| {
-                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
-                })?;
-                if session.running {
-                    return Err(CliError::runtime(HeadlessTurnError::State));
-                }
-                *session = resumed;
-                drop(session);
-                TuiSubmissionOutcome::SessionResumed {
-                    message,
-                    presentation: self.presentation()?,
-                    messages,
-                }
+                commit_tui_session_resume(
+                    &bootstrap,
+                    &self.session,
+                    &expected,
+                    resumed,
+                    cancellation,
+                )?
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
                 message: rotate_tui_agent(&bootstrap, &command[7..], &self.session, &self.skills)?,
@@ -2547,44 +2835,7 @@ impl TuiRuntimeRouter {
             .session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-        let model = session
-            .selection
-            .as_ref()
-            .map(TuiModelSelector::model)
-            .or_else(|| {
-                session
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.model_id.as_deref())
-            })
-            .or_else(|| {
-                session
-                    .active_agent
-                    .as_ref()
-                    .and_then(|agent| agent.model.as_deref())
-            })
-            .or_else(|| bootstrap.model())
-            .unwrap_or_else(|| default_model(&bootstrap));
-        let provider = session
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.provider_id.as_deref())
-            .or_else(|| current_tui_provider(&bootstrap, &session).map(TuiProvider::identifier))
-            .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
-        let label = session
-            .identifier
-            .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
-        let effort = session
-            .selection
-            .as_ref()
-            .and_then(TuiModelSelector::reasoning_effort)
-            .map(str::to_owned);
-        let mut presentation = TuiPresentation::new(provider, model, label)
-            .with_dangerous_mode(session.dangerous_mode);
-        if let Some(effort) = effort {
-            presentation = presentation.with_effort(effort);
-        }
-        Ok(presentation)
+        Ok(tui_session_presentation(&bootstrap, &session))
     }
 
     fn toggle_dangerous_mode(&self) -> Result<TuiSubmissionOutcome, CliError> {
@@ -2623,6 +2874,9 @@ impl TuiRuntimeRouter {
         }
         let provider = current_tui_provider(&bootstrap, &context)
             .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
+        if let Some(selection) = &context.selection {
+            bootstrap.model = Some(selection.model().to_owned());
+        }
         drop(context);
 
         bootstrap.provider_type = Some(provider.identifier().into());
@@ -2648,6 +2902,19 @@ impl TuiRuntimeRouter {
             }
         };
         Ok(bootstrap)
+    }
+
+    fn task_parent_request_config(&self) -> Result<agens_core::RequestConfig, CliError> {
+        self.session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))
+            .map(|context| {
+                context
+                    .selection
+                    .as_ref()
+                    .map(|selection| selection.request_config().clone())
+                    .unwrap_or_default()
+            })
     }
 
     fn connect(
@@ -2972,6 +3239,16 @@ fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
     )
 }
 
+fn explicit_task_delegation_prompt(base: &str) -> String {
+    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline.";
+
+    if base.contains(INSTRUCTION) {
+        base.to_owned()
+    } else {
+        format!("{base}\n\n{INSTRUCTION}")
+    }
+}
+
 fn report_tui_extension_collisions<E: TuiEngine>(
     tui: &mut Tui<E>,
     commands: &CommandCatalog,
@@ -2988,7 +3265,11 @@ fn report_tui_extension_collisions<E: TuiEngine>(
     }
 }
 
-fn resolved_tui_palette(commands: &CommandCatalog, skills: &SkillCatalog) -> Vec<PaletteEntry> {
+fn resolved_tui_palette(
+    commands: &CommandCatalog,
+    skills: &SkillCatalog,
+    has_subagents: bool,
+) -> Vec<PaletteEntry> {
     let mut entries = TUI_PALETTE_BUILT_INS
         .iter()
         .map(|(name, description, hint, dialog_id)| {
@@ -3001,6 +3282,17 @@ fn resolved_tui_palette(commands: &CommandCatalog, skills: &SkillCatalog) -> Vec
             dialog_id.map_or(entry.clone(), |route| entry.with_dialog(route))
         })
         .collect::<Vec<_>>();
+    if has_subagents {
+        entries.push(
+            PaletteEntry::new(
+                "subagent",
+                "Choose an eligible configured subagent",
+                "[name]",
+                PaletteEntryKind::BuiltIn,
+            )
+            .with_dialog("subagent"),
+        );
+    }
     let mut custom_commands = commands
         .iter()
         .filter(|command| !RESERVED_TUI_COMMANDS.contains(&command.name()))
@@ -3086,6 +3378,145 @@ fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
     .with_empty_message("No MCP servers configured.")
 }
 
+fn diagnostics_dialog(data_directory: &Path) -> DialogView {
+    let directory = data_directory.join("diagnostics");
+    let safe_directory =
+        fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir());
+    let mut files = match safe_directory.then(|| fs::read_dir(&directory)) {
+        Some(Ok(entries)) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                is_diagnostic_file_name(&name).then_some((name, entry.path()))
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut entries = Vec::new();
+    for (name, path) in files {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.len() > DIAGNOSTIC_FILE_LIMIT_BYTES {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let relative_path = format!("diagnostics/{name}");
+        entries.extend(content.lines().filter_map(|line| {
+            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+            safe_diagnostic_entry(&value, &relative_path)
+        }));
+    }
+
+    DialogView::read_only(
+        "Runtime diagnostics",
+        Some("Sanitized local events | Type to search | Enter details | Esc close"),
+        entries,
+        "diagnostics",
+    )
+    .with_empty_message("No runtime diagnostics are available.")
+}
+
+fn is_diagnostic_file_name(name: &str) -> bool {
+    let Some(identifier) = name
+        .strip_prefix("agens-")
+        .and_then(|name| name.strip_suffix(".jsonl"))
+    else {
+        return false;
+    };
+    let mut parts = identifier.split('.');
+    let Some(process) = parts.next() else {
+        return false;
+    };
+    if process.is_empty() || !process.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(generation), None) => matches!(generation, "1" | "2" | "3"),
+        _ => false,
+    }
+}
+
+fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Option<DialogEntry> {
+    let object = value.as_object()?;
+    let timestamp = object.get("timestamp_ms")?.as_u64()?;
+    let reference = object.get("reference")?.as_str()?;
+    DiagnosticRef::new(reference.to_owned()).ok()?;
+    let scope =
+        allowlisted_diagnostic_value(object.get("scope")?.as_str()?, &["parent", "subagent"])?;
+    let component = allowlisted_diagnostic_value(
+        object.get("component")?.as_str()?,
+        &["responses", "oauth_refresh", "subagent"],
+    )?;
+    let event = allowlisted_diagnostic_value(
+        object.get("event")?.as_str()?,
+        &["attempt", "retry_scheduled", "terminal"],
+    )?;
+    let attempt = object
+        .get("attempt")?
+        .as_u64()
+        .filter(|attempt| *attempt <= 3)?;
+    let max_attempts = object
+        .get("max_attempts")?
+        .as_u64()
+        .filter(|attempts| *attempts <= 3)?;
+    let delay = optional_bounded_u64(object.get("delay_ms"), 5_000)?;
+    let status = optional_bounded_u64(object.get("status"), 599)?;
+    let class = match object.get("class") {
+        Some(serde_json::Value::String(class)) => Some(allowlisted_diagnostic_value(
+            class,
+            &[
+                "authentication",
+                "cancelled",
+                "context",
+                "deadline",
+                "model_unavailable",
+                "network",
+                "provider",
+                "protocol",
+                "rate_limited",
+                "rejected",
+                "runtime",
+                "server",
+                "tool",
+            ],
+        )?),
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => return None,
+    };
+    let class_label = class.unwrap_or("success");
+    let status_label = status.map_or_else(|| "none".into(), |status| status.to_string());
+    let delay_label = delay.map_or_else(|| "none".into(), |delay| format!("{delay}ms"));
+    let label = format!("[ref: {reference}] {scope} · {component} · {event} · {class_label}");
+    let detail = format!(
+        "Source: {relative_path}\nTimestamp: {timestamp}\nAttempt: {attempt}/{max_attempts}\nHTTP status: {status_label}\nRetry delay: {delay_label}"
+    );
+    Some(DialogEntry::read_only(
+        label.clone(),
+        format!("{reference} {scope} {component} {event} {class_label}"),
+        detail,
+    ))
+}
+
+fn allowlisted_diagnostic_value<'a>(value: &'a str, allowed: &[&str]) -> Option<&'a str> {
+    allowed.contains(&value).then_some(value)
+}
+
+fn optional_bounded_u64(value: Option<&serde_json::Value>, maximum: u64) -> Option<Option<u64>> {
+    match value {
+        Some(serde_json::Value::Number(number)) => {
+            Some(Some(number.as_u64().filter(|value| *value <= maximum)?))
+        }
+        Some(serde_json::Value::Null) | None => Some(None),
+        Some(_) => None,
+    }
+}
+
 fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap: &Bootstrap) {
     if let Some(project_root) = bootstrap.project_root() {
         tui.set_project(project_root.display().to_string());
@@ -3104,36 +3535,17 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
     let skills = start_tui_skills(&mut tui, bootstrap)?;
     if let Some(identifier) = resume {
-        let resumed = resume_tui_session(
+        let mut resumed = resume_tui_session(
             bootstrap,
             identifier,
             &skills,
             &TuiCredentialResolver::production(),
         )?;
-        let presentation = TuiPresentation::new(
-            resumed
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.provider_id.as_deref())
-                .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider")),
-            resumed
-                .selection
-                .as_ref()
-                .map(TuiModelSelector::model)
-                .or_else(|| {
-                    resumed
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.model_id.as_deref())
-                })
-                .or_else(|| bootstrap.model())
-                .unwrap_or("default model"),
-            format!("session #{identifier}"),
-        );
+        let presentation = tui_session_presentation(bootstrap, &resumed);
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
             message: resumed.note(),
             presentation,
-            messages: resumed.messages.clone(),
+            history: std::mem::take(&mut resumed.restored_history),
         });
         for event in resumed_subagent_cards(&resumed.messages) {
             tui.apply_runtime_event(event);
@@ -3142,11 +3554,10 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
         })? = resumed;
     } else {
-        tui.set_presentation(
-            bootstrap.provider_type().unwrap_or("provider"),
-            bootstrap.model().unwrap_or("default model"),
-            "new session",
-        );
+        tui.apply_presentation(tui_session_presentation(
+            bootstrap,
+            &TuiSessionContext::fresh(),
+        ));
     }
 
     let commands = start_tui_commands(&mut tui, bootstrap)?;
@@ -3165,7 +3576,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     let prompt_bridge = permission_bridge.clone();
     run_with_default_progress_submit_with_permissions(
         &mut tui,
-        move |request, progress| route_router.route_request(request, progress),
+        move |request, progress, cancellation| {
+            route_router.route_request_with_cancellation(request, progress, cancellation)
+        },
         move |prompt, background, progress, metrics| {
             let task_events = metrics.clone();
             let turn_cancellation =
@@ -3200,6 +3613,11 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Ok(bootstrap) => bootstrap,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            let task_parent_request_config = match router.task_parent_request_config() {
+                Ok(config) => config,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
+            let task_diagnostic_reference = next_diagnostic_reference();
             let lifecycle_bridge = TuiTaskLifecycleBridge::new(task_events, task_controls.clone())
                 .with_session_writer(runtime_bootstrap.clone(), Arc::clone(&router.session));
             let mut task_runtime = match production_tui_task_runtime(
@@ -3207,10 +3625,19 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 &router.skills,
                 prompt_bridge.clone(),
                 lifecycle_bridge.clone(),
+                task_parent_request_config.clone(),
+                task_diagnostic_reference.clone(),
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            if let Err(error) = ensure_active_tui_agent_runtime(
+                &runtime_bootstrap,
+                &router.session,
+                &task_runtime.dispatcher,
+            ) {
+                return tui_provider_outcome(Err(error));
+            }
             match selected_tui_task_skips_parent(
                 launch_selected_tui_task(
                     &mut task_runtime,
@@ -3234,7 +3661,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                     let project_root = runtime_bootstrap.project_root().ok_or_else(|| {
                         CliError::configuration("native tools require a project root")
                     })?;
-                    let task_runtime = production_tui_task_runtime_with_runner(
+                    let task_runtime = production_tui_task_runtime_with_runner_and_parent_config(
                         &runtime_bootstrap,
                         &router.skills,
                         prompt_bridge.clone(),
@@ -3244,6 +3671,8 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                         )
                         .with_lifecycle_bridge(lifecycle_bridge.clone())
                         .with_dangerous_mode(request.dangerous_mode),
+                        task_parent_request_config.clone(),
+                        Some(task_diagnostic_reference.clone()),
                     )?;
                     run_production_headless_chat_with_progress(
                         request,
@@ -3252,6 +3681,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                         Some(&sink),
                         Some(prompt_bridge.clone()),
                         Some(&task_runtime),
+                        Some(&task_diagnostic_reference),
                     )
                 },
             );
@@ -3300,6 +3730,7 @@ fn run_tui_prompt(
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
                 | TuiSubmissionOutcome::SelectionCancelled
+                | TuiSubmissionOutcome::RouteCancelled
                 | TuiSubmissionOutcome::SelectionError { .. } => {
                     unreachable!("slash routing returns a local result or CLI error")
                 }
@@ -3312,6 +3743,7 @@ fn run_tui_prompt(
                 bootstrap,
                 cancellation,
                 progress,
+                None,
                 None,
                 None,
             )
@@ -3462,6 +3894,55 @@ fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> O
     context
         .provider
         .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
+}
+
+fn tui_session_presentation(bootstrap: &Bootstrap, session: &TuiSessionContext) -> TuiPresentation {
+    let model = session
+        .selection
+        .as_ref()
+        .map(TuiModelSelector::model)
+        .or_else(|| {
+            session
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.model_id.as_deref())
+        })
+        .or_else(|| {
+            session
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref())
+        })
+        .or_else(|| bootstrap.model())
+        .unwrap_or_else(|| default_model(bootstrap));
+    let provider = session
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider_id.as_deref())
+        .or_else(|| current_tui_provider(bootstrap, session).map(TuiProvider::identifier))
+        .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
+    let label = session
+        .identifier
+        .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
+    let effort = session
+        .selection
+        .as_ref()
+        .and_then(|selection| {
+            selection
+                .reasoning_effort()
+                .or_else(|| selection.reasoning_effort_default())
+        })
+        .or_else(|| {
+            TuiModelSelector::for_source(model, tui_model_source(bootstrap, session))
+                .reasoning_effort_default()
+        });
+    let mut presentation = TuiPresentation::new(provider, model, label)
+        .with_context_window(model_registry::context_window_for(model))
+        .with_dangerous_mode(session.dangerous_mode);
+    if let Some(effort) = effort {
+        presentation = presentation.with_effort(effort);
+    }
+    presentation
 }
 
 enum ChatGptCredentialSnapshot {
@@ -3749,13 +4230,6 @@ fn rotate_tui_agent(
     Ok(format!("Active agent: {}.", agent.name))
 }
 
-fn tui_session_is_running(session: &Arc<Mutex<TuiSessionContext>>) -> Result<bool, CliError> {
-    session
-        .lock()
-        .map(|context| context.running)
-        .map_err(|_| CliError::storage("TUI session is unavailable"))
-}
-
 #[cfg(test)]
 fn list_tui_agents(
     bootstrap: &Bootstrap,
@@ -3807,7 +4281,12 @@ fn select_tui_subagent(
     name: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
-    let agent = tui_subagent_catalog(bootstrap)?
+    let agents = tui_subagent_catalog(bootstrap)?.collect::<Vec<_>>();
+    if agents.is_empty() {
+        return Err(CliError::usage("No eligible subagents are available."));
+    }
+    let agent = agents
+        .into_iter()
         .find(|agent| agent.name == name.trim())
         .ok_or_else(|| CliError::usage("/subagent requires an available subagent"))?;
     let mut context = session
@@ -3843,6 +4322,17 @@ fn tui_agent_catalog(
     bootstrap: &Bootstrap,
     validator: &dyn AgentModelValidator,
 ) -> Result<AgentCatalog, CliError> {
+    discover_tui_agent_catalog(bootstrap, Some(validator))
+}
+
+fn tui_task_agent_catalog(bootstrap: &Bootstrap) -> Result<AgentCatalog, CliError> {
+    discover_tui_agent_catalog(bootstrap, None)
+}
+
+fn discover_tui_agent_catalog(
+    bootstrap: &Bootstrap,
+    validator: Option<&dyn AgentModelValidator>,
+) -> Result<AgentCatalog, CliError> {
     let primary = AgentDefinition {
         name: "primary".into(),
         description: "Default interactive agent".into(),
@@ -3855,9 +4345,36 @@ fn tui_agent_catalog(
         permission_rules: Vec::new(),
         skills: Vec::new(),
     };
+    let explore = AgentDefinition {
+        name: "explore".into(),
+        description: "Explore the codebase without modifying files".into(),
+        mode: agens_core::AgentMode::Subagent,
+        model: None,
+        system_prompt: "You are the read-only exploration subagent. Inspect the codebase without modifying files and return concise, grounded findings."
+            .into(),
+        permission_rules: Vec::new(),
+        skills: Vec::new(),
+    };
+    let general = AgentDefinition {
+        name: "general".into(),
+        description: "Handle a general delegated coding task".into(),
+        mode: agens_core::AgentMode::Subagent,
+        model: None,
+        system_prompt: "You are the general-purpose subagent. Complete the delegated task with the available native tools and return a concise result."
+            .into(),
+        permission_rules: Vec::new(),
+        skills: Vec::new(),
+    };
     let global = bootstrap.paths.global_config.with_file_name("agents");
     let project = bootstrap.paths.project_config.with_file_name("agents");
-    AgentCatalog::discover_with_model_validator(&[primary], &global, &project, validator)
+    let built_ins = [primary, explore, general];
+    let discovery = match validator {
+        Some(validator) => {
+            AgentCatalog::discover_with_model_validator(&built_ins, &global, &project, validator)
+        }
+        None => AgentCatalog::discover(&built_ins, &global, &project),
+    };
+    discovery
         .map(|discovery| discovery.catalog().clone())
         .map_err(|_| CliError::configuration("agent catalog is unavailable"))
 }
@@ -3885,6 +4402,39 @@ impl AgentModelValidator for BundledModelValidator {
     }
 }
 
+#[derive(Clone)]
+struct TaskModelValidator {
+    available: Arc<BTreeSet<String>>,
+}
+
+impl TaskModelValidator {
+    fn new(models: &[String]) -> Self {
+        Self {
+            available: Arc::new(models.iter().cloned().collect()),
+        }
+    }
+}
+
+impl AgentModelValidator for TaskModelValidator {
+    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
+        self.available
+            .contains(model)
+            .then_some(())
+            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+    }
+}
+
+fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
+    let source = bootstrap
+        .provider_type()
+        .and_then(TuiProvider::parse)
+        .map(TuiProvider::source)
+        .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
+    TuiModelSelector::for_source(default_model(bootstrap), source)
+        .model_values()
+        .map_err(CliError::unavailable)
+}
+
 #[cfg(test)]
 fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
     let project = tui_project_identifier(bootstrap)?;
@@ -3908,23 +4458,69 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
         .join("\n"))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TUI_RESUME_PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PRODUCTION_TOOL_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PRODUCTION_PROVIDER_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_tui_resume_test_counters() {
+    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(0));
+    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(0));
+    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(0));
+    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn tui_resume_test_counters() -> (usize, usize, usize, usize) {
+    (
+        TUI_RESUME_LOAD_CALLS.with(std::cell::Cell::get),
+        TUI_RESUME_PROJECTION_CALLS.with(std::cell::Cell::get),
+        PRODUCTION_TOOL_RUNTIME_CALLS.with(std::cell::Cell::get),
+        PRODUCTION_PROVIDER_RUNTIME_CALLS.with(std::cell::Cell::get),
+    )
+}
+
 fn resume_tui_session(
     bootstrap: &Bootstrap,
     identifier: i64,
-    skills: &SkillCatalog,
+    _skills: &SkillCatalog,
     credentials: &TuiCredentialResolver,
 ) -> Result<TuiSessionContext, CliError> {
+    let session = load_tui_session_for_resume(bootstrap, identifier)?;
+    prepare_loaded_tui_session_resume(bootstrap, identifier, session, credentials)
+}
+
+fn load_tui_session_for_resume(
+    bootstrap: &Bootstrap,
+    identifier: i64,
+) -> Result<StoredSession, CliError> {
+    #[cfg(test)]
+    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let session = store
+    store
         .load_session_for_resume(identifier)
-        .map_err(|_| CliError::storage("saved session is unavailable"))?;
+        .map_err(|_| CliError::storage("saved session is unavailable"))
+}
+
+fn prepare_loaded_tui_session_resume(
+    bootstrap: &Bootstrap,
+    identifier: i64,
+    session: StoredSession,
+    credentials: &TuiCredentialResolver,
+) -> Result<TuiSessionContext, CliError> {
     if session.metadata.project != tui_project_identifier(bootstrap)? {
         return Err(CliError::storage("saved session is unavailable"));
     }
-    Conversation::from_messages(&session.messages)
+    #[cfg(test)]
+    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let restored_history = Conversation::from_messages(&session.messages)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
-    let active_agent = active_tui_agent_runtime(bootstrap, &session.metadata.active_agent, skills)?;
     let saved_provider = session.metadata.provider_id.as_deref();
     let provider = saved_provider.and_then(TuiProvider::parse);
     let selection_provider =
@@ -3955,12 +4551,48 @@ fn resume_tui_session(
             })
         })
         .map(|_| "connect or choose provider".to_owned());
-    let mut context =
-        TuiSessionContext::resumed(identifier, session.metadata, session.messages, active_agent);
+    let mut context = TuiSessionContext::restored(
+        identifier,
+        session.metadata,
+        session.messages,
+        restored_history,
+    );
     context.provider = provider;
     context.selection = selection;
     context.resume_error = resume_error;
     Ok(context)
+}
+
+fn commit_tui_session_resume(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<TuiSessionContext>>,
+    expected: &TuiSessionContext,
+    mut resumed: TuiSessionContext,
+    cancellation: &TuiRouteCancellation,
+) -> Result<TuiSubmissionOutcome, CliError> {
+    let presentation = tui_session_presentation(bootstrap, &resumed);
+    let message = resumed.note();
+    let history = std::mem::take(&mut resumed.restored_history);
+    if cancellation.is_cancelled() {
+        return Ok(TuiSubmissionOutcome::RouteCancelled);
+    }
+
+    let mut current = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    if current.running {
+        return Err(CliError::runtime(HeadlessTurnError::State));
+    }
+    if *current != *expected || !cancellation.try_commit() {
+        return Ok(TuiSubmissionOutcome::RouteCancelled);
+    }
+    *current = resumed;
+
+    Ok(TuiSubmissionOutcome::SessionResumed {
+        message,
+        presentation,
+        history,
+    })
 }
 
 const MAX_RESTORED_SUBAGENT_TOOL_USES: usize = 256;
@@ -4047,33 +4679,63 @@ fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
         .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
 }
 
-fn active_tui_agent_runtime(
+fn ensure_active_tui_agent_runtime(
     bootstrap: &Bootstrap,
-    name: &str,
-    skills: &SkillCatalog,
-) -> Result<ActiveAgentRuntime, CliError> {
+    session: &Arc<Mutex<TuiSessionContext>>,
+    dispatcher: &SharedToolDispatcher,
+) -> Result<(), CliError> {
+    let name = {
+        let context = session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        if context.active_agent.is_some() {
+            return Ok(());
+        }
+        context
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.active_agent.clone())
+            .unwrap_or_else(|| "primary".into())
+    };
     let validator = BundledModelValidator;
     let catalog = tui_agent_catalog(bootstrap, &validator)?;
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(skills))?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
     let agent = catalog
-        .agent(name)
+        .agent(&name)
         .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
         .ok_or_else(|| CliError::configuration("active agent is unavailable"))?;
-
-    ActiveAgentRuntime::build(
+    let active_agent = ActiveAgentRuntime::build(
         agent,
         bootstrap.model(),
         &project_root.display().to_string(),
         &dispatcher,
         &validator,
     )
-    .map_err(agent_rotation_error)
+    .map_err(agent_rotation_error)?;
+    drop(dispatcher);
+
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    let current_name = context
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.active_agent.as_str())
+        .unwrap_or("primary");
+    if context.active_agent.is_none() && current_name == name {
+        context.active_agent = Some(active_agent);
+        return Ok(());
+    }
+    if context.active_agent.is_some() {
+        return Ok(());
+    }
+
+    Err(CliError::runtime(HeadlessTurnError::State))
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -4348,8 +5010,16 @@ fn run_production_headless_chat(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    run_production_headless_chat_with_progress(request, bootstrap, cancellation, None, None, None)
-        .map(|completion| completion.text)
+    run_production_headless_chat_with_progress(
+        request,
+        bootstrap,
+        cancellation,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map(|completion| completion.text)
 }
 
 struct HeadlessChatCompletion {
@@ -4364,18 +5034,42 @@ struct HeadlessProviderContext<'a> {
     progress: Option<&'a TurnProgressSink>,
     permission_bridge: Option<TuiPermissionBridge>,
     task_runtime: Option<&'a ProductionTuiTaskRuntime>,
+    diagnostic_reference: &'a str,
     include_system_prompt: bool,
 }
 
 fn run_production_headless_chat_with_progress(
-    request: HeadlessChatRequest,
+    mut request: HeadlessChatRequest,
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
     permission_bridge: Option<TuiPermissionBridge>,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
+    operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, CliError> {
-    match bootstrap.provider_type() {
+    #[cfg(test)]
+    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    let has_task = tui_agent_catalog(bootstrap, &BundledModelValidator)?
+        .subagents()
+        .any(|agent| agent.mode == agens_core::AgentMode::Subagent);
+    if has_task {
+        let base = request
+            .system_prompt
+            .take()
+            .or_else(|| bootstrap.system_prompt.clone())
+            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned());
+        request.system_prompt = Some(explicit_task_delegation_prompt(&base));
+    }
+
+    let diagnostics = operation_diagnostics(
+        bootstrap,
+        ProviderDiagnosticScope::Parent,
+        operation_reference,
+    );
+    let diagnostic_reference = diagnostics.reference;
+    let provider_diagnostics = diagnostics.provider;
+    let result = match bootstrap.provider_type() {
         Some("openai-api") => {
             let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
                 CliError::authentication("OpenAI API authentication is unavailable")
@@ -4388,6 +5082,7 @@ fn run_production_headless_chat_with_progress(
                     progress,
                     permission_bridge,
                     task_runtime,
+                    diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
                 },
                 move |model, messages, tools, request_config| {
@@ -4403,6 +5098,7 @@ fn run_production_headless_chat_with_progress(
                         provider
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
+                            .with_diagnostics(provider_diagnostics)
                     })
                     .map_err(|_| {
                         CliError::authentication("OpenAI API authentication is unavailable")
@@ -4425,6 +5121,7 @@ fn run_production_headless_chat_with_progress(
                     progress,
                     permission_bridge,
                     task_runtime,
+                    diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: false,
                 },
                 move |model, messages, tools, request_config| {
@@ -4442,6 +5139,7 @@ fn run_production_headless_chat_with_progress(
                         provider
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
+                            .with_diagnostics(provider_diagnostics)
                     })
                     .map_err(|_| {
                         CliError::authentication("ChatGPT credentials are unavailable or invalid")
@@ -4452,7 +5150,11 @@ fn run_production_headless_chat_with_progress(
         _ => Err(CliError::configuration(
             "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
         )),
-    }
+    };
+    result.map_err(|error| {
+        record_parent_terminal(bootstrap, &diagnostic_reference, &error);
+        error.with_diagnostic_reference(&diagnostic_reference)
+    })
 }
 
 fn run_production_headless_chat_with_provider<P>(
@@ -4490,9 +5192,14 @@ where
             task_runtime.provider_tools.clone(),
             Arc::clone(&task_runtime.dispatcher),
         ),
-        None => {
-            production_tool_runtime(context.bootstrap, project_root, request.skills.as_deref())?
-        }
+        None => production_tool_runtime_for_parent(
+            context.bootstrap,
+            project_root,
+            request.skills.as_deref(),
+            model.clone(),
+            request.request_config.clone(),
+            Some(context.diagnostic_reference.to_owned()),
+        )?,
     };
     let project = project_root.display().to_string();
     let policy = permission_policy(
@@ -4909,12 +5616,58 @@ fn production_tool_runtime(
     )
 }
 
+fn production_tool_runtime_for_parent(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    production_tool_runtime_with_parent_task_runner(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
+        ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf()),
+    )
+}
+
 fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    let parent_model = bootstrap
+        .model()
+        .unwrap_or_else(|| default_model(bootstrap))
+        .to_owned();
+    production_tool_runtime_with_parent_task_runner(
+        bootstrap,
+        project_root,
+        skills,
+        parent_model,
+        agens_core::RequestConfig::default(),
+        None,
+        task_runner,
+    )
+}
+
+fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    skills: Option<&SkillCatalog>,
+    parent_model: String,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+    task_runner: R,
+) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
+    #[cfg(test)]
+    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
         NativeTools::open(project_root)
             .map_err(|_| CliError::configuration("native tools are unavailable"))?,
@@ -4975,6 +5728,11 @@ fn production_tool_runtime_with_task_runner<R: TaskRunner>(
         skills,
         &mut dispatcher,
         &mut provider_tools,
+        TaskParentSelection {
+            model: parent_model,
+            request_config: parent_request_config,
+            diagnostic_reference: model_resolution_reference,
+        },
         task_runner,
     )?;
 
@@ -5002,37 +5760,73 @@ struct ProductionTuiTaskRuntime {
     authorized: AuthorizedNativeTaskRuntime<ProductionPermissionPrompter>,
 }
 
+struct TaskParentSelection {
+    model: String,
+    request_config: agens_core::RequestConfig,
+    diagnostic_reference: Option<String>,
+}
+
 fn production_tui_task_runtime(
     bootstrap: &Bootstrap,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
     lifecycle_bridge: TuiTaskLifecycleBridge,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: String,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    production_tui_task_runtime_with_runner(
+    production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
         skills,
         permission_bridge,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf())
             .with_lifecycle_bridge(lifecycle_bridge),
+        parent_request_config,
+        Some(model_resolution_reference),
     )
 }
 
+#[cfg(test)]
 fn production_tui_task_runtime_with_runner(
     bootstrap: &Bootstrap,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
     task_runner: ProductionTaskRunner,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
+    production_tui_task_runtime_with_runner_and_parent_config(
+        bootstrap,
+        skills,
+        permission_bridge,
+        task_runner,
+        agens_core::RequestConfig::default(),
+        None,
+    )
+}
+
+fn production_tui_task_runtime_with_runner_and_parent_config(
+    bootstrap: &Bootstrap,
+    skills: &SkillCatalog,
+    permission_bridge: TuiPermissionBridge,
+    task_runner: ProductionTaskRunner,
+    parent_request_config: agens_core::RequestConfig,
+    model_resolution_reference: Option<String>,
+) -> Result<ProductionTuiTaskRuntime, CliError> {
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+    let parent_model = bootstrap
+        .model()
+        .unwrap_or_else(|| default_model(bootstrap))
+        .to_owned();
+    let (provider_tools, dispatcher) = production_tool_runtime_with_parent_task_runner(
         bootstrap,
         project_root,
         Some(skills),
+        parent_model,
+        parent_request_config,
+        model_resolution_reference,
         task_runner,
     )?;
     let project = project_root.display().to_string();
@@ -5092,10 +5886,12 @@ fn register_production_task_tool<R: TaskRunner>(
     skills: &SkillCatalog,
     dispatcher: &mut ToolDispatcher,
     provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+    parent: TaskParentSelection,
     task_runner: R,
 ) -> Result<(), CliError> {
-    let validator = BundledModelValidator;
-    let agents = tui_agent_catalog(bootstrap, &validator)?;
+    let available_models = task_model_catalog(bootstrap)?;
+    let validator = TaskModelValidator::new(&available_models);
+    let agents = tui_task_agent_catalog(bootstrap)?;
     if !agents
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent)
@@ -5103,24 +5899,38 @@ fn register_production_task_tool<R: TaskRunner>(
         return Ok(());
     }
 
-    let parent_model = bootstrap
-        .model()
-        .unwrap_or_else(|| default_model(bootstrap))
-        .to_owned();
-    let task = TaskTool::from_catalogs_with_model_validator(
+    let diagnostic_bootstrap = bootstrap.clone();
+    let task = TaskTool::from_catalogs_with_parent_config(
         agents,
         skills.clone(),
-        parent_model,
+        parent.model,
+        parent.request_config,
+        available_models,
         validator,
         task_runner,
-    );
+    )
+    .with_model_resolution_diagnostics(move |error| match error {
+        TaskModelResolutionError::ModelUnavailable => {
+            let reference = parent
+                .diagnostic_reference
+                .clone()
+                .unwrap_or_else(next_diagnostic_reference);
+            record_subagent_terminal(
+                &diagnostic_bootstrap,
+                &reference,
+                ProviderDiagnosticClass::ModelUnavailable,
+            );
+            Some(reference)
+        }
+    });
+    let input_schema = task.catalog_input_schema();
 
     provider_tools.insert(
         "task".into(),
         OpenAiFunctionTool::new(
             "task",
             "Dispatch an isolated eligible subagent task in the foreground or background",
-            TaskTool::<R>::input_schema(),
+            input_schema,
         )
         .map_err(|_| CliError::configuration("task tool is unavailable"))?,
     );
@@ -5150,7 +5960,16 @@ struct ProductionTaskRunner {
 }
 
 #[cfg(test)]
-type ProductionTaskProbe = Arc<Mutex<Vec<(agens_tools::TaskExecutionId, TaskLaunchMode, String)>>>;
+type ProductionTaskProbe = Arc<
+    Mutex<
+        Vec<(
+            agens_tools::TaskExecutionId,
+            TaskLaunchMode,
+            String,
+            Option<agens_core::ReasoningEffort>,
+        )>,
+    >,
+>;
 
 #[cfg(test)]
 struct TestTaskFailure {
@@ -5476,6 +6295,7 @@ impl TaskRunner for ProductionTaskRunner {
                 execution.id(),
                 execution.mode(),
                 request.model().to_owned(),
+                request.request_config().reasoning_effort(),
             ));
             if let (Some(lifecycle_bridge), Some(execution), Some(progress)) = (
                 &self.lifecycle_bridge,
@@ -5532,6 +6352,13 @@ impl TaskRunner for ProductionTaskRunner {
                     as TurnProgressSink
             },
         );
+        let diagnostic_reference = next_diagnostic_reference();
+        #[cfg(test)]
+        let diagnostic_reference = if self.failure_probe.is_some() {
+            "abc12345".into()
+        } else {
+            diagnostic_reference
+        };
         #[cfg(test)]
         let result = self
             .failure_probe
@@ -5545,6 +6372,7 @@ impl TaskRunner for ProductionTaskRunner {
                     self.dangerous_mode,
                     &cancellation,
                     progress.as_ref(),
+                    &diagnostic_reference,
                 )
             });
         #[cfg(not(test))]
@@ -5555,15 +6383,26 @@ impl TaskRunner for ProductionTaskRunner {
             self.dangerous_mode,
             &cancellation,
             progress.as_ref(),
+            &diagnostic_reference,
         );
+        if let Err(error) = &result {
+            record_subagent_terminal(
+                &self.bootstrap,
+                &diagnostic_reference,
+                error.diagnostic_class(),
+            );
+        }
         if let (Some(lifecycle_bridge), Some(execution), Err(error)) =
             (&self.lifecycle_bridge, context.execution(), &result)
             && let Some(kind) = error.tui_kind()
         {
-            lifecycle_bridge.publish(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
-                execution.id().value(),
-                kind,
-            )));
+            lifecycle_bridge.publish(TuiRuntimeEvent::SubagentExecution(
+                TuiSubagentEvent::error_with_reference(
+                    execution.id().value(),
+                    kind,
+                    &diagnostic_reference,
+                ),
+            ));
         }
         let result = result.map_err(ChildRunError::task_runner_error);
         if let (Some(lifecycle_bridge), Some(execution)) =
@@ -5598,19 +6437,50 @@ fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
 
 #[derive(Clone, Copy)]
 enum ChildRunError {
+    Authentication,
     Cancelled,
+    Context,
+    Network,
     TimedOut,
     Provider,
+    Protocol,
+    RateLimited,
+    Rejected,
+    Server,
     Tool,
     IterationLimit,
     Runtime,
 }
 
 impl ChildRunError {
+    const fn diagnostic_class(self) -> ProviderDiagnosticClass {
+        match self {
+            Self::Authentication => ProviderDiagnosticClass::Authentication,
+            Self::Cancelled => ProviderDiagnosticClass::Cancelled,
+            Self::Context => ProviderDiagnosticClass::Context,
+            Self::Network => ProviderDiagnosticClass::Network,
+            Self::TimedOut => ProviderDiagnosticClass::Deadline,
+            Self::Provider => ProviderDiagnosticClass::Provider,
+            Self::Protocol => ProviderDiagnosticClass::Protocol,
+            Self::RateLimited => ProviderDiagnosticClass::RateLimited,
+            Self::Rejected => ProviderDiagnosticClass::Rejected,
+            Self::Server => ProviderDiagnosticClass::Server,
+            Self::Tool => ProviderDiagnosticClass::Tool,
+            Self::IterationLimit | Self::Runtime => ProviderDiagnosticClass::Runtime,
+        }
+    }
+
     const fn tui_kind(self) -> Option<TuiSubagentErrorKind> {
         match self {
             Self::Cancelled | Self::TimedOut => None,
+            Self::Authentication => Some(TuiSubagentErrorKind::Authentication),
+            Self::Context => Some(TuiSubagentErrorKind::Context),
+            Self::Network => Some(TuiSubagentErrorKind::Network),
             Self::Provider => Some(TuiSubagentErrorKind::Provider),
+            Self::Protocol => Some(TuiSubagentErrorKind::Protocol),
+            Self::RateLimited => Some(TuiSubagentErrorKind::RateLimited),
+            Self::Rejected => Some(TuiSubagentErrorKind::Rejected),
+            Self::Server => Some(TuiSubagentErrorKind::Server),
             Self::Tool => Some(TuiSubagentErrorKind::Tool),
             Self::IterationLimit | Self::Runtime => Some(TuiSubagentErrorKind::Runtime),
         }
@@ -5620,7 +6490,14 @@ impl ChildRunError {
         match self {
             Self::Cancelled => TaskRunnerError::Cancelled,
             Self::TimedOut => TaskRunnerError::TimedOut,
-            Self::Provider => TaskRunnerError::ProviderFailure,
+            Self::Authentication
+            | Self::Context
+            | Self::Network
+            | Self::Provider
+            | Self::Protocol
+            | Self::RateLimited
+            | Self::Rejected
+            | Self::Server => TaskRunnerError::ProviderFailure,
             Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
             Self::IterationLimit => TaskRunnerError::IterationLimit,
         }
@@ -5629,13 +6506,16 @@ impl ChildRunError {
 
 fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     match error {
+        HeadlessTurnError::Authentication => ChildRunError::Authentication,
         HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
+        HeadlessTurnError::ProviderContext => ChildRunError::Context,
+        HeadlessTurnError::ProviderNetwork => ChildRunError::Network,
         HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
-        HeadlessTurnError::Provider
-        | HeadlessTurnError::ProviderRejected
-        | HeadlessTurnError::ProviderRateLimited
-        | HeadlessTurnError::ProviderServer
-        | HeadlessTurnError::ProviderProtocol => ChildRunError::Provider,
+        HeadlessTurnError::Provider => ChildRunError::Provider,
+        HeadlessTurnError::ProviderProtocol => ChildRunError::Protocol,
+        HeadlessTurnError::ProviderRateLimited => ChildRunError::RateLimited,
+        HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
+        HeadlessTurnError::ProviderServer => ChildRunError::Server,
         HeadlessTurnError::Tool => ChildRunError::Tool,
         HeadlessTurnError::MaxIterations => ChildRunError::IterationLimit,
         _ => ChildRunError::Runtime,
@@ -5649,6 +6529,7 @@ fn run_production_task(
     dangerous_mode: bool,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    diagnostic_reference: &str,
 ) -> Result<String, ChildRunError> {
     let messages = vec![
         Message {
@@ -5663,6 +6544,16 @@ fn run_production_task(
     let (provider_tools, tool_runtime) =
         production_child_tool_runtime(project_root, dangerous_mode)
             .map_err(|_| ChildRunError::Runtime)?;
+    let diagnostic_store = SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf());
+    let diagnostic_sink = Arc::new(move |event: ProviderDiagnosticEvent| {
+        diagnostic_store.record(&event);
+    });
+    let provider_diagnostics = ProviderDiagnostics::new(
+        diagnostic_reference.to_owned(),
+        ProviderDiagnosticScope::Subagent,
+        diagnostic_sink,
+    )
+    .map_err(|_| ChildRunError::Runtime)?;
 
     match bootstrap.provider_type() {
         Some("openai-api") => {
@@ -5679,7 +6570,12 @@ fn run_production_task(
                     provider_tools,
                     std::time::Duration::from_secs(120),
                 )
-                .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
+                .map(|provider| {
+                    provider
+                        .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                        .with_request_config(request.request_config().clone())
+                        .with_diagnostics(provider_diagnostics)
+                })
                 .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(
                 provider,
@@ -5701,7 +6597,12 @@ fn run_production_task(
                 provider_tools,
                 std::time::Duration::from_secs(120),
             )
-            .map(|provider| provider.with_parallel_tool_calls(bootstrap.parallel_tool_calls))
+            .map(|provider| {
+                provider
+                    .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                    .with_request_config(request.request_config().clone())
+                    .with_diagnostics(provider_diagnostics)
+            })
             .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(
                 provider,
@@ -6661,7 +7562,7 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
                     return Err(HeadlessTurnPortError::TaskTerminal(terminal));
                 }
                 let content = if output.is_error {
-                    "tool execution failed".to_owned()
+                    sanitized_native_tool_failure(&output.content)
                 } else {
                     output.content
                 };
@@ -6671,6 +7572,55 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
                 })
             });
         std::future::ready(output)
+    }
+}
+
+fn sanitized_native_tool_failure(content: &str) -> String {
+    let Some((tool, reason)) = content.split_once(": ") else {
+        return "tool execution failed".to_owned();
+    };
+    if !matches!(
+        tool,
+        "read"
+            | "list"
+            | "search"
+            | "glob"
+            | "grep"
+            | "write"
+            | "edit"
+            | "bash"
+            | "webfetch"
+            | "file picker"
+    ) {
+        return "tool execution failed".to_owned();
+    }
+
+    let safe_reason = matches!(
+        reason,
+        "operation timed out" | "cancelled" | "invalid regex" | "invalid glob pattern"
+    ) || [
+        ("entry limit of ", " exceeded"),
+        ("result limit of ", " exceeded"),
+        ("traversal depth limit of ", " exceeded"),
+    ]
+    .into_iter()
+    .any(|(prefix, suffix)| {
+        reason
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+            .is_some_and(|value| {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    });
+    if safe_reason {
+        format!("{tool}: {reason}")
+    } else if reason.contains("outside project root")
+        || reason.contains("traversal is not allowed")
+        || reason.contains("must be a non-empty relative path")
+    {
+        format!("{tool}: path validation failed")
+    } else {
+        "tool execution failed".to_owned()
     }
 }
 
@@ -8097,6 +9047,52 @@ mod tests {
     }
 
     #[test]
+    fn fresh_tui_presentation_projects_resolved_model_effort_and_context() {
+        let known_root = tui_session_directory("fresh-presentation-known");
+        let known_bootstrap =
+            tui_session_bootstrap_for_provider(&known_root, &[], "openai-api", "gpt-5.6-sol");
+        let mut known_tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        known_tui.apply_presentation(tui_session_presentation(
+            &known_bootstrap,
+            &TuiSessionContext::fresh(),
+        ));
+        configure_tui_project_identity(&mut known_tui, &known_bootstrap);
+        let known = render_tui_test_backend(&known_tui, 140, 14);
+
+        assert!(
+            known.contains("gpt-5.6-sol · medium · 0/1.1m (0%)"),
+            "{known:?}"
+        );
+        assert!(!known.contains("model · default · ctx —"), "{known:?}");
+
+        let unknown_root = tui_session_directory("fresh-presentation-unknown");
+        let unknown_bootstrap =
+            tui_session_bootstrap_for_provider(&unknown_root, &[], "openai-api", "gpt-future-1");
+        let mut unknown_tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        unknown_tui.apply_presentation(tui_session_presentation(
+            &unknown_bootstrap,
+            &TuiSessionContext::fresh(),
+        ));
+        let unknown = render_tui_test_backend(&unknown_tui, 140, 14);
+
+        assert!(
+            unknown.contains("gpt-future-1 · effort — · ctx —"),
+            "{unknown:?}"
+        );
+        assert!(
+            !unknown.contains("gpt-future-1 · effort — · 0/"),
+            "{unknown:?}"
+        );
+
+        std::fs::remove_dir_all(known_root).unwrap();
+        std::fs::remove_dir_all(unknown_root).unwrap();
+    }
+
+    #[test]
     fn tui_session_reset_refuses_running_mutation_without_state_change() {
         let mut context = TuiSessionContext::fresh();
         context.identifier = Some(7);
@@ -8529,7 +9525,7 @@ mod tests {
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
             message: "Resumed session 7".into(),
             presentation: TuiPresentation::new("openai-api", "gpt-4.1", "session #7"),
-            messages: Vec::new(),
+            history: Vec::new(),
         });
         let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
         assert!(
@@ -8576,6 +9572,7 @@ mod tests {
 
         assert_eq!(list_tui_sessions(&bootstrap).unwrap(), "1\t1 event(s)");
 
+        reset_tui_resume_test_counters();
         let resumed = resume_tui_session(
             &bootstrap,
             current.id,
@@ -8586,13 +9583,221 @@ mod tests {
         assert_eq!(resumed.identifier, Some(current.id));
         assert_eq!(resumed.metadata, Some(current));
         assert_eq!(resumed.messages, tui_session_messages());
+        assert!(resumed.active_agent.is_none());
+        assert_eq!(resumed.restored_history.len(), 1);
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_resume_commit_discards_cancelled_stale_and_invalid_preparations() {
+        let temporary = tui_session_directory("atomic-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "atomic");
+        drop(store);
+        let credentials = TuiCredentialResolver::production();
+        let prepared = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &credentials,
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let original = session.lock().unwrap().clone();
+
+        let cancelled = TuiRouteCancellation::new();
+        cancelled.cancel();
         assert_eq!(
-            resumed
+            commit_tui_session_resume(
+                &bootstrap,
+                &session,
+                &original,
+                prepared.clone(),
+                &cancelled,
+            )
+            .unwrap(),
+            TuiSubmissionOutcome::RouteCancelled
+        );
+        assert_eq!(*session.lock().unwrap(), original);
+
+        session.lock().unwrap().dangerous_mode = true;
+        let newer = session.lock().unwrap().clone();
+        assert_eq!(
+            commit_tui_session_resume(
+                &bootstrap,
+                &session,
+                &original,
+                prepared.clone(),
+                &TuiRouteCancellation::new(),
+            )
+            .unwrap(),
+            TuiSubmissionOutcome::RouteCancelled
+        );
+        assert_eq!(*session.lock().unwrap(), newer);
+
+        *session.lock().unwrap() = original.clone();
+        let accepted = TuiRouteCancellation::new();
+        assert!(matches!(
+            commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted,)
+                .unwrap(),
+            TuiSubmissionOutcome::SessionResumed { .. }
+        ));
+        assert!(!accepted.cancel());
+        let committed = session.lock().unwrap();
+        assert_eq!(committed.identifier, Some(metadata.id));
+        assert_eq!(committed.messages, tui_session_messages());
+        assert!(committed.restored_history.is_empty());
+        drop(committed);
+
+        let mut invalid = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        invalid.messages = vec![Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("orphan".into())],
+        }];
+        let before_error = session.lock().unwrap().clone();
+        assert!(
+            prepare_loaded_tui_session_resume(&bootstrap, metadata.id, invalid, &credentials,)
+                .is_err()
+        );
+        assert_eq!(*session.lock().unwrap(), before_error);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn first_runtime_materialization_after_resume_preserves_permission_denial() {
+        let temporary = tui_session_directory("lazy-resume-runtime");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "lazy");
+        drop(store);
+        let skills = SkillCatalog::default();
+        reset_tui_resume_test_counters();
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &skills,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+        let session = Arc::new(Mutex::new(resumed));
+        let (permission_bridge, _) = TuiPermissionBridge::channel();
+        let (events, _) = BridgeTx::bounded(8);
+        let runtime = production_tui_task_runtime(
+            &bootstrap,
+            &skills,
+            permission_bridge,
+            TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
+            agens_core::RequestConfig::default(),
+            "abc12345".to_owned(),
+        )
+        .unwrap();
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
+        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
                 .active_agent
                 .as_ref()
                 .map(|agent| agent.name.as_str()),
             Some("primary")
         );
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = runtime
+            .dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    tui_project(&temporary),
+                    "task",
+                    serde_json::json!({"agent":"explore","description":"inspect"}),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(outcome, ToolEvaluationOutcome::Denied));
+        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn barrier_resume_loader_is_local_and_discards_its_late_cancelled_result() {
+        let temporary = tui_session_directory("barrier-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "barrier");
+        drop(store);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let original = session.lock().unwrap().clone();
+        let cancellation = TuiRouteCancellation::new();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let bootstrap = bootstrap.clone();
+            let session = Arc::clone(&session);
+            let original = original.clone();
+            let cancellation = cancellation.clone();
+            move || {
+                reset_tui_resume_test_counters();
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                let prepared = resume_tui_session(
+                    &bootstrap,
+                    metadata.id,
+                    &SkillCatalog::default(),
+                    &TuiCredentialResolver::production(),
+                )
+                .unwrap();
+                let outcome = commit_tui_session_resume(
+                    &bootstrap,
+                    &session,
+                    &original,
+                    prepared,
+                    &cancellation,
+                )
+                .unwrap();
+                (outcome, tui_resume_test_counters())
+            }
+        });
+        started_receiver.recv().unwrap();
+
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        tui.set_presentation("old-provider", "old-model", "session #1");
+        tui.begin_submission("old prompt");
+        tui.finish_submission(Ok("old answer".into()));
+        assert!(tui.begin_session_load());
+        assert!(tui.view().session_loading);
+        assert!(!tui.view().running);
+        assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
+
+        assert!(cancellation.cancel());
+        tui.cancel_session_load();
+        release_sender.send(()).unwrap();
+        let (outcome, counters) = worker.join().unwrap();
+        assert_eq!(outcome, TuiSubmissionOutcome::RouteCancelled);
+        assert_eq!(counters, (1, 1, 0, 0));
+        assert_eq!(*session.lock().unwrap(), original);
+        assert_eq!(tui.view().provider_model, "old-provider / old-model");
+        assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -8736,14 +9941,14 @@ mod tests {
         );
         assert_eq!(
             list_tui_agents(&bootstrap, &session, AgentMode::Subagent).unwrap(),
-            "Subagent: none. Available: reviewer."
+            "Subagent: none. Available: explore, general, reviewer."
         );
 
         let no_agents_temporary = tui_session_directory("no-agent-selectors");
         let no_subagents = tui_session_bootstrap(&no_agents_temporary, &[]);
         assert_eq!(
             list_tui_agents(&no_subagents, &session, AgentMode::Subagent).unwrap(),
-            "Subagent: none."
+            "Subagent: none. Available: explore, general."
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -8853,6 +10058,13 @@ mod tests {
             cancellation: Arc::new(Mutex::new(None)),
         });
 
+        assert!(
+            router
+                .palette_entries()
+                .iter()
+                .any(|entry| entry.name() == "subagent")
+        );
+
         assert!(matches!(
             router.route("/subagent".into()),
             TuiSubmissionOutcome::SafeDialog(_)
@@ -8864,14 +10076,16 @@ mod tests {
         );
         assert!(tui.view().running);
         let overlay = render_tui_test_backend(&tui, 80, 24);
-        assert!(overlay.contains("main"));
+        assert!(!overlay.contains("main"));
+        assert!(overlay.contains("explore"));
+        assert!(overlay.contains("general"));
         assert!(overlay.contains("reviewer"));
         assert!(!overlay.contains("all"));
         assert!(!overlay.contains("primary"));
         assert!(!overlay.contains("invalid-model"));
         assert_eq!(
             tui.handle(Event::Key(Key::Enter)),
-            Action::DialogAction("subagent:reviewer".into())
+            Action::DialogAction("subagent:explore".into())
         );
         assert!(tui.transcript().is_empty());
 
@@ -8906,9 +10120,19 @@ mod tests {
             Arc::new(SkillCatalog::default()),
         );
 
+        assert!(
+            !unavailable_router
+                .palette_entries()
+                .iter()
+                .any(|entry| entry.name() == "subagent")
+        );
+
+        let unavailable_selection =
+            unavailable_router.route("/subagent unavailable-provider".into());
         assert!(matches!(
-            unavailable_router.route("/subagent unavailable-provider".into()),
-            TuiSubmissionOutcome::LocalActionableError { .. }
+            &unavailable_selection,
+            TuiSubmissionOutcome::LocalActionableError { message, .. }
+                if message.contains("No eligible subagents")
         ));
         assert!(
             unavailable_session
@@ -8936,6 +10160,11 @@ mod tests {
         let empty_selection =
             unavailable_tui.apply_submission_outcome(unavailable_router.route("/subagent".into()));
         assert_eq!(empty_selection, None);
+        let unavailable_overlay = render_tui_test_backend(&unavailable_tui, 80, 24);
+        assert!(
+            unavailable_overlay.contains("No eligible subagents are available."),
+            "{unavailable_overlay:?}"
+        );
         assert_eq!(
             unavailable_tui.handle(Event::Key(Key::Enter)),
             Action::Render
@@ -9153,7 +10382,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_startup_skills_reach_parent_context_and_tool_without_subagents() {
+    fn tui_startup_skills_reach_parent_context_and_tool_with_builtin_subagents() {
         let temporary = tui_session_directory("parent-skills");
         let config_home = temporary.join("config");
         let global_skills = config_home.join("skills");
@@ -9256,7 +10485,7 @@ mod tests {
         )
         .unwrap();
         assert!(tools.iter().any(|tool| tool.name() == "skill"));
-        assert!(!tools.iter().any(|tool| tool.name() == "task"));
+        assert!(tools.iter().any(|tool| tool.name() == "task"));
         assert!(
             dispatcher
                 .lock()
@@ -9379,6 +10608,7 @@ mod tests {
             vec![
                 "connect",
                 "disconnect",
+                "diagnostics",
                 "new",
                 "sessions",
                 "resume",
@@ -9390,6 +10620,7 @@ mod tests {
                 "mcp",
                 "select",
                 "quit",
+                "subagent",
                 "review",
                 "shared",
                 "inspect",
@@ -9418,7 +10649,7 @@ mod tests {
                 .description(),
             "project command"
         );
-        assert!(!entries.iter().any(|entry| entry.name() == "subagent"));
+        assert!(entries.iter().any(|entry| entry.name() == "subagent"));
         assert!(tui.transcript().is_empty());
         assert!(tui.view().dialog.is_some());
 
@@ -9509,6 +10740,10 @@ mod tests {
         assert!(matches!(
             router.route("/help".into()),
             TuiSubmissionOutcome::Dialog(_)
+        ));
+        assert!(matches!(
+            router.route("/mouse".into()),
+            TuiSubmissionOutcome::LocalActionableError { .. }
         ));
 
         let unknown = enter_tui_input(&mut tui, "/unknown");
@@ -9970,7 +11205,10 @@ mod tests {
                 &outcome,
                 TuiSubmissionOutcome::ContextChanged { message, presentation }
                     if message == "Model: gpt-5.6."
-                        && presentation == &TuiPresentation::new(provider, "gpt-5.6", "new session")
+                        && presentation
+                            == &TuiPresentation::new(provider, "gpt-5.6", "new session")
+                                .with_effort("medium")
+                                .with_context_window(Some(1_050_000))
             ));
             tui.apply_submission_outcome(outcome);
             let selection = session.lock().unwrap().selection.clone().unwrap();
@@ -10215,10 +11453,26 @@ mod tests {
             Arc::new(SkillCatalog::default()),
             resolver,
         );
+        assert_eq!(router.turn_bootstrap().unwrap().model(), Some("gpt-5.5"));
+        assert_eq!(
+            router
+                .task_parent_request_config()
+                .unwrap()
+                .reasoning_effort(),
+            Some(agens_core::ReasoningEffort::High)
+        );
         assert!(matches!(
             router.route("/model gpt-4.1".into()),
             TuiSubmissionOutcome::ContextChanged { .. }
         ));
+        assert_eq!(router.turn_bootstrap().unwrap().model(), Some("gpt-4.1"));
+        assert_eq!(
+            router
+                .task_parent_request_config()
+                .unwrap()
+                .reasoning_effort(),
+            None
+        );
         assert_eq!(
             SessionStore::open(bootstrap.data_directory())
                 .unwrap()
@@ -10508,9 +11762,25 @@ mod tests {
         assert!(project_rows.contains("Resume session · Current project"));
         assert!(project_rows.contains(&format!("#{} Gamma", current.id)));
         assert!(project_rows.contains(&format!("#{} Alpha", old.id)));
-        assert!(project_rows.contains("reviewer · current"));
-        assert!(project_rows.contains("Provider: openai-chatgpt · Model: gpt-5.5"));
-        assert!(project_rows.contains("Effort: high · Updated: 9950 (50s ago)"));
+        assert!(
+            project_rows.contains("1 turn · 50s ago"),
+            "{project_rows:?}"
+        );
+        assert!(!project_rows.contains("reviewer"), "{project_rows:?}");
+        assert!(!project_rows.contains("Provider:"), "{project_rows:?}");
+        assert!(!project_rows.contains("Model:"), "{project_rows:?}");
+        assert!(!project_rows.contains("Effort:"), "{project_rows:?}");
+        assert!(!project_rows.contains("Updated:"), "{project_rows:?}");
+        tui.handle(Event::Key(Key::CtrlO));
+        let project_details = render_tui_test_backend(&tui, 100, 26);
+        assert!(
+            project_details.contains("Provider: openai-chatgpt · Model: gpt-5.5"),
+            "{project_details:?}"
+        );
+        assert!(
+            project_details.contains("Effort: high · Updated: 9950 (50s ago)"),
+            "{project_details:?}"
+        );
         let old_details = format!(
             "{:?}",
             session_dialog_entry(
@@ -10527,10 +11797,6 @@ mod tests {
         assert!(old_details.contains("Provider: current runtime"));
         assert!(old_details.contains("Model: current runtime"));
         assert!(old_details.contains("Effort: current runtime"));
-        assert!(
-            project_rows.contains("Updated: 9950 (50s ago)"),
-            "{project_rows:?}"
-        );
         assert!(project_rows.find("Gamma").unwrap() < project_rows.find("Alpha").unwrap());
         assert!(!project_rows.contains("Beta"));
 
@@ -10538,8 +11804,8 @@ mod tests {
         let global_rows = render_tui_test_backend(&tui, 100, 24);
         assert!(global_rows.contains("Resume session · All projects"));
         assert!(global_rows.contains(&format!("#{} Beta", other.id)));
-        assert!(global_rows.contains("root="));
-        assert!(global_rows.contains("other-root"));
+        assert!(!global_rows.contains("root="), "{global_rows:?}");
+        assert!(!global_rows.contains("other-root"), "{global_rows:?}");
         assert!(global_rows.find("Gamma").unwrap() < global_rows.find("Beta").unwrap());
         assert!(global_rows.find("Beta").unwrap() < global_rows.find("Alpha").unwrap());
 
@@ -10845,7 +12111,7 @@ mod tests {
 
         open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress.clone());
         let connected = std::fs::read_to_string(&credentials_path).unwrap();
-        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
         let after_cancel = std::fs::read_to_string(&credentials_path).unwrap();
         assert_eq!(after_cancel, connected);
         open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress);
@@ -11233,7 +12499,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tui_native_select_restores_mouse_mode_after_running_turn_outcomes() {
+    fn tui_native_select_preserves_running_turn_outcomes_and_terminal_cleanup() {
         use std::os::unix::fs::symlink;
 
         let temporary = tui_session_directory("native-select");
@@ -11283,8 +12549,11 @@ mod tests {
         );
         assert_eq!(tui.transcript().len(), transcript_count);
         open_running_tui_select(&mut tui, &router);
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert!(tui.view().quit_armed);
+        assert!(tui.view().dialog.is_some());
         assert_eq!(
-            tui.handle(Event::Key(Key::CtrlC)),
+            tui.handle(Event::Key(Key::Escape)),
             Action::SafeDialogAction("select:cancel".into())
         );
         assert_eq!(
@@ -11357,16 +12626,32 @@ mod tests {
             vec![
                 EnableRaw,
                 EnterAlternate,
+                HideCursor,
                 EnableMouse,
                 EnableKeyboardEnhancement,
                 EnablePaste,
                 DisablePaste,
                 DisableKeyboardEnhancement,
                 DisableMouse,
+                ShowCursor,
                 LeaveAlternate,
                 DisableRaw,
             ]
         );
+    }
+
+    #[test]
+    fn second_control_c_uses_the_owned_turn_cancellation_before_quit() {
+        let cancellation = HeadlessTurnCancellation::new();
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(Some(cancellation.clone()))),
+        });
+        tui.set_running(true);
+
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert!(!cancellation.is_cancelled());
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+        assert!(cancellation.is_cancelled());
     }
 
     fn open_running_tui_select(
@@ -11945,6 +13230,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("resumed production turn should complete");
         let provider_request = worker.join().expect("mock provider should finish");
@@ -12035,8 +13321,8 @@ mod tests {
                 assert_eq!(request["model"], model, "{provider_type}: {model}");
                 assert_eq!(request["reasoning"]["effort"], "max", "{request}");
                 assert!(
-                    !request.to_string().contains("gpt-4.1"),
-                    "{provider_type} request retained the replaced model: {request}"
+                    !request["input"].to_string().contains("gpt-4.1"),
+                    "{provider_type} request input retained the replaced model: {request}"
                 );
             }
         }
@@ -12414,6 +13700,12 @@ mod tests {
                 .lock()
                 .expect("tool calls should be available")
                 .push(path.clone());
+            if let Some(message) = arguments
+                .get("_inject_tool_failure")
+                .and_then(serde_json::Value::as_str)
+            {
+                return Ok(ToolOutput::failure(message));
+            }
             if let Some(cancellation) = &self.cancellation {
                 cancellation.cancel();
             }
@@ -13043,6 +14335,46 @@ mod tests {
     }
 
     #[test]
+    fn production_dispatcher_preserves_safe_native_failure_reason() {
+        let outcome = run_production_batch(
+            "safe-native-failure",
+            vec![PermissionPromptAnswer::AllowOnce],
+            vec![MessagePart::ToolCall {
+                id: "glob".into(),
+                name: "native::glob".into(),
+                input: serde_json::json!({
+                    "pattern": "**/*.md",
+                    "_inject_tool_failure": "glob: entry limit of 10000 exceeded",
+                })
+                .to_string(),
+            }],
+            None,
+            None,
+            false,
+        );
+
+        assert!(outcome.result.is_ok());
+        assert!(outcome.progress.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                content,
+                is_error: true,
+                ..
+            }) if content == "glob: entry limit of 10000 exceeded"
+        )));
+        assert_eq!(
+            sanitized_native_tool_failure(
+                "glob: /home/user/private token=SECRET remote body details"
+            ),
+            "tool execution failed"
+        );
+        assert_eq!(
+            sanitized_native_tool_failure("glob: path is outside project root"),
+            "glob: path validation failed"
+        );
+    }
+
+    #[test]
     fn tui_metrics_publish_one_terminal_after_the_production_turn_outcome() {
         let success = run_production_batch(
             "metrics-success",
@@ -13556,7 +14888,7 @@ mod tests {
     }
 
     #[test]
-    fn production_task_catalog_is_conditional_and_dispatches_requested_call() {
+    fn production_task_catalog_includes_built_ins_and_dispatches_requested_call() {
         struct RecordingTaskRunner(Arc<Mutex<Vec<(String, TaskLaunchMode)>>>);
 
         impl TaskRunner for RecordingTaskRunner {
@@ -13607,20 +14939,17 @@ mod tests {
             "Dispatch an isolated eligible subagent task in the foreground or background"
         );
         assert_eq!(
-            task.parameters(),
-            &serde_json::json!({
-                "type":"object",
-                "additionalProperties":false,
-                "required":["description"],
-                "properties":{
-                    "agent":{"type":"string","minLength":1,"maxLength":64},
-                    "background":{"type":"boolean"},
-                    "description":{"type":"string","minLength":1,"maxLength":16384},
-                    "model":{"type":"string","minLength":1,"maxLength":64},
-                    "skills":{"type":"array","maxItems":128,"uniqueItems":true,"items":{"type":"string","minLength":1,"maxLength":64}}
-                }
-            })
+            task.parameters()["properties"]["agent"]["enum"],
+            serde_json::json!(["alpha", "explore", "general", "reviewer"])
         );
+        assert_eq!(
+            task.parameters()["properties"]["model"]["enum"],
+            serde_json::json!(task_model_catalog(&bootstrap).unwrap())
+        );
+        let task_schema = task.parameters().to_string();
+        assert!(task_schema.contains("Explore the codebase without modifying files"));
+        assert!(task_schema.contains("Handle a general delegated coding task"));
+        assert!(!task_schema.contains("You are the read-only exploration subagent"));
 
         let policy = PermissionPolicy::new(
             PermissionMode::Edit,
@@ -13659,18 +14988,10 @@ mod tests {
             ]
         );
 
-        for (label, agents) in [
-            ("absent", Vec::new()),
-            (
-                "ineligible",
-                vec![(
-                    "primary",
-                    "---\nname: primary\ndescription: primary\nmode: primary\npermissions: []\n---\nPrimary work.\n",
-                )],
-            ),
-        ] {
-            let temporary = tui_session_directory(label);
-            let bootstrap = tui_session_bootstrap(&temporary, &agents);
+        for provider in ["openai-api", "openai-chatgpt"] {
+            let provider_temporary = tui_session_directory(provider);
+            let bootstrap =
+                tui_session_bootstrap_for_provider(&provider_temporary, &[], provider, "gpt-4.1");
             let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
                 &bootstrap,
                 bootstrap.project_root().unwrap(),
@@ -13679,15 +15000,75 @@ mod tests {
             )
             .unwrap();
 
-            assert!(provider_tools.iter().all(|tool| tool.name() != "task"));
-            let dispatcher = dispatcher.lock().unwrap();
-            assert_eq!(dispatcher.canonical_identity("task"), None);
-            assert_eq!(dispatcher.canonical_identity("native::task"), None);
-            drop(dispatcher);
-            std::fs::remove_dir_all(temporary).unwrap();
+            let task = provider_tools
+                .iter()
+                .find(|tool| tool.name() == "task")
+                .expect("built-in subagents should expose task for both providers");
+            assert_eq!(
+                task.parameters()["properties"]["agent"]["enum"],
+                serde_json::json!(["explore", "general"])
+            );
+            assert_eq!(
+                task.parameters()["properties"]["model"]["enum"],
+                serde_json::json!(task_model_catalog(&bootstrap).unwrap())
+            );
+            assert!(
+                task.parameters()["properties"]["model"]["enum"]
+                    .as_array()
+                    .is_some_and(|models| !models.is_empty() && models.len() <= 256)
+            );
+            assert!(
+                dispatcher
+                    .lock()
+                    .unwrap()
+                    .canonical_identity("native::task")
+                    .is_some()
+            );
+
+            std::fs::remove_dir_all(provider_temporary).unwrap();
         }
 
+        let override_temporary = tui_session_directory("overridden-built-ins");
+        let bootstrap = tui_session_bootstrap(
+            &override_temporary,
+            &[
+                (
+                    "explore",
+                    "---\nname: explore\ndescription: primary override\nmode: primary\npermissions: []\n---\nPrimary work.\n",
+                ),
+                (
+                    "general",
+                    "---\nname: general\ndescription: all override\nmode: all\npermissions: []\n---\nAll work.\n",
+                ),
+            ],
+        );
+        let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+            &bootstrap,
+            bootstrap.project_root().unwrap(),
+            Some(&SkillCatalog::default()),
+            RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .unwrap();
+
+        assert!(provider_tools.iter().all(|tool| tool.name() != "task"));
+        let dispatcher = dispatcher.lock().unwrap();
+        assert_eq!(dispatcher.canonical_identity("task"), None);
+        assert_eq!(dispatcher.canonical_identity("native::task"), None);
+        drop(dispatcher);
+        std::fs::remove_dir_all(override_temporary).unwrap();
+
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
+        let prompt = explicit_task_delegation_prompt("Base instructions.");
+
+        assert_eq!(
+            prompt,
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline."
+        );
+        assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
     }
 
     #[test]
@@ -13700,9 +15081,9 @@ mod tests {
                 "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
             )],
         );
-        bootstrap.model = Some("gpt-4o".into());
+        bootstrap.model = Some("gpt-5.6-sol".into());
         let probe = Arc::new(Mutex::new(Vec::new()));
-        let runtime = production_tui_task_runtime_with_runner(
+        let runtime = production_tui_task_runtime_with_runner_and_parent_config(
             &bootstrap,
             &SkillCatalog::default(),
             production_tui_permission_bridge().0,
@@ -13711,6 +15092,8 @@ mod tests {
                 bootstrap.project_root().unwrap().to_path_buf(),
                 Arc::clone(&probe),
             ),
+            agens_core::RequestConfig::with_reasoning_effort("high").unwrap(),
+            None,
         )
         .unwrap();
 
@@ -13759,7 +15142,8 @@ mod tests {
         let probe = probe.lock().unwrap();
         assert_eq!(probe.len(), 1);
         assert_eq!(probe[0].1, TaskLaunchMode::Foreground);
-        assert_eq!(probe[0].2, "gpt-4o");
+        assert_eq!(probe[0].2, "gpt-5.6-sol");
+        assert_eq!(probe[0].3, Some(agens_core::ReasoningEffort::High));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -14104,9 +15488,65 @@ mod tests {
             expected_result,
         ) in [
             (
+                ChildRunError::Authentication,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Authentication),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Context,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Context),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Network,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Network),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
                 ChildRunError::Provider,
                 TaskRunnerError::ProviderFailure,
                 Some(TuiSubagentErrorKind::Provider),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Protocol,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Protocol),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::RateLimited,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::RateLimited),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Rejected,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Rejected),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Server,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Server),
                 TuiExecutionEvent::Failed { id: 1 },
                 TuiSubagentStatus::Failure,
                 "failed",
@@ -14204,9 +15644,9 @@ mod tests {
                 )),
             ];
             if let Some(kind) = expected_kind {
-                expected.push(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
-                    1, kind,
-                )));
+                expected.push(TuiRuntimeEvent::SubagentExecution(
+                    TuiSubagentEvent::error_with_reference(1, kind, "abc12345"),
+                ));
             }
             expected.push(TuiRuntimeEvent::TaskExecution {
                 agent: "reviewer".into(),
@@ -15439,4 +16879,141 @@ fn reliability_integration_completion(
     let turn = completed_session_turn(prompt, &snapshot, None).unwrap();
 
     (snapshot, turn)
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostics_store_writes_only_allowlisted_jsonl_with_private_bounded_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let data_directory = std::env::temp_dir().join(format!(
+        "agens-safe-diagnostics-{}-{}",
+        std::process::id(),
+        DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&data_directory).expect("test data directory should be created");
+    let store = SafeDiagnosticStore::new(data_directory.clone());
+    let event = ProviderDiagnosticEvent {
+        reference: DiagnosticRef::new("abc12345".into()).expect("reference should be valid"),
+        scope: ProviderDiagnosticScope::Subagent,
+        component: ProviderDiagnosticComponent::Responses,
+        event: ProviderDiagnosticKind::RetryScheduled,
+        attempt: 1,
+        max_attempts: 3,
+        delay_ms: Some(275),
+        status: Some(429),
+        class: Some(ProviderDiagnosticClass::RateLimited),
+    };
+
+    store.record(&event);
+
+    let diagnostics_directory = data_directory.join("diagnostics");
+    assert_eq!(
+        std::fs::metadata(&diagnostics_directory)
+            .expect("diagnostics metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+    let active = diagnostics_directory.join(format!("agens-{}.jsonl", std::process::id()));
+    let line = std::fs::read_to_string(&active).expect("diagnostic should be readable");
+    let object = serde_json::from_str::<serde_json::Value>(&line)
+        .expect("diagnostic should be JSON")
+        .as_object()
+        .expect("diagnostic should be an object")
+        .clone();
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "attempt",
+            "class",
+            "component",
+            "delay_ms",
+            "event",
+            "max_attempts",
+            "reference",
+            "scope",
+            "status",
+            "timestamp_ms",
+        ])
+    );
+    assert_eq!(object["reference"], "abc12345");
+    assert!(!line.contains("prompt"));
+    assert!(!line.contains("authorization"));
+    assert_eq!(
+        std::fs::metadata(&active)
+            .expect("diagnostic file metadata should be readable")
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+
+    for _ in 0..4 {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active)
+            .expect("active diagnostics file should open")
+            .set_len(DIAGNOSTIC_FILE_LIMIT_BYTES)
+            .expect("test should fill diagnostics file");
+        store.record(&event);
+    }
+    assert_eq!(
+        std::fs::read_dir(&diagnostics_directory)
+            .expect("diagnostics directory should be readable")
+            .count(),
+        DIAGNOSTIC_FILE_COUNT_LIMIT
+    );
+    assert!(
+        std::fs::read_dir(&diagnostics_directory)
+            .expect("diagnostics directory should be readable")
+            .all(|entry| entry
+                .expect("diagnostic entry should be readable")
+                .metadata()
+                .expect("diagnostic metadata should be readable")
+                .len()
+                <= DIAGNOSTIC_FILE_LIMIT_BYTES)
+    );
+
+    std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostics_dialog_projects_only_safe_fields_and_relative_paths() {
+    use std::os::unix::fs::symlink;
+
+    let data_directory = std::env::temp_dir().join(format!(
+        "agens-diagnostics-dialog-{}-{}",
+        std::process::id(),
+        DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let diagnostics_directory = data_directory.join("diagnostics");
+    std::fs::create_dir_all(&diagnostics_directory)
+        .expect("diagnostics directory should be created");
+    std::fs::write(
+        diagnostics_directory.join("agens-42.jsonl"),
+        concat!(
+            "{\"timestamp_ms\":1,\"reference\":\"abc12345\",\"scope\":\"parent\",",
+            "\"component\":\"responses\",\"event\":\"terminal\",\"attempt\":3,",
+            "\"max_attempts\":3,\"delay_ms\":null,\"status\":429,",
+            "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n"
+        ),
+    )
+    .expect("diagnostic fixture should be written");
+    let outside = data_directory.join("outside.txt");
+    std::fs::write(&outside, "SENTINEL_OUTSIDE").expect("outside fixture should be written");
+    symlink(&outside, diagnostics_directory.join("agens-99.jsonl"))
+        .expect("diagnostic symlink should be created");
+
+    let rendered = format!("{:?}", diagnostics_dialog(&data_directory));
+
+    assert!(rendered.contains("abc12345"));
+    assert!(rendered.contains("diagnostics/agens-42.jsonl"));
+    assert!(!rendered.contains(&data_directory.display().to_string()));
+    assert!(!rendered.contains("SENTINEL_SECRET"));
+    assert!(!rendered.contains("SENTINEL_OUTSIDE"));
+
+    std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
 }

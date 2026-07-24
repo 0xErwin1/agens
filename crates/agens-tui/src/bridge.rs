@@ -238,6 +238,7 @@ pub(crate) enum TuiSubagentUpdate {
     },
     Error {
         kind: TuiSubagentErrorKind,
+        reference: Option<String>,
     },
     Terminal {
         status: TuiSubagentStatus,
@@ -247,7 +248,14 @@ pub(crate) enum TuiSubagentUpdate {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiSubagentErrorKind {
+    Authentication,
+    Context,
+    Network,
     Provider,
+    Protocol,
+    RateLimited,
+    Rejected,
+    Server,
     Tool,
     Runtime,
 }
@@ -255,7 +263,14 @@ pub enum TuiSubagentErrorKind {
 impl TuiSubagentErrorKind {
     pub(crate) const fn message(self) -> &'static str {
         match self {
+            Self::Authentication => "Subagent authentication failed.",
+            Self::Context => "Subagent request exceeds the model context window.",
+            Self::Network => "Subagent network request failed.",
             Self::Provider => "Subagent provider request failed.",
+            Self::Protocol => "Subagent provider response protocol failed.",
+            Self::RateLimited => "Subagent provider request was rate limited.",
+            Self::Rejected => "Subagent provider request was rejected.",
+            Self::Server => "Subagent provider service failed.",
             Self::Tool => "Subagent tool execution failed.",
             Self::Runtime => "Subagent runtime failed.",
         }
@@ -263,7 +278,14 @@ impl TuiSubagentErrorKind {
 
     pub(crate) const fn action(self) -> &'static str {
         match self {
+            Self::Authentication => "Check provider credentials, then retry.",
+            Self::Context => "Reduce the task context, then retry.",
+            Self::Network => "Check network connectivity, then retry.",
             Self::Provider => "Retry the subagent request.",
+            Self::Protocol => "Retry the subagent request or inspect diagnostics.",
+            Self::RateLimited => "Wait before retrying the subagent request.",
+            Self::Rejected => "Review the request configuration, then retry.",
+            Self::Server => "Retry after the provider service recovers.",
             Self::Tool => "Review the tool call and retry.",
             Self::Runtime => "Retry the subagent request or inspect diagnostics.",
         }
@@ -341,7 +363,27 @@ impl TuiSubagentEvent {
     pub fn error(id: u64, kind: TuiSubagentErrorKind) -> Self {
         Self {
             id,
-            update: TuiSubagentUpdate::Error { kind },
+            update: TuiSubagentUpdate::Error {
+                kind,
+                reference: None,
+            },
+        }
+    }
+
+    pub fn error_with_reference(
+        id: u64,
+        kind: TuiSubagentErrorKind,
+        reference: impl AsRef<str>,
+    ) -> Self {
+        let reference = reference.as_ref();
+        let reference = (reference.len() == 8
+            && reference
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then(|| reference.to_owned());
+        Self {
+            id,
+            update: TuiSubagentUpdate::Error { kind, reference },
         }
     }
 

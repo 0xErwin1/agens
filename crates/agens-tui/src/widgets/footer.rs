@@ -8,6 +8,7 @@ use agens_core::Usage;
 pub(crate) struct FooterContext<'a> {
     pub model: &'a str,
     pub effort: Option<&'a str>,
+    pub context_window: Option<u64>,
     pub project: &'a str,
     pub turn_label: &'a str,
     pub duration: Option<Duration>,
@@ -21,31 +22,31 @@ pub(crate) struct MetricFooter;
 impl MetricFooter {
     /// Builds a dense footer without keymap laundry lists.
     pub(crate) fn text(width: u16, ctx: FooterContext<'_>) -> String {
-        let mut parts = Vec::new();
-
-        if ctx.dangerous {
-            parts.push("danger".to_owned());
-        }
-
         let model = short_model(ctx.model);
-        if !model.is_empty() {
-            parts.push(model);
-        }
-        if let Some(effort) = ctx
+        let model = if model.is_empty() {
+            "model —".to_owned()
+        } else {
+            model
+        };
+        let effort = ctx
             .effort
-            .filter(|value| !value.is_empty() && *value != "default")
-        {
-            parts.push(effort.to_owned());
+            .filter(|value| !value.is_empty())
+            .unwrap_or("effort —")
+            .to_owned();
+        let usage = match ctx.usage {
+            Some(usage) => Self::format_usage_with_context(usage, ctx.context_window),
+            None => ctx
+                .context_window
+                .filter(|window| *window > 0)
+                .map(|window| format!("0/{} (0%)", compact_count(window))),
         }
-
-        if let Some(usage) = ctx.usage.and_then(Self::format_usage) {
-            parts.push(usage);
-        }
-
+        .unwrap_or_else(|| "ctx —".to_owned());
         let project = short_project(ctx.project);
-        if !project.is_empty() && width >= 70 {
-            parts.push(project);
-        }
+        let project = if project.is_empty() {
+            "project —".to_owned()
+        } else {
+            project
+        };
 
         let mut status = ctx.turn_label.to_owned();
         if let Some(duration) = ctx.duration {
@@ -55,29 +56,43 @@ impl MetricFooter {
                 format!(" {}ms", duration.as_millis())
             });
         }
-        parts.push(status);
+        if ctx.dangerous {
+            status = format!("danger {status}");
+        }
 
-        let line = format!(" {}", parts.join(" · "));
+        let full = footer_line([&model, &effort, &usage, &project, &status]);
         if width == 0 {
-            return line;
+            return full;
         }
-        // Soft-truncate trailing segments if the terminal is very narrow.
-        if line.chars().count() as u16 <= width {
-            line
+        if full.chars().count() as u16 <= width {
+            return full;
+        }
+
+        let without_project = footer_line([&model, &effort, &usage, &status]);
+        let line = if without_project.chars().count() as u16 <= width {
+            without_project
         } else {
-            line.chars().take(usize::from(width)).collect()
-        }
+            footer_line([&model, &effort, &status])
+        };
+
+        line.chars().take(usize::from(width)).collect()
     }
 
-    /// Compact usage: `71k/1000k (7%)` or `tokens 71k` when window unknown.
-    pub(crate) fn format_usage(usage: &Usage) -> Option<String> {
+    #[cfg(test)]
+    fn format_usage(usage: &Usage) -> Option<String> {
+        Self::format_usage_with_context(usage, None)
+    }
+
+    fn format_usage_with_context(usage: &Usage, context_window: Option<u64>) -> Option<String> {
         match (
             usage.total_tokens.or(usage.input_tokens),
-            usage.context_window,
+            usage.context_window.or(context_window),
         ) {
             (Some(used), Some(window)) if window > 0 => {
                 let pct = ((used as f64 / window as f64) * 100.0).clamp(0.0, 100.0);
-                let pct_label = if pct < 10.0 {
+                let pct_label = if used == 0 {
+                    "0%".to_owned()
+                } else if pct < 10.0 {
                     format!("{pct:.1}%")
                 } else {
                     format!("{pct:.0}%")
@@ -92,6 +107,17 @@ impl MetricFooter {
             (None, _) => None,
         }
     }
+}
+
+fn footer_line<'a>(parts: impl IntoIterator<Item = &'a String>) -> String {
+    format!(
+        " {}",
+        parts
+            .into_iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" · ")
+    )
 }
 
 fn compact_count(value: u64) -> String {
@@ -133,6 +159,15 @@ mod tests {
 
     #[test]
     fn format_usage_covers_known_partial_and_empty_cases() {
+        assert_eq!(
+            MetricFooter::format_usage(&Usage {
+                input_tokens: Some(70_000),
+                output_tokens: Some(1_000),
+                total_tokens: Some(71_000),
+                context_window: Some(200_000),
+            }),
+            Some("71k/200k (36%)".into())
+        );
         assert_eq!(
             MetricFooter::format_usage(&Usage {
                 input_tokens: Some(1),
@@ -178,6 +213,7 @@ mod tests {
             FooterContext {
                 model: "openai-chatgpt / gpt-5.6-sol",
                 effort: Some("high"),
+                context_window: Some(200_000),
                 project: "/home/iperez/dev/personal/agens",
                 turn_label: "Ready",
                 duration: Some(Duration::from_secs(2)),

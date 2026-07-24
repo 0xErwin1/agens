@@ -21,6 +21,7 @@ use agens_core::{
     PermissionPolicy, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde::Deserialize;
 use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
@@ -49,8 +50,8 @@ pub use mcp_status::{
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
     TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
-    TaskTurnRequest, TaskTurnResult,
+    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
+    TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
 };
 
 #[cfg(unix)]
@@ -3701,7 +3702,7 @@ impl NativeTools {
 
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "file picker");
-        self.collect_tool_files(&self.project_root, 0, &mut budget, &mut files)?;
+        self.collect_tool_files(&self.project_root, &mut budget, &mut files)?;
         self.ensure_project_root_is_stable()?;
 
         let mut candidates = files
@@ -3885,7 +3886,7 @@ impl NativeTools {
 
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "grep");
-        if let Err(output) = self.collect_tool_files(&directory, 0, &mut budget, &mut files) {
+        if let Err(output) = self.collect_tool_files(&directory, &mut budget, &mut files) {
             return Ok(output);
         }
 
@@ -3945,8 +3946,7 @@ impl NativeTools {
         };
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "glob");
-        if let Err(output) = self.collect_tool_files(&self.project_root, 0, &mut budget, &mut files)
-        {
+        if let Err(output) = self.collect_tool_files(&self.project_root, &mut budget, &mut files) {
             return Ok(output);
         }
 
@@ -4351,43 +4351,45 @@ impl NativeTools {
     fn collect_tool_files(
         &self,
         directory: &Path,
-        depth: usize,
         budget: &mut SearchBudget,
         files: &mut Vec<PathBuf>,
     ) -> Result<(), ToolOutput> {
-        let directory_entries = fs::read_dir(directory)
-            .map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
-        let mut entries = Vec::new();
-        for entry in directory_entries {
-            budget.consume_entry()?;
-            let entry =
-                entry.map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            entries.push(entry);
-        }
-        entries.sort_by_key(|entry| entry.file_name());
+        let mut builder = WalkBuilder::new(directory);
+        builder
+            .hidden(true)
+            .ignore(false)
+            .git_ignore(true)
+            .git_exclude(true)
+            .git_global(true)
+            .parents(true)
+            .require_git(false)
+            .follow_links(false)
+            .sort_by_file_name(|left, right| left.cmp(right));
 
-        for entry in entries {
-            budget.check_deadline()?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| ToolOutput::failure(format!("{}: {error}", budget.tool)))?;
-            if metadata.file_type().is_symlink() {
+        for entry in builder.build() {
+            let entry = entry
+                .map_err(|_| ToolOutput::failure(format!("{}: traversal failed", budget.tool)))?;
+            if entry.depth() == 0 {
                 continue;
             }
-            if metadata.is_dir() {
-                let next_depth = depth + 1;
-                if next_depth > self.limits.max_search_depth {
+
+            budget.consume_entry()?;
+            budget.check_deadline()?;
+            let Some(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if entry.depth() > self.limits.max_search_depth {
                     return Err(ToolOutput::failure(format!(
                         "{}: traversal depth limit of {} exceeded",
                         budget.tool, self.limits.max_search_depth
                     )));
                 }
-                self.collect_tool_files(&path, next_depth, budget, files)?;
-            } else if metadata.is_file() {
-                files.push(path);
+            } else if file_type.is_file() {
+                files.push(entry.into_path());
             }
         }
         Ok(())

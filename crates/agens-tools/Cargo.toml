@@ -12,6 +12,7 @@ workspace = true
 agens-config = { path = "../agens-config" }
 agens-core = { path = "../agens-core" }
 globset = "0.4"
+ignore = "0.4"
 libc = "0.2"
 regex = "1"
 serde = "1"

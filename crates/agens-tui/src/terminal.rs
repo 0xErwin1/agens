@@ -53,6 +53,8 @@ pub enum TerminalOperation {
     DisableRaw,
     EnterAlternate,
     LeaveAlternate,
+    HideCursor,
+    ShowCursor,
     EnableMouse,
     DisableMouse,
     EnableKeyboardEnhancement,
@@ -66,6 +68,7 @@ pub trait TerminalControl {
 pub struct TerminalModeGuard {
     raw: bool,
     alternate: bool,
+    cursor_hidden: bool,
     mouse: bool,
     keyboard_enhancement: bool,
     paste: bool,
@@ -76,6 +79,7 @@ impl TerminalModeGuard {
         let mut guard = Self {
             raw: true,
             alternate: false,
+            cursor_hidden: false,
             mouse: false,
             keyboard_enhancement: false,
             paste: false,
@@ -85,6 +89,11 @@ impl TerminalModeGuard {
             return Err(error);
         }
         guard.alternate = true;
+        guard.cursor_hidden = true;
+        if let Err(error) = control.apply(TerminalOperation::HideCursor) {
+            let _ = guard.restore(control);
+            return Err(error);
+        }
         if let Err(error) = control.apply(TerminalOperation::EnableMouse) {
             let _ = guard.restore(control);
             return Err(error);
@@ -108,6 +117,7 @@ impl TerminalModeGuard {
         }
         Ok(guard)
     }
+
     pub fn restore(&mut self, control: &mut impl TerminalControl) -> io::Result<()> {
         let mut first_error = None;
         if self.paste {
@@ -125,6 +135,12 @@ impl TerminalModeGuard {
         if self.mouse {
             self.mouse = false;
             if let Err(error) = control.apply(TerminalOperation::DisableMouse) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if self.cursor_hidden {
+            self.cursor_hidden = false;
+            if let Err(error) = control.apply(TerminalOperation::ShowCursor) {
                 first_error.get_or_insert(error);
             }
         }

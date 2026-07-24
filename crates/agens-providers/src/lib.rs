@@ -22,6 +22,11 @@ use time::format_description::well_known::Rfc3339;
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_HTTP_REQUEST_ATTEMPTS: usize = 3;
+const HTTP_RETRY_FIRST_DELAY: Duration = Duration::from_millis(250);
+const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
+const HTTP_RETRY_MAX_JITTER: u64 = 100;
+const HTTP_RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
 const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_SSE_FRAME_BYTES: usize = 128 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -37,6 +42,7 @@ const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CHATGPT_ORIGINATOR: &str = "codex_cli_rs";
 const AGENS_USER_AGENT: &str = concat!("Agens/", env!("CARGO_PKG_VERSION"));
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static RETRY_JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 thread_local! {
     static FAIL_BEFORE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -74,6 +80,7 @@ pub struct OpenAiResponsesProvider {
     seen_call_ids: BTreeSet<String>,
     continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
+    diagnostics: Option<ProviderDiagnostics>,
 }
 
 /// ChatGPT subscription Responses transport using existing auth.json credentials.
@@ -97,6 +104,174 @@ pub struct ChatGptResponsesProvider {
     seen_replay_item_ids: BTreeSet<String>,
     continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
+    diagnostics: Option<ProviderDiagnostics>,
+}
+
+pub type ProviderDiagnosticSink = Arc<dyn Fn(ProviderDiagnosticEvent) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct ProviderDiagnostics {
+    reference: DiagnosticRef,
+    scope: ProviderDiagnosticScope,
+    sink: ProviderDiagnosticSink,
+}
+
+impl ProviderDiagnostics {
+    pub fn new(
+        reference: impl Into<String>,
+        scope: ProviderDiagnosticScope,
+        sink: ProviderDiagnosticSink,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            reference: DiagnosticRef::new(reference.into())?,
+            scope,
+            sink,
+        })
+    }
+
+    fn emit(
+        &self,
+        component: ProviderDiagnosticComponent,
+        event: ProviderDiagnosticKind,
+        attempt: usize,
+        delay: Option<Duration>,
+        status: Option<u16>,
+        class: Option<ProviderDiagnosticClass>,
+    ) {
+        (self.sink)(ProviderDiagnosticEvent {
+            reference: self.reference.clone(),
+            scope: self.scope,
+            component,
+            event,
+            attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
+            max_attempts: MAX_HTTP_REQUEST_ATTEMPTS as u8,
+            delay_ms: delay.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+            status,
+            class,
+        });
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiagnosticRef(String);
+
+impl DiagnosticRef {
+    pub fn new(reference: String) -> Result<Self, Error> {
+        if reference.len() == 8
+            && reference
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            Ok(Self(reference))
+        } else {
+            Err(Error::Provider(
+                "provider diagnostics reference is invalid".into(),
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderDiagnosticScope {
+    Parent,
+    Subagent,
+}
+
+impl ProviderDiagnosticScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderDiagnosticComponent {
+    Responses,
+    OauthRefresh,
+    Subagent,
+}
+
+impl ProviderDiagnosticComponent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::OauthRefresh => "oauth_refresh",
+            Self::Subagent => "subagent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderDiagnosticKind {
+    Attempt,
+    RetryScheduled,
+    Terminal,
+}
+
+impl ProviderDiagnosticKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderDiagnosticClass {
+    Authentication,
+    Cancelled,
+    Context,
+    Deadline,
+    ModelUnavailable,
+    Network,
+    Provider,
+    Protocol,
+    RateLimited,
+    Rejected,
+    Runtime,
+    Server,
+    Tool,
+}
+
+impl ProviderDiagnosticClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Cancelled => "cancelled",
+            Self::Context => "context",
+            Self::Deadline => "deadline",
+            Self::ModelUnavailable => "model_unavailable",
+            Self::Network => "network",
+            Self::Provider => "provider",
+            Self::Protocol => "protocol",
+            Self::RateLimited => "rate_limited",
+            Self::Rejected => "rejected",
+            Self::Runtime => "runtime",
+            Self::Server => "server",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderDiagnosticEvent {
+    pub reference: DiagnosticRef,
+    pub scope: ProviderDiagnosticScope,
+    pub component: ProviderDiagnosticComponent,
+    pub event: ProviderDiagnosticKind,
+    pub attempt: u8,
+    pub max_attempts: u8,
+    pub delay_ms: Option<u64>,
+    pub status: Option<u16>,
+    pub class: Option<ProviderDiagnosticClass>,
 }
 
 enum ChatGptResponseError {
@@ -295,6 +470,7 @@ impl OpenAiResponsesProvider {
             seen_call_ids: BTreeSet::new(),
             continuation_rounds: 0,
             progress: None,
+            diagnostics: None,
         })
     }
 
@@ -329,35 +505,119 @@ impl OpenAiResponsesProvider {
         self
     }
 
+    pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
     async fn request_response(
         &self,
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, HeadlessTurnPortError> {
-        let request = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.api_key)
-            .header("Accept", "text/event-stream")
-            .json(&payload)
-            .build()
-            .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
-        let response = tokio::select! {
-            response = self.client.execute(request) => {
-                stop_before_mapping(cancellation)?;
-                response.map_err(|_| HeadlessTurnPortError::ProviderNetwork)?
+        let mut attempt = 0;
+        let mut last_transient_status = None;
+        let response = loop {
+            stop_before_mapping(cancellation)?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::Responses,
+                    ProviderDiagnosticKind::Attempt,
+                    attempt + 1,
+                    None,
+                    None,
+                    None,
+                );
             }
-            stop = wait_for_stop(cancellation) => return Err(stop),
+            let request = self
+                .client
+                .post(format!("{}/responses", self.base_url))
+                .bearer_auth(&self.api_key)
+                .header("Accept", "text/event-stream")
+                .json(&payload)
+                .build()
+                .map_err(|_| HeadlessTurnPortError::ProviderProtocol)?;
+            let response = tokio::select! {
+                response = self.client.execute(request) => {
+                    stop_before_mapping(cancellation)?;
+                    response
+                }
+                stop = wait_for_stop(cancellation) => return Err(stop),
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
+                        && is_transient_transport_error(&error)
+                    {
+                        wait_for_http_retry(
+                            cancellation,
+                            attempt,
+                            None,
+                            self.diagnostics.as_ref(),
+                            ProviderDiagnosticComponent::Responses,
+                            ProviderDiagnosticClass::Network,
+                            None,
+                        )
+                        .await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    let error = last_transient_status
+                        .map(|status| classify_openai_response_status(status, false))
+                        .unwrap_or(HeadlessTurnPortError::ProviderNetwork);
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.emit(
+                            ProviderDiagnosticComponent::Responses,
+                            ProviderDiagnosticKind::Terminal,
+                            attempt + 1,
+                            None,
+                            last_transient_status,
+                            Some(diagnostic_class_for_port_error(error)),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let status = response.status().as_u16();
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+                last_transient_status = Some(status);
+                let retry_after = retry_after_from_headers(response.headers());
+                drop(response);
+                wait_for_http_retry(
+                    cancellation,
+                    attempt,
+                    retry_after,
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticComponent::Responses,
+                    diagnostic_class_for_status(status, false),
+                    Some(status),
+                )
+                .await?;
+                attempt += 1;
+                continue;
+            }
+            break response;
         };
 
         stop_before_mapping(cancellation)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let context_exceeded = read_safe_openai_context_error(response, cancellation).await?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::Responses,
+                    ProviderDiagnosticKind::Terminal,
+                    attempt + 1,
+                    None,
+                    Some(status),
+                    Some(diagnostic_class_for_status(status, context_exceeded)),
+                );
+            }
             return Err(classify_openai_response_status(status, context_exceeded));
         }
 
-        decode_http_response_stream(
+        let result = decode_http_response_stream(
             response,
             cancellation,
             false,
@@ -365,7 +625,22 @@ impl OpenAiResponsesProvider {
             HeadlessTurnPortError::ProviderProtocol,
             false,
         )
-        .await
+        .await;
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.emit(
+                ProviderDiagnosticComponent::Responses,
+                ProviderDiagnosticKind::Terminal,
+                attempt + 1,
+                None,
+                None,
+                result
+                    .as_ref()
+                    .err()
+                    .copied()
+                    .map(diagnostic_class_for_port_error),
+            );
+        }
+        result
     }
 }
 
@@ -524,6 +799,7 @@ impl ChatGptResponsesProvider {
             seen_replay_item_ids: BTreeSet::new(),
             continuation_rounds: 0,
             progress: None,
+            diagnostics: None,
         })
     }
 
@@ -563,29 +839,115 @@ impl ChatGptResponsesProvider {
         self
     }
 
+    pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
+    }
+
     async fn request_response(
         &self,
         payload: Value,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<DecodedResponse, ChatGptResponseError> {
-        let request = self
-            .client
-            .post(&self.base_url)
-            .bearer_auth(&self.access_token)
-            .header("ChatGPT-Account-ID", &self.account_id)
-            .header("Accept", "text/event-stream")
-            .header("originator", CHATGPT_ORIGINATOR)
-            .header("User-Agent", AGENS_USER_AGENT)
-            .header("session-id", &self.session_id)
-            .json(&payload)
-            .build()
-            .map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::ProviderProtocol))?;
-        let response = tokio::select! {
-            response = self.client.execute(request) => {
-                stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
-                response.map_err(|_| ChatGptResponseError::Other(HeadlessTurnPortError::ProviderNetwork))?
+        let mut attempt = 0;
+        let mut last_transient_status = None;
+        let response = loop {
+            stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::Responses,
+                    ProviderDiagnosticKind::Attempt,
+                    attempt + 1,
+                    None,
+                    None,
+                    None,
+                );
             }
-            stop = wait_for_stop(cancellation) => return Err(ChatGptResponseError::Other(stop)),
+            let request = self
+                .client
+                .post(&self.base_url)
+                .bearer_auth(&self.access_token)
+                .header("ChatGPT-Account-ID", &self.account_id)
+                .header("Accept", "text/event-stream")
+                .header("originator", CHATGPT_ORIGINATOR)
+                .header("User-Agent", AGENS_USER_AGENT)
+                .header("session-id", &self.session_id)
+                .json(&payload)
+                .build()
+                .map_err(|_| {
+                    ChatGptResponseError::Other(HeadlessTurnPortError::ProviderProtocol)
+                })?;
+            let response = tokio::select! {
+                response = self.client.execute(request) => {
+                    stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
+                    response
+                }
+                stop = wait_for_stop(cancellation) => {
+                    return Err(ChatGptResponseError::Other(stop));
+                }
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
+                        && is_transient_transport_error(&error)
+                    {
+                        wait_for_http_retry(
+                            cancellation,
+                            attempt,
+                            None,
+                            self.diagnostics.as_ref(),
+                            ProviderDiagnosticComponent::Responses,
+                            ProviderDiagnosticClass::Network,
+                            None,
+                        )
+                        .await
+                        .map_err(ChatGptResponseError::Other)?;
+                        attempt += 1;
+                        continue;
+                    }
+                    let error = last_transient_status
+                        .map(chatgpt_transient_status_error)
+                        .unwrap_or(ChatGptResponseError::Other(
+                            HeadlessTurnPortError::ProviderNetwork,
+                        ));
+                    if let Some(diagnostics) = &self.diagnostics {
+                        let class = last_transient_status
+                            .map_or(ProviderDiagnosticClass::Network, |status| {
+                                diagnostic_class_for_status(status, false)
+                            });
+                        diagnostics.emit(
+                            ProviderDiagnosticComponent::Responses,
+                            ProviderDiagnosticKind::Terminal,
+                            attempt + 1,
+                            None,
+                            last_transient_status,
+                            Some(class),
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let status = response.status().as_u16();
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+                last_transient_status = Some(status);
+                let retry_after = retry_after_from_headers(response.headers());
+                drop(response);
+                wait_for_http_retry(
+                    cancellation,
+                    attempt,
+                    retry_after,
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticComponent::Responses,
+                    diagnostic_class_for_status(status, false),
+                    Some(status),
+                )
+                .await
+                .map_err(ChatGptResponseError::Other)?;
+                attempt += 1;
+                continue;
+            }
+            break response;
         };
 
         stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
@@ -594,6 +956,19 @@ impl ChatGptResponsesProvider {
             let safe_error = read_safe_chatgpt_error(response, cancellation)
                 .await
                 .map_err(ChatGptResponseError::Other)?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::Responses,
+                    ProviderDiagnosticKind::Terminal,
+                    attempt + 1,
+                    None,
+                    Some(status),
+                    Some(diagnostic_class_for_status(
+                        status,
+                        safe_error == Some(SafeRemoteError::ContextLengthExceeded),
+                    )),
+                );
+            }
             return Err(match status {
                 401 | 403 => ChatGptResponseError::Authentication(status),
                 429 => ChatGptResponseError::RateLimited,
@@ -606,7 +981,7 @@ impl ChatGptResponsesProvider {
             });
         }
 
-        decode_http_response_stream(
+        let result = decode_http_response_stream(
             response,
             cancellation,
             true,
@@ -620,7 +995,26 @@ impl ChatGptResponsesProvider {
                 ChatGptResponseError::Other(error)
             }
             _ => ChatGptResponseError::Protocol,
-        })
+        });
+        if let Some(diagnostics) = &self.diagnostics {
+            let class = result.as_ref().err().map(|error| match error {
+                ChatGptResponseError::Other(error) => diagnostic_class_for_port_error(*error),
+                ChatGptResponseError::Authentication(_) => ProviderDiagnosticClass::Authentication,
+                ChatGptResponseError::Rejected => ProviderDiagnosticClass::Rejected,
+                ChatGptResponseError::RateLimited => ProviderDiagnosticClass::RateLimited,
+                ChatGptResponseError::Server => ProviderDiagnosticClass::Server,
+                ChatGptResponseError::Protocol => ProviderDiagnosticClass::Protocol,
+            });
+            diagnostics.emit(
+                ProviderDiagnosticComponent::Responses,
+                ProviderDiagnosticKind::Terminal,
+                attempt + 1,
+                None,
+                None,
+                class,
+            );
+        }
+        result
     }
 
     async fn refresh_if_needed(
@@ -674,26 +1068,89 @@ impl ChatGptResponsesProvider {
             .append_pair("grant_type", "refresh_token")
             .append_pair("refresh_token", refresh_token)
             .finish();
-        let request = self
-            .client
-            .post(&self.oauth_url)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(form)
-            .build()
-            .map_err(|_| HeadlessTurnPortError::Provider)?;
-        let response = tokio::select! {
-            response = self.client.execute(request) => {
-                stop_before_mapping(cancellation)?;
-                response.map_err(|_| HeadlessTurnPortError::Provider)?
+        let mut attempt = 0;
+        let response = loop {
+            stop_before_mapping(cancellation)?;
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::OauthRefresh,
+                    ProviderDiagnosticKind::Attempt,
+                    attempt + 1,
+                    None,
+                    None,
+                    None,
+                );
             }
-            stop = wait_for_stop(cancellation) => return Err(stop),
+            let request = self
+                .client
+                .post(&self.oauth_url)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(form.clone())
+                .build()
+                .map_err(|_| HeadlessTurnPortError::Provider)?;
+            let response = tokio::select! {
+                response = self.client.execute(request) => {
+                    stop_before_mapping(cancellation)?;
+                    response
+                }
+                stop = wait_for_stop(cancellation) => return Err(stop),
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
+                        && is_transient_transport_error(&error) =>
+                {
+                    wait_for_http_retry(
+                        cancellation,
+                        attempt,
+                        None,
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticComponent::OauthRefresh,
+                        ProviderDiagnosticClass::Network,
+                        None,
+                    )
+                    .await?;
+                    attempt += 1;
+                    continue;
+                }
+                Err(_) => return Err(HeadlessTurnPortError::Provider),
+            };
+            let status = response.status().as_u16();
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+                let retry_after = retry_after_from_headers(response.headers());
+                drop(response);
+                wait_for_http_retry(
+                    cancellation,
+                    attempt,
+                    retry_after,
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticComponent::OauthRefresh,
+                    diagnostic_class_for_status(status, false),
+                    Some(status),
+                )
+                .await?;
+                attempt += 1;
+                continue;
+            }
+            break response;
         };
 
         stop_before_mapping(cancellation)?;
         if response.status().as_u16() == 401 {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::OauthRefresh,
+                    ProviderDiagnosticKind::Terminal,
+                    attempt + 1,
+                    None,
+                    Some(401),
+                    Some(ProviderDiagnosticClass::Authentication),
+                );
+            }
             return Err(HeadlessTurnPortError::Authentication);
         }
 
@@ -708,11 +1165,26 @@ impl ChatGptResponsesProvider {
                 stop = wait_for_stop(cancellation) => return Err(stop),
             };
             stop_before_mapping(cancellation)?;
-            return Err(if body.as_ref().is_some_and(is_permanent_refresh_failure) {
+            let error = if body.as_ref().is_some_and(is_permanent_refresh_failure) {
                 HeadlessTurnPortError::Authentication
             } else {
                 HeadlessTurnPortError::Provider
-            });
+            };
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.emit(
+                    ProviderDiagnosticComponent::OauthRefresh,
+                    ProviderDiagnosticKind::Terminal,
+                    attempt + 1,
+                    None,
+                    Some(status.as_u16()),
+                    Some(if error == HeadlessTurnPortError::Authentication {
+                        ProviderDiagnosticClass::Authentication
+                    } else {
+                        diagnostic_class_for_status(status.as_u16(), false)
+                    }),
+                );
+            }
+            return Err(error);
         }
 
         let body = tokio::select! {
@@ -763,6 +1235,16 @@ impl ChatGptResponsesProvider {
         if let Some(account_id) = refreshed_account_id {
             self.account_id = account_id;
         }
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.emit(
+                ProviderDiagnosticComponent::OauthRefresh,
+                ProviderDiagnosticKind::Terminal,
+                attempt + 1,
+                None,
+                Some(200),
+                None,
+            );
+        }
         Ok(())
     }
 
@@ -787,6 +1269,147 @@ impl ChatGptResponsesProvider {
 
     fn initial_input(&self) -> Vec<Value> {
         self.initial_input.clone()
+    }
+}
+
+fn is_transient_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+fn is_transient_transport_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
+fn chatgpt_transient_status_error(status: u16) -> ChatGptResponseError {
+    match status {
+        429 => ChatGptResponseError::RateLimited,
+        500..=599 => ChatGptResponseError::Server,
+        _ => ChatGptResponseError::Rejected,
+    }
+}
+
+fn diagnostic_class_for_status(status: u16, context_exceeded: bool) -> ProviderDiagnosticClass {
+    match status {
+        401 | 403 => ProviderDiagnosticClass::Authentication,
+        429 => ProviderDiagnosticClass::RateLimited,
+        500..=599 => ProviderDiagnosticClass::Server,
+        400..=499 if context_exceeded => ProviderDiagnosticClass::Context,
+        400..=499 => ProviderDiagnosticClass::Rejected,
+        _ => ProviderDiagnosticClass::Protocol,
+    }
+}
+
+fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiagnosticClass {
+    match error {
+        HeadlessTurnPortError::Authentication => ProviderDiagnosticClass::Authentication,
+        HeadlessTurnPortError::Cancelled => ProviderDiagnosticClass::Cancelled,
+        HeadlessTurnPortError::TimedOut => ProviderDiagnosticClass::Deadline,
+        HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
+        HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
+        HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
+        HeadlessTurnPortError::ProviderServer => ProviderDiagnosticClass::Server,
+        HeadlessTurnPortError::Provider => ProviderDiagnosticClass::Provider,
+        HeadlessTurnPortError::ProviderProtocol
+        | HeadlessTurnPortError::Permission
+        | HeadlessTurnPortError::Tool
+        | HeadlessTurnPortError::TaskTerminal(_) => ProviderDiagnosticClass::Protocol,
+    }
+}
+
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let seconds = value?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds).min(HTTP_RETRY_AFTER_CAP))
+}
+
+fn retry_after_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    parse_retry_after(
+        headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn http_retry_delay(retry: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after;
+    }
+
+    let base = if retry == 0 {
+        HTTP_RETRY_FIRST_DELAY
+    } else {
+        HTTP_RETRY_SECOND_DELAY
+    };
+    let sequence = RETRY_JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let jitter = Duration::from_millis(
+        (sequence.wrapping_mul(17) + retry as u64 * 13) % (HTTP_RETRY_MAX_JITTER + 1),
+    );
+    base.saturating_add(jitter)
+}
+
+async fn wait_for_http_retry(
+    cancellation: &HeadlessTurnCancellation,
+    retry: usize,
+    retry_after: Option<Duration>,
+    diagnostics: Option<&ProviderDiagnostics>,
+    component: ProviderDiagnosticComponent,
+    class: ProviderDiagnosticClass,
+    status: Option<u16>,
+) -> Result<(), HeadlessTurnPortError> {
+    if let Err(error) = stop_before_mapping(cancellation) {
+        emit_retry_terminal(diagnostics, component, retry, status, error);
+        return Err(error);
+    }
+    let delay = http_retry_delay(retry, retry_after);
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.emit(
+            component,
+            ProviderDiagnosticKind::RetryScheduled,
+            retry + 1,
+            Some(delay),
+            status,
+            Some(class),
+        );
+    }
+    let result = if let Some(remaining) = cancellation.adapter_view().remaining_duration()
+        && remaining <= delay
+    {
+        if remaining.is_zero() {
+            Err(HeadlessTurnPortError::TimedOut)
+        } else {
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => Err(HeadlessTurnPortError::TimedOut),
+                stop = wait_for_stop(cancellation) => Err(stop),
+            }
+        }
+    } else {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => stop_before_mapping(cancellation),
+            stop = wait_for_stop(cancellation) => Err(stop),
+        }
+    };
+    if let Err(error) = result {
+        emit_retry_terminal(diagnostics, component, retry, status, error);
+    }
+    result
+}
+
+fn emit_retry_terminal(
+    diagnostics: Option<&ProviderDiagnostics>,
+    component: ProviderDiagnosticComponent,
+    retry: usize,
+    status: Option<u16>,
+    error: HeadlessTurnPortError,
+) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.emit(
+            component,
+            ProviderDiagnosticKind::Terminal,
+            retry + 1,
+            None,
+            status,
+            Some(diagnostic_class_for_port_error(error)),
+        );
     }
 }
 
@@ -2515,6 +3138,44 @@ mod tests {
 
         assert!(validate_chatgpt_replay_history(&[exact]).is_ok());
         assert!(validate_chatgpt_replay_history(&[oversized]).is_err());
+    }
+
+    #[test]
+    fn retry_backoff_uses_practical_bounded_delays() {
+        for _ in 0..32 {
+            let first = http_retry_delay(0, None);
+            assert!(first >= Duration::from_millis(250));
+            assert!(first <= Duration::from_millis(350));
+
+            let second = http_retry_delay(1, None);
+            assert!(second >= Duration::from_secs(1));
+            assert!(second <= Duration::from_millis(1_100));
+        }
+    }
+
+    #[test]
+    fn numeric_retry_after_is_capped_and_invalid_values_are_ignored() {
+        assert_eq!(parse_retry_after(Some("2")), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after(Some("12")), Some(Duration::from_secs(5)));
+        assert_eq!(parse_retry_after(Some("1.5")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn diagnostic_references_accept_only_eight_lowercase_hex_characters() {
+        assert_eq!(
+            DiagnosticRef::new("abc12345".into())
+                .expect("reference should be valid")
+                .as_str(),
+            "abc12345"
+        );
+        for invalid in ["abc1234", "abc123456", "ABC12345", "../../xx", "secret!!"] {
+            assert!(DiagnosticRef::new(invalid.into()).is_err());
+        }
     }
 
     fn credentials() -> String {

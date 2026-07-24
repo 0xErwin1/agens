@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,7 +9,10 @@ use std::time::{Duration, Instant};
 use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, RequestConfig, TurnEvent, TurnProvider,
 };
-use agens_providers::{OpenAiFunctionTool, OpenAiResponsesProvider};
+use agens_providers::{
+    OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticKind,
+    ProviderDiagnosticScope, ProviderDiagnostics,
+};
 use serde_json::json;
 
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
@@ -142,8 +147,8 @@ fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_pr
         let server = LocalResponsesServer::start(mode);
         let result = run_provider(
             server.base_url(),
-            HeadlessTurnCancellation::with_deadline(Duration::from_secs(1)),
-            Duration::from_secs(1),
+            HeadlessTurnCancellation::with_deadline(Duration::from_secs(3)),
+            Duration::from_secs(3),
         );
 
         assert_eq!(result, Err(expected));
@@ -207,6 +212,164 @@ fn openai_transport_uses_frozen_failure_precedence() {
         );
         server.join();
     }
+}
+
+#[test]
+fn openai_retries_transient_statuses_twice_then_succeeds() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Status(500),
+        RetryResponse::Status(429),
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+
+    assert_eq!(
+        run_provider(
+            server.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Ok(())
+    );
+    assert_eq!(server.join(), 3);
+}
+
+#[test]
+fn openai_honors_numeric_retry_after_before_the_next_attempt() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::StatusWithRetryAfter(429, "1"),
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+    let started_at = Instant::now();
+
+    assert_eq!(
+        run_provider(
+            server.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(2),
+        ),
+        Ok(())
+    );
+    assert!(started_at.elapsed() >= Duration::from_millis(900));
+    assert_eq!(server.join(), 2);
+}
+
+#[test]
+fn openai_emits_allowlisted_retry_diagnostics_with_one_reference() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Status(500),
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(2),
+    )
+    .expect("provider should be configured")
+    .with_diagnostics(diagnostics);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime should build");
+
+    assert!(
+        runtime
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .is_ok()
+    );
+    let events = events.lock().expect("event lock");
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0].event, ProviderDiagnosticKind::Attempt);
+    assert_eq!(events[1].event, ProviderDiagnosticKind::RetryScheduled);
+    assert_eq!(events[1].class, Some(ProviderDiagnosticClass::Server));
+    assert!(matches!(events[1].delay_ms, Some(250..=350)));
+    assert_eq!(events[2].event, ProviderDiagnosticKind::Attempt);
+    assert_eq!(events[3].event, ProviderDiagnosticKind::Terminal);
+    assert_eq!(events[3].class, None);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.reference.as_str() == "abc12345")
+    );
+    drop(events);
+    assert_eq!(server.join(), 2);
+}
+
+#[test]
+fn openai_does_not_retry_permanent_or_partial_stream_failures() {
+    let permanent = RetryResponsesServer::start(vec![RetryResponse::Status(400)]);
+    assert_eq!(
+        run_provider(
+            permanent.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+    assert_eq!(permanent.join(), 1);
+
+    let partial = RetryResponsesServer::start(vec![RetryResponse::Sse(
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {not-json}\n\n"
+            .to_owned(),
+    )]);
+    assert_eq!(
+        run_provider(
+            partial.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::ProviderProtocol)
+    );
+    assert_eq!(partial.join(), 1);
+}
+
+#[test]
+fn openai_cancellation_and_deadline_interrupt_retry_backoff() {
+    let mut cancelled_server = RetryResponsesServer::start(vec![RetryResponse::Status(500)]);
+    let observed = cancelled_server.take_observed_request();
+    let cancellation = HeadlessTurnCancellation::new();
+    let canceller = cancellation.clone();
+    let cancellation_thread = thread::spawn(move || {
+        observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first request should be observed");
+        canceller.cancel();
+    });
+    let started_at = Instant::now();
+    assert_eq!(
+        run_provider(
+            cancelled_server.base_url(),
+            cancellation,
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::Cancelled)
+    );
+    assert!(started_at.elapsed() < Duration::from_millis(100));
+    cancellation_thread.join().expect("canceller should finish");
+    assert_eq!(cancelled_server.join(), 1);
+
+    let deadline_server =
+        RetryResponsesServer::start(vec![RetryResponse::StatusWithRetryAfter(429, "5")]);
+    let started_at = Instant::now();
+    assert_eq!(
+        run_provider(
+            deadline_server.base_url(),
+            HeadlessTurnCancellation::with_deadline(Duration::from_millis(15)),
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::TimedOut)
+    );
+    assert!(started_at.elapsed() < Duration::from_millis(100));
+    assert_eq!(deadline_server.join(), 1);
 }
 
 #[test]
@@ -846,6 +1009,104 @@ struct LocalResponsesServer {
     observed_request: Option<mpsc::Receiver<()>>,
     observed_body: Option<mpsc::Receiver<serde_json::Value>>,
     worker: thread::JoinHandle<()>,
+}
+
+enum RetryResponse {
+    Status(u16),
+    StatusWithRetryAfter(u16, &'static str),
+    Sse(String),
+}
+
+struct RetryResponsesServer {
+    address: std::net::SocketAddr,
+    observed_request: Option<mpsc::Receiver<usize>>,
+    request_count: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl RetryResponsesServer {
+    fn start(responses: Vec<RetryResponse>) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("retry server should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("retry listener should be nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("retry server address should be available");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_count = Arc::clone(&request_count);
+        let worker_stop = Arc::clone(&stop);
+        let (observed_sender, observed_request) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut responses = VecDeque::from(responses);
+            while !worker_stop.load(Ordering::Acquire) && !responses.is_empty() {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                };
+                read_request(&stream);
+                let request_number = worker_count.fetch_add(1, Ordering::AcqRel) + 1;
+                observed_sender
+                    .send(request_number)
+                    .expect("test should receive request observation");
+                match responses.pop_front().expect("response should be available") {
+                    RetryResponse::Status(status) => stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("status response should be written"),
+                    RetryResponse::StatusWithRetryAfter(status, retry_after) => stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} Test\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .expect("retry-after response should be written"),
+                    RetryResponse::Sse(events) => {
+                        write_sse_headers(&mut stream);
+                        stream
+                            .write_all(events.as_bytes())
+                            .expect("SSE response should be written");
+                    }
+                }
+            }
+        });
+
+        Self {
+            address,
+            observed_request: Some(observed_request),
+            request_count,
+            stop,
+            worker,
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn take_observed_request(&mut self) -> mpsc::Receiver<usize> {
+        self.observed_request
+            .take()
+            .expect("request observation should only be taken once")
+    }
+
+    fn join(self) -> usize {
+        self.stop.store(true, Ordering::Release);
+        self.worker.join().expect("retry server should finish");
+        self.request_count.load(Ordering::Acquire)
+    }
 }
 
 impl LocalResponsesServer {

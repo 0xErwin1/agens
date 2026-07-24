@@ -20,6 +20,83 @@ use agens_core::{
 use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::McpTransport;
 
+fn assert_diagnostic_error(actual: &[u8], expected_without_reference: &str) {
+    assert_diagnostic_error_text(&String::from_utf8_lossy(actual), expected_without_reference);
+}
+
+fn assert_diagnostic_error_text(actual: &str, expected_without_reference: &str) {
+    let prefix = expected_without_reference
+        .strip_suffix('\n')
+        .expect("expected diagnostic should end with a newline");
+    let reference = actual
+        .strip_prefix(prefix)
+        .and_then(|suffix| suffix.strip_prefix(" [ref: "))
+        .and_then(|suffix| suffix.strip_suffix("]\n"))
+        .expect("diagnostic should append a reference");
+    assert_eq!(reference.len(), 8);
+    assert!(
+        reference
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+}
+
+#[test]
+fn production_binary_launches_are_centralized_through_isolated_helper() {
+    let source = include_str!("cli.rs");
+    let direct_launch = ["Command::new", "(env!(\"CARGO_BIN_EXE_agens\"))"].concat();
+
+    assert_eq!(source.matches(&direct_launch).count(), 1);
+}
+
+#[test]
+fn isolated_commands_use_distinct_temporary_environment_roots() {
+    let temporary = std::sync::Arc::new(TemporaryDirectory::new("isolated-command-roots"));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let first_temporary = std::sync::Arc::clone(&temporary);
+    let first_barrier = std::sync::Arc::clone(&barrier);
+    let first = thread::spawn(move || {
+        first_barrier.wait();
+        isolated_agens_command(&first_temporary)
+    });
+    let second_temporary = std::sync::Arc::clone(&temporary);
+    let second_barrier = std::sync::Arc::clone(&barrier);
+    let second = thread::spawn(move || {
+        second_barrier.wait();
+        isolated_agens_command(&second_temporary)
+    });
+    let first = first.join().expect("first command should be constructed");
+    let second = second.join().expect("second command should be constructed");
+
+    for variable in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "AGENS_CONFIG_HOME",
+    ] {
+        let path_for = |command: &Command| {
+            command
+                .get_envs()
+                .find_map(|(name, value)| {
+                    (name == variable)
+                        .then(|| value.map(PathBuf::from))
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("{variable} should be isolated"))
+        };
+        let first_path = path_for(&first);
+        let second_path = path_for(&second);
+
+        assert_ne!(first_path, second_path, "{variable} roots must be unique");
+        assert!(first_path.starts_with(temporary.path()));
+        assert!(second_path.starts_with(temporary.path()));
+        if let Some(real_path) = std::env::var_os(variable).map(PathBuf::from) {
+            assert_ne!(first_path, real_path, "{variable} inherited the real path");
+            assert_ne!(second_path, real_path, "{variable} inherited the real path");
+        }
+    }
+}
+
 #[test]
 fn config_doctor_merges_compatible_paths_and_reports_loaded_sources() {
     let temporary = TemporaryDirectory::new("config-doctor");
@@ -567,7 +644,7 @@ fn api_key_login_flag_updates_only_the_selected_provider_with_private_credential
     )
     .expect("credentials should be written");
 
-    let login = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let login = isolated_agens_command(&temporary)
         .args([
             "auth",
             "login",
@@ -579,12 +656,12 @@ fn api_key_login_flag_updates_only_the_selected_provider_with_private_credential
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("API-key login should execute");
-    let status = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let status = isolated_agens_command(&temporary)
         .args(["auth", "status", "openai-api"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("selected provider status should execute");
-    let logout = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let logout = isolated_agens_command(&temporary)
         .args(["auth", "logout", "openai-api"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -639,7 +716,7 @@ fn api_key_login_reads_one_non_tty_line_and_rejects_invalid_input_without_persis
     let sentinel = "SENTINEL_API_KEY_STDIN";
     std::fs::create_dir_all(&config_home).expect("config directory should be created");
 
-    let mut login = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let mut login = isolated_agens_command(&temporary)
         .args(["auth", "login", "api-key", "openai-api"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .stdin(Stdio::piped())
@@ -701,7 +778,7 @@ fn api_key_login_reads_one_non_tty_line_and_rejects_invalid_input_without_persis
     ] {
         let isolated_home = temporary.path().join(name);
         std::fs::create_dir_all(&isolated_home).expect("isolated config directory should exist");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+        let mut command = isolated_agens_command(&temporary);
         command
             .args(arguments)
             .env("AGENS_CONFIG_HOME", &isolated_home)
@@ -1325,13 +1402,13 @@ fn production_binary_runs_configured_openai_responses_transport_and_persists_the
     )
     .expect("config should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args(["chat", "hello from production"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
         .output()
         .expect("production binary should execute");
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let sessions = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -1428,7 +1505,7 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
     )
     .expect("configuration should be written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let result = isolated_agens_command(&temporary)
         .current_dir(&project_root)
         .args(["chat", "parent request"])
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -1441,25 +1518,25 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
     assert_eq!(String::from_utf8(result.stdout).unwrap(), "parent answer\n");
     assert_eq!(String::from_utf8(result.stderr).unwrap(), "");
 
-    let listed = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let listed = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("sessions should list the parent turn");
-    let reopened = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let reopened = isolated_agens_command(&temporary)
         .args(["sessions", "show", "1"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("sessions should reopen the parent turn");
-    let removed = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let removed = isolated_agens_command(&temporary)
         .args(["sessions", "rm", "1"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("sessions should remove the parent turn");
-    let empty = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let empty = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -1503,6 +1580,280 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
     );
 }
 
+#[test]
+fn built_in_explore_inherits_the_effective_openai_parent_model_without_agent_files() {
+    let temporary = TemporaryDirectory::new("builtin-explore-openai-model");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.6-sol\"".into(),
+                "explore".into(),
+                "general".into(),
+                "parent explore request".into(),
+            ],
+            response: native_tool_call_response(
+                "task-explore",
+                "task",
+                r#"{"agent":"explore","description":"inspect child"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.6-sol\"".into(),
+                "inspect child".into(),
+                "read-only exploration subagent".into(),
+                "!parent explore request".into(),
+                "!\"name\":\"task\"".into(),
+            ],
+            response: text_response("child explored"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child explored".into()],
+            response: text_response("parent complete"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .current_dir(&project_root)
+        .args(["chat", "--model", "gpt-5.6-sol", "parent explore request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "parent complete\n");
+}
+
+#[test]
+fn explicit_task_model_selects_a_second_available_openai_model() {
+    let temporary = TemporaryDirectory::new("task-explicit-openai-model");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.6-sol\"".into(),
+                "\"model\":{\"enum\"".into(),
+                "gpt-4.1".into(),
+                "parent chooses child model".into(),
+            ],
+            response: native_tool_call_response(
+                "task-model",
+                "task",
+                r#"{"agent":"explore","model":"gpt-4.1","description":"inspect with second model"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-4.1\"".into(),
+                "inspect with second model".into(),
+                "!\"name\":\"task\"".into(),
+            ],
+            response: text_response("second model child"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["second model child".into()],
+            response: text_response("parent complete"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .current_dir(&project_root)
+        .args([
+            "chat",
+            "--model",
+            "gpt-5.6-sol",
+            "parent chooses child model",
+        ])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "parent complete\n");
+}
+
+#[test]
+fn built_in_general_inherits_the_effective_chatgpt_parent_model_without_agent_files() {
+    let temporary = TemporaryDirectory::new("builtin-general-chatgpt-model");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.5\"".into(),
+                "explore".into(),
+                "general".into(),
+                "parent general request".into(),
+            ],
+            response: native_tool_call_response(
+                "task-general",
+                "task",
+                r#"{"agent":"general","description":"implement child"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.5\"".into(),
+                "implement child".into(),
+                "general-purpose subagent".into(),
+                "!parent general request".into(),
+                "!\"name\":\"task\"".into(),
+            ],
+            response: text_response("child implemented"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child implemented".into()],
+            response: text_response("parent complete"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"SENTINEL_CHATGPT_REFRESH","account_id":"account_123","expires_at":"2030-01-01T00:00:00Z"}}"#,
+    )
+    .expect("ChatGPT credentials should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .current_dir(&project_root)
+        .args(["chat", "--model", "gpt-5.5", "parent general request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "parent complete\n");
+}
+
+#[test]
+fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_request() {
+    let temporary = TemporaryDirectory::new("task-model-unavailable-diagnostic");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["parent unavailable child".into(), "task".into()],
+        response: native_tool_call_response(
+            "task-unavailable",
+            "task",
+            r#"{"agent":"explore","model":"gpt-4o","description":"must not run"}"#,
+        ),
+    }]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"gpt-5.5\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(explore)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+    std::fs::write(
+        config_home.join("auth.json"),
+        r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"SENTINEL_CHATGPT_REFRESH","account_id":"account_123","expires_at":"2030-01-01T00:00:00Z"}}"#,
+    )
+    .expect("ChatGPT credentials should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .current_dir(&project_root)
+        .args(["chat", "parent unavailable child"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("error: task: requested model is unavailable [ref: "));
+    let model_events = diagnostic_json_events(&data_directory)
+        .into_iter()
+        .filter(|event| {
+            event["scope"] == "subagent"
+                && event["component"] == "subagent"
+                && event["event"] == "terminal"
+                && event["class"] == "model_unavailable"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(model_events.len(), 1);
+    assert!(
+        model_events[0]["reference"]
+            .as_str()
+            .is_some_and(|reference| reference.len() == 8)
+    );
+    assert_eq!(model_events[0]["attempt"], 0);
+    assert_eq!(model_events[0]["max_attempts"], 0);
+    let reference = model_events[0]["reference"].as_str().unwrap();
+    assert!(stderr.contains(&format!("[ref: {reference}]")));
+    assert!(
+        diagnostic_json_events(&data_directory)
+            .into_iter()
+            .all(|event| {
+                !(event["scope"] == "parent"
+                    && event["event"] == "terminal"
+                    && event["class"] == "runtime")
+            })
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
@@ -1529,7 +1880,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
     )
     .expect("configuration should be written");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let child = isolated_agens_command(&temporary)
         .current_dir(&project_root)
         .args(["chat", "parent task cancellation"])
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -1550,11 +1901,11 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: cancelled: headless turn was cancelled\n"
+    assert_diagnostic_error(
+        &output.stderr,
+        "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &[
@@ -1581,20 +1932,19 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
         "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
     )
     .expect("subagent definition should be written");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![
-        ScriptedOpenAiResponse {
-            required_body_fragments: vec!["parent provider failure".into()],
-            response: native_tool_call_response(
-                "task-failure",
-                "task",
-                r#"{"agent":"reviewer","description":"child provider failure"}"#,
-            ),
-        },
-        ScriptedOpenAiResponse {
-            required_body_fragments: vec!["child provider failure".into()],
-            response: "HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
-        },
-    ]);
+    let mut responses = vec![ScriptedOpenAiResponse {
+        required_body_fragments: vec!["parent provider failure".into()],
+        response: native_tool_call_response(
+            "task-failure",
+            "task",
+            r#"{"agent":"reviewer","description":"child provider failure"}"#,
+        ),
+    }];
+    responses.extend((0..3).map(|_| ScriptedOpenAiResponse {
+        required_body_fragments: vec!["child provider failure".into()],
+        response: "HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
+    }));
+    let server = BoundedScriptedOpenAiMockServer::start(responses);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -1605,7 +1955,7 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
     )
     .expect("configuration should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .current_dir(&project_root)
         .args(["chat", "parent provider failure"])
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -1616,11 +1966,8 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: task: provider failure\n"
-    );
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_diagnostic_error(&output.stderr, "error: task: provider failure\n");
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
     assert_output_and_store_exclude_sentinels(
         &output,
         &data_directory.join("rust-sessions.db"),
@@ -1656,7 +2003,7 @@ fn production_task_deadline_is_exact_and_aborts_the_parent_turn() {
     )
     .expect("configuration should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .current_dir(&project_root)
         .args(["chat", "parent task deadline"])
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -1667,11 +2014,8 @@ fn production_task_deadline_is_exact_and_aborts_the_parent_turn() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: task: timed out\n"
-    );
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_diagnostic_error(&output.stderr, "error: task: timed out\n");
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
     assert_output_and_store_exclude_sentinels(
         &output,
         &data_directory.join("rust-sessions.db"),
@@ -1709,13 +2053,13 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
     )
     .expect("ChatGPT credentials should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args(["chat", "hello from subscription"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env_remove("OPENAI_API_KEY")
         .output()
         .expect("production binary should execute");
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let sessions = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -1764,7 +2108,7 @@ fn production_binary_uses_auth_json_api_key_when_openai_is_inferred_without_envi
     )
     .expect("legacy API credentials should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args(["chat", "hello from auth json"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env_remove("OPENAI_API_KEY")
@@ -1790,10 +2134,14 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
         let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
         std::fs::write(
             config_home.join("config.toml"),
-            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\n",
+            format!(
+                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\n\n[options]\ndata_dir = \"{}\"\n",
+                data_directory.display(),
+            ),
         )
         .expect("config should be written");
         if let Some(credentials) = credentials {
@@ -1801,7 +2149,7 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
                 .expect("credential fixture should be written");
         }
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "reject invalid credentials"])
             .env("AGENS_CONFIG_HOME", &config_home)
             .env_remove("OPENAI_API_KEY")
@@ -1810,12 +2158,12 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
         assert_eq!(output.status.code(), Some(4), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+        assert_diagnostic_error(
+            &output.stderr,
             "error: auth: ChatGPT credentials are unavailable or invalid\n",
-            "{name}"
         );
         assert!(!format!("{output:?}").contains("SENTINEL"), "{name}");
+        assert!(data_directory.join("rust-sessions.db").is_file(), "{name}");
     }
 }
 
@@ -1855,6 +2203,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
         let config_home = temporary.path().join("config");
+        let data_directory = temporary.path().join("data");
         std::fs::create_dir_all(&config_home).expect("config directory should exist");
         let server = ScriptedNativeOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
             required_body_fragments: vec!["\"store\":false".to_owned()],
@@ -1863,14 +2212,15 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         std::fs::write(
             config_home.join("config.toml"),
             format!(
-                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n",
+                "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
                 server.base_url(),
+                data_directory.display(),
             ),
         )
         .expect("config should be written");
         write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_ACCESS");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "handle remote failure"])
             .env("AGENS_CONFIG_HOME", &config_home)
             .env_remove("OPENAI_API_KEY")
@@ -1879,11 +2229,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
 
         assert_eq!(output.status.code(), expected_exit, "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            expected_stderr,
-            "{name}"
-        );
+        assert_diagnostic_error(&output.stderr, expected_stderr);
         for secret in [
             "SENTINEL_CHATGPT_ACCESS",
             "SENTINEL_CHATGPT_REFRESH",
@@ -1892,6 +2238,16 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
         ] {
             assert!(!format!("{output:?}").contains(secret), "{name}: {secret}");
         }
+        assert_diagnostics_have_no_sentinels(
+            &data_directory,
+            &[
+                "SENTINEL_CHATGPT_ACCESS",
+                "SENTINEL_CHATGPT_REFRESH",
+                "SENTINEL_CHATGPT_REMOTE",
+                "SENTINEL_CHATGPT_ERROR_BODY",
+            ],
+        );
+        assert!(data_directory.join("rust-sessions.db").is_file(), "{name}");
 
         server.join();
     }
@@ -1949,7 +2305,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
         .expect("config should be written");
         write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_TOOL_ACCESS");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args([
                 "chat",
                 "--dangerously-allow-all",
@@ -1970,7 +2326,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
         assert!(
             String::from_utf8_lossy(
-                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                &isolated_agens_command(&temporary)
                     .args(["sessions", "list"])
                     .current_dir(&project_root)
                     .env("AGENS_CONFIG_HOME", &config_home)
@@ -2008,7 +2364,7 @@ fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
     .expect("config should be written");
     write_chatgpt_credentials(&config_home, "SENTINEL_CHATGPT_CANCEL_ACCESS");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let child = isolated_agens_command(&temporary)
         .args(["chat", "cancel subscription request"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env_remove("OPENAI_API_KEY")
@@ -2030,11 +2386,11 @@ fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: cancelled: headless turn was cancelled\n"
+    assert_diagnostic_error(
+        &output.stderr,
+        "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(temporary.path(), &config_home);
+    assert_no_saved_sessions(&temporary, temporary.path(), &config_home);
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &["SENTINEL_CHATGPT_CANCEL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
@@ -2086,20 +2442,20 @@ fn production_binary_executes_allowed_native_read_then_continues_and_persists() 
     )
     .expect("config should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args(["chat", "read the native file"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
         .output()
         .expect("production binary should execute");
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let sessions = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
         .expect("sessions command should execute");
-    let resumed = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let resumed = isolated_agens_command(&temporary)
         .args(["sessions", "show", "1"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -2165,7 +2521,7 @@ fn production_binary_executes_allowed_native_search_then_continues() {
     )
     .expect("config should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args(["chat", "--dangerously-allow-all", "search the native file"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -2267,7 +2623,7 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "apply static native permission"])
             .current_dir(&project_root)
             .env("AGENS_CONFIG_HOME", &config_home)
@@ -2284,7 +2640,7 @@ fn production_binary_applies_static_exact_and_glob_allows_to_native_list_and_sea
         assert_eq!(String::from_utf8_lossy(&output.stderr), "", "{name}");
         assert!(
             String::from_utf8_lossy(
-                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                &isolated_agens_command(&temporary)
                     .args(["sessions", "list"])
                     .current_dir(&project_root)
                     .env("AGENS_CONFIG_HOME", &config_home)
@@ -2360,7 +2716,7 @@ fn production_binary_static_glob_denies_native_list_and_search_without_execution
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "deny static native permission"])
             .current_dir(&project_root)
             .env("AGENS_CONFIG_HOME", &config_home)
@@ -2436,7 +2792,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "request unrelated native permission"])
             .current_dir(&project_root)
             .env("AGENS_CONFIG_HOME", &config_home)
@@ -2458,7 +2814,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
         );
         assert!(
             String::from_utf8_lossy(
-                &Command::new(env!("CARGO_BIN_EXE_agens"))
+                &isolated_agens_command(&temporary)
                     .args(["sessions", "list"])
                     .current_dir(&project_root)
                     .env("AGENS_CONFIG_HOME", &config_home)
@@ -2511,7 +2867,7 @@ fn production_binary_denies_native_read_without_side_effect_and_continues_safely
     )
     .expect("config should be written");
 
-    let chat = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let chat = isolated_agens_command(&temporary)
         .args([
             "chat",
             "--dangerously-allow-all",
@@ -2579,7 +2935,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "request native tool"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -2605,7 +2961,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
         )
         .contains("SENTINEL_UNRESOLVED_ASK")
     );
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let sessions = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -2660,7 +3016,7 @@ fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args([
             "chat",
             "--mode",
@@ -2726,7 +3082,7 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args([
                 "chat",
                 "--dangerously-allow-all",
@@ -2740,13 +3096,12 @@ fn production_binary_rejects_duplicate_and_mismatched_tool_call_protocol_items_b
 
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
+        assert_diagnostic_error(
+            &output.stderr,
             "error: provider: ChatGPT response protocol failed\n",
-            "{name}"
         );
         assert!(!side_effect.exists(), "{name} call must not dispatch");
-        assert_no_saved_sessions(&project_root, &config_home);
+        assert_no_saved_sessions(&temporary, &project_root, &config_home);
 
         server.join();
     }
@@ -2785,7 +3140,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
     )
     .expect("config should be written");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let child = isolated_agens_command(&temporary)
         .args([
             "chat",
             "--dangerously-allow-all",
@@ -2809,9 +3164,9 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
     let output = wait_for_child_output(child, Duration::from_secs(2));
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: cancelled: headless turn was cancelled\n"
+    assert_diagnostic_error(
+        &output.stderr,
+        "error: cancelled: headless turn was cancelled\n",
     );
 
     let process_ids = std::fs::read_to_string(&process_marker)
@@ -2827,7 +3182,7 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
     for process_id in process_ids {
         wait_for_process_exit(process_id, Duration::from_secs(2));
     }
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
 
     server.join();
 }
@@ -2874,7 +3229,7 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "execute exactly once"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -2884,16 +3239,13 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: provider: provider request failed\n"
-    );
+    assert_diagnostic_error(&output.stderr, "error: provider: provider request failed\n");
     assert_eq!(
         std::fs::read_to_string(&side_effect)
             .expect("only the first authorized call should execute"),
         "first execution"
     );
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
 
     server.join();
 }
@@ -2916,7 +3268,7 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
     )
     .expect("config should be written");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let child = isolated_agens_command(&temporary)
         .args(["chat", "cancel production request"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
@@ -2937,11 +3289,11 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: cancelled: headless turn was cancelled\n"
+    assert_diagnostic_error(
+        &output.stderr,
+        "error: cancelled: headless turn was cancelled\n",
     );
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let sessions = isolated_agens_command(&temporary)
         .args(["sessions", "list"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -2959,18 +3311,20 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
 fn production_binary_sanitizes_remote_response_headers_and_body() {
     let temporary = TemporaryDirectory::new("production-remote-error");
     let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
     let server = ErrorOpenAiMockServer::start();
     std::fs::write(
         config_home.join("config.toml"),
         format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n",
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n",
             server.base_url(),
+            data_directory.display(),
         ),
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "remote error"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
@@ -2983,7 +3337,7 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(diagnostics, "error: provider: ChatGPT service failed\n");
+    assert_diagnostic_error_text(&diagnostics, "error: provider: ChatGPT service failed\n");
     for secret in [
         "SENTINEL_OPENAI_API_KEY",
         "SENTINEL_REMOTE_ERROR_HEADER",
@@ -2991,6 +3345,15 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
     ] {
         assert!(!diagnostics.contains(secret), "diagnostics leaked {secret}");
     }
+    assert_diagnostics_have_no_sentinels(
+        &data_directory,
+        &[
+            "SENTINEL_OPENAI_API_KEY",
+            "SENTINEL_REMOTE_ERROR_HEADER",
+            "SENTINEL_REMOTE_ERROR_BODY",
+        ],
+    );
+    assert!(data_directory.join("rust-sessions.db").is_file());
 
     server.join();
 }
@@ -3007,7 +3370,7 @@ fn production_binary_sanitizes_config_and_store_error_sources() {
     )
     .expect("malformed config should be written");
 
-    let config_output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let config_output = isolated_agens_command(&temporary)
         .args(["chat", "reject malformed config"])
         .env("AGENS_CONFIG_HOME", &config_home)
         .output()
@@ -3033,7 +3396,7 @@ fn production_binary_sanitizes_config_and_store_error_sources() {
     )
     .expect("store config should be written");
 
-    let store_output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let store_output = isolated_agens_command(&temporary)
         .args(["chat", "reject store path"])
         .env("AGENS_CONFIG_HOME", &store_config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
@@ -3041,9 +3404,9 @@ fn production_binary_sanitizes_config_and_store_error_sources() {
         .expect("production binary should execute");
     assert_eq!(store_output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&store_output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&store_output.stderr),
-        "error: store: permission grants are unavailable\n"
+    assert_diagnostic_error(
+        &store_output.stderr,
+        "error: store: permission grants are unavailable\n",
     );
     for secret in ["SENTINEL_STORE_PATH", "SENTINEL_OPENAI_API_KEY"] {
         assert!(!format!("{store_output:?}").contains(secret));
@@ -3089,7 +3452,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args([
             "chat",
             "--dangerously-allow-all",
@@ -3117,7 +3480,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
     assert!(!diagnostics.contains("SENTINEL_MCP_TRANSPORT"));
     assert!(
         String::from_utf8_lossy(
-            &Command::new(env!("CARGO_BIN_EXE_agens"))
+            &isolated_agens_command(&temporary)
                 .args(["sessions", "list"])
                 .current_dir(&project_root)
                 .env("AGENS_CONFIG_HOME", &config_home)
@@ -3182,7 +3545,7 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
     )
     .expect("config should be written");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let child = isolated_agens_command(&temporary)
         .args([
             "chat",
             "--dangerously-allow-all",
@@ -3208,11 +3571,11 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
 
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "error: cancelled: headless turn was cancelled\n"
+    assert_diagnostic_error(
+        &output.stderr,
+        "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(&project_root, &config_home);
+    assert_no_saved_sessions(&temporary, &project_root, &config_home);
 
     server.join();
 }
@@ -3256,7 +3619,7 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "--dangerously-allow-all", "run failing MCP tool"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -3346,7 +3709,7 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "run failing native command"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -3423,7 +3786,7 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "--dangerously-allow-all", "run broken MCP tool"])
             .current_dir(&project_root)
             .env("AGENS_CONFIG_HOME", &config_home)
@@ -3433,7 +3796,7 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
 
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_no_saved_sessions(&project_root, &config_home);
+        assert_no_saved_sessions(&temporary, &project_root, &config_home);
         assert_sqlite_has_terminal_attempt_without_history(
             &data_directory.join("rust-sessions.db"),
         );
@@ -3477,7 +3840,7 @@ fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
     )
     .expect("config should be written");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+    let output = isolated_agens_command(&temporary)
         .args(["chat", "deny configured MCP write"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
@@ -3615,7 +3978,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
         )
         .expect("config should be written");
 
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+        let mut command = isolated_agens_command(&temporary);
         command.arg("chat");
         command.args(flags);
         let output = command
@@ -3650,7 +4013,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
         if persists {
             assert!(
                 String::from_utf8_lossy(
-                    &Command::new(env!("CARGO_BIN_EXE_agens"))
+                    &isolated_agens_command(&temporary)
                         .args(["sessions", "list"])
                         .current_dir(&project_root)
                         .env("AGENS_CONFIG_HOME", &config_home)
@@ -3661,7 +4024,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
                 .ends_with("\tprimary\t1\n")
             );
         } else {
-            assert_no_saved_sessions(&project_root, &config_home);
+            assert_no_saved_sessions(&temporary, &project_root, &config_home);
         }
         assert!(
             PermissionGrantStore::open(&data_directory)
@@ -3739,7 +4102,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
         )
         .expect("config should be written");
 
-        let output = Command::new(env!("CARGO_BIN_EXE_agens"))
+        let output = isolated_agens_command(&temporary)
             .args(["chat", "--dangerously-allow-all", "reject MCP replay"])
             .current_dir(&project_root)
             .env("AGENS_CONFIG_HOME", &config_home)
@@ -3749,11 +4112,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
 
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            expected_error,
-            "{name}"
-        );
+        assert_diagnostic_error(&output.stderr, expected_error);
         assert_eq!(
             call_marker
                 .exists()
@@ -3763,7 +4122,7 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
             expected_calls,
             "{name}"
         );
-        assert_no_saved_sessions(&project_root, &config_home);
+        assert_no_saved_sessions(&temporary, &project_root, &config_home);
 
         server.join();
     }
@@ -3847,6 +4206,29 @@ fn write_chatgpt_credentials(config_home: &std::path::Path, access_token: &str) 
         ),
     )
     .expect("ChatGPT credentials should be written");
+}
+
+fn isolated_agens_command(temporary: &TemporaryDirectory) -> Command {
+    static NEXT_COMMAND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let sequence = NEXT_COMMAND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let process_root = temporary.path().join(format!("command-{sequence}"));
+    let home = process_root.join("home");
+    let xdg_config_home = process_root.join("xdg-config");
+    let xdg_data_home = process_root.join("xdg-data");
+    let agens_config_home = process_root.join("agens-config");
+
+    for directory in [&home, &xdg_config_home, &xdg_data_home, &agens_config_home] {
+        std::fs::create_dir_all(directory).expect("isolated command root should be created");
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agens"));
+    command
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg_config_home)
+        .env("XDG_DATA_HOME", xdg_data_home)
+        .env("AGENS_CONFIG_HOME", agens_config_home);
+    command
 }
 
 struct TemporaryDirectory {
@@ -4405,8 +4787,12 @@ fn wait_for_process_exit(process_id: u32, timeout: Duration) {
     }
 }
 
-fn assert_no_saved_sessions(project_root: &std::path::Path, config_home: &std::path::Path) {
-    let sessions = Command::new(env!("CARGO_BIN_EXE_agens"))
+fn assert_no_saved_sessions(
+    temporary: &TemporaryDirectory,
+    project_root: &std::path::Path,
+    config_home: &std::path::Path,
+) {
+    let sessions = isolated_agens_command(temporary)
         .args(["sessions", "list"])
         .current_dir(project_root)
         .env("AGENS_CONFIG_HOME", config_home)
@@ -4447,6 +4833,60 @@ fn assert_output_and_store_exclude_sentinels(
     }
 
     assert_sqlite_has_no_sentinels(database, sentinels);
+    if let Some(data_directory) = database.parent() {
+        assert_diagnostics_have_no_sentinels(data_directory, sentinels);
+    }
+}
+
+fn assert_diagnostics_have_no_sentinels(data_directory: &std::path::Path, sentinels: &[&str]) {
+    let diagnostics = data_directory.join("diagnostics");
+    let Ok(entries) = std::fs::read_dir(diagnostics) else {
+        return;
+    };
+    for entry in entries {
+        let entry = entry.expect("diagnostic entry should be readable");
+        let metadata = entry
+            .metadata()
+            .expect("diagnostic metadata should be readable");
+        if !metadata.is_file() {
+            continue;
+        }
+        let content = std::fs::read(entry.path()).expect("diagnostic file should be readable");
+        for sentinel in sentinels {
+            assert!(
+                !content
+                    .windows(sentinel.len())
+                    .any(|window| window == sentinel.as_bytes()),
+                "diagnostics leaked {sentinel}"
+            );
+        }
+    }
+}
+
+fn diagnostic_json_events(data_directory: &std::path::Path) -> Vec<serde_json::Value> {
+    let diagnostics = data_directory.join("diagnostics");
+    let Ok(entries) = std::fs::read_dir(diagnostics) else {
+        return Vec::new();
+    };
+    let mut events = Vec::new();
+    for entry in entries {
+        let entry = entry.expect("diagnostic entry should be readable");
+        if !entry
+            .metadata()
+            .expect("diagnostic metadata should be readable")
+            .is_file()
+        {
+            continue;
+        }
+        let content = std::fs::read_to_string(entry.path())
+            .expect("diagnostic JSONL should be readable text");
+        events.extend(
+            content.lines().map(|line| {
+                serde_json::from_str(line).expect("diagnostic line should be valid JSON")
+            }),
+        );
+    }
+    events
 }
 
 fn assert_sqlite_contains_sentinels(database: &std::path::Path, sentinels: &[&str]) {
