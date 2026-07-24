@@ -125,30 +125,33 @@ pub(crate) struct OverlaySizing {
 
 impl OverlaySizing {
     /// Default centered overlay for list and detail dialogs.
-    #[allow(dead_code)]
+    ///
+    /// Vertical margins are zero on purpose: they are absolute rows subtracted
+    /// before degradation, so on a short terminal they silently cost content
+    /// rows instead of yielding. `max_height` already keeps the frame from
+    /// swallowing a tall terminal.
     pub(crate) const fn dialog() -> Self {
         Self {
-            width_pct: 70,
-            min_width: 44,
+            width_pct: 80,
+            min_width: 48,
             max_width: 96,
             max_height: 18,
-            v_margin: 2,
-            h_pad: 2,
-            v_pad: 1,
+            v_margin: 0,
+            h_pad: 1,
+            v_pad: 0,
             anchor: OverlayAnchor::Center,
         }
     }
 
     /// Small centered overlay for confirms and short prompts.
-    #[allow(dead_code)]
     pub(crate) const fn compact() -> Self {
         Self {
             width_pct: 50,
             min_width: 34,
             max_width: 72,
             max_height: 10,
-            v_margin: 4,
-            h_pad: 2,
+            v_margin: 0,
+            h_pad: 1,
             v_pad: 0,
             anchor: OverlayAnchor::Center,
         }

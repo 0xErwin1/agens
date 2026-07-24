@@ -172,7 +172,6 @@ impl OverlayList {
     }
 
     /// Paints the search row: label, query, cursor, and an empty-state hint.
-    #[allow(dead_code)]
     pub(crate) fn render_search(frame: &mut Frame<'_>, area: Rect, query: &str) {
         if area.width == 0 || area.height == 0 {
             return;

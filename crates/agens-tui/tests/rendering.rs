@@ -1664,8 +1664,13 @@ fn renderer_clips_a_generic_dialog_inside_the_viewport() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("Details"), "{text:?}");
+    assert!(
+        text.contains("─ Details"),
+        "title sits in the border: {text:?}"
+    );
+    assert!(text.contains("[×]"), "{text:?}");
     assert!(text.contains("bounded dialog body"), "{text:?}");
+    assert!(text.contains("close"), "derived footer: {text:?}");
 }
 
 #[test]
@@ -1691,10 +1696,13 @@ fn renderer_clips_selection_help_options_current_and_disabled_states_after_resiz
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("Choose a model"), "{text:?}");
-    assert!(text.contains("gpt-4.1 (current)"), "{text:?}");
-    assert!(text.contains("future-model"), "{text:?}");
-    assert!(text.contains("disabled"), "{text:?}");
+    assert!(text.contains("─ Choose a model"), "{text:?}");
+    assert!(text.contains("[×]"), "{text:?}");
+    assert!(text.contains("❯ gpt-4.1 (current)"), "{text:?}");
+    // 28 columns leave 11 label cells once the badge is placed.
+    assert!(text.contains("disabled future-mod"), "{text:?}");
+    assert!(text.contains("navigate"), "derived footer: {text:?}");
+    assert!(text.contains("select"), "derived footer: {text:?}");
     assert!(!text.contains("model:gpt-4.1"), "{text:?}");
 }
 
@@ -1719,18 +1727,19 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     }
     renderer.render(tui.view()).unwrap();
     let arrows = rendered_text(&renderer);
-    assert!(arrows.contains("> Option 08"), "{arrows:?}");
+    assert!(arrows.contains("❯ Option 08"), "{arrows:?}");
     assert!(!arrows.contains("Option 00"), "{arrows:?}");
+    assert!(arrows.contains("█") || arrows.contains("│"), "{arrows:?}");
 
     tui.handle(Event::Key(Key::PageDown));
     renderer.render(tui.view()).unwrap();
     let page = rendered_text(&renderer);
-    assert!(page.contains("> Option 10"), "{page:?}");
+    assert!(page.contains("❯ Option 10"), "{page:?}");
 
     tui.handle(Event::Key(Key::ScrollUp));
     renderer.render(tui.view()).unwrap();
     let wheel = rendered_text(&renderer);
-    assert!(wheel.contains("> Option 09"), "{wheel:?}");
+    assert!(wheel.contains("❯ Option 09"), "{wheel:?}");
 
     tui.handle(Event::Resize {
         width: 24,
@@ -1738,7 +1747,7 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     });
     renderer.render(tui.view()).unwrap();
     let resized = rendered_text(&renderer);
-    assert!(resized.contains("> Option 09"), "{resized:?}");
+    assert!(resized.contains("❯ Option 09"), "{resized:?}");
 
     tui.handle(Event::Key(Key::Char('1')));
     for _ in 0..10 {
@@ -1746,8 +1755,8 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     }
     renderer.render(tui.view()).unwrap();
     let filtered = rendered_text(&renderer);
-    assert!(filtered.contains("Search: 1"), "{filtered:?}");
-    assert!(filtered.contains("> Option 19"), "{filtered:?}");
+    assert!(filtered.contains("search: 1"), "{filtered:?}");
+    assert!(filtered.contains("❯ Option 19"), "{filtered:?}");
     assert!(!filtered.contains("Option 08"), "{filtered:?}");
 }
 
@@ -1781,10 +1790,14 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
         project.contains("Resume session · Current project"),
         "{project:?}"
     );
-    assert!(project.contains("Ctrl+A All projects"), "{project:?}");
-    assert!(project.contains("#7 Alpha"), "{project:?}");
+    assert!(project.contains("ctrl+a all projects"), "{project:?}");
+    assert!(project.contains("❯ #7 Alpha"), "{project:?}");
     assert!(project.contains("2 turns · 5m ago"), "{project:?}");
-    assert!(project.contains("Page 1 · more"), "{project:?}");
+    assert!(project.contains("page 1 · more"), "{project:?}");
+    assert!(
+        !project.contains("Type to search |"),
+        "session help prose lives in the footer now: {project:?}"
+    );
     assert!(!project.contains("Agent: primary"), "{project:?}");
     assert!(!project.contains("Updated: 100"), "{project:?}");
     assert!(!project.contains("#9 Beta"), "{project:?}");
@@ -1809,6 +1822,7 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
         global.contains("Resume session · All projects"),
         "{global:?}"
     );
+    assert!(global.contains("ctrl+a current project"), "{global:?}");
     assert!(global.contains("4 turns · 1h ago"), "{global:?}");
     assert!(!global.contains("root=/work/beta"), "{global:?}");
     assert!(!global.contains("Agent: primary"), "{global:?}");
@@ -1899,9 +1913,10 @@ fn short_session_dialog_keeps_search_and_selected_row_visible_without_default_de
 
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
-    assert!(text.contains("Search:"), "{text:?}");
-    assert!(text.contains("#8 Session 8"), "{text:?}");
-    assert!(text.contains("2 turns"), "{text:?}");
+    assert!(text.contains("search:"), "{text:?}");
+    // 34 columns keep the right column and truncate the label instead.
+    assert!(text.contains("❯ #8 Sessio"), "{text:?}");
+    assert!(text.contains("2 turns · now"), "{text:?}");
     assert!(!text.contains("Agent: primary"), "{text:?}");
     assert!(!text.contains("#0 Session 0"), "{text:?}");
 }
@@ -1929,6 +1944,7 @@ fn read_only_dialog_renders_explicit_empty_and_clipped_selected_details() {
     let details = rendered_text(&renderer);
     assert!(details.contains("Source: global"), "{details:?}");
     assert!(!details.contains("safe/path"), "{details:?}");
+    assert!(details.contains("─ MCP servers"), "{details:?}");
 
     tui.show_selection_dialog(
         DialogView::read_only("MCP servers", Some("Search"), Vec::new(), "mcp")

@@ -55,7 +55,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -1296,129 +1296,141 @@ fn render_palette(
 }
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
-    let dialog_area = dialog_area(area, dialog);
-    let matches = dialog_matches(dialog);
-    let layout = dialog_content_layout(dialog, dialog_area.height);
-
-    frame.render_widget(Clear, dialog_area);
-    let mut lines: Vec<Line<'_>> = if layout.show_help {
-        dialog
-            .help
-            .as_deref()
-            .and_then(|help| help.lines().next())
-            .map(Line::from)
-            .into_iter()
-            .collect()
-    } else if dialog.entries.is_empty() && dialog.session_entries.is_none() {
-        dialog
-            .help
-            .as_deref()
-            .map(|help| help.lines().map(Line::from).collect())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
+    let labels = dialog_shortcut_labels(dialog);
+    let shortcuts = dialog_shortcuts(&labels);
+    let config = dialog_config(dialog, &shortcuts);
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
+        return;
     };
-    if dialog.interactive {
-        lines.push(Line::styled(
-            format!("Search: {}", dialog.query),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    if dialog
-        .session_entries
-        .as_ref()
-        .is_some_and(|entries| entries.loading)
-    {
-        lines.push(Line::from("Loading sessions…"));
-    } else if let Some(error) = dialog
-        .session_entries
-        .as_ref()
-        .and_then(|entries| entries.error.as_deref())
-    {
-        lines.push(Line::styled(
-            error,
-            Style::default().fg(widgets::RolePalette::warning()),
-        ));
-    } else if matches.is_empty()
-        && (dialog.session_entries.is_some()
-            || dialog.help.is_none()
-            || dialog.empty_message.is_some())
-    {
-        lines.push(Line::from(dialog_empty_message(dialog)));
-    }
-    lines.extend(
-        matches
-            .iter()
-            .skip(dialog.offset)
-            .take(layout.entry_rows)
-            .map(|(index, entry)| {
-                let selected = dialog.interactive && *index == dialog.selected;
-                let text = match (&entry.action, &entry.detail) {
-                    (None, Some(detail)) => format!("disabled {}: {detail}", entry.label),
-                    (None, None) => format!("disabled {}", entry.label),
-                    (Some(_), Some(detail)) if selected => {
-                        format!("> {} - {detail}", entry.label)
-                    }
-                    (Some(_), Some(detail)) => format!("  {} - {detail}", entry.label),
-                    _ if selected => format!("> {}", entry.label),
-                    _ => format!("  {}", entry.label),
-                };
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(widgets::RolePalette::brand())
-                } else if entry.action.is_none() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                };
-                Line::styled(text, style)
-            }),
-    );
-    if let Some(detail) = dialog
-        .details_open
-        .then(|| {
-            matches
-                .iter()
-                .find(|(index, _)| *index == dialog.selected)
-                .and_then(|(_, entry)| entry.selected_detail.as_deref())
-        })
-        .flatten()
-    {
-        lines.extend(
-            detail
-                .lines()
-                .take(layout.detail_rows)
-                .map(|line| Line::styled(line, Style::default().fg(Color::DarkGray))),
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
+    let sections = dialog_sections(layout.content, dialog);
+    let muted = Style::default().fg(widgets::RolePalette::muted());
+    if let Some(help) = sections.help {
+        frame.render_widget(
+            Paragraph::new(dialog_prose(dialog.help.as_deref(), help.height, muted)),
+            help,
         );
     }
-    if let Some(session_entries) = dialog.session_entries.as_ref() {
-        let end = if session_entries.next_cursor.is_some() {
-            "more"
-        } else {
-            "end"
-        };
-        lines.push(Line::styled(
-            format!("Page {} · {end}", session_entries.request.page),
-            Style::default().fg(Color::DarkGray),
+    if let Some(search) = sections.search {
+        widgets::OverlayList::render_search(frame, search, &dialog.query);
+    }
+    render_dialog_rows(frame, sections.rows, dialog);
+    if let Some(details) = sections.details {
+        frame.render_widget(
+            Paragraph::new(dialog_prose(
+                dialog_selected_detail(dialog),
+                details.height,
+                muted,
+            )),
+            details,
+        );
+    }
+}
+
+fn dialog_prose(text: Option<&str>, rows: u16, style: Style) -> Text<'static> {
+    Text::from(
+        text.map(|text| {
+            text.lines()
+                .take(usize::from(rows))
+                .map(|line| Line::styled(line.to_owned(), style))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default(),
+    )
+}
+
+/// Paints the entry rows, preceded by the loading, error or empty-state line.
+fn render_dialog_rows(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut area = area;
+    if let Some(status) = dialog_status_line(dialog) {
+        frame.render_widget(
+            Paragraph::new(status),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        area = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        if area.height == 0 {
+            return;
+        }
+    }
+
+    let matches = dialog_matches(dialog);
+    let rows = matches
+        .iter()
+        .map(|(index, entry)| dialog_row(entry, dialog.interactive && *index == dialog.selected))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+
+    let offset = dialog_row_offset(dialog, &matches, usize::from(area.height));
+    widgets::OverlayList::render(frame, area, &rows, offset, rows.len());
+}
+
+fn dialog_row<'a>(entry: &'a DialogEntry, selected: bool) -> widgets::OverlayRow<'a> {
+    let disabled = entry.action.is_none();
+    widgets::OverlayRow {
+        right_label: entry.detail.as_deref().map(Cow::Borrowed),
+        badge: disabled.then_some("disabled"),
+        selected,
+        dimmed: disabled,
+        ..widgets::OverlayRow::new(entry.label.as_str())
+    }
+}
+
+/// Clamps the stored scroll offset against the rows this frame can really show,
+/// so a resize can never leave the selected row painted off-screen.
+fn dialog_row_offset(
+    dialog: &DialogView,
+    matches: &[(usize, &DialogEntry)],
+    visible: usize,
+) -> usize {
+    let offset = dialog.offset.min(matches.len().saturating_sub(visible));
+    let Some(selected) = matches
+        .iter()
+        .position(|(index, _)| *index == dialog.selected)
+    else {
+        return offset;
+    };
+    if selected < offset {
+        selected
+    } else if selected >= offset.saturating_add(visible) {
+        selected.saturating_add(1).saturating_sub(visible)
+    } else {
+        offset
+    }
+}
+
+/// The single non-entry line: loading, error, or the empty-state message.
+fn dialog_status_line(dialog: &DialogView) -> Option<Line<'static>> {
+    let sessions = dialog.session_entries.as_ref();
+    if sessions.is_some_and(|entries| entries.loading) {
+        return Some(Line::styled(
+            "Loading sessions…",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+    }
+    if let Some(error) = sessions.and_then(|entries| entries.error.as_deref()) {
+        return Some(Line::styled(
+            error.to_owned(),
+            Style::default().fg(widgets::RolePalette::warning()),
         ));
     }
 
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(widgets::RolePalette::brand()))
-                .title(Span::styled(
-                    format!(" {} ", dialog.title),
-                    Style::default()
-                        .fg(widgets::RolePalette::brand())
-                        .add_modifier(Modifier::BOLD),
-                )),
-        ),
-        dialog_area,
-    );
+    let empty = dialog_matches(dialog).is_empty()
+        && (sessions.is_some()
+            || dialog.empty_message.is_some()
+            || !dialog_shows_help_body(dialog));
+    empty.then(|| {
+        Line::styled(
+            dialog_empty_message(dialog).to_owned(),
+            Style::default().fg(widgets::RolePalette::muted()),
+        )
+    })
 }
 
 /// Detail lines the expanded selection may claim.
@@ -1427,7 +1439,6 @@ const MAX_DIALOG_DETAIL_ROWS: usize = 3;
 const CONFIRM_SHORT_KEYS: [char; 4] = ['a', 'd', 'A', 'D'];
 
 /// Body rows the dialog would like, before the shell subtracts its chrome.
-#[allow(dead_code)]
 fn dialog_desired_rows(dialog: &DialogView) -> u16 {
     saturating_u16(
         usize::from(dialog_help_rows(dialog))
@@ -1439,13 +1450,13 @@ fn dialog_desired_rows(dialog: &DialogView) -> u16 {
 
 /// Whether `help` still belongs in the body.
 ///
-/// Entry-bearing dialogs hand that role to the derived keybinding footer, but
-/// informational overlays have no other body, and a Confirm's help carries the
-/// tool and target being decided rather than keybinding prose.
+/// Only the session browser hands that role entirely to the derived footer: its
+/// help is a keybinding list the footer reproduces. Every other caller passes
+/// contextual prose (the tool being confirmed, the model source, a warning),
+/// which has no other place to go, so it stays as a body row that yields to the
+/// search and entry rows under pressure.
 fn dialog_shows_help_body(dialog: &DialogView) -> bool {
-    dialog.help.is_some()
-        && (dialog.overlay_kind == widgets::OverlayKind::Confirm
-            || (dialog.entries.is_empty() && dialog.session_entries.is_none()))
+    dialog.help.is_some() && dialog.session_entries.is_none()
 }
 
 /// Help is stored control-character free, so the body claims a single row.
@@ -1470,7 +1481,6 @@ fn dialog_detail_rows(dialog: &DialogView) -> u16 {
 }
 
 /// Vertical split of the shell content rect, in painting order.
-#[allow(dead_code)]
 struct DialogSections {
     help: Option<Rect>,
     search: Option<Rect>,
@@ -1479,7 +1489,6 @@ struct DialogSections {
 }
 
 /// Splits the content rect the shell produced, keeping at least one entry row.
-#[allow(dead_code)]
 fn dialog_sections(content: Rect, dialog: &DialogView) -> DialogSections {
     let mut remaining = content.height;
     let search = u16::from(dialog.interactive && remaining > 1);
@@ -1505,7 +1514,6 @@ fn dialog_sections(content: Rect, dialog: &DialogView) -> DialogSections {
 type DialogShortcutLabels = Vec<(Cow<'static, str>, Cow<'static, str>)>;
 
 /// Footer shortcuts derived from dialog capabilities, never parsed from `help`.
-#[allow(dead_code)]
 fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
     if dialog.overlay_kind == widgets::OverlayKind::Confirm {
         let mut labels: DialogShortcutLabels = CONFIRM_SHORT_KEYS
@@ -1551,82 +1559,39 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
     labels
 }
 
-fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
-    let width = area.width.saturating_sub(4).clamp(1, 64);
-    let content_rows = usize::from(dialog.help.is_some())
-        .saturating_add(usize::from(dialog.interactive))
-        .saturating_add(usize::from(dialog.session_entries.is_some()))
-        .saturating_add(dialog_matches(dialog).len().max(1))
-        .saturating_add(if dialog.details_open {
-            dialog
-                .entries
-                .get(dialog.selected)
-                .and_then(|entry| entry.selected_detail.as_deref())
-                .map_or(0, |detail| detail.lines().count().min(3))
-        } else {
-            0
-        })
-        .saturating_add(2) as u16;
-    let height = content_rows
-        .min(if dialog.session_entries.is_some() {
-            16
-        } else {
-            12
-        })
-        .min(area.height.saturating_sub(2))
-        .max(1);
-    Rect::new(
-        area.x.saturating_add(area.width.saturating_sub(width) / 2),
-        area.y
-            .saturating_add(area.height.saturating_sub(height) / 2),
-        width,
-        height,
-    )
+fn dialog_shortcuts(labels: &DialogShortcutLabels) -> Vec<widgets::OverlayShortcut<'_>> {
+    labels
+        .iter()
+        .map(|(key, label)| widgets::OverlayShortcut { key, label })
+        .collect()
 }
 
-#[derive(Clone, Copy)]
-struct DialogContentLayout {
-    show_help: bool,
-    entry_rows: usize,
-    detail_rows: usize,
-}
-
-fn dialog_content_layout(dialog: &DialogView, height: u16) -> DialogContentLayout {
-    let inner_rows = usize::from(height.saturating_sub(2));
-    let search_rows = usize::from(dialog.interactive);
-    let footer_rows = usize::from(dialog.session_entries.is_some());
-    let detail_rows = if dialog.details_open {
-        dialog
-            .entries
-            .get(dialog.selected)
-            .and_then(|entry| entry.selected_detail.as_deref())
-            .map_or(0, |detail| {
-                detail.lines().count().min(3).min(
-                    inner_rows
-                        .saturating_sub(search_rows.saturating_add(footer_rows).saturating_add(1)),
-                )
-            })
-    } else {
-        0
-    };
-    let show_help = dialog.help.is_some()
-        && inner_rows
-            > search_rows
-                .saturating_add(detail_rows)
-                .saturating_add(footer_rows)
-                .saturating_add(1);
-    let entry_rows = inner_rows
-        .saturating_sub(search_rows)
-        .saturating_sub(detail_rows)
-        .saturating_sub(footer_rows)
-        .saturating_sub(usize::from(show_help))
-        .max(1);
-
-    DialogContentLayout {
-        show_help,
-        entry_rows,
-        detail_rows,
+fn dialog_config<'a>(
+    dialog: &'a DialogView,
+    shortcuts: &'a [widgets::OverlayShortcut<'a>],
+) -> widgets::OverlayConfig<'a> {
+    widgets::OverlayConfig {
+        title: &dialog.title,
+        tabs: None,
+        shortcuts,
+        sizing: if dialog.overlay_kind == widgets::OverlayKind::Confirm {
+            widgets::OverlaySizing::compact()
+        } else {
+            widgets::OverlaySizing::dialog()
+        },
+        desired_content_rows: dialog_desired_rows(dialog),
     }
+}
+
+/// Entry rows the dialog can show in `area`, shared by the renderer and the
+/// paging keys so navigation never disagrees with what is painted.
+fn dialog_visible_rows(area: Rect, dialog: &DialogView) -> usize {
+    let labels = dialog_shortcut_labels(dialog);
+    let shortcuts = dialog_shortcuts(&labels);
+    let config = dialog_config(dialog, &shortcuts);
+    widgets::OverlayLayout::solve(area, &config).map_or(1, |layout| {
+        usize::from(dialog_sections(layout.content, dialog).rows.height).max(1)
+    })
 }
 
 fn dialog_empty_message(dialog: &DialogView) -> &str {
@@ -4781,8 +4746,7 @@ where
             return 1;
         };
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let height = dialog_area(area, dialog).height;
-        dialog_content_layout(dialog, height).entry_rows
+        dialog_visible_rows(area, dialog)
     }
 
     fn clamp_palette_selection(&mut self) {
@@ -7322,7 +7286,18 @@ mod runtime_tests {
                 })
                 .collect(),
         );
-        assert_eq!(dialog_desired_rows(&selection), 4);
+        assert_eq!(dialog_desired_rows(&selection), 5);
+
+        let sessions = DialogView::sessions_page(
+            vec![DialogEntry::action("#7 Alpha", "session:7")],
+            SessionDialogRequest::initial(),
+            None,
+        );
+        assert_eq!(
+            dialog_desired_rows(&sessions),
+            2,
+            "session help is fully covered by the derived footer"
+        );
 
         // Dialog help is stored control-character free, so it is one body row.
         let informational = DialogView::informational("Details", "first line\nsecond line");
@@ -7357,17 +7332,19 @@ mod runtime_tests {
         );
 
         let roomy = dialog_sections(content, &selection);
-        assert!(roomy.help.is_none(), "entry-bearing dialogs drop body help");
-        assert_eq!(roomy.search, Some(Rect::new(4, 2, 30, 1)));
-        assert_eq!(roomy.rows, Rect::new(4, 3, 30, 9));
+        assert_eq!(roomy.help, Some(Rect::new(4, 2, 30, 1)));
+        assert_eq!(roomy.search, Some(Rect::new(4, 3, 30, 1)));
+        assert_eq!(roomy.rows, Rect::new(4, 4, 30, 8));
         assert!(roomy.details.is_none());
 
         let single = dialog_sections(Rect::new(4, 2, 30, 1), &selection);
         assert!(single.search.is_none(), "one row belongs to the entries");
+        assert!(single.help.is_none());
         assert_eq!(single.rows.height, 1);
 
         let pair = dialog_sections(Rect::new(4, 2, 30, 2), &selection);
         assert_eq!(pair.search.map(|rect| rect.y), Some(2));
+        assert!(pair.help.is_none(), "help yields to search and entries");
         assert_eq!(pair.rows, Rect::new(4, 3, 30, 1));
 
         let informational = DialogView::informational("Details", "body prose");
