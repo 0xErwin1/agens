@@ -1007,7 +1007,7 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
 }
 
 #[test]
-fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
+fn atomically_rolls_back_failed_writes_and_appends_from_stale_metadata() {
     let directory = directory();
     let metadata = SessionMetadata {
         id: 9,
@@ -1091,10 +1091,12 @@ fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
     first
         .persist_completed_session_turn(&metadata, &completed)
         .unwrap();
-    assert!(
+    assert_eq!(
         stale
             .persist_completed_session_turn(&metadata, &completed)
-            .is_err()
+            .unwrap()
+            .completed_turn_count,
+        2
     );
     drop(first);
     drop(stale);
@@ -1109,9 +1111,97 @@ fn atomically_rolls_back_failed_writes_and_rejects_stale_metadata() {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
             )
             .unwrap(),
-        (1, true)
+        (2, true)
     );
-    assert_eq!(normalized_counts(&connection), (1, 1, 3, 3));
+    assert_eq!(normalized_counts(&connection), (1, 2, 6, 6));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn appends_completed_turn_when_a_concurrent_subagent_turn_advanced_the_count() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 11,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let completed = |text: &str| {
+        turn(vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text(text.into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text(text.into())],
+            },
+        ])
+    };
+
+    let mut store = SessionStore::open(&directory).unwrap();
+    let resumed = store
+        .persist_completed_session_turn(&metadata, &completed("history"))
+        .unwrap();
+    assert_eq!(resumed.completed_turn_count, 1);
+
+    let parent_snapshot = resumed.clone();
+    let attempt = store
+        .begin_session_attempt(&parent_snapshot, "parent prompt".into())
+        .unwrap();
+    let subagent = store
+        .persist_completed_session_turn(&parent_snapshot, &completed("subagent"))
+        .unwrap();
+    assert_eq!(subagent.completed_turn_count, 2);
+    let second_subagent = store
+        .persist_completed_session_turn(&parent_snapshot, &completed("second subagent"))
+        .unwrap();
+    assert_eq!(second_subagent.completed_turn_count, 3);
+
+    assert_eq!(
+        store
+            .persist_completed_session_attempt(
+                attempt.key(),
+                &parent_snapshot,
+                &completed("parent"),
+                99,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(stored.metadata.completed_turn_count, 4);
+    assert_eq!(stored.metadata.updated_at, 99);
+    assert!(stored.metadata.resumable);
+    assert_eq!(
+        stored
+            .messages
+            .iter()
+            .filter_map(|message| match message.parts.first() {
+                Some(MessagePart::Text(text)) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "history",
+            "history",
+            "subagent",
+            "subagent",
+            "second subagent",
+            "second subagent",
+            "parent",
+            "parent",
+        ]
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }

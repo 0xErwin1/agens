@@ -209,14 +209,6 @@ impl SessionStore {
             ));
         }
         validate_metadata(metadata, &self.database_path)?;
-        let expected_turn_count =
-            i64::try_from(metadata.completed_turn_count).map_err(|error| {
-                SessionStoreError::operation(
-                    "validate session metadata",
-                    &self.database_path,
-                    error,
-                )
-            })?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -251,10 +243,10 @@ impl SessionStore {
             &transaction,
             &self.database_path,
             metadata,
-            expected_turn_count,
             turn,
             finished_at,
-        )?;
+        )?
+        .sequence;
         let changed = transaction
             .execute(
                 "UPDATE session_attempts
@@ -716,25 +708,7 @@ impl SessionStore {
                 format!("{error:?}"),
             )
         })?;
-        let expected_turn_count =
-            i64::try_from(metadata.completed_turn_count).map_err(|error| {
-                SessionStoreError::operation(
-                    "validate session metadata",
-                    &self.database_path,
-                    error,
-                )
-            })?;
         let mut persisted_metadata = metadata.clone();
-        persisted_metadata.completed_turn_count = persisted_metadata
-            .completed_turn_count
-            .checked_add(1)
-            .ok_or_else(|| {
-                SessionStoreError::operation(
-                    "validate session metadata",
-                    &self.database_path,
-                    "completed turn count overflow",
-                )
-            })?;
         persisted_metadata.resumable = true;
 
         let transaction = self
@@ -745,15 +719,17 @@ impl SessionStore {
             })?;
         persisted_metadata.id =
             insert_attempt_session(&transaction, &self.database_path, metadata)?;
-        let metadata = &persisted_metadata;
-        persist_completed_turn_in_transaction(
+        let persisted = persist_completed_turn_in_transaction(
             &transaction,
             &self.database_path,
-            metadata,
-            expected_turn_count,
+            &persisted_metadata,
             turn,
-            metadata.updated_at,
+            persisted_metadata.updated_at,
         )?;
+        persisted_metadata.completed_turn_count = u64::try_from(persisted.completed_turn_count)
+            .map_err(|error| {
+                SessionStoreError::operation("update session", &self.database_path, error)
+            })?;
         transaction.commit().map_err(|error| {
             SessionStoreError::operation("commit session turn", &self.database_path, error)
         })?;
@@ -875,39 +851,57 @@ fn insert_attempt_session(
     Ok(metadata.id)
 }
 
+struct PersistedTurn {
+    sequence: i64,
+    completed_turn_count: i64,
+}
+
+/// Appends a completed turn relative to the count stored in the database rather than to a
+/// caller-supplied snapshot: the enclosing immediate transaction already holds the write lock,
+/// so another turn persisted by the same session (a sub-agent turn running inside the parent
+/// turn) must extend the history instead of rejecting it.
 fn persist_completed_turn_in_transaction(
     transaction: &Transaction<'_>,
     database_path: &std::path::Path,
     metadata: &SessionMetadata,
-    expected_turn_count: i64,
     turn: &CompletedSessionTurn,
     completed_at: i64,
-) -> Result<i64, SessionStoreError> {
-    if transaction
+) -> Result<PersistedTurn, SessionStoreError> {
+    let stored_turn_count = transaction
+        .query_row(
+            "SELECT completed_turn_count FROM sessions WHERE id = ?1",
+            params![metadata.id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| SessionStoreError::operation("update session", database_path, error))?
+        .ok_or_else(|| {
+            SessionStoreError::operation("update session", database_path, "session does not exist")
+        })?;
+    let completed_turn_count = stored_turn_count.checked_add(1).ok_or_else(|| {
+        SessionStoreError::operation(
+            "update session",
+            database_path,
+            "completed turn count overflow",
+        )
+    })?;
+    transaction
         .execute(
             "UPDATE sessions SET active_agent = ?1, provider_id = ?2, model_id = ?3,
                 reasoning_effort = ?4, updated_at = ?5,
-                completed_turn_count = completed_turn_count + 1, resumable = 1
-             WHERE id = ?6 AND completed_turn_count = ?7",
+                completed_turn_count = ?6, resumable = 1
+             WHERE id = ?7",
             params![
                 metadata.active_agent,
                 metadata.provider_id,
                 metadata.model_id,
                 metadata.reasoning_effort.map(ReasoningEffort::as_str),
                 completed_at,
-                metadata.id,
-                expected_turn_count
+                completed_turn_count,
+                metadata.id
             ],
         )
-        .map_err(|error| SessionStoreError::operation("update session", database_path, error))?
-        != 1
-    {
-        return Err(SessionStoreError::operation(
-            "update session",
-            database_path,
-            "completed turn count changed",
-        ));
-    }
+        .map_err(|error| SessionStoreError::operation("update session", database_path, error))?;
 
     let turn_sequence = next_sequence(transaction, database_path, "turns", metadata.id)?;
     transaction
@@ -938,7 +932,10 @@ fn persist_completed_turn_in_transaction(
         }
     }
 
-    Ok(turn_sequence)
+    Ok(PersistedTurn {
+        sequence: turn_sequence,
+        completed_turn_count,
+    })
 }
 
 fn attempt_status(status: SessionAttemptStatus) -> &'static str {

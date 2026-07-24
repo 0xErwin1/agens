@@ -6445,8 +6445,19 @@ impl TuiTaskLifecycleBridge {
         bootstrap: Bootstrap,
         session: Arc<Mutex<TuiSessionContext>>,
     ) -> Self {
-        self.persist_completed = Some(Arc::new(move |turn| {
-            let _ = persist_completed_subagent_turn(&bootstrap, &session, turn);
+        let events = self.events.clone();
+        self.persist_completed = Some(Arc::new(move |turn: CompletedSubagentTurn| {
+            let id = turn.id;
+            if persist_completed_subagent_turn(&bootstrap, &session, turn).is_err() {
+                let _ = events.publish(
+                    TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                        id,
+                        TuiSubagentErrorKind::Runtime,
+                    )),
+                    &BridgeCancel::new(),
+                    None,
+                );
+            }
         }));
         self
     }
@@ -17043,6 +17054,44 @@ mod tests {
                 is_error: false,
             }
         );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn failed_subagent_turn_persistence_publishes_a_runtime_error() {
+        let temporary = tui_session_directory("subagent-persistence-failure");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        std::fs::create_dir_all(bootstrap.data_directory().join("rust-sessions.db")).unwrap();
+        let (events, receiver) = BridgeTx::bounded(4);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let persist = bridge
+            .persist_completed
+            .clone()
+            .expect("session writer should be installed");
+
+        persist(CompletedSubagentTurn {
+            id: 7,
+            agent: "reviewer".into(),
+            task: "review task".into(),
+            final_result: "done".into(),
+            tool_uses: 1,
+        });
+
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("persistence failure should reach the TUI bridge")
+                .into_parts()
+                .1,
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                7,
+                TuiSubagentErrorKind::Runtime,
+            ))
+        );
+        assert!(session.lock().unwrap().identifier.is_none());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
