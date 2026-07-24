@@ -756,6 +756,66 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
 }
 
 #[test]
+fn consecutive_reads_render_as_one_animated_group_that_settles_into_past_tense() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: path.into(),
+            name: "native::read".into(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Read { path: path.into() },
+        })
+        .unwrap();
+    }
+
+    tui.tick(Duration::from_millis(0));
+    renderer.render(tui.view()).unwrap();
+    let first_frame = rendered_text(&renderer);
+    assert!(first_frame.contains("Reading 3 files…"), "{first_frame:?}");
+    assert!(!first_frame.contains("Read src/a.rs"), "{first_frame:?}");
+    assert!(first_frame.contains('◦'), "{first_frame:?}");
+
+    tui.tick(Duration::from_millis(200));
+    renderer.render(tui.view()).unwrap();
+    let second_frame = rendered_text(&renderer);
+    assert!(
+        second_frame.contains("Reading 3 files…"),
+        "{second_frame:?}"
+    );
+    assert!(
+        second_frame.contains('•') && !second_frame.contains('◦'),
+        "the running accent advances on tick: {second_frame:?}"
+    );
+
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: path.into(),
+            output: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
+    }
+    renderer.render(tui.view()).unwrap();
+    let settled = rendered_text(&renderer);
+    assert!(settled.contains("Read 3 files"), "{settled:?}");
+    assert!(!settled.contains("Reading 3 files"), "{settled:?}");
+    assert!(settled.contains("Ctrl+O to expand"), "{settled:?}");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(!expanded.contains("Read 3 files"), "{expanded:?}");
+    for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
+        assert!(
+            expanded.contains(&format!("Read {path}")),
+            "expanding the group restores the individual rows: {expanded:?}"
+        );
+    }
+}
+
+#[test]
 fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
     let terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);

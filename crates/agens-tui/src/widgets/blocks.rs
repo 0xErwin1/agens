@@ -259,6 +259,53 @@ pub(crate) fn tool_input_groupable(parsed: &ToolInput) -> bool {
     )
 }
 
+/// Verb vocabulary for a folded run of consecutive read-family tool calls.
+///
+/// Membership mirrors [`tool_input_groupable`] exactly: a kind that may fold is
+/// a kind that has a group verb.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerbGroup {
+    Read,
+    List,
+    Search,
+    Glob,
+    Grep,
+}
+
+impl VerbGroup {
+    pub(crate) const fn of(parsed: &ToolInput) -> Option<Self> {
+        match parsed {
+            ToolInput::Read { .. } => Some(Self::Read),
+            ToolInput::List { .. } => Some(Self::List),
+            ToolInput::Search { .. } => Some(Self::Search),
+            ToolInput::Glob { .. } => Some(Self::Glob),
+            ToolInput::Grep { .. } => Some(Self::Grep),
+            ToolInput::Write { .. }
+            | ToolInput::Edit { .. }
+            | ToolInput::Bash { .. }
+            | ToolInput::WebFetch { .. }
+            | ToolInput::Skill { .. }
+            | ToolInput::Other { .. } => None,
+        }
+    }
+
+    /// Tense-aware summary for `count` folded calls.
+    pub(crate) fn label(self, count: usize, running: bool) -> String {
+        let (present, past, noun) = match self {
+            Self::Read => ("Reading", "Read", "files"),
+            Self::List => ("Listing", "Listed", "directories"),
+            Self::Search => ("Searching", "Searched", "paths"),
+            Self::Glob => ("Matching", "Matched", "patterns"),
+            Self::Grep => ("Searching", "Searched", "patterns"),
+        };
+        if running {
+            format!("{present} {count} {noun}…")
+        } else {
+            format!("{past} {count} {noun}")
+        }
+    }
+}
+
 struct HeaderParts {
     verb: &'static str,
     operand: String,
@@ -730,6 +777,46 @@ mod tests {
         ] {
             assert!(!tool_input_groupable(&ungroupable), "{ungroupable:?}");
         }
+    }
+
+    #[test]
+    fn every_groupable_kind_has_a_tense_aware_group_verb() {
+        for parsed in [
+            ToolInput::Read { path: "a".into() },
+            ToolInput::List { path: "a".into() },
+            ToolInput::Search { path: "a".into() },
+            ToolInput::Glob {
+                pattern: "*".into(),
+                path: None,
+            },
+            ToolInput::Grep {
+                pattern: "*".into(),
+                path: None,
+            },
+            ToolInput::Write { path: "a".into() },
+            ToolInput::Edit { path: "a".into() },
+            ToolInput::Bash {
+                command: "ls".into(),
+            },
+            ToolInput::WebFetch { url: "u".into() },
+            ToolInput::Skill { skill: "s".into() },
+            ToolInput::Other {
+                name: "x".into(),
+                raw: "y".into(),
+            },
+        ] {
+            assert_eq!(
+                VerbGroup::of(&parsed).is_some(),
+                tool_input_groupable(&parsed),
+                "fold policy and verb vocabulary must agree: {parsed:?}"
+            );
+        }
+
+        assert_eq!(VerbGroup::Read.label(3, true), "Reading 3 files…");
+        assert_eq!(VerbGroup::Read.label(3, false), "Read 3 files");
+        assert_eq!(VerbGroup::List.label(2, false), "Listed 2 directories");
+        assert_eq!(VerbGroup::Glob.label(2, true), "Matching 2 patterns…");
+        assert_eq!(VerbGroup::Grep.label(4, false), "Searched 4 patterns");
     }
 
     #[test]

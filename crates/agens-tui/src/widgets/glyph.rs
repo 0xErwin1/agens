@@ -12,6 +12,8 @@ impl StatusGlyph {
     const FRAME_PERIOD_MS: u128 = 80;
     const FRAMES: &'static [&'static str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     const IDLE: &'static str = "·";
+    const PULSE_PERIOD_MS: u128 = 200;
+    const PULSE_FRAMES: &'static [&'static str] = &["◦", "•", "●", "•"];
 
     /// Returns the glyph for the given activity flag and clock.
     ///
@@ -29,6 +31,15 @@ impl StatusGlyph {
     pub(crate) fn frame_index(now: Duration) -> usize {
         let step = now.as_millis() / Self::FRAME_PERIOD_MS;
         (step as usize) % Self::FRAMES.len()
+    }
+
+    /// Accent bullet for a running block's gutter.
+    ///
+    /// Deliberately slower than the spinner: this glyph sits next to text the
+    /// user is reading, so it breathes rather than strobes.
+    pub(crate) fn pulse(now: Duration) -> &'static str {
+        let step = now.as_millis() / Self::PULSE_PERIOD_MS;
+        Self::PULSE_FRAMES[(step as usize) % Self::PULSE_FRAMES.len()]
     }
 
     /// Formats a status label with a tick glyph when the surface is active.
@@ -83,6 +94,24 @@ mod tests {
         assert_ne!(
             StatusGlyph::frame_index(Duration::from_millis(79)),
             StatusGlyph::frame_index(Duration::from_millis(80))
+        );
+    }
+
+    #[test]
+    fn pulse_breathes_slower_than_the_spinner_and_cycles_deterministically() {
+        assert_eq!(StatusGlyph::pulse(Duration::from_millis(0)), "◦");
+        assert_eq!(
+            StatusGlyph::pulse(Duration::from_millis(0)),
+            StatusGlyph::pulse(Duration::from_millis(199)),
+            "a pulse frame outlives several spinner frames"
+        );
+        assert_ne!(
+            StatusGlyph::pulse(Duration::from_millis(199)),
+            StatusGlyph::pulse(Duration::from_millis(200))
+        );
+        assert_eq!(
+            StatusGlyph::pulse(Duration::from_millis(0)),
+            StatusGlyph::pulse(Duration::from_millis(800))
         );
     }
 

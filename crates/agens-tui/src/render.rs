@@ -22,7 +22,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
-    BlockContent, DisplayMode, RolePalette, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow,
+    BlockContent, DisplayMode, RolePalette, StatusGlyph, ThinkingBlock, ToolCallBlock,
+    ToolResultBlock, ToolRow, VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -50,8 +51,17 @@ pub(super) fn conversation_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let content_width = usize::from(content_width.max(1));
+    let plan = plan_verb_groups(conversation, tool_display_modes);
 
-    for item in &conversation.items {
+    for (index, item) in conversation.items.iter().enumerate() {
+        if let Some(group) = plan.headers.get(&index) {
+            lines.push(verb_group_line(group, state.now));
+            lines.push(Line::default());
+            continue;
+        }
+        if plan.folded.contains(&index) {
+            continue;
+        }
         match item {
             ConversationItem::Info(text) => line(&mut lines, "INFO", RolePalette::info(), text),
             ConversationItem::User(text) => user_lines(&mut lines, text),
@@ -95,11 +105,12 @@ pub(super) fn conversation_lines(
                     .get(call_id)
                     .copied()
                     .unwrap_or_else(|| block.default_mode());
+                let running = !call_has_result(conversation, call_id);
                 lines.extend(
                     block
                         .lines(mode)
                         .into_iter()
-                        .map(|block_line| block_line.line),
+                        .map(|block_line| running_gutter_line(block_line.line, running, state.now)),
                 );
             }
             ConversationItem::ToolResult {
@@ -119,14 +130,7 @@ pub(super) fn conversation_lines(
                 } else {
                     vec![ToolRow::collapsed_output()]
                 };
-                let mut full_body = Vec::new();
-                markdown_lines(
-                    &mut full_body,
-                    &bounded_visible_tool_output(output),
-                    Style::default().fg(RolePalette::chrome()),
-                    "",
-                    content_width,
-                );
+                let full_body = tool_result_body(call_id, output, content_width).to_vec();
                 let size = result_size_label(output);
                 let block = ToolResultBlock {
                     footer: ToolRow::result_footer(&tool_name, &status, color, Some(&size)),
@@ -182,6 +186,229 @@ pub(super) fn conversation_lines(
         }
     }
     lines
+}
+
+/// A run of consecutive tool items folded behind one tense-aware header.
+struct FoldedGroup {
+    verb: VerbGroup,
+    count: usize,
+    running: bool,
+}
+
+#[derive(Default)]
+struct FoldPlan {
+    headers: BTreeMap<usize, FoldedGroup>,
+    folded: BTreeSet<usize>,
+}
+
+/// Pure layout pass folding consecutive collapsed read-family calls into groups.
+///
+/// The plan is recomputed per frame rather than stored, so it can never drift
+/// from the display modes and conversation it summarizes. A call folds while it
+/// is still running (the group then reads in present tense) and once it settles
+/// into `Collapsed`; any other mode means the user asked to see the individual
+/// rows, so the run is rendered unfolded.
+fn plan_verb_groups(
+    conversation: &Conversation,
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+) -> FoldPlan {
+    let mut plan = FoldPlan::default();
+    let mut index = 0usize;
+
+    while index < conversation.items.len() {
+        match collect_group(conversation, tool_display_modes, index) {
+            Some((group, end)) => {
+                plan.folded.extend(index..end);
+                plan.headers.insert(index, group);
+                index = end;
+            }
+            None => index += 1,
+        }
+    }
+
+    plan
+}
+
+const MIN_GROUP_CALLS: usize = 2;
+
+fn collect_group(
+    conversation: &Conversation,
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    start: usize,
+) -> Option<(FoldedGroup, usize)> {
+    let verb = foldable_call(
+        conversation,
+        tool_display_modes,
+        conversation.items.get(start)?,
+    )?;
+    let mut members = BTreeSet::new();
+    let mut count = 0usize;
+    let mut running = false;
+    let mut end = start;
+
+    for (offset, item) in conversation.items.iter().enumerate().skip(start) {
+        match item {
+            ConversationItem::ToolCall { name, .. } if is_task_tool_name(name) => {}
+            ConversationItem::ToolCall { call_id, .. } => {
+                if foldable_call(conversation, tool_display_modes, item) != Some(verb) {
+                    break;
+                }
+                members.insert(call_id.as_str());
+                count += 1;
+                running |= !call_has_result(conversation, call_id);
+            }
+            ConversationItem::ToolResult { call_id, .. }
+                if members.contains(call_id.as_str()) || is_task_call(conversation, call_id) => {}
+            _ => break,
+        }
+        end = offset + 1;
+    }
+
+    (count >= MIN_GROUP_CALLS).then_some((
+        FoldedGroup {
+            verb,
+            count,
+            running,
+        },
+        end,
+    ))
+}
+
+fn foldable_call(
+    conversation: &Conversation,
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    item: &ConversationItem,
+) -> Option<VerbGroup> {
+    let ConversationItem::ToolCall {
+        call_id, parsed, ..
+    } = item
+    else {
+        return None;
+    };
+    let verb = VerbGroup::of(parsed)?;
+    let settled = match tool_display_modes.get(call_id) {
+        Some(mode) => *mode == DisplayMode::Collapsed,
+        None => !call_has_result(conversation, call_id),
+    };
+    settled.then_some(verb)
+}
+
+fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
+    conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .any(|call| call.call_id == call_id && call.result.is_some())
+}
+
+fn verb_group_line(group: &FoldedGroup, now: Duration) -> Line<'static> {
+    let mut spans = vec![
+        running_gutter_span(group.running, now),
+        Span::styled(
+            group.verb.label(group.count, group.running),
+            Style::default()
+                .fg(RolePalette::tool())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !group.running {
+        spans.push(Span::styled(
+            " · Ctrl+O to expand",
+            Style::default().fg(RolePalette::chrome()),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Two-column leading gutter carrying the running-block pulse.
+///
+/// Finished blocks keep the same two columns so a block does not shift
+/// horizontally the moment its call completes.
+fn running_gutter_span(running: bool, now: Duration) -> Span<'static> {
+    if running {
+        Span::styled(
+            format!("{} ", StatusGlyph::pulse(now)),
+            Style::default().fg(RolePalette::accent_active()),
+        )
+    } else {
+        Span::raw("  ")
+    }
+}
+
+fn running_gutter_line(line: Line<'static>, running: bool, now: Duration) -> Line<'static> {
+    let mut spans = vec![running_gutter_span(running, now)];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
+const TOOL_BODY_CACHE_MAX_ENTRIES: usize = 64;
+
+struct ToolBodyKey {
+    call_id: String,
+    content_width: usize,
+    output_hash: u64,
+}
+
+thread_local! {
+    static TOOL_BODY_CACHE: std::cell::RefCell<VecDeque<(ToolBodyKey, Arc<[Line<'static>]>)>> =
+        const { std::cell::RefCell::new(VecDeque::new()) };
+}
+
+/// Described lines for a tool result body, reused while the body is unchanged.
+///
+/// Keyed by call, content width and output hash, so an idle block is described
+/// once instead of once per animation tick. Caching is safe here because a tool
+/// body is bounded well below [`SYNTAX_DEFER_SOURCE_BYTES`]: its syntax
+/// highlighting resolves on the first frame, so no deferred, unhighlighted
+/// frame can be frozen into the cache.
+fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[Line<'static>]> {
+    let mut hasher = DefaultHasher::new();
+    output.hash(&mut hasher);
+    let output_hash = hasher.finish();
+
+    let cached = TOOL_BODY_CACHE.with_borrow_mut(|cache| {
+        cache
+            .iter()
+            .find(|(key, _)| {
+                key.output_hash == output_hash
+                    && key.content_width == content_width
+                    && key.call_id == call_id
+            })
+            .map(|(_, body)| Arc::clone(body))
+    });
+    if let Some(body) = cached {
+        return body;
+    }
+
+    #[cfg(test)]
+    TOOL_BODY_RENDERS.with(|renders| renders.set(renders.get() + 1));
+
+    let mut described = Vec::new();
+    markdown_lines(
+        &mut described,
+        &bounded_visible_tool_output(output),
+        Style::default().fg(RolePalette::chrome()),
+        "",
+        content_width,
+    );
+    let body: Arc<[Line<'static>]> = Arc::from(described);
+
+    TOOL_BODY_CACHE.with_borrow_mut(|cache| {
+        cache.retain(|(key, _)| key.call_id != call_id);
+        while cache.len() >= TOOL_BODY_CACHE_MAX_ENTRIES {
+            cache.pop_front();
+        }
+        cache.push_back((
+            ToolBodyKey {
+                call_id: call_id.to_owned(),
+                content_width,
+                output_hash,
+            },
+            Arc::clone(&body),
+        ));
+    });
+
+    body
 }
 
 fn subagent_card_lines(
@@ -1475,6 +1702,18 @@ fn result_color(result: ToolResultState) -> Color {
 #[cfg(test)]
 thread_local! {
     static SYNTAX_HIGHLIGHT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOOL_BODY_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_tool_body_test_state() {
+    TOOL_BODY_CACHE.with_borrow_mut(VecDeque::clear);
+    TOOL_BODY_RENDERS.with(|renders| renders.set(0));
+}
+
+#[cfg(test)]
+fn tool_body_test_renders() -> usize {
+    TOOL_BODY_RENDERS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -1520,6 +1759,194 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn joined(lines: &[Line<'static>]) -> String {
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    fn read_conversation(paths: &[&str]) -> Conversation {
+        let mut conversation = Conversation::new("prompt");
+        for path in paths {
+            conversation
+                .apply(crate::ConversationEvent::ToolCall {
+                    call_id: (*path).to_owned(),
+                    name: "native::read".into(),
+                    input: "{}".into(),
+                    parsed: agens_core::ToolInput::Read {
+                        path: (*path).to_owned(),
+                    },
+                })
+                .expect("read call should project");
+        }
+        conversation
+    }
+
+    fn render_at(
+        conversation: &Conversation,
+        modes: &BTreeMap<String, DisplayMode>,
+        now: Duration,
+    ) -> String {
+        joined(&conversation_lines(
+            conversation,
+            &[],
+            modes,
+            80,
+            ConversationRenderState {
+                collapse_thinking: false,
+                thinking_streaming: false,
+                assistant_streaming: false,
+                now,
+            },
+        ))
+    }
+
+    #[test]
+    fn consecutive_reads_fold_into_a_tense_aware_group_that_expanding_restores() {
+        let paths = ["a.rs", "b.rs", "c.rs"];
+        let mut conversation = read_conversation(&paths);
+        let mut modes = BTreeMap::new();
+
+        let running = render_at(&conversation, &modes, Duration::ZERO);
+        assert!(running.contains("Reading 3 files…"), "{running:?}");
+        assert!(!running.contains("Read a.rs"), "{running:?}");
+
+        for path in paths {
+            conversation
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: path.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("read result should project");
+            modes.insert(path.to_owned(), DisplayMode::Collapsed);
+        }
+
+        let finished = render_at(&conversation, &modes, Duration::ZERO);
+        assert!(finished.contains("Read 3 files"), "{finished:?}");
+        assert!(!finished.contains("Reading 3 files"), "{finished:?}");
+        assert!(!finished.contains("Read a.rs"), "{finished:?}");
+
+        for path in paths {
+            modes.insert(path.to_owned(), DisplayMode::Truncated);
+        }
+        let expanded = render_at(&conversation, &modes, Duration::ZERO);
+        assert!(!expanded.contains("Read 3 files"), "{expanded:?}");
+        for path in paths {
+            assert!(expanded.contains(&format!("Read {path}")), "{expanded:?}");
+        }
+    }
+
+    #[test]
+    fn destructive_and_unknown_tool_rows_never_fold_into_a_group() {
+        let mut conversation = Conversation::new("prompt");
+        let mut modes = BTreeMap::new();
+        for (call_id, name, parsed) in [
+            (
+                "bash-1",
+                "native::bash",
+                agens_core::ToolInput::Bash {
+                    command: "echo one".into(),
+                },
+            ),
+            (
+                "bash-2",
+                "native::bash",
+                agens_core::ToolInput::Bash {
+                    command: "echo two".into(),
+                },
+            ),
+            (
+                "write-1",
+                "native::write",
+                agens_core::ToolInput::Write {
+                    path: "x.rs".into(),
+                },
+            ),
+            (
+                "write-2",
+                "native::write",
+                agens_core::ToolInput::Write {
+                    path: "y.rs".into(),
+                },
+            ),
+        ] {
+            conversation
+                .apply(crate::ConversationEvent::ToolCall {
+                    call_id: call_id.to_owned(),
+                    name: name.to_owned(),
+                    input: "{}".into(),
+                    parsed,
+                })
+                .expect("call should project");
+            conversation
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: call_id.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+            modes.insert(call_id.to_owned(), DisplayMode::Collapsed);
+        }
+
+        let rendered = render_at(&conversation, &modes, Duration::ZERO);
+        for header in ["$ echo one", "$ echo two", "Write x.rs", "Write y.rs"] {
+            assert!(rendered.contains(header), "{rendered:?}");
+        }
+        assert!(!rendered.contains("files"), "{rendered:?}");
+        assert!(!rendered.contains("Wrote 2"), "{rendered:?}");
+    }
+
+    #[test]
+    fn running_blocks_pulse_across_ticks_while_finished_blocks_stay_static() {
+        let running = read_conversation(&["a.rs", "b.rs"]);
+        let modes = BTreeMap::new();
+        let first = render_at(&running, &modes, Duration::ZERO);
+        let later = render_at(&running, &modes, Duration::from_millis(200));
+        assert_ne!(first, later, "a running group animates on tick");
+
+        let mut finished = read_conversation(&["c.rs", "d.rs"]);
+        let mut finished_modes = BTreeMap::new();
+        for path in ["c.rs", "d.rs"] {
+            finished
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: path.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+            finished_modes.insert(path.to_owned(), DisplayMode::Collapsed);
+        }
+        assert_eq!(
+            render_at(&finished, &finished_modes, Duration::ZERO),
+            render_at(&finished, &finished_modes, Duration::from_millis(600)),
+            "finished blocks are static across ticks"
+        );
+    }
+
+    #[test]
+    fn idle_tool_bodies_are_reused_across_ticks_instead_of_recomputed() {
+        reset_tool_body_test_state();
+        let mut conversation = read_conversation(&["a.rs"]);
+        conversation
+            .apply(crate::ConversationEvent::ToolResult {
+                call_id: "a.rs".into(),
+                output: "line one\nline two\nline three".into(),
+                is_error: false,
+            })
+            .expect("result should project");
+        let mut modes = BTreeMap::new();
+        modes.insert("a.rs".to_owned(), DisplayMode::Expanded);
+
+        for tick in [0, 80, 160, 240] {
+            let _ = render_at(&conversation, &modes, Duration::from_millis(tick));
+        }
+
+        assert_eq!(
+            tool_body_test_renders(),
+            1,
+            "an idle tool body is described once, not once per tick"
+        );
     }
 
     #[test]
