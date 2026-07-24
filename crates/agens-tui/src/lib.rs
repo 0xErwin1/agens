@@ -1421,6 +1421,136 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
     );
 }
 
+/// Detail lines the expanded selection may claim.
+const MAX_DIALOG_DETAIL_ROWS: usize = 3;
+/// Confirm answers offered as footer shortcuts, in prompt order.
+const CONFIRM_SHORT_KEYS: [char; 4] = ['a', 'd', 'A', 'D'];
+
+/// Body rows the dialog would like, before the shell subtracts its chrome.
+#[allow(dead_code)]
+fn dialog_desired_rows(dialog: &DialogView) -> u16 {
+    saturating_u16(
+        usize::from(dialog_help_rows(dialog))
+            .saturating_add(usize::from(dialog.interactive))
+            .saturating_add(dialog_matches(dialog).len().max(1))
+            .saturating_add(usize::from(dialog_detail_rows(dialog))),
+    )
+}
+
+/// Whether `help` still belongs in the body.
+///
+/// Entry-bearing dialogs hand that role to the derived keybinding footer, but
+/// informational overlays have no other body, and a Confirm's help carries the
+/// tool and target being decided rather than keybinding prose.
+fn dialog_shows_help_body(dialog: &DialogView) -> bool {
+    dialog.help.is_some()
+        && (dialog.overlay_kind == widgets::OverlayKind::Confirm
+            || (dialog.entries.is_empty() && dialog.session_entries.is_none()))
+}
+
+/// Help is stored control-character free, so the body claims a single row.
+fn dialog_help_rows(dialog: &DialogView) -> u16 {
+    u16::from(dialog_shows_help_body(dialog))
+}
+
+fn dialog_selected_detail(dialog: &DialogView) -> Option<&str> {
+    dialog
+        .entries
+        .get(dialog.selected)
+        .and_then(|entry| entry.selected_detail.as_deref())
+}
+
+fn dialog_detail_rows(dialog: &DialogView) -> u16 {
+    if !dialog.details_open {
+        return 0;
+    }
+    dialog_selected_detail(dialog).map_or(0, |detail| {
+        saturating_u16(detail.lines().count().min(MAX_DIALOG_DETAIL_ROWS))
+    })
+}
+
+/// Vertical split of the shell content rect, in painting order.
+#[allow(dead_code)]
+struct DialogSections {
+    help: Option<Rect>,
+    search: Option<Rect>,
+    rows: Rect,
+    details: Option<Rect>,
+}
+
+/// Splits the content rect the shell produced, keeping at least one entry row.
+#[allow(dead_code)]
+fn dialog_sections(content: Rect, dialog: &DialogView) -> DialogSections {
+    let mut remaining = content.height;
+    let search = u16::from(dialog.interactive && remaining > 1);
+    remaining -= search;
+    let details = dialog_detail_rows(dialog).min(remaining.saturating_sub(1));
+    remaining -= details;
+    let help = dialog_help_rows(dialog).min(remaining.saturating_sub(1));
+    remaining -= help;
+
+    let band = |y: u16, height: u16| Rect::new(content.x, y, content.width, height);
+    let search_y = content.y.saturating_add(help);
+    let rows_y = search_y.saturating_add(search);
+    let details_y = rows_y.saturating_add(remaining);
+
+    DialogSections {
+        help: (help > 0).then(|| band(content.y, help)),
+        search: (search > 0).then(|| band(search_y, search)),
+        rows: band(rows_y, remaining),
+        details: (details > 0).then(|| band(details_y, details)),
+    }
+}
+
+type DialogShortcutLabels = Vec<(Cow<'static, str>, Cow<'static, str>)>;
+
+/// Footer shortcuts derived from dialog capabilities, never parsed from `help`.
+#[allow(dead_code)]
+fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
+    if dialog.overlay_kind == widgets::OverlayKind::Confirm {
+        let mut labels: DialogShortcutLabels = CONFIRM_SHORT_KEYS
+            .iter()
+            .filter_map(|key| {
+                let answer = widgets::OverlayShell::confirm_answer(*key)?;
+                Some((
+                    Cow::Owned(key.to_string()),
+                    Cow::Owned(answer.replace('-', " ")),
+                ))
+            })
+            .collect();
+        labels.push((Cow::Borrowed("esc"), Cow::Borrowed("cancel")));
+        return labels;
+    }
+
+    let mut labels = DialogShortcutLabels::new();
+    if dialog.interactive {
+        labels.push((Cow::Borrowed("↑↓"), Cow::Borrowed("navigate")));
+    }
+    if let Some(sessions) = dialog.session_entries.as_ref() {
+        let paging = if sessions.next_cursor.is_some() {
+            "more"
+        } else {
+            "end"
+        };
+        labels.push((
+            Cow::Borrowed("⇞⇟"),
+            Cow::Owned(format!("page {} · {paging}", sessions.request.page)),
+        ));
+        labels.push((
+            Cow::Borrowed("ctrl+a"),
+            Cow::Borrowed(match sessions.request.scope {
+                SessionDialogScope::CurrentProject => "all projects",
+                SessionDialogScope::AllProjects => "current project",
+            }),
+        ));
+        labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("resume")));
+    } else if dialog.interactive {
+        labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("select")));
+    }
+    labels.push((Cow::Borrowed("esc"), Cow::Borrowed("close")));
+    labels
+}
+
 fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
     let width = area.width.saturating_sub(4).clamp(1, 64);
     let content_rows = usize::from(dialog.help.is_some())
@@ -7161,5 +7291,196 @@ mod runtime_tests {
         );
         assert_eq!(tui.input(), "draft text");
         assert!(tui.view().dialog.is_some());
+    }
+
+    fn detailed_entry(detail_lines: usize) -> DialogEntry {
+        DialogEntry::action_with_metadata(
+            "#7 Alpha",
+            "2 turns",
+            "7 alpha",
+            (0..detail_lines)
+                .map(|line| format!("detail {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "session:7",
+        )
+    }
+
+    fn open_details(mut dialog: DialogView) -> DialogView {
+        dialog.details_open = true;
+        dialog
+    }
+
+    #[test]
+    fn dialog_desired_rows_counts_body_help_search_matches_and_capped_details() {
+        let selection = DialogView::selection(
+            "Choose",
+            Some("Up/Down navigate"),
+            (0..3)
+                .map(|index| {
+                    DialogEntry::action(format!("Option {index}"), format!("pick:{index}"))
+                })
+                .collect(),
+        );
+        assert_eq!(dialog_desired_rows(&selection), 4);
+
+        // Dialog help is stored control-character free, so it is one body row.
+        let informational = DialogView::informational("Details", "first line\nsecond line");
+        assert_eq!(dialog_desired_rows(&informational), 2);
+
+        let empty = DialogView::selection("Choose", None::<String>, Vec::new());
+        assert_eq!(dialog_desired_rows(&empty), 2);
+
+        let detailed = open_details(DialogView::selection(
+            "Choose",
+            None::<String>,
+            vec![detailed_entry(5)],
+        ));
+        assert_eq!(dialog_desired_rows(&detailed), 5);
+
+        let confirm = DialogView::selection(
+            "Permission required",
+            Some("native::read\n/work/alpha"),
+            vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
+        )
+        .as_confirm();
+        assert_eq!(dialog_desired_rows(&confirm), 3);
+    }
+
+    #[test]
+    fn dialog_sections_sacrifice_help_then_details_before_the_entry_rows() {
+        let content = Rect::new(4, 2, 30, 10);
+        let selection = DialogView::selection(
+            "Choose",
+            Some("Up/Down navigate"),
+            vec![DialogEntry::action("Option", "pick")],
+        );
+
+        let roomy = dialog_sections(content, &selection);
+        assert!(roomy.help.is_none(), "entry-bearing dialogs drop body help");
+        assert_eq!(roomy.search, Some(Rect::new(4, 2, 30, 1)));
+        assert_eq!(roomy.rows, Rect::new(4, 3, 30, 9));
+        assert!(roomy.details.is_none());
+
+        let single = dialog_sections(Rect::new(4, 2, 30, 1), &selection);
+        assert!(single.search.is_none(), "one row belongs to the entries");
+        assert_eq!(single.rows.height, 1);
+
+        let pair = dialog_sections(Rect::new(4, 2, 30, 2), &selection);
+        assert_eq!(pair.search.map(|rect| rect.y), Some(2));
+        assert_eq!(pair.rows, Rect::new(4, 3, 30, 1));
+
+        let informational = DialogView::informational("Details", "body prose");
+        let help = dialog_sections(Rect::new(0, 0, 30, 6), &informational);
+        assert_eq!(help.help, Some(Rect::new(0, 0, 30, 1)));
+        assert!(help.search.is_none());
+        assert_eq!(help.rows, Rect::new(0, 1, 30, 5));
+
+        let squeezed = dialog_sections(Rect::new(0, 0, 30, 1), &informational);
+        assert!(squeezed.help.is_none(), "the last row belongs to the body");
+        assert_eq!(squeezed.rows.height, 1);
+
+        let detailed = open_details(DialogView::selection(
+            "Choose",
+            None::<String>,
+            vec![detailed_entry(3)],
+        ));
+        let detail = dialog_sections(Rect::new(0, 0, 30, 4), &detailed);
+        assert_eq!(detail.search.map(|rect| rect.y), Some(0));
+        assert_eq!(detail.rows, Rect::new(0, 1, 30, 1));
+        assert_eq!(detail.details, Some(Rect::new(0, 2, 30, 2)));
+    }
+
+    #[test]
+    fn dialog_footer_shortcuts_are_derived_from_capabilities_not_from_help_prose() {
+        let confirm = |help: &str| {
+            DialogView::selection(
+                "Permission required",
+                Some(help),
+                vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
+            )
+            .as_confirm()
+        };
+        let labels = dialog_shortcut_labels(&confirm("native::read"));
+        assert_eq!(
+            labels,
+            dialog_shortcut_labels(&confirm("totally different prose")),
+            "footer must not depend on the help string"
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .map(|(key, _)| key.as_ref())
+                .collect::<Vec<_>>(),
+            ["a", "d", "A", "D", "esc"]
+        );
+        assert_eq!(
+            labels
+                .iter()
+                .map(|(_, label)| label.as_ref())
+                .collect::<Vec<_>>(),
+            [
+                "allow once",
+                "deny once",
+                "allow always",
+                "deny always",
+                "cancel"
+            ]
+        );
+
+        let selection = dialog_shortcut_labels(&DialogView::selection(
+            "Choose",
+            Some("Up/Down navigate, Enter selects, Esc cancels"),
+            vec![DialogEntry::action("Option", "pick")],
+        ));
+        assert_eq!(
+            selection,
+            vec![
+                (Cow::Borrowed("↑↓"), Cow::Borrowed("navigate")),
+                (Cow::Borrowed("⏎"), Cow::Borrowed("select")),
+                (Cow::Borrowed("esc"), Cow::Borrowed("close")),
+            ]
+        );
+
+        let informational = dialog_shortcut_labels(&DialogView::informational("Details", "body"));
+        assert_eq!(
+            informational,
+            vec![(Cow::Borrowed("esc"), Cow::Borrowed("close"))]
+        );
+
+        let first_page = dialog_shortcut_labels(&DialogView::sessions_page(
+            vec![DialogEntry::action("#7 Alpha", "session:7")],
+            SessionDialogRequest::initial(),
+            Some(SessionDialogCursor::new(100, 7)),
+        ));
+        assert!(
+            first_page.contains(&(Cow::Borrowed("⇞⇟"), Cow::Owned("page 1 · more".to_owned()))),
+            "{first_page:?}"
+        );
+        assert!(
+            first_page.contains(&(Cow::Borrowed("ctrl+a"), Cow::Borrowed("all projects"))),
+            "{first_page:?}"
+        );
+        assert!(
+            first_page.contains(&(Cow::Borrowed("⏎"), Cow::Borrowed("resume"))),
+            "{first_page:?}"
+        );
+
+        let last_page = dialog_shortcut_labels(&DialogView::sessions_page(
+            Vec::new(),
+            SessionDialogRequest {
+                scope: SessionDialogScope::AllProjects,
+                ..SessionDialogRequest::initial()
+            },
+            None,
+        ));
+        assert!(
+            last_page.contains(&(Cow::Borrowed("⇞⇟"), Cow::Owned("page 1 · end".to_owned()))),
+            "{last_page:?}"
+        );
+        assert!(
+            last_page.contains(&(Cow::Borrowed("ctrl+a"), Cow::Borrowed("current project"))),
+            "{last_page:?}"
+        );
     }
 }
