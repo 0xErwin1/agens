@@ -49,9 +49,11 @@ pub use mcp_status::{
 };
 pub use stdio_mcp::{McpStdioTransport, McpStdioTransportConfig};
 pub use task::{
-    TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode,
-    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
-    TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
+    TaskControlAction, TaskControlTool, TaskExecutionEvent, TaskExecutionId,
+    TaskExecutionLifecycle, TaskExecutionRegistry, TaskExecutionSnapshot, TaskInvocation,
+    TaskLaunchMode, TaskMessage, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
+    TaskModelResolutionError, TaskRegistryError, TaskRunContext, TaskRunner, TaskRunnerError,
+    TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult,
 };
 
 #[cfg(unix)]

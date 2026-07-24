@@ -1,10 +1,11 @@
 use agens_core::{AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, RequestConfig};
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
@@ -25,11 +26,10 @@ const MAX_TASK_OUTPUT_CHARS: usize = 65_536;
 const MAX_TASK_CONCURRENCY: usize = 4;
 const MAX_TASK_AGENT_SCHEMA_DESCRIPTION_CHARS: usize = 160;
 const MAX_TASK_MODEL_SCHEMA_ENTRIES: usize = 256;
-const TASK_TIMEOUT: Duration = Duration::from_secs(30);
 const TASK_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const OPEN: u8 = 0;
-const CANCELLED: u8 = 1;
-const PUBLISHED: u8 = 2;
+const MAX_TASK_MESSAGES_PER_TARGET: usize = 32;
+const MAX_TASK_MESSAGE_BYTES: usize = 8 * 1024;
+const MAX_TASK_MAILBOX_BYTES: usize = 64 * 1024;
 
 type BeforePublicationHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 type ModelResolutionDiagnostics =
@@ -39,6 +39,10 @@ type ModelResolutionDiagnostics =
 pub struct TaskExecutionId(u64);
 
 impl TaskExecutionId {
+    pub const fn from_value(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn value(self) -> u64 {
         self.0
     }
@@ -64,6 +68,515 @@ pub enum TaskExecutionEvent {
     Completed(TaskExecutionId),
     Failed(TaskExecutionId),
     Cancelled(TaskExecutionId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskControlAction {
+    Background,
+    Cancel,
+    Status,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskMessageSource {
+    Main,
+    User,
+    Execution(TaskExecutionId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskMessageTarget {
+    Main,
+    Execution(TaskExecutionId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskMessage {
+    source: TaskMessageSource,
+    content: String,
+}
+
+impl TaskMessage {
+    pub const fn source(&self) -> TaskMessageSource {
+        self.source
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskRegistryError {
+    UnknownExecution,
+    TerminalExecution,
+    InvalidControl,
+    ForbiddenRoute,
+    MessageLimit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskExecutionSnapshot {
+    pub id: TaskExecutionId,
+    pub mode: TaskLaunchMode,
+    pub terminal: Option<TaskTerminalState>,
+    pub result: Option<ToolOutput>,
+}
+
+#[derive(Clone)]
+pub struct TaskControlTool {
+    registry: TaskExecutionRegistry,
+    source: TaskMessageSource,
+}
+
+impl TaskControlTool {
+    pub fn new(registry: TaskExecutionRegistry, source: TaskMessageSource) -> Self {
+        Self { registry, source }
+    }
+
+    pub fn input_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["action", "id"],
+            "properties": {
+                "action": {"type": "string", "enum": ["background", "cancel", "status"]},
+                "id": {"type": "integer", "minimum": 1}
+            }
+        })
+    }
+}
+
+impl DispatchTool for TaskControlTool {
+    fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
+        parse_execution_id(arguments).map(|id| id.value().to_string())
+    }
+
+    fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
+        let id = parse_execution_id(&arguments)?;
+        let action = match arguments.get("action").and_then(Value::as_str) {
+            Some("background") => TaskControlAction::Background,
+            Some("cancel") => TaskControlAction::Cancel,
+            Some("status") => TaskControlAction::Status,
+            _ => return Ok(ToolOutput::failure("task control arguments are invalid")),
+        };
+        if arguments.as_object().is_none_or(|object| object.len() != 2) {
+            return Ok(ToolOutput::failure("task control arguments are invalid"));
+        }
+
+        if action == TaskControlAction::Status {
+            if let TaskMessageSource::Execution(source_id) = self.source
+                && source_id != id
+            {
+                return Ok(ToolOutput::failure("task control target is unavailable"));
+            }
+            return Ok(match self.registry.snapshot(id) {
+                Some(snapshot) => ToolOutput::success(task_status(&snapshot)),
+                None => ToolOutput::failure("task control target is unavailable"),
+            });
+        }
+
+        Ok(match self.registry.control(self.source, id, action) {
+            Ok(()) => match action {
+                TaskControlAction::Background => {
+                    ToolOutput::success(format!("Subagent #{} moved to background", id.value()))
+                }
+                TaskControlAction::Cancel => {
+                    ToolOutput::success(format!("Subagent #{} cancellation requested", id.value()))
+                }
+                TaskControlAction::Status => unreachable!("status handled above"),
+            },
+            Err(_) => ToolOutput::failure("task control target is unavailable"),
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct TaskMessageTool {
+    registry: TaskExecutionRegistry,
+    source: TaskMessageSource,
+}
+
+impl TaskMessageTool {
+    pub fn new(registry: TaskExecutionRegistry, source: TaskMessageSource) -> Self {
+        Self { registry, source }
+    }
+
+    pub fn input_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["message", "target"],
+            "properties": {
+                "message": {"type": "string", "minLength": 1, "maxLength": 8192},
+                "target": {
+                    "oneOf": [
+                        {"type": "integer", "minimum": 1},
+                        {"type": "string", "enum": ["main"]}
+                    ]
+                }
+            }
+        })
+    }
+}
+
+impl DispatchTool for TaskMessageTool {
+    fn permission_target(&self, arguments: &Value) -> Result<String, Error> {
+        match parse_message_target(arguments)? {
+            TaskMessageTarget::Main => Ok("main".into()),
+            TaskMessageTarget::Execution(id) => Ok(id.value().to_string()),
+        }
+    }
+
+    fn execute(&mut self, _: &ToolExecutionContext, arguments: Value) -> Result<ToolOutput, Error> {
+        if arguments.as_object().is_none_or(|object| object.len() != 2) {
+            return Ok(ToolOutput::failure("task message arguments are invalid"));
+        }
+        let target = parse_message_target(&arguments)?;
+        let Some(message) = arguments.get("message").and_then(Value::as_str) else {
+            return Ok(ToolOutput::failure("task message arguments are invalid"));
+        };
+
+        Ok(
+            match self
+                .registry
+                .send_message(self.source, target, message.into())
+            {
+                Ok(()) => ToolOutput::success("task message queued"),
+                Err(_) => ToolOutput::failure("task message target is unavailable"),
+            },
+        )
+    }
+}
+
+fn parse_execution_id(arguments: &Value) -> Result<TaskExecutionId, Error> {
+    arguments
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|id| *id > 0)
+        .map(TaskExecutionId)
+        .ok_or_else(|| Error::Tool("task control arguments are invalid".into()))
+}
+
+fn parse_message_target(arguments: &Value) -> Result<TaskMessageTarget, Error> {
+    match arguments.get("target") {
+        Some(Value::String(target)) if target == "main" => Ok(TaskMessageTarget::Main),
+        Some(Value::Number(target)) => target
+            .as_u64()
+            .filter(|id| *id > 0)
+            .map(|id| TaskMessageTarget::Execution(TaskExecutionId(id)))
+            .ok_or_else(|| Error::Tool("task message arguments are invalid".into())),
+        _ => Err(Error::Tool("task message arguments are invalid".into())),
+    }
+}
+
+fn task_status(snapshot: &TaskExecutionSnapshot) -> String {
+    let status = match snapshot.terminal {
+        Some(TaskTerminalState::Completed) => "completed",
+        Some(TaskTerminalState::Failed) => "failed",
+        Some(TaskTerminalState::Cancelled) => "cancelled",
+        None if snapshot.mode == TaskLaunchMode::Foreground => "foreground running",
+        None => "background running",
+    };
+    let mut output = format!("Subagent #{}: {status}", snapshot.id.value());
+    if let Some(result) = &snapshot.result {
+        output.push('\n');
+        output.push_str(&result.content);
+    }
+    output
+}
+
+#[derive(Clone, Default)]
+pub struct TaskExecutionRegistry {
+    inner: Arc<Mutex<TaskExecutionRegistryState>>,
+}
+
+#[derive(Default)]
+struct TaskExecutionRegistryState {
+    next_id: u64,
+    executions: BTreeMap<TaskExecutionId, TaskExecutionRecord>,
+    main_mailbox: TaskMailbox,
+}
+
+struct TaskExecutionRecord {
+    lifecycle: TaskExecutionLifecycle,
+    cancellation: Arc<AtomicBool>,
+    result: Option<ToolOutput>,
+    mailbox: TaskMailbox,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct TaskMailbox {
+    messages: VecDeque<TaskMessage>,
+    bytes: usize,
+}
+
+impl TaskExecutionRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn admit(&self, mode: TaskLaunchMode) -> Option<TaskExecutionId> {
+        self.join_finished_workers();
+        let mut registry = self.inner.lock().expect("task registry lock poisoned");
+        let active = registry
+            .executions
+            .values()
+            .filter(|execution| execution.lifecycle.terminal().is_none())
+            .count();
+        if active >= MAX_TASK_CONCURRENCY || registry.next_id == u64::MAX {
+            return None;
+        }
+
+        registry.next_id += 1;
+        let id = TaskExecutionId(registry.next_id);
+        registry.executions.insert(
+            id,
+            TaskExecutionRecord {
+                lifecycle: TaskExecutionLifecycle::new(id, mode),
+                cancellation: Arc::new(AtomicBool::new(false)),
+                result: None,
+                mailbox: TaskMailbox::default(),
+                worker: None,
+            },
+        );
+        Some(id)
+    }
+
+    pub fn lifecycle(&self, id: TaskExecutionId) -> Option<TaskExecutionLifecycle> {
+        self.inner
+            .lock()
+            .ok()?
+            .executions
+            .get(&id)
+            .map(|execution| execution.lifecycle.clone())
+    }
+
+    pub fn cancellation_handle(&self, id: TaskExecutionId) -> Option<Arc<AtomicBool>> {
+        self.inner
+            .lock()
+            .ok()?
+            .executions
+            .get(&id)
+            .map(|execution| Arc::clone(&execution.cancellation))
+    }
+
+    pub fn snapshot(&self, id: TaskExecutionId) -> Option<TaskExecutionSnapshot> {
+        let registry = self.inner.lock().ok()?;
+        let execution = registry.executions.get(&id)?;
+        Some(TaskExecutionSnapshot {
+            id,
+            mode: execution.lifecycle.mode(),
+            terminal: execution.lifecycle.terminal(),
+            result: execution.result.clone(),
+        })
+    }
+
+    pub fn result(&self, id: TaskExecutionId) -> Option<ToolOutput> {
+        self.snapshot(id)?.result
+    }
+
+    pub fn finish(
+        &self,
+        id: TaskExecutionId,
+        terminal: TaskTerminalState,
+        result: ToolOutput,
+    ) -> bool {
+        let Ok(mut registry) = self.inner.lock() else {
+            return false;
+        };
+        let Some(execution) = registry.executions.get_mut(&id) else {
+            return false;
+        };
+        if !execution.lifecycle.finish(terminal) {
+            return false;
+        }
+
+        execution.result = Some(result);
+        true
+    }
+
+    pub fn control(
+        &self,
+        source: TaskMessageSource,
+        id: TaskExecutionId,
+        action: TaskControlAction,
+    ) -> Result<(), TaskRegistryError> {
+        if let TaskMessageSource::Execution(source_id) = source
+            && source_id != id
+        {
+            return Err(TaskRegistryError::ForbiddenRoute);
+        }
+
+        let mut registry = self
+            .inner
+            .lock()
+            .map_err(|_| TaskRegistryError::UnknownExecution)?;
+        let execution = registry
+            .executions
+            .get_mut(&id)
+            .ok_or(TaskRegistryError::UnknownExecution)?;
+        if execution.lifecycle.terminal().is_some() {
+            return Err(TaskRegistryError::TerminalExecution);
+        }
+
+        match action {
+            TaskControlAction::Background => execution
+                .lifecycle
+                .transition_to_background()
+                .then_some(())
+                .ok_or(TaskRegistryError::InvalidControl),
+            TaskControlAction::Cancel => {
+                execution.cancellation.store(true, Ordering::Release);
+                Ok(())
+            }
+            TaskControlAction::Status => Ok(()),
+        }
+    }
+
+    pub fn transition_to_background(&self, id: TaskExecutionId) -> bool {
+        self.control(TaskMessageSource::Main, id, TaskControlAction::Background)
+            .is_ok()
+    }
+
+    pub fn cancel(&self, id: TaskExecutionId) -> bool {
+        self.control(TaskMessageSource::Main, id, TaskControlAction::Cancel)
+            .is_ok()
+    }
+
+    pub fn is_cancelled(&self, id: TaskExecutionId) -> bool {
+        self.cancellation_handle(id)
+            .is_some_and(|cancellation| cancellation.load(Ordering::Acquire))
+    }
+
+    pub fn send_message(
+        &self,
+        source: TaskMessageSource,
+        target: TaskMessageTarget,
+        content: String,
+    ) -> Result<(), TaskRegistryError> {
+        if content.is_empty() || content.len() > MAX_TASK_MESSAGE_BYTES {
+            return Err(TaskRegistryError::MessageLimit);
+        }
+        match (source, target) {
+            (
+                TaskMessageSource::Main | TaskMessageSource::User,
+                TaskMessageTarget::Execution(_),
+            )
+            | (TaskMessageSource::Execution(_), TaskMessageTarget::Main) => {}
+            _ => return Err(TaskRegistryError::ForbiddenRoute),
+        }
+
+        let mut registry = self
+            .inner
+            .lock()
+            .map_err(|_| TaskRegistryError::UnknownExecution)?;
+        if let TaskMessageSource::Execution(source_id) = source {
+            let source = registry
+                .executions
+                .get(&source_id)
+                .ok_or(TaskRegistryError::UnknownExecution)?;
+            if source.lifecycle.terminal().is_some() {
+                return Err(TaskRegistryError::TerminalExecution);
+            }
+        }
+        let mailbox = match target {
+            TaskMessageTarget::Main => &mut registry.main_mailbox,
+            TaskMessageTarget::Execution(id) => {
+                let execution = registry
+                    .executions
+                    .get_mut(&id)
+                    .ok_or(TaskRegistryError::UnknownExecution)?;
+                if execution.lifecycle.terminal().is_some() {
+                    return Err(TaskRegistryError::TerminalExecution);
+                }
+                &mut execution.mailbox
+            }
+        };
+        if mailbox.messages.len() >= MAX_TASK_MESSAGES_PER_TARGET
+            || mailbox.bytes + content.len() > MAX_TASK_MAILBOX_BYTES
+        {
+            return Err(TaskRegistryError::MessageLimit);
+        }
+
+        mailbox.bytes += content.len();
+        mailbox.messages.push_back(TaskMessage { source, content });
+        Ok(())
+    }
+
+    pub fn drain_messages(&self, target: TaskMessageTarget) -> Vec<TaskMessage> {
+        let Ok(mut registry) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mailbox = match target {
+            TaskMessageTarget::Main => &mut registry.main_mailbox,
+            TaskMessageTarget::Execution(id) => {
+                let Some(execution) = registry.executions.get_mut(&id) else {
+                    return Vec::new();
+                };
+                &mut execution.mailbox
+            }
+        };
+        mailbox.bytes = 0;
+        mailbox.messages.drain(..).collect()
+    }
+
+    pub fn wait_for_idle(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let idle = self.inner.lock().is_ok_and(|registry| {
+                registry
+                    .executions
+                    .values()
+                    .all(|execution| execution.lifecycle.terminal().is_some())
+            });
+            if idle {
+                self.join_finished_workers();
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(TASK_RESULT_POLL_INTERVAL);
+        }
+    }
+
+    pub fn cancel_all(&self) {
+        if let Ok(registry) = self.inner.lock() {
+            for execution in registry.executions.values() {
+                if execution.lifecycle.terminal().is_none() {
+                    execution.cancellation.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    fn set_worker(&self, id: TaskExecutionId, worker: thread::JoinHandle<()>) {
+        if let Ok(mut registry) = self.inner.lock()
+            && let Some(execution) = registry.executions.get_mut(&id)
+        {
+            execution.worker = Some(worker);
+        }
+    }
+
+    fn join_finished_workers(&self) {
+        let workers = self
+            .inner
+            .lock()
+            .map(|mut registry| {
+                registry
+                    .executions
+                    .values_mut()
+                    .filter(|execution| execution.lifecycle.terminal().is_some())
+                    .filter_map(|execution| execution.worker.take())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +620,13 @@ impl TaskExecutionLifecycle {
             .expect("task lifecycle lock poisoned")
             .events
             .clone()
+    }
+
+    pub fn terminal(&self) -> Option<TaskTerminalState> {
+        self.inner
+            .lock()
+            .expect("task lifecycle lock poisoned")
+            .terminal
     }
 
     pub fn transition_to_background(&self) -> bool {
@@ -314,29 +834,42 @@ pub enum TaskModelResolutionError {
 
 #[derive(Clone)]
 pub struct TaskRunContext {
-    pub cancellation: Arc<std::sync::atomic::AtomicBool>,
-    pub deadline: Instant,
+    pub cancellation: Arc<AtomicBool>,
     execution: Option<TaskExecutionLifecycle>,
+    registry: TaskExecutionRegistry,
     before_publication: BeforePublicationHook,
 }
 
 impl TaskRunContext {
-    fn inherit(parent: &ToolExecutionContext) -> Self {
+    fn new(
+        cancellation: Arc<AtomicBool>,
+        execution: TaskExecutionLifecycle,
+        registry: TaskExecutionRegistry,
+    ) -> Self {
         Self {
-            cancellation: parent.cancellation_handle(),
-            deadline: parent.deadline().min(Instant::now() + TASK_TIMEOUT),
-            execution: None,
+            cancellation,
+            execution: Some(execution),
+            registry,
             before_publication: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn with_execution(mut self, execution: TaskExecutionLifecycle) -> Self {
-        self.execution = Some(execution);
-        self
-    }
-
     pub fn execution(&self) -> Option<&TaskExecutionLifecycle> {
         self.execution.as_ref()
+    }
+
+    pub fn execution_registry(&self) -> &TaskExecutionRegistry {
+        &self.registry
+    }
+
+    pub fn drain_messages(&self) -> Vec<TaskMessage> {
+        self.execution
+            .as_ref()
+            .map(|execution| {
+                self.registry
+                    .drain_messages(TaskMessageTarget::Execution(execution.id()))
+            })
+            .unwrap_or_default()
     }
 
     pub fn set_before_publication_hook(&self, hook: impl FnOnce() + Send + 'static) {
@@ -361,16 +894,17 @@ impl TaskRunContext {
         if self.cancellation.load(Ordering::Acquire) {
             return Some(task_terminal(HeadlessTaskTerminal::Cancelled));
         }
-        if Instant::now() >= self.deadline {
-            return Some(task_terminal(HeadlessTaskTerminal::TimedOut));
-        }
         None
     }
 }
 
-pub trait TaskRunner: Send + 'static {
+pub trait TaskRunner: Send + Sync + 'static {
+    fn execution_registry(&self) -> Option<TaskExecutionRegistry> {
+        None
+    }
+
     fn run(
-        &mut self,
+        &self,
         request: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError>;
@@ -384,9 +918,8 @@ pub struct TaskTool<R> {
     available_models: Vec<String>,
     model_validator: Arc<dyn AgentModelValidator + Send + Sync>,
     model_resolution_diagnostics: Option<ModelResolutionDiagnostics>,
-    runner: Arc<Mutex<R>>,
-    active: Arc<AtomicUsize>,
-    execution_ids: Arc<AtomicU64>,
+    runner: Arc<R>,
+    registry: TaskExecutionRegistry,
 }
 
 impl<R> Clone for TaskTool<R> {
@@ -400,13 +933,12 @@ impl<R> Clone for TaskTool<R> {
             model_validator: Arc::clone(&self.model_validator),
             model_resolution_diagnostics: self.model_resolution_diagnostics.clone(),
             runner: Arc::clone(&self.runner),
-            active: Arc::clone(&self.active),
-            execution_ids: Arc::clone(&self.execution_ids),
+            registry: self.registry.clone(),
         }
     }
 }
 
-impl<R> TaskTool<R> {
+impl<R: TaskRunner> TaskTool<R> {
     pub fn from_catalogs_with_model_validator(
         agents: AgentCatalog,
         skills: SkillCatalog,
@@ -441,6 +973,7 @@ impl<R> TaskTool<R> {
         available_models.sort();
         available_models.dedup();
         available_models.truncate(MAX_TASK_MODEL_SCHEMA_ENTRIES);
+        let registry = runner.execution_registry().unwrap_or_default();
         Self {
             agents,
             skills,
@@ -449,10 +982,18 @@ impl<R> TaskTool<R> {
             available_models,
             model_validator: Arc::new(model_validator),
             model_resolution_diagnostics: None,
-            runner: Arc::new(Mutex::new(runner)),
-            active: Arc::new(AtomicUsize::new(0)),
-            execution_ids: Arc::new(AtomicU64::new(0)),
+            runner: Arc::new(runner),
+            registry,
         }
+    }
+
+    pub fn with_execution_registry(mut self, registry: TaskExecutionRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    pub fn execution_registry(&self) -> &TaskExecutionRegistry {
+        &self.registry
     }
 
     pub fn with_model_resolution_diagnostics(
@@ -651,35 +1192,33 @@ impl<R: TaskRunner> TaskTool<R> {
             Ok(invocation) => invocation,
             Err(_) => return Ok(task_terminal(HeadlessTaskTerminal::InputLimit)),
         };
-        let context = TaskRunContext::inherit(parent);
-        if let Some(output) = context.terminal_output() {
-            return Ok(output);
+        if parent.is_cancelled() {
+            return Ok(task_terminal(HeadlessTaskTerminal::Cancelled));
         }
         let request = match self.resolve(invocation) {
             Ok(request) => request,
             Err(output) => return Ok(output),
         };
-        let Some(permit) = TaskPermit::acquire(&self.active) else {
+        let Some(execution_id) = self.registry.admit(mode) else {
             return Ok(task_terminal(HeadlessTaskTerminal::ConcurrencyLimit));
         };
-        if let Some(output) = context.terminal_output() {
-            return Ok(output);
-        }
-
-        let execution_id = TaskExecutionId(self.execution_ids.fetch_add(1, Ordering::AcqRel) + 1);
-        let lifecycle = TaskExecutionLifecycle::new(execution_id, mode);
-        let context = context.with_execution(lifecycle);
-        let publication = Arc::new(AtomicU8::new(OPEN));
+        let lifecycle = self
+            .registry
+            .lifecycle(execution_id)
+            .expect("admitted task lifecycle");
+        let cancellation = self
+            .registry
+            .cancellation_handle(execution_id)
+            .expect("admitted task cancellation");
+        let context = TaskRunContext::new(cancellation, lifecycle, self.registry.clone());
         let (sender, receiver) = mpsc::channel();
         let runner = Arc::clone(&self.runner);
+        let registry = self.registry.clone();
         let worker_context = context.clone();
-        let worker_publication = Arc::clone(&publication);
-        thread::spawn(move || {
-            let _permit = permit;
-            let output = {
+        let worker = thread::spawn(move || {
+            let mut output = {
                 let _panic_hook = TaskPanicHookGuard::new();
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    let mut runner = runner.lock().map_err(|_| TaskRunnerError::ChildFailure)?;
                     if let Some(output) = worker_context.terminal_output() {
                         return Ok(output);
                     }
@@ -691,37 +1230,38 @@ impl<R: TaskRunner> TaskTool<R> {
             };
 
             worker_context.run_before_publication_hook();
-
-            if worker_publication
-                .compare_exchange(OPEN, PUBLISHED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                if let Some(lifecycle) = worker_context.execution() {
-                    lifecycle.finish(task_terminal_state(&output));
-                }
-                let _ = sender.send(output);
+            if let Some(cancelled) = worker_context.terminal_output() {
+                output = cancelled;
             }
+            registry.finish(execution_id, task_terminal_state(&output), output.clone());
+            let _ = sender.send(output);
         });
+        self.registry.set_worker(execution_id, worker);
+
+        if mode == TaskLaunchMode::Background {
+            return Ok(background_output(execution_id));
+        }
 
         loop {
-            if let Some(output) = context.terminal_output() {
-                let output = finish_task_call(&publication, &receiver, output, context.execution());
-                return Ok(output);
+            if parent.is_cancelled() {
+                self.registry.cancel(execution_id);
+                return Ok(task_terminal(HeadlessTaskTerminal::Cancelled));
+            }
+            if self
+                .registry
+                .lifecycle(execution_id)
+                .is_some_and(|lifecycle| lifecycle.mode() == TaskLaunchMode::Background)
+            {
+                return Ok(background_output(execution_id));
             }
 
             match receiver.recv_timeout(TASK_RESULT_POLL_INTERVAL) {
-                Ok(output) if publication.load(Ordering::Acquire) == PUBLISHED => {
-                    return Ok(output);
-                }
-                Ok(_) => return Ok(task_terminal(HeadlessTaskTerminal::ChildFailure)),
+                Ok(output) => return Ok(output),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let output = finish_task_call(
-                        &publication,
-                        &receiver,
-                        task_terminal(HeadlessTaskTerminal::ChildFailure),
-                        context.execution(),
-                    );
+                    let output = task_terminal(HeadlessTaskTerminal::ChildFailure);
+                    self.registry
+                        .finish(execution_id, TaskTerminalState::Failed, output.clone());
                     return Ok(output);
                 }
             }
@@ -750,6 +1290,10 @@ fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolO
     ToolOutput::success(result.output)
 }
 
+fn background_output(id: TaskExecutionId) -> ToolOutput {
+    ToolOutput::success(format!("Subagent #{} running in background", id.value()))
+}
+
 fn task_error_output(error: TaskRunnerError) -> ToolOutput {
     match error {
         TaskRunnerError::Cancelled => task_terminal(HeadlessTaskTerminal::Cancelled),
@@ -776,27 +1320,6 @@ impl Drop for TaskPanicHookGuard {
     }
 }
 
-fn finish_task_call(
-    publication: &AtomicU8,
-    receiver: &mpsc::Receiver<ToolOutput>,
-    terminal: ToolOutput,
-    lifecycle: Option<&TaskExecutionLifecycle>,
-) -> ToolOutput {
-    match publication.compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {
-            if let Some(lifecycle) = lifecycle {
-                lifecycle.finish(task_terminal_state(&terminal));
-            }
-            terminal
-        }
-        Err(CANCELLED) => terminal,
-        Err(PUBLISHED) => receiver
-            .recv()
-            .unwrap_or_else(|_| task_terminal(HeadlessTaskTerminal::ChildFailure)),
-        Err(_) => task_terminal(HeadlessTaskTerminal::ChildFailure),
-    }
-}
-
 fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
     ToolOutput::task_terminal(terminal)
 }
@@ -814,67 +1337,4 @@ fn is_safe_model_identifier(model: &str) -> bool {
         && model.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
-}
-
-struct TaskPermit {
-    active: Arc<AtomicUsize>,
-}
-
-impl TaskPermit {
-    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
-        let mut current = active.load(Ordering::Acquire);
-        loop {
-            if current >= MAX_TASK_CONCURRENCY {
-                return None;
-            }
-            match active.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(Self {
-                        active: Arc::clone(active),
-                    });
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
-impl Drop for TaskPermit {
-    fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disconnected_worker_without_publication_cancels_and_cannot_publish_late_value() {
-        let publication = AtomicU8::new(OPEN);
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || drop(sender)).join().unwrap();
-
-        assert_eq!(
-            receiver.recv_timeout(TASK_RESULT_POLL_INTERVAL),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        );
-
-        assert_eq!(
-            finish_task_call(
-                &publication,
-                &receiver,
-                task_terminal(HeadlessTaskTerminal::ChildFailure),
-                None,
-            ),
-            task_terminal(HeadlessTaskTerminal::ChildFailure)
-        );
-        assert_eq!(publication.load(Ordering::Acquire), CANCELLED);
-        assert_eq!(receiver.try_recv(), Err(mpsc::TryRecvError::Disconnected));
-    }
 }

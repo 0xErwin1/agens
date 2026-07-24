@@ -1943,16 +1943,12 @@ fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    assert!(text.contains("reviewer"), "{text:?}");
-    assert!(
-        !text.contains("agents"),
-        "catalog count laundry removed: {text:?}"
-    );
-    assert!(
-        text.contains("fg 1") && text.contains("bg 1") && text.contains("done 1"),
-        "{text:?}"
-    );
-    assert!(text.contains("failed 1"), "{text:?}");
+    assert!(text.contains("Main"), "{text:?}");
+    assert!(text.contains("Reviewer #1"), "{text:?}");
+    assert!(text.contains("Writer #2"), "{text:?}");
+    assert!(text.contains("Triage #4"), "{text:?}");
+    assert!(!text.contains("Tester #3"), "{text:?}");
+    assert!(!text.contains("fg 1"), "old aggregate leaked: {text:?}");
 }
 
 #[test]
@@ -1988,10 +1984,10 @@ fn p1a1_renderer_collapses_live_tool_uses_and_expands_ordered_details() {
     renderer.render(tui.view()).unwrap();
     let main = rendered_text(&renderer);
     assert!(
-        main.contains("Subagent 9 · reviewer")
-            && main.contains("foreground running")
-            && main.contains("review the rendering")
-            && main.contains("2 tool uses"),
+        main.contains("● Reviewer · review the rendering")
+            && main.contains("Running · foreground")
+            && main.contains("Read files")
+            && main.contains("Search code"),
         "{main:?}"
     );
     assert!(!main.contains("native::read"), "{main:?}");
@@ -2031,16 +2027,282 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
     renderer.render(tui.view()).unwrap();
     let main = rendered_text(&renderer);
     assert!(
-        main.contains("Subagent 10 · reviewer · success"),
+        main.contains("● Reviewer · review terminal output") && main.contains("Success · recent"),
         "{main:?}"
     );
-    assert!(main.contains("2 tool uses"), "{main:?}");
     for child_row in ["terminal result", "read", "native::grep", "first result"] {
         assert!(
             !main.contains(child_row),
             "duplicated {child_row:?}: {main:?}"
         );
     }
+}
+
+#[test]
+fn subagent_cards_are_compact_statusful_and_never_render_raw_task_payloads() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.tick(Duration::from_secs(5));
+    tui.begin_submission("delegate");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "parent-task".into(),
+        name: "task".into(),
+        input: "raw-parent-task-input-secret".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "parent-task".into(),
+        content: "raw-parent-task-output-secret".into(),
+        is_error: false,
+    }));
+    for (id, name, input, output) in [
+        (
+            "task-control",
+            "task_control",
+            "raw-task-control-input-secret",
+            "raw-task-control-output-secret",
+        ),
+        (
+            "task-message",
+            "native::task_message",
+            "raw-task-message-input-secret",
+            "raw-task-message-output-secret",
+        ),
+    ] {
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: id.into(),
+            name: name.into(),
+            input: input.into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: id.into(),
+            content: output.into(),
+            is_error: false,
+        }));
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::ForegroundStarted { id: 9 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(
+            9,
+            "explore",
+            "inspect the navigation",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let initializing = rendered_text(&renderer);
+    assert!(
+        initializing.contains("● Explore · inspect the navigation"),
+        "{initializing:?}"
+    );
+    assert!(initializing.contains("Initializing"), "{initializing:?}");
+    assert!(!initializing.contains("raw-parent-task-input-secret"));
+    assert!(!initializing.contains("raw-parent-task-output-secret"));
+    assert!(!initializing.contains("raw-task-control-input-secret"));
+    assert!(!initializing.contains("raw-task-control-output-secret"));
+    assert!(!initializing.contains("raw-task-message-input-secret"));
+    assert!(!initializing.contains("raw-task-message-output-secret"));
+
+    tui.tick(Duration::from_secs(8));
+    for (call_id, name, input) in [
+        ("read", "native::read", "api_key=not-rendered"),
+        ("grep", "native::grep", "token=not-rendered"),
+        ("list", "native::list", "password=not-rendered"),
+        ("unknown", "plugin::opaque", "secret=not-rendered"),
+    ] {
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::tool_call(9, call_id, name, input),
+        );
+    }
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::tool_result(9, "read", "child-output-secret", false),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let running = rendered_text(&renderer);
+    assert!(running.contains("Running"), "{running:?}");
+    assert!(running.contains("3s"), "{running:?}");
+    assert!(running.contains("Read files"), "{running:?}");
+    assert!(running.contains("Search code"), "{running:?}");
+    assert!(running.contains("List files"), "{running:?}");
+    assert!(running.contains("+1 more activity"), "{running:?}");
+    let title_row = rendered_row(&renderer, "● Explore · inspect");
+    let affordance_row = rendered_row(&renderer, "Ctrl+B background");
+    assert!(affordance_row.saturating_sub(title_row) < 7, "{running:?}");
+    for secret in [
+        "api_key=not-rendered",
+        "token=not-rendered",
+        "password=not-rendered",
+        "secret=not-rendered",
+        "child-output-secret",
+        "plugin::opaque",
+    ] {
+        assert!(!running.contains(secret), "leaked {secret:?}: {running:?}");
+    }
+}
+
+#[test]
+fn resumed_task_tool_rows_remain_stored_but_are_not_rendered_in_main() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.replace_history(&[
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("delegate restored".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::ToolCall {
+                id: "restored-task".into(),
+                name: "native::task".into(),
+                input: "restored-raw-input-sentinel".into(),
+            }],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "restored-task".into(),
+                content: "restored-raw-result-sentinel".into(),
+                is_error: false,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("restored parent summary".into())],
+        },
+    ])
+    .unwrap();
+
+    let stored = &tui.view().completed_conversations[0].tool_batches[0].calls[0];
+    assert_eq!(stored.input, "restored-raw-input-sentinel");
+    assert_eq!(
+        stored.result.as_ref().unwrap().output,
+        "restored-raw-result-sentinel"
+    );
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+    assert!(rendered.contains("restored parent summary"), "{rendered:?}");
+    assert!(!rendered.contains("restored-raw-input-sentinel"));
+    assert!(!rendered.contains("restored-raw-result-sentinel"));
+    assert!(!rendered.contains("native::task"));
+}
+
+#[test]
+fn subagent_terminal_status_and_elapsed_are_frozen_and_low_dimensions_are_safe() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.tick(Duration::from_secs(5));
+    for (id, agent) in [(9, "explore"), (10, "reviewer")] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(
+                id,
+                agent,
+                "bounded summary",
+                TuiExecutionState::ForegroundRunning,
+            ),
+        );
+    }
+    tui.tick(Duration::from_secs(10));
+    for (id, agent, event, status) in [
+        (
+            9,
+            "explore",
+            TuiExecutionEvent::Completed { id: 9 },
+            TuiSubagentStatus::Success,
+        ),
+        (
+            10,
+            "reviewer",
+            TuiExecutionEvent::Failed { id: 10 },
+            TuiSubagentStatus::Failure,
+        ),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event,
+        });
+        apply_subagent(&mut tui, TuiSubagentEvent::terminal(id, status, "done"));
+    }
+    tui.tick(Duration::from_secs(20));
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::text(9, "post-terminal-sentinel"),
+    );
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+    assert!(rendered.contains("Success · recent · 5s"), "{rendered:?}");
+    assert!(rendered.contains("Failure · recent · 5s"), "{rendered:?}");
+    assert!(!rendered.contains("post-terminal-sentinel"));
+
+    for height in 1..=8 {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(20, height)).unwrap());
+        renderer.render(tui.view()).unwrap();
+        assert_eq!(
+            rendered_text(&renderer).chars().count(),
+            20 * usize::from(height)
+        );
+    }
+}
+
+#[test]
+fn execution_strip_shows_main_and_at_most_three_prioritized_children() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    for (id, agent, event) in [
+        (1, "old", TuiExecutionEvent::ForegroundStarted { id: 1 }),
+        (2, "recent", TuiExecutionEvent::ForegroundStarted { id: 2 }),
+        (
+            3,
+            "background",
+            TuiExecutionEvent::BackgroundStarted { id: 3 },
+        ),
+        (4, "active", TuiExecutionEvent::ForegroundStarted { id: 4 }),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event,
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(
+                id,
+                agent,
+                "task",
+                match event {
+                    TuiExecutionEvent::BackgroundStarted { .. } => {
+                        TuiExecutionState::BackgroundRunning
+                    }
+                    _ => TuiExecutionState::ForegroundRunning,
+                },
+            ),
+        );
+        tui.tick(Duration::from_secs(id));
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "old".into(),
+        event: TuiExecutionEvent::Completed { id: 1 },
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+    assert!(rendered.contains("Main"), "{rendered:?}");
+    assert!(rendered.contains("Active #4"), "{rendered:?}");
+    assert!(rendered.contains("Background #3"), "{rendered:?}");
+    assert!(rendered.contains("Recent #2"), "{rendered:?}");
+    assert!(!rendered.contains("Old #1"), "{rendered:?}");
 }
 
 #[test]
@@ -2057,8 +2319,9 @@ fn p1c2_renderer_shows_restored_tool_count_without_fabricating_tool_details() {
 
     renderer.render(tui.view()).unwrap();
     let main = rendered_text(&renderer);
-    assert!(main.contains("Subagent 42 · reviewer · success · review the durable result"));
-    assert!(main.contains("3 tool uses"));
+    assert!(main.contains("● Reviewer · review the durable result"));
+    assert!(main.contains("Success · recent"));
+    assert!(main.contains("+3 more activities"));
     assert!(!main.contains("Final result: approved"));
 }
 
@@ -2212,7 +2475,10 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
         !main.contains("Main · primary conversation"),
         "main provenance should be quiet: {main:?}"
     );
-    assert!(main.contains("Subagent 7 · reviewer"), "{main:?}");
+    assert!(
+        main.contains("● Reviewer · review the active transcript"),
+        "{main:?}"
+    );
     for child_row in [
         "child-reasoning-sentinel",
         "child-text-sentinel",
@@ -2239,7 +2505,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
         "{child:?}"
     );
     assert!(
-        child.contains("Subagent transcript · read-only"),
+        child.contains("Subagent transcript · i to message · x to cancel"),
         "{child:?}"
     );
     assert!(!child.contains("Compose"), "{child:?}");

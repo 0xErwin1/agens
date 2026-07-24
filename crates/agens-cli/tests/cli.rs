@@ -1471,7 +1471,7 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
                 "gpt-4o".into(),
                 "read".into(),
                 "!parent request".into(),
-                "!task".into(),
+                "!\"name\":\"task\"".into(),
                 "!write".into(),
                 "!bash".into(),
                 "!webfetch".into(),
@@ -1976,50 +1976,6 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
             "SENTINEL_PROVIDER_ERROR",
             "SENTINEL_HEADER",
         ],
-    );
-}
-
-#[test]
-fn production_task_deadline_is_exact_and_aborts_the_parent_turn() {
-    let temporary = TemporaryDirectory::new("production-task-deadline");
-    let project_root = temporary.path().join("project");
-    let config_home = temporary.path().join("config");
-    let data_directory = temporary.path().join("data");
-    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
-    std::fs::create_dir_all(config_home.join("agents")).expect("agents directory should exist");
-    std::fs::write(
-        config_home.join("agents/reviewer.md"),
-        "---\nname: reviewer\ndescription: Review implementation\nmode: subagent\nmodel: gpt-4o\npermissions: []\n---\nYou are the isolated reviewer.\n",
-    )
-    .expect("subagent definition should be written");
-    let server = TaskStalledOpenAiMockServer::start(Duration::from_secs(40));
-    std::fs::write(
-        config_home.join("config.toml"),
-        format!(
-            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(reviewer)\"]\n",
-            server.base_url(),
-            data_directory.display(),
-        ),
-    )
-    .expect("configuration should be written");
-
-    let output = isolated_agens_command(&temporary)
-        .current_dir(&project_root)
-        .args(["chat", "parent task deadline"])
-        .env("AGENS_CONFIG_HOME", &config_home)
-        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
-        .output()
-        .expect("production binary should run");
-    server.join();
-
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_diagnostic_error(&output.stderr, "error: task: timed out\n");
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
-    assert_output_and_store_exclude_sentinels(
-        &output,
-        &data_directory.join("rust-sessions.db"),
-        &["SENTINEL_OPENAI_API_KEY"],
     );
 }
 
@@ -4562,7 +4518,7 @@ impl TaskStalledOpenAiMockServer {
                 .expect("test should receive the child request observation");
             for forbidden in [
                 "parent task cancellation",
-                "task",
+                "\"name\":\"task\"",
                 "write",
                 "bash",
                 "webfetch",

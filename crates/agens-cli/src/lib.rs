@@ -20,8 +20,9 @@ use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     Message, MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
-    PermissionRule, PermissionSession, RecoveryOutcome, Role, SessionMessage, SessionMetadata,
-    TurnEvent, TurnProgressSink, TurnState, run_headless_turn_with_max_iterations_and_progress,
+    PermissionRule, PermissionSession, RecoveryOutcome, RetryBoundary, Role, SessionAttemptStatus,
+    SessionMessage, SessionMetadata, TurnEvent, TurnProgressSink, TurnProvider, TurnState,
+    run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
@@ -42,9 +43,11 @@ use agens_tools::{
     McpStatusHandle, McpStatusSnapshot, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog, NativeTools,
     PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog, SkillResourceTool,
-    TaskExecutionEvent, TaskExecutionLifecycle, TaskLaunchMode, TaskModelResolutionError,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskTool, TaskTurnRequest, TaskTurnResult,
-    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    TaskControlTool, TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry,
+    TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
+    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskTool,
+    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
+    ToolExecutionContext, ToolOutput,
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
@@ -52,7 +55,7 @@ use agens_tui::{
     TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiPresentation,
     TuiProviderOutcome, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent,
     TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
-    run_with_default_progress_submit_with_permissions,
+    run_with_default_progress_submit_with_permissions_and_task_controls,
 };
 
 mod chatgpt_auth;
@@ -84,6 +87,7 @@ const RESERVED_TUI_COMMANDS: &[&str] = &[
     "select",
     "sessions",
     "subagent",
+    "subagents",
 ];
 
 const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
@@ -1604,9 +1608,38 @@ struct TuiSessionContext {
     provider: Option<TuiProvider>,
     chatgpt_unavailable: bool,
     resume_error: Option<String>,
+    resume_notice: Option<String>,
+    resume_draft: Option<ResumeDraft>,
     selected_subagent: Option<String>,
     dangerous_mode: bool,
     running: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ResumeDraft(String);
+
+impl ResumeDraft {
+    fn new(prompt: String) -> Self {
+        Self(prompt)
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ResumeDraft {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ResumeDraft {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ResumeDraft([REDACTED])")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1825,6 +1858,21 @@ fn session_attempt_status_label(status: agens_core::SessionAttemptStatus) -> &'s
     }
 }
 
+fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'static str> {
+    match status {
+        SessionAttemptStatus::Cancelled => {
+            Some("Previous attempt was cancelled. Prompt restored; press Enter to retry.")
+        }
+        SessionAttemptStatus::Interrupted => {
+            Some("Previous attempt was interrupted. Prompt restored; press Enter to retry.")
+        }
+        SessionAttemptStatus::Failed | SessionAttemptStatus::ProviderError => {
+            Some("Previous attempt failed. Prompt restored; press Enter to retry.")
+        }
+        SessionAttemptStatus::Running | SessionAttemptStatus::Completed => None,
+    }
+}
+
 fn recovery_confirmation_dialog(
     metadata: &SessionMetadata,
     attempt: &agens_core::SessionAttemptSummary,
@@ -1907,6 +1955,8 @@ impl TuiSessionContext {
             provider: None,
             chatgpt_unavailable: false,
             resume_error: None,
+            resume_notice: None,
+            resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
             running: false,
@@ -1930,6 +1980,8 @@ impl TuiSessionContext {
             provider: None,
             chatgpt_unavailable: false,
             resume_error: None,
+            resume_notice: None,
+            resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
             running: false,
@@ -1937,6 +1989,9 @@ impl TuiSessionContext {
     }
 
     fn note(&self) -> String {
+        if let Some(notice) = &self.resume_notice {
+            return notice.clone();
+        }
         if let Some(error) = &self.resume_error {
             return error.clone();
         }
@@ -2790,6 +2845,7 @@ impl TuiRuntimeRouter {
                 presentation: self.presentation()?,
             },
             "/subagent" => self.open_dialog("subagent")?,
+            "/subagents" => TuiSubmissionOutcome::TranscriptDialog,
             "/model" => self.open_dialog("model")?,
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
                 message: select_tui_model(&bootstrap, command, &self.session)?,
@@ -3240,7 +3296,7 @@ fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
 }
 
 fn explicit_task_delegation_prompt(base: &str) -> String {
-    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline.";
+    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion.";
 
     if base.contains(INSTRUCTION) {
         base.to_owned()
@@ -3292,6 +3348,12 @@ fn resolved_tui_palette(
             )
             .with_dialog("subagent"),
         );
+        entries.push(PaletteEntry::new(
+            "subagents",
+            "Inspect current-session subagent transcripts",
+            "",
+            PaletteEntryKind::BuiltIn,
+        ));
     }
     let mut custom_commands = commands
         .iter()
@@ -3542,10 +3604,16 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             &TuiCredentialResolver::production(),
         )?;
         let presentation = tui_session_presentation(bootstrap, &resumed);
+        let message = resumed.note();
+        let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
+        let resume_error = resumed.resume_error.clone();
+        resumed.resume_notice = None;
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
-            message: resumed.note(),
+            message,
             presentation,
             history: std::mem::take(&mut resumed.restored_history),
+            draft,
+            resume_error,
         });
         for event in resumed_subagent_cards(&resumed.messages) {
             tui.apply_runtime_event(event);
@@ -3573,8 +3641,11 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
     let route_router = router.clone();
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
     let transition_controls = task_controls.clone();
+    let cancel_controls = task_controls.clone();
+    let message_controls = task_controls.clone();
+    let submit_task_controls = task_controls.clone();
     let prompt_bridge = permission_bridge.clone();
-    run_with_default_progress_submit_with_permissions(
+    let tui_result = run_with_default_progress_submit_with_permissions_and_task_controls(
         &mut tui,
         move |request, progress, cancellation| {
             route_router.route_request_with_cancellation(request, progress, cancellation)
@@ -3618,8 +3689,9 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
             let task_diagnostic_reference = next_diagnostic_reference();
-            let lifecycle_bridge = TuiTaskLifecycleBridge::new(task_events, task_controls.clone())
-                .with_session_writer(runtime_bootstrap.clone(), Arc::clone(&router.session));
+            let lifecycle_bridge =
+                TuiTaskLifecycleBridge::new(task_events, submit_task_controls.clone())
+                    .with_session_writer(runtime_bootstrap.clone(), Arc::clone(&router.session));
             let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
                 &router.skills,
@@ -3695,9 +3767,28 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             tui_provider_outcome(result)
         },
         move |id| transition_controls.transition_to_background(id),
+        move |id| {
+            cancel_controls
+                .0
+                .cancel(agens_tools::TaskExecutionId::from_value(id))
+        },
+        move |id, message| {
+            message_controls
+                .0
+                .send_message(
+                    TaskMessageSource::User,
+                    TaskMessageTarget::Execution(agens_tools::TaskExecutionId::from_value(id)),
+                    message,
+                )
+                .is_ok()
+        },
         Some((permission_bridge, permission_requests)),
-    )
-    .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
+    );
+    task_controls.0.cancel_all();
+    let _ = task_controls
+        .0
+        .wait_for_idle(std::time::Duration::from_secs(2));
+    tui_result.map_err(|_| CliError::new(ExitStatus::Failure, "ui", "terminal UI failed"))?;
 
     Ok(String::new())
 }
@@ -3729,6 +3820,7 @@ fn run_tui_prompt(
                 | TuiSubmissionOutcome::LocalActionableError { .. }
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)
+                | TuiSubmissionOutcome::TranscriptDialog
                 | TuiSubmissionOutcome::SelectionCancelled
                 | TuiSubmissionOutcome::RouteCancelled
                 | TuiSubmissionOutcome::SelectionError { .. } => {
@@ -4466,6 +4558,19 @@ thread_local! {
     static PRODUCTION_PROVIDER_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+struct LoadedTuiSessionResume {
+    session: StoredSession,
+    retry_boundary: Option<RetryBoundary>,
+}
+
+impl std::ops::Deref for LoadedTuiSessionResume {
+    type Target = StoredSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
 #[cfg(test)]
 fn reset_tui_resume_test_counters() {
     TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(0));
@@ -4497,23 +4602,51 @@ fn resume_tui_session(
 fn load_tui_session_for_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
-) -> Result<StoredSession, CliError> {
+) -> Result<LoadedTuiSessionResume, CliError> {
     #[cfg(test)]
     TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
 
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    store
+    let session = store
         .load_session_for_resume(identifier)
-        .map_err(|_| CliError::storage("saved session is unavailable"))
+        .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    let retry_boundary = session
+        .latest_attempt
+        .as_ref()
+        .filter(|attempt| resume_retry_notice(attempt.status()).is_some())
+        .map(|attempt| {
+            store
+                .load_retry_boundary(attempt.key())
+                .map_err(|_| CliError::storage("saved session is unavailable"))
+        })
+        .transpose()?
+        .flatten();
+    if session.metadata.completed_turn_count == 0
+        && session
+            .latest_attempt
+            .as_ref()
+            .is_none_or(|attempt| attempt.status() != SessionAttemptStatus::Running)
+        && retry_boundary.is_none()
+    {
+        return Err(CliError::storage("saved session is unavailable"));
+    }
+    Ok(LoadedTuiSessionResume {
+        session,
+        retry_boundary,
+    })
 }
 
 fn prepare_loaded_tui_session_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
-    session: StoredSession,
+    loaded: LoadedTuiSessionResume,
     credentials: &TuiCredentialResolver,
 ) -> Result<TuiSessionContext, CliError> {
+    let LoadedTuiSessionResume {
+        session,
+        retry_boundary,
+    } = loaded;
     if session.metadata.project != tui_project_identifier(bootstrap)? {
         return Err(CliError::storage("saved session is unavailable"));
     }
@@ -4560,6 +4693,15 @@ fn prepare_loaded_tui_session_resume(
     context.provider = provider;
     context.selection = selection;
     context.resume_error = resume_error;
+    if let Some(boundary) = retry_boundary {
+        let status = session
+            .latest_attempt
+            .as_ref()
+            .map(agens_core::SessionAttemptSummary::status)
+            .ok_or_else(|| CliError::storage("saved session is unavailable"))?;
+        context.resume_notice = resume_retry_notice(status).map(str::to_owned);
+        context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
+    }
     Ok(context)
 }
 
@@ -4573,6 +4715,9 @@ fn commit_tui_session_resume(
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
     let history = std::mem::take(&mut resumed.restored_history);
+    let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
+    let resume_error = resumed.resume_error.clone();
+    resumed.resume_notice = None;
     if cancellation.is_cancelled() {
         return Ok(TuiSubmissionOutcome::RouteCancelled);
     }
@@ -4592,6 +4737,8 @@ fn commit_tui_session_resume(
         message,
         presentation,
         history,
+        draft,
+        resume_error,
     })
 }
 
@@ -5168,7 +5315,7 @@ fn run_production_headless_chat_with_provider<P>(
     ) -> Result<P, CliError>,
 ) -> Result<HeadlessChatCompletion, CliError>
 where
-    P: ProgressAwareProvider,
+    P: ProgressAwareProvider + Send,
 {
     let model = request
         .model
@@ -5201,6 +5348,9 @@ where
             Some(context.diagnostic_reference.to_owned()),
         )?,
     };
+    let task_registry = context
+        .task_runtime
+        .map(|runtime| runtime.task_registry.clone());
     let project = project_root.display().to_string();
     let policy = permission_policy(
         context.bootstrap.permission_rules(),
@@ -5284,6 +5434,8 @@ where
             if let Some(progress) = context.progress {
                 provider = provider.with_progress_sink(Arc::clone(progress));
             }
+            let mut provider =
+                TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
             cancellation_result(context.cancellation)?;
             let snapshot = match request.max_iterations.or(context.bootstrap.max_iterations) {
                 Some(max_iterations) => {
@@ -5756,6 +5908,7 @@ fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
 struct ProductionTuiTaskRuntime {
     provider_tools: Vec<OpenAiFunctionTool>,
     dispatcher: SharedToolDispatcher,
+    task_registry: TaskExecutionRegistry,
     #[allow(dead_code)]
     authorized: AuthorizedNativeTaskRuntime<ProductionPermissionPrompter>,
 }
@@ -5813,6 +5966,7 @@ fn production_tui_task_runtime_with_runner_and_parent_config(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
+    let task_registry = task_runner.execution_registry().unwrap_or_default();
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
@@ -5872,6 +6026,7 @@ fn production_tui_task_runtime_with_runner_and_parent_config(
     Ok(ProductionTuiTaskRuntime {
         provider_tools,
         dispatcher: Arc::clone(&dispatcher),
+        task_registry,
         authorized: AuthorizedNativeTaskRuntime {
             gate,
             resolver,
@@ -5924,6 +6079,7 @@ fn register_production_task_tool<R: TaskRunner>(
         }
     });
     let input_schema = task.catalog_input_schema();
+    let task_registry = task.execution_registry().clone();
 
     provider_tools.insert(
         "task".into(),
@@ -5936,6 +6092,53 @@ fn register_production_task_tool<R: TaskRunner>(
     );
     dispatcher
         .register_native("native::task", agens_core::ToolAccess::Write, task)
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+
+    register_task_coordination_tools(
+        dispatcher,
+        provider_tools,
+        task_registry,
+        TaskMessageSource::Main,
+    )
+}
+
+fn register_task_coordination_tools(
+    dispatcher: &mut ToolDispatcher,
+    provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
+    registry: TaskExecutionRegistry,
+    source: TaskMessageSource,
+) -> Result<(), CliError> {
+    provider_tools.insert(
+        "task_control".into(),
+        OpenAiFunctionTool::new(
+            "task_control",
+            "Inspect, background, or cancel a live subagent execution",
+            TaskControlTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
+    );
+    provider_tools.insert(
+        "task_message".into(),
+        OpenAiFunctionTool::new(
+            "task_message",
+            "Queue a bounded coordination message for a live subagent or the main agent",
+            TaskMessageTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
+    );
+    dispatcher
+        .register_native(
+            "native::task_control",
+            agens_core::ToolAccess::Write,
+            TaskControlTool::new(registry.clone(), source),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    dispatcher
+        .register_native(
+            "native::task_message",
+            agens_core::ToolAccess::Write,
+            TaskMessageTool::new(registry, source),
+        )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))
 }
 
@@ -5951,6 +6154,7 @@ struct ProductionTaskRunner {
     project_root: PathBuf,
     dangerous_mode: bool,
     lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
+    task_registry: Option<TaskExecutionRegistry>,
     #[cfg(test)]
     probe: Option<ProductionTaskProbe>,
     #[cfg(test)]
@@ -5978,15 +6182,12 @@ struct TestTaskFailure {
 }
 
 #[derive(Clone, Default)]
-struct TuiTaskControls(Arc<Mutex<BTreeMap<u64, TaskExecutionLifecycle>>>);
+struct TuiTaskControls(TaskExecutionRegistry);
 
 impl TuiTaskControls {
     fn transition_to_background(&self, id: u64) -> bool {
         self.0
-            .lock()
-            .ok()
-            .and_then(|controls| controls.get(&id).cloned())
-            .is_some_and(|lifecycle| lifecycle.transition_to_background())
+            .transition_to_background(agens_tools::TaskExecutionId::from_value(id))
     }
 }
 #[derive(Clone)]
@@ -6032,9 +6233,6 @@ impl TuiTaskLifecycleBridge {
         if let Ok(mut current) = self.lifecycle.lock() {
             *current = Some(lifecycle.clone());
         }
-        if let Ok(mut controls) = self.controls.0.lock() {
-            controls.insert(id, lifecycle.clone());
-        }
         let presentation = match lifecycle.mode() {
             TaskLaunchMode::Foreground => agens_tui::TuiExecutionState::ForegroundRunning,
             TaskLaunchMode::Background => agens_tui::TuiExecutionState::BackgroundRunning,
@@ -6063,7 +6261,6 @@ impl TuiTaskLifecycleBridge {
             TuiSubagentEvent::started(id, &agent, request.description(), presentation),
         ));
         let events = self.events.clone();
-        let controls = self.controls.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
         let completed_turns = Arc::clone(&self.completed_turns);
         let persist_completed = self.persist_completed.clone();
@@ -6136,9 +6333,6 @@ impl TuiTaskLifecycleBridge {
                         {
                             persist(turn);
                         }
-                        if let Ok(mut controls) = controls.0.lock() {
-                            controls.remove(&id);
-                        }
                         return;
                     }
                 }
@@ -6204,6 +6398,7 @@ impl ProductionTaskRunner {
             project_root,
             dangerous_mode: false,
             lifecycle_bridge: None,
+            task_registry: None,
             #[cfg(test)]
             probe: None,
             #[cfg(test)]
@@ -6214,6 +6409,7 @@ impl ProductionTaskRunner {
     }
 
     fn with_lifecycle_bridge(mut self, lifecycle_bridge: TuiTaskLifecycleBridge) -> Self {
+        self.task_registry = Some(lifecycle_bridge.controls.0.clone());
         self.lifecycle_bridge = Some(lifecycle_bridge);
         self
     }
@@ -6229,6 +6425,7 @@ impl ProductionTaskRunner {
             project_root,
             dangerous_mode: false,
             lifecycle_bridge: None,
+            task_registry: None,
             probe: Some(probe),
             progress_probe: None,
             failure_probe: None,
@@ -6247,6 +6444,7 @@ impl ProductionTaskRunner {
             project_root,
             dangerous_mode: false,
             lifecycle_bridge: None,
+            task_registry: None,
             probe: Some(probe),
             progress_probe: Some(progress),
             failure_probe: None,
@@ -6265,6 +6463,7 @@ impl ProductionTaskRunner {
             project_root,
             dangerous_mode: false,
             lifecycle_bridge: None,
+            task_registry: None,
             probe: None,
             progress_probe: None,
             failure_probe: Some(TestTaskFailure {
@@ -6276,8 +6475,12 @@ impl ProductionTaskRunner {
 }
 
 impl TaskRunner for ProductionTaskRunner {
+    fn execution_registry(&self) -> Option<TaskExecutionRegistry> {
+        self.task_registry.clone()
+    }
+
     fn run(
-        &mut self,
+        &self,
         request: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -6342,7 +6545,7 @@ impl TaskRunner for ProductionTaskRunner {
         }
         let cancellation = HeadlessTurnCancellation::with_cancellation_and_deadline(
             Arc::clone(&context.cancellation),
-            Some(context.deadline),
+            None,
         );
         let progress = self.lifecycle_bridge.as_ref().zip(context.execution()).map(
             |(lifecycle_bridge, execution)| {
@@ -6367,23 +6570,31 @@ impl TaskRunner for ProductionTaskRunner {
             .unwrap_or_else(|| {
                 run_production_task(
                     request,
-                    &self.bootstrap,
-                    &self.project_root,
-                    self.dangerous_mode,
-                    &cancellation,
-                    progress.as_ref(),
-                    &diagnostic_reference,
+                    ProductionTaskExecutionContext {
+                        bootstrap: &self.bootstrap,
+                        project_root: &self.project_root,
+                        dangerous_mode: self.dangerous_mode,
+                        cancellation: &cancellation,
+                        progress: progress.as_ref(),
+                        diagnostic_reference: &diagnostic_reference,
+                        task_registry: context.execution_registry(),
+                        execution_id: context.execution().expect("registered task execution").id(),
+                    },
                 )
             });
         #[cfg(not(test))]
         let result = run_production_task(
             request,
-            &self.bootstrap,
-            &self.project_root,
-            self.dangerous_mode,
-            &cancellation,
-            progress.as_ref(),
-            &diagnostic_reference,
+            ProductionTaskExecutionContext {
+                bootstrap: &self.bootstrap,
+                project_root: &self.project_root,
+                dangerous_mode: self.dangerous_mode,
+                cancellation: &cancellation,
+                progress: progress.as_ref(),
+                diagnostic_reference: &diagnostic_reference,
+                task_registry: context.execution_registry(),
+                execution_id: context.execution().expect("registered task execution").id(),
+            },
         );
         if let Err(error) = &result {
             record_subagent_terminal(
@@ -6522,15 +6733,31 @@ fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
     }
 }
 
+struct ProductionTaskExecutionContext<'a> {
+    bootstrap: &'a Bootstrap,
+    project_root: &'a Path,
+    dangerous_mode: bool,
+    cancellation: &'a HeadlessTurnCancellation,
+    progress: Option<&'a TurnProgressSink>,
+    diagnostic_reference: &'a str,
+    task_registry: &'a TaskExecutionRegistry,
+    execution_id: agens_tools::TaskExecutionId,
+}
+
 fn run_production_task(
     request: TaskTurnRequest,
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-    dangerous_mode: bool,
-    cancellation: &HeadlessTurnCancellation,
-    progress: Option<&TurnProgressSink>,
-    diagnostic_reference: &str,
+    context: ProductionTaskExecutionContext<'_>,
 ) -> Result<String, ChildRunError> {
+    let ProductionTaskExecutionContext {
+        bootstrap,
+        project_root,
+        dangerous_mode,
+        cancellation,
+        progress,
+        diagnostic_reference,
+        task_registry,
+        execution_id,
+    } = context;
     let messages = vec![
         Message {
             role: Role::System,
@@ -6541,9 +6768,13 @@ fn run_production_task(
             parts: vec![MessagePart::Text(request.description().to_owned())],
         },
     ];
-    let (provider_tools, tool_runtime) =
-        production_child_tool_runtime(project_root, dangerous_mode)
-            .map_err(|_| ChildRunError::Runtime)?;
+    let (provider_tools, tool_runtime) = production_child_tool_runtime(
+        project_root,
+        dangerous_mode,
+        task_registry.clone(),
+        execution_id,
+    )
+    .map_err(|_| ChildRunError::Runtime)?;
     let diagnostic_store = SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf());
     let diagnostic_sink = Arc::new(move |event: ProviderDiagnosticEvent| {
         diagnostic_store.record(&event);
@@ -6584,6 +6815,10 @@ fn run_production_task(
                 dangerous_mode,
                 cancellation,
                 progress,
+                TaskMailboxContext {
+                    registry: task_registry.clone(),
+                    target: TaskMessageTarget::Execution(execution_id),
+                },
             )
         }
         Some("openai-chatgpt") => {
@@ -6611,6 +6846,10 @@ fn run_production_task(
                 dangerous_mode,
                 cancellation,
                 progress,
+                TaskMailboxContext {
+                    registry: task_registry.clone(),
+                    target: TaskMessageTarget::Execution(execution_id),
+                },
             )
         }
         _ => Err(ChildRunError::Runtime),
@@ -6626,24 +6865,94 @@ fn task_system_prompt(request: &TaskTurnRequest) -> String {
         })
 }
 
+struct TaskMailboxProvider<P> {
+    inner: P,
+    registry: Option<TaskExecutionRegistry>,
+    target: TaskMessageTarget,
+}
+
+impl<P> TaskMailboxProvider<P> {
+    fn new(inner: P, registry: Option<TaskExecutionRegistry>, target: TaskMessageTarget) -> Self {
+        Self {
+            inner,
+            registry,
+            target,
+        }
+    }
+}
+
+impl<P: TurnProvider + Send> TurnProvider for TaskMailboxProvider<P> {
+    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
+        self.inner.queue_user_messages(messages)
+    }
+
+    async fn next_parts(
+        &mut self,
+        events: &[TurnEvent],
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        let messages = self
+            .registry
+            .as_ref()
+            .map(|registry| registry.drain_messages(self.target))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|message| Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text(format!(
+                    "[coordination source={} untrusted=true]\n{}",
+                    task_message_source_label(message.source()),
+                    message.content(),
+                ))],
+            })
+            .collect::<Vec<_>>();
+        self.inner.queue_user_messages(messages)?;
+        self.inner.next_parts(events, cancellation).await
+    }
+}
+
+fn task_message_source_label(source: TaskMessageSource) -> String {
+    match source {
+        TaskMessageSource::Main => "main".into(),
+        TaskMessageSource::User => "user".into(),
+        TaskMessageSource::Execution(id) => format!("subagent:{}", id.value()),
+    }
+}
+
+struct TaskMailboxContext {
+    registry: TaskExecutionRegistry,
+    target: TaskMessageTarget,
+}
+
 fn run_isolated_task_turn<P>(
-    mut provider: P,
+    provider: P,
     tool_runtime: SharedToolDispatcher,
     project_root: &Path,
     dangerous_mode: bool,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    mailbox: TaskMailboxContext,
 ) -> Result<String, ChildRunError>
 where
-    P: ProgressAwareProvider,
+    P: ProgressAwareProvider + Send,
 {
+    let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
     let policy = PermissionPolicy::new(
         PermissionMode::Edit,
-        vec![PermissionRule::global(
-            PermissionDecision::Allow,
-            PermissionPattern::Exact("native::read".into()),
-            PermissionPattern::Any,
-        )],
+        [
+            "native::read",
+            "native::task_control",
+            "native::task_message",
+        ]
+        .into_iter()
+        .map(|tool| {
+            PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact(tool.into()),
+                PermissionPattern::Any,
+            )
+        })
+        .collect(),
     );
     let grants = Arc::new(Mutex::new(Vec::new()));
     let session = PermissionSession::new();
@@ -6783,12 +7092,53 @@ fn production_dangerous_child_tool_runtime(
 fn production_child_tool_runtime(
     project_root: &Path,
     dangerous_mode: bool,
+    task_registry: TaskExecutionRegistry,
+    execution_id: agens_tools::TaskExecutionId,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    if dangerous_mode {
+    let (mut provider_tools, dispatcher) = if dangerous_mode {
         production_dangerous_child_tool_runtime(project_root)
     } else {
         production_read_only_tool_runtime(project_root)
-    }
+    }?;
+    provider_tools.push(
+        OpenAiFunctionTool::new(
+            "task_control",
+            "Inspect, background, or cancel this subagent execution",
+            TaskControlTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("task control tool is unavailable"))?,
+    );
+    provider_tools.push(
+        OpenAiFunctionTool::new(
+            "task_message",
+            "Queue a bounded coordination message for the main agent",
+            TaskMessageTool::input_schema(),
+        )
+        .map_err(|_| CliError::configuration("task message tool is unavailable"))?,
+    );
+    let mut dispatcher_guard = dispatcher
+        .lock()
+        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
+    dispatcher_guard
+        .register_native(
+            "native::task_control",
+            agens_core::ToolAccess::Write,
+            TaskControlTool::new(
+                task_registry.clone(),
+                TaskMessageSource::Execution(execution_id),
+            ),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    dispatcher_guard
+        .register_native(
+            "native::task_message",
+            agens_core::ToolAccess::Write,
+            TaskMessageTool::new(task_registry, TaskMessageSource::Execution(execution_id)),
+        )
+        .map_err(|_| CliError::configuration("tool catalog is invalid"))?;
+    drop(dispatcher_guard);
+
+    Ok((provider_tools, dispatcher))
 }
 
 struct ProductionMcpRuntime {
@@ -8150,6 +8500,81 @@ mod tests {
         Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState, Usage,
     };
     use agens_tui::{Action, Event, Key};
+    use rusqlite::Connection;
+
+    struct RecordingMailboxProvider {
+        queued: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl TurnProvider for RecordingMailboxProvider {
+        fn queue_user_messages(
+            &mut self,
+            messages: Vec<Message>,
+        ) -> Result<(), HeadlessTurnPortError> {
+            self.queued.lock().unwrap().push(messages);
+            Ok(())
+        }
+
+        async fn next_parts(
+            &mut self,
+            _: &[TurnEvent],
+            _: &HeadlessTurnCancellation,
+        ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+            Ok(vec![MessagePart::Text("ok".into())])
+        }
+    }
+
+    #[test]
+    fn task_mailbox_provider_injects_typed_user_messages_only_at_request_safe_points() {
+        let registry = TaskExecutionRegistry::new();
+        let id = registry.admit(TaskLaunchMode::Background).unwrap();
+        registry
+            .send_message(
+                TaskMessageSource::Main,
+                TaskMessageTarget::Execution(id),
+                "first".into(),
+            )
+            .unwrap();
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TaskMailboxProvider::new(
+            RecordingMailboxProvider {
+                queued: Arc::clone(&queued),
+            },
+            Some(registry.clone()),
+            TaskMessageTarget::Execution(id),
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+        registry
+            .send_message(
+                TaskMessageSource::User,
+                TaskMessageTarget::Execution(id),
+                "second".into(),
+            )
+            .unwrap();
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+
+        let queued = queued.lock().unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0][0].role, Role::User);
+        assert_eq!(
+            queued[0][0].parts,
+            [MessagePart::Text(
+                "[coordination source=main untrusted=true]\nfirst".into()
+            )]
+        );
+        assert_eq!(
+            queued[1][0].parts,
+            [MessagePart::Text(
+                "[coordination source=user untrusted=true]\nsecond".into()
+            )]
+        );
+    }
 
     #[test]
     fn production_task_error_mapping_reserves_provider_for_provider_failures() {
@@ -8886,7 +9311,9 @@ mod tests {
             });
             let lifecycle = (0..100)
                 .find_map(|_| {
-                    let lifecycle = controls.0.lock().unwrap().get(&1).cloned();
+                    let lifecycle = controls
+                        .0
+                        .lifecycle(agens_tools::TaskExecutionId::from_value(1));
                     if lifecycle.is_none() {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
@@ -9269,14 +9696,17 @@ mod tests {
         }
         drop(dispatcher);
 
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
         let (mode_off_tools, mode_off_dispatcher) =
-            production_child_tool_runtime(&project_root, false).unwrap();
+            production_child_tool_runtime(&project_root, false, task_registry, execution_id)
+                .unwrap();
         assert_eq!(
             mode_off_tools
                 .iter()
                 .map(|tool| tool.name())
                 .collect::<Vec<_>>(),
-            ["read"]
+            ["read", "task_control", "task_message"]
         );
         assert!(
             mode_off_dispatcher
@@ -9526,6 +9956,8 @@ mod tests {
             message: "Resumed session 7".into(),
             presentation: TuiPresentation::new("openai-api", "gpt-4.1", "session #7"),
             history: Vec::new(),
+            draft: None,
+            resume_error: None,
         });
         let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
         assert!(
@@ -9590,12 +10022,212 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    fn session_attempt_count(store: &SessionStore) -> i64 {
+        Connection::open(store.database_path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn assert_restored_retry_draft_ui(outcome: TuiSubmissionOutcome, retry_prompt: &str) {
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        assert!(tui.begin_session_load());
+        assert!(tui.apply_submission_outcome(outcome).is_none());
+        let view = tui.view();
+        assert_eq!(view.input, retry_prompt);
+        assert_eq!(view.focus, agens_tui::TranscriptFocus::Composer);
+        assert!(view.following_bottom);
+        assert_eq!(
+            view.status,
+            Some("Previous attempt failed. Prompt restored; press Enter to retry.")
+        );
+        assert!(view.completed_conversations.is_empty());
+        assert!(!view.running);
+        let rendered = render_tui_test_backend(&tui, 120, 24);
+        assert!(rendered.contains(retry_prompt), "{rendered:?}");
+        assert!(rendered.contains("Previous attempt failed"), "{rendered:?}");
+    }
+
+    #[test]
+    fn zero_turn_failed_tui_resume_restores_draft_without_runtime_or_attempt_creation() {
+        let temporary = tui_session_directory("failed-draft-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = SessionMetadata {
+            id: 0,
+            project: tui_project(&temporary),
+            title: "failed".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let retry_prompt = "retry exact café 🙂";
+        let attempt = store
+            .begin_session_attempt(&metadata, retry_prompt.into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+            .unwrap();
+        let attempt_count = session_attempt_count(&store);
+        drop(store);
+
+        reset_tui_resume_test_counters();
+        let loaded = load_tui_session_for_resume(&bootstrap, attempt.key().session_id()).unwrap();
+        assert_eq!(
+            loaded.retry_boundary.as_ref().map(RetryBoundary::prompt),
+            Some(retry_prompt)
+        );
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            attempt.key().session_id(),
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert!(!format!("{prepared:?}").contains(retry_prompt));
+        assert_eq!(
+            prepared.note(),
+            "Previous attempt failed. Prompt restored; press Enter to retry."
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let expected = session.lock().unwrap().clone();
+        let outcome = commit_tui_session_resume(
+            &bootstrap,
+            &session,
+            &expected,
+            prepared,
+            &TuiRouteCancellation::new(),
+        )
+        .unwrap();
+        assert!(session.lock().unwrap().resume_draft.is_none());
+        assert_restored_retry_draft_ui(outcome.clone(), retry_prompt);
+        let TuiSubmissionOutcome::SessionResumed {
+            message,
+            history,
+            draft,
+            ..
+        } = outcome
+        else {
+            panic!("expected resumed outcome");
+        };
+        assert_eq!(
+            message,
+            "Previous attempt failed. Prompt restored; press Enter to retry."
+        );
+        assert!(history.is_empty());
+        assert_eq!(draft.as_deref(), Some(retry_prompt));
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+
+        let reopened = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let unchanged_attempt_count = session_attempt_count(&reopened);
+        assert_eq!(unchanged_attempt_count, attempt_count);
+        assert_eq!(
+            reopened
+                .load_session_for_resume(attempt.key().session_id())
+                .unwrap()
+                .latest_attempt
+                .unwrap()
+                .status(),
+            SessionAttemptStatus::Failed
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn completed_history_resume_adds_failed_draft_without_duplicate_user_message() {
+        let temporary = tui_session_directory("history-failed-draft");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "history");
+        let retry_prompt = "failed next prompt";
+        let attempt = store
+            .begin_session_attempt(&metadata, retry_prompt.into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::ProviderError, 40)
+            .unwrap();
+        drop(store);
+
+        let loaded = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            metadata.id,
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(prepared.messages, tui_session_messages());
+        assert_eq!(prepared.restored_history.len(), 1);
+        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert_eq!(
+            prepared.note(),
+            "Previous attempt failed. Prompt restored; press Enter to retry."
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .all(|message| message.role != Role::User
+                    || message.parts != [MessagePart::Text(retry_prompt.into())])
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn completed_resume_without_retry_draft_and_cancelled_timeout_taxonomy_stay_explicit() {
+        let temporary = tui_session_directory("completed-no-draft");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "completed");
+        drop(store);
+
+        let loaded = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        assert!(loaded.retry_boundary.is_none());
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            metadata.id,
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert!(prepared.resume_draft.is_none());
+        assert!(prepared.note().starts_with("Resumed session"));
+        assert_eq!(
+            resume_retry_notice(SessionAttemptStatus::Cancelled),
+            Some("Previous attempt was cancelled. Prompt restored; press Enter to retry.")
+        );
+        assert_eq!(
+            attempt_failure_status(&CliError::runtime(HeadlessTurnError::TimedOut)),
+            SessionAttemptStatus::Cancelled
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
     #[test]
     fn tui_resume_commit_discards_cancelled_stale_and_invalid_preparations() {
         let temporary = tui_session_directory("atomic-resume");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "atomic");
+        let attempt = store
+            .begin_session_attempt(&metadata, "atomic preserved draft".into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+            .unwrap();
         drop(store);
         let credentials = TuiCredentialResolver::production();
         let prepared = resume_tui_session(
@@ -9605,6 +10237,10 @@ mod tests {
             &credentials,
         )
         .unwrap();
+        assert_eq!(
+            prepared.resume_draft.as_deref(),
+            Some("atomic preserved draft")
+        );
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let original = session.lock().unwrap().clone();
 
@@ -9653,7 +10289,7 @@ mod tests {
         drop(committed);
 
         let mut invalid = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
-        invalid.messages = vec![Message {
+        invalid.session.messages = vec![Message {
             role: Role::Assistant,
             parts: vec![MessagePart::Text("orphan".into())],
         }];
@@ -9784,6 +10420,9 @@ mod tests {
         tui.set_presentation("old-provider", "old-model", "session #1");
         tui.begin_submission("old prompt");
         tui.finish_submission(Ok("old answer".into()));
+        for character in "preserved draft".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
         assert!(tui.begin_session_load());
         assert!(tui.view().session_loading);
         assert!(!tui.view().running);
@@ -9797,6 +10436,7 @@ mod tests {
         assert_eq!(counters, (1, 1, 0, 0));
         assert_eq!(*session.lock().unwrap(), original);
         assert_eq!(tui.view().provider_model, "old-provider / old-model");
+        assert_eq!(tui.input(), "preserved draft");
         assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -10179,6 +10819,34 @@ mod tests {
         let unavailable_context = unavailable_session.lock().unwrap();
         assert!(unavailable_context.selected_subagent.is_none());
         assert!(unavailable_context.messages.is_empty());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn plural_subagents_command_opens_the_transcript_picker_without_changing_next_type() {
+        let temporary = tui_session_directory("plural-subagents");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("explore".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let router = TuiRuntimeRouter::new(
+            bootstrap,
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        );
+
+        assert!(matches!(
+            router.route("/subagents".into()),
+            TuiSubmissionOutcome::TranscriptDialog
+        ));
+        assert_eq!(
+            session.lock().unwrap().selected_subagent.as_deref(),
+            Some("explore")
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -10621,6 +11289,7 @@ mod tests {
                 "select",
                 "quit",
                 "subagent",
+                "subagents",
                 "review",
                 "shared",
                 "inspect",
@@ -14893,7 +15562,7 @@ mod tests {
 
         impl TaskRunner for RecordingTaskRunner {
             fn run(
-                &mut self,
+                &self,
                 request: TaskTurnRequest,
                 context: &TaskRunContext,
             ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -15066,7 +15735,7 @@ mod tests {
 
         assert_eq!(
             prompt,
-            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline."
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
         );
         assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
     }
@@ -15219,7 +15888,7 @@ mod tests {
                 )
                 .unwrap()
                 .content,
-            "probe"
+            "Subagent #1 running in background"
         );
         drop(dispatcher);
 

@@ -169,6 +169,11 @@ pub enum Action {
     Submit(String),
     SubmitBackground(String),
     TransitionToBackground(u64),
+    CancelExecution(u64),
+    SendTaskMessage {
+        id: u64,
+        message: String,
+    },
     /// Ask the composition layer to resolve a palette dialog by stable route ID.
     OpenDialog(String),
     /// Dispatch the selected dialog action through the composition layer.
@@ -254,9 +259,12 @@ pub enum TuiSubmissionOutcome {
         message: String,
         presentation: TuiPresentation,
         history: Vec<Conversation>,
+        draft: Option<String>,
+        resume_error: Option<String>,
     },
     Dialog(DialogView),
     SafeDialog(DialogView),
+    TranscriptDialog,
     SelectionInfo(String),
     SelectionCancelled,
     RouteCancelled,
@@ -498,6 +506,7 @@ pub struct ViewState<'a> {
     pub agent_catalog: &'a [String],
     pub selected_agent: Option<&'a str>,
     pub executions: Vec<&'a TuiExecution>,
+    pub execution_selection: Option<TranscriptId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -591,6 +600,16 @@ pub struct DialogEntry {
 impl DialogEntry {
     fn transcript(label: impl AsRef<str>, id: TranscriptId) -> Self {
         let mut entry = Self::action(label, "");
+        entry.action = Some(DialogEntryAction::SelectTranscript(id));
+        entry
+    }
+
+    fn transcript_with_detail(
+        label: impl AsRef<str>,
+        detail: impl AsRef<str>,
+        id: TranscriptId,
+    ) -> Self {
+        let mut entry = Self::action_with_detail(label, Some(detail), "");
         entry.action = Some(DialogEntryAction::SelectTranscript(id));
         entry
     }
@@ -966,7 +985,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
         frame.render_widget(
-            Paragraph::new(" Subagent transcript · read-only")
+            Paragraph::new(" Subagent transcript · i to message · x to cancel")
                 .style(Style::default().fg(Color::DarkGray))
                 .block(
                     Block::default()
@@ -1383,7 +1402,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
         ));
     }
     if !state.executions.is_empty() {
-        append_execution_summary(&mut left, state);
+        append_execution_strip(&mut left, state);
     } else if let Some(status) = state.status.filter(|value| !value.is_empty()) {
         // Transient context messages (e.g. resume notices) live here — not model/project.
         left.push(Span::styled(
@@ -1418,44 +1437,35 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
     }
 }
 
-fn append_execution_summary(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
-    let mut foreground = 0;
-    let mut background = 0;
-    let mut completed = 0;
-    let mut failed = 0;
-    let mut cancelled = 0;
-
-    for execution in &state.executions {
-        match execution.state() {
-            TuiExecutionState::ForegroundRunning => foreground += 1,
-            TuiExecutionState::BackgroundRunning => background += 1,
-            TuiExecutionState::CompletedRecent => completed += 1,
-            TuiExecutionState::Failed => failed += 1,
-            TuiExecutionState::Cancelled => cancelled += 1,
+fn append_execution_strip(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
+    let ids = std::iter::once(TranscriptId::Main).chain(
+        state
+            .executions
+            .iter()
+            .take(3)
+            .map(|execution| TranscriptId::Subagent(execution.id)),
+    );
+    let executions = state
+        .executions
+        .iter()
+        .map(|execution| (*execution).clone())
+        .collect::<Vec<_>>();
+    for id in ids {
+        let selected = state.execution_selection == Some(id);
+        let active = state.active_transcript == id;
+        let color = if selected {
+            widgets::RolePalette::brand()
+        } else if active {
+            widgets::RolePalette::tool()
+        } else {
+            widgets::RolePalette::muted()
+        };
+        let mut style = Style::default().fg(color);
+        if selected || active {
+            style = style.add_modifier(Modifier::BOLD);
         }
+        left.push(Span::styled(execution_strip_label(id, &executions), style));
     }
-
-    let agent = state.selected_agent.unwrap_or("main");
-    left.push(Span::styled(
-        format!(" {agent}"),
-        Style::default().fg(widgets::RolePalette::tool()),
-    ));
-
-    let mut parts = vec![
-        format!("fg {foreground}"),
-        format!("bg {background}"),
-        format!("done {completed}"),
-    ];
-    if failed > 0 {
-        parts.push(format!("failed {failed}"));
-    }
-    if cancelled > 0 {
-        parts.push(format!("cancelled {cancelled}"));
-    }
-    left.push(Span::styled(
-        format!(" · {}", parts.join(" ")),
-        Style::default().fg(widgets::RolePalette::warning()),
-    ));
 }
 
 fn turn_state_label(
@@ -1546,10 +1556,13 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
                     conversation,
                     &[],
                     state.collapsed_tool_outputs,
-                    state.collapse_thinking,
-                    false,
-                    !state.highlight_restored_syntax,
                     content_width,
+                    render::ConversationRenderState {
+                        collapse_thinking: state.collapse_thinking,
+                        thinking_streaming: false,
+                        assistant_streaming: !state.highlight_restored_syntax,
+                        now: state.now,
+                    },
                 )
             })
             .collect::<Vec<_>>(),
@@ -1559,10 +1572,13 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
             conversation,
             state.runtime_events,
             state.collapsed_tool_outputs,
-            state.collapse_thinking,
-            thinking_streaming,
-            state.assistant_streaming,
             content_width,
+            render::ConversationRenderState {
+                collapse_thinking: state.collapse_thinking,
+                thinking_streaming,
+                assistant_streaming: state.assistant_streaming,
+                now: state.now,
+            },
         ));
     }
     let conversation_is_authoritative =
@@ -1835,6 +1851,77 @@ fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
     }
 }
 
+fn display_agent_name(value: &str) -> String {
+    let mut characters = value.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
+fn is_task_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "task"
+            | "native::task"
+            | "task_control"
+            | "native::task_control"
+            | "task_message"
+            | "native::task_message"
+    )
+}
+
+fn subagent_picker_detail(card: &SubagentCard) -> String {
+    let status = match card.status {
+        Some(TuiSubagentStatus::Success) => "Success",
+        Some(TuiSubagentStatus::Failure) => "Failure",
+        Some(TuiSubagentStatus::Cancelled) => "Cancelled",
+        None if card.has_activity => "Running",
+        None => "Initializing",
+    };
+    format!(
+        "{status} · {}",
+        card.task_summary.replace(['\n', '\r'], " ")
+    )
+}
+
+fn execution_priority(state: TuiExecutionState) -> u8 {
+    match state {
+        TuiExecutionState::ForegroundRunning => 3,
+        TuiExecutionState::BackgroundRunning => 2,
+        TuiExecutionState::CompletedRecent
+        | TuiExecutionState::Failed
+        | TuiExecutionState::Cancelled => 1,
+    }
+}
+
+fn execution_strip_label(id: TranscriptId, executions: &[TuiExecution]) -> String {
+    match id {
+        TranscriptId::Main => " Main ".into(),
+        TranscriptId::Subagent(id) => executions
+            .iter()
+            .find(|execution| execution.id == id)
+            .map_or_else(
+                || format!(" Subagent #{id} "),
+                |execution| {
+                    format!(
+                        " {} {} #{id} ",
+                        execution_state_glyph(execution.state),
+                        display_agent_name(&execution.agent)
+                    )
+                },
+            ),
+    }
+}
+
+fn execution_state_glyph(state: TuiExecutionState) -> &'static str {
+    match state {
+        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => "●",
+        TuiExecutionState::CompletedRecent => "✓",
+        TuiExecutionState::Failed => "×",
+        TuiExecutionState::Cancelled => "–",
+    }
+}
+
 fn cursor_position(input: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0;
     let mut current_line = String::new();
@@ -1923,6 +2010,7 @@ pub struct Tui<E> {
     selected_agent: Option<String>,
     dangerous_mode: bool,
     executions: Vec<TuiExecution>,
+    execution_selection: Option<TranscriptId>,
     now: Duration,
     next_runtime_ordinal: u64,
 }
@@ -1969,6 +2057,7 @@ where
             selected_agent: None,
             dangerous_mode: false,
             executions: Vec::new(),
+            execution_selection: None,
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
         }
@@ -1989,11 +2078,16 @@ where
                 MouseWheelDirection::Up => Key::ScrollUp,
                 MouseWheelDirection::Down => Key::ScrollDown,
             }),
-            Event::MouseDown { column, row } => self.begin_mouse_selection(column, row),
+            Event::MouseDown { column, row } => self
+                .handle_execution_strip_click(column, row)
+                .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
             Event::Paste(text) => {
-                if self.active_transcript != TranscriptId::Main
+                let child_read_only = self.active_transcript != TranscriptId::Main
+                    && (self.active_record_mut().terminal
+                        || self.active_record_mut().focus != TranscriptFocus::Composer);
+                if child_read_only
                     || self
                         .dialog
                         .as_ref()
@@ -2073,9 +2167,9 @@ where
     pub fn executions(&self) -> Vec<&TuiExecution> {
         let mut executions = self.executions.iter().collect::<Vec<_>>();
         executions.sort_unstable_by(|left, right| {
-            right
-                .last_activity
-                .cmp(&left.last_activity)
+            execution_priority(right.state)
+                .cmp(&execution_priority(left.state))
+                .then_with(|| right.last_activity.cmp(&left.last_activity))
                 .then_with(|| right.id.cmp(&left.id))
         });
         executions
@@ -2098,6 +2192,15 @@ where
                 .terminal_at
                 .is_none_or(|terminal_at| now < terminal_at + Duration::from_secs(60))
         });
+        if self.execution_selection.is_some_and(|selection| {
+            selection != TranscriptId::Main
+                && !self
+                    .executions
+                    .iter()
+                    .any(|execution| TranscriptId::Subagent(execution.id) == selection)
+        }) {
+            self.execution_selection = None;
+        }
     }
 
     /// Updates active-turn state after the composition layer starts or finishes a turn.
@@ -2325,20 +2428,24 @@ where
                 message,
                 presentation,
                 history,
+                draft,
+                resume_error,
             } => {
                 self.finish_session_load();
                 self.replace_projected_history(history);
                 self.apply_presentation(presentation);
+                if let Some(draft) = draft {
+                    self.restore_resume_draft(draft);
+                }
                 self.highlight_restored_syntax = false;
                 self.restored_syntax_ready_at =
                     Some(self.now.saturating_add(ACTIVE_FRAME_HEARTBEAT));
-                if message == "connect or choose provider" {
+                self.status = Some(message);
+                if let Some(error) = resume_error {
                     self.show_dialog(
                         "Action required",
-                        "Saved provider is unavailable.\nAction: connect or choose provider.",
+                        format!("Saved provider is unavailable.\nAction: {error}."),
                     );
-                } else {
-                    self.status = Some(message);
                 }
                 None
             }
@@ -2349,6 +2456,11 @@ where
             }
             TuiSubmissionOutcome::SafeDialog(dialog) => {
                 self.show_selection_dialog(dialog);
+                None
+            }
+            TuiSubmissionOutcome::TranscriptDialog => {
+                self.set_running(false);
+                self.show_transcript_dialog();
                 None
             }
             TuiSubmissionOutcome::SelectionInfo(message) => {
@@ -2372,6 +2484,16 @@ where
                 None
             }
         }
+    }
+
+    fn restore_resume_draft(&mut self, draft: String) {
+        self.input = draft;
+        self.input_cursor = self.input.chars().count();
+        let scroll_offset = self.max_scroll_offset();
+        let record = self.active_record_mut();
+        record.focus = TranscriptFocus::Composer;
+        record.following_bottom = true;
+        record.scroll_offset = scroll_offset;
     }
 
     pub fn finish_provider_turn(&mut self, outcome: TuiProviderOutcome) {
@@ -2495,6 +2617,7 @@ where
         } else {
             TranscriptId::Main
         };
+        self.execution_selection = Some(self.active_transcript);
     }
 
     fn active_record_mut(&mut self) -> &mut TranscriptRecord {
@@ -2504,26 +2627,56 @@ where
     }
 
     fn show_transcript_dialog(&mut self) {
-        let entries: Vec<_> = self
-            .child_transcript_order
-            .iter()
-            .copied()
-            .filter(|id| self.transcripts.contains_key(id))
-            .filter_map(|id| match id {
-                TranscriptId::Main => None,
-                TranscriptId::Subagent(id_value) => {
-                    Some(DialogEntry::transcript(format!("Subagent {id_value}"), id))
-                }
-            })
-            .collect();
-        if entries.is_empty() {
+        if self.child_transcript_order.is_empty() {
             return;
         }
-        self.show_selection_dialog(DialogView::selection(
-            "Select transcript",
-            Some("Enter select | Esc cancel"),
-            entries,
-        ));
+        let mut entries = vec![DialogEntry::transcript("Main", TranscriptId::Main)];
+        entries.extend(
+            self.child_transcript_order
+                .iter()
+                .copied()
+                .filter(|id| self.transcripts.contains_key(id))
+                .filter_map(|id| {
+                    let TranscriptId::Subagent(id_value) = id else {
+                        return None;
+                    };
+                    let record = self.transcripts.get(&id)?;
+                    let agent = display_agent_name(&record.owner_label);
+                    let detail = self
+                        .subagent_card(id_value)
+                        .map(subagent_picker_detail)
+                        .unwrap_or_else(|| "Transcript available".into());
+                    Some(DialogEntry::transcript_with_detail(
+                        format!("{agent} #{id_value}"),
+                        detail,
+                        id,
+                    ))
+                }),
+        );
+        let selected = if self.active_transcript == TranscriptId::Main && entries.len() > 1 {
+            1
+        } else {
+            std::iter::once(TranscriptId::Main)
+                .chain(self.child_transcript_order.iter().copied())
+                .position(|id| id == self.active_transcript)
+                .unwrap_or_default()
+        };
+        self.show_selection_dialog(
+            DialogView::selection(
+                "Subagents",
+                Some("Up/Down navigate | Enter inspect | Esc cancel"),
+                entries,
+            )
+            .with_selected(selected),
+        );
+    }
+
+    fn subagent_card(&self, id: u64) -> Option<&SubagentCard> {
+        self.completed_conversations
+            .iter()
+            .chain(self.conversation.as_ref())
+            .flat_map(|conversation| &conversation.subagent_cards)
+            .find(|card| card.id == id)
     }
 
     fn select_sibling(&mut self, direction: isize) {
@@ -2543,6 +2696,73 @@ where
         if let Some(id) = sibling.filter(|id| self.transcripts.contains_key(id)) {
             self.select_transcript(id);
         }
+    }
+
+    fn execution_strip_ids(&self) -> Vec<TranscriptId> {
+        std::iter::once(TranscriptId::Main)
+            .chain(
+                self.executions()
+                    .into_iter()
+                    .take(3)
+                    .map(|execution| TranscriptId::Subagent(execution.id)),
+            )
+            .collect()
+    }
+
+    fn focus_execution_strip(&mut self) {
+        let ids = self.execution_strip_ids();
+        self.execution_selection = match self.execution_selection {
+            None => Some(TranscriptId::Main),
+            Some(current) => ids
+                .iter()
+                .position(|id| *id == current)
+                .map(|index| ids[(index + 1) % ids.len()])
+                .or(Some(TranscriptId::Main)),
+        };
+    }
+
+    fn move_execution_selection(&mut self, direction: isize) {
+        let ids = self.execution_strip_ids();
+        let current = self.execution_selection.unwrap_or(TranscriptId::Main);
+        let Some(index) = ids.iter().position(|id| *id == current) else {
+            self.execution_selection = Some(TranscriptId::Main);
+            return;
+        };
+        let next = index
+            .checked_add_signed(direction)
+            .map(|index| index % ids.len())
+            .unwrap_or(ids.len().saturating_sub(1));
+        self.execution_selection = ids.get(next).copied();
+    }
+
+    fn inspect_execution_selection(&mut self) {
+        if let Some(id) = self.execution_selection {
+            self.select_transcript(id);
+        }
+    }
+
+    fn handle_execution_strip_click(&mut self, column: u16, row: u16) -> Option<Action> {
+        if self.executions.is_empty() || self.dialog.is_some() || self.palette_open {
+            return None;
+        }
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
+        if row < layout.header.y || row >= layout.header.bottom() {
+            return None;
+        }
+
+        let mut start = layout.header.x;
+        for id in self.execution_strip_ids() {
+            let label = execution_strip_label(id, &self.executions);
+            let end = start.saturating_add(saturating_u16(label.width()));
+            if column >= start && column < end {
+                self.execution_selection = Some(id);
+                self.select_transcript(id);
+                return Some(Action::Render);
+            }
+            start = end;
+        }
+        None
     }
 
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
@@ -2577,9 +2797,6 @@ where
             }
             TuiRuntimeEvent::TaskExecution { agent, event } => {
                 self.apply_task_execution_event(agent, *event);
-                if matches!(event, TuiExecutionEvent::Backgrounded { .. }) {
-                    self.set_running(false);
-                }
             }
             TuiRuntimeEvent::SubagentExecution(event) => {
                 if self.subagent_event_matches_execution(event) {
@@ -2608,6 +2825,18 @@ where
     }
 
     fn apply_subagent_event(&mut self, event: &TuiSubagentEvent) {
+        if let Some(execution) = self
+            .executions
+            .iter_mut()
+            .find(|execution| execution.id == event.id)
+        {
+            execution.last_activity = self.now;
+            if execution.terminal_at.is_some()
+                && matches!(&event.update, bridge::TuiSubagentUpdate::Terminal { .. })
+            {
+                execution.terminal_at = Some(self.now);
+            }
+        }
         let completed_tool_call = match &event.update {
             bridge::TuiSubagentUpdate::ToolResult { call_id, .. } => Some(call_id.clone()),
             _ => None,
@@ -2644,7 +2873,7 @@ where
 
         self.conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
-            .apply_subagent_summary(event.clone());
+            .apply_subagent_summary(event.clone(), self.now);
     }
 
     fn admit_runtime_event(&mut self, ordinal: u64, event: &TuiRuntimeEvent) -> bool {
@@ -2741,6 +2970,7 @@ where
         self.transcripts
             .insert(TranscriptId::Main, TranscriptRecord::main());
         self.active_transcript = TranscriptId::Main;
+        self.execution_selection = None;
         self.child_transcript_order.clear();
         self.next_runtime_ordinal = 0;
     }
@@ -2850,6 +3080,7 @@ where
             agent_catalog: &self.agent_catalog,
             selected_agent: self.selected_agent.as_deref(),
             executions: self.executions(),
+            execution_selection: self.execution_selection,
         }
     }
 
@@ -3106,26 +3337,33 @@ where
                 }
             }
             TurnEvent::ToolCallRequested { id, name, input } => {
+                let hidden_task = is_task_tool_name(&name);
                 self.project_conversation(ConversationEvent::ToolCall {
                     call_id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
                 });
                 self.turn_state = Some(TurnState::Dispatching);
-                self.active_tool = Some(name.clone());
-                self.transcript
-                    .push(TranscriptEntry::Tool(format!("{name} started")));
+                self.active_tool = (!hidden_task).then_some(name.clone());
+                if !hidden_task {
+                    self.transcript
+                        .push(TranscriptEntry::Tool(format!("{name} started")));
+                }
             }
             TurnEvent::ToolResult(MessagePart::ToolResult {
                 tool_call_id,
                 content,
                 is_error,
             }) => {
+                let hidden_task = self.main_task_call_ids().any(|id| id == tool_call_id);
                 self.project_conversation(ConversationEvent::ToolResult {
                     call_id: tool_call_id.clone(),
                     output: content.clone(),
                     is_error,
                 });
+                if hidden_task {
+                    return;
+                }
                 let name = self
                     .transcript
                     .iter()
@@ -3154,6 +3392,16 @@ where
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
             _ => {}
         }
+    }
+
+    fn main_task_call_ids(&self) -> impl Iterator<Item = &str> {
+        self.completed_conversations
+            .iter()
+            .chain(self.conversation.as_ref())
+            .flat_map(|conversation| &conversation.tool_batches)
+            .flat_map(|batch| &batch.calls)
+            .filter(|call| is_task_tool_name(&call.name))
+            .map(|call| call.call_id.as_str())
     }
 
     fn handle_key(&mut self, key: Key) -> Action {
@@ -3209,6 +3457,36 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
+        if !self.palette_open && !self.executions.is_empty() {
+            match key {
+                Key::Tab => {
+                    self.focus_execution_strip();
+                    return Action::Render;
+                }
+                Key::Up if self.execution_selection.is_some() => {
+                    self.move_execution_selection(-1);
+                    return Action::Render;
+                }
+                Key::Down if self.execution_selection.is_some() => {
+                    self.move_execution_selection(1);
+                    return Action::Render;
+                }
+                Key::Enter if self.execution_selection.is_some() => {
+                    self.inspect_execution_selection();
+                    return Action::Render;
+                }
+                Key::CtrlB if self.execution_selection.is_some() => {
+                    return self.handle_background_key();
+                }
+                _ => {}
+            }
+        }
+
+        if key == Key::Escape && self.active_transcript != TranscriptId::Main {
+            self.select_transcript(TranscriptId::Main);
+            return Action::Render;
+        }
+
         match key {
             Key::Char('g') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.show_transcript_dialog();
@@ -3227,11 +3505,20 @@ where
                 return Action::Render;
             }
             Key::Char('i')
-                if self.active_transcript == TranscriptId::Main
-                    && self.active_record_mut().focus == TranscriptFocus::Viewport =>
+                if self.active_record_mut().focus == TranscriptFocus::Viewport
+                    && !self.active_record_mut().terminal =>
             {
                 self.active_record_mut().focus = TranscriptFocus::Composer;
+                self.execution_selection = None;
                 return Action::Render;
+            }
+            Key::Char('x')
+                if self.active_record_mut().focus == TranscriptFocus::Viewport
+                    && !self.active_record_mut().terminal =>
+            {
+                if let TranscriptId::Subagent(id) = self.active_transcript {
+                    return Action::CancelExecution(id);
+                }
             }
             Key::Home
                 if self.active_transcript != TranscriptId::Main
@@ -3251,6 +3538,7 @@ where
         }
 
         if self.active_transcript != TranscriptId::Main
+            && self.active_record_mut().terminal
             && (matches!(
                 key,
                 Key::Char(_)
@@ -3288,6 +3576,25 @@ where
         if key == Key::CtrlShiftD {
             self.palette_open = false;
             return Action::OpenDialog("dangerous".into());
+        }
+
+        if matches!(
+            key,
+            Key::Char(_)
+                | Key::ShiftEnter
+                | Key::Backspace
+                | Key::Delete
+                | Key::DeletePreviousWord
+                | Key::DeleteToLineStart
+                | Key::DeleteToLineEnd
+                | Key::Left
+                | Key::Right
+                | Key::PreviousWord
+                | Key::NextWord
+                | Key::LineStart
+                | Key::LineEnd
+        ) {
+            self.execution_selection = None;
         }
 
         if let Some(action) = self.handle_composer_key(key) {
@@ -3359,6 +3666,17 @@ where
             }
             Key::Up | Key::Down | Key::Tab => Action::Render,
             Key::Enter if self.input.is_empty() || self.session_loading => Action::Render,
+            Key::Enter if self.active_transcript != TranscriptId::Main => {
+                let TranscriptId::Subagent(id) = self.active_transcript else {
+                    unreachable!("non-main transcript is a subagent");
+                };
+                self.input_cursor = 0;
+                self.active_record_mut().focus = TranscriptFocus::Viewport;
+                Action::SendTaskMessage {
+                    id,
+                    message: std::mem::take(&mut self.input),
+                }
+            }
             Key::Enter if self.running && self.input.trim() == "/select" => {
                 self.palette_open = false;
                 self.input.clear();
@@ -3437,6 +3755,20 @@ where
     }
 
     fn handle_background_key(&mut self) -> Action {
+        if let Some(selection) = self.execution_selection {
+            return match selection {
+                TranscriptId::Subagent(id)
+                    if self.executions.iter().any(|execution| {
+                        execution.id == id
+                            && execution.state == TuiExecutionState::ForegroundRunning
+                    }) =>
+                {
+                    Action::TransitionToBackground(id)
+                }
+                TranscriptId::Main | TranscriptId::Subagent(_) => Action::Render,
+            };
+        }
+
         if let Some(id) = self.selected_agent.as_deref().and_then(|agent| {
             self.executions
                 .iter()
@@ -4378,6 +4710,8 @@ where
             | Action::Submit(_)
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
+            | Action::CancelExecution(_)
+            | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -4436,6 +4770,8 @@ where
             Action::Render
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
+            | Action::CancelExecution(_)
+            | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
@@ -4632,11 +4968,11 @@ pub fn run_with_default_progress_submit(
     )
 }
 
-pub fn run_with_default_progress_submit_with_permissions<E, R, F, C>(
+pub fn run_with_default_progress_submit_with_permissions<E, R, F, B>(
     tui: &mut Tui<E>,
     route: R,
     submit: F,
-    transition: C,
+    transition: B,
     permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
 ) -> io::Result<()>
 where
@@ -4653,11 +4989,51 @@ where
         + Send
         + Sync
         + 'static,
+    B: Fn(u64) -> bool + Send + Sync + 'static,
+{
+    run_with_default_progress_submit_with_permissions_and_task_controls(
+        tui,
+        route,
+        submit,
+        transition,
+        |_| false,
+        |_, _| false,
+        permissions,
+    )
+}
+
+pub fn run_with_default_progress_submit_with_permissions_and_task_controls<E, R, F, B, C, M>(
+    tui: &mut Tui<E>,
+    route: R,
+    submit: F,
+    transition: B,
+    cancel_execution: C,
+    send_task_message: M,
+    permissions: Option<(TuiPermissionBridge, mpsc::Receiver<TuiPermissionRequest>)>,
+) -> io::Result<()>
+where
+    E: Engine + Send,
+    R: Fn(
+            TuiRouteRequest,
+            mpsc::Sender<TuiRouteProgress>,
+            TuiRouteCancellation,
+        ) -> TuiSubmissionOutcome
+        + Send
+        + Sync
+        + 'static,
+    F: Fn(String, bool, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+        + Send
+        + Sync
+        + 'static,
+    B: Fn(u64) -> bool + Send + Sync + 'static,
     C: Fn(u64) -> bool + Send + Sync + 'static,
+    M: Fn(u64, String) -> bool + Send + Sync + 'static,
 {
     let route = Arc::new(route);
     let submit = Arc::new(submit);
     let transition = Arc::new(transition);
+    let cancel_execution = Arc::new(cancel_execution);
+    let send_task_message = Arc::new(send_task_message);
     let (sender, receiver) = mpsc::channel();
     let (completion_sender, completion_receiver) = mpsc::channel();
     let (route_sender, route_receiver) = mpsc::channel();
@@ -4807,6 +5183,12 @@ where
             }
             Action::TransitionToBackground(id) => {
                 let _ = transition(id);
+            }
+            Action::CancelExecution(id) => {
+                let _ = cancel_execution(id);
+            }
+            Action::SendTaskMessage { id, message } => {
+                let _ = send_task_message(id, message);
             }
             Action::OpenDialog(route_id) => {
                 next_route_id = next_route_id.wrapping_add(1).max(1);
@@ -5542,6 +5924,8 @@ mod runtime_tests {
             message: "Resumed session 2.".into(),
             presentation: TuiPresentation::new("provider", "model", "session #2"),
             history,
+            draft: None,
+            resume_error: None,
         });
         let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut renderer = RatatuiRenderer::new(terminal);

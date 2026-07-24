@@ -389,6 +389,46 @@ fn session_pages_and_load_are_read_only_complete_sorted_and_cross_64() {
 }
 
 #[test]
+fn zero_turn_session_without_retained_retry_prompt_is_not_resumable() {
+    let directory = directory();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let metadata = SessionMetadata {
+        id: 7,
+        project: "project".into(),
+        title: "empty".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let attempt = store
+        .begin_session_attempt(&metadata, "discarded draft".into())
+        .unwrap();
+    store
+        .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+        .unwrap();
+    Connection::open(store.database_path())
+        .unwrap()
+        .execute(
+            "UPDATE session_attempts SET retry_prompt = NULL WHERE id = ?1",
+            [attempt.key().attempt_id()],
+        )
+        .unwrap();
+
+    let page = store.list_session_page(None, 0).unwrap();
+
+    assert_eq!(page.total_count, 0);
+    assert!(page.sessions.is_empty());
+    assert!(store.load_session_for_resume(metadata.id).is_err());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
     let directory = directory();
     let metadata = SessionMetadata {

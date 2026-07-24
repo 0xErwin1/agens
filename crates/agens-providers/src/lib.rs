@@ -322,6 +322,7 @@ enum ContinuationState {
         previous_response_id: String,
         pending_calls: Vec<PendingToolCall>,
         event_cursor: usize,
+        pending_input: Vec<Value>,
     },
     Completed,
     Failed,
@@ -1414,6 +1415,20 @@ fn emit_retry_terminal(
 }
 
 impl TurnProvider for ChatGptResponsesProvider {
+    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
+        let input = queued_user_input(messages)?;
+        match &mut self.state {
+            ChatGptContinuationState::Initial => self.initial_input.extend(input),
+            ChatGptContinuationState::AwaitingToolOutputs { replay_history, .. } => {
+                replay_history.extend(input);
+            }
+            ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+        }
+        Ok(())
+    }
+
     async fn next_parts(
         &mut self,
         events: &[TurnEvent],
@@ -1548,6 +1563,24 @@ impl ProgressAwareProvider for ChatGptResponsesProvider {
 }
 
 impl TurnProvider for OpenAiResponsesProvider {
+    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
+        let input = queued_user_input(messages)?;
+        match &mut self.state {
+            ContinuationState::Initial => self
+                .initial_input
+                .as_array_mut()
+                .ok_or(HeadlessTurnPortError::Provider)?
+                .extend(input),
+            ContinuationState::AwaitingToolOutputs { pending_input, .. } => {
+                pending_input.extend(input);
+            }
+            ContinuationState::Completed | ContinuationState::Failed => {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+        }
+        Ok(())
+    }
+
     async fn next_parts(
         &mut self,
         _events: &[TurnEvent],
@@ -1566,12 +1599,13 @@ impl TurnProvider for OpenAiResponsesProvider {
                 previous_response_id,
                 pending_calls,
                 event_cursor,
+                pending_input,
             } => {
                 let Some(events) = _events.get(event_cursor..) else {
                     return Err(HeadlessTurnPortError::Provider);
                 };
 
-                match continuation_payload(
+                let mut payload = match continuation_payload(
                     &self.model,
                     &self.request_config,
                     &self.tools,
@@ -1582,7 +1616,12 @@ impl TurnProvider for OpenAiResponsesProvider {
                 ) {
                     Ok(payload) => payload,
                     Err(()) => return Err(HeadlessTurnPortError::Provider),
-                }
+                };
+                let Some(input) = payload["input"].as_array_mut() else {
+                    return Err(HeadlessTurnPortError::Provider);
+                };
+                input.extend(pending_input);
+                payload
             }
             ContinuationState::Completed | ContinuationState::Failed => {
                 return Err(HeadlessTurnPortError::Provider);
@@ -1626,6 +1665,7 @@ impl TurnProvider for OpenAiResponsesProvider {
                 previous_response_id,
                 pending_calls: response.pending_calls,
                 event_cursor: _events.len(),
+                pending_input: Vec::new(),
             };
         }
 
@@ -1770,6 +1810,28 @@ fn correlated_tool_outputs(
                 "call_id": call.call_id,
                 "output": output,
             }))
+        })
+        .collect()
+}
+
+fn queued_user_input(messages: Vec<Message>) -> Result<Vec<Value>, HeadlessTurnPortError> {
+    messages
+        .into_iter()
+        .map(|message| {
+            if message.role != Role::User || message.parts.is_empty() {
+                return Err(HeadlessTurnPortError::Provider);
+            }
+            let content = message
+                .parts
+                .into_iter()
+                .map(|part| match part {
+                    MessagePart::Text(text) if !text.is_empty() => {
+                        Ok(serde_json::json!({"type": "input_text", "text": text}))
+                    }
+                    _ => Err(HeadlessTurnPortError::Provider),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(serde_json::json!({"role": "user", "content": content}))
         })
         .collect()
 }
@@ -2978,6 +3040,28 @@ fn auth_error(detail: &str) -> Error {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn queued_coordination_encodes_only_nonempty_user_text_as_user_input() {
+        assert_eq!(
+            queued_user_input(vec![Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("coordination".into())],
+            }])
+            .unwrap(),
+            vec![serde_json::json!({
+                "role": "user",
+                "content": [{"type": "input_text", "text": "coordination"}],
+            })],
+        );
+        assert!(
+            queued_user_input(vec![Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text("forbidden".into())],
+            }])
+            .is_err()
+        );
+    }
 
     #[test]
     fn preserves_existing_credentials_and_removes_temporary_file_after_pre_rename_failure() {

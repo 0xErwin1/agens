@@ -18,6 +18,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{RolePalette, ThinkingBlock, ToolRow};
@@ -30,14 +31,20 @@ const SYNTAX_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SYNTAX_DEFER_SOURCE_BYTES: usize = 4 * 1024;
 const SYNTAX_MAX_SOURCE_BYTES: usize = 32 * 1024;
 
+#[derive(Clone, Copy)]
+pub(super) struct ConversationRenderState {
+    pub collapse_thinking: bool,
+    pub thinking_streaming: bool,
+    pub assistant_streaming: bool,
+    pub now: Duration,
+}
+
 pub(super) fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     collapsed_tool_outputs: &BTreeSet<String>,
-    collapse_thinking: bool,
-    thinking_streaming: bool,
-    assistant_streaming: bool,
     content_width: u16,
+    state: ConversationRenderState,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let content_width = usize::from(content_width.max(1));
@@ -53,7 +60,7 @@ pub(super) fn conversation_lines(
                     Style::default().fg(RolePalette::assistant()),
                     "",
                     content_width,
-                    !assistant_streaming,
+                    !state.assistant_streaming,
                 );
                 lines.push(Line::default());
             }
@@ -61,8 +68,8 @@ pub(super) fn conversation_lines(
                 thinking_lines(
                     &mut lines,
                     text,
-                    collapse_thinking,
-                    thinking_streaming,
+                    state.collapse_thinking,
+                    state.thinking_streaming,
                     content_width,
                 );
             }
@@ -72,6 +79,9 @@ pub(super) fn conversation_lines(
                 input,
                 batch,
             } => {
+                if is_task_tool_name(name) {
+                    continue;
+                }
                 if let Some(batch) = batch {
                     lines.push(Line::from(Span::styled(
                         format!("Tools · batch {batch}"),
@@ -88,6 +98,9 @@ pub(super) fn conversation_lines(
                 output,
                 is_error,
             } => {
+                if is_task_call(conversation, call_id) {
+                    continue;
+                }
                 let (result_state, duration) = tool_state(events, call_id, *is_error);
                 let color = result_color(result_state);
                 let tool_name = tool_name_for_call(conversation, call_id);
@@ -140,25 +153,131 @@ pub(super) fn conversation_lines(
                 else {
                     continue;
                 };
-                let status = match card.status {
-                    Some(crate::TuiSubagentStatus::Success) => "success",
-                    Some(crate::TuiSubagentStatus::Failure) => "failure",
-                    Some(crate::TuiSubagentStatus::Cancelled) => "cancelled",
-                    None => match card.presentation {
-                        crate::TuiExecutionState::ForegroundRunning => "foreground running",
-                        crate::TuiExecutionState::BackgroundRunning => "background running",
-                        _ => "running",
-                    },
-                };
-                lines.push(Line::from(format!(
-                    "Subagent {} · {} · {status} · {} · {} tool uses",
-                    card.id, card.agent, card.task_summary, card.tool_uses
-                )));
-                lines.push(Line::default());
+                subagent_card_lines(&mut lines, card, content_width, state.now);
             }
         }
     }
     lines
+}
+
+fn subagent_card_lines(
+    lines: &mut Vec<Line<'static>>,
+    card: &crate::SubagentCard,
+    content_width: usize,
+    now: Duration,
+) {
+    let agent = title_case(&card.agent);
+    let title_prefix = format!("● {agent} · ");
+    let summary_width = content_width.saturating_sub(title_prefix.width()).max(1);
+    let summary = bounded_single_line(&card.task_summary, summary_width);
+    lines.push(Line::from(vec![
+        Span::styled(
+            "● ",
+            Style::default()
+                .fg(subagent_status_color(card.status))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            agent,
+            Style::default()
+                .fg(RolePalette::tool())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(" · {summary}")),
+    ]));
+
+    let status = match card.status {
+        Some(crate::TuiSubagentStatus::Success) => "Success",
+        Some(crate::TuiSubagentStatus::Failure) => "Failure",
+        Some(crate::TuiSubagentStatus::Cancelled) => "Cancelled",
+        None if card.has_activity => "Running",
+        None => "Initializing",
+    };
+    let presentation = if card.status.is_some() {
+        "recent"
+    } else {
+        match card.presentation {
+            crate::TuiExecutionState::ForegroundRunning => "foreground",
+            crate::TuiExecutionState::BackgroundRunning => "background",
+            _ => "recent",
+        }
+    };
+    let elapsed = card
+        .started_at
+        .map(|started| card.terminal_at.unwrap_or(now).saturating_sub(started));
+    lines.push(Line::from(Span::styled(
+        format!("  {status} · {presentation}{}", duration_label(elapsed)),
+        Style::default().fg(subagent_status_color(card.status)),
+    )));
+
+    for activity in card.activities.iter().take(3) {
+        lines.push(Line::from(format!("  · {activity}")));
+    }
+    let hidden = card.tool_uses.saturating_sub(card.activities.len().min(3));
+    if hidden > 0 {
+        let noun = if hidden == 1 {
+            "activity"
+        } else {
+            "activities"
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  +{hidden} more {noun}"),
+            Style::default().fg(RolePalette::muted()),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Ctrl+B background · Enter inspect",
+        Style::default().fg(RolePalette::muted()),
+    )));
+}
+
+fn subagent_status_color(status: Option<crate::TuiSubagentStatus>) -> Color {
+    match status {
+        Some(crate::TuiSubagentStatus::Success) => RolePalette::success(),
+        Some(crate::TuiSubagentStatus::Failure) => RolePalette::error(),
+        Some(crate::TuiSubagentStatus::Cancelled) => RolePalette::warning(),
+        None => RolePalette::tool(),
+    }
+}
+
+fn title_case(value: &str) -> String {
+    let mut characters = value.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
+}
+
+fn bounded_single_line(value: &str, max_width: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut output = String::new();
+    for character in normalized.chars() {
+        let candidate_width = format!("{output}{character}").width();
+        if candidate_width > max_width {
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn is_task_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "task"
+            | "native::task"
+            | "task_control"
+            | "native::task_control"
+            | "task_message"
+            | "native::task_message"
+    )
+}
+
+fn is_task_call(conversation: &Conversation, call_id: &str) -> bool {
+    conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .any(|call| call.call_id == call_id && is_task_tool_name(&call.name))
 }
 
 fn tool_name_for_call(conversation: &Conversation, call_id: &str) -> String {
@@ -236,6 +355,15 @@ pub(super) fn detail_lines(
     conversation_is_authoritative: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let task_calls = events
+        .iter()
+        .filter_map(|event| match event {
+            TuiRuntimeEvent::ToolStarted { call_id, name, .. } if is_task_tool_name(name) => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
 
     for event in events {
         match event {
@@ -243,7 +371,7 @@ pub(super) fn detail_lines(
                 call_id,
                 name,
                 input,
-            } if !conversation_is_authoritative => line(
+            } if !conversation_is_authoritative && !is_task_tool_name(name) => line(
                 &mut lines,
                 "TOOLS",
                 Color::Magenta,
@@ -253,7 +381,7 @@ pub(super) fn detail_lines(
                 call_id,
                 duration,
                 result,
-            } if !conversation_is_authoritative => line(
+            } if !conversation_is_authoritative && !task_calls.contains(call_id.as_str()) => line(
                 &mut lines,
                 "TOOLS",
                 result_color(*result),
@@ -1201,6 +1329,15 @@ pub(super) fn syntax_highlight_test_calls() -> usize {
 mod tests {
     use super::*;
 
+    fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
+        ConversationRenderState {
+            collapse_thinking: false,
+            thinking_streaming: false,
+            assistant_streaming,
+            now: Duration::ZERO,
+        }
+    }
+
     fn reset_syntax_cache() {
         reset_syntax_highlight_test_state();
     }
@@ -1305,8 +1442,13 @@ mod tests {
             conversation
                 .apply(crate::ConversationEvent::MarkdownDelta(delta.into()))
                 .expect("streaming markdown should project");
-            let _ =
-                conversation_lines(&conversation, &[], &BTreeSet::new(), false, false, true, 80);
+            let _ = conversation_lines(
+                &conversation,
+                &[],
+                &BTreeSet::new(),
+                80,
+                conversation_state(true),
+            );
             assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 0);
         }
 
@@ -1318,10 +1460,8 @@ mod tests {
             &conversation,
             &[],
             &BTreeSet::new(),
-            false,
-            false,
-            false,
             80,
+            conversation_state(false),
         );
 
         assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 1);
@@ -1329,10 +1469,8 @@ mod tests {
             &conversation,
             &[],
             &BTreeSet::new(),
-            false,
-            false,
-            false,
             80,
+            conversation_state(false),
         );
         assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 1);
     }
@@ -1350,11 +1488,23 @@ mod tests {
             ))
             .unwrap();
 
-        let _ = conversation_lines(&restored, &[], &BTreeSet::new(), false, false, true, 80);
+        let _ = conversation_lines(
+            &restored,
+            &[],
+            &BTreeSet::new(),
+            80,
+            conversation_state(true),
+        );
         assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 0);
 
         for _ in 0..2 {
-            let _ = conversation_lines(&restored, &[], &BTreeSet::new(), false, false, false, 80);
+            let _ = conversation_lines(
+                &restored,
+                &[],
+                &BTreeSet::new(),
+                80,
+                conversation_state(false),
+            );
         }
         assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 1);
     }
@@ -1370,15 +1520,26 @@ mod tests {
         completed
             .apply(crate::ConversationEvent::MarkdownFinal(markdown.into()))
             .expect("completed markdown should project");
-        let completed_lines =
-            conversation_lines(&completed, &[], &BTreeSet::new(), false, false, false, 80);
+        let completed_lines = conversation_lines(
+            &completed,
+            &[],
+            &BTreeSet::new(),
+            80,
+            conversation_state(false),
+        );
         let mut streaming = Conversation::new("second");
         streaming
             .apply(crate::ConversationEvent::MarkdownDelta(
                 "```js\nconst streaming =".into(),
             ))
             .expect("streaming markdown should project");
-        let _ = conversation_lines(&streaming, &[], &BTreeSet::new(), false, false, true, 80);
+        let _ = conversation_lines(
+            &streaming,
+            &[],
+            &BTreeSet::new(),
+            80,
+            conversation_state(true),
+        );
 
         assert_eq!(SYNTAX_HIGHLIGHT_CALLS.with(std::cell::Cell::get), 1);
         assert!(

@@ -1023,6 +1023,14 @@ pub enum HeadlessTurnPortError {
 }
 
 pub trait TurnProvider {
+    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
+        if messages.is_empty() {
+            Ok(())
+        } else {
+            Err(HeadlessTurnPortError::Provider)
+        }
+    }
+
     fn next_parts(
         &mut self,
         events: &[TurnEvent],

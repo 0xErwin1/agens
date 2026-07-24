@@ -1,5 +1,7 @@
 //! Typed, lossless source projection for one visible conversation turn.
 
+use std::time::Duration;
+
 use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentStatus, bridge::TuiSubagentUpdate};
 use agens_core::{Message, MessagePart, Role};
 
@@ -93,8 +95,12 @@ pub struct SubagentCard {
     pub presentation: TuiExecutionState,
     pub tool_calls: Vec<ToolCall>,
     pub tool_uses: usize,
+    pub activities: Vec<String>,
     pub status: Option<TuiSubagentStatus>,
     pub final_result: Option<String>,
+    pub started_at: Option<Duration>,
+    pub terminal_at: Option<Duration>,
+    pub has_activity: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,7 +345,7 @@ impl Conversation {
         self.last_was_tool_call = is_tool_call;
         Ok(())
     }
-    pub(crate) fn apply_subagent_summary(&mut self, event: TuiSubagentEvent) {
+    pub(crate) fn apply_subagent_summary(&mut self, event: TuiSubagentEvent, now: Duration) {
         match event.update {
             TuiSubagentUpdate::Started {
                 agent,
@@ -353,24 +359,42 @@ impl Conversation {
                     presentation,
                     tool_calls: Vec::new(),
                     tool_uses: 0,
+                    activities: Vec::new(),
                     status: None,
                     final_result: None,
+                    started_at: Some(now),
+                    terminal_at: None,
+                    has_activity: false,
                 });
                 self.items.push(ConversationItem::SubagentCard(event.id));
             }
-            TuiSubagentUpdate::ToolCall { .. } => {
+            TuiSubagentUpdate::ToolCall { name, .. } => {
                 if let Some(card) = self
                     .subagent_cards
                     .iter_mut()
                     .find(|card| card.id == event.id && card.status.is_none())
                 {
                     card.tool_uses += 1;
+                    card.has_activity = true;
+                    if card.activities.len() < 3
+                        && let Some(activity) = subagent_activity(&name)
+                    {
+                        card.activities.push(activity.into());
+                    }
                 }
             }
             TuiSubagentUpdate::Reasoning(_)
             | TuiSubagentUpdate::Text(_)
             | TuiSubagentUpdate::ToolResult { .. }
-            | TuiSubagentUpdate::Error { .. } => {}
+            | TuiSubagentUpdate::Error { .. } => {
+                if let Some(card) = self
+                    .subagent_cards
+                    .iter_mut()
+                    .find(|card| card.id == event.id && card.status.is_none())
+                {
+                    card.has_activity = true;
+                }
+            }
             TuiSubagentUpdate::Terminal {
                 status,
                 final_result,
@@ -382,6 +406,7 @@ impl Conversation {
                 {
                     card.status = Some(status);
                     card.final_result = Some(final_result);
+                    card.terminal_at = Some(now);
                 }
             }
             _ => {}
@@ -448,8 +473,12 @@ impl Conversation {
             presentation: TuiExecutionState::CompletedRecent,
             tool_calls: Vec::new(),
             tool_uses,
+            activities: Vec::new(),
             status: Some(TuiSubagentStatus::Success),
             final_result: Some(final_result),
+            started_at: None,
+            terminal_at: None,
+            has_activity: true,
         });
         self.items.push(ConversationItem::SubagentCard(id));
     }
@@ -465,6 +494,18 @@ impl Conversation {
             .iter_mut()
             .flat_map(|batch| &mut batch.calls)
             .find(|call| call.call_id == call_id)
+    }
+}
+
+fn subagent_activity(name: &str) -> Option<&'static str> {
+    match name.strip_prefix("native::").unwrap_or(name) {
+        "read" => Some("Read files"),
+        "grep" | "search" => Some("Search code"),
+        "glob" | "list" => Some("List files"),
+        "edit" | "write" => Some("Edit files"),
+        "bash" => Some("Run command"),
+        "skill" => Some("Load skill"),
+        _ => None,
     }
 }
 fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bool) {

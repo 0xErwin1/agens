@@ -234,6 +234,8 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
             },
         ])
         .unwrap(),
+        draft: None,
+        resume_error: None,
     });
 
     let view = tui.view();
@@ -318,6 +320,8 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
         message: "Resumed session 2.".into(),
         presentation: TuiPresentation::new("new-provider", "new-model", "session #2"),
         history,
+        draft: None,
+        resume_error: None,
     });
 
     let resumed = tui.view();
@@ -332,7 +336,48 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
 }
 
 #[test]
-fn transcript_navigation_restores_destination_focus_and_disables_child_composer() {
+fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 40,
+        height: 8,
+    });
+    tui.begin_submission("old prompt");
+    tui.finish_submission(Ok("old answer".into()));
+    tui.handle(Event::Key(Key::PageUp));
+    assert!(!tui.following_bottom());
+    assert!(tui.begin_session_load());
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Previous attempt failed. Prompt restored; press Enter to retry.".into(),
+        presentation: TuiPresentation::new("openai-chatgpt", "gpt-5.5", "session #327"),
+        history: vec![Conversation::new("completed prompt")],
+        draft: Some("retry exact café 🙂".into()),
+        resume_error: None,
+    });
+
+    let resumed = tui.view();
+    assert!(!resumed.session_loading);
+    assert!(!resumed.running);
+    assert_eq!(resumed.input, "retry exact café 🙂");
+    assert_eq!(resumed.input_cursor, "retry exact café 🙂".chars().count());
+    assert_eq!(resumed.focus, agens_tui::TranscriptFocus::Composer);
+    assert!(resumed.following_bottom);
+    assert_eq!(
+        resumed.status,
+        Some("Previous attempt failed. Prompt restored; press Enter to retry.")
+    );
+    assert_eq!(resumed.completed_conversations.len(), 1);
+    assert_eq!(resumed.completed_conversations[0].user, "completed prompt");
+    assert_ne!(resumed.completed_conversations[0].user, resumed.input);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("retry exact café 🙂".into())
+    );
+}
+
+#[test]
+fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbox() {
     let mut tui = Tui::new(FakeEngine::default());
     for (id, call, output) in [(7, "seven", 40), (8, "eight", 80)] {
         start_child(&mut tui, id);
@@ -361,7 +406,10 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
     tui.select_transcript(TranscriptId::Subagent(7));
-    assert_eq!(tui.handle(Event::Key(Key::Char('x'))), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Char('x'))),
+        Action::CancelExecution(7)
+    );
     assert_eq!(tui.input(), "");
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     tui.set_collapse_thinking(true);
@@ -394,8 +442,15 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     assert!(!tui.view().following_bottom);
     assert_eq!(tui.handle(Event::Paste(" blocked".into())), Action::Render);
     assert_eq!(tui.input(), "m");
-    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
-    assert_eq!(tui.input(), "m");
+    assert_eq!(tui.handle(Event::Key(Key::Char('i'))), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::SendTaskMessage {
+            id: 7,
+            message: "m".into(),
+        }
+    );
+    assert_eq!(tui.input(), "");
     tui.handle(Event::Key(Key::Char('l')));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
@@ -448,6 +503,100 @@ fn transcript_navigation_restores_destination_focus_and_disables_child_composer(
     restored.handle(Event::Key(Key::Escape));
     assert_eq!(restored.handle(Event::Key(Key::Char('g'))), Action::Render);
     assert!(restored.view().dialog.is_none());
+}
+
+#[test]
+fn execution_strip_navigation_enters_children_and_backgrounds_the_focused_execution() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_agent_catalog(["reviewer", "writer"]);
+    tui.select_agent("writer");
+    for character in "next task".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    for (id, agent) in [(7, "reviewer"), (8, "writer")] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+            TuiSubagentEvent::started(id, agent, "task", TuiExecutionState::ForegroundRunning),
+        ));
+    }
+
+    assert_eq!(tui.handle(Event::Key(Key::Tab)), Action::Render);
+    assert_eq!(tui.view().execution_selection, Some(TranscriptId::Main));
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.view().execution_selection,
+        Some(TranscriptId::Subagent(8))
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Subagent(8));
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlB)),
+        Action::TransitionToBackground(8)
+    );
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "writer".into(),
+        event: TuiExecutionEvent::Backgrounded { id: 8 },
+    });
+    assert_eq!(tui.handle(Event::Key(Key::CtrlB)), Action::Render);
+    assert_eq!(tui.input(), "next task");
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
+
+    assert_eq!(
+        tui.handle(Event::MouseDown { column: 11, row: 0 }),
+        Action::Render
+    );
+    assert_ne!(tui.view().execution_selection, None);
+    assert!(tui.selected_text().is_none());
+}
+
+#[test]
+fn child_activity_reorders_executions_and_background_transition_keeps_parent_running() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.tick(Duration::from_secs(1));
+    start_child(&mut tui, 8);
+    tui.tick(Duration::from_secs(2));
+
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::reasoning(7, "working"),
+    ));
+    assert_eq!(tui.executions()[0].id(), 7);
+
+    tui.set_running(true);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Backgrounded { id: 7 },
+    });
+    assert!(tui.view().running);
+}
+
+#[test]
+fn transcript_picker_outcome_and_g_use_the_same_main_and_child_entries() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(
+            7,
+            "reviewer",
+            "review navigation",
+            TuiExecutionState::ForegroundRunning,
+        ),
+    ));
+
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.handle(Event::Key(Key::Char('g'))), Action::Render);
+    let from_g = format!("{:?}", tui.view().dialog);
+    tui.handle(Event::Key(Key::Escape));
+    tui.apply_submission_outcome(TuiSubmissionOutcome::TranscriptDialog);
+    let from_command = format!("{:?}", tui.view().dialog);
+
+    assert_eq!(from_command, from_g);
+    assert!(from_command.contains("Main"));
+    assert!(from_command.contains("Reviewer"));
 }
 
 #[test]
@@ -706,7 +855,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(parent.contains("Subagent 7 · reviewer"));
+    assert!(parent.contains("● Reviewer · review task"));
     assert!(!parent.contains("child-reasoning"));
     assert!(!parent.contains("child-partial"));
     assert!(!parent.contains("result-a"));
@@ -785,8 +934,8 @@ fn main_and_child_hierarchy_renders_each_event_once() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert_eq!(main.matches("Subagent 7 · reviewer").count(), 1, "{main:?}");
-    assert_eq!(main.matches("Subagent 8 · writer").count(), 1, "{main:?}");
+    assert_eq!(main.matches("● Reviewer · task-7").count(), 1, "{main:?}");
+    assert_eq!(main.matches("● Writer · task-8").count(), 1, "{main:?}");
     assert!(!main.contains("child-seven-sentinel"), "{main:?}");
     assert!(!main.contains("child-eight-sentinel"), "{main:?}");
 

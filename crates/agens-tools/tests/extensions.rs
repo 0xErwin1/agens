@@ -2,7 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -17,11 +17,12 @@ use agens_core::{
 };
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
-    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskExecutionEvent,
-    TaskExecutionLifecycle, TaskInvocation, TaskLaunchMode, TaskModelResolutionError,
-    TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill, TaskTerminalState, TaskTool,
-    TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskControlAction,
+    TaskControlTool, TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry,
+    TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
+    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
+    TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
+    ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
 use serde_json::Value;
@@ -1023,7 +1024,7 @@ fn task_shares_four_permits_only_across_clones() {
     let (release_sender, release_receiver) = mpsc::channel();
     let task = task_tool(BlockingTaskRunner {
         started: started_sender,
-        release: release_receiver,
+        release: Mutex::new(release_receiver),
     });
     let cancellation = Arc::new(AtomicBool::new(false));
     let mut calls = Vec::new();
@@ -1074,7 +1075,7 @@ fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
     let (release_sender, release_receiver) = mpsc::channel();
     let task = task_tool(BlockingTaskRunner {
         started: started_sender,
-        release: release_receiver,
+        release: Mutex::new(release_receiver),
     });
     let cancellation = Arc::new(AtomicBool::new(false));
     let mut clone = task.clone();
@@ -1119,12 +1120,12 @@ fn task_cancellation_wins_and_holds_permit_until_worker_exit() {
 }
 
 #[test]
-fn task_deadline_wins_over_a_noncooperative_worker() {
+fn task_has_no_global_deadline_and_finishes_when_the_worker_finishes() {
     let (started_sender, started_receiver) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let task = task_tool(BlockingTaskRunner {
         started: started_sender,
-        release: release_receiver,
+        release: Mutex::new(release_receiver),
     });
     let mut clone = task.clone();
     let call = thread::spawn(move || {
@@ -1139,8 +1140,10 @@ fn task_deadline_wins_over_a_noncooperative_worker() {
     started_receiver
         .recv_timeout(Duration::from_secs(1))
         .unwrap();
-    assert_eq!(call.join().unwrap(), ToolOutput::failure("task: timed out"));
+    thread::sleep(Duration::from_millis(30));
+    assert!(!call.is_finished());
     release_sender.send(()).unwrap();
+    assert_eq!(call.join().unwrap(), ToolOutput::success("done"));
 }
 
 #[test]
@@ -1152,15 +1155,17 @@ fn u15_lifecycle_shared_id_modes_and_terminal_ownership() {
         observed: Arc::clone(&observed),
         terminal: None,
     });
-    assert_eq!(
-        task.execute_with_launch_mode(
+    let foreground_output = task
+        .execute_with_launch_mode(
             &task_context(),
             task_arguments(),
-            TaskLaunchMode::Foreground
+            TaskLaunchMode::Foreground,
         )
-        .unwrap(),
-        ToolOutput::success("done")
-    );
+        .unwrap();
+    assert!(matches!(
+        foreground_output.content.as_str(),
+        "done" | "Subagent #1 running in background"
+    ));
     let mut background = task.clone();
     assert_eq!(
         background
@@ -1170,7 +1175,11 @@ fn u15_lifecycle_shared_id_modes_and_terminal_ownership() {
                 TaskLaunchMode::Background
             )
             .unwrap(),
-        ToolOutput::success("done")
+        ToolOutput::success("Subagent #2 running in background")
+    );
+    assert!(
+        task.execution_registry()
+            .wait_for_idle(Duration::from_secs(1))
     );
     let observed = observed.lock().unwrap().clone();
     let foreground = &observed[0];
@@ -1241,7 +1250,11 @@ fn u15_background_task_invocation_uses_the_shared_task_lifecycle() {
             }),
         )
         .unwrap(),
-        ToolOutput::success("done")
+        ToolOutput::success("Subagent #1 running in background")
+    );
+    assert!(
+        task.execution_registry()
+            .wait_for_idle(Duration::from_secs(1))
     );
 
     let lifecycle = observed.lock().unwrap().pop().unwrap();
@@ -1256,51 +1269,299 @@ fn u15_background_task_invocation_uses_the_shared_task_lifecycle() {
 }
 
 #[test]
-fn u15_lifecycle_terminal_follows_publication_winner_during_cancellation_and_deadline() {
-    for (context, expected, event, cancel) in [
-        (
-            ToolExecutionContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
-            ToolOutput::failure("task: cancelled"),
-            TaskExecutionEvent::Cancelled as fn(_) -> _,
-            true,
-        ),
-        (
-            ToolExecutionContext::with_timeout(Duration::from_millis(50)),
-            ToolOutput::failure("task: timed out"),
-            TaskExecutionEvent::Failed as fn(_) -> _,
-            false,
-        ),
-    ] {
-        let (paused_sender, paused_receiver) = mpsc::channel();
-        let (release_sender, release_receiver) = mpsc::channel();
-        let observed = Arc::new(Mutex::new(None));
-        let cancellation = context.cancellation_handle();
-        let mut task = task_tool(PublicationPausedTaskRunner {
-            paused: paused_sender,
-            release: release_receiver,
-            observed: Arc::clone(&observed),
-        });
-        let call = thread::spawn(move || task.execute(&context, task_arguments()).unwrap());
+fn u15_lifecycle_terminal_follows_cancellation_publication_winner() {
+    let context =
+        ToolExecutionContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1));
+    let (paused_sender, paused_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let observed = Arc::new(Mutex::new(None));
+    let cancellation = context.cancellation_handle();
+    let mut task = task_tool(PublicationPausedTaskRunner {
+        paused: paused_sender,
+        release: Mutex::new(Some(release_receiver)),
+        observed: Arc::clone(&observed),
+    });
+    let registry = task.execution_registry().clone();
+    let call = thread::spawn(move || task.execute(&context, task_arguments()).unwrap());
 
-        paused_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        if cancel {
-            cancellation.store(true, Ordering::Release);
-        }
+    paused_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    cancellation.store(true, Ordering::Release);
 
-        assert_eq!(call.join().unwrap(), expected);
-        release_sender.send(()).unwrap();
+    assert_eq!(call.join().unwrap(), ToolOutput::failure("task: cancelled"));
+    release_sender.send(()).unwrap();
+    assert!(registry.wait_for_idle(Duration::from_secs(1)));
 
-        let lifecycle = observed.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            lifecycle.events(),
-            vec![
-                TaskExecutionEvent::Admitted(lifecycle.id(), TaskLaunchMode::Foreground),
-                event(lifecycle.id()),
-            ]
+    let lifecycle = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        lifecycle.events(),
+        vec![
+            TaskExecutionEvent::Admitted(lifecycle.id(), TaskLaunchMode::Foreground),
+            TaskExecutionEvent::Cancelled(lifecycle.id()),
+        ]
+    );
+}
+
+#[test]
+fn task_registry_owns_session_ids_global_capacity_and_terminal_results() {
+    let registry = TaskExecutionRegistry::new();
+    let mut ids = Vec::new();
+
+    for _ in 0..4 {
+        ids.push(
+            registry
+                .admit(TaskLaunchMode::Foreground)
+                .expect("registry capacity"),
         );
     }
+
+    assert!(registry.admit(TaskLaunchMode::Background).is_none());
+    assert_eq!(
+        ids.iter().map(|id| id.value()).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+
+    assert!(registry.finish(
+        ids[0],
+        TaskTerminalState::Completed,
+        ToolOutput::success("done")
+    ));
+    assert!(!registry.finish(
+        ids[0],
+        TaskTerminalState::Failed,
+        ToolOutput::failure("late failure"),
+    ));
+    assert_eq!(registry.result(ids[0]), Some(ToolOutput::success("done")));
+
+    let replacement = registry
+        .admit(TaskLaunchMode::Background)
+        .expect("terminal execution releases capacity");
+    assert_eq!(replacement.value(), 5);
+}
+
+#[test]
+fn background_tasks_return_immediately_and_admitted_children_run_concurrently() {
+    let registry = TaskExecutionRegistry::new();
+    let (started, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let task = task_tool(ConcurrentTaskRunner {
+        started,
+        release: Arc::clone(&release),
+    })
+    .with_execution_registry(registry.clone());
+    let mut calls = Vec::new();
+
+    for _ in 0..4 {
+        let mut task = task.clone();
+        calls.push(thread::spawn(move || {
+            task.execute(
+                &task_context(),
+                serde_json::json!({"description":"concurrent","background":true}),
+            )
+            .unwrap()
+        }));
+    }
+
+    for _ in 0..4 {
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("all admitted children should start without runner serialization");
+    }
+    let mut outputs = calls
+        .into_iter()
+        .map(|call| call.join().unwrap().content)
+        .collect::<Vec<_>>();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        (1..=4)
+            .map(|id| format!("Subagent #{id} running in background"))
+            .collect::<Vec<_>>(),
+    );
+
+    let (lock, wake) = &*release;
+    *lock.lock().unwrap() = true;
+    wake.notify_all();
+    assert!(registry.wait_for_idle(Duration::from_secs(1)));
+}
+
+#[test]
+fn task_registry_detach_and_cancel_control_live_execution_without_parent_timeout() {
+    let registry = TaskExecutionRegistry::new();
+    let id = registry.admit(TaskLaunchMode::Foreground).unwrap();
+
+    assert_eq!(
+        registry.control(TaskMessageSource::Main, id, TaskControlAction::Background),
+        Ok(())
+    );
+    assert_eq!(
+        registry.control(TaskMessageSource::Main, id, TaskControlAction::Cancel),
+        Ok(())
+    );
+    assert!(registry.is_cancelled(id));
+    assert!(registry.finish(
+        id,
+        TaskTerminalState::Cancelled,
+        ToolOutput::failure("task: cancelled"),
+    ));
+    assert!(
+        !registry
+            .lifecycle(id)
+            .unwrap()
+            .finish(TaskTerminalState::Completed)
+    );
+}
+
+#[test]
+fn task_mailboxes_are_typed_fifo_bounded_and_reject_siblings_or_terminal_targets() {
+    let registry = TaskExecutionRegistry::new();
+    let first = registry.admit(TaskLaunchMode::Background).unwrap();
+    let sibling = registry.admit(TaskLaunchMode::Background).unwrap();
+
+    registry
+        .send_message(
+            TaskMessageSource::Main,
+            TaskMessageTarget::Execution(first),
+            "one".into(),
+        )
+        .unwrap();
+    registry
+        .send_message(
+            TaskMessageSource::User,
+            TaskMessageTarget::Execution(first),
+            "two".into(),
+        )
+        .unwrap();
+    assert!(
+        registry
+            .send_message(
+                TaskMessageSource::Execution(first),
+                TaskMessageTarget::Execution(sibling),
+                "forbidden".into(),
+            )
+            .is_err()
+    );
+    registry
+        .send_message(
+            TaskMessageSource::Execution(first),
+            TaskMessageTarget::Main,
+            "child reply".into(),
+        )
+        .unwrap();
+
+    let inbox = registry.drain_messages(TaskMessageTarget::Execution(first));
+    assert_eq!(
+        inbox
+            .iter()
+            .map(|message| (message.source(), message.content()))
+            .collect::<Vec<_>>(),
+        vec![
+            (TaskMessageSource::Main, "one"),
+            (TaskMessageSource::User, "two"),
+        ]
+    );
+    assert_eq!(
+        registry.drain_messages(TaskMessageTarget::Main)[0].content(),
+        "child reply"
+    );
+
+    assert!(
+        registry
+            .send_message(
+                TaskMessageSource::Main,
+                TaskMessageTarget::Execution(first),
+                "x".repeat(8 * 1024 + 1),
+            )
+            .is_err()
+    );
+    registry.finish(
+        first,
+        TaskTerminalState::Completed,
+        ToolOutput::success("done"),
+    );
+    assert!(
+        registry
+            .send_message(
+                TaskMessageSource::Main,
+                TaskMessageTarget::Execution(first),
+                "late".into(),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn task_control_and_message_tools_share_registry_and_enforce_caller_routes() {
+    let registry = TaskExecutionRegistry::new();
+    let first = registry.admit(TaskLaunchMode::Foreground).unwrap();
+    let sibling = registry.admit(TaskLaunchMode::Background).unwrap();
+    let mut parent_control = TaskControlTool::new(registry.clone(), TaskMessageSource::Main);
+    let mut parent_message = TaskMessageTool::new(registry.clone(), TaskMessageSource::Main);
+    let mut child_message =
+        TaskMessageTool::new(registry.clone(), TaskMessageSource::Execution(first));
+
+    assert_eq!(
+        parent_control
+            .execute(
+                &task_context(),
+                serde_json::json!({"action":"background","id":first.value()}),
+            )
+            .unwrap(),
+        ToolOutput::success(format!("Subagent #{} moved to background", first.value())),
+    );
+    assert_eq!(
+        parent_message
+            .execute(
+                &task_context(),
+                serde_json::json!({"target":first.value(),"message":"continue"}),
+            )
+            .unwrap(),
+        ToolOutput::success("task message queued"),
+    );
+    assert_eq!(
+        child_message
+            .execute(
+                &task_context(),
+                serde_json::json!({"target":"main","message":"report"}),
+            )
+            .unwrap(),
+        ToolOutput::success("task message queued"),
+    );
+    assert!(
+        child_message
+            .execute(
+                &task_context(),
+                serde_json::json!({"target":sibling.value(),"message":"forbidden"}),
+            )
+            .unwrap()
+            .is_error
+    );
+    assert!(registry.finish(
+        first,
+        TaskTerminalState::Completed,
+        ToolOutput::success("final result"),
+    ));
+    assert_eq!(
+        parent_control
+            .execute(
+                &task_context(),
+                serde_json::json!({"action":"status","id":first.value()}),
+            )
+            .unwrap(),
+        ToolOutput::success(format!(
+            "Subagent #{}: completed\nfinal result",
+            first.value()
+        )),
+    );
+    assert_eq!(
+        TaskControlTool::input_schema()["properties"]["action"]["enum"],
+        serde_json::json!(["background", "cancel", "status"]),
+    );
+    assert_eq!(
+        TaskMessageTool::input_schema()["properties"]["message"]["maxLength"],
+        8192,
+    );
 }
 
 #[test]
@@ -1530,7 +1791,7 @@ struct RecordingTaskRunner;
 
 impl TaskRunner for RecordingTaskRunner {
     fn run(
-        &mut self,
+        &self,
         request: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1556,7 +1817,7 @@ struct CountingTaskRunner(Arc<AtomicUsize>);
 
 impl TaskRunner for CountingTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1574,7 +1835,7 @@ struct CapturingTaskRunner(CapturedTaskModels);
 
 impl TaskRunner for CapturingTaskRunner {
     fn run(
-        &mut self,
+        &self,
         request: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1593,7 +1854,7 @@ struct OversizedTaskRunner;
 
 impl TaskRunner for OversizedTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1614,7 +1875,7 @@ enum TerminalTaskRunner {
 
 impl TaskRunner for TerminalTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1636,7 +1897,32 @@ impl TaskRunner for TerminalTaskRunner {
 
 struct BlockingTaskRunner {
     started: mpsc::Sender<()>,
-    release: mpsc::Receiver<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+struct ConcurrentTaskRunner {
+    started: mpsc::Sender<()>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl TaskRunner for ConcurrentTaskRunner {
+    fn run(
+        &self,
+        _: TaskTurnRequest,
+        _: &TaskRunContext,
+    ) -> Result<TaskTurnResult, TaskRunnerError> {
+        self.started.send(()).unwrap();
+        let (lock, wake) = &*self.release;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = wake.wait(released).unwrap();
+        }
+
+        Ok(TaskTurnResult {
+            output: "done".into(),
+            iterations: 1,
+        })
+    }
 }
 
 struct LifecycleTaskRunner {
@@ -1647,20 +1933,25 @@ struct LifecycleTaskRunner {
 
 struct PublicationPausedTaskRunner {
     paused: mpsc::Sender<()>,
-    release: mpsc::Receiver<()>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
     observed: Arc<Mutex<Option<TaskExecutionLifecycle>>>,
 }
 
 impl TaskRunner for PublicationPausedTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
         let lifecycle = context.execution().cloned().expect("admitted lifecycle");
         self.observed.lock().unwrap().replace(lifecycle);
         let paused = self.paused.clone();
-        let release = std::mem::replace(&mut self.release, mpsc::channel().1);
+        let release = self
+            .release
+            .lock()
+            .unwrap()
+            .take()
+            .expect("single publication pause");
         context.set_before_publication_hook(move || {
             paused.send(()).unwrap();
             release.recv().unwrap();
@@ -1674,7 +1965,7 @@ impl TaskRunner for PublicationPausedTaskRunner {
 
 impl TaskRunner for LifecycleTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         context: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
@@ -1696,12 +1987,12 @@ impl TaskRunner for LifecycleTaskRunner {
 
 impl TaskRunner for BlockingTaskRunner {
     fn run(
-        &mut self,
+        &self,
         _: TaskTurnRequest,
         _: &TaskRunContext,
     ) -> Result<TaskTurnResult, TaskRunnerError> {
         self.started.send(()).unwrap();
-        self.release.recv().unwrap();
+        self.release.lock().unwrap().recv().unwrap();
         Ok(TaskTurnResult {
             output: "done".into(),
             iterations: 1,
