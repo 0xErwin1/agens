@@ -226,7 +226,7 @@ fn subagent_card_lines(
         )));
     }
     lines.push(Line::from(Span::styled(
-        "  Ctrl+B background · Enter inspect",
+        "  Tab focus · Enter inspect · Ctrl+B background",
         Style::default().fg(RolePalette::muted()),
     )));
 }

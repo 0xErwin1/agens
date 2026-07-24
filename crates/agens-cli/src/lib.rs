@@ -1414,7 +1414,9 @@ fn run_session_attempt_lifecycle_with_terminal_writer(
             &turn,
             current_session_timestamp(),
         )
-        .map_err(|_| CliError::storage("completed session could not be saved"))
+        .map_err(|error| {
+            CliError::storage(format!("completed session could not be saved: {error}"))
+        })
         .map_err(AttemptLifecycleError::Runtime)?
     {
         agens_core::AttemptFinishOutcome::Finished => {}
