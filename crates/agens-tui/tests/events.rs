@@ -523,6 +523,9 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     assert_eq!(tui.input(), "");
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
     tui.set_collapse_thinking(true);
+    // Collapsed → Truncated → Expanded: the bounded Truncated preview is too
+    // short to scroll, so the full body is what this navigation assertion needs.
+    tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
     assert!(tui.view().collapse_thinking);
@@ -562,6 +565,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
     );
     assert_eq!(tui.input(), "");
     tui.handle(Event::Key(Key::Char('l')));
+    tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::PageUp));
     let child_eight_offset = tui.view().scroll_offset;

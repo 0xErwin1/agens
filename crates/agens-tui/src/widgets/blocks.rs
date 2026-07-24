@@ -245,15 +245,15 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
 
 /// Whether consecutive collapsed calls of this kind may fold into a verb-group.
 ///
-/// Read-family and write calls fold; bash and edit never fold eagerly (their
-/// side effects deserve individual rows), and unknown/MCP tools stay separate.
+/// Only non-destructive read-family calls fold. Bash, edit and write mutate the
+/// world, so each keeps an individually auditable row, and unknown/MCP tools
+/// stay separate because their effect is unknown.
 pub(crate) fn tool_input_groupable(parsed: &ToolInput) -> bool {
     matches!(
         parsed,
         ToolInput::Read { .. }
             | ToolInput::List { .. }
             | ToolInput::Search { .. }
-            | ToolInput::Write { .. }
             | ToolInput::Glob { .. }
             | ToolInput::Grep { .. }
     )
@@ -289,7 +289,7 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
         },
         ToolInput::Bash { command } => HeaderParts {
             verb: "$",
-            operand: summarize_args(command),
+            operand: collapse_whitespace(command),
             suffix: None,
             shell: true,
         },
@@ -306,10 +306,93 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
     }
 }
 
-/// Collapse any whitespace run (including newlines) to a single space so a
-/// multi-line or JSON argument payload becomes a compact one-line summary.
+/// Summarize an unknown tool's arguments without echoing their values.
+///
+/// A JSON object payload is reduced to its top-level key shape (`{path, limit}`)
+/// so the header describes the call instead of dumping it; any other payload
+/// collapses to a single whitespace-normalized line. The complete raw arguments
+/// stay reachable through [`DisplayMode::Expanded`].
 fn summarize_args(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') {
+        format_key_shape(&object_keys(trimmed))
+    } else {
+        collapse_whitespace(trimmed)
+    }
+}
+
+fn collapse_whitespace(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const MAX_SUMMARIZED_KEYS: usize = 6;
+const MAX_SUMMARIZED_KEY_WIDTH: usize = 24;
+
+/// Top-level member names of a JSON-shaped object payload, in source order.
+///
+/// This is a shape scanner, not a parser: it tracks nesting depth and string
+/// literals well enough to distinguish a depth-1 key from a value or a nested
+/// member, and simply yields nothing for malformed input.
+fn object_keys(raw: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut pending: Option<String> = None;
+    let mut characters = raw.chars();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '{' | '[' => {
+                depth += 1;
+                pending = None;
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                pending = None;
+            }
+            '"' => {
+                let mut literal = String::new();
+                let mut escaped = false;
+                for character in characters.by_ref() {
+                    if escaped {
+                        literal.push(character);
+                        escaped = false;
+                    } else if character == '\\' {
+                        escaped = true;
+                    } else if character == '"' {
+                        break;
+                    } else {
+                        literal.push(character);
+                    }
+                }
+                pending = (depth == 1).then_some(literal);
+            }
+            ':' => {
+                if depth == 1
+                    && let Some(key) = pending.take()
+                {
+                    keys.push(key);
+                }
+            }
+            character if character.is_whitespace() => {}
+            _ => pending = None,
+        }
+    }
+
+    keys
+}
+
+fn format_key_shape(keys: &[String]) -> String {
+    let shown = keys
+        .iter()
+        .take(MAX_SUMMARIZED_KEYS)
+        .map(|key| truncate_operand(&collapse_whitespace(key), MAX_SUMMARIZED_KEY_WIDTH))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if keys.len() > MAX_SUMMARIZED_KEYS {
+        format!("{{{shown}, …}}")
+    } else {
+        format!("{{{shown}}}")
+    }
 }
 
 fn truncate_operand(operand: &str, budget: usize) -> String {
@@ -395,10 +478,11 @@ impl BlockContent for ToolResultBlock {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
         let mut lines = vec![BlockLine::new(self.footer.clone())];
         let body = match mode {
-            DisplayMode::Collapsed => &self.collapsed_body,
-            DisplayMode::Truncated | DisplayMode::Expanded => &self.full_body,
+            DisplayMode::Collapsed => self.collapsed_body.clone(),
+            DisplayMode::Truncated => bounded_preview(&self.full_body),
+            DisplayMode::Expanded => self.full_body.clone(),
         };
-        lines.extend(body.iter().cloned().map(BlockLine::new));
+        lines.extend(body.into_iter().map(BlockLine::new));
         lines
     }
 
@@ -421,6 +505,28 @@ impl BlockContent for ToolResultBlock {
     fn is_groupable(&self) -> bool {
         false
     }
+}
+
+const PREVIEW_HEAD_LINES: usize = 5;
+const PREVIEW_TAIL_LINES: usize = 3;
+
+/// Head/tail preview window for a [`DisplayMode::Truncated`] body.
+///
+/// Bodies short enough to fit the window are returned unchanged so the marker
+/// never claims a truncation that did not happen.
+fn bounded_preview(body: &[Line<'static>]) -> Vec<Line<'static>> {
+    if body.len() <= PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES + 1 {
+        return body.to_vec();
+    }
+
+    let hidden = body.len() - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES;
+    let mut preview = body[..PREVIEW_HEAD_LINES].to_vec();
+    preview.push(Line::from(Span::styled(
+        format!("  … {hidden} more lines · Ctrl+O for full output"),
+        Style::default().fg(RolePalette::chrome()),
+    )));
+    preview.extend_from_slice(&body[body.len() - PREVIEW_TAIL_LINES..]);
+    preview
 }
 
 fn short_tool_name(name: &str) -> String {
@@ -562,7 +668,7 @@ mod tests {
                 name: "mcp::foo__bar".into(),
                 raw: "{\"a\":1}".into(),
             }),
-            "foo__bar {\"a\":1}"
+            "foo__bar {a}"
         );
         // Multi-line raw args collapse to a single summarized line (no JSON dump).
         let collapsed = header_of(&ToolInput::Other {
@@ -595,12 +701,11 @@ mod tests {
     }
 
     #[test]
-    fn fold_policy_groups_read_family_but_never_bash_or_edit() {
+    fn fold_policy_groups_read_family_but_never_a_destructive_kind() {
         for groupable in [
             ToolInput::Read { path: "a".into() },
             ToolInput::List { path: "a".into() },
             ToolInput::Search { path: "a".into() },
-            ToolInput::Write { path: "a".into() },
             ToolInput::Glob {
                 pattern: "*".into(),
                 path: None,
@@ -617,6 +722,7 @@ mod tests {
                 command: "ls".into(),
             },
             ToolInput::Edit { path: "a".into() },
+            ToolInput::Write { path: "a".into() },
             ToolInput::Other {
                 name: "x".into(),
                 raw: "y".into(),
@@ -624,6 +730,85 @@ mod tests {
         ] {
             assert!(!tool_input_groupable(&ungroupable), "{ungroupable:?}");
         }
+    }
+
+    #[test]
+    fn write_calls_never_fold_eagerly_even_though_they_read_like_a_path_verb() {
+        let write = ToolInput::Write {
+            path: "src/generated.rs".into(),
+        };
+        let block = ToolCallBlock {
+            input: "{\"path\":\"src/generated.rs\"}",
+            parsed: &write,
+            batch: None,
+            content_width: 80,
+        };
+        assert!(
+            !block.is_groupable(),
+            "a write is destructive and keeps its own row"
+        );
+    }
+
+    #[test]
+    fn mcp_headers_summarize_argument_shape_instead_of_raw_json() {
+        let header = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: "{\"path\":\"/etc/hosts\",\"limit\":10,\"nested\":{\"deep\":true}}".into(),
+        });
+        assert_eq!(header, "foo__bar {path, limit, nested}");
+        assert!(!header.contains('"'), "no raw JSON punctuation: {header:?}");
+        assert!(!header.contains("/etc/hosts"), "no argument values");
+        assert!(!header.contains("deep"), "no nested keys");
+
+        assert_eq!(
+            header_of(&ToolInput::Other {
+                name: "native::custom".into(),
+                raw: "{}".into(),
+            }),
+            "custom {}"
+        );
+        // Non-object payloads keep the collapsed single-line summary.
+        assert_eq!(
+            header_of(&ToolInput::Other {
+                name: "native::custom".into(),
+                raw: "line one\n  line two".into(),
+            }),
+            "custom line one line two"
+        );
+    }
+
+    #[test]
+    fn truncated_result_body_is_a_bounded_preview_while_expanded_shows_everything() {
+        let full_body: Vec<Line<'static>> = (1..=40)
+            .map(|index| Line::from(format!("row {index}")))
+            .collect();
+        let block = ToolResultBlock {
+            footer: ToolRow::result_footer("read", "Success", RolePalette::success(), None),
+            collapsed_body: vec![ToolRow::collapsed_output()],
+            full_body,
+            accent: RolePalette::tool(),
+        };
+
+        let truncated = block.lines(DisplayMode::Truncated);
+        let truncated_text: Vec<String> =
+            truncated.iter().map(|row| line_text(&row.line)).collect();
+        assert!(
+            truncated.len() < 15,
+            "truncated stays bounded: {truncated_text:?}"
+        );
+        assert!(truncated_text.iter().any(|row| row == "row 1"));
+        assert!(truncated_text.iter().any(|row| row == "row 5"));
+        assert!(!truncated_text.iter().any(|row| row == "row 6"));
+        assert!(truncated_text.iter().any(|row| row == "row 40"));
+        assert!(
+            truncated_text
+                .iter()
+                .any(|row| row.contains("32 more lines")),
+            "elision marker names the hidden count: {truncated_text:?}"
+        );
+
+        let expanded = block.lines(DisplayMode::Expanded);
+        assert_eq!(expanded.len(), 41, "expanded still shows the whole body");
     }
 
     #[test]

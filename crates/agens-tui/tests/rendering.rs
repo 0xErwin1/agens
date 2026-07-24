@@ -674,6 +674,88 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
 }
 
 #[test]
+fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(110, 44)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    for (call_id, name, input, parsed) in [
+        (
+            "read-1",
+            "native::read",
+            "{\"path\":\"src/main.rs\"}",
+            agens_core::ToolInput::Read {
+                path: "src/main.rs".into(),
+            },
+        ),
+        (
+            "bash-1",
+            "native::bash",
+            "{\"command\":\"cargo test\"}",
+            agens_core::ToolInput::Bash {
+                command: "cargo test".into(),
+            },
+        ),
+        (
+            "grep-1",
+            "native::grep",
+            "{\"pattern\":\"needle\",\"path\":\"src\"}",
+            agens_core::ToolInput::Grep {
+                pattern: "needle".into(),
+                path: Some("src".into()),
+            },
+        ),
+        (
+            "mcp-1",
+            "mcp::foo__bar",
+            "{\"path\":\"/etc/hosts-sentinel\",\"limit\":10}",
+            agens_core::ToolInput::Other {
+                name: "mcp::foo__bar".into(),
+                raw: "{\"path\":\"/etc/hosts-sentinel\",\"limit\":10}".into(),
+            },
+        ),
+    ] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            input: input.into(),
+            parsed,
+        })
+        .unwrap();
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: call_id.into(),
+            output: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    for header in [
+        "Read src/main.rs",
+        "$ cargo test",
+        "Grep needle in src",
+        "foo__bar {path, limit}",
+    ] {
+        assert!(text.contains(header), "missing {header:?}: {text:?}");
+    }
+    assert!(
+        !text.contains("\"path\":"),
+        "no raw JSON on the scan path: {text:?}"
+    );
+    assert!(!text.contains("/etc/hosts-sentinel"), "{text:?}");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let expanded = rendered_text(&renderer);
+    assert!(
+        expanded.contains("/etc/hosts-sentinel"),
+        "full raw arguments stay reachable when expanded: {expanded:?}"
+    );
+}
+
+#[test]
 fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
     let terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
