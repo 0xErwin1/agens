@@ -28,6 +28,8 @@ const COLUMN_GAP: usize = 2;
 const TRAILING_PAD: usize = 1;
 const BADGE_GAP: usize = 1;
 const MIN_LABEL_COLUMNS: usize = 8;
+/// Below this the metadata column is dropped instead of squeezed to noise.
+const MIN_RIGHT_COLUMNS: usize = 8;
 const SEARCH_LABEL: &str = "search: ";
 const SEARCH_CURSOR: &str = "▏";
 const SEARCH_HINT: &str = "type to filter";
@@ -53,9 +55,10 @@ impl<'a> OverlayRow<'a> {
 
     /// Flattens the row into exactly `width` display columns.
     ///
-    /// The right column wins the width negotiation up to the point where the
-    /// label would drop below [`MIN_LABEL_COLUMNS`]; past that the right column
-    /// is dropped entirely rather than squeezing the label to nothing.
+    /// The right column may claim at most half the row and never enough to push
+    /// the label below [`MIN_LABEL_COLUMNS`]; once its own share falls below
+    /// [`MIN_RIGHT_COLUMNS`] it is dropped whole rather than squeezed, because
+    /// the label is the row's identity and the right column is metadata.
     fn line(&self, width: u16) -> Line<'static> {
         let width = usize::from(width);
         if width < MARKER_COLUMNS {
@@ -86,14 +89,14 @@ impl<'a> OverlayRow<'a> {
             remaining -= badge.width() + BADGE_GAP;
         }
 
+        let right_budget = remaining
+            .saturating_sub(MIN_LABEL_COLUMNS + COLUMN_GAP + TRAILING_PAD)
+            .min(remaining / 2);
         let right = self
             .right_label
             .as_deref()
-            .map(|right| {
-                let budget =
-                    remaining.saturating_sub(MIN_LABEL_COLUMNS + COLUMN_GAP + TRAILING_PAD);
-                truncate_columns(right, budget.min(right.width()))
-            })
+            .filter(|_| right_budget >= MIN_RIGHT_COLUMNS)
+            .map(|right| truncate_columns(right, right_budget.min(right.width())))
             .filter(|right| !right.is_empty());
         let reserved = right
             .as_ref()
@@ -325,7 +328,7 @@ mod tests {
         let buffer = render_rows(40, &rows, rows.len());
         let text = row_text(&buffer, 0);
 
-        assert!(text.ends_with("connect to a provider "), "{text:?}");
+        assert!(text.ends_with("connect to a provi… "), "{text:?}");
         assert!(text.contains('…'), "{text:?}");
         assert_eq!(text.width(), 40, "{text:?}");
         assert_eq!(
@@ -333,6 +336,31 @@ mod tests {
             RolePalette::muted(),
             "right column stays muted"
         );
+    }
+
+    #[test]
+    fn the_right_column_never_starves_the_label() {
+        let rows = [
+            OverlayRow {
+                right_label: Some("Initializing · inspect the overlay shell".into()),
+                ..OverlayRow::new("explore #9")
+            },
+            OverlayRow {
+                right_label: Some("Unavailable".into()),
+                badge: Some("disabled"),
+                ..OverlayRow::new("future-model")
+            },
+        ];
+
+        let wide = render_rows(54, &rows, rows.len());
+        let text = row_text(&wide, 0);
+        assert!(text.starts_with("  explore #9  "), "{text:?}");
+        assert!(text.ends_with("Initializing · inspect th… "), "{text:?}");
+
+        // Below the minimum the metadata column is dropped, not squeezed.
+        let narrow = row_text(&render_rows(22, &rows, rows.len()), 1);
+        assert!(narrow.starts_with("  disabled future-mod…"), "{narrow:?}");
+        assert!(!narrow.contains("Una"), "{narrow:?}");
     }
 
     #[test]

@@ -1922,6 +1922,45 @@ fn short_session_dialog_keeps_search_and_selected_row_visible_without_default_de
 }
 
 #[test]
+fn subagent_inspect_dialog_renders_through_the_overlay_shell() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(70, 18)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    for (id, agent) in [(9, "explore"), (10, "reviewer")] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(
+                id,
+                agent,
+                "inspect the overlay shell",
+                TuiExecutionState::ForegroundRunning,
+            ),
+        );
+    }
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('g')));
+    renderer.render(tui.view()).unwrap();
+    let inspect = rendered_text(&renderer);
+
+    assert!(inspect.contains("─ Subagents"), "{inspect:?}");
+    assert!(inspect.contains("[×]"), "{inspect:?}");
+    assert!(inspect.contains("  Main"), "{inspect:?}");
+    assert!(inspect.contains("❯ Explore #9"), "{inspect:?}");
+    assert!(inspect.contains("  Reviewer #10"), "{inspect:?}");
+    assert!(inspect.contains("navigate"), "derived footer: {inspect:?}");
+    assert!(inspect.contains("select"), "derived footer: {inspect:?}");
+    assert_eq!(
+        cell_for_text(&renderer, "Explore #9").bg,
+        Color::Rgb(0x1b, 0x33, 0x30),
+        "the selection band spans the row"
+    );
+}
+
+#[test]
 fn read_only_dialog_renders_explicit_empty_and_clipped_selected_details() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(32, 7)).unwrap());
     let mut tui = Tui::new(FakeEngine);
@@ -2687,15 +2726,61 @@ fn subagent_terminal_status_and_elapsed_are_frozen_and_low_dimensions_are_safe()
         ),
     ]);
     tui.handle(Event::Key(Key::Char('/')));
-    for (width, height) in [(1, 1), (2, 3), (8, 4), (34, 10)] {
-        let mut renderer =
-            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
-        renderer.render(tui.view()).unwrap();
-        assert_eq!(
-            rendered_text(&renderer).chars().count(),
-            usize::from(width) * usize::from(height)
-        );
-    }
+    let low_dimensions = |tui: &Tui<FakeEngine>, label: &str| {
+        for (width, height) in [(1, 1), (2, 3), (8, 4), (34, 10)] {
+            let mut renderer =
+                RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+            renderer.render(tui.view()).unwrap();
+            assert_eq!(
+                rendered_text(&renderer).chars().count(),
+                usize::from(width) * usize::from(height),
+                "{label} at {width}x{height}"
+            );
+        }
+    };
+    low_dimensions(&tui, "palette");
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose a model",
+        Some("Up/Down navigate, Enter selects, Esc cancels"),
+        (0..12)
+            .map(|index| DialogEntry::action(format!("Option {index:02}"), format!("pick:{index}")))
+            .collect(),
+    ));
+    low_dimensions(&tui, "selection dialog");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    low_dimensions(&tui, "selection dialog with details");
+
+    tui.show_selection_dialog(DialogView::sessions_page(
+        vec![DialogEntry::action_with_metadata(
+            "#7 Alpha",
+            "2 turns · 5m ago",
+            "7 alpha",
+            "ID: 7 · Alpha\nTurns: 2",
+            "session:7",
+        )],
+        SessionDialogRequest::initial(),
+        Some(SessionDialogCursor::new(100, 7)),
+    ));
+    low_dimensions(&tui, "session dialog");
+
+    tui.show_selection_dialog(DialogView::sessions_loading(SessionDialogRequest::initial()));
+    low_dimensions(&tui, "loading session dialog");
+
+    tui.show_selection_dialog(
+        DialogView::selection(
+            "Permission required",
+            Some("native::read\n/work/alpha"),
+            vec![
+                DialogEntry::action("Allow once", "permission:1:allow-once"),
+                DialogEntry::action("Deny once", "permission:1:deny-once"),
+            ],
+        )
+        .as_confirm(),
+    );
+    low_dimensions(&tui, "confirm dialog");
 }
 
 #[test]
