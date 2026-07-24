@@ -13435,9 +13435,9 @@ mod tests {
             );
         }
         // Tool name appears on header and result footer; assert the card chrome once.
-        assert!(restored_render.contains("┌ read"), "{restored_render:?}");
+        assert!(restored_render.contains("read {}"), "{restored_render:?}");
         assert_eq!(
-            restored_render.matches("┌ read").count(),
+            restored_render.matches("read {}").count(),
             1,
             "{restored_render:?}"
         );

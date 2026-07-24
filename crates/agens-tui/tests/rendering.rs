@@ -410,8 +410,8 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     ] {
         assert_eq!(text.matches(expected).count(), 1, "{expected}: {text:?}");
     }
-    assert!(text.contains("┌ read"), "{text:?}");
-    assert!(text.contains("┌ grep"), "{text:?}");
+    assert!(text.contains("read src/lib.rs"), "{text:?}");
+    assert!(text.contains("grep needle"), "{text:?}");
     assert!(text.contains("└ read · Success"), "{text:?}");
     assert!(text.contains("└ grep · Failure"), "{text:?}");
     assert!(!text.contains("native::read · read-1"), "{text:?}");
@@ -560,7 +560,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         "THINKING_BODY",
         "TOOL_BODY",
         "• ASSISTANT_LIST",
-        "┌ read",
+        "read {}",
     ] {
         // Full-width transcript content shares a stable left margin.
         assert!(
@@ -1058,7 +1058,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         "write",
         "write result",
         "12ms",
-        "8 + new line",
+        "new line",
         "8/128",
         "Request failed safely",
         "Action: Check credentials and retry.",
@@ -1074,7 +1074,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     assert!(!text.contains("native::write · write-2"), "{text:?}");
     assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
     assert_eq!(text.matches("Error").count(), 1, "{text:?}");
-    assert!(text.find("┌ read").unwrap() < text.find("┌ write").unwrap());
+    assert!(text.find("read src/render.rs").unwrap() < text.find("write src/render.rs").unwrap());
 }
 
 #[test]
@@ -1182,13 +1182,14 @@ fn renderer_recovers_complete_long_output_through_production_scroll_offsets() {
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("output-end-sentinel"));
 
+    let mut traversal = String::new();
     for _ in 0..100 {
-        tui.handle(Event::Key(Key::PageUp));
+        tui.handle(Event::Key(Key::ScrollUp));
         renderer.render(tui.view()).unwrap();
+        traversal.push_str(&rendered_text(&renderer));
     }
-    let mut traversal = rendered_text(&renderer);
     for _ in 0..100 {
-        tui.handle(Event::Key(Key::PageDown));
+        tui.handle(Event::Key(Key::ScrollDown));
         renderer.render(tui.view()).unwrap();
         traversal.push_str(&rendered_text(&renderer));
     }
@@ -1815,8 +1816,8 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         "first line",
         "second line",
         "12ms",
-        "7 - old line",
-        "8 + new line",
+        "old line",
+        "new line",
         "8/128",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");

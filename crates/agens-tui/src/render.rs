@@ -24,7 +24,7 @@ use crate::conversation::ConversationItem;
 use crate::widgets::{
     BlockContent, DisplayMode, RolePalette, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow,
 };
-use crate::{Conversation, DiffLineKind, ToolResultState, TuiRuntimeEvent};
+use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
@@ -76,23 +76,28 @@ pub(super) fn conversation_lines(
                 );
             }
             ConversationItem::ToolCall {
-                call_id: _,
+                call_id,
                 name,
                 input,
-                parsed: _,
+                parsed,
                 batch,
             } => {
                 if is_task_tool_name(name) {
                     continue;
                 }
                 let block = ToolCallBlock {
-                    name,
                     input,
+                    parsed,
                     batch: *batch,
+                    content_width,
                 };
+                let mode = tool_display_modes
+                    .get(call_id)
+                    .copied()
+                    .unwrap_or_else(|| block.default_mode());
                 lines.extend(
                     block
-                        .lines(block.default_mode())
+                        .lines(mode)
                         .into_iter()
                         .map(|block_line| block_line.line),
                 );
@@ -122,8 +127,9 @@ pub(super) fn conversation_lines(
                     "",
                     content_width,
                 );
+                let size = result_size_label(output);
                 let block = ToolResultBlock {
-                    footer: ToolRow::result_footer(&tool_name, &status, color),
+                    footer: ToolRow::result_footer(&tool_name, &status, color, Some(&size)),
                     collapsed_body,
                     full_body,
                     accent: color,
@@ -144,9 +150,7 @@ pub(super) fn conversation_lines(
                 }
             }
             ConversationItem::Diff(diff) => {
-                for change in diff {
-                    diff_line(&mut lines, change.number, change.kind, &change.text);
-                }
+                render_diff(&mut lines, diff, content_width);
             }
             ConversationItem::Error(error) => {
                 lines.push(Line::from(Span::styled(
@@ -1253,6 +1257,150 @@ const fn code_block_background() -> Color {
     Color::Rgb(0x1a, 0x1f, 0x29)
 }
 
+const MAX_DIFF_ROWS: usize = 200;
+
+/// Result-size metadata (lines and bytes) for a tool output.
+///
+/// This is a real measurement of the retained output, never a fabricated
+/// per-call token count.
+fn result_size_label(output: &str) -> String {
+    format!("{} lines · {} B", output.lines().count(), output.len())
+}
+
+/// Paint an edit diff with a dual old/new line-number gutter, gap markers for
+/// unchanged runs, insert/delete row backgrounds, and a row cap.
+///
+/// The projected diff carries only changed lines (context is dropped upstream),
+/// so unchanged runs are inferred from line-number jumps and rendered as a
+/// single `… N unchanged lines` marker. No `+`/`-` markers are drawn; the
+/// gutter position and row background encode insert vs. delete.
+fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width: usize) {
+    let gutter_width = diff
+        .iter()
+        .map(|change| digit_width(change.number))
+        .max()
+        .unwrap_or(1)
+        .max(1);
+
+    let mut old_cursor: Option<u32> = None;
+    let mut new_cursor: Option<u32> = None;
+
+    for (index, change) in diff.iter().enumerate() {
+        if index >= MAX_DIFF_ROWS {
+            let remaining = diff.len() - index;
+            lines.push(diff_note_line(
+                &format!("… {remaining} more lines"),
+                gutter_width,
+            ));
+            break;
+        }
+
+        let axis_cursor = match change.kind {
+            DiffLineKind::Added => new_cursor,
+            DiffLineKind::Removed | DiffLineKind::Context => old_cursor,
+        };
+        if let Some(expected) = axis_cursor
+            && change.number > expected
+        {
+            let gap = change.number - expected;
+            lines.push(diff_note_line(
+                &format!("… {gap} unchanged lines"),
+                gutter_width,
+            ));
+            old_cursor = old_cursor.map(|cursor| cursor + gap);
+            new_cursor = new_cursor.map(|cursor| cursor + gap);
+        }
+
+        let (old_number, new_number, background) = match change.kind {
+            DiffLineKind::Removed => (
+                Some(change.number),
+                None,
+                Some(RolePalette::diff_delete_bg()),
+            ),
+            DiffLineKind::Added => (
+                None,
+                Some(change.number),
+                Some(RolePalette::diff_insert_bg()),
+            ),
+            DiffLineKind::Context => (Some(change.number), Some(change.number), None),
+        };
+        lines.push(diff_change_line(
+            old_number,
+            new_number,
+            &change.text,
+            background,
+            gutter_width,
+            content_width,
+        ));
+
+        match change.kind {
+            DiffLineKind::Removed => old_cursor = Some(change.number + 1),
+            DiffLineKind::Added => new_cursor = Some(change.number + 1),
+            DiffLineKind::Context => {
+                old_cursor = Some(change.number + 1);
+                new_cursor = Some(change.number + 1);
+            }
+        }
+    }
+}
+
+fn digit_width(number: u32) -> usize {
+    number
+        .checked_ilog10()
+        .map_or(1, |digits| digits as usize + 1)
+}
+
+fn diff_gutter(old: Option<u32>, new: Option<u32>, gutter_width: usize) -> String {
+    let cell = |value: Option<u32>| match value {
+        Some(number) => format!("{number:>gutter_width$}"),
+        None => " ".repeat(gutter_width),
+    };
+    format!("{} {} │ ", cell(old), cell(new))
+}
+
+fn diff_change_line(
+    old: Option<u32>,
+    new: Option<u32>,
+    text: &str,
+    background: Option<Color>,
+    gutter_width: usize,
+    content_width: usize,
+) -> Line<'static> {
+    let gutter = diff_gutter(old, new, gutter_width);
+
+    let mut gutter_style = Style::default().fg(RolePalette::muted());
+    let mut text_style = Style::default();
+    if let Some(color) = background {
+        gutter_style = gutter_style.bg(color);
+        text_style = text_style.bg(color);
+    }
+
+    let mut spans = vec![
+        Span::styled(gutter.clone(), gutter_style),
+        Span::styled(text.to_owned(), text_style),
+    ];
+
+    if let Some(color) = background {
+        let used = gutter.width().saturating_add(text.width());
+        if used < content_width {
+            spans.push(Span::styled(
+                " ".repeat(content_width - used),
+                Style::default().bg(color),
+            ));
+        }
+    }
+
+    Line::from(spans)
+}
+
+fn diff_note_line(text: &str, gutter_width: usize) -> Line<'static> {
+    let indent = " ".repeat(gutter_width.saturating_mul(2).saturating_add(3));
+    Line::from(Span::styled(
+        format!("{indent}{text}"),
+        Style::default().fg(RolePalette::muted()),
+    ))
+}
+
 fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, text: &str) {
     let (marker, color) = match kind {
         DiffLineKind::Added => ('+', Color::Green),
@@ -1365,6 +1513,105 @@ mod tests {
 
     fn empty_tokens() -> Arc<[SyntaxToken]> {
         Arc::from(Vec::<SyntaxToken>::new())
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn result_size_label_reports_lines_and_bytes_not_tokens() {
+        assert_eq!(result_size_label("alpha\nbravo"), "2 lines · 11 B");
+        assert_eq!(result_size_label(""), "0 lines · 0 B");
+        assert!(!result_size_label("x").contains("token"));
+    }
+
+    #[test]
+    fn render_diff_uses_dual_gutter_and_row_backgrounds_without_plus_minus() {
+        let mut lines = Vec::new();
+        render_diff(
+            &mut lines,
+            &[
+                crate::DiffLine::new(7, DiffLineKind::Removed, "old line"),
+                crate::DiffLine::new(8, DiffLineKind::Added, "new line"),
+            ],
+            40,
+        );
+        assert_eq!(lines.len(), 2);
+
+        let removed = &lines[0];
+        let removed_text = line_text(removed);
+        assert!(removed_text.contains('7'), "{removed_text:?}");
+        assert!(removed_text.contains("old line"), "{removed_text:?}");
+        assert!(
+            !removed_text.contains(" - "),
+            "no +/- noise: {removed_text:?}"
+        );
+        assert!(
+            removed
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(RolePalette::diff_delete_bg())),
+            "deleted rows carry the delete background"
+        );
+
+        let added = &lines[1];
+        let added_text = line_text(added);
+        assert!(added_text.contains('8'), "{added_text:?}");
+        assert!(added_text.contains("new line"), "{added_text:?}");
+        assert!(
+            added
+                .spans
+                .iter()
+                .any(|span| span.style.bg == Some(RolePalette::diff_insert_bg())),
+            "inserted rows carry the insert background"
+        );
+    }
+
+    #[test]
+    fn render_diff_collapses_unchanged_runs_into_a_gap_marker() {
+        let mut lines = Vec::new();
+        render_diff(
+            &mut lines,
+            &[
+                crate::DiffLine::new(3, DiffLineKind::Added, "first change"),
+                crate::DiffLine::new(20, DiffLineKind::Added, "second change"),
+            ],
+            40,
+        );
+        let joined: String = lines
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("… 16 unchanged lines"), "{joined:?}");
+        assert!(joined.contains("first change"), "{joined:?}");
+        assert!(joined.contains("second change"), "{joined:?}");
+    }
+
+    #[test]
+    fn render_diff_caps_row_count_with_a_more_marker() {
+        let diff: Vec<crate::DiffLine> = (0..(MAX_DIFF_ROWS as u32 + 25))
+            .map(|index| {
+                crate::DiffLine::new(index + 1, DiffLineKind::Added, format!("line {index}"))
+            })
+            .collect();
+        let mut lines = Vec::new();
+        render_diff(&mut lines, &diff, 40);
+        let joined: String = lines
+            .iter()
+            .map(|line| line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("… 25 more lines"), "{joined:?}");
+        assert!(
+            lines.len() <= MAX_DIFF_ROWS + 1,
+            "row count is capped: {}",
+            lines.len()
+        );
     }
 
     #[test]

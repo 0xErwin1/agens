@@ -70,6 +70,30 @@ impl RolePalette {
     pub(crate) const fn brand() -> Color {
         rgb(0x95, 0xe6, 0xcb)
     }
+
+    /// File-path operand in typed tool headers — distinct from the tool accent.
+    pub(crate) const fn path() -> Color {
+        rgb(0x5c, 0xcf, 0xe5)
+    }
+
+    /// Row background for inserted diff lines — dim green wash.
+    pub(crate) const fn diff_insert_bg() -> Color {
+        rgb(0x14, 0x2a, 0x1c)
+    }
+
+    /// Row background for deleted diff lines — dim red wash.
+    pub(crate) const fn diff_delete_bg() -> Color {
+        rgb(0x36, 0x18, 0x1c)
+    }
+
+    /// Accent for a running/active block's pulsing gutter.
+    ///
+    /// Consumed by the S3 running-block animation pass; defined here with the
+    /// rest of the typed-block palette.
+    #[allow(dead_code)]
+    pub(crate) const fn accent_active() -> Color {
+        rgb(0x73, 0xd0, 0xff)
+    }
 }
 
 #[cfg(test)]
@@ -86,5 +110,18 @@ mod tests {
         assert_eq!(RolePalette::brand(), rgb(0x95, 0xe6, 0xcb));
         assert_ne!(RolePalette::user(), RolePalette::assistant());
         assert_ne!(RolePalette::tool(), RolePalette::thinking());
+    }
+
+    #[test]
+    fn typed_block_colors_are_distinct_semantic_slots() {
+        assert_eq!(RolePalette::path(), rgb(0x5c, 0xcf, 0xe5));
+        assert_eq!(RolePalette::diff_insert_bg(), rgb(0x14, 0x2a, 0x1c));
+        assert_eq!(RolePalette::diff_delete_bg(), rgb(0x36, 0x18, 0x1c));
+        assert_eq!(RolePalette::accent_active(), rgb(0x73, 0xd0, 0xff));
+
+        assert_ne!(RolePalette::path(), RolePalette::tool());
+        assert_ne!(RolePalette::path(), RolePalette::muted());
+        assert_ne!(RolePalette::diff_insert_bg(), RolePalette::diff_delete_bg());
+        assert_ne!(RolePalette::accent_active(), RolePalette::tool());
     }
 }
