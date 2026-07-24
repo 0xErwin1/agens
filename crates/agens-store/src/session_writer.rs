@@ -26,8 +26,28 @@ pub struct StoredSession {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionPage {
-    pub total_count: u64,
     pub sessions: Vec<StoredSession>,
+    pub next_cursor: Option<SessionCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SessionCursor {
+    updated_at: i64,
+    id: i64,
+}
+
+impl SessionCursor {
+    pub const fn new(updated_at: i64, id: i64) -> Self {
+        Self { updated_at, id }
+    }
+
+    pub const fn updated_at(self) -> i64 {
+        self.updated_at
+    }
+
+    pub const fn id(self) -> i64 {
+        self.id
+    }
 }
 
 impl SessionStore {
@@ -287,67 +307,92 @@ impl SessionStore {
     pub fn list_session_page(
         &self,
         project: Option<&str>,
-        offset: u64,
+        query: &str,
+        cursor: Option<SessionCursor>,
+        page_size: usize,
     ) -> Result<SessionPage, SessionStoreError> {
-        let transaction = self.connection.unchecked_transaction().map_err(|error| {
-            SessionStoreError::operation("start session page", &self.database_path, error)
+        if page_size == 0 {
+            return Err(SessionStoreError::operation(
+                "validate session page size",
+                &self.database_path,
+                "page size must be greater than zero",
+            ));
+        }
+
+        let page_size = page_size.min(64);
+        let fetch_limit = i64::try_from(page_size.saturating_add(1)).map_err(|error| {
+            SessionStoreError::operation("validate session page size", &self.database_path, error)
         })?;
-        let scope = project.map(str::to_owned);
-        let offset = i64::try_from(offset).map_err(|error| {
-            SessionStoreError::operation("validate session page offset", &self.database_path, error)
-        })?;
-        let count = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM sessions
-                 WHERE (completed_turn_count > 0 OR EXISTS (
-                     SELECT 1 FROM session_attempts
-                     WHERE session_attempts.session_id = sessions.id
-                       AND session_attempts.retry_prompt IS NOT NULL
-                 )) AND (?1 IS NULL OR project = ?1)",
-                [scope.as_deref()],
-                |row| row.get::<_, i64>(0),
+        let cursor_updated_at = cursor.map(SessionCursor::updated_at);
+        let cursor_id = cursor.map(SessionCursor::id);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sessions.id, sessions.project, sessions.title, sessions.active_agent,
+                    sessions.created_at, sessions.updated_at, sessions.completed_turn_count,
+                    sessions.resumable, sessions.provider_id, sessions.model_id,
+                    sessions.reasoning_effort, latest.id, latest.sequence, latest.status,
+                    latest.failure_kind, latest.started_at, latest.finished_at
+             FROM sessions
+             LEFT JOIN session_attempts AS latest
+               ON latest.session_id = sessions.id
+              AND latest.sequence = (
+                  SELECT MAX(candidate.sequence)
+                  FROM session_attempts AS candidate
+                  WHERE candidate.session_id = sessions.id
+              )
+             WHERE (sessions.completed_turn_count > 0 OR EXISTS (
+                  SELECT 1 FROM session_attempts
+                  WHERE session_attempts.session_id = sessions.id
+                    AND session_attempts.retry_prompt IS NOT NULL
+             )) AND (?1 IS NULL OR sessions.project = ?1)
+                AND (?2 = ''
+                     OR instr(lower(CAST(sessions.id AS TEXT)), lower(?2)) > 0
+                     OR instr(lower(sessions.title), lower(?2)) > 0
+                     OR instr(lower(sessions.project), lower(?2)) > 0
+                     OR instr(lower(sessions.active_agent), lower(?2)) > 0)
+                AND (?3 IS NULL
+                     OR sessions.updated_at < ?3
+                     OR (sessions.updated_at = ?3 AND sessions.id < ?4))
+             ORDER BY sessions.updated_at DESC, sessions.id DESC
+             LIMIT ?5",
             )
             .map_err(|error| {
-                SessionStoreError::operation("count session page", &self.database_path, error)
+                SessionStoreError::operation("prepare session page", &self.database_path, error)
             })?;
-        let mut statement = transaction.prepare(
-            "SELECT id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable,
-                    provider_id, model_id, reasoning_effort
-             FROM sessions
-             WHERE (completed_turn_count > 0 OR EXISTS (
-                 SELECT 1 FROM session_attempts
-                 WHERE session_attempts.session_id = sessions.id
-                   AND session_attempts.retry_prompt IS NOT NULL
-             )) AND (?1 IS NULL OR project = ?1)
-             ORDER BY updated_at DESC, id DESC LIMIT 64 OFFSET ?2",
-        ).map_err(|error| SessionStoreError::operation("prepare session page", &self.database_path, error))?;
-        let sessions = statement
-            .query_map(params![scope, offset], session_metadata)
+        let mut sessions = statement
+            .query_map(
+                params![project, query, cursor_updated_at, cursor_id, fetch_limit],
+                |row| {
+                    let metadata = session_metadata(row)?;
+                    let latest_attempt = row
+                        .get::<_, Option<i64>>(11)?
+                        .map(|_| attempt_summary_from_row(row, metadata.id, 11))
+                        .transpose()?;
+
+                    Ok(StoredSession {
+                        metadata,
+                        messages: Vec::new(),
+                        latest_attempt,
+                    })
+                },
+            )
             .map_err(|error| {
                 SessionStoreError::operation("query session page", &self.database_path, error)
             })?
-            .map(|row| {
-                let metadata = row.map_err(|error| {
-                    SessionStoreError::operation("read session page", &self.database_path, error)
-                })?;
-                let latest_attempt =
-                    latest_attempt_summary(&transaction, &self.database_path, metadata.id)?;
-                Ok(StoredSession {
-                    metadata,
-                    messages: Vec::new(),
-                    latest_attempt,
-                })
-            })
-            .collect::<Result<Vec<_>, SessionStoreError>>()?;
-        drop(statement);
-        transaction.commit().map_err(|error| {
-            SessionStoreError::operation("commit session page", &self.database_path, error)
-        })?;
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                SessionStoreError::operation("read session page", &self.database_path, error)
+            })?;
+        let has_more = sessions.len() > page_size;
+        sessions.truncate(page_size);
+        let next_cursor = has_more
+            .then(|| sessions.last())
+            .flatten()
+            .map(|session| SessionCursor::new(session.metadata.updated_at, session.metadata.id));
         Ok(SessionPage {
-            total_count: count.try_into().map_err(|error| {
-                SessionStoreError::operation("count session page", &self.database_path, error)
-            })?,
             sessions,
+            next_cursor,
         })
     }
 
@@ -740,28 +785,34 @@ fn latest_attempt_summary(
             "SELECT id, sequence, status, failure_kind, started_at, finished_at
              FROM session_attempts WHERE session_id = ?1 ORDER BY sequence DESC LIMIT 1",
             [session_id],
-            |row| {
-                let status = decode_attempt_status(&row.get::<_, String>(2)?)?;
-                let failure_kind = row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| decode_attempt_failure_kind(&value))
-                    .transpose()?;
-                SessionAttemptSummary::new(
-                    AttemptKey::new(session_id, row.get(0)?)
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    row.get::<_, i64>(1)?
-                        .try_into()
-                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    status,
-                    failure_kind,
-                    row.get(4)?,
-                    row.get(5)?,
-                )
-                .map_err(|_| rusqlite::Error::InvalidQuery)
-            },
+            |row| attempt_summary_from_row(row, session_id, 0),
         )
         .optional()
         .map_err(|error| SessionStoreError::operation("load session attempt", database_path, error))
+}
+
+fn attempt_summary_from_row(
+    row: &rusqlite::Row<'_>,
+    session_id: i64,
+    offset: usize,
+) -> rusqlite::Result<SessionAttemptSummary> {
+    let status = decode_attempt_status(&row.get::<_, String>(offset + 2)?)?;
+    let failure_kind = row
+        .get::<_, Option<String>>(offset + 3)?
+        .map(|value| decode_attempt_failure_kind(&value))
+        .transpose()?;
+
+    SessionAttemptSummary::new(
+        AttemptKey::new(session_id, row.get(offset)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        row.get::<_, i64>(offset + 1)?
+            .try_into()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        status,
+        failure_kind,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+    )
+    .map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
 fn decode_attempt_status(value: &str) -> rusqlite::Result<SessionAttemptStatus> {
@@ -1088,4 +1139,71 @@ fn decode_part(
     part.ok_or_else(|| {
         SessionStoreError::operation("decode session message part", database_path, "invalid part")
     })
+}
+
+#[cfg(test)]
+mod session_page_statement_tests {
+    use std::cell::Cell;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+
+    use super::*;
+
+    static DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static STATEMENT_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn count_statement(event: TraceEvent<'_>) {
+        if matches!(event, TraceEvent::Stmt(_, _)) {
+            STATEMENT_COUNT.with(|count| count.set(count.get() + 1));
+        }
+    }
+
+    #[test]
+    fn five_hundred_one_session_page_executes_exactly_one_sql_statement() {
+        let directory = std::env::temp_dir().join(format!(
+            "agens-session-page-statement-count-{}-{}",
+            std::process::id(),
+            DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let mut store = SessionStore::open(&directory).unwrap();
+        for id in 1..=501 {
+            let metadata = SessionMetadata {
+                id,
+                project: if id % 2 == 0 { "current" } else { "other" }.into(),
+                title: format!("session-{id}"),
+                active_agent: "primary".into(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: id,
+                updated_at: id / 2,
+                completed_turn_count: 0,
+                resumable: false,
+            };
+            store
+                .begin_session_attempt(&metadata, format!("private-{id}"))
+                .unwrap();
+        }
+
+        store
+            .connection
+            .trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_statement));
+        STATEMENT_COUNT.with(|count| count.set(0));
+
+        let page = store.list_session_page(None, "", None, 64).unwrap();
+        let statement_count = STATEMENT_COUNT.with(Cell::get);
+        store.connection.trace_v2(TraceEventCodes::empty(), None);
+
+        assert_eq!(page.sessions.len(), 64);
+        assert!(page.next_cursor.is_some());
+        assert_eq!(statement_count, 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

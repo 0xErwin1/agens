@@ -195,6 +195,7 @@ pub enum ProviderDiagnosticComponent {
     Responses,
     OauthRefresh,
     Subagent,
+    Agent,
 }
 
 impl ProviderDiagnosticComponent {
@@ -203,6 +204,7 @@ impl ProviderDiagnosticComponent {
             Self::Responses => "responses",
             Self::OauthRefresh => "oauth_refresh",
             Self::Subagent => "subagent",
+            Self::Agent => "agent",
         }
     }
 }
@@ -212,6 +214,8 @@ pub enum ProviderDiagnosticKind {
     Attempt,
     RetryScheduled,
     Terminal,
+    AgentUnavailable,
+    AgentFallback,
 }
 
 impl ProviderDiagnosticKind {
@@ -220,6 +224,8 @@ impl ProviderDiagnosticKind {
             Self::Attempt => "attempt",
             Self::RetryScheduled => "retry_scheduled",
             Self::Terminal => "terminal",
+            Self::AgentUnavailable => "agent_unavailable",
+            Self::AgentFallback => "agent_fallback",
         }
     }
 }

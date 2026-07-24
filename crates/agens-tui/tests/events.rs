@@ -3,10 +3,10 @@ use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, Effect, Engine,
     Event, Key, PaletteEntry, PaletteEntryKind, PublishOutcome, RatatuiRenderer, Renderer, Runtime,
-    TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
-    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
-    TuiSubmissionOutcome,
+    SessionDialogCursor, SessionDialogRequest, SessionDialogScope, TranscriptEntry,
+    TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
+    TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress, TuiRuntimeEvent,
+    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -258,10 +258,10 @@ fn session_loading_is_local_preserves_visible_state_and_escape_cancels() {
         total_tokens: Some(8),
         context_window: Some(128),
     }));
-    tui.show_selection_dialog(DialogView::selection(
-        "Resume session · Current project",
-        None::<String>,
+    tui.show_selection_dialog(DialogView::sessions_page(
         vec![DialogEntry::action("Session 2", "session:2")],
+        SessionDialogRequest::initial(),
+        None,
     ));
 
     assert_eq!(
@@ -363,6 +363,7 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
     assert_eq!(resumed.input_cursor, "retry exact café 🙂".chars().count());
     assert_eq!(resumed.focus, agens_tui::TranscriptFocus::Composer);
     assert!(resumed.following_bottom);
+    assert!(resumed.recovered_failed_prompt);
     assert_eq!(
         resumed.status,
         Some("Previous attempt failed. Prompt restored; press Enter to retry.")
@@ -370,10 +371,109 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
     assert_eq!(resumed.completed_conversations.len(), 1);
     assert_eq!(resumed.completed_conversations[0].user, "completed prompt");
     assert_ne!(resumed.completed_conversations[0].user, resumed.input);
+    tui.handle(Event::Key(Key::Char('!')));
+    assert!(tui.view().recovered_failed_prompt);
+    tui.show_selection_dialog(DialogView::selection(
+        "Resume session · Current project",
+        None::<String>,
+        vec![DialogEntry::action("Session 2", "session:2")],
+    ));
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.input(), "retry exact café 🙂!");
+    assert!(tui.view().recovered_failed_prompt);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
-        Action::Submit("retry exact café 🙂".into())
+        Action::Submit("retry exact café 🙂!".into())
     );
+    assert!(!tui.view().recovered_failed_prompt);
+}
+
+#[test]
+fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomically() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Recovered failed prompt.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #1"),
+        history: Vec::new(),
+        draft: Some("failed prompt".into()),
+        resume_error: None,
+    });
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.input().is_empty());
+    assert!(!tui.view().recovered_failed_prompt);
+    assert_eq!(tui.view().status, Some("Recovered prompt discarded."));
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Recovered failed prompt.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #2"),
+        history: Vec::new(),
+        draft: Some("older failed prompt".into()),
+        resume_error: None,
+    });
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Resumed session 3.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #3"),
+        history: Vec::new(),
+        draft: None,
+        resume_error: None,
+    });
+
+    assert!(tui.input().is_empty());
+    assert!(!tui.view().recovered_failed_prompt);
+}
+
+#[test]
+fn session_dialog_requests_server_search_scope_and_keyset_pages_with_generations() {
+    let initial = SessionDialogRequest::initial();
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.show_selection_dialog(DialogView::sessions_page(
+        vec![DialogEntry::action("Session 501", "session:501")],
+        initial.clone(),
+        Some(SessionDialogCursor::new(250, 438)),
+    ));
+
+    let Action::LoadSessionPage(search) = tui.handle(Event::Key(Key::Char('n'))) else {
+        panic!("session search should request a server page");
+    };
+    assert_eq!(search.scope(), SessionDialogScope::CurrentProject);
+    assert_eq!(search.query(), "n");
+    assert_eq!(search.page(), 1);
+    assert!(search.cursor().is_none());
+    assert!(search.generation() > initial.generation());
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        vec![DialogEntry::action("stale", "session:1")],
+        initial,
+        None,
+    )));
+    assert!(tui.view().dialog.unwrap().is_loading());
+
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        vec![DialogEntry::action("Needle", "session:1")],
+        search,
+        Some(SessionDialogCursor::new(10, 1)),
+    )));
+    let Action::LoadSessionPage(next) = tui.handle(Event::Key(Key::PageDown)) else {
+        panic!("PageDown should request the next keyset page");
+    };
+    assert_eq!(next.page(), 2);
+    assert_eq!(next.cursor(), Some(SessionDialogCursor::new(10, 1)));
+
+    let Action::LoadSessionPage(previous) = tui.handle(Event::Key(Key::PageUp)) else {
+        panic!("PageUp should request the previous keyset page");
+    };
+    assert_eq!(previous.page(), 1);
+    assert!(previous.cursor().is_none());
+    assert_eq!(previous.query(), "n");
+
+    let Action::LoadSessionPage(global) = tui.handle(Event::Key(Key::LineStart)) else {
+        panic!("Ctrl+A should request the alternate scope");
+    };
+    assert_eq!(global.scope(), SessionDialogScope::AllProjects);
+    assert_eq!(global.query(), "n");
+    assert_eq!(global.page(), 1);
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::CancelRoute);
 }
 
 #[test]
@@ -2072,7 +2172,7 @@ fn selection_dialog_search_edits_navigates_filtered_rows_and_closes_on_first_esc
 }
 
 #[test]
-fn session_dialog_toggles_scope_preserves_search_and_dispatches_the_filtered_selection() {
+fn session_dialog_toggles_scope_preserves_search_and_dispatches_server_selection() {
     let current = DialogEntry::action_with_metadata(
         "#7 Alpha",
         "2 turns · 5m ago · primary · current",
@@ -2088,17 +2188,31 @@ fn session_dialog_toggles_scope_preserves_search_and_dispatches_the_filtered_sel
         "session:9",
     );
     let mut tui = Tui::new(FakeEngine::default());
-    tui.show_selection_dialog(DialogView::sessions(
-        vec![current.clone()],
-        vec![current, other],
+    tui.show_selection_dialog(DialogView::sessions_page(
+        vec![current],
+        SessionDialogRequest::initial(),
+        None,
     ));
 
+    let mut search = None;
     for character in "reviewer".chars() {
-        tui.handle(Event::Key(Key::Char(character)));
+        let Action::LoadSessionPage(request) = tui.handle(Event::Key(Key::Char(character))) else {
+            panic!("session search should load from the store");
+        };
+        search = Some(request);
     }
     assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
 
-    assert_eq!(tui.handle(Event::Key(Key::LineStart)), Action::Render);
+    let Action::LoadSessionPage(global) = tui.handle(Event::Key(Key::LineStart)) else {
+        panic!("scope toggle should load from the store");
+    };
+    assert_eq!(global.query(), search.unwrap().query());
+    assert_eq!(global.scope(), SessionDialogScope::AllProjects);
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        vec![other],
+        global,
+        None,
+    )));
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("session:9".into())

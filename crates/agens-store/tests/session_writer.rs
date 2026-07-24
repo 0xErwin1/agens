@@ -8,7 +8,7 @@ use agens_core::{
     MAX_RETRY_PROMPT_BYTES, Message, MessagePart, ReasoningEffort, RecoveryOutcome, Role,
     SessionAttemptFailureKind, SessionAttemptStatus, SessionMessage, SessionMetadata,
 };
-use agens_store::SessionStore;
+use agens_store::{SessionCursor, SessionStore, StoredSession};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -32,6 +32,24 @@ fn turn(messages: Vec<Message>) -> CompletedSessionTurn {
             .unwrap(),
     )
     .unwrap()
+}
+
+fn collect_session_pages(
+    store: &SessionStore,
+    project: Option<&str>,
+    query: &str,
+) -> Vec<StoredSession> {
+    let mut cursor: Option<SessionCursor> = None;
+    let mut sessions = Vec::new();
+
+    loop {
+        let page = store.list_session_page(project, query, cursor, 64).unwrap();
+        sessions.extend(page.sessions);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return sessions;
+        }
+    }
 }
 
 fn normalized_counts(connection: &Connection) -> (i64, i64, i64, i64) {
@@ -332,21 +350,25 @@ fn terminal_attempt_cas_shapes_never_append_history() {
 }
 
 #[test]
-fn session_pages_and_load_are_read_only_complete_sorted_and_cross_64() {
+fn session_pages_use_stable_keyset_search_scope_and_bounded_sizes() {
     let directory = directory();
     let mut store = SessionStore::open(&directory).unwrap();
 
-    for id in 1..=65 {
+    for id in 1..=501 {
         let metadata = SessionMetadata {
             id,
             project: if id % 2 == 0 { "current" } else { "other" }.into(),
-            title: format!("session-{id}"),
-            active_agent: "primary".into(),
+            title: if id == 1 {
+                "Needle Café".into()
+            } else {
+                format!("session-{id}")
+            },
+            active_agent: if id == 2 { "reviewer" } else { "primary" }.into(),
             provider_id: None,
             model_id: None,
             reasoning_effort: None,
             created_at: id,
-            updated_at: id,
+            updated_at: id / 2,
             completed_turn_count: 0,
             resumable: false,
         };
@@ -354,36 +376,124 @@ fn session_pages_and_load_are_read_only_complete_sorted_and_cross_64() {
             .begin_session_attempt(&metadata, format!("private-{id}"))
             .unwrap();
     }
+    let latest = store
+        .load_session_for_resume(501)
+        .unwrap()
+        .latest_attempt
+        .unwrap();
+    store
+        .finish_session_attempt(latest.key(), SessionAttemptStatus::Failed, 300)
+        .unwrap();
+    let replacement = SessionMetadata {
+        id: 501,
+        project: "other".into(),
+        title: "session-501".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 501,
+        updated_at: 301,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    store
+        .begin_session_attempt(&replacement, "replacement-private".into())
+        .unwrap();
 
-    let first = store.list_session_page(None, 0).unwrap();
-    let second = store.list_session_page(None, 64).unwrap();
-    let current = store.list_session_page(Some("current"), 0).unwrap();
-
-    assert_eq!(first.total_count, 65);
+    let first = store.list_session_page(None, "", None, 100).unwrap();
     assert_eq!(first.sessions.len(), 64);
-    assert_eq!(first.sessions[0].metadata.id, 65);
-    assert_eq!(first.sessions[63].metadata.id, 2);
-    assert_eq!(second.sessions.len(), 1);
-    assert_eq!(second.sessions[0].metadata.id, 1);
-    assert_eq!(current.total_count, 32);
-    assert!(
-        current
-            .sessions
-            .iter()
-            .all(|session| session.metadata.project == "current")
-    );
+    assert_eq!(first.sessions[0].metadata.id, 501);
+    assert_eq!(first.sessions[1].metadata.id, 500);
+    assert_eq!(first.sessions[63].metadata.id, 438);
+    assert!(first.next_cursor.is_some());
     assert!(first.sessions.iter().all(|session| {
         session
             .latest_attempt
             .as_ref()
             .is_some_and(|attempt| attempt.status() == SessionAttemptStatus::Running)
     }));
+    assert_eq!(
+        first.sessions[0]
+            .latest_attempt
+            .as_ref()
+            .unwrap()
+            .sequence(),
+        2
+    );
     assert!(!format!("{first:?}").contains("private-"));
 
-    let loaded = store.load_session_for_resume(65).unwrap();
+    let inserted = SessionMetadata {
+        id: 999,
+        project: "current".into(),
+        title: "inserted-newer".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 999,
+        updated_at: 1_000,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    store
+        .begin_session_attempt(&inserted, "inserted-private".into())
+        .unwrap();
+
+    let mut traversed = first.sessions;
+    let mut cursor = first.next_cursor;
+    while let Some(current) = cursor {
+        let page = store
+            .list_session_page(None, "", Some(current), 64)
+            .unwrap();
+        traversed.extend(page.sessions);
+        cursor = page.next_cursor;
+    }
+    let identifiers = traversed
+        .iter()
+        .map(|session| session.metadata.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(traversed.len(), 501);
+    assert_eq!(identifiers.len(), 501);
+    assert!(!identifiers.contains(&999));
+    assert_eq!(traversed[64].metadata.id, 437);
+    assert!(traversed.windows(2).all(|pair| {
+        let left = (pair[0].metadata.updated_at, pair[0].metadata.id);
+        let right = (pair[1].metadata.updated_at, pair[1].metadata.id);
+        left > right
+    }));
+
+    let all = collect_session_pages(&store, None, "");
+    let current = collect_session_pages(&store, Some("current"), "");
+    let by_title = collect_session_pages(&store, None, "needle café");
+    let by_identifier = collect_session_pages(&store, None, "1");
+    let by_project = collect_session_pages(&store, None, "OTHER");
+    let by_agent = collect_session_pages(&store, None, "REVIEWER");
+
+    assert_eq!(all.len(), 502);
+    assert_eq!(all[0].metadata.id, 999);
+    assert_eq!(current.len(), 251);
+    assert!(
+        current
+            .iter()
+            .all(|session| session.metadata.project == "current")
+    );
+    assert_eq!(by_title.len(), 1);
+    assert_eq!(by_title[0].metadata.id, 1);
+    assert!(by_identifier.len() > 64);
+    assert!(
+        by_identifier
+            .iter()
+            .all(|session| session.metadata.id.to_string().contains('1'))
+    );
+    assert_eq!(by_project.len(), 251);
+    assert_eq!(by_agent.len(), 1);
+    assert_eq!(by_agent[0].metadata.id, 2);
+
+    let loaded = store.load_session_for_resume(501).unwrap();
     let running = loaded.latest_attempt.unwrap();
     assert!(loaded.messages.is_empty());
-    assert_eq!(running.key().session_id(), 65);
+    assert_eq!(running.key().session_id(), 501);
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -419,9 +529,8 @@ fn zero_turn_session_without_retained_retry_prompt_is_not_resumable() {
         )
         .unwrap();
 
-    let page = store.list_session_page(None, 0).unwrap();
+    let page = store.list_session_page(None, "", None, 64).unwrap();
 
-    assert_eq!(page.total_count, 0);
     assert!(page.sessions.is_empty());
     assert!(store.load_session_for_resume(metadata.id).is_err());
 

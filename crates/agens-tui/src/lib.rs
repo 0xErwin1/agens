@@ -176,6 +176,8 @@ pub enum Action {
     },
     /// Ask the composition layer to resolve a palette dialog by stable route ID.
     OpenDialog(String),
+    /// Load a bounded session-browser page through the composition layer.
+    LoadSessionPage(SessionDialogRequest),
     /// Dispatch the selected dialog action through the composition layer.
     DialogAction(String),
     SafeDialogAction(String),
@@ -280,6 +282,7 @@ pub enum TuiRouteRequest {
     Input(String),
     OpenDialog(String),
     DialogAction(String),
+    SessionPage(SessionDialogRequest),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -446,6 +449,8 @@ pub struct ViewState<'a> {
     pub owner_label: &'a str,
     /// The editable prompt text.
     pub input: &'a str,
+    /// Whether the composer contains a recovered failed prompt that can be retried or discarded.
+    pub recovered_failed_prompt: bool,
     /// Current terminal dimensions.
     pub size: (u16, u16),
     /// Whether the composed engine has an active turn.
@@ -705,11 +710,81 @@ impl DialogEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDialogScope {
+    CurrentProject,
+    AllProjects,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionDialogCursor {
+    updated_at: i64,
+    id: i64,
+}
+
+impl SessionDialogCursor {
+    pub const fn new(updated_at: i64, id: i64) -> Self {
+        Self { updated_at, id }
+    }
+
+    pub const fn updated_at(self) -> i64 {
+        self.updated_at
+    }
+
+    pub const fn id(self) -> i64 {
+        self.id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionDialogRequest {
+    scope: SessionDialogScope,
+    query: String,
+    cursor: Option<SessionDialogCursor>,
+    previous_cursors: Vec<Option<SessionDialogCursor>>,
+    page: u64,
+    generation: u64,
+}
+
+impl SessionDialogRequest {
+    pub fn initial() -> Self {
+        Self {
+            scope: SessionDialogScope::CurrentProject,
+            query: String::new(),
+            cursor: None,
+            previous_cursors: Vec::new(),
+            page: 1,
+            generation: 0,
+        }
+    }
+
+    pub const fn scope(&self) -> SessionDialogScope {
+        self.scope
+    }
+
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub const fn cursor(&self) -> Option<SessionDialogCursor> {
+        self.cursor
+    }
+
+    pub const fn page(&self) -> u64 {
+        self.page
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SessionDialogEntries {
-    current_project: Vec<DialogEntry>,
-    all_projects: Vec<DialogEntry>,
-    showing_all_projects: bool,
+    request: SessionDialogRequest,
+    next_cursor: Option<SessionDialogCursor>,
+    loading: bool,
+    error: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,22 +874,47 @@ impl DialogView {
         self
     }
 
-    pub fn sessions(current_project: Vec<DialogEntry>, all_projects: Vec<DialogEntry>) -> Self {
-        let current_project = current_project.into_iter().take(64).collect::<Vec<_>>();
-        let all_projects = all_projects.into_iter().take(64).collect::<Vec<_>>();
+    pub fn sessions_page(
+        entries: Vec<DialogEntry>,
+        request: SessionDialogRequest,
+        next_cursor: Option<SessionDialogCursor>,
+    ) -> Self {
+        let entries = entries.into_iter().take(64).collect::<Vec<_>>();
         let mut dialog = Self::selection(
-            "Resume session · Current project",
-            Some(
-                "Type to search | Ctrl+A All projects | Up/Down navigate | Enter resume | Esc cancel",
-            ),
-            current_project.clone(),
+            session_dialog_title(request.scope),
+            Some(session_dialog_help(request.scope)),
+            entries,
         );
+        dialog.query.clone_from(&request.query);
         dialog.session_entries = Some(SessionDialogEntries {
-            current_project,
-            all_projects,
-            showing_all_projects: false,
+            request,
+            next_cursor,
+            loading: false,
+            error: None,
         });
         dialog
+    }
+
+    pub fn sessions_loading(request: SessionDialogRequest) -> Self {
+        let mut dialog = Self::sessions_page(Vec::new(), request, None);
+        if let Some(session_entries) = dialog.session_entries.as_mut() {
+            session_entries.loading = true;
+        }
+        dialog
+    }
+
+    pub fn sessions_error(request: SessionDialogRequest, message: impl AsRef<str>) -> Self {
+        let mut dialog = Self::sessions_page(Vec::new(), request, None);
+        if let Some(session_entries) = dialog.session_entries.as_mut() {
+            session_entries.error = Some(bounded_dialog_text(message.as_ref(), 256));
+        }
+        dialog
+    }
+
+    pub fn is_loading(&self) -> bool {
+        self.session_entries
+            .as_ref()
+            .is_some_and(|entries| entries.loading)
     }
 
     pub fn with_selected(mut self, selected: usize) -> Self {
@@ -891,7 +991,29 @@ fn refresh_dialog_query_action(dialog: &mut DialogView) {
     ));
 }
 
+fn session_dialog_title(scope: SessionDialogScope) -> &'static str {
+    match scope {
+        SessionDialogScope::CurrentProject => "Resume session · Current project",
+        SessionDialogScope::AllProjects => "Resume session · All projects",
+    }
+}
+
+fn session_dialog_help(scope: SessionDialogScope) -> &'static str {
+    match scope {
+        SessionDialogScope::CurrentProject => {
+            "Type to search | Ctrl+A All projects | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
+        }
+        SessionDialogScope::AllProjects => {
+            "Type to search | Ctrl+A Current project | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
+        }
+    }
+}
+
 fn dialog_matches(dialog: &DialogView) -> Vec<(usize, &DialogEntry)> {
+    if dialog.session_entries.is_some() {
+        return dialog.entries.iter().enumerate().collect();
+    }
+
     let query = dialog.query.to_lowercase();
     dialog
         .entries
@@ -1167,7 +1289,22 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if matches.is_empty()
+    if dialog
+        .session_entries
+        .as_ref()
+        .is_some_and(|entries| entries.loading)
+    {
+        lines.push(Line::from("Loading sessions…"));
+    } else if let Some(error) = dialog
+        .session_entries
+        .as_ref()
+        .and_then(|entries| entries.error.as_deref())
+    {
+        lines.push(Line::styled(
+            error,
+            Style::default().fg(widgets::RolePalette::warning()),
+        ));
+    } else if matches.is_empty()
         && (dialog.session_entries.is_some()
             || dialog.help.is_none()
             || dialog.empty_message.is_some())
@@ -1220,6 +1357,17 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
                 .map(|line| Line::styled(line, Style::default().fg(Color::DarkGray))),
         );
     }
+    if let Some(session_entries) = dialog.session_entries.as_ref() {
+        let end = if session_entries.next_cursor.is_some() {
+            "more"
+        } else {
+            "end"
+        };
+        lines.push(Line::styled(
+            format!("Page {} · {end}", session_entries.request.page),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -1242,6 +1390,7 @@ fn dialog_area(area: Rect, dialog: &DialogView) -> Rect {
     let width = area.width.saturating_sub(4).clamp(1, 64);
     let content_rows = usize::from(dialog.help.is_some())
         .saturating_add(usize::from(dialog.interactive))
+        .saturating_add(usize::from(dialog.session_entries.is_some()))
         .saturating_add(dialog_matches(dialog).len().max(1))
         .saturating_add(if dialog.details_open {
             dialog
@@ -1280,26 +1429,31 @@ struct DialogContentLayout {
 fn dialog_content_layout(dialog: &DialogView, height: u16) -> DialogContentLayout {
     let inner_rows = usize::from(height.saturating_sub(2));
     let search_rows = usize::from(dialog.interactive);
+    let footer_rows = usize::from(dialog.session_entries.is_some());
     let detail_rows = if dialog.details_open {
         dialog
             .entries
             .get(dialog.selected)
             .and_then(|entry| entry.selected_detail.as_deref())
             .map_or(0, |detail| {
-                detail
-                    .lines()
-                    .count()
-                    .min(3)
-                    .min(inner_rows.saturating_sub(search_rows.saturating_add(1)))
+                detail.lines().count().min(3).min(
+                    inner_rows
+                        .saturating_sub(search_rows.saturating_add(footer_rows).saturating_add(1)),
+                )
             })
     } else {
         0
     };
     let show_help = dialog.help.is_some()
-        && inner_rows > search_rows.saturating_add(detail_rows).saturating_add(1);
+        && inner_rows
+            > search_rows
+                .saturating_add(detail_rows)
+                .saturating_add(footer_rows)
+                .saturating_add(1);
     let entry_rows = inner_rows
         .saturating_sub(search_rows)
         .saturating_sub(detail_rows)
+        .saturating_sub(footer_rows)
         .saturating_sub(usize::from(show_help))
         .max(1);
 
@@ -1319,7 +1473,7 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
     };
     if !dialog.query.is_empty() {
         "No sessions match search."
-    } else if session_entries.showing_all_projects {
+    } else if session_entries.request.scope == SessionDialogScope::AllProjects {
         "No resumable sessions in any project."
     } else {
         "No resumable sessions in current project."
@@ -1376,6 +1530,7 @@ fn screen_layout(area: Rect, input: &str, show_header: bool) -> ScreenLayout {
 
 fn header_should_show(state: &ViewState<'_>) -> bool {
     state.quit_armed
+        || state.recovered_failed_prompt
         || state.dangerous_mode
         || state.running
         || state.session_loading
@@ -1393,6 +1548,13 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
         ));
+    } else if state.recovered_failed_prompt {
+        left.push(Span::styled(
+            " Recovered failed prompt · Enter retry · Esc discard ",
+            Style::default()
+                .fg(widgets::RolePalette::warning())
+                .add_modifier(Modifier::BOLD),
+        ));
     } else if state.dangerous_mode {
         left.push(Span::styled(
             " danger ",
@@ -1403,7 +1565,9 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
     }
     if !state.executions.is_empty() {
         append_execution_strip(&mut left, state);
-    } else if let Some(status) = state.status.filter(|value| !value.is_empty()) {
+    } else if !state.recovered_failed_prompt
+        && let Some(status) = state.status.filter(|value| !value.is_empty())
+    {
         // Transient context messages (e.g. resume notices) live here — not model/project.
         left.push(Span::styled(
             format!(" {status} "),
@@ -1418,7 +1582,8 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
     }
     let status = widgets::StatusGlyph::decorate_status(
         state.running,
-        if state.status.is_some() && state.executions.is_empty() {
+        if state.recovered_failed_prompt || (state.status.is_some() && state.executions.is_empty())
+        {
             state_label
         } else {
             state.status.unwrap_or(state_label)
@@ -1978,6 +2143,7 @@ pub struct Tui<E> {
     engine: E,
     input: String,
     input_cursor: usize,
+    recovered_failed_prompt: bool,
     size: (u16, u16),
     running: bool,
     session_loading: bool,
@@ -2025,6 +2191,7 @@ where
             engine,
             input: String::new(),
             input_cursor: 0,
+            recovered_failed_prompt: false,
             size: (80, 24),
             running: false,
             session_loading: false,
@@ -2434,6 +2601,9 @@ where
                 self.finish_session_load();
                 self.replace_projected_history(history);
                 self.apply_presentation(presentation);
+                self.input.clear();
+                self.input_cursor = 0;
+                self.recovered_failed_prompt = false;
                 if let Some(draft) = draft {
                     self.restore_resume_draft(draft);
                 }
@@ -2489,6 +2659,7 @@ where
     fn restore_resume_draft(&mut self, draft: String) {
         self.input = draft;
         self.input_cursor = self.input.chars().count();
+        self.recovered_failed_prompt = true;
         let scroll_offset = self.max_scroll_offset();
         let record = self.active_record_mut();
         record.focus = TranscriptFocus::Composer;
@@ -3001,6 +3172,16 @@ where
     }
 
     pub fn show_selection_dialog(&mut self, mut dialog: DialogView) {
+        if let (Some(current), Some(incoming)) = (
+            self.dialog
+                .as_ref()
+                .and_then(|dialog| dialog.session_entries.as_ref()),
+            dialog.session_entries.as_ref(),
+        ) && current.loading
+            && current.request.generation != incoming.request.generation
+        {
+            return;
+        }
         if dialog.refresh_id.is_some()
             && dialog.refresh_id
                 == self
@@ -3035,6 +3216,7 @@ where
                 .collect(),
             owner_label: &active.owner_label,
             input: &self.input,
+            recovered_failed_prompt: self.recovered_failed_prompt,
             size: self.size,
             running: self.running,
             session_loading: self.session_loading,
@@ -3701,7 +3883,16 @@ where
                 }
                 self.palette_open = false;
                 self.input_cursor = 0;
+                self.recovered_failed_prompt = false;
                 Action::Submit(std::mem::take(&mut self.input))
+            }
+            Key::Escape if self.recovered_failed_prompt => {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.recovered_failed_prompt = false;
+                self.active_record_mut().focus = TranscriptFocus::Composer;
+                self.status = Some("Recovered prompt discarded.".into());
+                Action::Render
             }
             Key::Escape if self.running => self.cancel_running(),
             Key::Escape if self.dialog.is_some() => {
@@ -3981,8 +4172,7 @@ where
                     .as_ref()
                     .is_some_and(|dialog| dialog.session_entries.is_some()) =>
             {
-                self.toggle_session_dialog_scope();
-                Action::Render
+                self.toggle_session_dialog_scope()
             }
             Key::Char(character) => {
                 if let Some(action) = self.try_confirm_shortcut(character) {
@@ -4000,6 +4190,16 @@ where
                 {
                     return Action::OpenDialog(refresh_id);
                 }
+                if let Some(request) = self.session_dialog_request() {
+                    let mut request = request.clone();
+                    if request.query.chars().count() < 128 {
+                        request.query.push(character);
+                    }
+                    request.cursor = None;
+                    request.previous_cursors.clear();
+                    request.page = 1;
+                    return self.start_session_dialog_request(request);
+                }
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.push(character);
                     refresh_dialog_query_action(dialog);
@@ -4008,6 +4208,14 @@ where
                 Action::Render
             }
             Key::Backspace => {
+                if let Some(request) = self.session_dialog_request() {
+                    let mut request = request.clone();
+                    request.query.pop();
+                    request.cursor = None;
+                    request.previous_cursors.clear();
+                    request.page = 1;
+                    return self.start_session_dialog_request(request);
+                }
                 if let Some(dialog) = self.dialog.as_mut() {
                     dialog.query.pop();
                     refresh_dialog_query_action(dialog);
@@ -4016,6 +4224,16 @@ where
                 Action::Render
             }
             Key::DeletePreviousWord => {
+                if let Some(request) = self.session_dialog_request() {
+                    let mut request = request.clone();
+                    let boundary =
+                        previous_word_boundary(&request.query, request.query.chars().count());
+                    request.query.truncate(byte_index(&request.query, boundary));
+                    request.cursor = None;
+                    request.previous_cursors.clear();
+                    request.page = 1;
+                    return self.start_session_dialog_request(request);
+                }
                 if let Some(dialog) = self.dialog.as_mut() {
                     let boundary =
                         previous_word_boundary(&dialog.query, dialog.query.chars().count());
@@ -4030,6 +4248,13 @@ where
                 Action::Render
             }
             Key::PageUp | Key::PageDown => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.session_entries.is_some())
+                {
+                    return self.change_session_dialog_page(key);
+                }
                 self.move_dialog_selection(key, self.dialog_page_rows(), false);
                 Action::Render
             }
@@ -4077,38 +4302,83 @@ where
                     .dialog
                     .as_ref()
                     .and_then(|dialog| dialog.cancellation_action.clone());
+                let session_request_loading = self.dialog.as_ref().is_some_and(|dialog| {
+                    dialog
+                        .session_entries
+                        .as_ref()
+                        .is_some_and(|entries| entries.loading)
+                });
                 self.dialog = None;
-                action_id.map_or(Action::Render, Action::SafeDialogAction)
+                if session_request_loading {
+                    Action::CancelRoute
+                } else {
+                    action_id.map_or(Action::Render, Action::SafeDialogAction)
+                }
             }
             _ => Action::Render,
         }
     }
 
-    fn toggle_session_dialog_scope(&mut self) {
-        let Some(dialog) = self.dialog.as_mut() else {
-            return;
-        };
-        let Some(session_entries) = dialog.session_entries.as_mut() else {
-            return;
-        };
+    fn session_dialog_request(&self) -> Option<&SessionDialogRequest> {
+        self.dialog
+            .as_ref()?
+            .session_entries
+            .as_ref()
+            .map(|entries| &entries.request)
+    }
 
-        session_entries.showing_all_projects = !session_entries.showing_all_projects;
-        if session_entries.showing_all_projects {
-            dialog.title = "Resume session · All projects".into();
-            dialog.help = Some(
-                "Type to search | Ctrl+A Current project | Up/Down navigate | Enter resume | Esc cancel"
-                    .into(),
-            );
-            dialog.entries.clone_from(&session_entries.all_projects);
-        } else {
-            dialog.title = "Resume session · Current project".into();
-            dialog.help = Some(
-                "Type to search | Ctrl+A All projects | Up/Down navigate | Enter resume | Esc cancel"
-                    .into(),
-            );
-            dialog.entries.clone_from(&session_entries.current_project);
+    fn start_session_dialog_request(&mut self, mut request: SessionDialogRequest) -> Action {
+        let generation = self
+            .session_dialog_request()
+            .map_or(1, |current| current.generation.wrapping_add(1).max(1));
+        request.generation = generation;
+        self.dialog = Some(DialogView::sessions_loading(request.clone()));
+        Action::LoadSessionPage(request)
+    }
+
+    fn toggle_session_dialog_scope(&mut self) -> Action {
+        let Some(request) = self.session_dialog_request() else {
+            return Action::Render;
+        };
+        let mut request = request.clone();
+        request.scope = match request.scope {
+            SessionDialogScope::CurrentProject => SessionDialogScope::AllProjects,
+            SessionDialogScope::AllProjects => SessionDialogScope::CurrentProject,
+        };
+        request.cursor = None;
+        request.previous_cursors.clear();
+        request.page = 1;
+        self.start_session_dialog_request(request)
+    }
+
+    fn change_session_dialog_page(&mut self, key: Key) -> Action {
+        let Some(entries) = self
+            .dialog
+            .as_ref()
+            .and_then(|dialog| dialog.session_entries.as_ref())
+        else {
+            return Action::Render;
+        };
+        let mut request = entries.request.clone();
+        match key {
+            Key::PageDown => {
+                let Some(next_cursor) = entries.next_cursor else {
+                    return Action::Render;
+                };
+                request.previous_cursors.push(request.cursor);
+                request.cursor = Some(next_cursor);
+                request.page = request.page.saturating_add(1);
+            }
+            Key::PageUp => {
+                let Some(previous_cursor) = request.previous_cursors.pop() else {
+                    return Action::Render;
+                };
+                request.cursor = previous_cursor;
+                request.page = request.page.saturating_sub(1).max(1);
+            }
+            _ => return Action::Render,
         }
-        self.reset_dialog_selection();
+        self.start_session_dialog_request(request)
     }
 
     fn move_dialog_selection(&mut self, key: Key, amount: usize, wrap: bool) {
@@ -4713,6 +4983,7 @@ where
             | Action::CancelExecution(_)
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
+            | Action::LoadSessionPage(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
             | Action::Cancel
@@ -4773,6 +5044,7 @@ where
             | Action::CancelExecution(_)
             | Action::SendTaskMessage { .. }
             | Action::OpenDialog(_)
+            | Action::LoadSessionPage(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
             | Action::Cancel
@@ -5156,6 +5428,10 @@ where
                     if !tui.begin_session_load() {
                         continue;
                     }
+                } else if is_session_browser_request(&request) {
+                    tui.show_selection_dialog(DialogView::sessions_loading(
+                        SessionDialogRequest::initial(),
+                    ));
                 } else {
                     tui.begin_route();
                 }
@@ -5191,16 +5467,63 @@ where
                 let _ = send_task_message(id, message);
             }
             Action::OpenDialog(route_id) => {
+                if route_id == "sessions"
+                    && let Some((_, cancellation, _)) = active_route.take()
+                {
+                    cancellation.cancel();
+                }
                 next_route_id = next_route_id.wrapping_add(1).max(1);
                 let active_id = next_route_id;
                 let cancellation = TuiRouteCancellation::new();
                 active_route = Some((active_id, cancellation.clone(), false));
-                let outcome = route(
-                    TuiRouteRequest::OpenDialog(route_id),
-                    route_progress_sender.clone(),
-                    cancellation,
-                );
-                let _ = route_sender.send((active_id, outcome));
+                if route_id == "sessions" {
+                    tui.show_selection_dialog(DialogView::sessions_loading(
+                        SessionDialogRequest::initial(),
+                    ));
+                    let route = Arc::clone(&route);
+                    let route_sender = route_sender.clone();
+                    let progress = route_progress_sender.clone();
+                    thread::spawn(move || {
+                        let outcome = route(
+                            TuiRouteRequest::OpenDialog(route_id),
+                            progress,
+                            cancellation,
+                        );
+                        let _ = route_sender.send((active_id, outcome));
+                    });
+                } else {
+                    let outcome = route(
+                        TuiRouteRequest::OpenDialog(route_id),
+                        route_progress_sender.clone(),
+                        cancellation,
+                    );
+                    let _ = route_sender.send((active_id, outcome));
+                }
+            }
+            Action::LoadSessionPage(request) => {
+                if let Some((_, cancellation, _)) = active_route.take() {
+                    cancellation.cancel();
+                }
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let active_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((active_id, cancellation.clone(), false));
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(120));
+                    let outcome = if cancellation.is_cancelled() {
+                        TuiSubmissionOutcome::RouteCancelled
+                    } else {
+                        route(
+                            TuiRouteRequest::SessionPage(request),
+                            progress,
+                            cancellation,
+                        )
+                    };
+                    let _ = route_sender.send((active_id, outcome));
+                });
             }
             Action::DialogAction(action_id) => {
                 if let Some((id, reply)) = parse_permission_reply(&action_id) {
@@ -5299,7 +5622,16 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
             .strip_prefix("/resume ")
             .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
-        TuiRouteRequest::OpenDialog(_) => false,
+        TuiRouteRequest::OpenDialog(_) | TuiRouteRequest::SessionPage(_) => false,
+    }
+}
+
+fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
+    match request {
+        TuiRouteRequest::Input(input) => matches!(input.trim(), "/resume" | "/sessions"),
+        TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
+        TuiRouteRequest::SessionPage(_) => true,
+        TuiRouteRequest::DialogAction(_) => false,
     }
 }
 

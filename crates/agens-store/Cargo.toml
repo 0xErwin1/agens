@@ -12,3 +12,6 @@ workspace = true
 agens-core = { path = "../agens-core" }
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 serde_json = "1.0.150"
+
+[dev-dependencies]
+rusqlite = { version = "0.40.1", features = ["trace"] }

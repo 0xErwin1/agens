@@ -33,7 +33,7 @@ use agens_providers::{
     ProviderDiagnosticComponent, ProviderDiagnosticEvent, ProviderDiagnosticKind,
     ProviderDiagnosticScope, ProviderDiagnostics, load_chatgpt_auth_state,
 };
-use agens_store::{PermissionGrantStore, SessionStore, StoredSession};
+use agens_store::{PermissionGrantStore, SessionCursor, SessionStore, StoredSession};
 #[cfg(test)]
 use agens_tools::TaskTerminalState;
 use agens_tools::{
@@ -51,10 +51,11 @@ use agens_tools::{
 };
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
-    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, ToolResultState, Tui, TuiExecutionEvent,
-    TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest, TuiPresentation,
-    TuiProviderOutcome, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent,
-    TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    Engine as TuiEngine, PaletteEntry, PaletteEntryKind, SessionDialogCursor, SessionDialogRequest,
+    SessionDialogScope, ToolResultState, Tui, TuiExecutionEvent, TuiPermissionBridge,
+    TuiPermissionReply, TuiPermissionRequest, TuiPresentation, TuiProviderOutcome,
+    TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubagentErrorKind,
+    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
     run_with_default_progress_submit_with_permissions_and_task_controls,
 };
 
@@ -324,6 +325,25 @@ fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliErr
             delay_ms: None,
             status: None,
             class: Some(class),
+        },
+    );
+}
+
+fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
+    let Ok(reference) = DiagnosticRef::new(next_diagnostic_reference()) else {
+        return;
+    };
+    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
+        &ProviderDiagnosticEvent {
+            reference,
+            scope: ProviderDiagnosticScope::Parent,
+            component: ProviderDiagnosticComponent::Agent,
+            event,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Runtime),
         },
     );
 }
@@ -1609,6 +1629,7 @@ struct TuiSessionContext {
     chatgpt_unavailable: bool,
     resume_error: Option<String>,
     resume_notice: Option<String>,
+    agent_correction_pending: bool,
     resume_draft: Option<ResumeDraft>,
     selected_subagent: Option<String>,
     dangerous_mode: bool,
@@ -1680,17 +1701,18 @@ impl ActiveAgentRuntime {
         dispatcher: &ToolDispatcher,
         validator: &dyn AgentModelValidator,
     ) -> Result<Self, AgentRotationError> {
-        let model = agent
+        if agent
             .model
-            .as_deref()
-            .or(inherited_model)
-            .map(str::to_owned);
-        if model
             .as_deref()
             .is_some_and(|model| validator.validate_model(model).is_err())
         {
             return Err(AgentRotationError::ModelUnavailable);
         }
+        let model = agent
+            .model
+            .as_deref()
+            .or(inherited_model)
+            .map(str::to_owned);
         Ok(Self {
             name: agent.name.clone(),
             model,
@@ -1709,19 +1731,15 @@ enum AgentRotationError {
 fn rotate_active_agent(
     context: &mut TuiSessionContext,
     candidate: &AgentDefinition,
+    inherited_model: Option<&str>,
     project: &str,
     dispatcher: &ToolDispatcher,
     validator: &dyn AgentModelValidator,
     store: Option<&mut SessionStore>,
-    busy: bool,
 ) -> Result<(), AgentRotationError> {
-    if busy {
+    if context.running {
         return Err(AgentRotationError::Busy);
     }
-    let inherited_model = context
-        .active_agent
-        .as_ref()
-        .and_then(|agent| agent.model.as_deref());
     let next =
         ActiveAgentRuntime::build(candidate, inherited_model, project, dispatcher, validator)?;
     let reminder = context.active_agent.as_ref().and_then(|current| {
@@ -1860,14 +1878,11 @@ fn session_attempt_status_label(status: agens_core::SessionAttemptStatus) -> &'s
 
 fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'static str> {
     match status {
-        SessionAttemptStatus::Cancelled => {
-            Some("Previous attempt was cancelled. Prompt restored; press Enter to retry.")
-        }
-        SessionAttemptStatus::Interrupted => {
-            Some("Previous attempt was interrupted. Prompt restored; press Enter to retry.")
-        }
-        SessionAttemptStatus::Failed | SessionAttemptStatus::ProviderError => {
-            Some("Previous attempt failed. Prompt restored; press Enter to retry.")
+        SessionAttemptStatus::Cancelled
+        | SessionAttemptStatus::Interrupted
+        | SessionAttemptStatus::Failed
+        | SessionAttemptStatus::ProviderError => {
+            Some("Recovered failed prompt · Enter retry · Esc discard")
         }
         SessionAttemptStatus::Running | SessionAttemptStatus::Completed => None,
     }
@@ -1956,6 +1971,7 @@ impl TuiSessionContext {
             chatgpt_unavailable: false,
             resume_error: None,
             resume_notice: None,
+            agent_correction_pending: false,
             resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
@@ -1981,6 +1997,7 @@ impl TuiSessionContext {
             chatgpt_unavailable: false,
             resume_error: None,
             resume_notice: None,
+            agent_correction_pending: false,
             resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
@@ -2015,20 +2032,31 @@ impl TuiSessionContext {
             request.session = self.metadata.clone();
         }
 
+        let selected_model = self.selection.as_ref().map(|selection| {
+            request.model = Some(selection.model().to_owned());
+            request.request_config = selection.request_config().clone();
+            request.session_reasoning_effort = selection.reasoning_effort_value();
+            selection.model()
+        });
         if let Some(agent) = &self.active_agent {
-            if request.model.is_none() {
+            let overrides_selection = selected_model.is_some_and(|selected| {
+                agent
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model != selected)
+            });
+            if request.model.is_none() || overrides_selection {
                 request.model = agent.model.clone();
+            }
+            if overrides_selection {
+                request.request_config = Default::default();
+                request.session_reasoning_effort = None;
             }
             request
                 .system_prompt
                 .get_or_insert_with(|| agent.system_prompt.clone());
             request.active_agent = Some(agent.name.clone());
             request.effective_capabilities = Some(agent.capabilities.clone());
-        }
-        if let Some(selection) = &self.selection {
-            request.model = Some(selection.model().to_owned());
-            request.request_config = selection.request_config().clone();
-            request.session_reasoning_effort = selection.reasoning_effort_value();
         }
         request.pending_system_reminder = self.pending_system_reminder.clone();
 
@@ -2198,8 +2226,10 @@ impl TuiRuntimeRouter {
         skills: Arc<SkillCatalog>,
         auth: ChatGptAuthCoordinator,
     ) -> Self {
-        let has_subagents =
-            tui_subagent_catalog(&bootstrap).is_ok_and(|mut agents| agents.next().is_some());
+        let has_subagents = session.lock().is_ok_and(|context| {
+            tui_subagent_catalog(&bootstrap, &context)
+                .is_ok_and(|mut agents| agents.next().is_some())
+        });
         let palette = resolved_tui_palette(&commands, &skills, has_subagents).into();
         let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
         let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
@@ -2323,6 +2353,9 @@ impl TuiRuntimeRouter {
                 return self.route_with_progress_cancellable(input, progress, cancellation);
             }
             TuiRouteRequest::OpenDialog(route_id) => self.open_dialog(&route_id),
+            TuiRouteRequest::SessionPage(request) => {
+                return self.session_dialog_outcome(request);
+            }
             TuiRouteRequest::DialogAction(action_id) => {
                 return self.route_dialog_action_with_cancellation(
                     &action_id,
@@ -2514,37 +2547,14 @@ impl TuiRuntimeRouter {
                 ));
             }
             "sessions" => {
-                let project = tui_project_identifier(&bootstrap)?;
-                let store = SessionStore::open(bootstrap.data_directory())
-                    .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-                let current_session = self
-                    .session
-                    .lock()
-                    .map_err(|_| CliError::storage("TUI session is unavailable"))?
-                    .identifier;
-                let now = (self.clock)();
-                let current_project = store
-                    .list_session_page(Some(&project), 0)
-                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
-                    .sessions
-                    .iter()
-                    .map(|session| session_dialog_entry(session, current_session, false, now))
-                    .collect();
-                let all_projects = store
-                    .list_session_page(None, 0)
-                    .map_err(|_| CliError::storage("saved sessions could not be listed"))?
-                    .sessions
-                    .into_iter()
-                    .map(|session| session_dialog_entry(&session, current_session, true, now))
-                    .collect();
-                DialogView::sessions(current_project, all_projects)
+                return Ok(self.session_dialog_outcome(SessionDialogRequest::initial()));
             }
             "agent" => {
-                let catalog = tui_agent_catalog(&bootstrap, &BundledModelValidator)?;
                 let context = self
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let catalog = tui_agent_catalog_for_context(&bootstrap, &context)?;
                 let current = context
                     .active_agent
                     .as_ref()
@@ -2570,7 +2580,11 @@ impl TuiRuntimeRouter {
                 DialogView::selection("Choose agent", Some("Eligible primary agents"), entries)
             }
             "subagent" => {
-                let entries = tui_subagent_catalog(&bootstrap)?
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let entries = tui_subagent_catalog(&bootstrap, &context)?
                     .map(|agent| {
                         DialogEntry::action(&agent.name, format!("subagent:{}", agent.name))
                     })
@@ -2585,6 +2599,51 @@ impl TuiRuntimeRouter {
         } else {
             Ok(TuiSubmissionOutcome::Dialog(dialog))
         }
+    }
+
+    fn session_dialog_outcome(&self, request: SessionDialogRequest) -> TuiSubmissionOutcome {
+        let fallback_request = request.clone();
+        match self.load_session_dialog(request) {
+            Ok(dialog) => TuiSubmissionOutcome::Dialog(dialog),
+            Err(_) => TuiSubmissionOutcome::Dialog(DialogView::sessions_error(
+                fallback_request,
+                "Saved sessions could not be loaded.",
+            )),
+        }
+    }
+
+    fn load_session_dialog(&self, request: SessionDialogRequest) -> Result<DialogView, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let project = tui_project_identifier(&bootstrap)?;
+        let project = match request.scope() {
+            SessionDialogScope::CurrentProject => Some(project.as_str()),
+            SessionDialogScope::AllProjects => None,
+        };
+        let cursor = request
+            .cursor()
+            .map(|cursor| SessionCursor::new(cursor.updated_at(), cursor.id()));
+        let store = SessionStore::open(bootstrap.data_directory())
+            .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+        let page = store
+            .list_session_page(project, request.query(), cursor, 64)
+            .map_err(|_| CliError::storage("saved sessions could not be listed"))?;
+        let current_session = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?
+            .identifier;
+        let now = (self.clock)();
+        let show_project = request.scope() == SessionDialogScope::AllProjects;
+        let entries = page
+            .sessions
+            .iter()
+            .map(|session| session_dialog_entry(session, current_session, show_project, now))
+            .collect();
+        let next_cursor = page
+            .next_cursor
+            .map(|cursor| SessionDialogCursor::new(cursor.updated_at(), cursor.id()));
+
+        Ok(DialogView::sessions_page(entries, request, next_cursor))
     }
 
     #[cfg(test)]
@@ -2740,8 +2799,9 @@ impl TuiRuntimeRouter {
             .ok_or_else(|| CliError::storage("attempt recovery failed"))?;
         drop(store);
 
-        let resumed =
+        let mut resumed =
             resume_tui_session(bootstrap, key.session_id(), &self.skills, &self.credentials)?;
+        persist_pending_agent_correction(bootstrap, &mut resumed);
         let prompt = boundary.prompt().to_owned();
         *self
             .session
@@ -3092,6 +3152,7 @@ impl TuiRuntimeRouter {
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
         context.provider = None;
         context.chatgpt_unavailable = true;
+        context.active_agent = None;
         Ok(())
     }
 
@@ -3117,28 +3178,17 @@ impl TuiRuntimeRouter {
             return Err(CliError::authentication(message));
         }
 
-        let current_model = context
-            .selection
-            .as_ref()
-            .map(TuiModelSelector::model)
-            .or_else(|| {
-                context
-                    .active_agent
-                    .as_ref()
-                    .and_then(|agent| agent.model.as_deref())
-            })
-            .or_else(|| bootstrap.model())
-            .unwrap_or_else(|| default_model(bootstrap));
+        let current_model = effective_tui_model(bootstrap, &context);
         let previous_effort = context
             .selection
             .as_ref()
             .and_then(TuiModelSelector::reasoning_effort);
-        let mut next = TuiModelSelector::for_source(current_model, provider.source());
+        let mut next = TuiModelSelector::for_source(&current_model, provider.source());
         let compatible = next
             .model_values()
             .map_err(CliError::unavailable)?
             .iter()
-            .any(|model| model == current_model);
+            .any(|model| model == &current_model);
         let label = provider.label();
         let message = if compatible {
             let reset_effort =
@@ -3151,7 +3201,7 @@ impl TuiRuntimeRouter {
                 format!("Provider: {label}. Model retained: {current_model}.")
             }
         } else {
-            let previous = current_model.to_owned();
+            let previous = current_model.clone();
             let default = ["gpt-4.1", "gpt-5.5"][provider as usize];
             next = TuiModelSelector::for_source(default, provider.source());
             format!(
@@ -3513,11 +3563,17 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
         allowlisted_diagnostic_value(object.get("scope")?.as_str()?, &["parent", "subagent"])?;
     let component = allowlisted_diagnostic_value(
         object.get("component")?.as_str()?,
-        &["responses", "oauth_refresh", "subagent"],
+        &["responses", "oauth_refresh", "subagent", "agent"],
     )?;
     let event = allowlisted_diagnostic_value(
         object.get("event")?.as_str()?,
-        &["attempt", "retry_scheduled", "terminal"],
+        &[
+            "attempt",
+            "retry_scheduled",
+            "terminal",
+            "agent_unavailable",
+            "agent_fallback",
+        ],
     )?;
     let attempt = object
         .get("attempt")?
@@ -3603,6 +3659,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             &skills,
             &TuiCredentialResolver::production(),
         )?;
+        persist_pending_agent_correction(bootstrap, &mut resumed);
         let presentation = tui_session_presentation(bootstrap, &resumed);
         let message = resumed.note();
         let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
@@ -3988,25 +4045,24 @@ fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> O
         .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
 }
 
-fn tui_session_presentation(bootstrap: &Bootstrap, session: &TuiSessionContext) -> TuiPresentation {
-    let model = session
+fn effective_tui_model(bootstrap: &Bootstrap, context: &TuiSessionContext) -> String {
+    context
         .selection
         .as_ref()
         .map(TuiModelSelector::model)
         .or_else(|| {
-            session
+            context
                 .metadata
                 .as_ref()
                 .and_then(|metadata| metadata.model_id.as_deref())
         })
-        .or_else(|| {
-            session
-                .active_agent
-                .as_ref()
-                .and_then(|agent| agent.model.as_deref())
-        })
         .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap));
+        .unwrap_or_else(|| default_model(bootstrap))
+        .to_owned()
+}
+
+fn tui_session_presentation(bootstrap: &Bootstrap, session: &TuiSessionContext) -> TuiPresentation {
+    let model = effective_tui_model(bootstrap, session);
     let provider = session
         .metadata
         .as_ref()
@@ -4025,11 +4081,11 @@ fn tui_session_presentation(bootstrap: &Bootstrap, session: &TuiSessionContext) 
                 .or_else(|| selection.reasoning_effort_default())
         })
         .or_else(|| {
-            TuiModelSelector::for_source(model, tui_model_source(bootstrap, session))
+            TuiModelSelector::for_source(&model, tui_model_source(bootstrap, session))
                 .reasoning_effort_default()
         });
-    let mut presentation = TuiPresentation::new(provider, model, label)
-        .with_context_window(model_registry::context_window_for(model))
+    let mut presentation = TuiPresentation::new(provider, &model, label)
+        .with_context_window(model_registry::context_window_for(&model))
         .with_dangerous_mode(session.dangerous_mode);
     if let Some(effort) = effort {
         presentation = presentation.with_effort(effort);
@@ -4089,6 +4145,7 @@ fn apply_tui_selection(
     }
     context.provider = Some(provider);
     context.selection = Some(selector);
+    context.active_agent = None;
     Ok(())
 }
 
@@ -4263,12 +4320,30 @@ fn rotate_tui_agent(
     session: &Arc<Mutex<TuiSessionContext>>,
     skills: &SkillCatalog,
 ) -> Result<String, CliError> {
-    let validator = BundledModelValidator;
+    let validator = {
+        let context = session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        TuiAgentModelValidator::for_context(bootstrap, &context)?
+    };
     let catalog = tui_agent_catalog(bootstrap, &validator)?;
+    if session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?
+        .running
+    {
+        return Err(CliError::runtime(HeadlessTurnError::State));
+    }
+    let agent = catalog
+        .agent(name.trim())
+        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
+        .ok_or_else(|| CliError::usage("/agent requires an available primary agent"))?
+        .clone();
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(skills))?;
+    ensure_active_tui_agent_runtime(bootstrap, session, &dispatcher)?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
@@ -4278,45 +4353,21 @@ fn rotate_tui_agent(
     if context.running {
         return Err(CliError::runtime(HeadlessTurnError::State));
     }
-    if context.active_agent.is_none() {
-        let current = context
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.active_agent.as_str())
-            .unwrap_or("primary");
-        let agent = catalog
-            .agent(current)
-            .ok_or_else(|| CliError::configuration("active agent is unavailable"))?;
-        context.active_agent = Some(
-            ActiveAgentRuntime::build(
-                agent,
-                bootstrap.model(),
-                &project_root.display().to_string(),
-                &dispatcher,
-                &validator,
-            )
-            .map_err(agent_rotation_error)?,
-        );
-    }
-    let agent = catalog
-        .agent(name.trim())
-        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
-        .ok_or_else(|| CliError::usage("/agent requires an available primary agent"))?;
+    let inherited_model = effective_tui_model(bootstrap, &context);
     let mut store = context
         .metadata
         .is_some()
         .then(|| SessionStore::open(bootstrap.data_directory()))
         .transpose()
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
-    let running = context.running;
     rotate_active_agent(
         &mut context,
-        agent,
+        &agent,
+        Some(&inherited_model),
         &project_root.display().to_string(),
         &dispatcher,
         &validator,
         store.as_mut(),
-        running,
     )
     .map_err(agent_rotation_error)?;
     Ok(format!("Active agent: {}.", agent.name))
@@ -4328,10 +4379,10 @@ fn list_tui_agents(
     session: &Arc<Mutex<TuiSessionContext>>,
     mode: agens_core::AgentMode,
 ) -> Result<String, CliError> {
-    let catalog = tui_agent_catalog(bootstrap, &BundledModelValidator)?;
     let context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    let catalog = tui_agent_catalog_for_context(bootstrap, &context)?;
     let current = match mode {
         agens_core::AgentMode::Primary => context
             .active_agent
@@ -4373,7 +4424,11 @@ fn select_tui_subagent(
     name: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
 ) -> Result<String, CliError> {
-    let agents = tui_subagent_catalog(bootstrap)?.collect::<Vec<_>>();
+    let snapshot = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?
+        .clone();
+    let agents = tui_subagent_catalog(bootstrap, &snapshot)?.collect::<Vec<_>>();
     if agents.is_empty() {
         return Err(CliError::usage("No eligible subagents are available."));
     }
@@ -4393,6 +4448,7 @@ fn select_tui_subagent(
 
 fn tui_subagent_catalog(
     bootstrap: &Bootstrap,
+    context: &TuiSessionContext,
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
     if bootstrap
         .provider_type()
@@ -4402,7 +4458,7 @@ fn tui_subagent_catalog(
         return Ok(Vec::new().into_iter());
     }
 
-    let agents = tui_agent_catalog(bootstrap, &BundledModelValidator)?
+    let agents = tui_agent_catalog_for_context(bootstrap, context)?
         .subagents()
         .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
         .cloned()
@@ -4417,6 +4473,14 @@ fn tui_agent_catalog(
     discover_tui_agent_catalog(bootstrap, Some(validator))
 }
 
+fn tui_agent_catalog_for_context(
+    bootstrap: &Bootstrap,
+    context: &TuiSessionContext,
+) -> Result<AgentCatalog, CliError> {
+    let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
+    tui_agent_catalog(bootstrap, &validator)
+}
+
 fn tui_task_agent_catalog(bootstrap: &Bootstrap) -> Result<AgentCatalog, CliError> {
     discover_tui_agent_catalog(bootstrap, None)
 }
@@ -4429,7 +4493,7 @@ fn discover_tui_agent_catalog(
         name: "primary".into(),
         description: "Default interactive agent".into(),
         mode: agens_core::AgentMode::Primary,
-        model: bootstrap.model().map(ToOwned::to_owned),
+        model: None,
         system_prompt: bootstrap
             .system_prompt
             .clone()
@@ -4481,16 +4545,188 @@ fn agent_rotation_error(error: AgentRotationError) -> CliError {
     }
 }
 
-struct BundledModelValidator;
+#[derive(Clone)]
+struct TuiAgentModelValidator {
+    available: Arc<BTreeSet<String>>,
+}
 
-impl AgentModelValidator for BundledModelValidator {
+impl TuiAgentModelValidator {
+    fn for_source(source: TuiModelSource) -> Result<Self, CliError> {
+        let available = TuiModelSelector::for_source("gpt-4.1", source)
+            .model_values()
+            .map_err(CliError::unavailable)?
+            .into_iter()
+            .collect();
+        Ok(Self {
+            available: Arc::new(available),
+        })
+    }
+
+    fn for_context(bootstrap: &Bootstrap, context: &TuiSessionContext) -> Result<Self, CliError> {
+        Self::for_source(tui_model_source(bootstrap, context))
+    }
+}
+
+impl AgentModelValidator for TuiAgentModelValidator {
     fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        model_registry::bundled_openai_models()
-            .map_err(|_| agens_tools::AgentModelValidationError::Unavailable)?
-            .iter()
-            .any(|candidate| candidate.id == model)
+        self.available
+            .contains(model)
             .then_some(())
             .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+struct BundledModelValidator;
+
+#[cfg(test)]
+impl AgentModelValidator for BundledModelValidator {
+    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
+        [
+            TuiModelSource::OpenAiApi,
+            TuiModelSource::ChatGptSubscription,
+        ]
+        .into_iter()
+        .any(|source| {
+            TuiModelSelector::for_source(model, source)
+                .model_values()
+                .is_ok_and(|models| models.iter().any(|candidate| candidate == model))
+        })
+        .then_some(())
+        .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistedAgentResolution {
+    agent: AgentDefinition,
+    fallback_from: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedAgentResolutionError {
+    Model,
+    Agent,
+    Primary,
+}
+
+fn resolve_persisted_active_agent(
+    name: &str,
+    catalog: &AgentCatalog,
+    unvalidated_catalog: &AgentCatalog,
+    validator: &dyn AgentModelValidator,
+) -> Result<PersistedAgentResolution, PersistedAgentResolutionError> {
+    let unvalidated = unvalidated_catalog.agent(name);
+    if unvalidated
+        .and_then(|agent| agent.model.as_deref())
+        .is_some_and(|model| validator.validate_model(model).is_err())
+    {
+        return Err(PersistedAgentResolutionError::Model);
+    }
+    if let Some(agent) = catalog
+        .agent(name)
+        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
+    {
+        return Ok(PersistedAgentResolution {
+            agent: agent.clone(),
+            fallback_from: None,
+        });
+    }
+    if name == "primary" {
+        return Err(PersistedAgentResolutionError::Primary);
+    }
+    if unvalidated.is_some() {
+        return Err(PersistedAgentResolutionError::Agent);
+    }
+
+    let unvalidated_primary = unvalidated_catalog
+        .agent("primary")
+        .ok_or(PersistedAgentResolutionError::Primary)?;
+    if unvalidated_primary.mode == agens_core::AgentMode::Subagent {
+        return Err(PersistedAgentResolutionError::Primary);
+    }
+    if unvalidated_primary
+        .model
+        .as_deref()
+        .is_some_and(|model| validator.validate_model(model).is_err())
+    {
+        return Err(PersistedAgentResolutionError::Model);
+    }
+    let primary = catalog
+        .agent("primary")
+        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
+        .ok_or(PersistedAgentResolutionError::Primary)?;
+    Ok(PersistedAgentResolution {
+        agent: primary.clone(),
+        fallback_from: Some(name.to_owned()),
+    })
+}
+
+fn persisted_agent_resolution_error(error: PersistedAgentResolutionError) -> CliError {
+    match error {
+        PersistedAgentResolutionError::Model => {
+            CliError::configuration("agent model is unavailable")
+        }
+        PersistedAgentResolutionError::Agent => {
+            CliError::configuration("active agent is unavailable")
+        }
+        PersistedAgentResolutionError::Primary => {
+            CliError::configuration("primary agent is unavailable")
+        }
+    }
+}
+
+fn reconcile_persisted_active_agent(
+    bootstrap: &Bootstrap,
+    context: &mut TuiSessionContext,
+) -> Result<AgentDefinition, CliError> {
+    let name = context
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.active_agent.clone())
+        .unwrap_or_else(|| "primary".into());
+    let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
+    let catalog = tui_agent_catalog(bootstrap, &validator)?;
+    let unvalidated_catalog = tui_task_agent_catalog(bootstrap)?;
+    let resolution =
+        resolve_persisted_active_agent(&name, &catalog, &unvalidated_catalog, &validator).map_err(
+            |error| {
+                record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentUnavailable);
+                persisted_agent_resolution_error(error)
+            },
+        )?;
+
+    let Some(stale_name) = resolution.fallback_from.as_deref() else {
+        return Ok(resolution.agent);
+    };
+    if let Some(metadata) = context.metadata.as_mut() {
+        metadata.active_agent = "primary".into();
+        context.agent_correction_pending = true;
+    }
+    context.resume_notice = Some(format!(
+        "Agent '{stale_name}' is unavailable; resumed with primary."
+    ));
+    record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentFallback);
+
+    Ok(resolution.agent)
+}
+
+fn persist_pending_agent_correction(bootstrap: &Bootstrap, context: &mut TuiSessionContext) {
+    if !context.agent_correction_pending {
+        return;
+    }
+    context.agent_correction_pending = false;
+
+    let Some(metadata) = context.metadata.as_mut() else {
+        return;
+    };
+    let mut corrected = metadata.clone();
+    corrected.updated_at = current_session_timestamp();
+    if SessionStore::open(bootstrap.data_directory())
+        .and_then(|mut store| store.update_session(&corrected))
+        .is_ok()
+    {
+        *metadata = corrected;
     }
 }
 
@@ -4702,6 +4938,7 @@ fn prepare_loaded_tui_session_resume(
         context.resume_notice = resume_retry_notice(status).map(str::to_owned);
         context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
     }
+    reconcile_persisted_active_agent(bootstrap, &mut context)?;
     Ok(context)
 }
 
@@ -4731,6 +4968,7 @@ fn commit_tui_session_resume(
     if *current != *expected || !cancellation.try_commit() {
         return Ok(TuiSubmissionOutcome::RouteCancelled);
     }
+    persist_pending_agent_correction(bootstrap, &mut resumed);
     *current = resumed;
 
     Ok(TuiSubmissionOutcome::SessionResumed {
@@ -4831,58 +5069,32 @@ fn ensure_active_tui_agent_runtime(
     session: &Arc<Mutex<TuiSessionContext>>,
     dispatcher: &SharedToolDispatcher,
 ) -> Result<(), CliError> {
-    let name = {
-        let context = session
-            .lock()
-            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-        if context.active_agent.is_some() {
-            return Ok(());
-        }
-        context
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.active_agent.clone())
-            .unwrap_or_else(|| "primary".into())
-    };
-    let validator = BundledModelValidator;
-    let catalog = tui_agent_catalog(bootstrap, &validator)?;
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
-    let agent = catalog
-        .agent(&name)
-        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
-        .ok_or_else(|| CliError::configuration("active agent is unavailable"))?;
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    if context.active_agent.is_some() {
+        return Ok(());
+    }
+    let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
+    let validator = TuiAgentModelValidator::for_context(bootstrap, &context)?;
+    let inherited_model = effective_tui_model(bootstrap, &context);
     let active_agent = ActiveAgentRuntime::build(
-        agent,
-        bootstrap.model(),
+        &agent,
+        Some(&inherited_model),
         &project_root.display().to_string(),
         &dispatcher,
         &validator,
     )
     .map_err(agent_rotation_error)?;
-    drop(dispatcher);
-
-    let mut context = session
-        .lock()
-        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    let current_name = context
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.active_agent.as_str())
-        .unwrap_or("primary");
-    if context.active_agent.is_none() && current_name == name {
-        context.active_agent = Some(active_agent);
-        return Ok(());
-    }
-    if context.active_agent.is_some() {
-        return Ok(());
-    }
-
-    Err(CliError::runtime(HeadlessTurnError::State))
+    persist_pending_agent_correction(bootstrap, &mut context);
+    context.active_agent = Some(active_agent);
+    Ok(())
 }
 
 fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
@@ -5197,7 +5409,13 @@ fn run_production_headless_chat_with_progress(
     #[cfg(test)]
     PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    let has_task = tui_agent_catalog(bootstrap, &BundledModelValidator)?
+    let source = bootstrap
+        .provider_type()
+        .and_then(TuiProvider::parse)
+        .map(TuiProvider::source)
+        .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
+    let validator = TuiAgentModelValidator::for_source(source)?;
+    let has_task = tui_agent_catalog(bootstrap, &validator)?
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent);
     if has_task {
@@ -8577,6 +8795,50 @@ mod tests {
     }
 
     #[test]
+    fn subagent_message_and_cancellation_leave_the_primary_agent_unchanged() {
+        let registry = TaskExecutionRegistry::new();
+        let id = registry.admit(TaskLaunchMode::Background).unwrap();
+        let dispatcher = rotation_dispatcher();
+        let primary = rotation_agent("primary", None, false);
+        let active = ActiveAgentRuntime::build(
+            &primary,
+            Some("gpt-5.5"),
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+        )
+        .unwrap();
+        let session = TuiSessionContext {
+            active_agent: Some(active),
+            ..TuiSessionContext::fresh()
+        };
+
+        registry
+            .send_message(
+                TaskMessageSource::User,
+                TaskMessageTarget::Execution(id),
+                "continue".into(),
+            )
+            .unwrap();
+        assert!(registry.cancel(id));
+
+        assert_eq!(
+            session
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("primary")
+        );
+        assert_eq!(
+            session
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref()),
+            Some("gpt-5.5")
+        );
+    }
+
+    #[test]
     fn production_task_error_mapping_reserves_provider_for_provider_failures() {
         assert_eq!(
             map_task_turn_error(HeadlessTurnError::MaxIterations),
@@ -8833,18 +9095,21 @@ mod tests {
         let mut context =
             TuiSessionContext::resumed(1, metadata.clone(), Vec::new(), primary_runtime);
         let original = context.clone();
+        context.running = true;
+        let busy_original = context.clone();
 
         let busy = rotate_active_agent(
             &mut context,
             &reviewer,
+            Some("gpt-4.1"),
             "project",
             &dispatcher,
             &BundledModelValidator,
             Some(&mut store),
-            true,
         );
         assert_eq!(busy, Err(AgentRotationError::Busy));
-        assert_eq!(context, original);
+        assert_eq!(context, busy_original);
+        context.running = false;
         assert_eq!(
             SessionStore::open(&temporary)
                 .unwrap()
@@ -8864,11 +9129,11 @@ mod tests {
         let rollback = rotate_active_agent(
             &mut context,
             &reviewer,
+            Some("gpt-4.1"),
             "project",
             &dispatcher,
             &BundledModelValidator,
             Some(&mut store),
-            false,
         );
         assert_eq!(rollback, Err(AgentRotationError::Persistence));
         assert_eq!(context, original);
@@ -8877,11 +9142,11 @@ mod tests {
         rotate_active_agent(
             &mut context,
             &reviewer,
+            Some("gpt-4.1"),
             "project",
             &dispatcher,
             &BundledModelValidator,
             Some(&mut store),
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -8935,11 +9200,11 @@ mod tests {
         rotate_active_agent(
             &mut context,
             &reviewer,
+            Some("gpt-4.1"),
             "project",
             &dispatcher,
             &BundledModelValidator,
             Some(&mut store),
-            false,
         )
         .unwrap();
         assert_eq!(
@@ -9017,11 +9282,11 @@ mod tests {
         rotate_active_agent(
             &mut no_expansion,
             &reviewer,
+            Some("gpt-4.1"),
             "project",
             &dispatcher,
             &BundledModelValidator,
             None,
-            false,
         )
         .unwrap();
         assert!(no_expansion.pending_system_reminder.is_none());
@@ -10043,13 +10308,16 @@ mod tests {
         assert!(view.following_bottom);
         assert_eq!(
             view.status,
-            Some("Previous attempt failed. Prompt restored; press Enter to retry.")
+            Some("Recovered failed prompt · Enter retry · Esc discard")
         );
         assert!(view.completed_conversations.is_empty());
         assert!(!view.running);
         let rendered = render_tui_test_backend(&tui, 120, 24);
         assert!(rendered.contains(retry_prompt), "{rendered:?}");
-        assert!(rendered.contains("Previous attempt failed"), "{rendered:?}");
+        assert!(
+            rendered.contains("Recovered failed prompt · Enter retry · Esc discard"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -10097,7 +10365,7 @@ mod tests {
         assert!(!format!("{prepared:?}").contains(retry_prompt));
         assert_eq!(
             prepared.note(),
-            "Previous attempt failed. Prompt restored; press Enter to retry."
+            "Recovered failed prompt · Enter retry · Esc discard"
         );
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let expected = session.lock().unwrap().clone();
@@ -10122,7 +10390,7 @@ mod tests {
         };
         assert_eq!(
             message,
-            "Previous attempt failed. Prompt restored; press Enter to retry."
+            "Recovered failed prompt · Enter retry · Esc discard"
         );
         assert!(history.is_empty());
         assert_eq!(draft.as_deref(), Some(retry_prompt));
@@ -10172,7 +10440,7 @@ mod tests {
         assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
         assert_eq!(
             prepared.note(),
-            "Previous attempt failed. Prompt restored; press Enter to retry."
+            "Recovered failed prompt · Enter retry · Esc discard"
         );
         assert!(
             prepared
@@ -10206,7 +10474,7 @@ mod tests {
         assert!(prepared.note().starts_with("Resumed session"));
         assert_eq!(
             resume_retry_notice(SessionAttemptStatus::Cancelled),
-            Some("Previous attempt was cancelled. Prompt restored; press Enter to retry.")
+            Some("Recovered failed prompt · Enter retry · Esc discard")
         );
         assert_eq!(
             attempt_failure_status(&CliError::runtime(HeadlessTurnError::TimedOut)),
@@ -10374,12 +10642,408 @@ mod tests {
     }
 
     #[test]
-    fn barrier_resume_loader_is_local_and_discards_its_late_cancelled_result() {
-        let temporary = tui_session_directory("barrier-resume");
+    fn resumed_primary_inherits_every_effective_pinned_model_and_compatible_effort() {
+        for provider in ["openai-api", "openai-chatgpt"] {
+            for model in [
+                "gpt-5.5",
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ] {
+                let temporary =
+                    tui_session_directory(&format!("resume-primary-{provider}-{model}"));
+                let bootstrap =
+                    tui_session_bootstrap_for_provider(&temporary, &[], provider, model);
+                let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+                let mut metadata =
+                    persist_tui_session(&mut store, &tui_project(&temporary), "inherited");
+                metadata.provider_id = Some(provider.into());
+                metadata.model_id = Some(model.into());
+                metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
+                store.update_session_selection(&metadata).unwrap();
+                drop(store);
+
+                let resumed = resume_tui_session(
+                    &bootstrap,
+                    metadata.id,
+                    &SkillCatalog::default(),
+                    &TuiCredentialResolver::production(),
+                )
+                .unwrap();
+                assert!(resumed.active_agent.is_none());
+                let session = Arc::new(Mutex::new(resumed));
+                let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
+
+                ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+
+                let context = session.lock().unwrap();
+                let active = context.active_agent.as_ref().unwrap();
+                assert_eq!(active.name, "primary", "{provider} {model}");
+                assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
+                let request =
+                    context.apply_to(parse_chat_request(&["first submission".into()]).unwrap());
+                assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+                assert_eq!(
+                    request.request_config.reasoning_effort(),
+                    Some(agens_core::ReasoningEffort::High),
+                    "{provider} {model}"
+                );
+                drop(context);
+
+                std::fs::remove_dir_all(temporary).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn model_switch_invalidates_and_rematerializes_inherited_primary_without_stale_model() {
+        let temporary = tui_session_directory("active-agent-model-switch");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref()),
+            Some("gpt-5.5")
+        );
+
+        apply_tui_model(&bootstrap, "gpt-5.6-sol", &session).unwrap();
+        assert!(session.lock().unwrap().active_agent.is_none());
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+
+        let context = session.lock().unwrap();
+        assert_eq!(
+            context
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref()),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            context
+                .selection
+                .as_ref()
+                .unwrap()
+                .reasoning_effort_default(),
+            Some("medium")
+        );
+        drop(context);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn stale_persisted_agent_falls_back_to_primary_warns_and_persists_correction() {
+        let temporary = tui_session_directory("stale-active-agent-fallback");
+        let stale_definition = "---\nname: retired\ndescription: retired\nmode: primary\npermissions:\n  - allow native::read\n---\nRetired work.\n";
+        let bootstrap = tui_session_bootstrap(&temporary, &[("retired", stale_definition)]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "stale",
+            "retired",
+            100,
+        );
+        drop(store);
+        std::fs::remove_file(
+            bootstrap
+                .paths
+                .global_config
+                .with_file_name("agents")
+                .join("retired.md"),
+        )
+        .unwrap();
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resumed.note(),
+            "Agent 'retired' is unavailable; resumed with primary."
+        );
+        assert_eq!(resumed.metadata.as_ref().unwrap().active_agent, "primary");
+        assert!(resumed.active_agent.is_none());
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "retired"
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let expected = session.lock().unwrap().clone();
+        let outcome = commit_tui_session_resume(
+            &bootstrap,
+            &session,
+            &expected,
+            resumed,
+            &TuiRouteCancellation::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            TuiSubmissionOutcome::SessionResumed { message, .. }
+                if message == "Agent 'retired' is unavailable; resumed with primary."
+        ));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "primary"
+        );
+        assert!(!session.lock().unwrap().agent_correction_pending);
+        assert!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .unwrap()
+                .capabilities
+                .descriptors()
+                .is_empty()
+        );
+        let diagnostics = std::fs::read_to_string(
+            bootstrap
+                .data_directory()
+                .join("diagnostics")
+                .join(format!("agens-{}.jsonl", std::process::id())),
+        )
+        .unwrap();
+        assert!(diagnostics.contains(r#""event":"agent_fallback""#));
+        assert!(!diagnostics.contains("Retired work"));
+        assert!(!diagnostics.contains(&tui_project(&temporary)));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn explicit_unavailable_agent_model_and_ineligible_primary_are_hard_errors() {
+        for (case, definition, active_agent, expected) in [
+            (
+                "explicit-model",
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: gpt-4o\npermissions: []\n---\nReview.\n",
+                "reviewer",
+                "agent model is unavailable",
+            ),
+            (
+                "ineligible-primary",
+                "---\nname: primary\ndescription: primary\nmode: subagent\npermissions: []\n---\nWrong mode.\n",
+                "primary",
+                "primary agent is unavailable",
+            ),
+        ] {
+            let temporary = tui_session_directory(case);
+            let bootstrap = tui_session_bootstrap_for_provider(
+                &temporary,
+                &[(active_agent, definition)],
+                "openai-chatgpt",
+                "gpt-5.5",
+            );
+            let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+            let metadata = persist_tui_session_metadata(
+                &mut store,
+                &tui_project(&temporary),
+                case,
+                active_agent,
+                100,
+            );
+            drop(store);
+
+            let error = resume_tui_session(
+                &bootstrap,
+                metadata.id,
+                &SkillCatalog::default(),
+                &TuiCredentialResolver::production(),
+            )
+            .unwrap_err();
+            assert_eq!(error.message, expected, "{case}");
+            assert_eq!(
+                SessionStore::open(bootstrap.data_directory())
+                    .unwrap()
+                    .load_session_for_resume(metadata.id)
+                    .unwrap()
+                    .metadata
+                    .active_agent,
+                active_agent,
+                "{case}"
+            );
+            let diagnostics = std::fs::read_to_string(
+                bootstrap
+                    .data_directory()
+                    .join("diagnostics")
+                    .join(format!("agens-{}.jsonl", std::process::id())),
+            )
+            .unwrap();
+            assert!(diagnostics.contains(r#""event":"agent_unavailable""#));
+            assert!(!diagnostics.contains(definition));
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_agent_models_use_the_provider_aware_effective_registry() {
+        for (provider, model, expected_effort) in [
+            ("openai-api", "gpt-4o", None),
+            ("openai-chatgpt", "gpt-5.4", None),
+            ("openai-api", "gpt-5.6-luna", None),
+            ("openai-chatgpt", "gpt-5.6-luna", None),
+            (
+                "openai-api",
+                "gpt-5.5",
+                Some(agens_core::ReasoningEffort::High),
+            ),
+            (
+                "openai-chatgpt",
+                "gpt-5.5",
+                Some(agens_core::ReasoningEffort::High),
+            ),
+        ] {
+            let temporary = tui_session_directory(&format!("explicit-{provider}-{model}"));
+            let definition = format!(
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: {model}\npermissions: []\n---\nReview.\n"
+            );
+            let bootstrap = tui_session_bootstrap_for_provider(
+                &temporary,
+                &[("reviewer", &definition)],
+                provider,
+                "gpt-5.5",
+            );
+            let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+            let mut metadata = persist_tui_session_metadata(
+                &mut store,
+                &tui_project(&temporary),
+                "explicit",
+                "reviewer",
+                100,
+            );
+            metadata.provider_id = Some(provider.into());
+            metadata.model_id = Some("gpt-5.5".into());
+            metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
+            store.update_session_selection(&metadata).unwrap();
+            drop(store);
+            let resumed = resume_tui_session(
+                &bootstrap,
+                metadata.id,
+                &SkillCatalog::default(),
+                &TuiCredentialResolver::production(),
+            )
+            .unwrap();
+            let session = Arc::new(Mutex::new(resumed));
+
+            ensure_active_tui_agent_runtime(
+                &bootstrap,
+                &session,
+                &Arc::new(Mutex::new(rotation_dispatcher())),
+            )
+            .unwrap();
+
+            let context = session.lock().unwrap();
+            assert_eq!(context.active_agent.as_ref().unwrap().name, "reviewer");
+            assert_eq!(
+                context.active_agent.as_ref().unwrap().model.as_deref(),
+                Some(model),
+                "{provider} {model}"
+            );
+            let request = context.apply_to(parse_chat_request(&["review".into()]).unwrap());
+            assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+            assert_eq!(
+                request.request_config.reasoning_effort(),
+                expected_effort,
+                "{provider} {model}"
+            );
+            drop(context);
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_agent_missing_keeps_active_primary_and_persisted_metadata_unchanged() {
+        let temporary = tui_session_directory("explicit-agent-missing");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
-        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "barrier");
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "primary");
         drop(store);
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(resumed));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
+        let before = session.lock().unwrap().clone();
+
+        let error = rotate_tui_agent(&bootstrap, "missing", &session, &SkillCatalog::default())
+            .unwrap_err();
+
+        assert_eq!(error.category, "usage");
+        assert_eq!(*session.lock().unwrap(), before);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "primary"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn barrier_resume_loader_is_local_and_discards_its_late_cancelled_result() {
+        let temporary = tui_session_directory("barrier-resume");
+        let stale_definition = "---\nname: retired\ndescription: retired\nmode: primary\npermissions: []\n---\nRetired.\n";
+        let bootstrap = tui_session_bootstrap(&temporary, &[("retired", stale_definition)]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "barrier",
+            "retired",
+            100,
+        );
+        drop(store);
+        std::fs::remove_file(
+            bootstrap
+                .paths
+                .global_config
+                .with_file_name("agents")
+                .join("retired.md"),
+        )
+        .unwrap();
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let original = session.lock().unwrap().clone();
         let cancellation = TuiRouteCancellation::new();
@@ -10435,6 +11099,15 @@ mod tests {
         assert_eq!(outcome, TuiSubmissionOutcome::RouteCancelled);
         assert_eq!(counters, (1, 1, 0, 0));
         assert_eq!(*session.lock().unwrap(), original);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "retired"
+        );
         assert_eq!(tui.view().provider_model, "old-provider / old-model");
         assert_eq!(tui.input(), "preserved draft");
         assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
@@ -10642,6 +11315,12 @@ mod tests {
             )],
         );
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
 
         assert_eq!(
             run_tui_prompt(
@@ -10657,6 +11336,15 @@ mod tests {
         assert_eq!(
             session.lock().unwrap().selected_subagent.as_deref(),
             Some("reviewer")
+        );
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("primary")
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -12469,7 +13157,8 @@ mod tests {
         assert!(project_rows.find("Gamma").unwrap() < project_rows.find("Alpha").unwrap());
         assert!(!project_rows.contains("Beta"));
 
-        tui.handle(Event::Key(Key::LineStart));
+        let global_action = tui.handle(Event::Key(Key::LineStart));
+        dispatch_tui_session_page(&mut tui, &router, global_action, progress.clone());
         let global_rows = render_tui_test_backend(&tui, 100, 24);
         assert!(global_rows.contains("Resume session · All projects"));
         assert!(global_rows.contains(&format!("#{} Beta", other.id)));
@@ -12478,19 +13167,24 @@ mod tests {
         assert!(global_rows.find("Gamma").unwrap() < global_rows.find("Beta").unwrap());
         assert!(global_rows.find("Beta").unwrap() < global_rows.find("Alpha").unwrap());
 
+        let mut search_action = Action::Render;
         for character in "reviewer".chars() {
-            tui.handle(Event::Key(Key::Char(character)));
+            search_action = tui.handle(Event::Key(Key::Char(character)));
         }
+        dispatch_tui_session_page(&mut tui, &router, search_action, progress.clone());
         let agent_search = render_tui_test_backend(&tui, 100, 24);
         assert!(agent_search.contains("Gamma"));
         assert!(!agent_search.contains("Alpha"));
         assert!(!agent_search.contains("Beta"));
         tui.handle(Event::Key(Key::Escape));
         tui.apply_submission_outcome(router.open_dialog("sessions").unwrap());
-        tui.handle(Event::Key(Key::LineStart));
+        let global_action = tui.handle(Event::Key(Key::LineStart));
+        dispatch_tui_session_page(&mut tui, &router, global_action, progress.clone());
+        let mut search_action = Action::Render;
         for character in "other-root".chars() {
-            tui.handle(Event::Key(Key::Char(character)));
+            search_action = tui.handle(Event::Key(Key::Char(character)));
         }
+        dispatch_tui_session_page(&mut tui, &router, search_action, progress.clone());
         let root_search = render_tui_test_backend(&tui, 100, 24);
         assert!(root_search.contains("Beta"));
         assert!(!root_search.contains("Gamma"));
@@ -12923,6 +13617,12 @@ mod tests {
             provider: Some(TuiProvider::OpenAiChatGpt),
             ..TuiSessionContext::fresh()
         }));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),
@@ -12934,6 +13634,7 @@ mod tests {
         assert!(router.disconnect().is_ok());
         assert_eq!(session.lock().unwrap().provider, None);
         assert!(session.lock().unwrap().chatgpt_unavailable);
+        assert!(session.lock().unwrap().active_agent.is_none());
         let error = match router.turn_bootstrap() {
             Ok(_) => panic!("disconnected ChatGPT runtime must be unavailable"),
             Err(error) => error,
@@ -13416,6 +14117,19 @@ mod tests {
             panic!("dialog Enter should dispatch an action");
         };
         let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
+        assert!(tui.apply_submission_outcome(outcome).is_none());
+    }
+
+    fn dispatch_tui_session_page(
+        tui: &mut Tui<ProductionTuiEngine>,
+        router: &TuiRuntimeRouter,
+        action: Action,
+        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+    ) {
+        let Action::LoadSessionPage(request) = action else {
+            panic!("session dialog action should request a page");
+        };
+        let outcome = router.route_request(TuiRouteRequest::SessionPage(request), progress);
         assert!(tui.apply_submission_outcome(outcome).is_none());
     }
 
@@ -15944,6 +16658,7 @@ mod tests {
             selected_subagent: Some("reviewer".into()),
             ..TuiSessionContext::fresh()
         }));
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
         let cancellation = HeadlessTurnCancellation::new();
         let parent_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_event = |timeout| receiver.recv_timeout(timeout).unwrap().into_parts().1;
@@ -16008,6 +16723,13 @@ mod tests {
         assert_eq!(parent_runs.load(std::sync::atomic::Ordering::SeqCst), 0);
         let session = session.lock().unwrap();
         assert!(session.messages.is_empty());
+        assert_eq!(
+            session
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("primary")
+        );
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -17429,12 +18151,14 @@ fn reliability_integration_bounds_recovers_attempts_and_sanitizes_failures() {
             .begin_session_attempt(&metadata, format!("SENTINEL_PRIVATE_PAGE_{id}"))
             .unwrap();
     }
-    let first_page = store.list_session_page(None, 0).unwrap();
-    let second_page = store.list_session_page(None, 64).unwrap();
+    let first_page = store.list_session_page(None, "", None, 64).unwrap();
+    let second_page = store
+        .list_session_page(None, "", first_page.next_cursor, 64)
+        .unwrap();
 
-    assert_eq!(first_page.total_count, 69);
     assert_eq!(first_page.sessions.len(), 64);
     assert_eq!(second_page.sessions.len(), 5);
+    assert_eq!(first_page.sessions.len() + second_page.sessions.len(), 69);
     assert!(
         first_page
             .sessions

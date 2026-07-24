@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
 use agens_tui::{
-    ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
-    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, ToolResultState, TranscriptId, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentErrorKind,
-    TuiSubagentEvent, TuiSubagentStatus,
+    Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
+    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
+    SessionDialogRequest, ToolResultState, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
+    TuiPresentation, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
+    TuiSubmissionOutcome,
 };
 use ratatui::{
     Terminal,
@@ -1486,9 +1487,10 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
         "ID: 9 · Beta\nTurns: 4 · Agent: reviewer\nUpdated: 90 (1h ago) · Root: /work/beta",
         "session:9",
     );
-    tui.show_selection_dialog(DialogView::sessions(
+    tui.show_selection_dialog(DialogView::sessions_page(
         vec![current.clone()],
-        vec![current, other],
+        SessionDialogRequest::initial(),
+        Some(SessionDialogCursor::new(100, 7)),
     ));
 
     renderer.render(tui.view()).unwrap();
@@ -1500,6 +1502,7 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     assert!(project.contains("Ctrl+A All projects"), "{project:?}");
     assert!(project.contains("#7 Alpha"), "{project:?}");
     assert!(project.contains("2 turns · 5m ago"), "{project:?}");
+    assert!(project.contains("Page 1 · more"), "{project:?}");
     assert!(!project.contains("Agent: primary"), "{project:?}");
     assert!(!project.contains("Updated: 100"), "{project:?}");
     assert!(!project.contains("#9 Beta"), "{project:?}");
@@ -1510,7 +1513,14 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     assert!(details.contains("Agent: primary"), "{details:?}");
     assert!(details.contains("Updated: 100 (5m ago)"), "{details:?}");
 
-    tui.handle(Event::Key(Key::LineStart));
+    let Action::LoadSessionPage(global_request) = tui.handle(Event::Key(Key::LineStart)) else {
+        panic!("scope toggle should request a page");
+    };
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        vec![current, other],
+        global_request,
+        None,
+    )));
     renderer.render(tui.view()).unwrap();
     let global = rendered_text(&renderer);
     assert!(
@@ -1521,21 +1531,60 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     assert!(!global.contains("root=/work/beta"), "{global:?}");
     assert!(!global.contains("Agent: primary"), "{global:?}");
 
+    let mut search_request = None;
     for character in "missing".chars() {
-        tui.handle(Event::Key(Key::Char(character)));
+        let Action::LoadSessionPage(request) = tui.handle(Event::Key(Key::Char(character))) else {
+            panic!("search should request a page");
+        };
+        search_request = Some(request);
     }
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        Vec::new(),
+        search_request.unwrap(),
+        None,
+    )));
     renderer.render(tui.view()).unwrap();
     let search = rendered_text(&renderer);
     assert!(search.contains("No sessions match search."), "{search:?}");
 
-    tui.show_selection_dialog(DialogView::sessions(Vec::new(), Vec::new()));
+    tui.show_selection_dialog(DialogView::sessions_page(
+        Vec::new(),
+        SessionDialogRequest::initial(),
+        None,
+    ));
     renderer.render(tui.view()).unwrap();
     let empty_project = rendered_text(&renderer);
     assert!(empty_project.contains("No resumable sessions in current project."));
-    tui.handle(Event::Key(Key::LineStart));
+    let Action::LoadSessionPage(empty_global_request) = tui.handle(Event::Key(Key::LineStart))
+    else {
+        panic!("scope toggle should request a page");
+    };
+    tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::sessions_page(
+        Vec::new(),
+        empty_global_request,
+        None,
+    )));
     renderer.render(tui.view()).unwrap();
     let empty_global = rendered_text(&renderer);
     assert!(empty_global.contains("No resumable sessions in any project."));
+
+    tui.show_selection_dialog(DialogView::sessions_loading(SessionDialogRequest::initial()));
+    renderer.render(tui.view()).unwrap();
+    let loading = rendered_text(&renderer);
+    assert!(loading.contains("Loading sessions…"), "{loading:?}");
+    assert!(!loading.contains("No resumable sessions"), "{loading:?}");
+
+    tui.show_selection_dialog(DialogView::sessions_error(
+        SessionDialogRequest::initial(),
+        "Saved sessions could not be loaded.",
+    ));
+    renderer.render(tui.view()).unwrap();
+    let error = rendered_text(&renderer);
+    assert!(
+        error.contains("Saved sessions could not be loaded."),
+        "{error:?}"
+    );
+    assert!(!error.contains("Loading sessions…"), "{error:?}");
 }
 
 #[test]
@@ -1553,7 +1602,11 @@ fn short_session_dialog_keeps_search_and_selected_row_visible_without_default_de
             )
         })
         .collect::<Vec<_>>();
-    tui.show_selection_dialog(DialogView::sessions(entries.clone(), entries));
+    tui.show_selection_dialog(DialogView::sessions_page(
+        entries,
+        SessionDialogRequest::initial(),
+        None,
+    ));
     tui.handle(Event::Resize {
         width: 34,
         height: 7,
