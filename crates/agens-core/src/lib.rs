@@ -483,6 +483,52 @@ pub enum TurnEvent {
     ToolResult(MessagePart),
 }
 
+/// Typed decomposition of a tool call's raw argument payload.
+///
+/// Native tool kinds carry their authoritative field (path, pattern, command,
+/// url, or skill name) so adapters can render or reason about a call without
+/// parsing JSON. Unknown and MCP tools degrade to `Other`, preserving the raw
+/// payload for audit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolInput {
+    Read {
+        path: String,
+    },
+    Write {
+        path: String,
+    },
+    Edit {
+        path: String,
+    },
+    List {
+        path: String,
+    },
+    Search {
+        path: String,
+    },
+    Glob {
+        pattern: String,
+        path: Option<String>,
+    },
+    Grep {
+        pattern: String,
+        path: Option<String>,
+    },
+    Bash {
+        command: String,
+    },
+    WebFetch {
+        url: String,
+    },
+    Skill {
+        skill: String,
+    },
+    Other {
+        name: String,
+        raw: String,
+    },
+}
+
 const MAX_RETAINED_TOOL_RESULT_BYTES: usize = 64 * 1024;
 
 fn bound_retained_tool_result(content: String) -> String {

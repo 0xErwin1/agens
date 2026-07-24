@@ -371,6 +371,7 @@ pub(super) fn detail_lines(
                 call_id,
                 name,
                 input,
+                ..
             } if !conversation_is_authoritative && !is_task_tool_name(name) => line(
                 &mut lines,
                 "TOOLS",

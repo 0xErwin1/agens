@@ -1746,6 +1746,9 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         call_id: "read-1".into(),
         name: "native::read".into(),
         input: "src/render.rs".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "src/render.rs".into(),
+        },
     });
     tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
         call_id: "read-1".into(),

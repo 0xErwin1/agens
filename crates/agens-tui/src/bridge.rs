@@ -187,6 +187,7 @@ pub enum TuiRuntimeEvent {
         call_id: String,
         name: String,
         input: String,
+        parsed: agens_core::ToolInput,
     },
     ToolEnded {
         call_id: String,

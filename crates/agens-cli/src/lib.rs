@@ -1503,6 +1503,7 @@ impl TuiMetricsPublisher {
                     call_id: id.clone(),
                     name: name.clone(),
                     input: sanitize_tui_metric(input),
+                    parsed: agens_core::ToolInput::parse(name, input),
                 })
             }
             TurnEvent::ToolResult(MessagePart::ToolResult {
@@ -7667,6 +7668,46 @@ fn native_permission_target_field(
     Ok(value.to_owned())
 }
 
+trait ParseToolInput: Sized {
+    fn parse(name: &str, raw: &str) -> Self;
+}
+
+impl ParseToolInput for agens_core::ToolInput {
+    fn parse(name: &str, raw: &str) -> Self {
+        let fallback = || Self::Other {
+            name: name.to_owned(),
+            raw: raw.to_owned(),
+        };
+
+        let Ok(serde_json::Value::Object(arguments)) = serde_json::from_str(raw) else {
+            return fallback();
+        };
+
+        let field = |field| native_permission_target_field(&arguments, field).ok();
+
+        match name {
+            "read" => field("path").map(|path| Self::Read { path }),
+            "write" => field("path").map(|path| Self::Write { path }),
+            "edit" => field("path").map(|path| Self::Edit { path }),
+            "list" => field("path").map(|path| Self::List { path }),
+            "search" => field("path").map(|path| Self::Search { path }),
+            "glob" => field("pattern").map(|pattern| Self::Glob {
+                pattern,
+                path: field("path"),
+            }),
+            "grep" => field("pattern").map(|pattern| Self::Grep {
+                pattern,
+                path: field("path"),
+            }),
+            "bash" => field("command").map(|command| Self::Bash { command }),
+            "webfetch" => field("url").map(|url| Self::WebFetch { url }),
+            "skill" => field("skill").map(|skill| Self::Skill { skill }),
+            _ => None,
+        }
+        .unwrap_or_else(fallback)
+    }
+}
+
 struct RegisteredNativeTool {
     name: String,
     catalog: Arc<Mutex<NativeToolCatalog>>,
@@ -9004,6 +9045,115 @@ mod tests {
                 &serde_json::json!({"path": "notes.md"}),
             ),
             Err(NativePermissionTargetError::UnknownTool)
+        );
+    }
+
+    #[test]
+    fn tool_input_parses_every_native_tool_into_its_typed_kind() {
+        let cases = [
+            (
+                "read",
+                serde_json::json!({"path": "notes.md"}),
+                agens_core::ToolInput::Read {
+                    path: "notes.md".into(),
+                },
+            ),
+            (
+                "write",
+                serde_json::json!({"path": "notes.md", "content": "body"}),
+                agens_core::ToolInput::Write {
+                    path: "notes.md".into(),
+                },
+            ),
+            (
+                "edit",
+                serde_json::json!({"path": "notes.md", "old": "old", "new": "new"}),
+                agens_core::ToolInput::Edit {
+                    path: "notes.md".into(),
+                },
+            ),
+            (
+                "list",
+                serde_json::json!({"path": "src"}),
+                agens_core::ToolInput::List { path: "src".into() },
+            ),
+            (
+                "search",
+                serde_json::json!({"path": "src", "query": "permission"}),
+                agens_core::ToolInput::Search { path: "src".into() },
+            ),
+            (
+                "glob",
+                serde_json::json!({"pattern": "src/**/*.rs"}),
+                agens_core::ToolInput::Glob {
+                    pattern: "src/**/*.rs".into(),
+                    path: None,
+                },
+            ),
+            (
+                "grep",
+                serde_json::json!({"pattern": "TODO", "path": "crates/agens-cli"}),
+                agens_core::ToolInput::Grep {
+                    pattern: "TODO".into(),
+                    path: Some("crates/agens-cli".into()),
+                },
+            ),
+            (
+                "bash",
+                serde_json::json!({"command": "git status"}),
+                agens_core::ToolInput::Bash {
+                    command: "git status".into(),
+                },
+            ),
+            (
+                "webfetch",
+                serde_json::json!({"url": "https://example.test/docs"}),
+                agens_core::ToolInput::WebFetch {
+                    url: "https://example.test/docs".into(),
+                },
+            ),
+            (
+                "skill",
+                serde_json::json!({"skill": "shared"}),
+                agens_core::ToolInput::Skill {
+                    skill: "shared".into(),
+                },
+            ),
+        ];
+
+        for (name, arguments, expected) in cases {
+            let raw = arguments.to_string();
+            assert_eq!(agens_core::ToolInput::parse(name, &raw), expected);
+        }
+    }
+
+    #[test]
+    fn tool_input_degrades_unknown_and_mcp_tools_to_other_without_erroring() {
+        let raw = serde_json::json!({"foo": "bar"}).to_string();
+        assert_eq!(
+            agens_core::ToolInput::parse("mcp_server_tool", &raw),
+            agens_core::ToolInput::Other {
+                name: "mcp_server_tool".into(),
+                raw: raw.clone(),
+            }
+        );
+
+        let malformed = "{not json";
+        assert_eq!(
+            agens_core::ToolInput::parse("read", malformed),
+            agens_core::ToolInput::Other {
+                name: "read".into(),
+                raw: malformed.into(),
+            }
+        );
+
+        let missing_field = serde_json::json!({}).to_string();
+        assert_eq!(
+            agens_core::ToolInput::parse("read", &missing_field),
+            agens_core::ToolInput::Other {
+                name: "read".into(),
+                raw: missing_field.clone(),
+            }
         );
     }
 
@@ -15900,7 +16050,7 @@ mod tests {
                 (_, agens_tui::TuiRuntimeEvent::Usage(agens_core::Usage {
                     input_tokens: Some(11), output_tokens: None, total_tokens: Some(17), context_window: None,
                 })),
-                (_, agens_tui::TuiRuntimeEvent::ToolStarted { call_id, name, input }),
+                (_, agens_tui::TuiRuntimeEvent::ToolStarted { call_id, name, input, .. }),
                 _, _, _,
             ] if call_id == "edit-1" && name == "native::edit" && input == "[redacted]"
         ));
