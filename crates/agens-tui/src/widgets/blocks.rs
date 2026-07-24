@@ -46,19 +46,10 @@ pub(crate) trait BlockContent {
         DisplayMode::Collapsed
     }
 
-    /// Mode while the block's source content is still streaming.
-    ///
-    /// Not yet driving any per-tool policy branch; wired by S2's per-tool
-    /// default-mode table (T19).
-    #[allow(dead_code)]
-    fn mode_while_streaming(&self) -> DisplayMode {
-        DisplayMode::Truncated
-    }
-
     /// Mode applied automatically once the block finishes.
     ///
-    /// S1 achieves this policy implicitly (absent map entry = `default_mode`
-    /// = Collapsed); wired explicitly once S2 differentiates per-tool policy.
+    /// Currently implicit: an absent mode entry already resolves to
+    /// [`BlockContent::default_mode`].
     #[allow(dead_code)]
     fn mode_on_finish(&self) -> DisplayMode {
         DisplayMode::Collapsed
@@ -72,14 +63,14 @@ pub(crate) trait BlockContent {
 
     /// Accent color for the block's gutter/bullet.
     ///
-    /// Not yet painted by `render.rs`; wired by S2's gutter painting (T18).
+    /// Not painted yet: `render.rs` still uses per-role styles directly.
     #[allow(dead_code)]
     fn accent(&self) -> Color;
 
     /// Whether consecutive collapsed instances of this block may fold into
     /// a verb-group summary row.
     ///
-    /// Not yet consumed; wired by S3's verb-group folding pass (T24).
+    /// Not consumed yet: no folding pass reads it.
     #[allow(dead_code)]
     fn is_groupable(&self) -> bool {
         true
@@ -533,10 +524,11 @@ impl BlockContent for ToolResultBlock {
         lines
     }
 
-    // A finished call always gets an explicit `Collapsed` entry recorded at
-    // completion (see `Tui::apply_conversation_event`); this fallback only
-    // applies to calls whose entry was cleared by a new submission, which
-    // must keep showing their retained output (never re-collapse silently).
+    /// `Expanded`, deliberately against the collapsed-by-default policy: a
+    /// finished call always gets an explicit `Collapsed` entry recorded at
+    /// completion (see `Tui::apply_conversation_event`), so this fallback only
+    /// reaches calls whose entry was cleared by a new submission, which must
+    /// keep showing their retained output instead of re-collapsing silently.
     fn default_mode(&self) -> DisplayMode {
         DisplayMode::Expanded
     }
