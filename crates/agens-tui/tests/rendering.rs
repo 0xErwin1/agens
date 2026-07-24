@@ -1979,8 +1979,14 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     assert!(palette.contains("/review"), "{palette:?}");
     assert!(palette.contains("/resume"), "{palette:?}");
     assert!(palette.contains("/review [scope]"), "{palette:?}");
-    assert!(!palette.contains("Review the patch"), "{palette:?}");
-    assert!(!palette.contains("Resume a session"), "{palette:?}");
+    assert!(
+        !palette.contains("Review the patch"),
+        "34 columns degrade to a single column: {palette:?}"
+    );
+    assert!(
+        !palette.contains("Resume a session"),
+        "34 columns degrade to a single column: {palette:?}"
+    );
     assert!(!palette.contains("[command]"), "{palette:?}");
     assert!(!palette.contains("[built-in]"), "{palette:?}");
     assert_eq!(
@@ -2006,6 +2012,51 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     renderer.render(tui.view()).unwrap();
     assert!(tui.transcript().is_empty());
     assert!(tui.view().status.is_none());
+}
+
+#[test]
+fn renderer_draws_the_palette_description_column_right_aligned_when_wide() {
+    let backend = TestBackend::new(100, 20);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_palette_entries(vec![
+        PaletteEntry::new(
+            "review",
+            "Review the patch",
+            "[scope]",
+            PaletteEntryKind::Command,
+        ),
+        PaletteEntry::new(
+            "resume",
+            "Resume a session",
+            "<id>",
+            PaletteEntryKind::BuiltIn,
+        ),
+    ]);
+
+    tui.handle(Event::Key(Key::Char('/')));
+    tui.handle(Event::Key(Key::Char('r')));
+    renderer.render(tui.view()).unwrap();
+    let palette = rendered_text(&renderer);
+
+    assert!(palette.contains("❯ /review [scope]"), "{palette:?}");
+    assert!(palette.contains("Review the patch"), "{palette:?}");
+    assert!(palette.contains("Resume a session"), "{palette:?}");
+    assert_eq!(
+        rendered_column(&renderer, "Review the patch"),
+        rendered_column(&renderer, "Resume a session"),
+        "equal-width descriptions share the right-aligned column"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "Review the patch").fg,
+        Color::Rgb(0x5c, 0x67, 0x73)
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "Review the patch").bg,
+        Color::Rgb(0x1b, 0x33, 0x30),
+        "the selection band spans the full row"
+    );
 }
 
 #[test]

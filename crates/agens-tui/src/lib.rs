@@ -24,6 +24,7 @@ pub use terminal::{
 pub use widgets::DisplayMode;
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Stdout, Write},
     sync::{
@@ -54,9 +55,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
-    },
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -1225,6 +1224,9 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 }
 
+/// Content width below which the palette drops the description column entirely.
+const PALETTE_DESCRIPTION_MIN_WIDTH: u16 = 40;
+
 const PALETTE_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
     widgets::OverlayShortcut {
         key: "↑↓",
@@ -1260,37 +1262,37 @@ fn render_palette(
     };
     widgets::OverlayFrame::render(frame, &layout, &config);
 
-    let items = if matches.is_empty() {
-        vec![ListItem::new("No matching commands")]
-    } else {
-        matches
-            .iter()
-            .map(|entry| {
-                ListItem::new(
-                    format!("/{} {}", entry.name, entry.argument_hint)
-                        .trim_end()
-                        .to_owned(),
-                )
-            })
-            .collect()
-    };
-    let mut state = ListState::default().with_selected(
-        (!matches.is_empty()).then_some(palette.selected.min(matches.len().saturating_sub(1))),
-    );
+    if matches.is_empty() {
+        let empty = [widgets::OverlayRow {
+            dimmed: true,
+            ..widgets::OverlayRow::new("No matching commands")
+        }];
+        widgets::OverlayList::render(frame, layout.content, &empty, 0, empty.len());
+        return;
+    }
 
-    frame.render_stateful_widget(
-        List::new(items)
-            .style(Style::default().fg(widgets::RolePalette::assistant()))
-            .highlight_symbol("❯ ")
-            .highlight_style(
-                Style::default()
-                    .fg(widgets::RolePalette::selection_fg())
-                    .bg(widgets::RolePalette::selection_bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        layout.content,
-        &mut state,
-    );
+    let selected = palette.selected.min(matches.len() - 1);
+    let describes = layout.content.width >= PALETTE_DESCRIPTION_MIN_WIDTH;
+    let rows: Vec<widgets::OverlayRow<'_>> = matches
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| widgets::OverlayRow {
+            right_label: describes
+                .then_some(entry.description.as_str())
+                .filter(|description| !description.is_empty())
+                .map(Cow::Borrowed),
+            selected: index == selected,
+            ..widgets::OverlayRow::new(
+                format!("/{} {}", entry.name, entry.argument_hint)
+                    .trim_end()
+                    .to_owned(),
+            )
+        })
+        .collect();
+
+    let visible = usize::from(layout.content.height);
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    widgets::OverlayList::render(frame, layout.content, &rows, offset, rows.len());
 }
 
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {

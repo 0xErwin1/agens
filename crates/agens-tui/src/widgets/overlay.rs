@@ -398,7 +398,8 @@ fn top_border(width: u16, title: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-fn truncate_columns(text: &str, budget: usize) -> String {
+/// Truncates to at most `budget` display columns, marking the cut with `…`.
+pub(super) fn truncate_columns(text: &str, budget: usize) -> String {
     if budget == 0 {
         return String::new();
     }

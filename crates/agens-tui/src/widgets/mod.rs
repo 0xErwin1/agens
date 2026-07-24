@@ -5,6 +5,7 @@ mod expand;
 mod footer;
 mod glyph;
 mod overlay;
+mod overlay_list;
 mod role_palette;
 
 pub(crate) use blocks::{
@@ -18,4 +19,5 @@ pub(crate) use overlay::{
     OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
     OverlaySizing,
 };
+pub(crate) use overlay_list::{OverlayList, OverlayRow};
 pub(crate) use role_palette::RolePalette;
