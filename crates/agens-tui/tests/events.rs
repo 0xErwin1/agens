@@ -661,11 +661,13 @@ fn execution_strip_navigation_enters_children_and_backgrounds_the_focused_execut
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
 
+    // Row 0 is transcript chrome, not subagent navigation: it starts a
+    // selection drag and leaves the active transcript alone.
     assert_eq!(
         tui.handle(Event::MouseDown { column: 11, row: 0 }),
         Action::Render
     );
-    assert_ne!(tui.view().execution_selection, None);
+    assert_eq!(tui.view().active_transcript, TranscriptId::Main);
     assert!(tui.selected_text().is_none());
 }
 

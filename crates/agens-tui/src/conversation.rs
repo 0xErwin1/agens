@@ -553,7 +553,7 @@ impl Conversation {
     }
 }
 
-fn subagent_activity(name: &str) -> Option<&'static str> {
+pub(crate) fn subagent_activity(name: &str) -> Option<&'static str> {
     match name.strip_prefix("native::").unwrap_or(name) {
         "read" => Some("Read files"),
         "grep" | "search" => Some("Search code"),

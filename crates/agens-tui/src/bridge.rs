@@ -471,6 +471,7 @@ pub struct TuiExecution {
     pub(crate) id: u64,
     pub(crate) agent: String,
     pub(crate) state: TuiExecutionState,
+    pub(crate) started_at: Duration,
     pub(crate) last_activity: Duration,
     pub(crate) terminal_at: Option<Duration>,
 }

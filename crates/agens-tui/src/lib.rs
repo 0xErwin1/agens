@@ -513,6 +513,21 @@ pub struct ViewState<'a> {
     pub selected_agent: Option<&'a str>,
     pub executions: Vec<&'a TuiExecution>,
     pub execution_selection: Option<TranscriptId>,
+    /// Live tool activity of the focused subagent, for the tree's child rows.
+    pub execution_activities: Vec<TuiExecutionActivity>,
+    /// Tick clock reading when the active turn began, for live elapsed time.
+    pub turn_started_at: Option<Duration>,
+}
+
+/// One child row of the subagent tree: a bounded, name-only activity label.
+///
+/// Only activities with a known native label are surfaced, so an unknown or MCP
+/// tool never leaks its name or arguments into the navigation surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiExecutionActivity {
+    pub parent: u64,
+    pub label: String,
+    pub running: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1061,10 +1076,10 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(area, state.input, header_should_show(&state));
+    let layout = screen_layout(area, state.input, chrome_rows(&state));
 
-    if layout.header.height > 0 {
-        render_header(frame, layout.header, &state);
+    if layout.notice.height > 0 {
+        render_notice(frame, layout.notice, &state);
     }
 
     let transcript_width = layout
@@ -1168,6 +1183,13 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             ));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
+    }
+
+    if layout.tree.height > 0 {
+        frame.render_widget(
+            Paragraph::new(Text::from(subagent_tree_lines(&state))),
+            layout.tree,
+        );
     }
 
     if layout.footer.height > 0 {
@@ -1482,10 +1504,25 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
 }
 
 struct ScreenLayout {
-    header: Rect,
+    notice: Rect,
     transcript: Rect,
     composer: Rect,
+    tree: Rect,
     footer: Rect,
+}
+
+/// Optional chrome bands competing with the transcript for vertical space.
+#[derive(Clone, Copy)]
+struct ChromeRows {
+    notice: bool,
+    tree: u16,
+}
+
+fn chrome_rows(state: &ViewState<'_>) -> ChromeRows {
+    ChromeRows {
+        notice: notice_should_show(state),
+        tree: subagent_tree_rows(state),
+    }
 }
 
 fn conversation_surface(area: Rect) -> Rect {
@@ -1493,11 +1530,23 @@ fn conversation_surface(area: Rect) -> Rect {
     area
 }
 
-fn screen_layout(area: Rect, input: &str, show_header: bool) -> ScreenLayout {
+/// Minimum terminal height before the subagent tree may claim rows.
+const TREE_MIN_SCREEN_HEIGHT: u16 = 14;
+/// Executions shown as tree branches, matching the navigable transcript set.
+const MAX_TREE_EXECUTIONS: usize = 3;
+/// Child activity rows shown under the focused branch.
+const MAX_TREE_ACTIVITIES: usize = 2;
+
+fn screen_layout(area: Rect, input: &str, chrome: ChromeRows) -> ScreenLayout {
     let area = conversation_surface(area);
-    // Reclaim a row when idle chrome would be empty (no danger / status / executions / run).
-    let header_rows = u16::from(area.height >= 7 && show_header);
+    // Reclaim a row when idle chrome would be empty (no danger / status / recovery).
+    let notice_rows = u16::from(area.height >= 7 && chrome.notice);
     let footer_rows = u16::from(area.height >= 12);
+    let tree_rows = if area.height >= TREE_MIN_SCREEN_HEIGHT {
+        chrome.tree.min(area.height / 3)
+    } else {
+        0
+    };
     let composer_rows = match area.height {
         0 => 0,
         1 => 1,
@@ -1510,37 +1559,41 @@ fn screen_layout(area: Rect, input: &str, show_header: bool) -> ScreenLayout {
     };
     let transcript_rows = area
         .height
-        .saturating_sub(header_rows)
+        .saturating_sub(notice_rows)
         .saturating_sub(composer_rows)
+        .saturating_sub(tree_rows)
         .saturating_sub(footer_rows);
     let chunks = Layout::vertical([
-        Constraint::Length(header_rows),
+        Constraint::Length(notice_rows),
         Constraint::Length(transcript_rows),
         Constraint::Length(composer_rows),
+        Constraint::Length(tree_rows),
         Constraint::Length(footer_rows),
     ])
     .split(area);
 
     ScreenLayout {
-        header: chunks[0],
+        notice: chunks[0],
         transcript: chunks[1],
         composer: chunks[2],
-        footer: chunks[3],
+        tree: chunks[3],
+        footer: chunks[4],
     }
 }
 
-fn header_should_show(state: &ViewState<'_>) -> bool {
+/// Whether a transient notice row is warranted.
+///
+/// Active-turn feedback deliberately does not appear here: the working
+/// indicator lives at the end of the transcript and the subagent tree lives
+/// under the composer, so this band is reserved for warnings and recovery.
+fn notice_should_show(state: &ViewState<'_>) -> bool {
     state.quit_armed
         || state.recovered_failed_prompt
         || state.dangerous_mode
-        || state.running
-        || state.session_loading
-        || !state.executions.is_empty()
         || state.status.is_some_and(|value| !value.is_empty())
 }
 
-fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
-    let state_label = turn_state_label(state.turn_state, state.running, state.session_loading);
+fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
     let mut left = Vec::new();
     if state.quit_armed {
         left.push(Span::styled(
@@ -1564,9 +1617,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if !state.executions.is_empty() {
-        append_execution_strip(&mut left, state);
-    } else if !state.recovered_failed_prompt
+    if !state.recovered_failed_prompt
         && let Some(status) = state.status.filter(|value| !value.is_empty())
     {
         // Transient context messages (e.g. resume notices) live here — not model/project.
@@ -1581,56 +1632,142 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
             area,
         );
     }
-    let status = widgets::StatusGlyph::decorate_status(
-        state.running,
-        if state.recovered_failed_prompt || (state.status.is_some() && state.executions.is_empty())
-        {
-            state_label
-        } else {
-            state.status.unwrap_or(state_label)
-        },
-        state.now,
-    );
-    let state_width = status.chars().count() as u16 + 1;
-    if area.width > state_width {
-        let state_area = Rect::new(area.right() - state_width, area.y, state_width, area.height);
-        frame.render_widget(
-            Paragraph::new(status)
-                .style(Style::default().fg(turn_state_color(state.turn_state, state.running)))
-                .alignment(Alignment::Right),
-            state_area,
-        );
+}
+
+/// Navigable subagent tree rendered between the composer and the status bar.
+///
+/// The tree is the single navigation surface for delegated work: `Main` is the
+/// root, each running or recently finished execution is a branch, and the
+/// focused branch expands into its live tool activity. Its keybinding hints
+/// live here rather than on the in-transcript card.
+fn subagent_tree_lines(state: &ViewState<'_>) -> Vec<Line<'static>> {
+    if state.executions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![Line::from(Span::styled(
+        "Main".to_owned(),
+        tree_row_style(state, TranscriptId::Main),
+    ))];
+
+    let shown = state
+        .executions
+        .iter()
+        .take(MAX_TREE_EXECUTIONS)
+        .collect::<Vec<_>>();
+    for (index, execution) in shown.iter().enumerate() {
+        let last = index + 1 == shown.len();
+        lines.push(Line::from(vec![
+            Span::styled(
+                if last { "└─ " } else { "├─ " }.to_owned(),
+                Style::default().fg(widgets::RolePalette::chrome()),
+            ),
+            Span::styled(
+                format!("{} ", execution_state_glyph(execution.state)),
+                Style::default().fg(execution_state_color(execution.state)),
+            ),
+            Span::styled(
+                tree_execution_label(execution, state.now),
+                tree_row_style(state, TranscriptId::Subagent(execution.id)),
+            ),
+        ]));
+
+        let children = state
+            .execution_activities
+            .iter()
+            .filter(|activity| activity.parent == execution.id)
+            .collect::<Vec<_>>();
+        for (child_index, activity) in children.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        if last { "   " } else { "│  " },
+                        if child_index + 1 == children.len() {
+                            "└─ "
+                        } else {
+                            "├─ "
+                        }
+                    ),
+                    Style::default().fg(widgets::RolePalette::chrome()),
+                ),
+                Span::styled(
+                    format!("{} ", if activity.running { "●" } else { "✓" }),
+                    Style::default().fg(if activity.running {
+                        widgets::RolePalette::accent_active()
+                    } else {
+                        widgets::RolePalette::success()
+                    }),
+                ),
+                Span::styled(
+                    activity.label.clone(),
+                    Style::default().fg(widgets::RolePalette::muted()),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        "Tab focus · Enter inspect · Ctrl+B background".to_owned(),
+        Style::default().fg(widgets::RolePalette::chrome()),
+    )));
+    lines
+}
+
+fn subagent_tree_rows(state: &ViewState<'_>) -> u16 {
+    saturating_u16(subagent_tree_lines(state).len())
+}
+
+fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
+    let selected = state.execution_selection == Some(id);
+    let active = state.active_transcript == id;
+    let color = if selected {
+        widgets::RolePalette::brand()
+    } else if active {
+        widgets::RolePalette::tool()
+    } else {
+        widgets::RolePalette::muted()
+    };
+    let style = Style::default().fg(color);
+    if selected || active {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
     }
 }
 
-fn append_execution_strip(left: &mut Vec<Span<'_>>, state: &ViewState<'_>) {
-    let ids = std::iter::once(TranscriptId::Main).chain(
-        state
-            .executions
-            .iter()
-            .take(3)
-            .map(|execution| TranscriptId::Subagent(execution.id)),
-    );
-    let executions = state
-        .executions
-        .iter()
-        .map(|execution| (*execution).clone())
-        .collect::<Vec<_>>();
-    for id in ids {
-        let selected = state.execution_selection == Some(id);
-        let active = state.active_transcript == id;
-        let color = if selected {
-            widgets::RolePalette::brand()
-        } else if active {
-            widgets::RolePalette::tool()
-        } else {
-            widgets::RolePalette::muted()
-        };
-        let mut style = Style::default().fg(color);
-        if selected || active {
-            style = style.add_modifier(Modifier::BOLD);
+fn tree_execution_label(execution: &TuiExecution, now: Duration) -> String {
+    let elapsed = execution
+        .terminal_at
+        .unwrap_or(now)
+        .saturating_sub(execution.started_at);
+    format!(
+        "{} #{} · {} · {}s",
+        display_agent_name(&execution.agent),
+        execution.id,
+        execution_state_label(execution.state),
+        elapsed.as_secs()
+    )
+}
+
+const fn execution_state_label(state: TuiExecutionState) -> &'static str {
+    match state {
+        TuiExecutionState::ForegroundRunning => "running",
+        TuiExecutionState::BackgroundRunning => "background",
+        TuiExecutionState::CompletedRecent => "done",
+        TuiExecutionState::Failed => "failed",
+        TuiExecutionState::Cancelled => "cancelled",
+    }
+}
+
+fn execution_state_color(state: TuiExecutionState) -> Color {
+    match state {
+        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => {
+            widgets::RolePalette::accent_active()
         }
-        left.push(Span::styled(execution_strip_label(id, &executions), style));
+        TuiExecutionState::CompletedRecent => widgets::RolePalette::success(),
+        TuiExecutionState::Failed => widgets::RolePalette::error(),
+        TuiExecutionState::Cancelled => widgets::RolePalette::warning(),
     }
 }
 
@@ -1652,17 +1789,6 @@ fn turn_state_label(
         Some(TurnState::Completed) => "Completed",
         _ if running => "Working",
         _ => "Ready",
-    }
-}
-
-fn turn_state_color(state: Option<TurnState>, running: bool) -> Color {
-    match state {
-        Some(TurnState::Failed) => Color::Red,
-        Some(TurnState::Cancelled) => Color::Yellow,
-        Some(TurnState::Dispatching) => Color::Magenta,
-        Some(TurnState::Streaming) => Color::Cyan,
-        _ if running => Color::Cyan,
-        _ => Color::DarkGray,
     }
 }
 
@@ -1756,6 +1882,21 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
         state.runtime_events,
         conversation_is_authoritative,
     ));
+    if state.running {
+        transcript.push(render::turn_status_line(
+            render::TurnStatus {
+                label: turn_state_label(state.turn_state, state.running, state.session_loading),
+                now: state.now,
+                elapsed: state
+                    .turn_started_at
+                    .map(|started| state.now.saturating_sub(started)),
+                tokens: state
+                    .latest_usage
+                    .and_then(|usage| usage.total_tokens.or(usage.output_tokens)),
+            },
+            usize::from(content_width.max(1)),
+        ));
+    }
     transcript
 }
 
@@ -2060,31 +2201,12 @@ fn execution_priority(state: TuiExecutionState) -> u8 {
     }
 }
 
-fn execution_strip_label(id: TranscriptId, executions: &[TuiExecution]) -> String {
-    match id {
-        TranscriptId::Main => " Main ".into(),
-        TranscriptId::Subagent(id) => executions
-            .iter()
-            .find(|execution| execution.id == id)
-            .map_or_else(
-                || format!(" Subagent #{id} "),
-                |execution| {
-                    format!(
-                        " {} {} #{id} ",
-                        execution_state_glyph(execution.state),
-                        display_agent_name(&execution.agent)
-                    )
-                },
-            ),
-    }
-}
-
-fn execution_state_glyph(state: TuiExecutionState) -> &'static str {
+const fn execution_state_glyph(state: TuiExecutionState) -> &'static str {
     match state {
         TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => "●",
         TuiExecutionState::CompletedRecent => "✓",
-        TuiExecutionState::Failed => "×",
-        TuiExecutionState::Cancelled => "–",
+        TuiExecutionState::Failed => "✗",
+        TuiExecutionState::Cancelled => "○",
     }
 }
 
@@ -2163,6 +2285,7 @@ pub struct Tui<E> {
     active_tool: Option<String>,
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
+    turn_started_at: Option<Duration>,
     latest_usage: Option<Usage>,
     status: Option<String>,
     restored_syntax_ready_at: Option<Duration>,
@@ -2211,6 +2334,7 @@ where
             active_tool: None,
             runtime_events: Vec::new(),
             turn_duration: None,
+            turn_started_at: None,
             latest_usage: None,
             status: None,
             restored_syntax_ready_at: None,
@@ -2247,7 +2371,7 @@ where
                 MouseWheelDirection::Down => Key::ScrollDown,
             }),
             Event::MouseDown { column, row } => self
-                .handle_execution_strip_click(column, row)
+                .handle_subagent_tree_click(column, row)
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
@@ -2376,6 +2500,7 @@ where
         let finishing = self.running && !running;
         self.running = running;
         if running {
+            self.turn_started_at = Some(self.now);
             self.palette_open = false;
             self.turn_state = Some(TurnState::Requesting);
         } else if !matches!(
@@ -2465,6 +2590,7 @@ where
         self.latest_usage = None;
         self.dialog = None;
         self.running = true;
+        self.turn_started_at = Some(self.now);
         self.assistant_streaming = false;
         self.turn_state = None;
         self.quit_armed_until = None;
@@ -2915,28 +3041,26 @@ where
         }
     }
 
-    fn handle_execution_strip_click(&mut self, column: u16, row: u16) -> Option<Action> {
+    /// Selects a transcript from a click on the subagent tree.
+    ///
+    /// Tree rows are addressed by row, not column: the root is `Main` and each
+    /// following row is one navigable execution. Child activity and hint rows
+    /// carry no transcript, so a click there is ignored.
+    fn handle_subagent_tree_click(&mut self, _column: u16, row: u16) -> Option<Action> {
         if self.executions.is_empty() || self.dialog.is_some() || self.palette_open {
             return None;
         }
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
-        if row < layout.header.y || row >= layout.header.bottom() {
+        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
+        if layout.tree.height == 0 || row < layout.tree.y || row >= layout.tree.bottom() {
             return None;
         }
 
-        let mut start = layout.header.x;
-        for id in self.execution_strip_ids() {
-            let label = execution_strip_label(id, &self.executions);
-            let end = start.saturating_add(saturating_u16(label.width()));
-            if column >= start && column < end {
-                self.execution_selection = Some(id);
-                self.select_transcript(id);
-                return Some(Action::Render);
-            }
-            start = end;
-        }
-        None
+        let index = usize::from(row.saturating_sub(layout.tree.y));
+        let id = *self.execution_strip_ids().get(index)?;
+        self.execution_selection = Some(id);
+        self.select_transcript(id);
+        Some(Action::Render)
     }
 
     /// Retains typed runtime metrics for the renderer without altering turn persistence.
@@ -3269,7 +3393,63 @@ where
             selected_agent: self.selected_agent.as_deref(),
             executions: self.executions(),
             execution_selection: self.execution_selection,
+            execution_activities: self.focused_execution_activities(),
+            turn_started_at: self.turn_started_at,
         }
+    }
+
+    /// Live tool activity of the subagent the tree currently focuses.
+    ///
+    /// Focus follows an explicit tree selection, then the active transcript,
+    /// then the first running execution, so the tree always expands the branch
+    /// the user is most likely acting on.
+    fn focused_execution_activities(&self) -> Vec<TuiExecutionActivity> {
+        let visible = self
+            .executions()
+            .into_iter()
+            .take(MAX_TREE_EXECUTIONS)
+            .map(|execution| execution.id)
+            .collect::<Vec<_>>();
+        let preferred = match (self.execution_selection, self.active_transcript) {
+            (Some(TranscriptId::Subagent(id)), _) | (_, TranscriptId::Subagent(id)) => Some(id),
+            _ => None,
+        }
+        .filter(|id| visible.contains(id));
+
+        if let Some(id) = preferred {
+            return self.execution_activities(id);
+        }
+        visible
+            .into_iter()
+            .map(|id| self.execution_activities(id))
+            .find(|activities| !activities.is_empty())
+            .unwrap_or_default()
+    }
+
+    fn execution_activities(&self, parent: u64) -> Vec<TuiExecutionActivity> {
+        let Some(conversation) = self
+            .transcripts
+            .get(&TranscriptId::Subagent(parent))
+            .and_then(|record| record.conversation.as_ref())
+        else {
+            return Vec::new();
+        };
+
+        let mut activities = conversation
+            .tool_batches
+            .iter()
+            .flat_map(|batch| &batch.calls)
+            .filter_map(|call| {
+                conversation::subagent_activity(&call.name).map(|label| TuiExecutionActivity {
+                    parent,
+                    label: label.to_owned(),
+                    running: call.result.is_none(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let start = activities.len().saturating_sub(MAX_TREE_ACTIVITIES);
+        activities.drain(..start);
+        activities
     }
 
     fn apply_task_execution_event(&mut self, agent: &str, event: TuiExecutionEvent) {
@@ -3325,6 +3505,7 @@ where
             id,
             agent: agent.to_owned(),
             state,
+            started_at: self.now,
             last_activity: self.now,
             terminal_at: None,
         });
@@ -3455,7 +3636,7 @@ where
         }
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input, header_should_show(&view));
+        let layout = screen_layout(area, &self.input, chrome_rows(&view));
         let content_y = layout.transcript.y.saturating_add(1);
         let content_x = layout
             .transcript
@@ -3496,7 +3677,7 @@ where
     fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input, header_should_show(&view));
+        let layout = screen_layout(area, &self.input, chrome_rows(&view));
         let content_width = layout
             .transcript
             .width
@@ -4042,7 +4223,7 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
+        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         let content_width = layout
             .transcript
@@ -4057,7 +4238,7 @@ where
 
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input, header_should_show(&self.view()))
+        screen_layout(area, &self.input, chrome_rows(&self.view()))
             .transcript
             .height
             .saturating_sub(1)
@@ -4635,7 +4816,7 @@ where
 
     fn jump_to_user_message(&mut self, previous: bool) {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, header_should_show(&self.view()));
+        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
         let content_width = layout
             .transcript
             .width
@@ -6754,7 +6935,7 @@ mod runtime_tests {
         let transcript_row = screen_layout(
             Rect::new(0, 0, tui.size.0, tui.size.1),
             &tui.input,
-            header_should_show(&tui.view()),
+            chrome_rows(&tui.view()),
         )
         .transcript
         .y

@@ -188,6 +188,58 @@ pub(super) fn conversation_lines(
     lines
 }
 
+/// Inputs for the inline working indicator closing an active turn's transcript.
+pub(super) struct TurnStatus<'a> {
+    pub label: &'a str,
+    pub now: Duration,
+    pub elapsed: Option<Duration>,
+    pub tokens: Option<u64>,
+}
+
+/// Working indicator rendered as the last row of an active turn's transcript.
+///
+/// Spinner and activity label sit on the left; elapsed time and the real
+/// provider turn-token count are right-aligned. Token counts are never
+/// fabricated — the field is simply absent until the provider reports usage.
+pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> Line<'static> {
+    let left = StatusGlyph::decorate_status(true, status.label, status.now);
+    let mut right = String::new();
+    if let Some(elapsed) = status.elapsed {
+        right.push_str(&elapsed_label(elapsed));
+    }
+    if let Some(tokens) = status.tokens {
+        if !right.is_empty() {
+            right.push_str(" · ");
+        }
+        right.push_str(&format!("{tokens} tok"));
+    }
+
+    let mut spans = vec![Span::styled(
+        left.clone(),
+        Style::default()
+            .fg(RolePalette::accent_active())
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !right.is_empty() {
+        let used = left.width().saturating_add(right.width());
+        let padding = content_width.saturating_sub(used).max(1);
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(
+            right,
+            Style::default().fg(RolePalette::muted()),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn elapsed_label(elapsed: Duration) -> String {
+    if elapsed.as_secs() > 0 {
+        format!("{}s", elapsed.as_secs())
+    } else {
+        format!("{}ms", elapsed.as_millis())
+    }
+}
+
 /// A run of consecutive tool items folded behind one tense-aware header.
 struct FoldedGroup {
     verb: VerbGroup,
@@ -476,10 +528,6 @@ fn subagent_card_lines(
             Style::default().fg(RolePalette::muted()),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "  Tab focus · Enter inspect · Ctrl+B background",
-        Style::default().fg(RolePalette::muted()),
-    )));
 }
 
 fn subagent_status_color(status: Option<crate::TuiSubagentStatus>) -> Color {

@@ -816,6 +816,117 @@ fn consecutive_reads_render_as_one_animated_group_that_settles_into_past_tense()
 }
 
 #[test]
+fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("do work");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "assistant body".into(),
+    )));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(3_000),
+        output_tokens: Some(400),
+        total_tokens: Some(3_400),
+        context_window: Some(200_000),
+    }));
+    tui.tick(Duration::from_secs(12));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    assert!(
+        rendered_line(&renderer, 0)
+            .chars()
+            .all(|glyph| glyph == '─'),
+        "the first row is transcript content chrome, not a header strip: {:?}",
+        rendered_line(&renderer, 0)
+    );
+    assert!(text.contains("12s"), "{text:?}");
+    assert!(text.contains("3400 tok"), "{text:?}");
+
+    let body_row = rendered_row(&renderer, "assistant body");
+    let indicator_row = rendered_row(&renderer, "3400 tok");
+    let footer_row = rendered_row(&renderer, "model —");
+    assert!(
+        body_row < indicator_row && indicator_row < footer_row,
+        "the working indicator sits inside the chat: {body_row} {indicator_row} {footer_row}"
+    );
+
+    tui.set_running(false);
+    renderer.render(tui.view()).unwrap();
+    let idle = rendered_text(&renderer);
+    assert!(
+        !idle.contains("3400 tok"),
+        "the working indicator disappears when idle: {idle:?}"
+    );
+}
+
+#[test]
+fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 30,
+    });
+    tui.begin_submission("delegate");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "assistant body".into(),
+    )));
+    for (id, agent) in [(9_u64, "explore"), (10, "plan")] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(id, agent, "task", TuiExecutionState::ForegroundRunning),
+        );
+    }
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::tool_call(9, "read-1", "native::read", "secret-child-input"),
+    );
+    tui.tick(Duration::from_secs(13));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    assert!(text.contains("├─"), "{text:?}");
+    assert!(text.contains("└─"), "{text:?}");
+    assert!(text.contains("Explore #9"), "{text:?}");
+    assert!(text.contains("Plan #10"), "{text:?}");
+    assert!(
+        text.contains("└─ ● Read files"),
+        "the focused branch expands into its live child activity: {text:?}"
+    );
+    assert!(!text.contains("secret-child-input"), "{text:?}");
+
+    assert_eq!(
+        text.matches("Tab focus · Enter inspect · Ctrl+B background")
+            .count(),
+        1,
+        "the navigation hints live with the tree only: {text:?}"
+    );
+    let body_row = rendered_row(&renderer, "assistant body");
+    let tree_row = rendered_row(&renderer, "Tab focus");
+    let footer_row = rendered_row(&renderer, "model —");
+    assert!(
+        body_row < tree_row && tree_row < footer_row,
+        "the tree sits between the composer and the status bar: {body_row} {tree_row} {footer_row}"
+    );
+
+    let branch_row = rendered_row(&renderer, "Explore #9");
+    tui.handle(Event::MouseDown {
+        column: 4,
+        row: u16::try_from(branch_row).unwrap(),
+    });
+    assert_eq!(
+        tui.view().active_transcript,
+        TranscriptId::Subagent(9),
+        "clicking a tree branch navigates to that subagent"
+    );
+}
+
+#[test]
 fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
     let terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
@@ -2360,8 +2471,11 @@ fn subagent_cards_are_compact_statusful_and_never_render_raw_task_payloads() {
     assert!(running.contains("List files"), "{running:?}");
     assert!(running.contains("+1 more activity"), "{running:?}");
     let title_row = rendered_row(&renderer, "● Explore · inspect");
+    let last_card_row = rendered_row(&renderer, "+1 more activity");
+    assert!(last_card_row.saturating_sub(title_row) < 7, "{running:?}");
+    // Navigation affordances belong to the tree under the composer, not the card.
     let affordance_row = rendered_row(&renderer, "Ctrl+B background");
-    assert!(affordance_row.saturating_sub(title_row) < 7, "{running:?}");
+    assert!(affordance_row > last_card_row + 7, "{running:?}");
     for secret in [
         "api_key=not-rendered",
         "token=not-rendered",
