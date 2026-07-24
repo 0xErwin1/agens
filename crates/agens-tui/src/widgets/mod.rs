@@ -14,5 +14,8 @@ pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
 pub(crate) use footer::{FooterContext, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
-pub(crate) use overlay::{OverlayKind, OverlayShell};
+pub(crate) use overlay::{
+    OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
+    OverlaySizing,
+};
 pub(crate) use role_palette::RolePalette;

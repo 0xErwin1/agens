@@ -86,6 +86,16 @@ impl RolePalette {
         rgb(0x36, 0x18, 0x1c)
     }
 
+    /// Selected overlay row background — brand hue collapsed to a dark wash.
+    pub(crate) const fn selection_bg() -> Color {
+        rgb(0x1b, 0x33, 0x30)
+    }
+
+    /// Selected overlay row foreground — one step above `assistant()` for bold text.
+    pub(crate) const fn selection_fg() -> Color {
+        rgb(0xd6, 0xd4, 0xcd)
+    }
+
     /// Accent for a running/active block's pulsing gutter.
     ///
     /// Consumed by the S3 running-block animation pass; defined here with the
@@ -123,5 +133,39 @@ mod tests {
         assert_ne!(RolePalette::path(), RolePalette::muted());
         assert_ne!(RolePalette::diff_insert_bg(), RolePalette::diff_delete_bg());
         assert_ne!(RolePalette::accent_active(), RolePalette::tool());
+    }
+
+    #[test]
+    fn selection_slots_are_distinct_and_desaturated_against_brand() {
+        assert_eq!(RolePalette::selection_bg(), rgb(0x1b, 0x33, 0x30));
+        assert_eq!(RolePalette::selection_fg(), rgb(0xd6, 0xd4, 0xcd));
+
+        for existing in [
+            RolePalette::user(),
+            RolePalette::assistant(),
+            RolePalette::thinking(),
+            RolePalette::tool(),
+            RolePalette::error(),
+            RolePalette::info(),
+            RolePalette::success(),
+            RolePalette::muted(),
+            RolePalette::chrome(),
+            RolePalette::user_bar(),
+            RolePalette::brand(),
+            RolePalette::path(),
+            RolePalette::diff_insert_bg(),
+            RolePalette::diff_delete_bg(),
+            RolePalette::accent_active(),
+        ] {
+            assert_ne!(RolePalette::selection_bg(), existing);
+            assert_ne!(RolePalette::selection_fg(), existing);
+        }
+
+        let (Color::Rgb(sr, sg, sb), Color::Rgb(br, bg, bb)) =
+            (RolePalette::selection_bg(), RolePalette::brand())
+        else {
+            panic!("palette slots are RGB");
+        };
+        assert!(sr < br && sg < bg && sb < bb);
     }
 }

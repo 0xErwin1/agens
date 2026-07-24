@@ -1221,31 +1221,53 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     if let Some(palette) = state.palette {
-        render_palette(frame, layout.composer, state.input, palette);
+        render_palette(frame, area, layout.composer, state.input, palette);
     }
 }
 
+const PALETTE_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
+    widgets::OverlayShortcut {
+        key: "↑↓",
+        label: "navigate",
+    },
+    widgets::OverlayShortcut {
+        key: "⏎",
+        label: "run",
+    },
+    widgets::OverlayShortcut {
+        key: "esc",
+        label: "close",
+    },
+];
+
 fn render_palette(
     frame: &mut ratatui::Frame<'_>,
+    area: Rect,
     composer: Rect,
     input: &str,
     palette: PaletteView<'_>,
 ) {
     let matches = palette_matches(palette.entries, input);
-    let content_rows = matches.len().clamp(1, 6) as u16;
-    let height = content_rows.saturating_add(2).min(composer.y);
-    if height < 3 || composer.width == 0 {
+    let config = widgets::OverlayConfig {
+        title: "commands",
+        tabs: None,
+        shortcuts: &PALETTE_SHORTCUTS,
+        sizing: widgets::OverlaySizing::palette(composer),
+        desired_content_rows: saturating_u16(matches.len().clamp(1, 8)),
+    };
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
         return;
-    }
-    let palette_area = Rect::new(composer.x, composer.y - height, composer.width, height);
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
     let items = if matches.is_empty() {
-        vec![ListItem::new(" No matching commands")]
+        vec![ListItem::new("No matching commands")]
     } else {
         matches
             .iter()
             .map(|entry| {
                 ListItem::new(
-                    format!(" /{} {}", entry.name, entry.argument_hint)
+                    format!("/{} {}", entry.name, entry.argument_hint)
                         .trim_end()
                         .to_owned(),
                 )
@@ -1256,29 +1278,17 @@ fn render_palette(
         (!matches.is_empty()).then_some(palette.selected.min(matches.len().saturating_sub(1))),
     );
 
-    frame.render_widget(Clear, palette_area);
     frame.render_stateful_widget(
         List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(widgets::RolePalette::brand()))
-                    .title(Span::styled(
-                        " commands ",
-                        Style::default()
-                            .fg(widgets::RolePalette::brand())
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            )
             .style(Style::default().fg(widgets::RolePalette::assistant()))
+            .highlight_symbol("❯ ")
             .highlight_style(
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(widgets::RolePalette::brand())
+                    .fg(widgets::RolePalette::selection_fg())
+                    .bg(widgets::RolePalette::selection_bg())
                     .add_modifier(Modifier::BOLD),
             ),
-        palette_area,
+        layout.content,
         &mut state,
     );
 }

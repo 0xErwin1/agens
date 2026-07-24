@@ -1985,11 +1985,19 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     assert!(!palette.contains("[built-in]"), "{palette:?}");
     assert_eq!(
         cell_for_text(&renderer, "commands").fg,
-        Color::Rgb(0x95, 0xe6, 0xcb)
+        Color::Rgb(0xbf, 0xbd, 0xb6)
     );
     assert_eq!(
+        cell_for_text(&renderer, "─ commands").fg,
+        Color::Rgb(0x6c, 0x73, 0x80)
+    );
+    assert!(palette.contains("[×]"), "{palette:?}");
+    assert!(palette.contains("❯ /review"), "{palette:?}");
+    assert!(palette.contains("navigate"), "{palette:?}");
+    assert!(palette.contains("close"), "{palette:?}");
+    assert_eq!(
         cell_for_text(&renderer, "/review").bg,
-        Color::Rgb(0x95, 0xe6, 0xcb)
+        Color::Rgb(0x1b, 0x33, 0x30)
     );
     assert!(!palette.contains("/connect"), "{palette:?}");
     assert_ne!(before, palette);
@@ -2594,6 +2602,31 @@ fn subagent_terminal_status_and_elapsed_are_frozen_and_low_dimensions_are_safe()
         assert_eq!(
             rendered_text(&renderer).chars().count(),
             20 * usize::from(height)
+        );
+    }
+
+    tui.set_palette_entries(vec![
+        PaletteEntry::new(
+            "review",
+            "Review the patch",
+            "[scope]",
+            PaletteEntryKind::Command,
+        ),
+        PaletteEntry::new(
+            "resume",
+            "Resume a session",
+            "<id>",
+            PaletteEntryKind::BuiltIn,
+        ),
+    ]);
+    tui.handle(Event::Key(Key::Char('/')));
+    for (width, height) in [(1, 1), (2, 3), (8, 4), (34, 10)] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+        renderer.render(tui.view()).unwrap();
+        assert_eq!(
+            rendered_text(&renderer).chars().count(),
+            usize::from(width) * usize::from(height)
         );
     }
 }
