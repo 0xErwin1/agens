@@ -1599,8 +1599,8 @@ fn record_requested_subagent(requested: &Mutex<Vec<RequestedSubagent>>, event: &
         .ok()
         .and_then(|value| {
             Some(RequestedSubagent {
-                agent: sanitize_subagent_persistence(value.get("agent")?.as_str()?),
-                description: sanitize_subagent_persistence(value.get("description")?.as_str()?),
+                agent: sanitize_subagent_summary(value.get("agent")?.as_str()?),
+                description: sanitize_subagent_summary(value.get("description")?.as_str()?),
             })
         })
     else {
@@ -5231,9 +5231,9 @@ fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
 
         restored.push(TuiRuntimeEvent::RestoredCompletedSubagent {
             id,
-            agent: sanitize_subagent_persistence(&agent),
-            task_summary: sanitize_subagent_persistence(task),
-            final_result: sanitize_subagent_persistence(final_result),
+            agent: sanitize_subagent_summary(&agent),
+            task_summary: sanitize_subagent_summary(task),
+            final_result: sanitize_subagent_summary(final_result),
             tool_uses,
         });
     }
@@ -6119,9 +6119,9 @@ fn completed_subagent_session_turn(
     call_id: &str,
 ) -> Result<CompletedSessionTurn, CliError> {
     let call_id = call_id.to_owned();
-    let agent = sanitize_subagent_persistence(&turn.agent);
-    let task = sanitize_subagent_persistence(&turn.task);
-    let final_result = sanitize_subagent_persistence(&turn.final_result);
+    let agent = sanitize_subagent_summary(&turn.agent);
+    let task = sanitize_subagent_summary(&turn.task);
+    let final_result = sanitize_subagent_result_for_persistence(&turn.final_result);
     let input = serde_json::json!({
         "agent": agent,
         "description": task,
@@ -6162,6 +6162,11 @@ fn completed_subagent_session_turn(
 }
 
 const SUBAGENT_CALL_ID_PREFIX: &str = "subagent:";
+const MAX_SUBAGENT_SUMMARY_CHARS: usize = 256;
+const MAX_PERSISTED_SUBAGENT_RESULT_CHARS: usize = 65_536;
+const SUBAGENT_RESULT_TRUNCATION_MARKER: &str =
+    "\n[truncated: only the first 65536 characters of this subagent result were persisted]";
+const CREDENTIAL_MARKERS: [&str; 5] = ["api_key", "authorization", "password", "secret", "token"];
 
 /// A subagent tool-call id must be unique inside the session, not merely inside the process:
 /// execution ids restart at one in every process, so a resumed session would otherwise persist a
@@ -6181,16 +6186,51 @@ fn next_subagent_call_id(history: &[Message]) -> String {
     format!("{SUBAGENT_CALL_ID_PREFIX}{}", highest.saturating_add(1))
 }
 
-fn sanitize_subagent_persistence(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if ["api_key", "authorization", "password", "secret", "token"]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+fn sanitize_subagent_summary(value: &str) -> String {
+    if contains_credential_marker(value) {
         "[redacted]".into()
     } else {
-        value.chars().take(256).collect()
+        value.chars().take(MAX_SUBAGENT_SUMMARY_CHARS).collect()
     }
+}
+
+/// The persisted result is the model's only durable record of a background subagent's work, so it
+/// keeps the same budget the foreground task path allows and every removal stays visible: silent
+/// truncation or a wholesale replacement would make the model reason over a fragment it cannot see.
+fn sanitize_subagent_result_for_persistence(value: &str) -> String {
+    let redacted = redact_credential_lines(value);
+    let mut bounded = redacted
+        .chars()
+        .take(MAX_PERSISTED_SUBAGENT_RESULT_CHARS)
+        .collect::<String>();
+    if redacted.chars().count() > MAX_PERSISTED_SUBAGENT_RESULT_CHARS {
+        bounded.push_str(SUBAGENT_RESULT_TRUNCATION_MARKER);
+    }
+    bounded
+}
+
+fn redact_credential_lines(value: &str) -> String {
+    value
+        .lines()
+        .map(|line| {
+            if contains_credential_marker(line) {
+                format!(
+                    "[withheld: {} characters matched a credential pattern]",
+                    line.chars().count()
+                )
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn contains_credential_marker(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn persist_completed_subagent_turn(
@@ -9892,9 +9932,55 @@ mod tests {
             messages[2].parts,
             vec![MessagePart::ToolResult {
                 tool_call_id: "subagent:1".into(),
-                content: "[redacted]".into(),
+                content: "[withheld: 12 characters matched a credential pattern]".into(),
                 is_error: false,
             }]
+        );
+    }
+
+    #[test]
+    fn p1c1_persisted_subagent_result_stays_bounded_and_marks_every_loss() {
+        let subagent_turn = |final_result: String| CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "review the patch".into(),
+            final_result,
+            tool_uses: 1,
+        };
+        let persisted_result = |turn: &CompletedSubagentTurn| {
+            let messages = completed_subagent_session_turn(turn, "subagent:1")
+                .unwrap()
+                .messages()
+                .to_vec();
+            match &messages[2].parts[0] {
+                MessagePart::ToolResult { content, .. } => content.clone(),
+                part => panic!("subagent turns persist a tool result: {part:?}"),
+            }
+        };
+
+        let long = persisted_result(&subagent_turn("a".repeat(70_000)));
+        assert!(long.starts_with(&"a".repeat(MAX_PERSISTED_SUBAGENT_RESULT_CHARS)));
+        assert!(long.ends_with(SUBAGENT_RESULT_TRUNCATION_MARKER));
+        assert_eq!(
+            long.chars().count(),
+            MAX_PERSISTED_SUBAGENT_RESULT_CHARS + SUBAGENT_RESULT_TRUNCATION_MARKER.chars().count()
+        );
+
+        let bounded = persisted_result(&subagent_turn("a".repeat(300)));
+        assert_eq!(bounded, "a".repeat(300));
+
+        let with_secret = persisted_result(&subagent_turn(
+            "usable finding\napi_key=abcd\ntrailing finding".into(),
+        ));
+        assert_eq!(
+            with_secret,
+            "usable finding\n[withheld: 12 characters matched a credential pattern]\ntrailing finding"
+        );
+
+        let only_secret = persisted_result(&subagent_turn("token=abcd".into()));
+        assert_eq!(
+            only_secret,
+            "[withheld: 10 characters matched a credential pattern]"
         );
     }
 
