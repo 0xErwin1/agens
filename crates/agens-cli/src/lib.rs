@@ -3815,7 +3815,9 @@ fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap:
 fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-    let task_controls = TuiTaskControls::default();
+    let task_controls = TuiTaskControls(TaskExecutionRegistry::with_limits(task_execution_limits(
+        bootstrap.subagent_limits(),
+    )));
     let engine = ProductionTuiEngine {
         cancellation: Arc::clone(&cancellation),
     };
@@ -5672,6 +5674,17 @@ fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLim
         max_search_depth: settings.max_search_depth,
         operation_timeout: std::time::Duration::from_millis(settings.operation_timeout_ms),
         bash_timeout: std::time::Duration::from_millis(settings.bash_timeout_ms),
+    }
+}
+
+/// Converts configured subagent bounds into the runtime shape the task tool
+/// owns. The `[subagents]` table names the user-facing concept; the registry
+/// names the mechanism that enforces it.
+fn task_execution_limits(settings: SubagentSettings) -> agens_tools::TaskExecutionLimits {
+    agens_tools::TaskExecutionLimits {
+        max_iterations: settings.max_iterations,
+        max_concurrency: settings.max_concurrency,
+        max_output_chars: settings.max_output_chars,
     }
 }
 
@@ -7585,6 +7598,7 @@ fn run_production_task(
     ];
     let (provider_tools, tool_runtime) = production_child_tool_runtime(
         project_root,
+        bootstrap.tool_limits(),
         dangerous_mode,
         task_registry.clone(),
         execution_id,
@@ -7825,11 +7839,12 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
 
 fn production_read_only_tool_runtime(
     project_root: &Path,
+    tool_limits: ToolLimitSettings,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
-        NativeTools::open(project_root)
-            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
-    )));
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
+        project_root,
+        tool_limits,
+    )?)));
     let metadata = NativeToolCatalog::metadata()
         .into_iter()
         .find(|metadata| metadata.qualified_name == "native::read")
@@ -7866,11 +7881,12 @@ const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 9] = [
 
 fn production_dangerous_child_tool_runtime(
     project_root: &Path,
+    tool_limits: ToolLimitSettings,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
-        NativeTools::open(project_root)
-            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
-    )));
+    let catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
+        project_root,
+        tool_limits,
+    )?)));
     let metadata = NativeToolCatalog::metadata();
     let mut provider_tools = Vec::with_capacity(DANGEROUS_CHILD_NATIVE_TOOLS.len());
     let mut dispatcher = ToolDispatcher::new();
@@ -7906,14 +7922,15 @@ fn production_dangerous_child_tool_runtime(
 
 fn production_child_tool_runtime(
     project_root: &Path,
+    tool_limits: ToolLimitSettings,
     dangerous_mode: bool,
     task_registry: TaskExecutionRegistry,
     execution_id: agens_tools::TaskExecutionId,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let (mut provider_tools, dispatcher) = if dangerous_mode {
-        production_dangerous_child_tool_runtime(project_root)
+        production_dangerous_child_tool_runtime(project_root, tool_limits)
     } else {
-        production_read_only_tool_runtime(project_root)
+        production_read_only_tool_runtime(project_root, tool_limits)
     }?;
     provider_tools.push(
         OpenAiFunctionTool::new(
@@ -10814,7 +10831,8 @@ mod tests {
         std::fs::create_dir_all(&project_root).unwrap();
 
         let (provider_tools, dispatcher) =
-            production_dangerous_child_tool_runtime(&project_root).unwrap();
+            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+                .unwrap();
         let provider_names = provider_tools
             .iter()
             .map(|tool| tool.name())
@@ -10872,9 +10890,14 @@ mod tests {
 
         let task_registry = TaskExecutionRegistry::new();
         let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
-        let (mode_off_tools, mode_off_dispatcher) =
-            production_child_tool_runtime(&project_root, false, task_registry, execution_id)
-                .unwrap();
+        let (mode_off_tools, mode_off_dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            false,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
         assert_eq!(
             mode_off_tools
                 .iter()
@@ -11055,7 +11078,9 @@ mod tests {
         let temporary = tui_session_directory("dangerous-confined-write");
         let project_root = temporary.join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let (_, dispatcher) = production_dangerous_child_tool_runtime(&project_root).unwrap();
+        let (_, dispatcher) =
+            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+                .unwrap();
         let allowed = Arc::new(Mutex::new(BTreeMap::new()));
         let mut gate = ProductionPermissionGate::new(
             PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
@@ -15512,6 +15537,33 @@ mod tests {
     }
 
     #[test]
+    fn configured_subagent_limits_bound_the_task_registry() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-subagent-limits",
+            Some("[subagents]\nmax_iterations = 3\nmax_concurrency = 1\nmax_output_chars = 2048\n"),
+            None,
+        );
+
+        let registry =
+            TaskExecutionRegistry::with_limits(task_execution_limits(bootstrap.subagent_limits()));
+
+        assert_eq!(registry.limits().max_iterations, 3);
+        assert_eq!(registry.limits().max_output_chars, 2_048);
+        assert!(registry.admit(TaskLaunchMode::Background).is_some());
+        assert!(registry.admit(TaskLaunchMode::Background).is_none());
+    }
+
+    #[test]
+    fn default_configuration_keeps_the_runtime_subagent_limits_unchanged() {
+        let bootstrap = bootstrap_from_configuration("config-subagent-defaults", None, None);
+
+        assert_eq!(
+            task_execution_limits(bootstrap.subagent_limits()),
+            agens_tools::TaskExecutionLimits::default()
+        );
+    }
+
+    #[test]
     fn default_configuration_keeps_the_runtime_tool_limits_unchanged() {
         let bootstrap = bootstrap_from_configuration("config-tool-defaults", None, None);
 
@@ -19843,7 +19895,9 @@ fn reliability_integration_bounds_recovers_attempts_and_sanitizes_failures() {
 
     let project_root = directory.join("project");
     std::fs::create_dir_all(&project_root).unwrap();
-    let (catalog, dispatcher) = production_dangerous_child_tool_runtime(&project_root).unwrap();
+    let (catalog, dispatcher) =
+        production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+            .unwrap();
     assert_eq!(
         catalog.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
         [

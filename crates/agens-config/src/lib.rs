@@ -715,6 +715,12 @@ pub struct ToolLimitSettings {
     pub bash_timeout_ms: u64,
 }
 
+impl Default for ToolLimitSettings {
+    fn default() -> Self {
+        Self::from(&ResolvedSettings::default())
+    }
+}
+
 impl From<&ResolvedSettings> for ToolLimitSettings {
     fn from(resolved: &ResolvedSettings) -> Self {
         Self {

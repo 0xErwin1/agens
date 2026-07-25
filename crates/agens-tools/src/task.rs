@@ -302,6 +302,26 @@ fn task_status(snapshot: &TaskExecutionSnapshot) -> String {
     output
 }
 
+/// Bounds the task tool applies to the subagents it launches. Configured by
+/// the `[subagents]` table; the defaults are the values the runtime used before
+/// they were configurable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskExecutionLimits {
+    pub max_iterations: usize,
+    pub max_concurrency: usize,
+    pub max_output_chars: usize,
+}
+
+impl Default for TaskExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_iterations: MAX_TASK_ITERATIONS,
+            max_concurrency: MAX_TASK_CONCURRENCY,
+            max_output_chars: MAX_TASK_OUTPUT_CHARS,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct TaskExecutionRegistry {
     inner: Arc<Mutex<TaskExecutionRegistryState>>,
@@ -312,6 +332,7 @@ struct TaskExecutionRegistryState {
     next_id: u64,
     executions: BTreeMap<TaskExecutionId, TaskExecutionRecord>,
     main_mailbox: TaskMailbox,
+    limits: TaskExecutionLimits,
 }
 
 struct TaskExecutionRecord {
@@ -333,6 +354,23 @@ impl TaskExecutionRegistry {
         Self::default()
     }
 
+    pub fn with_limits(limits: TaskExecutionLimits) -> Self {
+        let registry = Self::default();
+        registry
+            .inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .limits = limits;
+        registry
+    }
+
+    pub fn limits(&self) -> TaskExecutionLimits {
+        self.inner
+            .lock()
+            .expect("task registry lock poisoned")
+            .limits
+    }
+
     pub fn admit(&self, mode: TaskLaunchMode) -> Option<TaskExecutionId> {
         self.join_finished_workers();
         let mut registry = self.inner.lock().expect("task registry lock poisoned");
@@ -341,7 +379,7 @@ impl TaskExecutionRegistry {
             .values()
             .filter(|execution| execution.lifecycle.terminal().is_none())
             .count();
-        if active >= MAX_TASK_CONCURRENCY || registry.next_id == u64::MAX {
+        if active >= registry.limits.max_concurrency || registry.next_id == u64::MAX {
             return None;
         }
 
@@ -1316,10 +1354,11 @@ fn task_result_output(result: TaskTurnResult, context: &TaskRunContext) -> ToolO
     if let Some(output) = context.terminal_output() {
         return output;
     }
-    if result.iterations > MAX_TASK_ITERATIONS {
+    let limits = context.registry.limits();
+    if result.iterations > limits.max_iterations {
         return task_terminal(HeadlessTaskTerminal::IterationLimit);
     }
-    if result.output.chars().count() > MAX_TASK_OUTPUT_CHARS {
+    if result.output.chars().count() > limits.max_output_chars {
         return task_terminal(HeadlessTaskTerminal::OutputLimit);
     }
     ToolOutput::success(result.output)
