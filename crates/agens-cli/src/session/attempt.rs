@@ -206,7 +206,9 @@ pub(crate) fn run_session_attempt_lifecycle(
         metadata,
         prompt,
         runtime,
-        |store, write| write_terminal_attempt(store, write, &crate::interrupted_turn_note(&[])),
+        |store, write| {
+            write_terminal_attempt(store, write, &crate::headless::interrupted_turn_note(&[]))
+        },
     )
 }
 
