@@ -121,6 +121,7 @@ use commands::chat::run_chat;
 // calls these unqualified. Remove this re-export once the test module moves.
 use commands::chat::{chat_args_with_prompt, chat_request};
 use commands::config::{create_configuration_file, run_config};
+use commands::models::run_models;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -518,12 +519,6 @@ fn execute_command(
         Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
         Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
     }
-}
-
-fn run_models() -> Result<String, CliError> {
-    model_registry::bundled_openai_models()
-        .map(|models| model_registry::format_models(&models))
-        .map_err(|_| CliError::unavailable("model registry is unavailable"))
 }
 
 fn run_sessions(
