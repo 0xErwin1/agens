@@ -274,6 +274,110 @@ impl SessionStore {
         Ok(AttemptFinishOutcome::Finished)
     }
 
+    /// Persists the content an unsuccessful attempt produced and marks the attempt with its
+    /// terminal failure status in one immediate transaction, so a sub-agent turn persisted into
+    /// the same session cannot interleave with this history. The retained retry prompt is dropped
+    /// because the prompt now lives in the persisted history.
+    pub fn persist_partial_session_attempt(
+        &mut self,
+        key: AttemptKey,
+        metadata: &SessionMetadata,
+        turn: &CompletedSessionTurn,
+        status: SessionAttemptStatus,
+        finished_at: i64,
+    ) -> Result<AttemptFinishOutcome, SessionStoreError> {
+        let Some(failure_kind) = status.expected_failure_kind() else {
+            return Err(SessionStoreError::operation(
+                "persist partial session attempt",
+                &self.database_path,
+                "partial attempts require a failure status",
+            ));
+        };
+        if metadata.id != key.session_id() {
+            return Err(SessionStoreError::operation(
+                "persist partial session attempt",
+                &self.database_path,
+                "attempt session does not match metadata",
+            ));
+        }
+        validate_metadata(metadata, &self.database_path)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "start partial session attempt",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        let running = transaction
+            .query_row(
+                "SELECT 1 FROM session_attempts WHERE id = ?1 AND session_id = ?2 AND status = 'running'",
+                params![key.attempt_id(), key.session_id()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                SessionStoreError::operation("check partial session attempt", &self.database_path, error)
+            })?;
+        if running.is_none() {
+            transaction.commit().map_err(|error| {
+                SessionStoreError::operation(
+                    "commit stale partial session attempt",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+            return Ok(AttemptFinishOutcome::Stale);
+        }
+
+        persist_completed_turn_in_transaction(
+            &transaction,
+            &self.database_path,
+            metadata,
+            turn,
+            finished_at,
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_attempts
+                 SET status = ?1, failure_kind = ?2, retry_prompt = NULL, finished_at = ?3
+                 WHERE id = ?4 AND session_id = ?5 AND status = 'running'",
+                params![
+                    attempt_status(status),
+                    attempt_failure_kind(failure_kind),
+                    finished_at,
+                    key.attempt_id(),
+                    key.session_id()
+                ],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "persist partial session attempt",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+        if changed != 1 {
+            return Err(SessionStoreError::operation(
+                "persist partial session attempt",
+                &self.database_path,
+                "running attempt changed during persistence",
+            ));
+        }
+
+        transaction.commit().map_err(|error| {
+            SessionStoreError::operation(
+                "commit partial session attempt",
+                &self.database_path,
+                error,
+            )
+        })?;
+        Ok(AttemptFinishOutcome::Finished)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>, SessionStoreError> {
         let mut statement = self
             .connection

@@ -204,6 +204,118 @@ fn successful_attempt_finish_is_atomic_exact_and_private() {
 }
 
 #[test]
+fn partial_attempt_persistence_appends_history_and_drops_the_retry_prompt() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 5,
+        project: "project".into(),
+        title: "title".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let partial = turn(vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("question".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("interrupted note".into())],
+        },
+    ]);
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "private-prompt-token".into())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .persist_partial_session_attempt(
+                attempt.key(),
+                &metadata,
+                &partial,
+                SessionAttemptStatus::Cancelled,
+                21,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Finished
+    );
+    assert_eq!(
+        store
+            .persist_partial_session_attempt(
+                attempt.key(),
+                &metadata,
+                &partial,
+                SessionAttemptStatus::Cancelled,
+                22,
+            )
+            .unwrap(),
+        AttemptFinishOutcome::Stale
+    );
+    assert!(
+        store
+            .persist_partial_session_attempt(
+                attempt.key(),
+                &metadata,
+                &partial,
+                SessionAttemptStatus::Completed,
+                23,
+            )
+            .is_err()
+    );
+
+    let connection = Connection::open(store.database_path()).unwrap();
+    assert_eq!(normalized_counts(&connection), (1, 1, 2, 2));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT status, failure_kind, retry_prompt, finished_at, completed_turn_sequence
+                 FROM session_attempts WHERE id = ?1",
+                [attempt.key().attempt_id()],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                )),
+            )
+            .unwrap(),
+        ("cancelled".into(), Some("cancelled".into()), None, 21, None)
+    );
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT completed_turn_count, resumable FROM sessions WHERE id = ?1",
+                [metadata.id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .unwrap(),
+        (1, true)
+    );
+    assert!(store.load_retry_boundary(attempt.key()).unwrap().is_none());
+    assert_eq!(
+        collect_session_pages(&store, Some(&metadata.project), "")
+            .iter()
+            .map(|session| (session.metadata.id, session.metadata.completed_turn_count))
+            .collect::<Vec<_>>(),
+        [(metadata.id, 1)]
+    );
+
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+    assert_eq!(stored.metadata.completed_turn_count, 1);
+    assert_eq!(stored.messages, partial.messages());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn attempt_begin_bounds_prompts_allocates_zero_ids_and_preserves_other_sessions() {
     let directory = directory();
     let mut store = SessionStore::open(&directory).unwrap();
