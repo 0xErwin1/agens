@@ -131,16 +131,23 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
 #[derive(Clone)]
 struct SafeDiagnosticStore {
     directory: PathBuf,
+    enabled: bool,
 }
 
 impl SafeDiagnosticStore {
-    fn new(data_directory: PathBuf) -> Self {
+    /// Capture is what `options.debug` switches: disabled, nothing about a
+    /// failure is written to disk.
+    fn with_capture(data_directory: PathBuf, enabled: bool) -> Self {
         Self {
             directory: data_directory.join("diagnostics"),
+            enabled,
         }
     }
 
     fn record(&self, event: &ProviderDiagnosticEvent) {
+        if !self.enabled {
+            return;
+        }
         let _guard = DIAGNOSTIC_FILE_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -258,7 +265,7 @@ fn operation_diagnostics(
     reference: Option<&str>,
 ) -> OperationDiagnostics {
     let reference = reference.map_or_else(next_diagnostic_reference, str::to_owned);
-    let store = SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf());
+    let store = diagnostic_store(bootstrap);
     let sink = Arc::new(move |event: ProviderDiagnosticEvent| store.record(&event));
     let provider = ProviderDiagnostics::new(reference.clone(), scope, sink)
         .expect("generated diagnostics references are valid");
@@ -266,6 +273,10 @@ fn operation_diagnostics(
         reference,
         provider,
     }
+}
+
+fn diagnostic_store(bootstrap: &Bootstrap) -> SafeDiagnosticStore {
+    SafeDiagnosticStore::with_capture(bootstrap.data_directory().to_path_buf(), bootstrap.debug())
 }
 
 fn next_diagnostic_reference() -> String {
@@ -289,19 +300,17 @@ fn record_subagent_terminal(
     let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
         return;
     };
-    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
-        &ProviderDiagnosticEvent {
-            reference,
-            scope: ProviderDiagnosticScope::Subagent,
-            component: ProviderDiagnosticComponent::Subagent,
-            event: ProviderDiagnosticKind::Terminal,
-            attempt: 0,
-            max_attempts: 0,
-            delay_ms: None,
-            status: None,
-            class: Some(class),
-        },
-    );
+    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
+        reference,
+        scope: ProviderDiagnosticScope::Subagent,
+        component: ProviderDiagnosticComponent::Subagent,
+        event: ProviderDiagnosticKind::Terminal,
+        attempt: 0,
+        max_attempts: 0,
+        delay_ms: None,
+        status: None,
+        class: Some(class),
+    });
 }
 
 fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
@@ -319,38 +328,34 @@ fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliErr
     let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
         return;
     };
-    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
-        &ProviderDiagnosticEvent {
-            reference,
-            scope: ProviderDiagnosticScope::Parent,
-            component: ProviderDiagnosticComponent::Responses,
-            event: ProviderDiagnosticKind::Terminal,
-            attempt: 0,
-            max_attempts: 0,
-            delay_ms: None,
-            status: None,
-            class: Some(class),
-        },
-    );
+    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
+        reference,
+        scope: ProviderDiagnosticScope::Parent,
+        component: ProviderDiagnosticComponent::Responses,
+        event: ProviderDiagnosticKind::Terminal,
+        attempt: 0,
+        max_attempts: 0,
+        delay_ms: None,
+        status: None,
+        class: Some(class),
+    });
 }
 
 fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
     let Ok(reference) = DiagnosticRef::new(next_diagnostic_reference()) else {
         return;
     };
-    SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf()).record(
-        &ProviderDiagnosticEvent {
-            reference,
-            scope: ProviderDiagnosticScope::Parent,
-            component: ProviderDiagnosticComponent::Agent,
-            event,
-            attempt: 0,
-            max_attempts: 0,
-            delay_ms: None,
-            status: None,
-            class: Some(ProviderDiagnosticClass::Runtime),
-        },
-    );
+    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
+        reference,
+        scope: ProviderDiagnosticScope::Parent,
+        component: ProviderDiagnosticComponent::Agent,
+        event,
+        attempt: 0,
+        max_attempts: 0,
+        delay_ms: None,
+        status: None,
+        class: Some(ProviderDiagnosticClass::Runtime),
+    });
 }
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
@@ -5525,7 +5530,6 @@ pub struct Bootstrap {
     parallel_tool_calls: bool,
     collapse_thinking: bool,
     debug: bool,
-    truncate_tool_output: bool,
     default_agent: Option<String>,
     reasoning_effort: Option<String>,
     tool_limits: ToolLimitSettings,
@@ -5559,7 +5563,6 @@ impl Clone for Bootstrap {
             parallel_tool_calls: self.parallel_tool_calls,
             collapse_thinking: self.collapse_thinking,
             debug: self.debug,
-            truncate_tool_output: self.truncate_tool_output,
             default_agent: self.default_agent.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
             tool_limits: self.tool_limits,
@@ -5599,10 +5602,6 @@ impl Bootstrap {
 
     pub fn debug(&self) -> bool {
         self.debug
-    }
-
-    pub fn truncate_tool_output(&self) -> bool {
-        self.truncate_tool_output
     }
 
     pub fn default_agent(&self) -> Option<&str> {
@@ -5778,8 +5777,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
             .boolean("agent.parallel_tool_calls")
             .unwrap_or(true),
         collapse_thinking: settings.boolean("ui.collapse_thinking").unwrap_or(false),
-        debug: settings.boolean("options.debug").unwrap_or(false),
-        truncate_tool_output: settings.boolean("ui.truncate_tool_output").unwrap_or(false),
+        debug: settings.boolean("options.debug").unwrap_or(true),
         default_agent: settings.text("agent.default_agent").map(ToOwned::to_owned),
         reasoning_effort: settings
             .text("agent.reasoning_effort")
@@ -7632,7 +7630,7 @@ fn run_production_task(
         execution_id,
     )
     .map_err(|_| ChildRunError::Runtime)?;
-    let diagnostic_store = SafeDiagnosticStore::new(bootstrap.data_directory().to_path_buf());
+    let diagnostic_store = diagnostic_store(bootstrap);
     let diagnostic_sink = Arc::new(move |event: ProviderDiagnosticEvent| {
         diagnostic_store.record(&event);
     });
@@ -15494,8 +15492,7 @@ mod tests {
 
         assert_eq!(bootstrap.mcp_defaults().timeout_ms, 10_000);
         assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
-        assert!(!bootstrap.debug());
-        assert!(!bootstrap.truncate_tool_output());
+        assert!(bootstrap.debug());
         assert_eq!(bootstrap.default_agent(), None);
         assert_eq!(bootstrap.reasoning_effort(), None);
     }
@@ -15529,13 +15526,12 @@ mod tests {
         let bootstrap = bootstrap_from_configuration(
             "config-behavior",
             Some(
-                "[options]\ndebug = true\n\n[agent]\ndefault_agent = \"reviewer\"\nreasoning_effort = \"high\"\n\n[ui]\ntruncate_tool_output = true\n\n[subagents]\nmax_concurrency = 2\n",
+                "[options]\ndebug = true\n\n[agent]\ndefault_agent = \"reviewer\"\nreasoning_effort = \"high\"\n\n[subagents]\nmax_concurrency = 2\n",
             ),
             None,
         );
 
         assert!(bootstrap.debug());
-        assert!(bootstrap.truncate_tool_output());
         assert_eq!(bootstrap.default_agent(), Some("reviewer"));
         assert_eq!(bootstrap.reasoning_effort(), Some("high"));
         assert_eq!(bootstrap.subagent_limits().max_concurrency, 2);
@@ -15562,6 +15558,58 @@ mod tests {
             std::time::Duration::from_millis(900)
         );
         assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn diagnostics_capture_follows_the_debug_setting() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-diagnostic-capture-{}", std::process::id()));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
+        let event = ProviderDiagnosticEvent {
+            reference: DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
+            scope: ProviderDiagnosticScope::Parent,
+            component: ProviderDiagnosticComponent::Responses,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::Provider),
+        };
+
+        SafeDiagnosticStore::with_capture(temporary.clone(), false).record(&event);
+        assert!(!temporary.join("diagnostics").exists());
+
+        SafeDiagnosticStore::with_capture(temporary.clone(), true).record(&event);
+        assert!(
+            std::fs::read_dir(temporary.join("diagnostics"))
+                .expect("enabled capture should create the directory")
+                .count()
+                > 0
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    #[test]
+    fn diagnostics_are_captured_unless_debug_is_disabled() {
+        let enabled = bootstrap_from_configuration("config-debug-default", None, None);
+        let disabled = bootstrap_from_configuration(
+            "config-debug-off",
+            Some("[options]\ndebug = false\n"),
+            None,
+        );
+
+        assert!(enabled.debug());
+        assert!(!disabled.debug());
+    }
+
+    #[test]
+    fn the_removed_tool_output_key_is_no_longer_accepted() {
+        let document = parse_toml_document("[ui]\ntruncate_tool_output = true\n").unwrap();
+
+        assert!(validate_toml_document(&document).is_err());
     }
 
     #[test]
@@ -20116,7 +20164,7 @@ fn diagnostics_store_writes_only_allowlisted_jsonl_with_private_bounded_files() 
         DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir(&data_directory).expect("test data directory should be created");
-    let store = SafeDiagnosticStore::new(data_directory.clone());
+    let store = SafeDiagnosticStore::with_capture(data_directory.clone(), true);
     let event = ProviderDiagnosticEvent {
         reference: DiagnosticRef::new("abc12345".into()).expect("reference should be valid"),
         scope: ProviderDiagnosticScope::Subagent,

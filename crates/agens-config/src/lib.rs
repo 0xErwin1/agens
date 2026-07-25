@@ -373,8 +373,8 @@ pub const SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         path: "options.debug",
         kind: SettingKind::Bool,
-        default: SettingValue::Bool(false),
-        doc: "Emit diagnostic records for provider and tool activity.",
+        default: SettingValue::Bool(true),
+        doc: "Capture provider and subagent diagnostics under the data directory.",
     },
     SettingSpec {
         path: "options.data_dir",
@@ -438,12 +438,6 @@ pub const SETTINGS: &[SettingSpec] = &[
         kind: SettingKind::Bool,
         default: SettingValue::Bool(false),
         doc: "Collapse reasoning blocks in the transcript.",
-    },
-    SettingSpec {
-        path: "ui.truncate_tool_output",
-        kind: SettingKind::Bool,
-        default: SettingValue::Bool(false),
-        doc: "Bound tool output before it reaches the transcript.",
     },
     SettingSpec {
         path: "tools.max_list_entries",
