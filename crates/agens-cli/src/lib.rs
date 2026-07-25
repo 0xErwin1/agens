@@ -68,16 +68,19 @@ use agens_tui::{
 
 mod chatgpt_auth;
 mod cli;
+mod error;
 mod model_registry;
 #[cfg(test)]
 mod test_support;
 
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
+use error::cancellation_result;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{reset_tui_resume_test_counters, tui_resume_test_counters};
 
+pub use error::{CliError, CommandResult, ExitStatus};
 pub use model_registry::{TuiModelSelector, TuiModelSource};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
@@ -471,189 +474,6 @@ impl CliDependencies {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExitStatus {
-    Success,
-    Failure,
-    Usage,
-    Configuration,
-    Authentication,
-    Unavailable,
-}
-
-impl ExitStatus {
-    pub const fn code(self) -> u8 {
-        match self {
-            Self::Success => 0,
-            Self::Failure => 1,
-            Self::Usage => 2,
-            Self::Configuration => 3,
-            Self::Authentication => 4,
-            Self::Unavailable => 5,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct CommandResult {
-    pub status: ExitStatus,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CliError {
-    status: ExitStatus,
-    category: &'static str,
-    message: String,
-    preformatted: bool,
-}
-
-impl CliError {
-    fn usage(message: impl Into<String>) -> Self {
-        Self::new(ExitStatus::Usage, "usage", message)
-    }
-
-    /// Wraps text clap has already fully rendered (its own `error: ` prefix
-    /// and usage block). `error_result` emits `message` verbatim instead of
-    /// wrapping it in the `error: {category}: {message}` envelope, which
-    /// would otherwise double the `error: ` prefix.
-    fn preformatted_usage(message: impl Into<String>) -> Self {
-        Self {
-            status: ExitStatus::Usage,
-            category: "usage",
-            message: message.into(),
-            preformatted: true,
-        }
-    }
-
-    fn configuration(message: impl Into<String>) -> Self {
-        Self::new(ExitStatus::Configuration, "config", message)
-    }
-
-    fn authentication(message: impl Into<String>) -> Self {
-        Self::new(ExitStatus::Authentication, "auth", message)
-    }
-
-    fn unavailable(message: impl Into<String>) -> Self {
-        Self::new(ExitStatus::Unavailable, "unavailable", message)
-    }
-
-    fn storage(message: impl Into<String>) -> Self {
-        Self::new(ExitStatus::Failure, "store", message)
-    }
-
-    fn runtime(error: HeadlessTurnError) -> Self {
-        let (status, category, message) = match error {
-            HeadlessTurnError::Cancelled => (
-                ExitStatus::Failure,
-                "cancelled",
-                "headless turn was cancelled",
-            ),
-            HeadlessTurnError::TimedOut => {
-                (ExitStatus::Failure, "timeout", "headless turn timed out")
-            }
-            HeadlessTurnError::Authentication => (
-                ExitStatus::Authentication,
-                "auth",
-                "ChatGPT credentials are unavailable or invalid",
-            ),
-            HeadlessTurnError::Provider => {
-                (ExitStatus::Failure, "provider", "provider request failed")
-            }
-            HeadlessTurnError::ProviderRejected => (
-                ExitStatus::Failure,
-                "provider",
-                "ChatGPT request was rejected",
-            ),
-            HeadlessTurnError::ProviderContext => (
-                ExitStatus::Failure,
-                "provider",
-                "request exceeds the model context window",
-            ),
-            HeadlessTurnError::ProviderRateLimited => (
-                ExitStatus::Failure,
-                "provider",
-                "ChatGPT request was rate limited",
-            ),
-            HeadlessTurnError::ProviderServer => {
-                (ExitStatus::Failure, "provider", "ChatGPT service failed")
-            }
-            HeadlessTurnError::ProviderNetwork => {
-                (ExitStatus::Failure, "provider", "network request failed")
-            }
-            HeadlessTurnError::ProviderProtocol => (
-                ExitStatus::Failure,
-                "provider",
-                "ChatGPT response protocol failed",
-            ),
-            HeadlessTurnError::Permission => (
-                ExitStatus::Failure,
-                "permission",
-                "permission evaluation failed",
-            ),
-            HeadlessTurnError::PermissionEvaluation => (
-                ExitStatus::Failure,
-                "permission",
-                "permission target could not be evaluated; correct the tool arguments and retry",
-            ),
-            HeadlessTurnError::PermissionRequired => (
-                ExitStatus::Failure,
-                "permission",
-                "permission approval is required",
-            ),
-            HeadlessTurnError::Tool => (ExitStatus::Failure, "tool", "tool execution failed"),
-            HeadlessTurnError::Store => (
-                ExitStatus::Failure,
-                "store",
-                "completed turn could not be saved",
-            ),
-            HeadlessTurnError::MaxIterations => (
-                ExitStatus::Failure,
-                "runtime",
-                "headless turn reached the maximum iterations",
-            ),
-            HeadlessTurnError::State => (
-                ExitStatus::Failure,
-                "runtime",
-                "headless turn entered an invalid state",
-            ),
-            HeadlessTurnError::TaskTerminal(terminal) => {
-                (ExitStatus::Failure, "", terminal.message())
-            }
-        };
-        Self::new(status, category, message)
-    }
-
-    fn new(status: ExitStatus, category: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            category,
-            message: message.into(),
-            preformatted: false,
-        }
-    }
-
-    fn with_diagnostic_reference(mut self, reference: &str) -> Self {
-        self.message.push_str(" [ref: ");
-        self.message.push_str(reference);
-        self.message.push(']');
-        self
-    }
-}
-
-impl fmt::Display for CliError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.category.is_empty() {
-            return formatter.write_str(&self.message);
-        }
-
-        write!(formatter, "{}: {}", self.category, self.message)
-    }
-}
-
-impl std::error::Error for CliError {}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
     pub prompt: String,
@@ -771,13 +591,14 @@ fn execute_strings(
 
 fn error_result(arguments: &[String], error: CliError) -> CommandResult {
     CommandResult {
-        status: error.status,
-        stdout: if arguments == ["config", "doctor"] && error.status == ExitStatus::Configuration {
+        status: error.status(),
+        stdout: if arguments == ["config", "doctor"] && error.status() == ExitStatus::Configuration
+        {
             "Agens config doctor\nStatus:  invalid\n".to_owned()
         } else {
             String::new()
         },
-        stderr: if error.preformatted {
+        stderr: if error.is_preformatted() {
             error.message.clone()
         } else {
             format!("error: {error}\n")
@@ -8456,16 +8277,6 @@ impl DispatchTool for RegisteredMcpTool {
     }
 }
 
-fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), CliError> {
-    if cancellation.is_cancelled() {
-        return Err(CliError::runtime(HeadlessTurnError::Cancelled));
-    }
-    if cancellation.is_expired() {
-        return Err(CliError::runtime(HeadlessTurnError::TimedOut));
-    }
-    Ok(())
-}
-
 struct AllowedNativeCall {
     name: String,
     input: String,
@@ -15657,7 +15468,7 @@ mod tests {
         let error = run_config(cli::ConfigAction::Init, &dependencies)
             .expect_err("init must refuse an existing file");
 
-        assert_eq!(error.status, ExitStatus::Configuration);
+        assert_eq!(error.status(), ExitStatus::Configuration);
         assert!(error.message.contains("already exists"));
     }
 
