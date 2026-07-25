@@ -35,6 +35,10 @@ impl TemporaryDirectory {
         Self { path }
     }
 
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     fn project_root(&self) -> PathBuf {
         self.path.join("project")
     }
@@ -560,6 +564,353 @@ fn table_a_auth_holds() {
                 expected: failure(
                     ExitStatus::Usage,
                     "usage: auth requires status, login, or logout",
+                ),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
+/// Echoes every field of the parsed `HeadlessChatRequest` so the assertion
+/// exercises actual argument parsing, not just a stubbed success path.
+fn echoing_chat_dependencies(temporary: &TemporaryDirectory) -> CliDependencies {
+    base_dependencies(temporary).with_headless_chat(|request, _, _| {
+        Ok(format!(
+            "model={:?} system={:?} max_iterations={:?} mode={:?} dangerously_allow_all={} prompt={:?}",
+            request.model,
+            request.system_prompt,
+            request.max_iterations,
+            request.mode,
+            request.dangerously_allow_all,
+            request.prompt
+        ))
+    })
+}
+
+#[test]
+fn table_a_chat_holds() {
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-model");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --model is threaded through to the request",
+                argv: argv(&["chat", "--model", "gpt-4", "hi"]),
+                dependencies,
+                expected: success(
+                    "model=Some(\"gpt-4\") system=None max_iterations=None mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-system");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --system is threaded through to the request",
+                argv: argv(&["chat", "--system", "sys", "hi"]),
+                dependencies,
+                expected: success(
+                    "model=None system=Some(\"sys\") max_iterations=None mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-max-iterations");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --max-iterations is threaded through to the request",
+                argv: argv(&["chat", "--max-iterations", "3", "hi"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=Some(3) mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-mode-chat");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --mode chat overrides the default Edit mode",
+                argv: argv(&["chat", "--mode", "chat", "hi"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=None mode=Chat dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-dangerously-allow-all");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --dangerously-allow-all is threaded through to the request",
+                argv: argv(&["chat", "--dangerously-allow-all", "hi"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=None mode=Edit dangerously_allow_all=true prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-all-flags-together");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat with every flag combined",
+                argv: argv(&[
+                    "chat",
+                    "--model",
+                    "X",
+                    "--system",
+                    "S",
+                    "--max-iterations",
+                    "3",
+                    "--mode",
+                    "chat",
+                    "--dangerously-allow-all",
+                    "hi",
+                ]),
+                dependencies,
+                expected: success(
+                    "model=Some(\"X\") system=Some(\"S\") max_iterations=Some(3) mode=Chat dangerously_allow_all=true prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // A single whitespace-only argument is NOT treated as an empty
+            // prompt: `prompt.trim().is_empty()` guards the "set the
+            // prompt" arm, so the argument instead falls into the
+            // catch-all "one prompt argument" arm. This diverges from the
+            // spec's assumption that this case reads as a missing prompt;
+            // pin the OBSERVED behavior.
+            let temporary = TemporaryDirectory::new("chat-whitespace-only-prompt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat with a single whitespace-only argument (observed, not `requires a prompt`)",
+                argv: argv(&["chat", "  "]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: chat accepts one prompt argument"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-max-iterations-zero");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat --max-iterations 0 is rejected",
+                argv: argv(&["chat", "--max-iterations", "0", "x"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: chat --max-iterations must be >= 1",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-mode-bogus");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat --mode bogus is rejected",
+                argv: argv(&["chat", "--mode", "bogus", "x"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: chat --mode must be chat or edit"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-two-positionals");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat rejects a second positional argument",
+                argv: argv(&["chat", "a", "b"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: chat accepts one prompt argument"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-unknown-flag");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat rejects an unrecognized flag",
+                argv: argv(&["chat", "--bogus", "hi"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: chat received an unknown flag"),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
+#[test]
+fn table_a_models_and_sessions_hold() {
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("models-default");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "models lists the bundled snapshot",
+                argv: argv(&["models"]),
+                dependencies,
+                expected: success(concat!(
+                    "ID\tNAME\tCONTEXT\tPRICE\n",
+                    "gpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\n",
+                    "gpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\n",
+                    "gpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\n",
+                    "gpt-4o\tGPT-4o\t128000\t$2.50/$10.00\n",
+                    "gpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\n",
+                    "o3\to3\t200000\t$2.00/$8.00\n",
+                    "o4-mini\to4-mini\t200000\t$1.10/$4.40\n",
+                )),
+                _temporary: temporary,
+            }
+        },
+        {
+            // Full triple pinned here in Table A; the wording is sourced
+            // from the Table B constant so a Phase 1 re-baseline of that
+            // constant updates this expectation automatically.
+            let temporary = TemporaryDirectory::new("models-extra-argument");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "models rejects any argument",
+                argv: argv(&["models", "extra"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    format!("usage: {}", parser_surface_baseline::MODELS_EXTRA_MESSAGE),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-list-empty");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions list with no saved sessions",
+                argv: argv(&["sessions", "list"]),
+                dependencies,
+                expected: success("No saved sessions.\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-show-missing-id");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions show of a numeric id that does not exist",
+                argv: argv(&["sessions", "show", "1"]),
+                dependencies,
+                expected: failure(ExitStatus::Failure, "store: saved session is unavailable"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-show-non-numeric");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions show requires a numeric id",
+                argv: argv(&["sessions", "show", "abc"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions show requires a numeric id",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // Deletion is idempotent: removing a session id that was never
+            // stored still reports success (confirmed by
+            // `sessions_crud_uses_normalized_metadata_and_idempotent_removal`
+            // in `tests/cli.rs`, not a Phase-0 discovery).
+            let temporary = TemporaryDirectory::new("sessions-rm-missing-id");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions rm of a numeric id that does not exist is idempotent",
+                argv: argv(&["sessions", "rm", "1"]),
+                dependencies,
+                expected: success("Removed session 1.\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-rm-non-numeric");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions rm requires a numeric id",
+                argv: argv(&["sessions", "rm", "abc"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions rm requires a numeric id",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-no-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions with no subcommand",
+                argv: argv(&["sessions"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions requires list, show, or rm",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("sessions-unknown-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions bogus is an unknown subcommand",
+                argv: argv(&["sessions", "bogus"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions requires list, show, or rm",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // A store-open failure: `data_dir` names a path whose parent
+            // segment is an ordinary file, so `create_dir_all` fails before
+            // any session table is touched.
+            let temporary = TemporaryDirectory::new("sessions-store-open-failure");
+            let blocked_by_file = temporary.path().join("blocked-file");
+            std::fs::write(&blocked_by_file, b"not a directory")
+                .expect("blocking file should be created");
+            let data_directory = blocked_by_file.join("data");
+            let mut files = BTreeMap::new();
+            files.insert(
+                config_project_config_path(&temporary),
+                format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
+            );
+            let dependencies = CliDependencies::for_test(
+                temporary.project_root(),
+                Some(temporary.home()),
+                BTreeMap::new(),
+                files,
+            );
+            Case {
+                name: "sessions list reports a store-open failure",
+                argv: argv(&["sessions", "list"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Failure,
+                    "store: sessions database is unavailable",
                 ),
                 _temporary: temporary,
             }
