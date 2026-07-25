@@ -575,7 +575,8 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
     let terminal = Terminal::new(TestBackend::new(width, 40)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
-    let content_width = usize::from(width - 4);
+    // Four columns of transcript margin plus the two-column shared row gutter.
+    let content_width = usize::from(width - 6);
     let first_line = format!(
         "ASSISTANT_FIRST{}",
         "x".repeat(content_width - "ASSISTANT_FIRST".len())
@@ -643,7 +644,6 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
     for content in [
         "ASSISTANT_FIRST",
         "ASSISTANT_WRAPPED",
-        "ASSISTANT_CODE",
         "THINKING_BODY",
         "TOOL_BODY",
         "• ASSISTANT_LIST",
@@ -656,6 +656,12 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             rendered_column(&renderer, content)
         );
     }
+    // A fenced body sits inside its own panel rail, which owns the content column.
+    assert!(
+        rendered_column(&renderer, "ASSISTANT_CODE") <= 8,
+        "ASSISTANT_CODE at col {}: {text:?}",
+        rendered_column(&renderer, "ASSISTANT_CODE")
+    );
     assert!(!text.contains("Assistant"), "{text:?}");
 }
 
@@ -843,7 +849,7 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
 }
 
 #[test]
-fn consecutive_reads_render_as_one_animated_group_that_settles_into_past_tense() {
+fn consecutive_reads_render_as_one_group_row_that_settles_into_past_tense() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.begin_submission("inspect");
@@ -860,20 +866,25 @@ fn consecutive_reads_render_as_one_animated_group_that_settles_into_past_tense()
     tui.tick(Duration::from_millis(0));
     renderer.render(tui.view()).unwrap();
     let first_frame = rendered_text(&renderer);
-    assert!(first_frame.contains("Reading 3 files…"), "{first_frame:?}");
+    assert!(
+        first_frame.contains("◈ Reading 3 files…"),
+        "{first_frame:?}"
+    );
     assert!(!first_frame.contains("Read src/a.rs"), "{first_frame:?}");
-    assert!(first_frame.contains('◦'), "{first_frame:?}");
+    assert_eq!(
+        cell_for_text(&renderer, "◈").fg,
+        Color::Rgb(0x73, 0xd0, 0xff),
+        "a running group carries the active accent: {first_frame:?}"
+    );
 
+    let group_row = rendered_line(&renderer, rendered_row(&renderer, "◈ Reading 3 files…"));
     tui.tick(Duration::from_millis(200));
     renderer.render(tui.view()).unwrap();
     let second_frame = rendered_text(&renderer);
-    assert!(
-        second_frame.contains("Reading 3 files…"),
-        "{second_frame:?}"
-    );
-    assert!(
-        second_frame.contains('•') && !second_frame.contains('◦'),
-        "the running accent advances on tick: {second_frame:?}"
+    assert_eq!(
+        rendered_line(&renderer, rendered_row(&renderer, "◈ Reading 3 files…")),
+        group_row,
+        "a group row keeps one shape across ticks; state lives in its colour: {second_frame:?}"
     );
 
     for path in ["src/a.rs", "src/b.rs", "src/c.rs"] {
@@ -900,6 +911,210 @@ fn consecutive_reads_render_as_one_animated_group_that_settles_into_past_tense()
             "expanding the group restores the individual rows: {expanded:?}"
         );
     }
+}
+
+/// Columns owned by the shared transcript gutter: the bullet sits at
+/// `CHROME_GUTTER`, its content two columns further right.
+const BULLET_COLUMN: usize = CHROME_GUTTER as usize;
+const CONTENT_COLUMN: usize = BULLET_COLUMN + 2;
+
+/// Transcript content rows, excluding the top border and the bottom scroll label.
+fn transcript_rows(renderer: &RatatuiRenderer<TestBackend>) -> Vec<String> {
+    let last = usize::from(composer_top_row(renderer)).saturating_sub(1);
+    (1..last).map(|row| rendered_line(renderer, row)).collect()
+}
+
+fn first_glyph_column(row: &str) -> Option<usize> {
+    row.char_indices()
+        .find(|(_, glyph)| !glyph.is_whitespace())
+        .map(|(index, _)| row[..index].chars().count())
+}
+
+#[test]
+fn every_transcript_row_sits_on_the_shared_gutter() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "check the manifests".into(),
+    )));
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "{}".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "Cargo.toml".into(),
+        },
+    })
+    .unwrap();
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "read-1".into(),
+        output: "ok".into(),
+        is_error: false,
+    })
+    .unwrap();
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "one focused workspace".into(),
+    )));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed(
+        "one focused workspace".into(),
+    ));
+
+    renderer.render(tui.view()).unwrap();
+    let rows = transcript_rows(&renderer);
+
+    for row in &rows {
+        let Some(column) = first_glyph_column(row) else {
+            continue;
+        };
+        assert!(
+            column == BULLET_COLUMN || column == CONTENT_COLUMN,
+            "row {row:?} starts at column {column}, outside the shared gutter"
+        );
+    }
+    assert_eq!(
+        rendered_column(&renderer, "└"),
+        BULLET_COLUMN,
+        "the result footer rail shares the bullet column"
+    );
+    assert_eq!(
+        rendered_column(&renderer, "Read Cargo.toml"),
+        CONTENT_COLUMN
+    );
+    assert_eq!(rendered_column(&renderer, "◆"), BULLET_COLUMN);
+}
+
+#[test]
+fn collapsed_tool_rows_pack_while_prose_keeps_exactly_one_blank_row() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    for (call_id, name, parsed) in [
+        (
+            "read-1",
+            "native::read",
+            agens_core::ToolInput::Read {
+                path: "Cargo.toml".into(),
+            },
+        ),
+        (
+            "grep-1",
+            "native::grep",
+            agens_core::ToolInput::Grep {
+                pattern: "needle".into(),
+                path: None,
+            },
+        ),
+    ] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            input: "{}".into(),
+            parsed,
+        })
+        .unwrap();
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: call_id.into(),
+            output: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
+    }
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "PROSE_SENTINEL".into(),
+    )));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed(
+        "PROSE_SENTINEL".into(),
+    ));
+
+    renderer.render(tui.view()).unwrap();
+    let rows = transcript_rows(&renderer);
+
+    let read_row = rendered_row(&renderer, "Read Cargo.toml");
+    let grep_row = rendered_row(&renderer, "Grep needle");
+    let prose_row = rendered_row(&renderer, "PROSE_SENTINEL");
+    for row in read_row..grep_row {
+        assert!(
+            !rendered_line(&renderer, row).trim().is_empty(),
+            "collapsed tool rows pack without a blank row: {rows:?}"
+        );
+    }
+    assert!(
+        rendered_line(&renderer, prose_row - 1).trim().is_empty(),
+        "prose keeps one blank row above it: {rows:?}"
+    );
+    assert!(
+        !rendered_line(&renderer, prose_row - 2).trim().is_empty(),
+        "prose keeps exactly one blank row above it: {rows:?}"
+    );
+}
+
+#[test]
+fn transcript_bullets_carry_state_in_colour_and_group_headers_own_their_glyph() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 44)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: "{}".into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo check".into(),
+        },
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    assert_eq!(
+        cell_for_text(&renderer, "◆").fg,
+        Color::Rgb(0x73, 0xd0, 0xff),
+        "a running activity row carries the active accent"
+    );
+
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "bash-1".into(),
+        output: "boom".into(),
+        is_error: true,
+    })
+    .unwrap();
+    renderer.render(tui.view()).unwrap();
+    assert_eq!(
+        cell_for_text(&renderer, "◆").fg,
+        Color::Rgb(0xf0, 0x71, 0x78),
+        "a failed activity row carries the error colour"
+    );
+
+    for path in ["src/a.rs", "src/b.rs"] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: path.into(),
+            name: "native::read".into(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Read { path: path.into() },
+        })
+        .unwrap();
+    }
+    for (path, is_error) in [("src/a.rs", false), ("src/b.rs", true)] {
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: path.into(),
+            output: "ok".into(),
+            is_error,
+        })
+        .unwrap();
+    }
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("Read 2 files"), "{text:?}");
+    assert!(
+        text.contains("· 1 failed"),
+        "a folded group names its failures: {text:?}"
+    );
+    assert_eq!(rendered_column(&renderer, "◈"), BULLET_COLUMN);
+    assert_eq!(
+        cell_for_text(&renderer, "◈").fg,
+        Color::Rgb(0xf0, 0x71, 0x78),
+        "a group with a failure carries the error colour"
+    );
 }
 
 #[test]

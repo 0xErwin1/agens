@@ -9,7 +9,8 @@ mod overlay_list;
 mod role_palette;
 
 pub(crate) use blocks::{
-    BlockContent, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow, VerbGroup,
+    BlockContent, BlockLine, GUTTER_WIDTH, RowBullet, RowState, ThinkingBlock, ToolCallBlock,
+    ToolResultBlock, ToolRow, VerbGroup,
 };
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};

@@ -9,13 +9,76 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{DisplayMode, ExpandMode, ExpandableBody, RolePalette};
 
-/// One presentation row within a [`BlockContent`], carrying optional row
-/// background (diff insert/delete highlighting) and whether it may be
-/// folded into a verb-group summary.
+/// Columns reserved by the shared transcript gutter: one bullet cell plus one
+/// separator cell.
+///
+/// Every transcript row spends them, whether or not it carries a bullet, so a
+/// row's content column never depends on its kind or lifecycle state.
+pub(crate) const GUTTER_WIDTH: usize = 2;
+
+/// Lifecycle a transcript bullet encodes through its colour alone.
+///
+/// Shape stays constant as a row settles: only the colour moves, so a finished
+/// row never shifts or changes glyph under the reader's eye.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RowState {
+    Running,
+    Success,
+    Failure,
+    /// Content the reader cannot see from this row (elided behind a count).
+    Muted,
+}
+
+impl RowState {
+    pub(crate) const fn color(self) -> Color {
+        match self {
+            Self::Running => RolePalette::accent_active(),
+            Self::Success => RolePalette::success(),
+            Self::Failure => RolePalette::error(),
+            Self::Muted => RolePalette::muted(),
+        }
+    }
+}
+
+/// Leading glyph vocabulary for transcript rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RowBullet {
+    /// A single action: one tool call, one step.
+    Activity(RowState),
+    /// A header standing in for several rows (verb run, elided remainder).
+    Group(RowState),
+    /// Closing rail of a block whose lead row is above it.
+    Rail(Color),
+    /// Fixed identity glyph (user prompt, subagent card).
+    Identity(&'static str, Color),
+}
+
+impl RowBullet {
+    const ACTIVITY: &'static str = "◆";
+    const GROUP: &'static str = "◈";
+    const RAIL: &'static str = "└";
+
+    pub(crate) fn span(self) -> Span<'static> {
+        let (glyph, color) = match self {
+            Self::Activity(state) => (Self::ACTIVITY, state.color()),
+            Self::Group(state) => (Self::GROUP, state.color()),
+            Self::Rail(color) => (Self::RAIL, color),
+            Self::Identity(glyph, color) => (glyph, color),
+        };
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+/// One presentation row within a [`BlockContent`], carrying its optional gutter
+/// bullet, optional row background (diff insert/delete highlighting) and
+/// whether it may be folded into a verb-group summary.
 pub(crate) struct BlockLine {
     pub(crate) line: Line<'static>,
-    // Consumed by the S2 diff painter and S3 verb-group pass; not yet read
-    // by the S1 foundation this batch lands.
+    pub(crate) bullet: Option<RowBullet>,
+    // Consumed by the S2 diff painter; not yet read by the row painter.
     #[allow(dead_code)]
     pub(crate) background: Option<Color>,
     #[allow(dead_code)]
@@ -23,12 +86,21 @@ pub(crate) struct BlockLine {
 }
 
 impl BlockLine {
-    /// Plain row with no background and default groupability.
+    /// Plain row with no bullet, no background and default groupability.
     pub(crate) fn new(line: Line<'static>) -> Self {
         Self {
             line,
+            bullet: None,
             background: None,
             groupable: true,
+        }
+    }
+
+    /// Row leading the shared gutter with `bullet`.
+    pub(crate) fn with_bullet(line: Line<'static>, bullet: RowBullet) -> Self {
+        Self {
+            bullet: Some(bullet),
+            ..Self::new(line)
         }
     }
 }
@@ -124,6 +196,9 @@ impl ToolRow {
     /// Result footer with tool name, status, and optional result-size metadata
     /// (no call_id on the scan path).
     ///
+    /// The closing rail glyph lives in the shared gutter, not in this row, so
+    /// the footer never starts left of the rows it closes.
+    ///
     /// `size` carries the computed result size (lines/bytes) as muted trailing
     /// metadata; it is never a fabricated per-call token count.
     pub(crate) fn result_footer(
@@ -133,7 +208,6 @@ impl ToolRow {
         size: Option<&str>,
     ) -> Line<'static> {
         let mut spans = vec![
-            Span::styled("└ ", Style::default().fg(color)),
             Span::styled(
                 short_tool_name(tool_name),
                 Style::default()
@@ -158,7 +232,7 @@ impl ToolRow {
     /// Collapsed successful output placeholder.
     pub(crate) fn collapsed_output() -> Line<'static> {
         Line::from(Span::styled(
-            "  output collapsed · Ctrl+O to expand",
+            "output collapsed · Ctrl+O to expand",
             Style::default().fg(RolePalette::chrome()),
         ))
     }
@@ -177,7 +251,7 @@ impl ToolRow {
             preview.push('…');
         }
         Line::from(vec![
-            Span::styled("  reason ", Style::default().fg(RolePalette::muted())),
+            Span::styled("reason ", Style::default().fg(RolePalette::muted())),
             Span::styled(preview, Style::default().fg(RolePalette::error())),
             Span::styled(
                 " · Ctrl+O for full output",
@@ -466,20 +540,27 @@ pub(crate) struct ToolCallBlock<'a> {
     pub(crate) parsed: &'a ToolInput,
     pub(crate) batch: Option<usize>,
     pub(crate) content_width: usize,
+    pub(crate) state: RowState,
 }
 
 impl BlockContent for ToolCallBlock<'_> {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
         let mut lines = Vec::new();
         if let Some(batch) = self.batch {
-            lines.push(BlockLine::new(Line::from(Span::styled(
-                format!("Tools · batch {batch}"),
-                Style::default()
-                    .fg(RolePalette::tool())
-                    .add_modifier(Modifier::BOLD),
-            ))));
+            lines.push(BlockLine::with_bullet(
+                Line::from(Span::styled(
+                    format!("Tools · batch {batch}"),
+                    Style::default()
+                        .fg(RolePalette::tool())
+                        .add_modifier(Modifier::BOLD),
+                )),
+                RowBullet::Group(self.state),
+            ));
         }
-        lines.push(BlockLine::new(tool_header(self.parsed, self.content_width)));
+        lines.push(BlockLine::with_bullet(
+            tool_header(self.parsed, self.content_width),
+            RowBullet::Activity(self.state),
+        ));
         if mode == DisplayMode::Expanded {
             lines.push(BlockLine::new(ToolRow::args(self.input)));
         }
@@ -508,13 +589,15 @@ pub(crate) struct ToolResultBlock {
     pub(crate) footer: Line<'static>,
     pub(crate) collapsed_body: Vec<Line<'static>>,
     pub(crate) full_body: Vec<Line<'static>>,
-    #[allow(dead_code)]
     pub(crate) accent: Color,
 }
 
 impl BlockContent for ToolResultBlock {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
-        let mut lines = vec![BlockLine::new(self.footer.clone())];
+        let mut lines = vec![BlockLine::with_bullet(
+            self.footer.clone(),
+            RowBullet::Rail(self.accent),
+        )];
         let body = match mode {
             DisplayMode::Collapsed => self.collapsed_body.clone(),
             DisplayMode::Truncated => bounded_preview(&self.full_body),
@@ -561,7 +644,7 @@ fn bounded_preview(body: &[Line<'static>]) -> Vec<Line<'static>> {
     let hidden = body.len() - PREVIEW_HEAD_LINES - PREVIEW_TAIL_LINES;
     let mut preview = body[..PREVIEW_HEAD_LINES].to_vec();
     preview.push(Line::from(Span::styled(
-        format!("  … {hidden} more lines · Ctrl+O for full output"),
+        format!("… {hidden} more lines · Ctrl+O for full output"),
         Style::default().fg(RolePalette::chrome()),
     )));
     preview.extend_from_slice(&body[body.len() - PREVIEW_TAIL_LINES..]);
@@ -821,6 +904,7 @@ mod tests {
             parsed: &write,
             batch: None,
             content_width: 80,
+            state: RowState::Running,
         };
         assert!(
             !block.is_groupable(),
@@ -900,6 +984,7 @@ mod tests {
             parsed: &parsed,
             batch: Some(2),
             content_width: 80,
+            state: RowState::Success,
         };
         assert_eq!(block.default_mode(), DisplayMode::Truncated);
         assert!(block.is_groupable());

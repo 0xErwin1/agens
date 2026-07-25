@@ -22,8 +22,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
-    BlockContent, DisplayMode, RolePalette, StatusGlyph, ThinkingBlock, ToolCallBlock,
-    ToolResultBlock, ToolRow, VerbGroup,
+    BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowBullet, RowState,
+    StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow, VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -49,143 +49,299 @@ pub(super) fn conversation_lines(
     content_width: u16,
     state: ConversationRenderState,
 ) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let content_width = usize::from(content_width.max(1));
+    let context = ItemContext {
+        conversation,
+        events,
+        tool_display_modes,
+        content_width: usize::from(content_width.max(1))
+            .saturating_sub(GUTTER_WIDTH)
+            .max(1),
+        state,
+    };
     let plan = plan_verb_groups(conversation, tool_display_modes);
+    let mut blocks = Vec::new();
 
     for (index, item) in conversation.items.iter().enumerate() {
         if let Some(group) = plan.headers.get(&index) {
-            lines.push(verb_group_line(group, state.now));
-            lines.push(Line::default());
+            blocks.push(verb_group_block(group));
             continue;
         }
         if plan.folded.contains(&index) {
             continue;
         }
-        match item {
-            ConversationItem::Info(text) => line(&mut lines, "INFO", RolePalette::info(), text),
-            ConversationItem::User(text) => user_lines(&mut lines, text),
-            ConversationItem::Assistant(text) => {
-                markdown_lines_with_syntax(
-                    &mut lines,
-                    text,
-                    Style::default().fg(RolePalette::assistant()),
-                    "",
-                    content_width,
-                    !state.assistant_streaming,
-                );
-                lines.push(Line::default());
-            }
-            ConversationItem::Reasoning(text) => {
-                thinking_lines(
-                    &mut lines,
-                    text,
-                    state.collapse_thinking,
-                    state.thinking_streaming,
-                    content_width,
-                );
-            }
-            ConversationItem::ToolCall {
-                call_id,
-                name,
-                input,
-                parsed,
-                batch,
-            } => {
-                if is_task_tool_name(name) {
-                    continue;
-                }
-                let block = ToolCallBlock {
-                    input,
-                    parsed,
-                    batch: *batch,
-                    content_width,
-                };
-                let mode = tool_display_modes
-                    .get(call_id)
-                    .copied()
-                    .unwrap_or_else(|| block.default_mode());
-                let running = !call_has_result(conversation, call_id);
-                lines.extend(
-                    block
-                        .lines(mode)
-                        .into_iter()
-                        .map(|block_line| running_gutter_line(block_line.line, running, state.now)),
-                );
-            }
-            ConversationItem::ToolResult {
-                call_id,
-                output,
-                is_error,
-            } => {
-                if is_task_call(conversation, call_id) {
-                    continue;
-                }
-                let (result_state, duration) = tool_state(events, call_id, *is_error);
-                let color = result_color(result_state);
-                let tool_name = tool_name_for_call(conversation, call_id);
-                let status = format!("{result_state:?}{}", duration_label(duration));
-                let collapsed_body = if *is_error {
-                    vec![ToolRow::collapsed_failure(output)]
-                } else {
-                    vec![ToolRow::collapsed_output()]
-                };
-                let full_body = tool_result_body(call_id, output, content_width).to_vec();
-                let size = result_size_label(output);
-                let block = ToolResultBlock {
-                    footer: ToolRow::result_footer(&tool_name, &status, color, Some(&size)),
-                    collapsed_body,
-                    full_body,
-                    accent: color,
-                };
-                let mode = tool_display_modes
-                    .get(call_id)
-                    .copied()
-                    .unwrap_or_else(|| block.default_mode());
-                let is_collapsed = mode == DisplayMode::Collapsed;
-                lines.extend(
-                    block
-                        .lines(mode)
-                        .into_iter()
-                        .map(|block_line| block_line.line),
-                );
-                if is_collapsed {
-                    lines.push(Line::default());
-                }
-            }
-            ConversationItem::Diff(diff) => {
-                render_diff(&mut lines, diff, content_width);
-            }
-            ConversationItem::Error(error) => {
-                lines.push(Line::from(Span::styled(
-                    "┌ Error",
-                    Style::default()
-                        .fg(RolePalette::error())
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(RolePalette::error())),
-                    Span::raw(error.message.clone()),
-                ]));
-                lines.push(Line::from(Span::styled(
-                    format!("└ Action: {}", error.action),
-                    Style::default().fg(RolePalette::warning()),
-                )));
-                lines.push(Line::default());
-            }
-            ConversationItem::SubagentCard(id) => {
-                let Some(card) = conversation
-                    .subagent_cards
-                    .iter()
-                    .find(|card| card.id == *id)
-                else {
-                    continue;
-                };
-                subagent_card_lines(&mut lines, card, content_width, state.now);
-            }
+        blocks.push(item_block(&context, item));
+    }
+
+    paint_blocks(blocks)
+}
+
+/// Shared inputs every conversation item needs to describe its rows.
+///
+/// `content_width` is already reduced by [`GUTTER_WIDTH`], so a block never has
+/// to know that the transcript reserves leading columns for its bullet.
+struct ItemContext<'a> {
+    conversation: &'a Conversation,
+    events: &'a [TuiRuntimeEvent],
+    tool_display_modes: &'a BTreeMap<String, DisplayMode>,
+    content_width: usize,
+    state: ConversationRenderState,
+}
+
+/// One conversation item's rows plus what the vertical-gap policy needs.
+struct RenderedBlock {
+    rows: Vec<BlockLine>,
+    /// Whether the block is in its compact, single-summary form. A run of
+    /// packing blocks renders with no blank row between them.
+    packs: bool,
+    /// Tool call this block belongs to, when any.
+    call_id: Option<String>,
+    /// Whether the block closes a call opened by an earlier block.
+    closes_call: bool,
+}
+
+impl RenderedBlock {
+    /// Block of rows that share the gutter without owning a bullet.
+    fn plain(lines: Vec<Line<'static>>) -> Self {
+        Self {
+            rows: lines.into_iter().map(BlockLine::new).collect(),
+            packs: false,
+            call_id: None,
+            closes_call: false,
         }
     }
+
+    /// Block that renders nothing and is therefore transparent to the gap policy.
+    fn hidden() -> Self {
+        Self::plain(Vec::new())
+    }
+}
+
+/// Metadata of the last painted block, kept so the gap policy can look back.
+struct Neighbour {
+    packs: bool,
+    call_id: Option<String>,
+}
+
+/// Vertical rhythm of the transcript.
+///
+/// Consecutive compact blocks pack with no blank row; anything else is
+/// separated by exactly one. A tool result never detaches from the call it
+/// closes, even when the user expanded its body. Blocks that render nothing are
+/// transparent, so a hidden item can neither force nor absorb a gap.
+fn paint_blocks(blocks: Vec<RenderedBlock>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut previous: Option<Neighbour> = None;
+
+    for block in blocks.into_iter().filter(|block| !block.rows.is_empty()) {
+        if previous
+            .as_ref()
+            .is_some_and(|previous| separates(previous, &block))
+        {
+            lines.push(Line::default());
+        }
+        previous = Some(Neighbour {
+            packs: block.packs,
+            call_id: block.call_id,
+        });
+        lines.extend(block.rows.into_iter().map(painted_row));
+    }
+
     lines
+}
+
+fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
+    let closes_previous =
+        block.closes_call && block.call_id.is_some() && block.call_id == previous.call_id;
+    !closes_previous && !(previous.packs && block.packs)
+}
+
+/// Paints one row onto the shared gutter: its bullet, or the same width in
+/// blanks so content keeps a single column across every row type.
+fn painted_row(row: BlockLine) -> Line<'static> {
+    if row.bullet.is_none() && row.line.spans.iter().all(|span| span.content.is_empty()) {
+        return Line::default();
+    }
+
+    let mut spans = vec![
+        row.bullet
+            .map_or_else(|| Span::raw(" ".repeat(GUTTER_WIDTH)), RowBullet::span),
+    ];
+    spans.extend(row.line.spans);
+    Line::from(spans)
+}
+
+fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlock {
+    match item {
+        ConversationItem::Info(text) => {
+            RenderedBlock::plain(label_lines("INFO", RolePalette::info(), text))
+        }
+        ConversationItem::User(text) => user_block(text),
+        ConversationItem::Assistant(text) => {
+            let mut lines = Vec::new();
+            markdown_lines_with_syntax(
+                &mut lines,
+                text,
+                Style::default().fg(RolePalette::assistant()),
+                "",
+                context.content_width,
+                !context.state.assistant_streaming,
+            );
+            RenderedBlock::plain(lines)
+        }
+        ConversationItem::Reasoning(text) => {
+            let mut lines = Vec::new();
+            thinking_lines(
+                &mut lines,
+                text,
+                context.state.collapse_thinking,
+                context.state.thinking_streaming,
+                context.content_width,
+            );
+            RenderedBlock::plain(lines)
+        }
+        ConversationItem::ToolCall {
+            call_id,
+            name,
+            input,
+            parsed,
+            batch,
+        } => tool_call_block(context, call_id, name, input, parsed, *batch),
+        ConversationItem::ToolResult {
+            call_id,
+            output,
+            is_error,
+        } => tool_result_block(context, call_id, output, *is_error),
+        ConversationItem::Diff(diff) => {
+            let mut lines = Vec::new();
+            render_diff(&mut lines, diff, context.content_width);
+            RenderedBlock::plain(lines)
+        }
+        ConversationItem::Error(error) => RenderedBlock::plain(error_lines(error)),
+        ConversationItem::SubagentCard(id) => context
+            .conversation
+            .subagent_cards
+            .iter()
+            .find(|card| card.id == *id)
+            .map_or_else(RenderedBlock::hidden, |card| {
+                subagent_card_block(card, context.content_width, context.state.now)
+            }),
+    }
+}
+
+fn tool_call_block(
+    context: &ItemContext<'_>,
+    call_id: &str,
+    name: &str,
+    input: &str,
+    parsed: &agens_core::ToolInput,
+    batch: Option<usize>,
+) -> RenderedBlock {
+    if is_task_tool_name(name) {
+        return RenderedBlock::hidden();
+    }
+
+    let block = ToolCallBlock {
+        input,
+        parsed,
+        batch,
+        content_width: context.content_width,
+        state: call_row_state(context.conversation, call_id),
+    };
+    let mode = context
+        .tool_display_modes
+        .get(call_id)
+        .copied()
+        .unwrap_or_else(|| block.default_mode());
+
+    RenderedBlock {
+        rows: block.lines(mode),
+        packs: block.is_groupable() && mode != DisplayMode::Expanded,
+        call_id: Some(call_id.to_owned()),
+        closes_call: false,
+    }
+}
+
+fn tool_result_block(
+    context: &ItemContext<'_>,
+    call_id: &str,
+    output: &str,
+    is_error: bool,
+) -> RenderedBlock {
+    if is_task_call(context.conversation, call_id) {
+        return RenderedBlock::hidden();
+    }
+
+    let (result_state, duration) = tool_state(context.events, call_id, is_error);
+    let color = result_color(result_state);
+    let tool_name = tool_name_for_call(context.conversation, call_id);
+    let status = format!("{result_state:?}{}", duration_label(duration));
+    let collapsed_body = if is_error {
+        vec![ToolRow::collapsed_failure(output)]
+    } else {
+        vec![ToolRow::collapsed_output()]
+    };
+    let size = result_size_label(output);
+    let block = ToolResultBlock {
+        footer: ToolRow::result_footer(&tool_name, &status, color, Some(&size)),
+        collapsed_body,
+        full_body: tool_result_body(call_id, output, context.content_width).to_vec(),
+        accent: color,
+    };
+    let mode = context
+        .tool_display_modes
+        .get(call_id)
+        .copied()
+        .unwrap_or_else(|| block.default_mode());
+
+    RenderedBlock {
+        rows: block.lines(mode),
+        packs: call_is_groupable(context.conversation, call_id) && mode == DisplayMode::Collapsed,
+        call_id: Some(call_id.to_owned()),
+        closes_call: true,
+    }
+}
+
+fn user_block(text: &str) -> RenderedBlock {
+    let mut rows = Vec::new();
+    for source_line in text.split('\n') {
+        let line = Line::from(Span::styled(
+            source_line.to_owned(),
+            Style::default()
+                .fg(RolePalette::user())
+                .add_modifier(Modifier::BOLD),
+        ));
+        rows.push(if rows.is_empty() {
+            BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::user_bar()))
+        } else {
+            BlockLine::new(line)
+        });
+    }
+
+    RenderedBlock {
+        rows,
+        packs: false,
+        call_id: None,
+        closes_call: false,
+    }
+}
+
+fn error_lines(error: &crate::ActionableError) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            "┌ Error",
+            Style::default()
+                .fg(RolePalette::error())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("│ ", Style::default().fg(RolePalette::error())),
+            Span::raw(error.message.clone()),
+        ]),
+        Line::from(Span::styled(
+            format!("└ Action: {}", error.action),
+            Style::default().fg(RolePalette::warning()),
+        )),
+    ]
 }
 
 /// Inputs for the inline working indicator closing an active turn's transcript.
@@ -244,7 +400,20 @@ fn elapsed_label(elapsed: Duration) -> String {
 struct FoldedGroup {
     verb: VerbGroup,
     count: usize,
+    failed: usize,
     running: bool,
+}
+
+impl FoldedGroup {
+    const fn state(&self) -> RowState {
+        if self.running {
+            RowState::Running
+        } else if self.failed > 0 {
+            RowState::Failure
+        } else {
+            RowState::Success
+        }
+    }
 }
 
 #[derive(Default)]
@@ -295,6 +464,7 @@ fn collect_group(
     )?;
     let mut members = BTreeSet::new();
     let mut count = 0usize;
+    let mut failed = 0usize;
     let mut running = false;
     let mut end = start;
 
@@ -307,6 +477,7 @@ fn collect_group(
                 }
                 members.insert(call_id.as_str());
                 count += 1;
+                failed += usize::from(call_row_state(conversation, call_id) == RowState::Failure);
                 running |= !call_has_result(conversation, call_id);
             }
             ConversationItem::ToolResult { call_id, .. }
@@ -320,6 +491,7 @@ fn collect_group(
         FoldedGroup {
             verb,
             count,
+            failed,
             running,
         },
         end,
@@ -345,52 +517,71 @@ fn foldable_call(
     settled.then_some(verb)
 }
 
-fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
+fn call_result<'a>(conversation: &'a Conversation, call_id: &str) -> Option<&'a crate::ToolResult> {
     conversation
         .tool_batches
         .iter()
         .flat_map(|batch| &batch.calls)
-        .any(|call| call.call_id == call_id && call.result.is_some())
+        .find(|call| call.call_id == call_id)
+        .and_then(|call| call.result.as_ref())
 }
 
-fn verb_group_line(group: &FoldedGroup, now: Duration) -> Line<'static> {
-    let mut spans = vec![
-        running_gutter_span(group.running, now),
-        Span::styled(
-            group.verb.label(group.count, group.running),
-            Style::default()
-                .fg(RolePalette::tool())
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
+fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
+    call_result(conversation, call_id).is_some()
+}
+
+/// Lifecycle a call's bullet carries: pending, or settled by its own result.
+fn call_row_state(conversation: &Conversation, call_id: &str) -> RowState {
+    match call_result(conversation, call_id) {
+        None => RowState::Running,
+        Some(result) if result.is_error => RowState::Failure,
+        Some(_) => RowState::Success,
+    }
+}
+
+/// Whether a call's rows may pack with their neighbours.
+///
+/// A result item inherits its call's policy: the conversation splits one logical
+/// tool block into a call item and a result item, so both sides of that split
+/// must agree or a result would detach from the run it belongs to.
+fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
+    conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .find(|call| call.call_id == call_id)
+        .is_some_and(|call| VerbGroup::of(&call.parsed).is_some())
+}
+
+fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
+    let mut spans = vec![Span::styled(
+        group.verb.label(group.count, group.running),
+        Style::default()
+            .fg(RolePalette::tool())
+            .add_modifier(Modifier::BOLD),
+    )];
+    if group.failed > 0 {
+        spans.push(Span::styled(
+            format!(" · {} failed", group.failed),
+            Style::default().fg(RolePalette::error()),
+        ));
+    }
     if !group.running {
         spans.push(Span::styled(
             " · Ctrl+O to expand",
             Style::default().fg(RolePalette::chrome()),
         ));
     }
-    Line::from(spans)
-}
 
-/// Two-column leading gutter carrying the running-block pulse.
-///
-/// Finished blocks keep the same two columns so a block does not shift
-/// horizontally the moment its call completes.
-fn running_gutter_span(running: bool, now: Duration) -> Span<'static> {
-    if running {
-        Span::styled(
-            format!("{} ", StatusGlyph::pulse(now)),
-            Style::default().fg(RolePalette::accent_active()),
-        )
-    } else {
-        Span::raw("  ")
+    RenderedBlock {
+        rows: vec![BlockLine::with_bullet(
+            Line::from(spans),
+            RowBullet::Group(group.state()),
+        )],
+        packs: true,
+        call_id: None,
+        closes_call: false,
     }
-}
-
-fn running_gutter_line(line: Line<'static>, running: bool, now: Duration) -> Line<'static> {
-    let mut spans = vec![running_gutter_span(running, now)];
-    spans.extend(line.spans);
-    Line::from(spans)
 }
 
 const TOOL_BODY_CACHE_MAX_ENTRIES: usize = 64;
@@ -463,31 +654,28 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
     body
 }
 
-fn subagent_card_lines(
-    lines: &mut Vec<Line<'static>>,
+fn subagent_card_block(
     card: &crate::SubagentCard,
     content_width: usize,
     now: Duration,
-) {
+) -> RenderedBlock {
+    let mut rows = Vec::new();
     let agent = title_case(&card.agent);
-    let title_prefix = format!("● {agent} · ");
+    let title_prefix = format!("{agent} · ");
     let summary_width = content_width.saturating_sub(title_prefix.width()).max(1);
     let summary = bounded_single_line(&card.task_summary, summary_width);
-    lines.push(Line::from(vec![
-        Span::styled(
-            "● ",
-            Style::default()
-                .fg(subagent_status_color(card.status))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            agent,
-            Style::default()
-                .fg(RolePalette::tool())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(" · {summary}")),
-    ]));
+    rows.push(BlockLine::with_bullet(
+        Line::from(vec![
+            Span::styled(
+                agent,
+                Style::default()
+                    .fg(RolePalette::tool())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" · {summary}")),
+        ]),
+        RowBullet::Identity("●", subagent_status_color(card.status)),
+    ));
 
     let status = match card.status {
         Some(crate::TuiSubagentStatus::Success) => "Success",
@@ -508,13 +696,13 @@ fn subagent_card_lines(
     let elapsed = card
         .started_at
         .map(|started| card.terminal_at.unwrap_or(now).saturating_sub(started));
-    lines.push(Line::from(Span::styled(
-        format!("  {status} · {presentation}{}", duration_label(elapsed)),
+    rows.push(BlockLine::new(Line::from(Span::styled(
+        format!("{status} · {presentation}{}", duration_label(elapsed)),
         Style::default().fg(subagent_status_color(card.status)),
-    )));
+    ))));
 
     for activity in card.activities.iter().take(3) {
-        lines.push(Line::from(format!("  · {activity}")));
+        rows.push(BlockLine::new(Line::from(format!("· {activity}"))));
     }
     let hidden = card.tool_uses.saturating_sub(card.activities.len().min(3));
     if hidden > 0 {
@@ -523,10 +711,20 @@ fn subagent_card_lines(
         } else {
             "activities"
         };
-        lines.push(Line::from(Span::styled(
-            format!("  +{hidden} more {noun}"),
-            Style::default().fg(RolePalette::muted()),
-        )));
+        rows.push(BlockLine::with_bullet(
+            Line::from(Span::styled(
+                format!("+{hidden} more {noun}"),
+                Style::default().fg(RolePalette::muted()),
+            )),
+            RowBullet::Group(RowState::Muted),
+        ));
+    }
+
+    RenderedBlock {
+        rows,
+        packs: false,
+        call_id: None,
+        closes_call: false,
     }
 }
 
@@ -604,29 +802,6 @@ fn bounded_visible_tool_output(output: &str) -> String {
     format!("{}{}", &output[..end], VISIBLE_TOOL_OUTPUT_MARKER)
 }
 
-fn user_lines(lines: &mut Vec<Line<'static>>, text: &str) {
-    let mut first = true;
-    for source_line in text.split('\n') {
-        let prefix = if first { "❯ " } else { "  " };
-        first = false;
-        lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default()
-                    .fg(RolePalette::user_bar())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                source_line.to_owned(),
-                Style::default()
-                    .fg(RolePalette::user())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-    }
-    lines.push(Line::default());
-}
-
 fn thinking_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
@@ -644,8 +819,6 @@ fn thinking_lines(
             "",
             content_width,
         );
-    } else {
-        lines.push(Line::default());
     }
 }
 
@@ -739,7 +912,6 @@ fn markdown_lines_with_syntax(
         MarkdownRenderer::with_syntax_highlighting(base_style, prefix, content_width, false)
     };
     lines.extend(renderer.render(markdown));
-    lines.push(Line::default());
 }
 
 struct MarkdownRenderer {
@@ -1717,16 +1889,23 @@ fn tool_state(
         ))
 }
 
+fn label_lines(label: &str, color: Color, text: impl Into<String>) -> Vec<Line<'static>> {
+    text.into()
+        .split('\n')
+        .map(|text_line| {
+            Line::from(vec![
+                Span::styled(
+                    format!("│ {label:<9} "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text_line.to_owned()),
+            ])
+        })
+        .collect()
+}
+
 fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl Into<String>) {
-    for text_line in text.into().split('\n') {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("│ {label:<9} "),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(text_line.to_owned()),
-        ]));
-    }
+    lines.extend(label_lines(label, color, text));
     lines.push(Line::default());
 }
 
@@ -1849,6 +2028,34 @@ mod tests {
         ))
     }
 
+    fn lines_at(
+        conversation: &Conversation,
+        modes: &BTreeMap<String, DisplayMode>,
+    ) -> Vec<Line<'static>> {
+        conversation_lines(
+            conversation,
+            &[],
+            modes,
+            80,
+            ConversationRenderState {
+                collapse_thinking: false,
+                thinking_streaming: false,
+                assistant_streaming: false,
+                now: Duration::ZERO,
+            },
+        )
+    }
+
+    /// Style of the gutter bullet on the row containing `needle`.
+    fn bullet_style(lines: &[Line<'static>], needle: &str) -> Style {
+        lines
+            .iter()
+            .find(|line| line_text(line).contains(needle))
+            .and_then(|line| line.spans.first())
+            .map(|span| span.style)
+            .expect("row should be rendered with a gutter")
+    }
+
     #[test]
     fn consecutive_reads_fold_into_a_tense_aware_group_that_expanding_restores() {
         let paths = ["a.rs", "b.rs", "c.rs"];
@@ -1946,30 +2153,137 @@ mod tests {
     }
 
     #[test]
-    fn running_blocks_pulse_across_ticks_while_finished_blocks_stay_static() {
+    fn row_shape_ignores_the_tick_clock_and_state_lives_in_the_bullet_colour() {
         let running = read_conversation(&["a.rs", "b.rs"]);
         let modes = BTreeMap::new();
-        let first = render_at(&running, &modes, Duration::ZERO);
-        let later = render_at(&running, &modes, Duration::from_millis(200));
-        assert_ne!(first, later, "a running group animates on tick");
+        assert_eq!(
+            render_at(&running, &modes, Duration::ZERO),
+            render_at(&running, &modes, Duration::from_millis(200)),
+            "a row never changes shape as ticks advance"
+        );
+        assert_eq!(
+            bullet_style(&lines_at(&running, &modes), "Reading 2 files…").fg,
+            Some(RolePalette::accent_active())
+        );
 
         let mut finished = read_conversation(&["c.rs", "d.rs"]);
         let mut finished_modes = BTreeMap::new();
-        for path in ["c.rs", "d.rs"] {
+        for (path, is_error) in [("c.rs", false), ("d.rs", true)] {
             finished
                 .apply(crate::ConversationEvent::ToolResult {
                     call_id: path.to_owned(),
                     output: "ok".into(),
-                    is_error: false,
+                    is_error,
                 })
                 .expect("result should project");
             finished_modes.insert(path.to_owned(), DisplayMode::Collapsed);
         }
+        let rendered = lines_at(&finished, &finished_modes);
         assert_eq!(
-            render_at(&finished, &finished_modes, Duration::ZERO),
-            render_at(&finished, &finished_modes, Duration::from_millis(600)),
-            "finished blocks are static across ticks"
+            bullet_style(&rendered, "Read 2 files").fg,
+            Some(RolePalette::error()),
+            "a group carrying a failure is coloured by that failure"
         );
+        assert!(joined(&rendered).contains("Read 2 files · 1 failed"));
+    }
+
+    #[test]
+    fn collapsed_groupable_neighbours_pack_and_everything_else_keeps_one_blank_row() {
+        let mut conversation = read_conversation(&["a.rs"]);
+        conversation
+            .apply(crate::ConversationEvent::ToolCall {
+                call_id: "grep-1".into(),
+                name: "native::grep".into(),
+                input: "{}".into(),
+                parsed: agens_core::ToolInput::Grep {
+                    pattern: "needle".into(),
+                    path: None,
+                },
+            })
+            .expect("grep call should project");
+        let mut modes = BTreeMap::new();
+        for call_id in ["a.rs", "grep-1"] {
+            conversation
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: call_id.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+            modes.insert(call_id.to_owned(), DisplayMode::Collapsed);
+        }
+        conversation
+            .apply(crate::ConversationEvent::MarkdownFinal("prose".into()))
+            .expect("prose should project");
+
+        let rows = lines_at(&conversation, &modes)
+            .iter()
+            .map(|line| line_text(line).trim_end().to_owned())
+            .collect::<Vec<_>>();
+        let blank_rows = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.is_empty())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let prose_row = rows
+            .iter()
+            .position(|row| row.contains("prose"))
+            .expect("prose renders");
+
+        assert_eq!(
+            blank_rows,
+            vec![1, prose_row - 1],
+            "only the user prompt and the prose are separated: {rows:?}"
+        );
+        assert!(
+            rows[2..prose_row - 1].iter().all(|row| !row.is_empty()),
+            "collapsed tool rows pack: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn every_rendered_row_starts_on_the_shared_gutter() {
+        let mut conversation = read_conversation(&["a.rs"]);
+        conversation
+            .apply(crate::ConversationEvent::ReasoningDelta("thought".into()))
+            .expect("reasoning should project");
+        conversation
+            .apply(crate::ConversationEvent::ToolResult {
+                call_id: "a.rs".into(),
+                output: "ok".into(),
+                is_error: false,
+            })
+            .expect("result should project");
+        conversation
+            .apply(crate::ConversationEvent::Error {
+                message: "failed".into(),
+                action: "retry".into(),
+            })
+            .expect("error should project");
+        conversation
+            .apply(crate::ConversationEvent::MarkdownFinal("prose".into()))
+            .expect("prose should project");
+
+        for line in lines_at(&conversation, &BTreeMap::new()) {
+            let text = line_text(&line);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let indent = text.len() - text.trim_start().len();
+            assert!(
+                indent == 0 || indent == GUTTER_WIDTH,
+                "row {text:?} starts at column {indent}, outside the shared gutter"
+            );
+            assert_eq!(
+                line.spans
+                    .first()
+                    .map(|span| span.content.width())
+                    .unwrap_or_default(),
+                GUTTER_WIDTH,
+                "row {text:?} does not open with the shared gutter"
+            );
+        }
     }
 
     #[test]
