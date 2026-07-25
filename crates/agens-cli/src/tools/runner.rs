@@ -19,10 +19,11 @@ use agens_tui::{
 };
 
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
+use crate::permissions::ParseToolInput;
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
 use crate::turns::persist_completed_subagent_turn;
 use crate::{
-    Bootstrap, CompletedSubagentTurn, ParseToolInput, TuiSessionContext, current_session_timestamp,
+    Bootstrap, CompletedSubagentTurn, TuiSessionContext, current_session_timestamp,
     sanitize_tui_metric,
 };
 

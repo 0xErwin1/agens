@@ -15,13 +15,16 @@ use agens_tools::{
 use agens_tui::TuiPermissionBridge;
 
 use crate::error::CliError;
+use crate::permissions::{
+    ProductionPermissionGate, ProductionPermissionPrompter, ProductionPermissionResolver,
+    ProductionPromptAuthorization, SharedToolDispatcher, permission_policy,
+};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{
-    AuthorizedNativeTaskRuntime, Bootstrap, ProductionPermissionGate, ProductionPermissionPrompter,
-    ProductionPermissionResolver, ProductionPromptAuthorization, ProductionToolDispatcher,
-    SharedToolDispatcher, TaskModelValidator, next_diagnostic_reference, permission_policy,
-    record_subagent_terminal, task_model_catalog, tui_task_agent_catalog,
+    AuthorizedNativeTaskRuntime, Bootstrap, ProductionToolDispatcher, TaskModelValidator,
+    next_diagnostic_reference, record_subagent_terminal, task_model_catalog,
+    tui_task_agent_catalog,
 };
 
 pub(crate) struct ProductionTuiTaskRuntime {
