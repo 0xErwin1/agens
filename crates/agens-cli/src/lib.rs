@@ -796,12 +796,12 @@ fn execute_command(
     match parsed.command {
         None => run_tui(dependencies, parsed.resume.flatten()),
         Some(cli::Command::Config { action }) => run_config(action, dependencies),
-        Some(cli::Command::Auth { arguments }) => run_auth(&arguments, dependencies, cancellation),
+        Some(cli::Command::Auth { action }) => run_auth(action, dependencies, cancellation),
         Some(cli::Command::Chat(chat_arguments)) => {
             run_chat(chat_arguments, dependencies, cancellation)
         }
         Some(cli::Command::Models) => run_models(),
-        Some(cli::Command::Sessions { arguments }) => run_sessions(&arguments, dependencies),
+        Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
         Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
     }
 }
@@ -894,22 +894,12 @@ fn effective_settings_report(settings: &ResolvedSettings) -> String {
 }
 
 fn run_auth(
-    arguments: &[String],
+    action: cli::AuthAction,
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    // `auth` captures its trailing tokens as a raw `Vec<String>` (see
-    // `cli.rs`), so clap's own help interception only fires when `--help`
-    // is the very first token; once any other token has started filling
-    // that vector, a later `--help` is just another leftover string. This
-    // check restores today's "help wins anywhere" precedence for the
-    // positions clap cannot reach.
-    if arguments.iter().any(|argument| is_help(argument)) {
-        return Ok("Usage: agens auth <status|login|logout>\n".to_owned());
-    }
-
-    match arguments {
-        [command] if command == "status" => {
+    match action {
+        cli::AuthAction::Status { provider: None } => {
             let bootstrap = bootstrap(dependencies)?;
             let state =
                 load_chatgpt_auth_state(&bootstrap.paths.credentials, std::time::SystemTime::now())
@@ -922,22 +912,34 @@ fn run_auth(
             };
             Ok(format!("ChatGPT authentication: {status}\n"))
         }
-        [command, provider] if command == "status" => {
-            let provider = CredentialProvider::parse(provider)?;
+        cli::AuthAction::Status {
+            provider: Some(provider),
+        } => {
+            let provider = CredentialProvider::parse(&provider)?;
             let bootstrap = bootstrap(dependencies)?;
             provider_status(&bootstrap.paths.credentials, provider)
         }
-        [command] if command == "login" => run_auth_login(dependencies, false, cancellation),
-        [command, flag] if command == "login" && flag == "--device-auth" => {
-            run_auth_login(dependencies, true, cancellation)
+        cli::AuthAction::Login {
+            device_auth,
+            method: None,
+        } => run_auth_login(dependencies, device_auth, cancellation),
+        cli::AuthAction::Login {
+            device_auth: true,
+            method: Some(_),
+        } => {
+            // clap parses `--device-auth` and `api-key ...` together
+            // without complaint (a plain flag cannot `conflicts_with` a
+            // nested subcommand in clap's grammar), so this guard is the
+            // only thing standing between that combination and being
+            // silently accepted with `--device-auth` quietly ignored.
+            Err(CliError::usage("auth requires status, login, or logout"))
         }
-        [command, subcommand, provider, rest @ ..]
-            if command == "login" && subcommand == "api-key" =>
-        {
-            run_api_key_login(provider, rest, dependencies)
-        }
-        [command, provider] if command == "logout" => {
-            let provider = CredentialProvider::parse(provider)?;
+        cli::AuthAction::Login {
+            device_auth: false,
+            method: Some(cli::LoginMethod::ApiKey { provider, api_key }),
+        } => run_api_key_login(&provider, api_key, dependencies),
+        cli::AuthAction::Logout { provider } => {
+            let provider = CredentialProvider::parse(&provider)?;
             let bootstrap = bootstrap(dependencies)?;
             let removed =
                 remove_provider_entry(&bootstrap.paths.credentials, provider.identifier())
@@ -953,7 +955,6 @@ fn run_auth(
                 ))
             }
         }
-        _ => Err(CliError::usage("auth requires status, login, or logout")),
     }
 }
 
@@ -982,7 +983,7 @@ impl CredentialProvider {
 
 fn run_api_key_login(
     provider: &str,
-    arguments: &[String],
+    api_key: Option<String>,
     dependencies: &CliDependencies,
 ) -> Result<String, CliError> {
     let provider = CredentialProvider::parse(provider)?;
@@ -990,7 +991,7 @@ fn run_api_key_login(
         return Err(CliError::usage("API-key login supports only openai-api"));
     }
 
-    let supplied_key = parse_api_key_flag(arguments)?;
+    let supplied_key = validate_api_key_flag(api_key)?;
     let api_key = read_api_key(supplied_key.as_deref())?;
     let bootstrap = bootstrap(dependencies)?;
     upsert_provider_entry(
@@ -1003,21 +1004,21 @@ fn run_api_key_login(
     Ok(format!("Logged in to {}.\n", provider.identifier()))
 }
 
-fn parse_api_key_flag(arguments: &[String]) -> Result<Option<String>, CliError> {
-    match arguments {
-        [] => Ok(None),
-        [flag, value] if flag == "--api-key" => {
-            let value = value.trim();
-            if value.is_empty() {
+/// clap already owns whether `--api-key` was supplied at all (and rejects
+/// any unrecognized trailing argument on its own); the only domain rule
+/// left is that a supplied value cannot be blank.
+fn validate_api_key_flag(api_key: Option<String>) -> Result<Option<String>, CliError> {
+    match api_key {
+        None => Ok(None),
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
                 return Err(CliError::usage(
                     "auth login api-key requires a non-empty API key",
                 ));
             }
-            Ok(Some(value.to_owned()))
+            Ok(Some(trimmed.to_owned()))
         }
-        _ => Err(CliError::usage(
-            "auth login api-key accepts only an optional --api-key value",
-        )),
     }
 }
 
@@ -1229,16 +1230,12 @@ fn run_models() -> Result<String, CliError> {
         .map_err(|_| CliError::unavailable("model registry is unavailable"))
 }
 
-fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
-    // See the matching comment in `run_auth`: `sessions` also captures its
-    // trailing tokens as a raw `Vec<String>`, so this restores "help wins
-    // anywhere" for positions clap's own interception cannot reach.
-    if arguments.iter().any(|argument| is_help(argument)) {
-        return Ok("Usage: agens sessions <list|show|rm>\n".to_owned());
-    }
-
-    match arguments {
-        [command] if command == "list" => {
+fn run_sessions(
+    action: cli::SessionsAction,
+    dependencies: &CliDependencies,
+) -> Result<String, CliError> {
+    match action {
+        cli::SessionsAction::List => {
             let bootstrap = bootstrap(dependencies)?;
             let store = SessionStore::open(&bootstrap.data_directory)
                 .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -1266,7 +1263,7 @@ fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<
                 .join("\n");
             Ok(format!("ID\tPROJECT\tTITLE\tAGENT\tTURNS\n{rows}\n"))
         }
-        [command, identifier] if command == "show" => {
+        cli::SessionsAction::Show { identifier } => {
             let identifier = identifier
                 .parse::<i64>()
                 .map_err(|_| CliError::usage("sessions show requires a numeric id"))?;
@@ -1285,7 +1282,7 @@ fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<
                 session.messages.len()
             ))
         }
-        [command, identifier] if command == "rm" => {
+        cli::SessionsAction::Rm { identifier } => {
             let identifier = identifier
                 .parse::<i64>()
                 .map_err(|_| CliError::usage("sessions rm requires a numeric id"))?;
@@ -1297,7 +1294,6 @@ fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<
                 .map_err(|_| CliError::storage("saved session could not be removed"))?;
             Ok(format!("Removed session {identifier}.\n"))
         }
-        _ => Err(CliError::usage("sessions requires list, show, or rm")),
     }
 }
 
@@ -9468,15 +9464,6 @@ fn data_directory(
 
 fn source_status(loaded: bool) -> &'static str {
     if loaded { "loaded" } else { "missing" }
-}
-
-/// `auth` and `sessions` capture their trailing arguments as a raw
-/// `Vec<String>` (see `cli.rs`) rather than a typed clap `Subcommand`, so
-/// clap's own help interception only fires when `--help` is the very first
-/// token. This restores today's "help wins anywhere in the argument list"
-/// precedence for those two commands.
-fn is_help(argument: &str) -> bool {
-    matches!(argument, "--help" | "-h" | "help")
 }
 
 #[cfg(test)]

@@ -247,7 +247,10 @@ fn table_a_root_shapes_hold() {
                 dependencies,
                 expected: preformatted_failure(
                     ExitStatus::Usage,
-                    parser_surface_baseline::unrecognized_subcommand_message("abc"),
+                    parser_surface_baseline::unrecognized_subcommand_message(
+                        "abc",
+                        "agens [OPTIONS] [COMMAND]",
+                    ),
                 ),
                 _temporary: temporary,
             }
@@ -485,39 +488,6 @@ fn table_a_auth_holds() {
             }
         },
         {
-            let temporary = TemporaryDirectory::new("auth-login-api-key-junk-trailer");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "auth login api-key openai-api rejects trailing junk arguments",
-                argv: argv(&["auth", "login", "api-key", "openai-api", "junk"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: auth login api-key accepts only an optional --api-key value",
-                ),
-                _temporary: temporary,
-            }
-        },
-        {
-            // D3: `--device-auth` before `api-key` is NOT a recognized
-            // shape at all today; it falls through to the generic "auth
-            // requires status, login, or logout" usage error. This is
-            // load-bearing for Phase 1, which must add an explicit guard
-            // to keep clap from silently accepting and ignoring the flag.
-            let temporary = TemporaryDirectory::new("auth-login-device-auth-api-key-d3");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "auth login --device-auth api-key openai-api is rejected today (D3)",
-                argv: argv(&["auth", "login", "--device-auth", "api-key", "openai-api"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: auth requires status, login, or logout",
-                ),
-                _temporary: temporary,
-            }
-        },
-        {
             let temporary = TemporaryDirectory::new("auth-logout-openai-api");
             let dependencies = base_dependencies(&temporary);
             Case {
@@ -547,34 +517,6 @@ fn table_a_auth_holds() {
                 argv: argv(&["auth", "logout", "bogus"]),
                 dependencies,
                 expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
-                _temporary: temporary,
-            }
-        },
-        {
-            let temporary = TemporaryDirectory::new("auth-no-subcommand");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "auth with no subcommand",
-                argv: argv(&["auth"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: auth requires status, login, or logout",
-                ),
-                _temporary: temporary,
-            }
-        },
-        {
-            let temporary = TemporaryDirectory::new("auth-unknown-subcommand");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "auth bogus is an unknown subcommand",
-                argv: argv(&["auth", "bogus"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: auth requires status, login, or logout",
-                ),
                 _temporary: temporary,
             }
         },
@@ -867,34 +809,6 @@ fn table_a_models_and_sessions_hold() {
             }
         },
         {
-            let temporary = TemporaryDirectory::new("sessions-no-subcommand");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "sessions with no subcommand",
-                argv: argv(&["sessions"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: sessions requires list, show, or rm",
-                ),
-                _temporary: temporary,
-            }
-        },
-        {
-            let temporary = TemporaryDirectory::new("sessions-unknown-subcommand");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "sessions bogus is an unknown subcommand",
-                argv: argv(&["sessions", "bogus"]),
-                dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    "usage: sessions requires list, show, or rm",
-                ),
-                _temporary: temporary,
-            }
-        },
-        {
             // A store-open failure: `data_dir` names a path whose parent
             // segment is an ordinary file, so `create_dir_all` fails before
             // any session table is touched.
@@ -951,7 +865,9 @@ mod parser_surface_baseline {
     /// clap treats a required subcommand group with nothing supplied the
     /// same as an explicit help request.
     pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = CONFIG_HELP;
-    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  \n  login   \n  logout  \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    /// `auth` with no subcommand renders byte-identical to `auth --help`.
+    pub(crate) const AUTH_MISSING_SUBCOMMAND_MESSAGE: &str = AUTH_HELP;
     pub(crate) const CHAT_HELP: &str = "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
     /// D1: `chat foo --help` is Usage(2) today (`--help` here is read as an
     /// unrecognized flag, not as a request for help). Under clap, the same
@@ -963,14 +879,17 @@ mod parser_surface_baseline {
     pub(crate) const CHAT_FOO_HELP_MESSAGE: &str = "chat received an unknown flag";
     pub(crate) const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  \n  show  \n  rm    \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    /// `sessions` with no subcommand renders byte-identical to `sessions --help`.
+    pub(crate) const SESSIONS_MISSING_SUBCOMMAND_MESSAGE: &str = SESSIONS_HELP;
 
-    /// clap's rendering embeds the offending token, so this can no longer be
-    /// a single shared literal the way the hand-rolled parser's one static
-    /// message was; it is a function of the invalid subcommand name.
-    pub(crate) fn unrecognized_subcommand_message(token: &str) -> String {
+    /// clap's rendering embeds both the offending token and the usage line
+    /// of whichever command group rejected it, so this can no longer be a
+    /// single shared literal the way the hand-rolled parser's one static
+    /// message was.
+    pub(crate) fn unrecognized_subcommand_message(token: &str, usage: &str) -> String {
         format!(
-            "error: unrecognized subcommand '{token}'\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+            "error: unrecognized subcommand '{token}'\n\nUsage: {usage}\n\nFor more information, try '--help'.\n"
         )
     }
 
@@ -991,6 +910,22 @@ mod parser_surface_baseline {
     /// `cli.rs`), so clap itself never errors on zero prompt tokens; the
     /// domain check in `chat_request` still produces this exact text.
     pub(crate) const CHAT_MISSING_PROMPT_MESSAGE: &str = "chat requires a prompt argument";
+
+    /// `AuthAction::Login`'s typed `LoginMethod::ApiKey { provider, api_key
+    /// }` only defines a required `provider` positional and an optional
+    /// `--api-key` flag, so a trailing `junk` argument is a clap-owned
+    /// shape error now, not the old hand-rolled arity message.
+    pub(crate) const AUTH_LOGIN_API_KEY_JUNK_MESSAGE: &str = "error: unexpected argument 'junk' found\n\nUsage: agens auth login api-key [OPTIONS] <PROVIDER>\n\nFor more information, try '--help'.\n";
+
+    /// D3: a plain `#[arg(long)]` cannot `conflicts_with` a nested
+    /// `#[command(subcommand)]` field (clap's own derive debug assertion
+    /// rejects that at startup — verified, not assumed), so
+    /// `--device-auth` combined with `api-key ...` is rejected by an
+    /// explicit body guard in `run_auth`, not by clap. The guard reuses the
+    /// pre-clap message; that message is body-owned so it is NOT
+    /// clap-preformatted (no `error: ` double-prefix concern here).
+    pub(crate) const AUTH_DEVICE_AUTH_API_KEY_MESSAGE: &str =
+        "auth requires status, login, or logout";
 }
 
 #[test]
@@ -1101,6 +1036,66 @@ fn table_b_parser_surface_baseline_holds() {
             }
         },
         {
+            let temporary = TemporaryDirectory::new("baseline-auth-missing-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth with no subcommand",
+                argv: argv(&["auth"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::AUTH_MISSING_SUBCOMMAND_MESSAGE,
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-unknown-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth bogus is an unknown subcommand",
+                argv: argv(&["auth", "bogus"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("bogus", "agens auth <COMMAND>"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-login-api-key-junk-trailer");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key openai-api rejects trailing junk arguments",
+                argv: argv(&["auth", "login", "api-key", "openai-api", "junk"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::AUTH_LOGIN_API_KEY_JUNK_MESSAGE,
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // D3: `--device-auth` before `api-key` is silently accepted by
+            // clap's grammar (a flag cannot `conflicts_with` a nested
+            // subcommand); `run_auth`'s explicit guard is what rejects it,
+            // reusing the pre-clap message verbatim.
+            let temporary = TemporaryDirectory::new("baseline-auth-login-device-auth-api-key-d3");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login --device-auth api-key openai-api is rejected (D3)",
+                argv: argv(&["auth", "login", "--device-auth", "api-key", "openai-api"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    format!("usage: {}", baseline::AUTH_DEVICE_AUTH_API_KEY_MESSAGE),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
             let temporary = TemporaryDirectory::new("baseline-chat-help");
             let dependencies = base_dependencies(&temporary);
             Case {
@@ -1148,6 +1143,34 @@ fn table_b_parser_surface_baseline_holds() {
             }
         },
         {
+            let temporary = TemporaryDirectory::new("baseline-sessions-missing-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions with no subcommand",
+                argv: argv(&["sessions"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::SESSIONS_MISSING_SUBCOMMAND_MESSAGE,
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-sessions-unknown-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions bogus is an unknown subcommand",
+                argv: argv(&["sessions", "bogus"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("bogus", "agens sessions <COMMAND>"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
             let temporary = TemporaryDirectory::new("baseline-unknown-command");
             let dependencies = base_dependencies(&temporary);
             Case {
@@ -1156,7 +1179,10 @@ fn table_b_parser_surface_baseline_holds() {
                 dependencies,
                 expected: preformatted_failure(
                     ExitStatus::Usage,
-                    baseline::unrecognized_subcommand_message("frobnicate"),
+                    baseline::unrecognized_subcommand_message(
+                        "frobnicate",
+                        "agens [OPTIONS] [COMMAND]",
+                    ),
                 ),
                 _temporary: temporary,
             }

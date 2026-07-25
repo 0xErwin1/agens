@@ -1,21 +1,13 @@
 //! Pure argv-shape parsing for the `agens` binary.
 //!
-//! This module owns only the SHAPE of the command line: subcommand names,
-//! flag arity, and clap's own help/version/error rendering. It performs no
-//! I/O and holds no `CliDependencies`. Every command body keeps its own
-//! domain validation (numeric-id checks, provider names, prompt arity) and
-//! its own exact `CliError` messages; only genuine shape errors are allowed
-//! to carry clap's wording.
-//!
-//! `Auth` and `Sessions` deliberately do NOT model their subcommands as a
-//! typed clap `Subcommand` enum. A typed enum makes clap itself reject a
-//! missing or unrecognized inner subcommand before the command body ever
-//! runs, which would replace several already-pinned domain messages (e.g.
-//! `auth requires status, login, or logout`, produced by the D3 guard
-//! today) with clap's own wording. Capturing the trailing tokens as a raw
-//! `Vec<String>` instead lets clap own only the top-level command name,
-//! while the command body keeps parsing and validating its own arguments
-//! exactly as it did before clap existed.
+//! This module owns the SHAPE of the command line end to end: every
+//! subcommand (including `auth`'s and `sessions`' own inner subcommands),
+//! flag arity, and clap's help/version/error rendering. It performs no I/O
+//! and holds no `CliDependencies`. Command bodies in `lib.rs` keep only
+//! genuine domain validation that clap cannot express as shape (numeric-id
+//! parsing, provider-name validation, the `--device-auth`/`api-key`
+//! mutual-exclusion guard) and their own exact `CliError` messages for
+//! those cases; every other parse failure carries clap's own wording.
 
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand};
@@ -45,8 +37,8 @@ pub(crate) enum Command {
     },
     #[command(about = "inspect supported authentication")]
     Auth {
-        #[arg(allow_hyphen_values = true)]
-        arguments: Vec<String>,
+        #[command(subcommand)]
+        action: AuthAction,
     },
     #[command(about = "run a headless agent turn")]
     Chat(ChatArgs),
@@ -54,8 +46,8 @@ pub(crate) enum Command {
     Models,
     #[command(about = "inspect completed turns")]
     Sessions {
-        #[arg(allow_hyphen_values = true)]
-        arguments: Vec<String>,
+        #[command(subcommand)]
+        action: SessionsAction,
     },
     /// Bare `agens version`; `--version`/`-V` are handled by clap itself.
     #[command(hide = true)]
@@ -66,6 +58,38 @@ pub(crate) enum Command {
 pub(crate) enum ConfigAction {
     Doctor,
     Init,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuthAction {
+    Status {
+        provider: Option<String>,
+    },
+    Login {
+        #[arg(long)]
+        device_auth: bool,
+        #[command(subcommand)]
+        method: Option<LoginMethod>,
+    },
+    Logout {
+        provider: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum LoginMethod {
+    ApiKey {
+        provider: String,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SessionsAction {
+    List,
+    Show { identifier: String },
+    Rm { identifier: String },
 }
 
 #[derive(Args, Debug)]
