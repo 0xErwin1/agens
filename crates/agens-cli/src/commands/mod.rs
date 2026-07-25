@@ -9,7 +9,7 @@ use agens_core::HeadlessTurnCancellation;
 use crate::CliDependencies;
 use crate::cli;
 use crate::error::CliError;
-use crate::run_tui;
+use crate::tui::run_tui;
 use auth::run_auth;
 use chat::run_chat;
 use config::run_config;

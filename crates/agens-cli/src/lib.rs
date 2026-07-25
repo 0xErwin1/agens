@@ -106,6 +106,7 @@ mod session;
 #[cfg(test)]
 mod test_support;
 mod tools;
+mod tui;
 mod turns;
 
 use bootstrap::{ProviderSource, effective_max_iterations, seed_configured_reasoning_effort};
@@ -211,6 +212,7 @@ use tools::task::{
     default_model, production_tui_task_runtime,
     production_tui_task_runtime_with_runner_and_parent_config,
 };
+use tui::run_tui;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -511,12 +513,6 @@ fn execute_command(
     };
 
     commands::dispatch(parsed, dependencies, cancellation)
-}
-
-fn run_tui(dependencies: &CliDependencies, resume: Option<i64>) -> Result<String, CliError> {
-    let bootstrap = bootstrap(dependencies)?;
-    let output = (dependencies.tui_launcher)(&bootstrap, resume)?;
-    Ok(format!("{output}\n"))
 }
 
 struct ProductionTuiEngine {
