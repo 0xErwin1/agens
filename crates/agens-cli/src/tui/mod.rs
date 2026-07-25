@@ -1,3 +1,5 @@
+pub(crate) mod engine;
+
 use crate::CliDependencies;
 use crate::bootstrap::bootstrap;
 use crate::error::CliError;
