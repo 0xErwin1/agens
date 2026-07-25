@@ -14,7 +14,7 @@ use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 mod session_writer;
 pub use session_writer::{SessionCursor, SessionPage, StoredSession};
 
-const PERMISSIONS_DATABASE: &str = "rust-permissions.db";
+const PERMISSIONS_DATABASE: &str = "permissions.db";
 const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
     ExpectedColumnSignature::new(0, "id", "INTEGER", false, None, 1),
@@ -674,7 +674,7 @@ fn decode_pattern(
     }
 }
 
-const SESSIONS_DATABASE: &str = "rust-sessions.db";
+const SESSIONS_DATABASE: &str = "sessions.db";
 const SESSIONS_SCHEMA_VERSION: i64 = 5;
 const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
     0, "id", "INTEGER", false, None, 1,

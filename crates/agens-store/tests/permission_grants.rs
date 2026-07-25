@@ -38,10 +38,10 @@ fn persists_only_project_scoped_grants_in_the_rust_permissions_database() {
         let mut store = PermissionGrantStore::open(&directory).unwrap();
         store.append_grants(&[allow.clone(), deny.clone()]).unwrap();
 
-        assert_eq!(store.database_path(), directory.join("rust-permissions.db"));
+        assert_eq!(store.database_path(), directory.join("permissions.db"));
     }
 
-    let database = directory.join("rust-permissions.db");
+    let database = directory.join("permissions.db");
     assert_eq!(
         Connection::open(&database)
             .unwrap()
@@ -89,7 +89,7 @@ fn rejects_missing_project_lookup_and_unsupported_schema_versions_with_actionabl
     assert!(store.grants_for_project("").is_err());
     drop(store);
 
-    let database = directory.join("rust-permissions.db");
+    let database = directory.join("permissions.db");
     Connection::open(&database)
         .unwrap()
         .pragma_update(None, "user_version", 999)
@@ -108,7 +108,7 @@ fn rejects_missing_project_lookup_and_unsupported_schema_versions_with_actionabl
 #[test]
 fn rejects_supported_version_without_the_expected_schema() {
     let directory = data_directory();
-    let database = directory.join("rust-permissions.db");
+    let database = directory.join("permissions.db");
     Connection::open(&database)
         .unwrap()
         .pragma_update(None, "user_version", 1)
@@ -236,7 +236,7 @@ fn rejects_version_one_databases_with_incompatible_permission_grant_contracts() 
 
     for (name, schema) in incompatible_schemas {
         let directory = data_directory();
-        let database = directory.join("rust-permissions.db");
+        let database = directory.join("permissions.db");
         let connection = Connection::open(&database).unwrap();
         connection.execute_batch(schema).unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
@@ -259,7 +259,7 @@ fn rejects_version_one_databases_with_incompatible_permission_grant_contracts() 
 #[test]
 fn corrupt_database_open_failure_includes_operation_and_path() {
     let directory = data_directory();
-    let database = directory.join("rust-permissions.db");
+    let database = directory.join("permissions.db");
     fs::write(&database, "not a sqlite database").unwrap();
 
     let error = PermissionGrantStore::open(&directory)
@@ -300,7 +300,7 @@ fn persists_glob_patterns_with_explicit_kind_and_value_without_changing_schema_v
         store.append_grants(&grants).unwrap();
     }
 
-    let database = directory.join("rust-permissions.db");
+    let database = directory.join("permissions.db");
     let connection = Connection::open(&database).unwrap();
     let rows = connection
         .prepare(

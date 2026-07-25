@@ -1047,7 +1047,7 @@ fn persists_all_typed_parts_with_canonical_tool_json() {
         .unwrap();
     drop(store);
 
-    let connection = Connection::open(directory.join("rust-sessions.db")).unwrap();
+    let connection = Connection::open(directory.join("sessions.db")).unwrap();
     let parts = connection.prepare("SELECT role, kind, text, call_id, name, input_json, content, is_error FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id AND messages.sequence = message_parts.message_sequence ORDER BY messages.sequence, message_parts.sequence").unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, Option<i64>>(7)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
     assert_eq!(
         parts,

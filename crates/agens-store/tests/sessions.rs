@@ -106,7 +106,7 @@ fn create_supported_session_schema(connection: &Connection, index_sql: &str) {
 }
 
 fn create_populated_wal_v1_fixture(directory: &std::path::Path) {
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let connection = Connection::open(database).unwrap();
     connection
         .pragma_update(None, "journal_mode", "WAL")
@@ -308,7 +308,7 @@ fn opens_populated_wal_v1_as_v5_smoke() {
     let database = store.database_path();
     let connection = Connection::open(&database).unwrap();
 
-    assert!(directory.join("rust-sessions.db.v1.bak").exists());
+    assert!(directory.join("sessions.db.v1.bak").exists());
     assert_eq!(
         connection
             .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
@@ -332,7 +332,7 @@ fn opens_populated_wal_v1_as_v5_smoke() {
     drop(store);
 
     SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("rust-sessions.db.v1.bak.1").exists());
+    assert!(!directory.join("sessions.db.v1.bak.1").exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -385,7 +385,7 @@ fn normalized_v5_schema() {
 #[test]
 fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
     let directory = data_directory();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     SessionStore::open(&directory).unwrap();
     let connection = Connection::open(&database).unwrap();
     connection
@@ -516,7 +516,7 @@ fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
 fn migration_preserves_v1_losslessly() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let source = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     let expected = v1_contents(&source);
     drop(source);
@@ -601,7 +601,7 @@ fn migration_validates_schema_and_reopen_contract() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
     let source = Connection::open_with_flags(
-        directory.join("rust-sessions.db"),
+        directory.join("sessions.db"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
@@ -684,7 +684,7 @@ fn migration_validates_schema_and_reopen_contract() {
     drop(archive);
 
     SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("rust-sessions.db.v1.bak.1").exists());
+    assert!(!directory.join("sessions.db.v1.bak.1").exists());
 
     let tampered = Connection::open(&database).unwrap();
     tampered
@@ -707,7 +707,7 @@ fn migration_validates_schema_and_reopen_contract() {
 fn rejects_tampered_v1_before_destructive_finalization() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let tampered = Connection::open(&database).unwrap();
     tampered
         .execute_batch(
@@ -741,7 +741,7 @@ fn rejects_tampered_v1_before_destructive_finalization() {
             .unwrap(),
         0
     );
-    assert!(!directory.join("rust-sessions.db.v1.bak").exists());
+    assert!(!directory.join("sessions.db.v1.bak").exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -759,7 +759,7 @@ fn migration_faults_preserve_v1_or_recover_only_a_committed_v4() {
     ] {
         let directory = data_directory();
         create_populated_wal_v1_fixture(&directory);
-        let database = directory.join("rust-sessions.db");
+        let database = directory.join("sessions.db");
         let source =
             Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let expected = v1_contents(&source);
@@ -810,7 +810,7 @@ fn migration_faults_preserve_v1_or_recover_only_a_committed_v4() {
         );
         drop(recovered);
         drop(retried);
-        assert!(!directory.join("rust-sessions.db.v1.bak.2").exists());
+        assert!(!directory.join("sessions.db.v1.bak.2").exists());
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -820,20 +820,20 @@ fn migration_faults_preserve_v1_or_recover_only_a_committed_v4() {
 fn migration_retry_uses_a_new_backup_suffix_without_clobbering_collision() {
     let directory = data_directory();
     create_populated_wal_v1_fixture(&directory);
-    let existing_backup = directory.join("rust-sessions.db.v1.bak");
+    let existing_backup = directory.join("sessions.db.v1.bak");
     fs::write(&existing_backup, "do not replace").unwrap();
 
-    let fault = MigrationFaultGuard::set(&directory.join("rust-sessions.db"), "before-commit");
+    let fault = MigrationFaultGuard::set(&directory.join("sessions.db"), "before-commit");
     assert!(SessionStore::open(&directory).is_err());
     drop(fault);
 
     SessionStore::open(&directory).unwrap();
     assert_eq!(fs::read(&existing_backup).unwrap(), b"do not replace");
-    assert!(directory.join("rust-sessions.db.v1.bak.1").exists());
-    assert!(directory.join("rust-sessions.db.v1.bak.2").exists());
+    assert!(directory.join("sessions.db.v1.bak.1").exists());
+    assert!(directory.join("sessions.db.v1.bak.2").exists());
 
     SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("rust-sessions.db.v1.bak.3").exists());
+    assert!(!directory.join("sessions.db.v1.bak.3").exists());
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -841,7 +841,7 @@ fn migration_retry_uses_a_new_backup_suffix_without_clobbering_collision() {
 #[test]
 fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
     let directory = data_directory();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let writer = Connection::open(&database).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
     create_supported_session_schema(
@@ -865,7 +865,7 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
         .unwrap();
 
     SessionStore::open(&directory).unwrap();
-    let backup = directory.join("rust-sessions.db.v1.bak");
+    let backup = directory.join("sessions.db.v1.bak");
     let manifest = fs::read_to_string(backup.with_extension("bak.manifest")).unwrap();
     let snapshot = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
 
@@ -931,7 +931,7 @@ fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
 #[test]
 fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
     let directory = data_directory();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let connection = Connection::open(&database).unwrap();
     create_supported_session_schema(
         &connection,
@@ -939,19 +939,19 @@ fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
          ON completed_turn_events(turn_id, sequence);",
     );
     drop(connection);
-    fs::write(directory.join("rust-sessions.db.v1.bak"), "existing").unwrap();
-    fs::write(directory.join("rust-sessions.db.v1.bak.1.tmp"), "stale").unwrap();
+    fs::write(directory.join("sessions.db.v1.bak"), "existing").unwrap();
+    fs::write(directory.join("sessions.db.v1.bak.1.tmp"), "stale").unwrap();
 
     SessionStore::open(&directory).unwrap();
-    let backup = directory.join("rust-sessions.db.v1.bak.2");
+    let backup = directory.join("sessions.db.v1.bak.2");
 
-    assert_eq!(backup, directory.join("rust-sessions.db.v1.bak.2"));
+    assert_eq!(backup, directory.join("sessions.db.v1.bak.2"));
     assert_eq!(
-        fs::read(directory.join("rust-sessions.db.v1.bak")).unwrap(),
+        fs::read(directory.join("sessions.db.v1.bak")).unwrap(),
         b"existing"
     );
     assert_eq!(
-        fs::read(directory.join("rust-sessions.db.v1.bak.1.tmp")).unwrap(),
+        fs::read(directory.join("sessions.db.v1.bak.1.tmp")).unwrap(),
         b"stale"
     );
 
@@ -966,8 +966,8 @@ fn fresh_v5_legacy_coexistence() {
 
     let stored_turns = {
         let mut store = SessionStore::open(&directory).unwrap();
-        assert_eq!(store.database_path(), directory.join("rust-sessions.db"));
-        assert!(!directory.join("rust-permissions.db").exists());
+        assert_eq!(store.database_path(), directory.join("sessions.db"));
+        assert!(!directory.join("permissions.db").exists());
         let database = Connection::open(store.database_path()).unwrap();
         assert_eq!(
             database
@@ -1040,7 +1040,7 @@ fn rolls_back_a_completed_turn_when_an_event_write_fails() {
 #[test]
 fn rejects_unsupported_session_schema_versions_with_path_and_operation_context() {
     let directory = data_directory();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     Connection::open(&database)
         .unwrap()
         .pragma_update(None, "user_version", 999)
@@ -1057,7 +1057,7 @@ fn rejects_unsupported_session_schema_versions_with_path_and_operation_context()
 #[test]
 fn rejects_supported_versions_with_an_incompatible_session_schema_shape() {
     let directory = data_directory();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
@@ -1136,7 +1136,7 @@ fn accepts_only_the_exact_supported_session_indexes() {
 
     for (name, index_sql, should_open) in fixtures {
         let directory = data_directory();
-        let database = directory.join("rust-sessions.db");
+        let database = directory.join("sessions.db");
         let connection = Connection::open(&database).unwrap();
         create_supported_session_schema(&connection, index_sql);
         drop(connection);

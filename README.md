@@ -117,8 +117,8 @@ Credentials live in `auth.json` under the selected config home. `OPENAI_API_KEY`
 
 Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.local/share}/agens`:
 
-- `rust-sessions.db` stores completed turn events.
-- `rust-permissions.db` stores project-scoped permission grants.
+- `sessions.db` stores completed turn events.
+- `permissions.db` stores project-scoped permission grants.
 
 Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. Native filesystem operations are confined beneath the project root, and process tools remain permission-gated and bounded.
 

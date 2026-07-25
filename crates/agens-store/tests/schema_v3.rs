@@ -23,7 +23,7 @@ fn populated_v2() -> std::path::PathBuf {
         NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
     ));
     fs::create_dir_all(&directory).unwrap();
-    let connection = Connection::open(directory.join("rust-sessions.db")).unwrap();
+    let connection = Connection::open(directory.join("sessions.db")).unwrap();
     connection.execute_batch(
         "CREATE TABLE legacy_turns (
              id INTEGER PRIMARY KEY, status TEXT NOT NULL, reason TEXT NOT NULL,
@@ -131,7 +131,7 @@ fn populated_v2_migrates_losslessly_with_null_metadata_and_reopens_idempotently(
     drop(store);
 
     SessionStore::open(&directory).unwrap();
-    let reopened = Connection::open(directory.join("rust-sessions.db")).unwrap();
+    let reopened = Connection::open(directory.join("sessions.db")).unwrap();
     assert_eq!(
         reopened
             .query_row("SELECT count(*) FROM sessions", [], |row| row
@@ -152,7 +152,7 @@ fn populated_v2_migrates_losslessly_with_null_metadata_and_reopens_idempotently(
 #[test]
 fn interrupted_v2_migration_rolls_back_schema_version_and_values() {
     let directory = populated_v2();
-    let database = directory.join("rust-sessions.db");
+    let database = directory.join("sessions.db");
     let fault_path = std::path::PathBuf::from(format!("{}.migration-fault", database.display()));
     fs::write(&fault_path, "before-v3-commit").unwrap();
     let fault = MigrationFaultGuard(fault_path);
