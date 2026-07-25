@@ -1118,14 +1118,16 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
+        let mut dock = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray));
+        if let Some(metrics) = border_metrics(&state, layout.composer) {
+            dock = dock.title_top(metrics);
+        }
         frame.render_widget(
             Paragraph::new(" Subagent transcript · i to message · x to cancel")
                 .style(Style::default().fg(Color::DarkGray))
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                ),
+                .block(dock),
             layout.composer,
         );
     }
@@ -1151,6 +1153,9 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                     .fg(composer_color)
                     .add_modifier(Modifier::BOLD),
             ));
+        }
+        if let Some(metrics) = border_metrics(&state, layout.composer) {
+            composer = composer.title_bottom(metrics);
         }
         frame.render_widget(
             Paragraph::new(state.input).block(composer).scroll((
@@ -1199,20 +1204,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         frame.render_widget(
             Paragraph::new(widgets::MetricFooter::text(
                 layout.footer.width,
-                widgets::FooterContext {
-                    model: state.provider_model,
-                    effort: state.reasoning_effort,
-                    context_window: state.context_window,
-                    project: state.project,
-                    turn_label: turn_state_label(
-                        state.turn_state,
-                        state.running,
-                        state.session_loading,
-                    ),
-                    duration: state.turn_duration,
-                    usage: state.latest_usage,
-                    dangerous: state.dangerous_mode,
-                },
+                footer_context(&state),
             ))
             .style(Style::default().fg(widgets::RolePalette::chrome())),
             layout.footer,
@@ -1226,6 +1218,41 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if let Some(palette) = state.palette {
         render_palette(frame, area, layout.composer, state.input, palette);
     }
+}
+
+fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
+    widgets::FooterContext {
+        model: state.provider_model,
+        effort: state.reasoning_effort,
+        context_window: state.context_window,
+        project: state.project,
+        turn_label: turn_state_label(state.turn_state, state.running, state.session_loading),
+        duration: state.turn_duration,
+        usage: state.latest_usage,
+        dangerous: state.dangerous_mode,
+    }
+}
+
+/// Metadata spliced into the composer's border, right-aligned and held one column
+/// off the closing corner, or `None` when the band cannot host it whole.
+///
+/// A single-row composer has no border row of its own to lend, so it declines
+/// rather than paint the metadata over the input line.
+fn border_metrics(state: &ViewState<'_>, composer: Rect) -> Option<Line<'static>> {
+    if composer.height < 2 {
+        return None;
+    }
+    let text = widgets::MetricFooter::border_text(
+        border_metrics_budget(composer.width),
+        footer_context(state),
+    )?;
+    Some(
+        Line::from(vec![
+            Span::styled(text, Style::default().fg(widgets::RolePalette::chrome())),
+            Span::raw(" "),
+        ])
+        .right_aligned(),
+    )
 }
 
 /// Content width below which the palette drops the description column entirely.
@@ -1646,6 +1673,27 @@ fn chrome_gutter(width: u16) -> u16 {
     CHROME_GUTTER.min(width.saturating_sub(MIN_GUTTERED_COMPOSER_WIDTH) / 2)
 }
 
+fn composer_width(width: u16) -> u16 {
+    width.saturating_sub(2 * chrome_gutter(width))
+}
+
+/// Border columns the metadata cannot use: both corners plus the gap that keeps
+/// the text from touching the closing one.
+const BORDER_METRICS_CHROME: u16 = 3;
+
+/// Columns the composer's bottom border can lend the metric footer.
+fn border_metrics_budget(composer_width: u16) -> u16 {
+    composer_width.saturating_sub(BORDER_METRICS_CHROME)
+}
+
+/// Whether the metadata rides the composer border instead of owning a row.
+///
+/// Decided from the terminal width alone: a longer model name or a growing token
+/// count must never claim a row and push the composer up mid-session.
+fn metrics_ride_the_border(width: u16) -> bool {
+    border_metrics_budget(composer_width(width)) >= widgets::MIN_BORDER_METRICS_WIDTH
+}
+
 /// Minimum terminal height before the subagent tree may claim rows.
 const TREE_MIN_SCREEN_HEIGHT: u16 = 14;
 /// Executions shown as tree branches, matching the navigable transcript set.
@@ -1663,7 +1711,7 @@ const MIN_TREE_ROWS: u16 = 2;
 const SCREEN_ROWS_PER_TREE_ROW: u16 = 10;
 
 /// Rows reserved below the composer for the notice, the subagent tree and the
-/// status bar.
+/// metric footer fallback row.
 #[derive(Clone, Copy)]
 struct BottomChrome {
     notice: u16,
@@ -1721,17 +1769,18 @@ impl BottomChrome {
     }
 }
 
-/// Sizes the bottom chrome region from the terminal height alone.
+/// Sizes the bottom chrome region from the terminal size alone.
 ///
 /// The budget deliberately ignores what the notice and the tree currently hold
 /// so the composer never moves while chrome content appears and disappears;
 /// content taller than its budget is elided instead. The tree reserves only a
 /// couple of rows on a common terminal so an idle screen shows no wide gap, and
 /// the composer keeps priority below the heights where each band becomes
-/// affordable.
-fn bottom_chrome(height: u16) -> BottomChrome {
+/// affordable. The footer row exists only for terminals too narrow to splice the
+/// metadata into the composer's bottom border.
+fn bottom_chrome(width: u16, height: u16) -> BottomChrome {
     let notice = u16::from(height >= 7);
-    let footer = u16::from(height >= 12);
+    let footer = u16::from(height >= 12 && !metrics_ride_the_border(width));
     let affordable = (height / 3).saturating_sub(notice).saturating_sub(footer);
     let tree = if height >= TREE_MIN_SCREEN_HEIGHT {
         affordable.min((height / SCREEN_ROWS_PER_TREE_ROW).clamp(MIN_TREE_ROWS, MAX_TREE_ROWS))
@@ -1761,7 +1810,8 @@ fn composer_rows(height: u16, input: &str) -> u16 {
 fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
     let area = conversation_surface(area);
     let composer_rows = composer_rows(area.height, input).min(area.height);
-    let chrome = bottom_chrome(area.height).fitted(area.height.saturating_sub(composer_rows));
+    let chrome =
+        bottom_chrome(area.width, area.height).fitted(area.height.saturating_sub(composer_rows));
     let transcript_rows = area
         .height
         .saturating_sub(composer_rows)

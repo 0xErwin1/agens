@@ -148,8 +148,8 @@ fn empty_composer_renders_a_complete_dock() {
     renderer.render(tui.view()).unwrap();
 
     let buffer = renderer.terminal().backend().buffer();
-    let composer_top = height - 7;
-    let composer_bottom = height - 5;
+    let composer_top = height - 6;
+    let composer_bottom = height - 4;
     assert_eq!(buffer[(CHROME_GUTTER, composer_top)].symbol(), "┌");
     assert_eq!(
         buffer[(width - 1 - CHROME_GUTTER, composer_top)].symbol(),
@@ -208,9 +208,14 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
         "the notice starts at the shared gutter plus its own leading space"
     );
     assert_eq!(
-        rendered_column(&renderer, "model —"),
-        usize::from(CHROME_GUTTER + 1),
-        "the status bar starts at the shared gutter plus its own leading space"
+        rendered_row(&renderer, "model —") as u16,
+        bottom,
+        "the metadata rides the composer's bottom border"
+    );
+    assert_eq!(
+        buffer[(width - 2 - CHROME_GUTTER, bottom)].symbol(),
+        " ",
+        "the metadata stops one column short of the closing corner"
     );
 }
 
@@ -1246,8 +1251,8 @@ fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
     let tree_row = rendered_row(&renderer, "Tab focus");
     let footer_row = rendered_row(&renderer, "model —");
     assert!(
-        body_row < tree_row && tree_row < footer_row,
-        "the tree sits between the composer and the status bar: {body_row} {tree_row} {footer_row}"
+        body_row < footer_row && footer_row < tree_row,
+        "the tree sits below the composer border that carries the metadata: {body_row} {footer_row} {tree_row}"
     );
 
     let branch_row = rendered_row(&renderer, "Explore #9");
@@ -3457,11 +3462,11 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
             "{needle:?} must not band the first row: {:?}",
             rendered_line(&renderer, 0)
         );
-        let notice_row = rendered_row(&renderer, needle) as u16;
+        let bottom = composer_bottom_row(&renderer);
         assert!(
-            notice_row > composer_bottom_row(&renderer),
-            "{needle:?} belongs to the bottom chrome: notice {notice_row} composer bottom {}",
-            composer_bottom_row(&renderer)
+            (bottom + 1..30).any(|row| rendered_line(&renderer, usize::from(row)).contains(needle)),
+            "{needle:?} belongs to the bottom chrome, below composer bottom {bottom}: {:?}",
+            rendered_text(&renderer)
         );
     }
 }
@@ -3499,9 +3504,13 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
     let notice_row = rendered_row(&renderer, "Press Ctrl+C again to exit") as u16;
     let tree_row = rendered_row(&renderer, "Tab focus") as u16;
     let footer_row = rendered_row(&renderer, "model —") as u16;
+    assert_eq!(
+        footer_row, idle_bottom,
+        "the metadata stays glued to the composer border"
+    );
     assert!(
-        idle_bottom < notice_row && notice_row < tree_row && tree_row < footer_row,
-        "bottom chrome order is notice, tree, status bar: {notice_row} {tree_row} {footer_row}"
+        idle_bottom < notice_row && notice_row < tree_row,
+        "bottom chrome order below the composer is notice then tree: {notice_row} {tree_row}"
     );
 
     tui.handle(Event::Key(Key::CtrlC));
@@ -3573,8 +3582,8 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
     );
     assert_eq!(
         rendered_row(&renderer, "model —") as u16,
-        height - 1,
-        "the status bar keeps the last row"
+        bottom,
+        "the metadata keeps the composer's bottom border"
     );
 
     tui.handle(Event::Key(Key::CtrlC));
@@ -3597,13 +3606,131 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
     );
     assert_eq!(
         rendered_row(&renderer, "model —") as u16,
-        height - 1,
-        "the status bar keeps the last row with a notice too"
+        bottom,
+        "the metadata keeps the composer's bottom border with a notice too"
+    );
+}
+
+/// Composer border rows for a terminal whose gutter is not the wide default.
+fn composer_border_rows(renderer: &RatatuiRenderer<TestBackend>, gutter: u16) -> (u16, u16) {
+    let buffer = renderer.terminal().backend().buffer();
+    let top = (0..buffer.area.height)
+        .find(|row| buffer[(gutter, *row)].symbol() == "┌")
+        .expect("composer top border should be rendered");
+    let bottom = (top + 1..buffer.area.height)
+        .find(|row| buffer[(gutter, *row)].symbol() == "└")
+        .expect("composer bottom border should be rendered");
+    (top, bottom)
+}
+
+fn docked_renderer(width: u16, height: u16) -> (RatatuiRenderer<TestBackend>, Tui<FakeEngine>) {
+    let renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width, height });
+    (renderer, tui)
+}
+
+#[test]
+fn composer_bottom_border_hosts_the_metadata_right_aligned() {
+    let (width, height) = (100_u16, 24_u16);
+    let (mut renderer, mut tui) = docked_renderer(width, height);
+
+    renderer.render(tui.view()).unwrap();
+    let (top, bottom) = composer_border_rows(&renderer, CHROME_GUTTER);
+
+    assert_eq!(
+        rendered_line(&renderer, usize::from(bottom)),
+        format!(
+            "    └{} model — · effort — · ctx — · agens · Ready ┘    ",
+            "─".repeat(46)
+        ),
+        "the metadata is spliced into the composer border, one gap off the corner"
+    );
+    assert_eq!(
+        rendered_text(&renderer).matches("model —").count(),
+        1,
+        "the metadata renders once, in the border only"
+    );
+    for row in bottom + 1..height {
+        assert!(
+            !rendered_line(&renderer, usize::from(row)).contains("Ready"),
+            "no detached status row survives below the composer: row {row}"
+        );
+    }
+
+    tui.begin_submission("prompt");
+    renderer.render(tui.view()).unwrap();
+    let (running_top, running_bottom) = composer_border_rows(&renderer, CHROME_GUTTER);
+    assert_eq!((running_top, running_bottom), (top, bottom));
+    assert!(
+        rendered_line(&renderer, usize::from(top)).contains(" running "),
+        "the top border keeps its state label: {:?}",
+        rendered_line(&renderer, usize::from(top))
+    );
+    assert!(
+        rendered_line(&renderer, usize::from(bottom)).contains("model —"),
+        "the bottom border keeps the metadata while running: {:?}",
+        rendered_line(&renderer, usize::from(bottom))
     );
 }
 
 #[test]
-fn idle_bottom_chrome_leaves_at_most_three_rows_below_the_composer() {
+fn border_metadata_drops_segments_as_the_composer_narrows() {
+    for (width, present, absent) in [
+        (100_u16, "model — · effort — · ctx — · agens · Ready", ""),
+        (52, "model — · effort — · ctx — · Ready", "agens"),
+        (42, "model — · effort — · Ready", "ctx —"),
+        (36, "model — · Ready", "effort —"),
+    ] {
+        let (mut renderer, tui) = docked_renderer(width, 20);
+        renderer.render(tui.view()).unwrap();
+        let (_, bottom) = composer_border_rows(&renderer, CHROME_GUTTER);
+        let line = rendered_line(&renderer, usize::from(bottom));
+
+        assert!(
+            line.contains(present),
+            "width {width} keeps {present:?}: {line:?}"
+        );
+        assert!(
+            absent.is_empty() || !line.contains(absent),
+            "width {width} drops {absent:?}: {line:?}"
+        );
+        assert_eq!(
+            line.chars().nth(usize::from(width - 2 - CHROME_GUTTER)),
+            Some(' '),
+            "width {width} keeps the metadata off the closing corner: {line:?}"
+        );
+        assert_eq!(
+            line.chars().nth(usize::from(width - 1 - CHROME_GUTTER)),
+            Some('┘'),
+            "width {width} keeps the closing corner: {line:?}"
+        );
+    }
+}
+
+#[test]
+fn a_border_too_narrow_for_the_metadata_falls_back_to_its_own_row() {
+    let (width, height) = (24_u16, 20_u16);
+    let (mut renderer, tui) = docked_renderer(width, height);
+
+    renderer.render(tui.view()).unwrap();
+    let (_, bottom) = composer_border_rows(&renderer, 0);
+    let border = rendered_line(&renderer, usize::from(bottom));
+
+    assert_eq!(
+        border,
+        format!("└{}┘", "─".repeat(usize::from(width - 2))),
+        "a border too narrow for the shortest form stays undecorated"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "model —") as u16,
+        height - 1,
+        "the metadata falls back to its own row below the composer"
+    );
+}
+
+#[test]
+fn idle_bottom_chrome_leaves_at_most_two_rows_below_the_composer() {
     let height = 24_u16;
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
     let mut tui = Tui::new(FakeEngine);
@@ -3617,8 +3744,8 @@ fn idle_bottom_chrome_leaves_at_most_three_rows_below_the_composer() {
         .saturating_sub(1);
 
     assert!(
-        gap <= 3,
-        "the idle screen keeps at most three blank chrome rows: composer bottom {bottom}, gap {gap}"
+        gap <= 2,
+        "the idle screen keeps at most two blank chrome rows: composer bottom {bottom}, gap {gap}"
     );
 }
 
@@ -3654,7 +3781,7 @@ fn elided_subagent_tree_keeps_a_running_branch_and_the_affordance_as_its_last_ro
     );
     assert!(
         rendered_row(&renderer, "Tab to focus") < usize::from(height - 1),
-        "the status bar keeps the last row: {text:?}"
+        "the elided tree stays inside its reserved band: {text:?}"
     );
     assert!(
         !text.contains("Main"),

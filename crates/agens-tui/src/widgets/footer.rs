@@ -3,6 +3,9 @@
 use std::time::Duration;
 
 use agens_core::Usage;
+use unicode_width::UnicodeWidthStr;
+
+use super::overlay::truncate_columns;
 
 /// Context for the single operational footer row.
 pub(crate) struct FooterContext<'a> {
@@ -16,12 +19,43 @@ pub(crate) struct FooterContext<'a> {
     pub dangerous: bool,
 }
 
-/// Formats the metric footer line: model · effort · usage · project · status.
-pub(crate) struct MetricFooter;
+/// Narrowest border line worth splicing metadata into.
+///
+/// Below it even `model · status` cannot be shown whole, so the caller owes the
+/// metadata a dedicated row instead of a mangled border.
+pub(crate) const MIN_BORDER_METRICS_WIDTH: u16 = 24;
 
-impl MetricFooter {
-    /// Builds a dense footer without keymap laundry lists.
-    pub(crate) fn text(width: u16, ctx: FooterContext<'_>) -> String {
+/// Segment sets the footer degrades through, widest first.
+#[derive(Clone, Copy)]
+enum FooterDetail {
+    Full,
+    NoProject,
+    NoUsage,
+    ModelAndStatus,
+    ModelOnly,
+}
+
+impl FooterDetail {
+    const LADDER: [Self; 5] = [
+        Self::Full,
+        Self::NoProject,
+        Self::NoUsage,
+        Self::ModelAndStatus,
+        Self::ModelOnly,
+    ];
+}
+
+/// Resolved footer segments, each already carrying its own explicit fallback.
+struct FooterSegments {
+    model: String,
+    effort: String,
+    usage: String,
+    project: String,
+    status: String,
+}
+
+impl FooterSegments {
+    fn new(ctx: FooterContext<'_>) -> Self {
         let model = short_model(ctx.model);
         let model = if model.is_empty() {
             "model —".to_owned()
@@ -34,7 +68,7 @@ impl MetricFooter {
             .unwrap_or("effort —")
             .to_owned();
         let usage = match ctx.usage {
-            Some(usage) => Self::format_usage_with_context(usage, ctx.context_window),
+            Some(usage) => MetricFooter::format_usage_with_context(usage, ctx.context_window),
             None => ctx
                 .context_window
                 .filter(|window| *window > 0)
@@ -60,22 +94,65 @@ impl MetricFooter {
             status = format!("danger {status}");
         }
 
-        let full = footer_line([&model, &effort, &usage, &project, &status]);
-        if width == 0 {
-            return full;
+        Self {
+            model,
+            effort,
+            usage,
+            project,
+            status,
         }
-        if full.chars().count() as u16 <= width {
-            return full;
-        }
+    }
 
-        let without_project = footer_line([&model, &effort, &usage, &status]);
-        let line = if without_project.chars().count() as u16 <= width {
-            without_project
-        } else {
-            footer_line([&model, &effort, &status])
+    fn line(&self, detail: FooterDetail) -> String {
+        let parts: Vec<&String> = match detail {
+            FooterDetail::Full => vec![
+                &self.model,
+                &self.effort,
+                &self.usage,
+                &self.project,
+                &self.status,
+            ],
+            FooterDetail::NoProject => {
+                vec![&self.model, &self.effort, &self.usage, &self.status]
+            }
+            FooterDetail::NoUsage => vec![&self.model, &self.effort, &self.status],
+            FooterDetail::ModelAndStatus => vec![&self.model, &self.status],
+            FooterDetail::ModelOnly => vec![&self.model],
         };
+        footer_line(parts)
+    }
 
-        line.chars().take(usize::from(width)).collect()
+    /// Widest form fitting `width`, or `None` when not even the model alone does.
+    fn fitted(&self, width: u16) -> Option<String> {
+        FooterDetail::LADDER
+            .into_iter()
+            .map(|detail| self.line(detail))
+            .find(|line| line.width() <= usize::from(width))
+    }
+}
+
+/// Formats the metric footer line: model · effort · usage · project · status.
+pub(crate) struct MetricFooter;
+
+impl MetricFooter {
+    /// Builds a dense footer without keymap laundry lists.
+    ///
+    /// Degradation drops whole segments before touching a token; only a model
+    /// name wider than the whole budget is ellipsized.
+    pub(crate) fn text(width: u16, ctx: FooterContext<'_>) -> String {
+        let segments = FooterSegments::new(ctx);
+        if width == 0 {
+            return segments.line(FooterDetail::Full);
+        }
+        segments.fitted(width).unwrap_or_else(|| {
+            truncate_columns(&segments.line(FooterDetail::ModelOnly), usize::from(width))
+        })
+    }
+
+    /// Same metadata sized for a border line, or `None` when the border is too
+    /// narrow to host the shortest form whole.
+    pub(crate) fn border_text(width: u16, ctx: FooterContext<'_>) -> Option<String> {
+        (width >= MIN_BORDER_METRICS_WIDTH).then(|| Self::text(width, ctx))
     }
 
     #[cfg(test)]
@@ -243,5 +320,63 @@ mod tests {
         let status_at = line.find("Ready").expect("status");
         assert!(model_at < effort_at && effort_at < usage_at);
         assert!(usage_at < project_at && project_at < status_at);
+    }
+
+    fn sample() -> FooterContext<'static> {
+        FooterContext {
+            model: "openai-chatgpt / gpt-5.6-sol",
+            effort: Some("high"),
+            context_window: Some(200_000),
+            project: "/home/iperez/dev/personal/agens",
+            turn_label: "Ready",
+            duration: None,
+            usage: Some(&Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                total_tokens: Some(15_000),
+                context_window: Some(200_000),
+            }),
+            dangerous: false,
+        }
+    }
+
+    #[test]
+    fn text_drops_whole_segments_before_ellipsizing_a_token() {
+        let at = |width: u16| MetricFooter::text(width, sample());
+
+        assert_eq!(
+            at(0),
+            " gpt-5.6-sol · high · 15k/200k (7.5%) · agens · Ready"
+        );
+        assert_eq!(
+            at(80),
+            " gpt-5.6-sol · high · 15k/200k (7.5%) · agens · Ready"
+        );
+        assert_eq!(at(52), " gpt-5.6-sol · high · 15k/200k (7.5%) · Ready");
+        assert_eq!(at(45), " gpt-5.6-sol · high · 15k/200k (7.5%) · Ready");
+        assert_eq!(at(44), " gpt-5.6-sol · high · Ready");
+        assert_eq!(at(27), " gpt-5.6-sol · high · Ready");
+        assert_eq!(at(26), " gpt-5.6-sol · Ready");
+        assert_eq!(at(20), " gpt-5.6-sol · Ready");
+        assert_eq!(at(19), " gpt-5.6-sol");
+        assert_eq!(at(12), " gpt-5.6-sol");
+        assert_eq!(at(11), " gpt-5.6-s…");
+    }
+
+    #[test]
+    fn border_text_yields_nothing_below_the_shortest_hostable_form() {
+        assert_eq!(
+            MetricFooter::border_text(MIN_BORDER_METRICS_WIDTH, sample()),
+            Some(" gpt-5.6-sol · Ready".to_owned())
+        );
+        assert_eq!(
+            MetricFooter::border_text(MIN_BORDER_METRICS_WIDTH - 1, sample()),
+            None
+        );
+        assert_eq!(MetricFooter::border_text(0, sample()), None);
+        assert_eq!(
+            MetricFooter::border_text(80, sample()),
+            Some(" gpt-5.6-sol · high · 15k/200k (7.5%) · agens · Ready".to_owned())
+        );
     }
 }

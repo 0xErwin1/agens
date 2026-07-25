@@ -14,7 +14,7 @@ pub(crate) use blocks::{
 };
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
-pub(crate) use footer::{FooterContext, MetricFooter};
+pub(crate) use footer::{FooterContext, MIN_BORDER_METRICS_WIDTH, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
 pub(crate) use overlay::{
     OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
