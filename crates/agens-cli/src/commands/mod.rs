@@ -3,3 +3,33 @@ pub(crate) mod chat;
 pub(crate) mod config;
 pub(crate) mod models;
 pub(crate) mod sessions;
+
+use agens_core::HeadlessTurnCancellation;
+
+use crate::CliDependencies;
+use crate::cli;
+use crate::error::CliError;
+use crate::run_tui;
+use auth::run_auth;
+use chat::run_chat;
+use config::run_config;
+use models::run_models;
+use sessions::run_sessions;
+
+pub(crate) fn dispatch(
+    parsed: cli::Cli,
+    dependencies: &CliDependencies,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<String, CliError> {
+    match parsed.command {
+        None => run_tui(dependencies, parsed.resume.flatten()),
+        Some(cli::Command::Config { action }) => run_config(action, dependencies),
+        Some(cli::Command::Auth { action }) => run_auth(action, dependencies, cancellation),
+        Some(cli::Command::Chat(chat_arguments)) => {
+            run_chat(chat_arguments, dependencies, cancellation)
+        }
+        Some(cli::Command::Models) => run_models(),
+        Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
+        Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
+    }
+}

@@ -114,15 +114,16 @@ use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress}
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use commands::auth::chatgpt_login_error;
-use commands::auth::{run_auth, run_production_auth_login};
-use commands::chat::run_chat;
+use commands::auth::run_production_auth_login;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use commands::chat::{chat_args_with_prompt, chat_request};
-use commands::config::{create_configuration_file, run_config};
-use commands::models::run_models;
-use commands::sessions::run_sessions;
+use commands::config::create_configuration_file;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use commands::config::run_config;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -509,17 +510,7 @@ fn execute_command(
         Err(error) => return cli::clap_outcome(error),
     };
 
-    match parsed.command {
-        None => run_tui(dependencies, parsed.resume.flatten()),
-        Some(cli::Command::Config { action }) => run_config(action, dependencies),
-        Some(cli::Command::Auth { action }) => run_auth(action, dependencies, cancellation),
-        Some(cli::Command::Chat(chat_arguments)) => {
-            run_chat(chat_arguments, dependencies, cancellation)
-        }
-        Some(cli::Command::Models) => run_models(),
-        Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
-        Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
-    }
+    commands::dispatch(parsed, dependencies, cancellation)
 }
 
 fn run_tui(dependencies: &CliDependencies, resume: Option<i64>) -> Result<String, CliError> {
