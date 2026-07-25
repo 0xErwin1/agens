@@ -91,7 +91,7 @@ Treat a function growing beyond roughly 100 lines as a design smell. Before addi
 - Treat process execution as mutating and permission-gated. Preserve bounded execution, cancellation, process-group termination, and sanitized output.
 - Validate network URLs, redirects, headers, response size, retries, and timeouts at the transport boundary. Do not expose raw remote errors that may contain secrets.
 - Validate configuration before expansion or execution. Project configuration must not acquire global-only capabilities such as MCP server definitions.
-- Use transactions for multi-step persistence changes. Never persist a partial or cancelled turn.
+- Use transactions for multi-step persistence changes. An interrupted turn persists only the prompt and an explicit interruption note; never persist unfinished tool calls or fabricated tool results.
 - Preserve restrictive permissions on credential directories, credential files, and SQLite runtime state.
 
 ## Workspace lint policy

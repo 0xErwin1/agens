@@ -1905,7 +1905,13 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
         &output.stderr,
         "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        &project_root,
+        &config_home,
+        "parent task cancellation",
+    );
+    assert_sqlite_has_interrupted_turn(&data_directory.join("rust-sessions.db"));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &[
@@ -2346,7 +2352,13 @@ fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
         &output.stderr,
         "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(&temporary, temporary.path(), &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        temporary.path(),
+        &config_home,
+        "cancel subscription request",
+    );
+    assert_sqlite_has_interrupted_turn(&data_directory.join("rust-sessions.db"));
     assert_sqlite_has_no_sentinels(
         &data_directory.join("rust-sessions.db"),
         &["SENTINEL_CHATGPT_CANCEL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
@@ -3138,7 +3150,12 @@ fn production_binary_cancellation_kills_native_bash_descendants_without_continui
     for process_id in process_ids {
         wait_for_process_exit(process_id, Duration::from_secs(2));
     }
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        &project_root,
+        &config_home,
+        "run the long native bash command",
+    );
 
     server.join();
 }
@@ -3249,16 +3266,13 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
         &output.stderr,
         "error: cancelled: headless turn was cancelled\n",
     );
-    let sessions = isolated_agens_command(&temporary)
-        .args(["sessions", "list"])
-        .env("AGENS_CONFIG_HOME", &config_home)
-        .output()
-        .expect("sessions command should execute");
-    assert!(sessions.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&sessions.stdout),
-        "No saved sessions.\n"
+    assert_interrupted_session_saved(
+        &temporary,
+        temporary.path(),
+        &config_home,
+        "cancel production request",
     );
+    assert_sqlite_has_interrupted_turn(&data_directory.join("rust-sessions.db"));
 
     server.join();
 }
@@ -3531,7 +3545,12 @@ fn production_binary_cancels_configured_mcp_call_without_continuing_or_persistin
         &output.stderr,
         "error: cancelled: headless turn was cancelled\n",
     );
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        &project_root,
+        &config_home,
+        "cancel configured MCP tool",
+    );
 
     server.join();
 }
@@ -3752,10 +3771,20 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
 
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_no_saved_sessions(&temporary, &project_root, &config_home);
-        assert_sqlite_has_terminal_attempt_without_history(
-            &data_directory.join("rust-sessions.db"),
-        );
+        if name == "timeout" {
+            assert_interrupted_session_saved(
+                &temporary,
+                &project_root,
+                &config_home,
+                "run broken MCP tool",
+            );
+            assert_sqlite_has_interrupted_turn(&data_directory.join("rust-sessions.db"));
+        } else {
+            assert_no_saved_sessions(&temporary, &project_root, &config_home);
+            assert_sqlite_has_terminal_attempt_without_history(
+                &data_directory.join("rust-sessions.db"),
+            );
+        }
 
         server.join();
     }
@@ -4762,6 +4791,29 @@ fn assert_no_saved_sessions(
     );
 }
 
+fn assert_interrupted_session_saved(
+    temporary: &TemporaryDirectory,
+    project_root: &std::path::Path,
+    config_home: &std::path::Path,
+    title: &str,
+) {
+    let sessions = isolated_agens_command(temporary)
+        .args(["sessions", "list"])
+        .current_dir(project_root)
+        .env("AGENS_CONFIG_HOME", config_home)
+        .output()
+        .expect("sessions command should execute");
+
+    assert!(sessions.status.success());
+    let stdout = String::from_utf8_lossy(&sessions.stdout);
+    let listed = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(listed.len(), 2, "{stdout:?}");
+    assert!(
+        listed[1].ends_with(&format!("\t{title}\tprimary\t1")),
+        "{stdout:?}"
+    );
+}
+
 fn assert_sqlite_has_no_sentinels(database: &std::path::Path, sentinels: &[&str]) {
     for (location, value) in sqlite_text_values(database) {
         for sentinel in sentinels {
@@ -4906,6 +4958,32 @@ fn sqlite_text_values(database: &std::path::Path) -> Vec<(String, String)> {
     }
 
     sqlite_values
+}
+
+fn assert_sqlite_has_interrupted_turn(database: &std::path::Path) {
+    assert!(database.exists(), "session database should exist");
+
+    let connection = rusqlite::Connection::open(database).expect("session database should open");
+    let counts = connection
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM session_attempts WHERE status != 'running'),
+                 (SELECT COUNT(*) FROM session_attempts WHERE retry_prompt IS NOT NULL),
+                 (SELECT COUNT(*) FROM turns),
+                 (SELECT COUNT(*) FROM messages)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .expect("interrupted attempt should be queryable");
+
+    assert_eq!(counts, (1, 0, 1, 2));
 }
 
 fn assert_sqlite_has_terminal_attempt_without_history(database: &std::path::Path) {

@@ -21,8 +21,8 @@ use agens_core::{
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     Message, MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
     PermissionRule, PermissionSession, RecoveryOutcome, RetryBoundary, Role, SessionAttemptStatus,
-    SessionMessage, SessionMetadata, TurnEvent, TurnProgressSink, TurnProvider, TurnState,
-    run_headless_turn_with_max_iterations_and_progress,
+    SessionMessage, SessionMessageError, SessionMetadata, TurnEvent, TurnProgressSink,
+    TurnProvider, TurnState, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
@@ -1276,7 +1276,37 @@ impl Drop for RegisteredAttempt<'_> {
 #[derive(Debug, PartialEq, Eq)]
 enum AttemptLifecycleError {
     Begin(BeginSessionAttemptError),
-    Runtime(CliError),
+    Runtime {
+        error: CliError,
+        partial: Option<Box<PartialTurnRecord>>,
+    },
+}
+
+impl AttemptLifecycleError {
+    fn runtime(error: CliError) -> Self {
+        Self::Runtime {
+            error,
+            partial: None,
+        }
+    }
+}
+
+/// History persisted for an attempt that ended without a completed turn, carried out of the
+/// failing path so the caller can keep owning the same session instead of minting a new one.
+#[derive(Clone, PartialEq, Eq)]
+struct PartialTurnRecord {
+    metadata: SessionMetadata,
+    messages: Vec<Message>,
+}
+
+impl fmt::Debug for PartialTurnRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PartialTurnRecord")
+            .field("session", &self.metadata.id)
+            .field("messages", &self.messages.len())
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -1320,7 +1350,7 @@ fn recover_session_attempt_lifecycle(
     let Some(recovery) = registry
         .recover_running_attempt(store, key, finished_at)
         .map_err(|_| {
-            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+            AttemptLifecycleError::runtime(CliError::storage("attempt recovery failed"))
         })?
     else {
         return Ok(ExplicitAttemptRecoveryOutcome::LocallyActive);
@@ -1331,14 +1361,14 @@ fn recover_session_attempt_lifecycle(
 
     let boundary = store
         .load_retry_boundary(key)
-        .map_err(|_| AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed")))?
+        .map_err(|_| AttemptLifecycleError::runtime(CliError::storage("attempt recovery failed")))?
         .ok_or_else(|| {
-            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+            AttemptLifecycleError::runtime(CliError::storage("attempt recovery failed"))
         })?;
     let stored = store
         .load_session_for_resume(key.session_id())
         .map_err(|_| {
-            AttemptLifecycleError::Runtime(CliError::storage("attempt recovery failed"))
+            AttemptLifecycleError::runtime(CliError::storage("attempt recovery failed"))
         })?;
     let metadata = stored.metadata;
     let runtime_metadata = metadata.clone();
@@ -1367,13 +1397,17 @@ fn run_session_attempt_lifecycle(
         metadata,
         prompt,
         runtime,
-        |store, key, status, finished_at| {
-            store
-                .finish_session_attempt(key, status, finished_at)
-                .map(|_| ())
-                .map_err(|_| ())
-        },
+        |store, write| write_terminal_attempt(store, write, &interrupted_turn_note(&[])),
     )
+}
+
+/// Terminal state of an attempt whose runtime failed, handed to the writer that records it.
+struct TerminalAttemptWrite<'a> {
+    key: AttemptKey,
+    status: agens_core::SessionAttemptStatus,
+    metadata: &'a SessionMetadata,
+    prompt: &'a str,
+    finished_at: i64,
 }
 
 fn run_session_attempt_lifecycle_with_terminal_writer(
@@ -1384,13 +1418,11 @@ fn run_session_attempt_lifecycle_with_terminal_writer(
     runtime: impl FnOnce() -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
     terminal_writer: impl FnOnce(
         &mut SessionStore,
-        AttemptKey,
-        agens_core::SessionAttemptStatus,
-        i64,
-    ) -> Result<(), ()>,
+        TerminalAttemptWrite<'_>,
+    ) -> Result<Option<PartialTurnRecord>, ()>,
 ) -> Result<SessionAttemptCompletion, AttemptLifecycleError> {
     let attempt = registry
-        .begin_and_register(store, &metadata, prompt)
+        .begin_and_register(store, &metadata, prompt.clone())
         .map_err(AttemptLifecycleError::Begin)?;
     let _registered = RegisteredAttempt {
         registry,
@@ -1401,9 +1433,23 @@ fn run_session_attempt_lifecycle_with_terminal_writer(
     let (snapshot, turn) = match runtime() {
         Ok(completion) => completion,
         Err(error) => {
-            let status = attempt_failure_status(&error);
-            let _ = terminal_writer(store, attempt.key(), status, current_session_timestamp());
-            return Err(AttemptLifecycleError::Runtime(error));
+            let partial = terminal_writer(
+                store,
+                TerminalAttemptWrite {
+                    key: attempt.key(),
+                    status: attempt_failure_status(&error),
+                    metadata: &metadata,
+                    prompt: &prompt,
+                    finished_at: current_session_timestamp(),
+                },
+            )
+            .ok()
+            .flatten();
+
+            return Err(AttemptLifecycleError::Runtime {
+                error,
+                partial: partial.map(Box::new),
+            });
         }
     };
 
@@ -1417,11 +1463,11 @@ fn run_session_attempt_lifecycle_with_terminal_writer(
         .map_err(|error| {
             CliError::storage(format!("completed session could not be saved: {error}"))
         })
-        .map_err(AttemptLifecycleError::Runtime)?
+        .map_err(AttemptLifecycleError::runtime)?
     {
         agens_core::AttemptFinishOutcome::Finished => {}
         agens_core::AttemptFinishOutcome::Stale => {
-            return Err(AttemptLifecycleError::Runtime(CliError::storage(
+            return Err(AttemptLifecycleError::runtime(CliError::storage(
                 "completed session could not be saved",
             )));
         }
@@ -1430,7 +1476,7 @@ fn run_session_attempt_lifecycle_with_terminal_writer(
     let stored = store
         .load_session_for_resume(metadata.id)
         .map_err(|_| CliError::storage("completed session could not be loaded"))
-        .map_err(AttemptLifecycleError::Runtime)?;
+        .map_err(AttemptLifecycleError::runtime)?;
 
     Ok(SessionAttemptCompletion {
         snapshot,
@@ -1444,6 +1490,128 @@ fn attempt_failure_status(error: &CliError) -> agens_core::SessionAttemptStatus 
         "cancelled" | "timeout" => agens_core::SessionAttemptStatus::Cancelled,
         "auth" | "provider" => agens_core::SessionAttemptStatus::ProviderError,
         _ => agens_core::SessionAttemptStatus::Failed,
+    }
+}
+
+/// Records an interrupted attempt (explicit cancellation or an expired deadline) as history, so
+/// the next turn keeps the prompt and knows the turn stopped early. Every other failure keeps its
+/// retained retry prompt instead, because its recovery path replays that prompt rather than
+/// continuing the conversation.
+fn write_terminal_attempt(
+    store: &mut SessionStore,
+    write: TerminalAttemptWrite<'_>,
+    note: &str,
+) -> Result<Option<PartialTurnRecord>, ()> {
+    if write.status != agens_core::SessionAttemptStatus::Cancelled {
+        return store
+            .finish_session_attempt(write.key, write.status, write.finished_at)
+            .map(|_| None)
+            .map_err(|_| ());
+    }
+
+    let turn = interrupted_session_turn(write.prompt, note).map_err(|_| ())?;
+    let outcome = store
+        .persist_partial_session_attempt(
+            write.key,
+            write.metadata,
+            &turn,
+            write.status,
+            write.finished_at,
+        )
+        .map_err(|_| ())?;
+    if outcome == agens_core::AttemptFinishOutcome::Stale {
+        return Ok(None);
+    }
+
+    let stored = store
+        .load_session_for_resume(write.metadata.id)
+        .map_err(|_| ())?;
+
+    Ok(Some(PartialTurnRecord {
+        metadata: stored.metadata,
+        messages: stored.messages,
+    }))
+}
+
+/// Keeps the interrupted turn to the prompt and a plain assistant note: a tool call that never
+/// answered must not gain a fabricated result, because the tool may already have changed the
+/// project and claiming otherwise would assert something unverified.
+fn interrupted_session_turn(
+    prompt: &str,
+    note: &str,
+) -> Result<CompletedSessionTurn, SessionMessageError> {
+    let messages = [
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text(prompt.to_owned())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text(note.to_owned())],
+        },
+    ]
+    .into_iter()
+    .map(SessionMessage::try_from)
+    .collect::<Result<Vec<_>, _>>()?;
+
+    CompletedSessionTurn::new(messages).map_err(|_| SessionMessageError::EmptyParts)
+}
+
+const MAX_NOTED_REQUESTED_SUBAGENTS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestedSubagent {
+    agent: String,
+    description: String,
+}
+
+/// Describes the turn as interrupted rather than cancelled by the user, because an expired
+/// deadline reaches this path with the same terminal status as an explicit cancellation.
+fn interrupted_turn_note(requested: &[RequestedSubagent]) -> String {
+    let mut note = "[interrupted] The previous turn stopped before this assistant produced a \
+                    result. Results of tools it had requested are unavailable, so their effects \
+                    are unverified."
+        .to_owned();
+    if requested.is_empty() {
+        return note;
+    }
+
+    note.push_str(" Subagents requested in that turn: ");
+    note.push_str(
+        &requested
+            .iter()
+            .map(|subagent| format!("{} — \"{}\"", subagent.agent, subagent.description))
+            .collect::<Vec<_>>()
+            .join("; "),
+    );
+    note.push('.');
+    note
+}
+
+fn record_requested_subagent(requested: &Mutex<Vec<RequestedSubagent>>, event: &TurnEvent) {
+    let TurnEvent::ToolCallRequested { name, input, .. } = event else {
+        return;
+    };
+    if name != "native::task" {
+        return;
+    }
+    let Some(subagent) = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| {
+            Some(RequestedSubagent {
+                agent: sanitize_subagent_persistence(value.get("agent")?.as_str()?),
+                description: sanitize_subagent_persistence(value.get("description")?.as_str()?),
+            })
+        })
+    else {
+        return;
+    };
+
+    if let Ok(mut requested) = requested.lock()
+        && requested.len() < MAX_NOTED_REQUESTED_SUBAGENTS
+        && !requested.contains(&subagent)
+    {
+        requested.push(subagent);
     }
 }
 
@@ -3908,7 +4076,7 @@ fn run_tui_prompt_with(
     prompt: &str,
     session: &Arc<Mutex<TuiSessionContext>>,
     skills: Option<Arc<SkillCatalog>>,
-    run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, CliError>,
+    run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
     let prompt = expand_tui_file_reference(bootstrap, prompt)?;
     let request = {
@@ -4017,10 +4185,21 @@ fn expand_tui_file_reference(bootstrap: &Bootstrap, prompt: &str) -> Result<Stri
 
 fn complete_tui_turn(
     session: &mut TuiSessionContext,
-    completion: Result<HeadlessChatCompletion, CliError>,
+    completion: Result<HeadlessChatCompletion, HeadlessChatFailure>,
     consumed_reminder: bool,
 ) -> Result<String, CliError> {
-    let completion = completion?;
+    let completion = match completion {
+        Ok(completion) => completion,
+        Err(failure) => {
+            if let Some(partial) = failure.partial {
+                session.identifier = Some(partial.metadata.id);
+                session.metadata = Some(partial.metadata);
+                session.messages = partial.messages;
+            }
+
+            return Err(failure.error);
+        }
+    };
     session.identifier = Some(completion.metadata.id);
     session.metadata = Some(completion.metadata);
     session.messages = completion.messages;
@@ -5389,12 +5568,43 @@ fn run_production_headless_chat(
         None,
     )
     .map(|completion| completion.text)
+    .map_err(HeadlessChatFailure::into_error)
 }
 
 struct HeadlessChatCompletion {
     text: String,
     metadata: SessionMetadata,
     messages: Vec<Message>,
+}
+
+/// Failed turn plus any history the attempt already persisted, so the caller can adopt the
+/// session the failed attempt belongs to instead of starting a new one on the next turn.
+#[derive(Debug)]
+struct HeadlessChatFailure {
+    error: CliError,
+    partial: Option<Box<PartialTurnRecord>>,
+}
+
+impl HeadlessChatFailure {
+    fn into_error(self) -> CliError {
+        self.error
+    }
+
+    fn map_error(self, map: impl FnOnce(CliError) -> CliError) -> Self {
+        Self {
+            error: map(self.error),
+            partial: self.partial,
+        }
+    }
+}
+
+impl From<CliError> for HeadlessChatFailure {
+    fn from(error: CliError) -> Self {
+        Self {
+            error,
+            partial: None,
+        }
+    }
 }
 
 struct HeadlessProviderContext<'a> {
@@ -5415,7 +5625,7 @@ fn run_production_headless_chat_with_progress(
     permission_bridge: Option<TuiPermissionBridge>,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
-) -> Result<HeadlessChatCompletion, CliError> {
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     #[cfg(test)]
     PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
 
@@ -5475,8 +5685,11 @@ fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                     })
-                    .map_err(|_| {
-                        CliError::authentication("OpenAI API authentication is unavailable")
+                    .map_err(|error| {
+                        provider_construction_error(
+                            error,
+                            "OpenAI API authentication is unavailable",
+                        )
                     })
                 },
             )
@@ -5516,20 +5729,39 @@ fn run_production_headless_chat_with_progress(
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
                     })
-                    .map_err(|_| {
-                        CliError::authentication("ChatGPT credentials are unavailable or invalid")
+                    .map_err(|error| {
+                        provider_construction_error(
+                            error,
+                            "ChatGPT credentials are unavailable or invalid",
+                        )
                     })
                 },
             )
         }
-        _ => Err(CliError::configuration(
+        _ => Err(HeadlessChatFailure::from(CliError::configuration(
             "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
-        )),
+        ))),
     };
-    result.map_err(|error| {
-        record_parent_terminal(bootstrap, &diagnostic_reference, &error);
-        error.with_diagnostic_reference(&diagnostic_reference)
+    result.map_err(|failure| {
+        record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
+        failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
     })
+}
+
+/// Keeps a rejected local encode of the resumed history distinguishable from missing or invalid
+/// credentials, so malformed persisted history is not reported as an authentication failure.
+fn provider_construction_error(error: agens_core::Error, authentication: &str) -> CliError {
+    match error {
+        agens_core::Error::Auth(_) => CliError::authentication(authentication),
+        agens_core::Error::Config(_) => {
+            CliError::configuration("provider request could not be configured")
+        }
+        _ => CliError::new(
+            ExitStatus::Failure,
+            "provider",
+            "session history could not be encoded for the provider request",
+        ),
+    }
 }
 
 fn run_production_headless_chat_with_provider<P>(
@@ -5541,7 +5773,7 @@ fn run_production_headless_chat_with_provider<P>(
         Vec<OpenAiFunctionTool>,
         agens_core::RequestConfig,
     ) -> Result<P, CliError>,
-) -> Result<HeadlessChatCompletion, CliError>
+) -> Result<HeadlessChatCompletion, HeadlessChatFailure>
 where
     P: ProgressAwareProvider + Send,
 {
@@ -5638,7 +5870,9 @@ where
         session_model,
         session_effort,
     )?;
-    let completion = run_session_attempt_lifecycle(
+    let requested_subagents = Arc::new(Mutex::new(Vec::new()));
+    let noted_subagents = Arc::clone(&requested_subagents);
+    let completion = run_session_attempt_lifecycle_with_terminal_writer(
         active_session_attempts(),
         &mut store,
         metadata,
@@ -5652,13 +5886,20 @@ where
             )?;
             // Live SSE already emits ProviderPart/Usage through the provider sink.
             // Headless flush_progress would re-send those and double TUI text/tools.
-            let headless_progress = context.progress.map(|progress| {
+            let forwarded_progress = context.progress.map(|progress| {
                 let progress = Arc::clone(progress);
                 Arc::new(move |event: TurnEvent| match event {
                     TurnEvent::ProviderPart(_) | TurnEvent::Usage(_) => {}
                     other => progress(other),
                 }) as TurnProgressSink
             });
+            let headless_progress: TurnProgressSink = Arc::new(move |event: TurnEvent| {
+                record_requested_subagent(&requested_subagents, &event);
+                if let Some(progress) = &forwarded_progress {
+                    progress(event);
+                }
+            });
+            let headless_progress = Some(&headless_progress);
             if let Some(progress) = context.progress {
                 provider = provider.with_progress_sink(Arc::clone(progress));
             }
@@ -5675,7 +5916,7 @@ where
                         &mut repository,
                         context.cancellation,
                         max_iterations,
-                        headless_progress.as_ref(),
+                        headless_progress,
                     ))
                 }
                 None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
@@ -5685,7 +5926,7 @@ where
                     &mut dispatcher,
                     &mut repository,
                     context.cancellation,
-                    headless_progress.as_ref(),
+                    headless_progress,
                 )),
             }?
             .map_err(CliError::runtime)?;
@@ -5697,15 +5938,23 @@ where
 
             Ok((snapshot, turn))
         },
+        |store, write| {
+            let note = noted_subagents
+                .lock()
+                .map(|requested| interrupted_turn_note(&requested))
+                .unwrap_or_else(|_| interrupted_turn_note(&[]));
+
+            write_terminal_attempt(store, write, &note)
+        },
     )
     .map_err(|error| match error {
         AttemptLifecycleError::Begin(BeginSessionAttemptError::AlreadyRunning(_)) => {
-            CliError::runtime(HeadlessTurnError::State)
+            HeadlessChatFailure::from(CliError::runtime(HeadlessTurnError::State))
         }
         AttemptLifecycleError::Begin(BeginSessionAttemptError::Store) => {
-            CliError::storage("session attempt could not be started")
+            HeadlessChatFailure::from(CliError::storage("session attempt could not be started"))
         }
-        AttemptLifecycleError::Runtime(error) => error,
+        AttemptLifecycleError::Runtime { error, partial } => HeadlessChatFailure { error, partial },
     })?;
 
     let text = completion
@@ -9505,7 +9754,9 @@ mod tests {
         assert!(context.pending_system_reminder.is_none());
 
         context.pending_system_reminder = Some("reminder".into());
-        assert!(complete_tui_turn(&mut context, Err(CliError::storage("failed")), true).is_err());
+        assert!(
+            complete_tui_turn(&mut context, Err(CliError::storage("failed").into()), true).is_err()
+        );
         assert_eq!(context.pending_system_reminder.as_deref(), Some("reminder"));
     }
 
@@ -18059,7 +18310,7 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
 
     assert_eq!(
         primary_error,
-        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Provider))
+        AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Provider))
     );
     assert!(!registry.contains(attempt.key()));
     assert_eq!(
@@ -18080,7 +18331,7 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
         terminal_failure,
         "terminal failure".into(),
         || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
-        |_, _, _, _| Err(()),
+        |_, _| Err(()),
     )
     .unwrap_err();
     let running = store
@@ -18091,7 +18342,7 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
 
     assert_eq!(
         terminal_error,
-        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+        AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
     );
     assert_eq!(running.status(), agens_core::SessionAttemptStatus::Running);
     assert!(!registry.contains(running.key()));
@@ -18129,6 +18380,226 @@ fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors(
             .status(),
         agens_core::SessionAttemptStatus::Completed
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn interrupted_attempt_persists_prompt_and_note_and_reuses_the_session() {
+    let directory =
+        std::env::temp_dir().join(format!("agens-interrupted-partial-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let registry = AttemptActivityRegistry::default();
+    let metadata = SessionMetadata {
+        id: 1,
+        project: "project".into(),
+        title: "launch the explorer subagent".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+
+    let cancelled = run_session_attempt_lifecycle(
+        &registry,
+        &mut store,
+        metadata.clone(),
+        "launch the explorer subagent".into(),
+        || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
+    )
+    .unwrap_err();
+
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+
+    assert_eq!(stored.metadata.completed_turn_count, 1);
+    assert_eq!(
+        stored.messages.first().map(|message| message.role),
+        Some(Role::User)
+    );
+    assert_eq!(
+        stored.messages.first().map(|message| message.parts.clone()),
+        Some(vec![MessagePart::Text(
+            "launch the explorer subagent".into()
+        )])
+    );
+    let note = match stored.messages.get(1) {
+        Some(Message {
+            role: Role::Assistant,
+            parts,
+        }) => match parts.as_slice() {
+            [MessagePart::Text(note)] => note.clone(),
+            other => panic!("expected a single note part, got {other:?}"),
+        },
+        other => panic!("expected an assistant note, got {other:?}"),
+    };
+    assert!(note.contains("interrupted"), "{note:?}");
+    assert_eq!(stored.messages.len(), 2);
+    assert_eq!(
+        stored.latest_attempt.as_ref().unwrap().status(),
+        agens_core::SessionAttemptStatus::Cancelled
+    );
+
+    let AttemptLifecycleError::Runtime { error, partial } = cancelled else {
+        panic!("expected a runtime failure");
+    };
+    let partial = partial.expect("an interrupted attempt carries its persisted turn");
+    assert!(!format!("{partial:?}").contains("launch the explorer subagent"));
+
+    let mut context = TuiSessionContext::fresh();
+    assert!(
+        complete_tui_turn(
+            &mut context,
+            Err(HeadlessChatFailure {
+                error,
+                partial: Some(partial),
+            }),
+            false,
+        )
+        .is_err()
+    );
+    assert_eq!(context.identifier, Some(metadata.id));
+
+    let next = context.apply_to(interrupted_turn_test_request(
+        "volve a lanzar el subagente que cancele",
+    ));
+    assert_eq!(next.history, stored.messages);
+    assert_eq!(
+        next.session.as_ref().map(|session| session.id),
+        Some(metadata.id)
+    );
+    assert!(
+        OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
+            "test-key".into(),
+            None,
+            "gpt-5.5".into(),
+            provider_messages(&next, false),
+            Vec::new(),
+            std::time::Duration::from_secs(1),
+        )
+        .is_ok()
+    );
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(test)]
+fn interrupted_turn_test_request(prompt: &str) -> HeadlessChatRequest {
+    HeadlessChatRequest {
+        prompt: prompt.to_owned(),
+        history: Vec::new(),
+        model: None,
+        system_prompt: None,
+        max_iterations: None,
+        mode: PermissionMode::Edit,
+        dangerously_allow_all: false,
+        dangerous_mode: false,
+        request_config: agens_core::RequestConfig::default(),
+        session_reasoning_effort: None,
+        session: None,
+        active_agent: None,
+        effective_capabilities: None,
+        pending_system_reminder: None,
+        skills: None,
+    }
+}
+
+#[test]
+fn timed_out_attempt_notes_the_interruption_with_requested_subagents() {
+    let directory = std::env::temp_dir().join(format!(
+        "agens-interrupted-subagents-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut store = SessionStore::open(&directory).unwrap();
+    let registry = AttemptActivityRegistry::default();
+    let metadata = SessionMetadata {
+        id: 4,
+        project: "project".into(),
+        title: "explore the runtime".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let requested = Mutex::new(Vec::new());
+    record_requested_subagent(
+        &requested,
+        &TurnEvent::ToolCallRequested {
+            id: "call-1".into(),
+            name: "native::task".into(),
+            input: r#"{"agent":"explorer","description":"map the session writer"}"#.into(),
+        },
+    );
+    record_requested_subagent(
+        &requested,
+        &TurnEvent::ToolCallRequested {
+            id: "call-2".into(),
+            name: "native::read".into(),
+            input: r#"{"path":"notes.md"}"#.into(),
+        },
+    );
+    assert_eq!(
+        requested.lock().unwrap().as_slice(),
+        [RequestedSubagent {
+            agent: "explorer".into(),
+            description: "map the session writer".into(),
+        }]
+    );
+
+    let note = interrupted_turn_note(&requested.lock().unwrap());
+    let timed_out = run_session_attempt_lifecycle_with_terminal_writer(
+        &registry,
+        &mut store,
+        metadata.clone(),
+        "explore the runtime".into(),
+        || Err(CliError::runtime(HeadlessTurnError::TimedOut)),
+        |store, write| {
+            assert_eq!(write.status, agens_core::SessionAttemptStatus::Cancelled);
+
+            write_terminal_attempt(store, write, &note)
+        },
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        timed_out,
+        AttemptLifecycleError::Runtime {
+            partial: Some(_),
+            ..
+        }
+    ));
+    let stored = store.load_session_for_resume(metadata.id).unwrap();
+    let [_, Message { parts, .. }] = stored.messages.as_slice() else {
+        panic!("expected a prompt and a note, got {:?}", stored.messages);
+    };
+    let [MessagePart::Text(note)] = parts.as_slice() else {
+        panic!("expected a single note part, got {parts:?}");
+    };
+
+    assert!(note.contains("interrupted"), "{note:?}");
+    assert!(!note.to_ascii_lowercase().contains("cancel"), "{note:?}");
+    assert!(note.contains("explorer"), "{note:?}");
+    assert!(note.contains("map the session writer"), "{note:?}");
+    assert!(
+        OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
+            "test-key".into(),
+            None,
+            "gpt-5.5".into(),
+            stored.messages,
+            Vec::new(),
+            std::time::Duration::from_secs(1),
+        )
+        .is_ok()
+    );
+
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -18217,7 +18688,7 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
         terminal_metadata.clone(),
         "terminal retry prompt".into(),
         || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
-        |_, _, _, _| Err(()),
+        |_, _| Err(()),
     )
     .unwrap_err();
     let terminal = store
@@ -18228,7 +18699,7 @@ fn explicit_attempt_recovery_is_exact_stale_safe_and_history_preserving() {
 
     assert_eq!(
         terminal_error,
-        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+        AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
     );
     assert_eq!(terminal.status(), agens_core::SessionAttemptStatus::Running);
     assert!(!registry.contains(terminal.key()));
@@ -18297,7 +18768,7 @@ fn reliability_integration_bounds_recovers_attempts_and_sanitizes_failures() {
 
     assert_eq!(
         failure,
-        AttemptLifecycleError::Runtime(CliError::runtime(HeadlessTurnError::ProviderServer))
+        AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::ProviderServer))
     );
     assert!(failed.messages.is_empty());
     assert_eq!(
