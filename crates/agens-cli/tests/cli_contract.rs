@@ -940,16 +940,19 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    \n  auth      \n  chat      \n  models    \n  sessions  \n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  sessions  inspect completed turns\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")
     }
 
-    pub(crate) const CONFIG_HELP: &str = "Usage: config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = "Usage: config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const AUTH_HELP: &str = "Usage: auth [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const CHAT_HELP: &str = "Usage: chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
+    pub(crate) const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    /// `config` with no subcommand renders byte-identical to `config --help`:
+    /// clap treats a required subcommand group with nothing supplied the
+    /// same as an explicit help request.
+    pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = CONFIG_HELP;
+    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CHAT_HELP: &str = "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
     /// D1: `chat foo --help` is Usage(2) today (`--help` here is read as an
     /// unrecognized flag, not as a request for help). Under clap, the same
     /// leftover-token loop still classifies `--help` here as an unknown
@@ -958,8 +961,9 @@ mod parser_surface_baseline {
     /// Usage(2) with the same body-owned message: NO delta observed here,
     /// unlike what the design anticipated.
     pub(crate) const CHAT_FOO_HELP_MESSAGE: &str = "chat received an unknown flag";
-    pub(crate) const MODELS_HELP: &str = "Usage: models\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const SESSIONS_HELP: &str = "Usage: sessions [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const MODELS_HELP: &str =
+        "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
 
     /// clap's rendering embeds the offending token, so this can no longer be
     /// a single shared literal the way the hand-rolled parser's one static
@@ -980,7 +984,7 @@ mod parser_surface_baseline {
         )
     }
 
-    pub(crate) const MODELS_EXTRA_MESSAGE: &str = "error: unexpected argument 'extra' found\n\nUsage: models\n\nFor more information, try '--help'.\n";
+    pub(crate) const MODELS_EXTRA_MESSAGE: &str = "error: unexpected argument 'extra' found\n\nUsage: agens models\n\nFor more information, try '--help'.\n";
     pub(crate) const CHAT_MODEL_MISSING_VALUE_MESSAGE: &str = "error: a value is required for '--model <MODEL>' but none was supplied\n\nFor more information, try '--help'.\n";
     /// Unlike the other clap-owned cases above, this stays a body-owned
     /// message: `ChatArgs.prompt` is an unbounded `Vec<String>` (see

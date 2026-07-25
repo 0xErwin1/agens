@@ -497,7 +497,7 @@ fn help_and_version_are_successful_without_bootstrapping_configuration() {
     assert!(
         chat_help
             .stdout
-            .starts_with("Usage: chat [OPTIONS] [PROMPT]...\n")
+            .contains("Usage: agens chat [OPTIONS] [PROMPT]...\n")
     );
     assert_eq!(version.status, ExitStatus::Success);
     assert_eq!(version.stdout, "agens 0.1.0\n");
@@ -1038,7 +1038,7 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
         let result = execute(arguments, &dependencies);
 
         assert_eq!(result.status, ExitStatus::Success, "{arguments:?}");
-        assert!(result.stdout.starts_with("Usage: "), "{arguments:?}");
+        assert!(result.stdout.contains("Usage: agens "), "{arguments:?}");
     }
 }
 

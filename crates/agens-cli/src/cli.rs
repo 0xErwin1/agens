@@ -23,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "agens",
+    bin_name = "agens",
     version,
     no_binary_name = true,
     about = "Agens is a coding agent CLI"
@@ -37,16 +38,21 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    #[command(about = "inspect configuration")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    #[command(about = "inspect supported authentication")]
     Auth {
         #[arg(allow_hyphen_values = true)]
         arguments: Vec<String>,
     },
+    #[command(about = "run a headless agent turn")]
     Chat(ChatArgs),
+    #[command(about = "list provider models")]
     Models,
+    #[command(about = "inspect completed turns")]
     Sessions {
         #[arg(allow_hyphen_values = true)]
         arguments: Vec<String>,
