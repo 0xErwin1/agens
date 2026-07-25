@@ -9,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{DisplayMode, ExpandMode, RolePalette};
+use super::{DisplayMode, ExpandMode, RolePalette, StatusGlyph};
 
 /// Columns reserved by the shared transcript gutter: one bullet cell plus one
 /// separator cell.
@@ -17,6 +17,68 @@ use super::{DisplayMode, ExpandMode, RolePalette};
 /// Every transcript row spends them, whether or not it carries a bullet, so a
 /// row's content column never depends on its kind or lifecycle state.
 pub(crate) const GUTTER_WIDTH: usize = 2;
+
+/// Column every transcript row reserves for its accent bar, left of the gutter.
+///
+/// It is carved out of the transcript's existing chrome padding, so introducing
+/// the bar moves neither the bullet nor the content column.
+pub(crate) const ACCENT_WIDTH: usize = 1;
+
+/// Left accent bar marking the rows of a live or consequential block.
+///
+/// Membership is per block kind, not per role: a row without an accent leaves
+/// the column blank. Motion is colour-only, so the bar never changes a row's
+/// shape as ticks advance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RowAccent {
+    /// Full bar whose brightness breathes down the block.
+    Wave(Color),
+    /// Full bar held at its own colour.
+    Still(Color),
+    /// Thin dimmed bar standing in for a collapsed groupable run.
+    Collapsed(Color),
+}
+
+impl RowAccent {
+    const BAR: &'static str = "┃";
+    const THIN_BAR: &'static str = "❙";
+    /// Brightness percentages the wave cycles through, in travel order.
+    const WAVE_LEVELS: [u16; 4] = [100, 84, 68, 84];
+    const COLLAPSED_LEVEL: u16 = 50;
+    /// Spinner periods one wave frame holds.
+    ///
+    /// The bar rides the surface's single tick clock and only slows it down:
+    /// three periods land near four frames per second, which reads as breathing
+    /// instead of strobing.
+    const WAVE_PERIODS: u128 = 3;
+
+    /// Bar painted for the `row`-th line of its block under the tick clock.
+    pub(crate) fn span(self, row: usize, now: Duration) -> Span<'static> {
+        let (glyph, color) = match self {
+            Self::Wave(color) => (Self::BAR, scaled(color, Self::wave_level(row, now))),
+            Self::Still(color) => (Self::BAR, color),
+            Self::Collapsed(color) => (Self::THIN_BAR, scaled(color, Self::COLLAPSED_LEVEL)),
+        };
+        Span::styled(glyph, Style::default().fg(color))
+    }
+
+    fn wave_level(row: usize, now: Duration) -> u16 {
+        let frame = now.as_millis() / (StatusGlyph::FRAME_PERIOD_MS * Self::WAVE_PERIODS);
+        let index = (frame as usize).wrapping_add(row) % Self::WAVE_LEVELS.len();
+        Self::WAVE_LEVELS[index]
+    }
+}
+
+/// `color` held at `percent` of its own brightness; a non-RGB color has no scale.
+fn scaled(color: Color, percent: u16) -> Color {
+    let scale = |channel: u8| {
+        u8::try_from(u16::from(channel).saturating_mul(percent) / 100).unwrap_or(u8::MAX)
+    };
+    match color {
+        Color::Rgb(red, green, blue) => Color::Rgb(scale(red), scale(green), scale(blue)),
+        other => other,
+    }
+}
 
 /// Lifecycle a transcript bullet encodes through its colour alone.
 ///
@@ -75,11 +137,12 @@ impl RowBullet {
 }
 
 /// One presentation row within a [`BlockContent`], carrying its optional gutter
-/// bullet, optional row background (diff insert/delete highlighting) and
-/// whether it may be folded into a verb-group summary.
+/// bullet, optional accent bar, optional row background (diff insert/delete
+/// highlighting) and whether it may be folded into a verb-group summary.
 pub(crate) struct BlockLine {
     pub(crate) line: Line<'static>,
     pub(crate) bullet: Option<RowBullet>,
+    pub(crate) accent: Option<RowAccent>,
     // Consumed by the S2 diff painter; not yet read by the row painter.
     #[allow(dead_code)]
     pub(crate) background: Option<Color>,
@@ -93,6 +156,7 @@ impl BlockLine {
         Self {
             line,
             bullet: None,
+            accent: None,
             background: None,
             groupable: true,
         }
@@ -104,6 +168,12 @@ impl BlockLine {
             bullet: Some(bullet),
             ..Self::new(line)
         }
+    }
+
+    /// Row carrying `accent` in the transcript's accent column.
+    pub(crate) fn accented(mut self, accent: Option<RowAccent>) -> Self {
+        self.accent = accent;
+        self
     }
 }
 
@@ -163,6 +233,18 @@ impl ThinkingBlock {
             ExpandMode::Collapsed
         } else {
             ExpandMode::Expanded
+        }
+    }
+
+    /// Accent bar the reasoning rows carry.
+    ///
+    /// A visible body breathes while it streams and holds still once the reader
+    /// pinned it open; a hidden thought is finished chrome and carries none.
+    pub(crate) const fn accent(mode: ExpandMode) -> Option<RowAccent> {
+        match mode {
+            ExpandMode::Streaming => Some(RowAccent::Wave(RolePalette::thinking())),
+            ExpandMode::Expanded => Some(RowAccent::Still(RolePalette::thinking())),
+            ExpandMode::Collapsed => None,
         }
     }
 
@@ -568,26 +650,48 @@ pub(crate) struct ToolCallBlock<'a> {
     pub(crate) state: RowState,
 }
 
+impl ToolCallBlock<'_> {
+    /// Accent bar every row of the call carries.
+    ///
+    /// A pending call breathes. A settled read-family call drops the bar and
+    /// leaves its outcome to the bullet colour, while a settled destructive or
+    /// opaque call keeps a still bar so it stays scannable after the fact.
+    fn row_accent(&self) -> Option<RowAccent> {
+        match self.state {
+            RowState::Running => Some(RowAccent::Wave(RolePalette::accent_active())),
+            _ if tool_input_groupable(self.parsed) => None,
+            state => Some(RowAccent::Still(state.color())),
+        }
+    }
+}
+
 impl BlockContent for ToolCallBlock<'_> {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
+        let accent = self.row_accent();
         let mut lines = Vec::new();
         if let Some(batch) = self.batch {
-            lines.push(BlockLine::with_bullet(
-                Line::from(Span::styled(
-                    format!("Tools · batch {batch}"),
-                    Style::default()
-                        .fg(RolePalette::tool())
-                        .add_modifier(Modifier::BOLD),
-                )),
-                RowBullet::Group(self.state),
-            ));
+            lines.push(
+                BlockLine::with_bullet(
+                    Line::from(Span::styled(
+                        format!("Tools · batch {batch}"),
+                        Style::default()
+                            .fg(RolePalette::tool())
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    RowBullet::Group(self.state),
+                )
+                .accented(accent),
+            );
         }
-        lines.push(BlockLine::with_bullet(
-            tool_header(self.parsed, self.content_width),
-            RowBullet::Activity(self.state),
-        ));
+        lines.push(
+            BlockLine::with_bullet(
+                tool_header(self.parsed, self.content_width),
+                RowBullet::Activity(self.state),
+            )
+            .accented(accent),
+        );
         if mode == DisplayMode::Expanded {
-            lines.push(BlockLine::new(ToolRow::args(self.input)));
+            lines.push(BlockLine::new(ToolRow::args(self.input)).accented(accent));
         }
         lines
     }
@@ -615,20 +719,28 @@ pub(crate) struct ToolResultBlock {
     pub(crate) collapsed_body: Vec<Line<'static>>,
     pub(crate) full_body: Vec<Line<'static>>,
     pub(crate) accent: Color,
+    /// Whether the call this result closes belongs to the foldable read family;
+    /// both halves of a call must agree so a result never accents a run its own
+    /// call row left bare.
+    pub(crate) groupable: bool,
 }
 
 impl BlockContent for ToolResultBlock {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
-        let mut lines = vec![BlockLine::with_bullet(
-            self.footer.clone(),
-            RowBullet::Rail(self.accent),
-        )];
+        let accent = (!self.groupable).then_some(RowAccent::Still(self.accent));
+        let mut lines = vec![
+            BlockLine::with_bullet(self.footer.clone(), RowBullet::Rail(self.accent))
+                .accented(accent),
+        ];
         let body = match mode {
             DisplayMode::Collapsed => self.collapsed_body.clone(),
             DisplayMode::Truncated => bounded_preview(&self.full_body),
             DisplayMode::Expanded => self.full_body.clone(),
         };
-        lines.extend(body.into_iter().map(BlockLine::new));
+        lines.extend(
+            body.into_iter()
+                .map(|line| BlockLine::new(line).accented(accent)),
+        );
         lines
     }
 
@@ -650,7 +762,7 @@ impl BlockContent for ToolResultBlock {
     }
 
     fn is_groupable(&self) -> bool {
-        false
+        self.groupable
     }
 }
 
@@ -992,6 +1104,7 @@ mod tests {
             collapsed_body: vec![ToolRow::collapsed_output()],
             full_body,
             accent: RolePalette::tool(),
+            groupable: false,
         };
 
         let truncated = block.lines(DisplayMode::Truncated);
@@ -1066,6 +1179,7 @@ mod tests {
             collapsed_body: vec![ToolRow::collapsed_output()],
             full_body: vec![Line::from("full output")],
             accent: RolePalette::tool(),
+            groupable: false,
         };
         assert_eq!(block.mode_on_finish(), DisplayMode::Collapsed);
         assert!(!block.is_groupable());
@@ -1081,6 +1195,138 @@ mod tests {
         assert_eq!(line_text(&expanded[1].line), "full output");
     }
 
+    fn call_accents(
+        parsed: &ToolInput,
+        state: RowState,
+        mode: DisplayMode,
+    ) -> Vec<Option<RowAccent>> {
+        ToolCallBlock {
+            input: "{}",
+            parsed,
+            batch: Some(1),
+            content_width: 80,
+            state,
+        }
+        .lines(mode)
+        .iter()
+        .map(|row| row.accent)
+        .collect()
+    }
+
+    #[test]
+    fn accent_membership_follows_the_block_kind_and_its_lifecycle() {
+        let read = ToolInput::Read {
+            path: "a.rs".into(),
+        };
+        let bash = ToolInput::Bash {
+            command: "cargo check".into(),
+        };
+        let running = Some(RowAccent::Wave(RolePalette::accent_active()));
+
+        for parsed in [&read, &bash] {
+            assert_eq!(
+                call_accents(parsed, RowState::Running, DisplayMode::Expanded),
+                vec![running; 3],
+                "every row of a pending call breathes: {parsed:?}"
+            );
+        }
+
+        assert_eq!(
+            call_accents(&read, RowState::Success, DisplayMode::Expanded),
+            vec![None; 3],
+            "a settled read leaves its outcome to the bullet"
+        );
+        assert_eq!(
+            call_accents(&bash, RowState::Failure, DisplayMode::Truncated),
+            vec![Some(RowAccent::Still(RolePalette::error())); 2],
+            "a settled destructive call keeps a still bar in its own colour"
+        );
+
+        let result = |groupable| ToolResultBlock {
+            footer: ToolRow::result_footer("read", "Success", RolePalette::success(), None),
+            collapsed_body: vec![ToolRow::collapsed_output()],
+            full_body: vec![Line::from("body")],
+            accent: RolePalette::success(),
+            groupable,
+        };
+        assert_eq!(
+            result(true)
+                .lines(DisplayMode::Expanded)
+                .iter()
+                .map(|row| row.accent)
+                .collect::<Vec<_>>(),
+            vec![None; 2],
+            "a read result agrees with its own bare call row"
+        );
+        assert_eq!(
+            result(false)
+                .lines(DisplayMode::Expanded)
+                .iter()
+                .map(|row| row.accent)
+                .collect::<Vec<_>>(),
+            vec![Some(RowAccent::Still(RolePalette::success())); 2],
+            "a destructive result keeps the bar its call row started"
+        );
+
+        assert_eq!(
+            ThinkingBlock::accent(ExpandMode::Streaming),
+            Some(RowAccent::Wave(RolePalette::thinking()))
+        );
+        assert_eq!(
+            ThinkingBlock::accent(ExpandMode::Expanded),
+            Some(RowAccent::Still(RolePalette::thinking()))
+        );
+        assert_eq!(
+            ThinkingBlock::accent(ExpandMode::Collapsed),
+            None,
+            "a hidden thought is finished chrome and carries no bar"
+        );
+    }
+
+    #[test]
+    fn the_accent_bar_moves_in_colour_only_and_dims_when_collapsed() {
+        let wave = RowAccent::Wave(RolePalette::accent_active());
+        let first = wave.span(0, Duration::ZERO);
+        let later = wave.span(0, Duration::from_millis(240));
+        let travelled = wave.span(1, Duration::ZERO);
+
+        assert_eq!(first.content, later.content, "the glyph never changes");
+        assert_eq!(
+            first.style.fg,
+            Some(RolePalette::accent_active()),
+            "the wave opens on the full accent"
+        );
+        assert_ne!(
+            first.style.fg, later.style.fg,
+            "the bar breathes with ticks"
+        );
+        assert_eq!(
+            later.style.fg, travelled.style.fg,
+            "the wave travels down the block by one row per frame"
+        );
+        assert_eq!(
+            wave.span(0, Duration::from_millis(239)).style.fg,
+            first.style.fg,
+            "a frame holds for three spinner periods"
+        );
+
+        let still = RowAccent::Still(RolePalette::success()).span(0, Duration::from_millis(240));
+        assert_eq!(still.content, first.content);
+        assert_eq!(still.style.fg, Some(RolePalette::success()));
+
+        let collapsed =
+            RowAccent::Collapsed(RolePalette::success()).span(0, Duration::from_millis(240));
+        assert_ne!(
+            collapsed.content, first.content,
+            "a collapsed run gets the thin variant"
+        );
+        assert_eq!(
+            collapsed.style.fg,
+            Some(Color::Rgb(0x55, 0x6c, 0x26)),
+            "the thin bar is held at half its own brightness"
+        );
+    }
+
     #[test]
     fn collapsed_failure_keeps_a_visible_reason_line() {
         let footer = ToolRow::result_footer("bash", "Failure", RolePalette::error(), None);
@@ -1091,6 +1337,7 @@ mod tests {
             )],
             full_body: vec![Line::from("full stderr")],
             accent: RolePalette::error(),
+            groupable: false,
         };
         let collapsed = block.lines(DisplayMode::Collapsed);
         let reason = line_text(&collapsed[1].line);

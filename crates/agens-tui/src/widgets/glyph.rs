@@ -9,7 +9,9 @@ use std::time::Duration;
 pub(crate) struct StatusGlyph;
 
 impl StatusGlyph {
-    const FRAME_PERIOD_MS: u128 = 80;
+    /// Single tick period the whole surface animates on; slower motion derives
+    /// from it by holding a frame for several periods instead of adding a clock.
+    pub(crate) const FRAME_PERIOD_MS: u128 = 80;
     const FRAMES: &'static [&'static str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     const IDLE: &'static str = "·";
 

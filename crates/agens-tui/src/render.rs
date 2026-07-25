@@ -22,8 +22,9 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
-    BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowBullet, RowState,
-    StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow, VerbGroup,
+    ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowAccent,
+    RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow,
+    VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -54,7 +55,7 @@ pub(super) fn conversation_lines(
         events,
         tool_display_modes,
         content_width: usize::from(content_width.max(1))
-            .saturating_sub(GUTTER_WIDTH)
+            .saturating_sub(ACCENT_WIDTH + GUTTER_WIDTH)
             .max(1),
         state,
     };
@@ -72,13 +73,14 @@ pub(super) fn conversation_lines(
         blocks.push(item_block(&context, item));
     }
 
-    paint_blocks(blocks)
+    paint_blocks(blocks, state.now)
 }
 
 /// Shared inputs every conversation item needs to describe its rows.
 ///
-/// `content_width` is already reduced by [`GUTTER_WIDTH`], so a block never has
-/// to know that the transcript reserves leading columns for its bullet.
+/// `content_width` is already reduced by [`ACCENT_WIDTH`] and [`GUTTER_WIDTH`],
+/// so a block never has to know that the transcript reserves leading columns for
+/// its accent bar and bullet.
 struct ItemContext<'a> {
     conversation: &'a Conversation,
     events: &'a [TuiRuntimeEvent],
@@ -110,6 +112,19 @@ impl RenderedBlock {
         }
     }
 
+    /// Block whose rows all carry the same accent bar and no bullet.
+    fn accented(lines: Vec<Line<'static>>, accent: Option<RowAccent>) -> Self {
+        Self {
+            rows: lines
+                .into_iter()
+                .map(|line| BlockLine::new(line).accented(accent))
+                .collect(),
+            packs: false,
+            call_id: None,
+            closes_call: false,
+        }
+    }
+
     /// Block that renders nothing and is therefore transparent to the gap policy.
     fn hidden() -> Self {
         Self::plain(Vec::new())
@@ -128,7 +143,7 @@ struct Neighbour {
 /// separated by exactly one. A tool result never detaches from the call it
 /// closes, even when the user expanded its body. Blocks that render nothing are
 /// transparent, so a hidden item can neither force nor absorb a gap.
-fn paint_blocks(blocks: Vec<RenderedBlock>) -> Vec<Line<'static>> {
+fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut previous: Option<Neighbour> = None;
 
@@ -143,7 +158,13 @@ fn paint_blocks(blocks: Vec<RenderedBlock>) -> Vec<Line<'static>> {
             packs: block.packs,
             call_id: block.call_id,
         });
-        lines.extend(block.rows.into_iter().map(painted_row));
+        lines.extend(
+            block
+                .rows
+                .into_iter()
+                .enumerate()
+                .map(|(row, line)| painted_row(line, row, now)),
+        );
     }
 
     lines
@@ -155,18 +176,40 @@ fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
     !closes_previous && !(previous.packs && block.packs)
 }
 
-/// Paints one row onto the shared gutter: its bullet, or the same width in
-/// blanks so content keeps a single column across every row type.
-fn painted_row(row: BlockLine) -> Line<'static> {
-    if row.bullet.is_none() && row.line.spans.iter().all(|span| span.content.is_empty()) {
+/// Paints one row onto the shared gutter: its accent bar and bullet, or the same
+/// width in blanks so content keeps a single column across every row type.
+///
+/// `row` is the row's index inside its own block, which is what makes the accent
+/// wave travel down a block instead of blinking in unison.
+fn painted_row(row: BlockLine, index: usize, now: Duration) -> Line<'static> {
+    if row.bullet.is_none()
+        && row.accent.is_none()
+        && row.line.spans.iter().all(|span| span.content.is_empty())
+    {
         return Line::default();
     }
 
     let mut spans = vec![
+        row.accent.map_or_else(
+            || Span::raw(" ".repeat(ACCENT_WIDTH)),
+            |accent| accent.span(index, now),
+        ),
         row.bullet
             .map_or_else(|| Span::raw(" ".repeat(GUTTER_WIDTH)), RowBullet::span),
     ];
     spans.extend(row.line.spans);
+    Line::from(spans)
+}
+
+/// Reserves the accent column on a transcript row that no conversation block
+/// owns, so chrome rows keep the same content column as block rows.
+pub(super) fn unaccented_row(line: Line<'static>) -> Line<'static> {
+    if line.spans.iter().all(|span| span.content.is_empty()) {
+        return line;
+    }
+
+    let mut spans = vec![Span::raw(" ".repeat(ACCENT_WIDTH))];
+    spans.extend(line.spans);
     Line::from(spans)
 }
 
@@ -190,14 +233,14 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
         }
         ConversationItem::Reasoning(text) => {
             let mut lines = Vec::new();
-            thinking_lines(
+            let accent = thinking_lines(
                 &mut lines,
                 text,
                 context.state.collapse_thinking,
                 context.state.thinking_streaming,
                 context.content_width,
             );
-            RenderedBlock::plain(lines)
+            RenderedBlock::accented(lines, accent)
         }
         ConversationItem::ToolCall {
             call_id,
@@ -286,6 +329,7 @@ fn tool_result_block(
         collapsed_body,
         full_body: tool_result_body(call_id, output, context.content_width).to_vec(),
         accent: color,
+        groupable: call_is_groupable(context.conversation, call_id),
     };
     let mode = context
         .tool_display_modes
@@ -553,6 +597,10 @@ fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
         .is_some_and(|call| VerbGroup::of(&call.parsed).is_some())
 }
 
+/// Header row standing in for a folded run of read-family calls.
+///
+/// A settled fold is the transcript's only collapsed groupable row, so it wears
+/// the dimmed thin bar; while the run is still live the bar breathes instead.
 fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
     let mut spans = vec![Span::styled(
         group.verb.label(group.count, group.running),
@@ -573,11 +621,17 @@ fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
         ));
     }
 
+    let accent = if group.running {
+        RowAccent::Wave(RolePalette::accent_active())
+    } else {
+        RowAccent::Collapsed(group.state().color())
+    };
+
     RenderedBlock {
-        rows: vec![BlockLine::with_bullet(
-            Line::from(spans),
-            RowBullet::Group(group.state()),
-        )],
+        rows: vec![
+            BlockLine::with_bullet(Line::from(spans), RowBullet::Group(group.state()))
+                .accented(Some(accent)),
+        ],
         packs: true,
         call_id: None,
         closes_call: false,
@@ -802,14 +856,16 @@ fn bounded_visible_tool_output(output: &str) -> String {
     format!("{}{}", &output[..end], VISIBLE_TOOL_OUTPUT_MARKER)
 }
 
+/// Describes the reasoning rows and reports the accent bar they carry.
 fn thinking_lines(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     collapsed: bool,
     streaming: bool,
     content_width: usize,
-) {
-    if ThinkingBlock::mode(streaming, collapsed).shows_body() {
+) -> Option<RowAccent> {
+    let mode = ThinkingBlock::mode(streaming, collapsed);
+    if mode.shows_body() {
         lines.push(ThinkingBlock::title());
         markdown_lines(
             lines,
@@ -821,6 +877,7 @@ fn thinking_lines(
     } else {
         lines.push(ThinkingBlock::collapsed_title(None));
     }
+    ThinkingBlock::accent(mode)
 }
 
 pub(super) fn detail_lines(
@@ -2047,14 +2104,25 @@ mod tests {
         )
     }
 
-    /// Style of the gutter bullet on the row containing `needle`.
+    /// Style of the gutter bullet on the row containing `needle`, which follows
+    /// the accent column every row opens with.
     fn bullet_style(lines: &[Line<'static>], needle: &str) -> Style {
         lines
             .iter()
             .find(|line| line_text(line).contains(needle))
-            .and_then(|line| line.spans.first())
+            .and_then(|line| line.spans.get(1))
             .map(|span| span.style)
             .expect("row should be rendered with a gutter")
+    }
+
+    /// Accent-column span of the row containing `needle`.
+    fn accent_span(lines: &[Line<'static>], needle: &str) -> Span<'static> {
+        lines
+            .iter()
+            .find(|line| line_text(line).contains(needle))
+            .and_then(|line| line.spans.first())
+            .cloned()
+            .expect("row should be rendered with an accent column")
     }
 
     #[test]
@@ -2189,6 +2257,72 @@ mod tests {
     }
 
     #[test]
+    fn accent_bars_mark_live_and_consequential_rows_only() {
+        let running = read_conversation(&["a.rs", "b.rs"]);
+        let live = lines_at(&running, &BTreeMap::new());
+        let bar = accent_span(&live, "Reading 2 files…");
+        assert_eq!(bar.content, "┃");
+        assert_eq!(bar.style.fg, Some(RolePalette::accent_active()));
+        assert_eq!(
+            accent_span(&live, "prompt").content,
+            " ",
+            "a user prompt owns no bar"
+        );
+
+        let mut folded = read_conversation(&["a.rs", "b.rs"]);
+        let mut folded_modes = BTreeMap::new();
+        for path in ["a.rs", "b.rs"] {
+            folded
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: path.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+            folded_modes.insert(path.to_owned(), DisplayMode::Collapsed);
+        }
+        let settled = accent_span(&lines_at(&folded, &folded_modes), "Read 2 files");
+        assert_eq!(
+            settled.content, "❙",
+            "a collapsed groupable run gets the thin variant"
+        );
+        assert_ne!(
+            settled.style.fg,
+            Some(RolePalette::success()),
+            "the thin variant is dimmed against the group's own colour"
+        );
+
+        let mut single = read_conversation(&["c.rs"]);
+        single
+            .apply(crate::ConversationEvent::ToolResult {
+                call_id: "c.rs".into(),
+                output: "ok".into(),
+                is_error: false,
+            })
+            .expect("result should project");
+        single
+            .apply(crate::ConversationEvent::ReasoningDelta("thought".into()))
+            .expect("reasoning should project");
+        let mut single_modes = BTreeMap::new();
+        single_modes.insert("c.rs".to_owned(), DisplayMode::Collapsed);
+        let plain = lines_at(&single, &single_modes);
+
+        assert_eq!(
+            accent_span(&plain, "Read c.rs").content,
+            " ",
+            "a plain finished read carries no bar"
+        );
+        assert_eq!(
+            accent_span(&plain, "read · Success").content,
+            " ",
+            "its result agrees with the call row"
+        );
+        let thinking = accent_span(&plain, "Thinking");
+        assert_eq!(thinking.content, "┃");
+        assert_eq!(thinking.style.fg, Some(RolePalette::thinking()));
+    }
+
+    #[test]
     fn collapsed_groupable_neighbours_pack_and_everything_else_keeps_one_blank_row() {
         let mut conversation = read_conversation(&["a.rs"]);
         conversation
@@ -2271,18 +2405,21 @@ mod tests {
             if text.trim().is_empty() {
                 continue;
             }
-            let indent = text.len() - text.trim_start().len();
-            assert!(
-                indent == 0 || indent == GUTTER_WIDTH,
-                "row {text:?} starts at column {indent}, outside the shared gutter"
-            );
             assert_eq!(
                 line.spans
                     .first()
                     .map(|span| span.content.width())
                     .unwrap_or_default(),
+                ACCENT_WIDTH,
+                "row {text:?} does not open with the accent column"
+            );
+            assert_eq!(
+                line.spans
+                    .get(1)
+                    .map(|span| span.content.width())
+                    .unwrap_or_default(),
                 GUTTER_WIDTH,
-                "row {text:?} does not open with the shared gutter"
+                "row {text:?} does not follow the accent column with the shared gutter"
             );
         }
     }

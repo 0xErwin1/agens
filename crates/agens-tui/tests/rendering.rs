@@ -916,10 +916,11 @@ fn consecutive_reads_render_as_one_group_row_that_settles_into_past_tense() {
     }
 }
 
-/// Columns owned by the shared transcript gutter: the bullet sits at
-/// `CHROME_GUTTER`, its content two columns further right.
+/// Columns owned by the shared transcript gutter: the accent bar sits one column
+/// left of the bullet at `CHROME_GUTTER`, its content two columns further right.
 const BULLET_COLUMN: usize = CHROME_GUTTER as usize;
 const CONTENT_COLUMN: usize = BULLET_COLUMN + 2;
+const ACCENT_COLUMN: usize = BULLET_COLUMN - 1;
 
 /// Transcript content rows, excluding the top border and the bottom scroll label.
 fn transcript_rows(renderer: &RatatuiRenderer<TestBackend>) -> Vec<String> {
@@ -1154,6 +1155,160 @@ fn transcript_bullets_carry_state_in_colour_and_group_headers_own_their_glyph() 
         Color::Rgb(0xf0, 0x71, 0x78),
         "a group with a failure carries the error colour"
     );
+}
+
+#[test]
+fn a_running_row_carries_an_accent_bar_left_of_its_bullet_without_shifting_content() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: "{}".into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo check".into(),
+        },
+    })
+    .unwrap();
+
+    tui.tick(Duration::from_millis(0));
+    renderer.render(tui.view()).unwrap();
+    let first = rendered_text(&renderer);
+    assert_eq!(
+        rendered_column(&renderer, "┃"),
+        ACCENT_COLUMN,
+        "the accent bar owns one column left of the bullet: {first:?}"
+    );
+    assert_eq!(rendered_column(&renderer, "◆"), BULLET_COLUMN);
+    assert_eq!(rendered_column(&renderer, "$ cargo check"), CONTENT_COLUMN);
+    assert_eq!(
+        cell_for_text(&renderer, "┃").fg,
+        Color::Rgb(0x73, 0xd0, 0xff),
+        "a running bar opens on the full active accent: {first:?}"
+    );
+
+    let bar_row = rendered_row(&renderer, "┃");
+    let shape = rendered_line(&renderer, bar_row);
+    tui.tick(Duration::from_millis(240));
+    renderer.render(tui.view()).unwrap();
+    assert_eq!(
+        rendered_line(&renderer, bar_row),
+        shape,
+        "the row keeps one shape across ticks; only the accent colour moves"
+    );
+    assert_ne!(
+        cell_for_text(&renderer, "┃").fg,
+        Color::Rgb(0x73, 0xd0, 0xff),
+        "the running bar breathes with the shared tick clock"
+    );
+}
+
+#[test]
+fn finished_read_rows_drop_the_accent_bar_while_a_folded_group_dims_it() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "{}".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "Cargo.toml".into(),
+        },
+    })
+    .unwrap();
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "read-1".into(),
+        output: "ok".into(),
+        is_error: false,
+    })
+    .unwrap();
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("done".into()));
+
+    renderer.render(tui.view()).unwrap();
+    let settled = rendered_text(&renderer);
+    let read_row = rendered_row(&renderer, "Read Cargo.toml");
+    let read_line = rendered_line(&renderer, read_row);
+    assert!(
+        !settled.contains('┃') && !settled.contains('❙'),
+        "a plain finished read carries no accent bar: {settled:?}"
+    );
+    assert_eq!(
+        read_line.chars().nth(ACCENT_COLUMN),
+        Some(' '),
+        "the accent column stays blank: {read_line:?}"
+    );
+    assert_eq!(
+        rendered_column(&renderer, "Read Cargo.toml"),
+        CONTENT_COLUMN
+    );
+
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    for path in ["src/a.rs", "src/b.rs"] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: path.into(),
+            name: "native::read".into(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Read { path: path.into() },
+        })
+        .unwrap();
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: path.into(),
+            output: "ok".into(),
+            is_error: false,
+        })
+        .unwrap();
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("done".into()));
+    renderer.render(tui.view()).unwrap();
+    let folded = rendered_text(&renderer);
+
+    assert!(folded.contains("Read 2 files"), "{folded:?}");
+    assert_eq!(
+        rendered_column(&renderer, "❙"),
+        ACCENT_COLUMN,
+        "a collapsed groupable run keeps the thin bar in the accent column: {folded:?}"
+    );
+    let Color::Rgb(red, green, blue) = cell_for_text(&renderer, "❙").fg else {
+        panic!("the accent bar is painted in RGB: {folded:?}");
+    };
+    assert!(
+        red < 0xaa && green < 0xd9 && blue < 0x4c,
+        "the collapsed bar is dimmed against the group's own colour: {red:x} {green:x} {blue:x}"
+    );
+}
+
+#[test]
+fn accented_rows_render_without_panicking_on_small_terminals() {
+    for (width, height) in [(1_u16, 1_u16), (2, 3), (6, 5), (10, 8), (24, 12), (40, 20)] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize { width, height });
+        tui.begin_submission("inspect");
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: "bash-1".into(),
+            name: "native::bash".into(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Bash {
+                command: "cargo check".into(),
+            },
+        })
+        .unwrap();
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+            "thinking body".into(),
+        )));
+        tui.tick(Duration::from_millis(240));
+
+        renderer.render(tui.view()).unwrap();
+        assert_eq!(
+            rendered_text(&renderer).chars().count(),
+            usize::from(width) * usize::from(height),
+            "{width}x{height}"
+        );
+    }
 }
 
 #[test]

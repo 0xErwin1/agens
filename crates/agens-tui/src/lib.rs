@@ -60,6 +60,12 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
+/// Chrome padding left of a transcript row, once the row itself spends
+/// [`widgets::ACCENT_WIDTH`] on its accent column.
+///
+/// The accent bar is carved out of the indent instead of added to it, so bullets
+/// and content keep the screen columns they had before the bar existed.
+const TRANSCRIPT_ROW_INDENT: u16 = TRANSCRIPT_CONTENT_INDENT - widgets::ACCENT_WIDTH as u16;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
 const PROGRESS_CHANNEL_BUDGET: usize = 32;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1078,14 +1084,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let notice = notice_spans(&state);
     let layout = screen_layout(area, state.input, !notice.is_empty());
 
-    let transcript_width = layout
+    let row_width = layout
         .transcript
         .width
-        .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
-    let transcript = SelectableTranscript::from_lines(
-        &rendered_transcript(&state, transcript_width),
-        transcript_width,
-    );
+        .saturating_sub(TRANSCRIPT_ROW_INDENT);
+    let transcript =
+        SelectableTranscript::from_lines(&rendered_transcript(&state, row_width), row_width);
     let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
     let bottom_scroll = saturating_u16(transcript.rows.len().saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
@@ -1104,7 +1108,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .block(
                     Block::default()
                         .borders(Borders::TOP)
-                        .padding(Padding::left(TRANSCRIPT_CONTENT_INDENT))
+                        .padding(Padding::left(TRANSCRIPT_ROW_INDENT))
                         .border_style(Style::default().fg(Color::DarkGray))
                         .title_bottom(Span::styled(
                             scroll_label,
@@ -2126,8 +2130,13 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     lines
 }
 
-fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'static>> {
-    let mut transcript = transcript_provenance(state);
+/// Every transcript row, each already carrying the accent column it owns.
+///
+/// `row_width` counts that column: chrome rows that no conversation block
+/// describes are padded through [`render::unaccented_row`] so their content
+/// keeps the same screen column as block rows.
+fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
+    let mut transcript = chrome_rows(transcript_provenance(state));
     let thinking_streaming = state.running;
     transcript.extend(
         state
@@ -2138,7 +2147,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
                     conversation,
                     &[],
                     state.tool_display_modes,
-                    content_width,
+                    row_width,
                     render::ConversationRenderState {
                         collapse_thinking: state.collapse_thinking,
                         thinking_streaming: false,
@@ -2154,7 +2163,7 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
             conversation,
             state.runtime_events,
             state.tool_display_modes,
-            content_width,
+            row_width,
             render::ConversationRenderState {
                 collapse_thinking: state.collapse_thinking,
                 thinking_streaming,
@@ -2166,14 +2175,14 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
     let conversation_is_authoritative =
         !state.completed_conversations.is_empty() || state.conversation.is_some();
     if !conversation_is_authoritative {
-        transcript = transcript_lines(state.transcript);
+        transcript = chrome_rows(transcript_lines(state.transcript));
     }
-    transcript.extend(render::detail_lines(
+    transcript.extend(chrome_rows(render::detail_lines(
         state.runtime_events,
         conversation_is_authoritative,
-    ));
+    )));
     if state.running {
-        transcript.push(render::turn_status_line(
+        transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
                 label: turn_state_label(state.turn_state, state.running, state.session_loading),
                 now: state.now,
@@ -2184,10 +2193,15 @@ fn rendered_transcript(state: &ViewState<'_>, content_width: u16) -> Vec<Line<'s
                     .latest_usage
                     .and_then(|usage| usage.total_tokens.or(usage.output_tokens)),
             },
-            usize::from(content_width.max(1)),
-        ));
+            usize::from(row_width.max(1)).saturating_sub(widgets::ACCENT_WIDTH),
+        )));
     }
     transcript
+}
+
+/// Reserves the accent column on transcript rows that no conversation block owns.
+fn chrome_rows(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    lines.into_iter().map(render::unaccented_row).collect()
 }
 
 #[derive(Clone, Debug)]
@@ -3928,10 +3942,7 @@ where
         let view = self.view();
         let layout = self.screen_layout();
         let content_y = layout.transcript.y.saturating_add(1);
-        let content_x = layout
-            .transcript
-            .x
-            .saturating_add(TRANSCRIPT_CONTENT_INDENT);
+        let content_x = layout.transcript.x.saturating_add(TRANSCRIPT_ROW_INDENT);
         if row < content_y
             || row >= layout.transcript.bottom()
             || column < content_x
@@ -3940,15 +3951,13 @@ where
             return None;
         }
 
-        let content_width = layout
+        let row_width = layout
             .transcript
             .width
-            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        let transcript = SelectableTranscript::from_lines(
-            &rendered_transcript(&view, content_width),
-            content_width,
-        );
+        let transcript =
+            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
         let bottom = saturating_u16(
             transcript
                 .rows
@@ -3967,12 +3976,12 @@ where
     fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
         let view = self.view();
         let layout = self.screen_layout();
-        let content_width = layout
+        let row_width = layout
             .transcript
             .width
-            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        SelectableTranscript::from_lines(&rendered_transcript(&view, content_width), content_width)
+        SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width)
             .selected_text(selection)
     }
 
@@ -4513,13 +4522,13 @@ where
     fn max_scroll_offset(&self) -> u16 {
         let layout = self.screen_layout();
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
-        let content_width = layout
+        let row_width = layout
             .transcript
             .width
-            .saturating_sub(TRANSCRIPT_CONTENT_INDENT);
+            .saturating_sub(TRANSCRIPT_ROW_INDENT);
         let transcript = SelectableTranscript::from_lines(
-            &rendered_transcript(&self.view(), content_width),
-            content_width,
+            &rendered_transcript(&self.view(), row_width),
+            row_width,
         );
         saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
     }
@@ -5105,12 +5114,12 @@ where
 
     fn jump_to_user_message(&mut self, previous: bool) {
         let layout = self.screen_layout();
-        let content_width = layout
+        let row_width = layout
             .transcript
             .width
-            .saturating_sub(TRANSCRIPT_CONTENT_INDENT)
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
             .max(1);
-        let lines = rendered_transcript(&self.view(), content_width);
+        let lines = rendered_transcript(&self.view(), row_width);
         let mut user_offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
@@ -5119,10 +5128,10 @@ where
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            if text.starts_with('❯') {
+            if text.trim_start().starts_with('❯') {
                 user_offsets.push(saturating_u16(row));
             }
-            row += line.width().div_ceil(usize::from(content_width)).max(1);
+            row += line.width().div_ceil(usize::from(row_width)).max(1);
         }
         if user_offsets.is_empty() {
             return;
@@ -7245,6 +7254,28 @@ mod runtime_tests {
                 < scroll_offset
         );
         assert_eq!(tui.selected_text(), selection.as_deref());
+    }
+
+    #[test]
+    fn user_message_jumps_still_find_the_prompt_row_behind_the_accent_column() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 48,
+            height: 12,
+        });
+        for turn in ["first-anchor", "second-anchor"] {
+            tui.begin_submission(turn);
+            tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+                "body\n".repeat(40),
+            )));
+            tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+        }
+
+        tui.handle(Event::Key(Key::CtrlN));
+        assert!(
+            tui.view().scroll_offset > 0,
+            "a prompt row is reachable even though the accent column precedes its glyph"
+        );
     }
 
     #[test]
