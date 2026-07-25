@@ -1199,6 +1199,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             Paragraph::new(Text::from(fitted_subagent_tree_lines(
                 &state,
                 layout.tree.height,
+                layout.tree.width,
             ))),
             layout.tree,
         );
@@ -1896,10 +1897,14 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'st
 /// already ranks running executions before finished ones, so elision keeps live
 /// work visible. The affordance row always closes the tree and reports how many
 /// branches it hides.
-fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'static>> {
+///
+/// The tree is painted without wrapping, so every label is bounded to the
+/// columns left of it by its own rail and glyph.
+fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> Vec<Line<'static>> {
     if state.executions.is_empty() || rows == 0 {
         return Vec::new();
     }
+    let width = usize::from(width);
 
     let body = usize::from(rows).saturating_sub(1);
     let branches = state
@@ -1913,17 +1918,23 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'sta
     let mut lines = Vec::new();
     if spare > 0 {
         lines.push(Line::from(Span::styled(
-            "Main".to_owned(),
+            render::bounded_single_line("Main", width),
             tree_row_style(state, TranscriptId::Main),
         )));
     }
     let backgroundable = branches
         .iter()
         .any(|execution| execution.state == TuiExecutionState::ForegroundRunning);
-    lines.extend(tree_branch_lines(state, &branches, spare.saturating_sub(1)));
+    lines.extend(tree_branch_lines(
+        state,
+        &branches,
+        spare.saturating_sub(1),
+        width,
+    ));
     lines.push(tree_affordance_line(
         state.executions.len().saturating_sub(branches.len()),
         backgroundable,
+        width,
     ));
     lines
 }
@@ -1932,23 +1943,31 @@ fn tree_branch_lines(
     state: &ViewState<'_>,
     branches: &[&TuiExecution],
     activity_rows: usize,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut activity_budget = activity_rows.min(MAX_TREE_ACTIVITIES);
 
     for (index, execution) in branches.iter().enumerate() {
         let last = index + 1 == branches.len();
+        let rail = if last { "└─ " } else { "├─ " };
+        let glyph = format!("{} ", execution_state_glyph(execution.state));
         lines.push(Line::from(vec![
             Span::styled(
-                if last { "└─ " } else { "├─ " }.to_owned(),
+                rail.to_owned(),
                 Style::default().fg(widgets::RolePalette::chrome()),
             ),
             Span::styled(
-                format!("{} ", execution_state_glyph(execution.state)),
+                glyph.clone(),
                 Style::default().fg(execution_state_color(execution.state)),
             ),
             Span::styled(
-                tree_execution_label(execution, state.now),
+                render::bounded_single_line(
+                    &tree_execution_label(execution, state.now),
+                    width
+                        .saturating_sub(rail.width())
+                        .saturating_sub(glyph.width()),
+                ),
                 tree_row_style(state, TranscriptId::Subagent(execution.id)),
             ),
         ]));
@@ -1962,21 +1981,23 @@ fn tree_branch_lines(
         activity_budget = activity_budget.saturating_sub(children.len());
 
         for (child_index, activity) in children.iter().enumerate() {
+            let rail = format!(
+                "{}{}",
+                if last { "   " } else { "│  " },
+                if child_index + 1 == children.len() {
+                    "└─ "
+                } else {
+                    "├─ "
+                }
+            );
+            let glyph = format!("{} ", if activity.running { "●" } else { "✓" });
+            let label_width = width
+                .saturating_sub(rail.width())
+                .saturating_sub(glyph.width());
             lines.push(Line::from(vec![
+                Span::styled(rail, Style::default().fg(widgets::RolePalette::chrome())),
                 Span::styled(
-                    format!(
-                        "{}{}",
-                        if last { "   " } else { "│  " },
-                        if child_index + 1 == children.len() {
-                            "└─ "
-                        } else {
-                            "├─ "
-                        }
-                    ),
-                    Style::default().fg(widgets::RolePalette::chrome()),
-                ),
-                Span::styled(
-                    format!("{} ", if activity.running { "●" } else { "✓" }),
+                    glyph,
                     Style::default().fg(if activity.running {
                         widgets::RolePalette::accent_active()
                     } else {
@@ -1984,7 +2005,7 @@ fn tree_branch_lines(
                     }),
                 ),
                 Span::styled(
-                    activity.label.clone(),
+                    render::bounded_single_line(&activity.label, label_width),
                     Style::default().fg(widgets::RolePalette::muted()),
                 ),
             ]));
@@ -1998,7 +2019,11 @@ fn tree_branch_lines(
 ///
 /// Backgrounding only applies to a branch still running in the foreground, so
 /// the hint is dropped when no shown branch can accept it.
-fn tree_affordance_line(hidden_branches: usize, backgroundable: bool) -> Line<'static> {
+fn tree_affordance_line(
+    hidden_branches: usize,
+    backgroundable: bool,
+    width: usize,
+) -> Line<'static> {
     let text = if hidden_branches > 0 {
         format!("+{hidden_branches} more · Tab to focus")
     } else if backgroundable {
@@ -2007,7 +2032,7 @@ fn tree_affordance_line(hidden_branches: usize, backgroundable: bool) -> Line<'s
         "Tab focus · Enter inspect".to_owned()
     };
     Line::from(Span::styled(
-        text,
+        render::bounded_single_line(&text, width),
         Style::default().fg(widgets::RolePalette::chrome()),
     ))
 }

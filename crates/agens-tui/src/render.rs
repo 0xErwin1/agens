@@ -401,8 +401,10 @@ pub(super) struct TurnStatus<'a> {
 /// Spinner and activity label sit on the left; elapsed time and the real
 /// provider turn-token count are right-aligned. Token counts are never
 /// fabricated — the field is simply absent until the provider reports usage.
+/// The metadata keeps its columns and the label yields, so a narrow terminal
+/// elides the activity name instead of pushing the row past the transcript.
 pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> Line<'static> {
-    let left = StatusGlyph::decorate_status(true, status.label, status.now);
+    let mut left = StatusGlyph::decorate_status(true, status.label, status.now);
     let mut right = String::new();
     if let Some(elapsed) = status.elapsed {
         right.push_str(&elapsed_label(elapsed));
@@ -413,6 +415,16 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
         }
         right.push_str(&format!("{tokens} tok"));
     }
+
+    // The metadata never takes the whole row: the label keeps at least the
+    // spinner cell and the gap that separates the two halves.
+    let right = bounded_single_line(&right, content_width.saturating_sub(2));
+    let label_budget = if right.is_empty() {
+        content_width
+    } else {
+        content_width.saturating_sub(right.width().saturating_add(1))
+    };
+    left = bounded_single_line(&left, label_budget);
 
     let mut spans = vec![Span::styled(
         left.clone(),
@@ -714,20 +726,23 @@ fn subagent_card_block(
     now: Duration,
 ) -> RenderedBlock {
     let mut rows = Vec::new();
-    let agent = title_case(&card.agent);
-    let title_prefix = format!("{agent} · ");
-    let summary_width = content_width.saturating_sub(title_prefix.width()).max(1);
-    let summary = bounded_single_line(&card.task_summary, summary_width);
+    let agent = bounded_single_line(&title_case(&card.agent), content_width);
+    const TITLE_SEPARATOR: &str = " · ";
+    let summary_width = content_width
+        .saturating_sub(agent.width())
+        .saturating_sub(TITLE_SEPARATOR.width());
+    let summary = compact_task_title(&card.task_summary, summary_width);
+    let mut title = vec![Span::styled(
+        agent,
+        Style::default()
+            .fg(RolePalette::tool())
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !summary.is_empty() {
+        title.push(Span::raw(format!("{TITLE_SEPARATOR}{summary}")));
+    }
     rows.push(BlockLine::with_bullet(
-        Line::from(vec![
-            Span::styled(
-                agent,
-                Style::default()
-                    .fg(RolePalette::tool())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(format!(" · {summary}")),
-        ]),
+        Line::from(title),
         RowBullet::Identity("●", subagent_status_color(card.status)),
     ));
 
@@ -751,12 +766,18 @@ fn subagent_card_block(
         .started_at
         .map(|started| card.terminal_at.unwrap_or(now).saturating_sub(started));
     rows.push(BlockLine::new(Line::from(Span::styled(
-        format!("{status} · {presentation}{}", duration_label(elapsed)),
+        bounded_single_line(
+            &format!("{status} · {presentation}{}", duration_label(elapsed)),
+            content_width,
+        ),
         Style::default().fg(subagent_status_color(card.status)),
     ))));
 
     for activity in card.activities.iter().take(3) {
-        rows.push(BlockLine::new(Line::from(format!("· {activity}"))));
+        rows.push(BlockLine::new(Line::from(bounded_single_line(
+            &format!("· {activity}"),
+            content_width,
+        ))));
     }
     let hidden = card.tool_uses.saturating_sub(card.activities.len().min(3));
     if hidden > 0 {
@@ -767,7 +788,7 @@ fn subagent_card_block(
         };
         rows.push(BlockLine::with_bullet(
             Line::from(Span::styled(
-                format!("+{hidden} more {noun}"),
+                bounded_single_line(&format!("+{hidden} more {noun}"), content_width),
                 Style::default().fg(RolePalette::muted()),
             )),
             RowBullet::Group(RowState::Muted),
@@ -798,17 +819,98 @@ fn title_case(value: &str) -> String {
     })
 }
 
-fn bounded_single_line(value: &str, max_width: usize) -> String {
+/// Trailing characters a cut must not leave dangling in front of the ellipsis.
+const DANGLING_CUT_CHARACTERS: [char; 4] = [' ', '·', ',', ';'];
+
+/// `value` collapsed onto one line and bounded to `max_width` display columns.
+///
+/// A value that does not fit is cut on a word boundary and marked with an
+/// ellipsis, so a row the painter cannot wrap never breaks mid-word and never
+/// spills past the columns it was given. A single word wider than the whole
+/// budget is the only case that still cuts inside a word.
+pub(super) fn bounded_single_line(value: &str, max_width: usize) -> String {
     let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut output = String::new();
-    for character in normalized.chars() {
-        let candidate_width = format!("{output}{character}").width();
-        if candidate_width > max_width {
+    if normalized.width() <= max_width {
+        return normalized;
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let budget = max_width - 1;
+    let kept = word_prefix(&normalized, budget);
+    let kept = if kept.is_empty() {
+        take_visible_width(&normalized, budget)
+    } else {
+        kept
+    };
+
+    elided(&kept)
+}
+
+/// Compact title for a task description that may be a whole delegated prompt.
+///
+/// The first sentence stands in for the prompt, because a summary the reader can
+/// scan beats a prefix of the full instruction. A title is prose, so it is cut
+/// only between words: when not even the first word fits, the card shows no
+/// summary rather than a word fragment.
+fn compact_task_title(value: &str, max_width: usize) -> String {
+    let sentence = first_sentence(value).split_whitespace().collect::<Vec<_>>();
+    let normalized = sentence.join(" ");
+    if normalized.width() <= max_width {
+        return normalized;
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let kept = word_prefix(&normalized, max_width - 1);
+    if kept.is_empty() {
+        return String::new();
+    }
+    elided(&kept)
+}
+
+/// Longest whole-word prefix of `value` fitting `max_width` display columns.
+fn word_prefix(value: &str, max_width: usize) -> String {
+    let mut kept = String::new();
+    for word in value.split(' ') {
+        let separator = usize::from(!kept.is_empty());
+        if kept.width() + separator + word.width() > max_width {
             break;
         }
-        output.push(character);
+        if separator == 1 {
+            kept.push(' ');
+        }
+        kept.push_str(word);
     }
-    output
+    kept
+}
+
+/// `kept` marked as a cut, without a dangling separator in front of the ellipsis.
+fn elided(kept: &str) -> String {
+    let mut marked = kept.trim_end_matches(DANGLING_CUT_CHARACTERS).to_owned();
+    marked.push('…');
+    marked
+}
+
+/// Leading sentence of `value`, or all of it when it declares no sentence end.
+///
+/// A terminator only counts when whitespace or the end of the text follows it,
+/// so a version, a decimal or a dotted path does not end a sentence.
+fn first_sentence(value: &str) -> &str {
+    for (index, character) in value.char_indices() {
+        if !matches!(character, '.' | '!' | '?') {
+            continue;
+        }
+        let rest = value
+            .get(index + character.len_utf8()..)
+            .unwrap_or_default();
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return value.get(..index).unwrap_or(value);
+        }
+    }
+    value
 }
 
 fn is_task_tool_name(name: &str) -> bool {
@@ -2447,6 +2549,123 @@ mod tests {
             1,
             "an idle tool body is described once, not once per tick"
         );
+    }
+
+    const LONG_TASK: &str = "Investiga este proyecto sin modificar archivos. Revisa la \
+         estructura, tecnologias usadas, puntos de entrada, scripts disponibles, arquitectura \
+         general, pruebas y documentacion.";
+
+    fn card_conversation(task: &str) -> Conversation {
+        let mut conversation = Conversation::new("delegate");
+        conversation.apply_subagent_summary(
+            crate::TuiSubagentEvent::started(
+                7,
+                "explore",
+                task,
+                crate::TuiExecutionState::ForegroundRunning,
+            ),
+            Duration::ZERO,
+        );
+        for (call_id, name) in [("read-1", "native::read"), ("grep-1", "native::grep")] {
+            conversation.apply_subagent_summary(
+                crate::TuiSubagentEvent::tool_call(7, call_id, name, "{}"),
+                Duration::ZERO,
+            );
+        }
+        conversation
+    }
+
+    #[test]
+    fn bounded_single_line_cuts_on_a_word_boundary_and_marks_the_cut() {
+        assert_eq!(bounded_single_line("alpha bravo", 20), "alpha bravo");
+        assert_eq!(bounded_single_line("alpha  \n bravo", 20), "alpha bravo");
+        assert_eq!(
+            bounded_single_line("alpha bravo charlie", 12),
+            "alpha bravo…"
+        );
+        assert_eq!(
+            bounded_single_line("alpha bravo, charlie", 14),
+            "alpha bravo…"
+        );
+        assert_eq!(bounded_single_line("unbreakablesingleword", 6), "unbre…");
+        assert_eq!(bounded_single_line("alpha bravo", 1), "…");
+        assert_eq!(bounded_single_line("alpha bravo", 0), "");
+
+        for max_width in 1..24usize {
+            let bounded = bounded_single_line("alpha bravo charlie delta", max_width);
+            assert!(
+                bounded.width() <= max_width,
+                "width {max_width}: {bounded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_task_becomes_a_first_sentence_title_cut_on_a_word_boundary() {
+        assert_eq!(
+            compact_task_title(LONG_TASK, 80),
+            "Investiga este proyecto sin modificar archivos",
+            "a card prefers the first sentence over the whole prompt"
+        );
+        assert_eq!(
+            compact_task_title(LONG_TASK, 24),
+            "Investiga este proyecto…",
+            "a first sentence that still overflows is cut on a word boundary"
+        );
+        assert_eq!(
+            compact_task_title("no terminator here", 80),
+            "no terminator here"
+        );
+        assert_eq!(
+            compact_task_title(LONG_TASK, 6),
+            "",
+            "a title never shows a word fragment"
+        );
+        assert_eq!(compact_task_title("  ", 40), "");
+
+        for max_width in 0..48usize {
+            let title = compact_task_title(LONG_TASK, max_width);
+            assert!(title.width() <= max_width, "width {max_width}: {title:?}");
+        }
+    }
+
+    #[test]
+    fn no_subagent_card_row_exceeds_the_columns_it_was_given() {
+        let conversation = card_conversation(LONG_TASK);
+        let card = conversation
+            .subagent_cards
+            .first()
+            .expect("the card should project");
+
+        for content_width in [1usize, 2, 4, 8, 12, 20, 24, 40, 60, 80] {
+            for row in subagent_card_block(card, content_width, Duration::from_secs(3)).rows {
+                assert!(
+                    row.line.width() <= content_width,
+                    "card row {:?} exceeds its {content_width}-column budget",
+                    line_text(&row.line)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_working_indicator_never_outgrows_the_row_it_closes() {
+        for content_width in [4usize, 8, 12, 20, 40, 80] {
+            let line = turn_status_line(
+                TurnStatus {
+                    label: "Loading session…",
+                    now: Duration::ZERO,
+                    elapsed: Some(Duration::from_secs(41)),
+                    tokens: Some(123_456),
+                },
+                content_width,
+            );
+            assert!(
+                line.width() <= content_width,
+                "width {content_width}: {:?}",
+                line_text(&line)
+            );
+        }
     }
 
     #[test]

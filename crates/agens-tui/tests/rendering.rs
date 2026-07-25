@@ -1422,6 +1422,54 @@ fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
     );
 }
 
+/// Long single-line summaries are the transcript's only unwrappable rows, so a
+/// narrow terminal must see them elided rather than sliced mid-word.
+#[test]
+fn narrow_terminals_elide_long_summaries_on_a_word_boundary_instead_of_slicing_them() {
+    const LONG_TASK: &str = "Investiga este proyecto sin modificar archivos. Revisa la \
+         estructura, tecnologias usadas, puntos de entrada, scripts disponibles.";
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(40, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 40,
+        height: 30,
+    });
+    tui.begin_submission("delegate");
+    for (id, agent, task) in [
+        (9_u64, "explore", LONG_TASK),
+        (10, "deep-research-explorer", "task"),
+    ] {
+        tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+            agent: agent.into(),
+            event: TuiExecutionEvent::ForegroundStarted { id },
+        });
+        apply_subagent(
+            &mut tui,
+            TuiSubagentEvent::started(id, agent, task, TuiExecutionState::ForegroundRunning),
+        );
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+    assert!(
+        text.contains("Explore · Investiga este proyecto…"),
+        "the card keeps a first-sentence title elided on a word boundary: {text:?}"
+    );
+    assert!(
+        !text.contains("Revisa"),
+        "the card never dumps the rest of the prompt: {text:?}"
+    );
+    assert!(
+        text.contains("Deep-research-explorer #10…"),
+        "a tree branch label is elided instead of sliced: {text:?}"
+    );
+    assert!(
+        text.contains("Tab focus · Enter inspect…"),
+        "the tree affordance row is elided instead of sliced: {text:?}"
+    );
+}
+
 #[test]
 fn local_info_renders_once_in_the_footer_without_a_conversation_row() {
     let terminal = Terminal::new(TestBackend::new(64, 16)).unwrap();
