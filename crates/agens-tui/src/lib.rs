@@ -525,6 +525,8 @@ pub struct ViewState<'a> {
     pub dialog: Option<&'a DialogView>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
+    /// Open `@` file picker, its typed query, and its current selection.
+    pub file_picker: Option<FilePickerView<'a>>,
     pub agent_catalog: &'a [String],
     pub selected_agent: Option<&'a str>,
     pub executions: Vec<&'a TuiExecution>,
@@ -614,6 +616,38 @@ impl PaletteEntry {
 pub struct PaletteView<'a> {
     entries: &'a [PaletteEntry],
     selected: usize,
+}
+
+/// Open `@` reference: character index of the `@` and the current row selection.
+#[derive(Clone, Copy, Debug)]
+struct FilePicker {
+    anchor: usize,
+    selected: usize,
+}
+
+/// Composer-anchored `@` reference picker: the project files it can insert, the
+/// token typed after the `@`, and the current row selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilePickerView<'a> {
+    candidates: &'a [String],
+    query: &'a str,
+    selected: usize,
+}
+
+impl<'a> FilePickerView<'a> {
+    /// The reference token typed after the `@`, without the `@` itself.
+    pub fn query(&self) -> &'a str {
+        self.query
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Project-relative paths matching the current query, in candidate order.
+    pub fn matches(&self) -> Vec<&'a str> {
+        file_picker_matches(self.candidates, self.query)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1234,6 +1268,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if let Some(palette) = state.palette {
         render_palette(frame, area, layout.composer, state.input, palette);
     }
+
+    if let Some(picker) = state.file_picker {
+        render_file_picker(frame, area, layout.composer, picker);
+    }
 }
 
 fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
@@ -1334,6 +1372,72 @@ fn render_palette(
                     .trim_end()
                     .to_owned(),
             )
+        })
+        .collect();
+
+    let visible = usize::from(layout.content.height);
+    let offset = selected.saturating_sub(visible.saturating_sub(1));
+    widgets::OverlayList::render(frame, layout.content, &rows, offset, rows.len());
+}
+
+const FILE_PICKER_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
+    widgets::OverlayShortcut {
+        key: "↑↓",
+        label: "navigate",
+    },
+    widgets::OverlayShortcut {
+        key: "⏎",
+        label: "insert",
+    },
+    widgets::OverlayShortcut {
+        key: "esc",
+        label: "close",
+    },
+];
+
+fn render_file_picker(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    composer: Rect,
+    picker: FilePickerView<'_>,
+) {
+    let matches = picker.matches();
+    let config = widgets::OverlayConfig {
+        title: "files",
+        tabs: None,
+        shortcuts: &FILE_PICKER_SHORTCUTS,
+        sizing: widgets::OverlaySizing::palette(composer),
+        desired_content_rows: saturating_u16(matches.len().clamp(1, 8)),
+    };
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
+        return;
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+
+    if matches.is_empty() {
+        let empty = [widgets::OverlayRow {
+            dimmed: true,
+            ..widgets::OverlayRow::new("No matching files")
+        }];
+        widgets::OverlayList::render(frame, layout.content, &empty, 0, empty.len());
+        return;
+    }
+
+    let selected = picker.selected().min(matches.len() - 1);
+    let describes = layout.content.width >= PALETTE_DESCRIPTION_MIN_WIDTH;
+    let rows: Vec<widgets::OverlayRow<'_>> = matches
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let (directory, name) = path.rsplit_once('/').unwrap_or(("", path));
+            widgets::OverlayRow {
+                right_label: describes
+                    .then_some(directory)
+                    .filter(|directory| !directory.is_empty())
+                    .map(Cow::Borrowed),
+                selected: index == selected,
+                ..widgets::OverlayRow::new(name)
+            }
         })
         .collect();
 
@@ -2636,6 +2740,8 @@ pub struct Tui<E> {
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
     palette_selected: usize,
+    file_candidates: Vec<String>,
+    file_picker: Option<FilePicker>,
     agent_catalog: Vec<String>,
     selected_agent: Option<String>,
     dangerous_mode: bool,
@@ -2686,6 +2792,8 @@ where
             palette_entries: Vec::new(),
             palette_open: false,
             palette_selected: 0,
+            file_candidates: Vec::new(),
+            file_picker: None,
             agent_catalog: vec!["main".into()],
             selected_agent: None,
             dangerous_mode: false,
@@ -2756,6 +2864,15 @@ where
     pub fn set_palette_entries(&mut self, entries: Vec<PaletteEntry>) {
         self.palette_entries = entries;
         self.clamp_palette_selection();
+    }
+
+    /// Installs the project files the `@` picker can insert.
+    ///
+    /// The composition root enumerates them once, confined to the project root,
+    /// so the picker never touches the filesystem from the render loop.
+    pub fn set_file_candidates(&mut self, candidates: Vec<String>) {
+        self.file_candidates = candidates;
+        self.refresh_file_picker();
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
@@ -3783,6 +3900,11 @@ where
                 entries: &self.palette_entries,
                 selected: self.palette_selected,
             }),
+            file_picker: self.file_picker_query().map(|query| FilePickerView {
+                candidates: &self.file_candidates,
+                query,
+                selected: self.file_picker.map_or(0, |picker| picker.selected),
+            }),
             agent_catalog: &self.agent_catalog,
             selected_agent: self.selected_agent.as_deref(),
             executions: self.executions(),
@@ -4206,15 +4328,23 @@ where
             self.status = None;
         }
 
-        // Esc closes the topmost overlay first (palette before dialog).
-        if key == Key::Escape
-            && widgets::OverlayShell::topmost(
+        // Esc closes the topmost overlay first (palette, then dialog, then picker).
+        if key == Key::Escape {
+            match widgets::OverlayShell::topmost(
                 self.palette_open,
                 self.dialog.as_ref().map(|dialog| dialog.overlay_kind),
-            ) == Some(widgets::OverlayKind::Palette)
-        {
-            self.palette_open = false;
-            return Action::Render;
+                self.file_picker.is_some(),
+            ) {
+                Some(widgets::OverlayKind::Palette) => {
+                    self.palette_open = false;
+                    return Action::Render;
+                }
+                Some(widgets::OverlayKind::FilePicker) => {
+                    self.file_picker = None;
+                    return Action::Render;
+                }
+                _ => {}
+            }
         }
 
         if self
@@ -4225,7 +4355,7 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
-        if !self.palette_open && !self.executions.is_empty() {
+        if !self.palette_open && self.file_picker.is_none() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
                     self.focus_execution_strip();
@@ -4432,6 +4562,14 @@ where
                 self.complete_palette_selection();
                 Action::Render
             }
+            Key::Up | Key::Down if self.file_picker.is_some() => {
+                self.move_file_picker_selection(key == Key::Down);
+                Action::Render
+            }
+            Key::Tab | Key::Enter if self.file_picker.is_some() => {
+                self.complete_file_picker_selection();
+                Action::Render
+            }
             Key::Up | Key::Down | Key::Tab => Action::Render,
             Key::Enter if self.input.is_empty() || self.session_loading => Action::Render,
             Key::Enter if self.active_transcript != TranscriptId::Main => {
@@ -4527,6 +4665,7 @@ where
         }
 
         self.clamp_palette_selection();
+        self.refresh_file_picker();
         self.active_record_mut().focus = TranscriptFocus::Composer;
         Some(Action::Render)
     }
@@ -4650,6 +4789,9 @@ where
         if !self.running && self.input == "/" {
             self.palette_open = true;
             self.palette_selected = 0;
+        }
+        if !self.running && text == "@" {
+            self.open_file_picker();
         }
         self.clamp_palette_selection();
     }
@@ -5065,6 +5207,96 @@ where
         self.palette_selected = 0;
     }
 
+    /// Opens the picker when `@` starts a fresh reference token in the composer.
+    fn open_file_picker(&mut self) {
+        if self.palette_open || self.file_candidates.is_empty() || self.input_cursor == 0 {
+            return;
+        }
+        let anchor = self.input_cursor - 1;
+        let before = byte_index(&self.input, anchor);
+        if anchor > 0
+            && !self.input[..before]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return;
+        }
+        self.file_picker = Some(FilePicker {
+            anchor,
+            selected: 0,
+        });
+    }
+
+    /// The token typed after the `@`, or `None` once the reference no longer holds.
+    fn file_picker_query(&self) -> Option<&str> {
+        let picker = self.file_picker.as_ref()?;
+        if self.input_cursor <= picker.anchor {
+            return None;
+        }
+        let at = byte_index(&self.input, picker.anchor);
+        if !self.input[at..].starts_with('@') {
+            return None;
+        }
+        let query = self.input.get(
+            byte_index(&self.input, picker.anchor + 1)..byte_index(&self.input, self.input_cursor),
+        )?;
+        if query.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(query)
+    }
+
+    fn file_picker_match_count(&self) -> usize {
+        self.file_picker_query().map_or(0, |query| {
+            file_picker_matches(&self.file_candidates, query).len()
+        })
+    }
+
+    /// Closes the picker once its token dissolves and keeps the selection in range.
+    fn refresh_file_picker(&mut self) {
+        if self.file_picker.is_none() {
+            return;
+        }
+        if self.file_picker_query().is_none() {
+            self.file_picker = None;
+            return;
+        }
+        let count = self.file_picker_match_count();
+        if let Some(picker) = self.file_picker.as_mut() {
+            picker.selected = picker.selected.min(count.saturating_sub(1));
+        }
+    }
+
+    fn move_file_picker_selection(&mut self, forward: bool) {
+        let count = self.file_picker_match_count();
+        if count == 0 {
+            return;
+        }
+        if let Some(picker) = self.file_picker.as_mut() {
+            let step = if forward { 1 } else { count - 1 };
+            picker.selected = (picker.selected + step) % count;
+        }
+    }
+
+    /// Replaces the typed token with the selected project-relative path.
+    fn complete_file_picker_selection(&mut self) {
+        let Some(query) = self.file_picker_query().map(str::to_owned) else {
+            self.file_picker = None;
+            return;
+        };
+        let Some(picker) = self.file_picker else {
+            return;
+        };
+        let selected = file_picker_matches(&self.file_candidates, &query)
+            .get(picker.selected)
+            .map(|path| (*path).to_owned());
+        self.file_picker = None;
+        if let Some(path) = selected {
+            self.replace_chars(picker.anchor + 1, self.input_cursor, &path);
+        }
+    }
+
     fn selected_palette_dialog(&self) -> Option<String> {
         let invocation = self.input.strip_prefix('/').unwrap_or(&self.input);
         let arguments = invocation
@@ -5353,6 +5585,19 @@ fn palette_matches<'a>(entries: &'a [PaletteEntry], input: &str) -> Vec<&'a Pale
     entries
         .iter()
         .filter(|entry| entry.name.starts_with(prefix))
+        .collect()
+}
+
+/// Case-insensitive substring match over the project-relative path.
+fn file_picker_matches<'a>(candidates: &'a [String], query: &str) -> Vec<&'a str> {
+    if query.is_empty() {
+        return candidates.iter().map(String::as_str).collect();
+    }
+    let query = query.to_lowercase();
+    candidates
+        .iter()
+        .filter(|candidate| candidate.to_lowercase().contains(&query))
+        .map(String::as_str)
         .collect()
 }
 

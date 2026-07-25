@@ -4095,3 +4095,79 @@ fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_swi
     assert!(sibling.contains("sibling-child-sentinel"), "{sibling:?}");
     assert!(!sibling.contains("expired-child-sentinel"), "{sibling:?}");
 }
+
+#[test]
+fn renderer_draws_the_file_picker_with_the_name_and_its_directory_column() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.add_info("conversation sentinel");
+    tui.set_file_candidates(vec![
+        "AGENTS.md".to_owned(),
+        "crates/agens-cli/src/lib.rs".to_owned(),
+        "crates/agens-tui/src/render.rs".to_owned(),
+    ]);
+
+    renderer.render(tui.view()).unwrap();
+    assert!(rendered_text(&renderer).contains("conversation sentinel"));
+
+    tui.handle(Event::Key(Key::Char('@')));
+    renderer.render(tui.view()).unwrap();
+    let picker = rendered_text(&renderer);
+
+    assert!(picker.contains("files"), "{picker:?}");
+    assert!(picker.contains("[×]"), "{picker:?}");
+    assert!(picker.contains("❯ AGENTS.md"), "{picker:?}");
+    assert!(picker.contains("render.rs"), "{picker:?}");
+    assert!(picker.contains("crates/agens-tui/src"), "{picker:?}");
+    assert!(picker.contains("insert"), "{picker:?}");
+    assert_eq!(
+        rendered_column(&renderer, "crates/agens-cli/src"),
+        rendered_column(&renderer, "crates/agens-tui/src"),
+        "equal-width directories share the right-aligned column"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "crates/agens-tui/src").fg,
+        Color::Rgb(0x5c, 0x67, 0x73)
+    );
+
+    for character in "render".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    renderer.render(tui.view()).unwrap();
+    let filtered = rendered_text(&renderer);
+    assert!(filtered.contains("❯ render.rs"), "{filtered:?}");
+    assert!(!filtered.contains("AGENTS.md"), "{filtered:?}");
+
+    for character in "-missing".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("No matching files"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+}
+
+#[test]
+fn the_file_picker_stays_panic_free_and_exact_on_narrow_terminals() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_file_candidates(
+        (0..40)
+            .map(|index| format!("crates/agens-tui/src/module-{index:02}.rs"))
+            .collect(),
+    );
+    tui.handle(Event::Key(Key::Char('@')));
+    assert!(tui.view().file_picker.is_some());
+
+    for (width, height) in [(1, 1), (2, 3), (8, 4), (12, 6), (34, 10)] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+        renderer.render(tui.view()).unwrap();
+        assert_eq!(
+            rendered_text(&renderer).chars().count(),
+            usize::from(width) * usize::from(height),
+            "file picker at {width}x{height}"
+        );
+    }
+}

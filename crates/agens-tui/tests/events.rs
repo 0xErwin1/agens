@@ -3346,3 +3346,154 @@ fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
     assert_eq!(tui.engine().cancellations, 1);
     assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));
 }
+
+fn file_candidates() -> Vec<String> {
+    vec![
+        "AGENTS.md".to_owned(),
+        "crates/agens-cli/src/lib.rs".to_owned(),
+        "crates/agens-tui/src/lib.rs".to_owned(),
+        "crates/agens-tui/src/render.rs".to_owned(),
+    ]
+}
+
+fn typed(tui: &mut Tui<FakeEngine>, text: &str) {
+    for character in text.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+}
+
+#[test]
+fn an_at_reference_opens_the_file_picker_and_the_typed_token_filters_it() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+
+    tui.handle(Event::Key(Key::Char('@')));
+    let opened = tui.view().file_picker.expect("@ opens the file picker");
+    assert_eq!(opened.query(), "");
+    assert_eq!(opened.matches().len(), 4);
+
+    typed(&mut tui, "tui/src/re");
+    let filtered = tui
+        .view()
+        .file_picker
+        .expect("typing keeps the picker open");
+    assert_eq!(filtered.query(), "tui/src/re");
+    assert_eq!(filtered.matches(), vec!["crates/agens-tui/src/render.rs"]);
+    assert_eq!(tui.input(), "@tui/src/re");
+
+    tui.handle(Event::Key(Key::Backspace));
+    assert_eq!(
+        tui.view()
+            .file_picker
+            .expect("backspace still edits the token")
+            .query(),
+        "tui/src/r"
+    );
+
+    tui.handle(Event::Key(Key::Char(' ')));
+    assert!(
+        tui.view().file_picker.is_none(),
+        "whitespace ends the reference token"
+    );
+}
+
+#[test]
+fn an_at_inside_a_word_never_opens_the_file_picker() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+
+    typed(&mut tui, "mail@example.com");
+
+    assert!(tui.view().file_picker.is_none());
+    assert_eq!(tui.input(), "mail@example.com");
+}
+
+#[test]
+fn selecting_a_file_inserts_its_relative_path_at_the_at_token() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+
+    typed(&mut tui, "review @src/lib");
+    let picker = tui.view().file_picker.expect("the picker is open");
+    assert_eq!(
+        picker.matches(),
+        vec!["crates/agens-cli/src/lib.rs", "crates/agens-tui/src/lib.rs"]
+    );
+
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Render,
+        "Enter inserts the selection instead of submitting"
+    );
+    assert_eq!(tui.input(), "review @crates/agens-tui/src/lib.rs");
+    assert!(tui.view().file_picker.is_none());
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::Submit("review @crates/agens-tui/src/lib.rs".to_owned())
+    );
+}
+
+#[test]
+fn escape_closes_the_file_picker_and_leaves_the_composer_as_typed() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+    typed(&mut tui, "review @src/lib");
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+
+    assert!(tui.view().file_picker.is_none());
+    assert_eq!(tui.input(), "review @src/lib");
+}
+
+#[test]
+fn escape_precedence_still_prefers_the_palette_and_dialogs_over_the_file_picker() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+    tui.set_palette_entries(vec![PaletteEntry::new(
+        "review",
+        "Review the patch",
+        "[scope]",
+        PaletteEntryKind::Command,
+    )]);
+
+    typed(&mut tui, "/review @src");
+    assert!(tui.view().palette.is_some());
+    assert!(
+        tui.view().file_picker.is_none(),
+        "the palette keeps the overlay layer"
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().palette.is_none());
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        None::<String>,
+        vec![DialogEntry::action("Keep", "keep")],
+    ));
+    tui.handle(Event::Key(Key::Char('@')));
+    assert!(
+        tui.view().file_picker.is_none(),
+        "an interactive dialog consumes composer keys"
+    );
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().file_picker.is_none());
+}
+
+#[test]
+fn the_file_picker_takes_navigation_keys_before_the_subagent_strip() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+    start_child(&mut tui, 7);
+    tui.handle(Event::Key(Key::Tab));
+    assert!(tui.view().execution_selection.is_some());
+
+    typed(&mut tui, "@src/lib");
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Enter));
+
+    assert_eq!(tui.input(), "@crates/agens-tui/src/lib.rs");
+}

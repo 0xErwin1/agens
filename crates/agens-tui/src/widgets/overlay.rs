@@ -25,21 +25,29 @@ pub(crate) enum OverlayKind {
     Picker,
     /// Permission (or similar) confirm with short-key answers.
     Confirm,
+    /// Composer-anchored `@` reference picker filtered by the typed token.
+    FilePicker,
 }
 
 /// Shell helpers for overlay kind classification and Confirm short keys.
 pub(crate) struct OverlayShell;
 
 impl OverlayShell {
-    /// Topmost kind: open palette wins over any dialog.
+    /// Topmost kind: open palette wins over any dialog, which wins over the
+    /// composer-anchored file picker.
     pub(crate) const fn topmost(
         palette_open: bool,
         dialog_kind: Option<OverlayKind>,
+        file_picker_open: bool,
     ) -> Option<OverlayKind> {
         if palette_open {
             Some(OverlayKind::Palette)
-        } else {
+        } else if dialog_kind.is_some() {
             dialog_kind
+        } else if file_picker_open {
+            Some(OverlayKind::FilePicker)
+        } else {
+            None
         }
     }
 
@@ -736,19 +744,31 @@ mod tests {
     }
 
     #[test]
-    fn topmost_prefers_palette_over_dialog() {
+    fn topmost_prefers_palette_then_dialog_then_the_file_picker() {
         assert_eq!(
-            OverlayShell::topmost(true, Some(OverlayKind::Confirm)),
+            OverlayShell::topmost(true, Some(OverlayKind::Confirm), false),
             Some(OverlayKind::Palette)
         );
         assert_eq!(
-            OverlayShell::topmost(false, Some(OverlayKind::Picker)),
+            OverlayShell::topmost(false, Some(OverlayKind::Picker), false),
             Some(OverlayKind::Picker)
         );
-        assert_eq!(OverlayShell::topmost(false, None), None);
+        assert_eq!(OverlayShell::topmost(false, None, false), None);
         assert_eq!(
-            OverlayShell::topmost(true, None),
+            OverlayShell::topmost(true, None, false),
             Some(OverlayKind::Palette)
+        );
+        assert_eq!(
+            OverlayShell::topmost(false, None, true),
+            Some(OverlayKind::FilePicker)
+        );
+        assert_eq!(
+            OverlayShell::topmost(true, Some(OverlayKind::Picker), true),
+            Some(OverlayKind::Palette)
+        );
+        assert_eq!(
+            OverlayShell::topmost(false, Some(OverlayKind::Picker), true),
+            Some(OverlayKind::Picker)
         );
     }
 }
