@@ -679,7 +679,7 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     renderer.render(tui.view()).unwrap();
     let streaming = rendered_text(&renderer);
     assert_eq!(streaming.matches("Thinking").count(), 1, "{streaming:?}");
-    assert!(!streaming.contains("Thinking · collapsed"), "{streaming:?}");
+    assert!(!streaming.contains("Thought"), "{streaming:?}");
     assert!(streaming.contains("THOUGHTTOKEN"), "{streaming:?}");
     assert!(!streaming.contains("**"), "{streaming:?}");
     assert!(
@@ -691,7 +691,8 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
-    assert!(collapsed.contains("Thinking · collapsed"), "{collapsed:?}");
+    assert!(collapsed.contains("Thought"), "{collapsed:?}");
+    assert!(!collapsed.contains("Thinking"), "{collapsed:?}");
     assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
     assert!(tui.view().collapse_thinking);
 
@@ -699,10 +700,7 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     renderer.render(tui.view()).unwrap();
     let reexpanded = rendered_text(&renderer);
     assert!(reexpanded.contains("THOUGHTTOKEN"), "{reexpanded:?}");
-    assert!(
-        !reexpanded.contains("Thinking · collapsed"),
-        "{reexpanded:?}"
-    );
+    assert!(!reexpanded.contains("Thought"), "{reexpanded:?}");
     assert!(!tui.view().collapse_thinking);
 
     // Pin: a later finish path must not re-collapse user-expanded thinking.
@@ -928,6 +926,42 @@ fn first_glyph_column(row: &str) -> Option<usize> {
     row.char_indices()
         .find(|(_, glyph)| !glyph.is_whitespace())
         .map(|(index, _)| row[..index].chars().count())
+}
+
+#[test]
+fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "THOUGHTTOKEN body".into(),
+    )));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("Thought"), "{text:?}");
+    assert!(
+        !text.contains("collapsed"),
+        "the collapsed state is the row itself, not a suffix: {text:?}"
+    );
+    assert!(!text.contains("THOUGHTTOKEN"), "{text:?}");
+
+    let thought_row = rendered_row(&renderer, "Thought");
+    assert_eq!(
+        rendered_line(&renderer, thought_row).trim(),
+        "Thought",
+        "no duration is tracked for reasoning, so the bare form renders"
+    );
+    let rows = transcript_rows(&renderer);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("Thought") || row.contains("Thinking"))
+            .count(),
+        1,
+        "collapsed thinking is exactly one row: {rows:?}"
+    );
 }
 
 #[test]

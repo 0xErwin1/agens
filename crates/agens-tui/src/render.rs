@@ -809,9 +809,8 @@ fn thinking_lines(
     streaming: bool,
     content_width: usize,
 ) {
-    let mode = ThinkingBlock::mode(streaming, collapsed);
-    lines.push(ThinkingBlock::title(mode));
-    if mode.shows_body() {
+    if ThinkingBlock::mode(streaming, collapsed).shows_body() {
+        lines.push(ThinkingBlock::title());
         markdown_lines(
             lines,
             text,
@@ -819,6 +818,8 @@ fn thinking_lines(
             "",
             content_width,
         );
+    } else {
+        lines.push(ThinkingBlock::collapsed_title(None));
     }
 }
 

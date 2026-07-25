@@ -1,5 +1,7 @@
 //! Conversation block presentation builders (thinking, tool rows).
 
+use std::time::Duration;
+
 use agens_core::ToolInput;
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -7,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{DisplayMode, ExpandMode, ExpandableBody, RolePalette};
+use super::{DisplayMode, ExpandMode, RolePalette};
 
 /// Columns reserved by the shared transcript gutter: one bullet cell plus one
 /// separator cell.
@@ -164,20 +166,43 @@ impl ThinkingBlock {
         }
     }
 
-    /// Title line for thinking chrome.
-    pub(crate) fn title(mode: ExpandMode) -> Line<'static> {
-        let body = ExpandableBody::new(mode);
-        let title = if body.is_visible() {
-            "Thinking"
-        } else {
-            "Thinking · collapsed"
-        };
+    /// Header introducing a visible reasoning body.
+    pub(crate) fn title() -> Line<'static> {
+        Self::row("Thinking".to_owned())
+    }
+
+    /// Single row standing in for a hidden reasoning body.
+    ///
+    /// The row names the finished thought instead of pairing a header with a
+    /// separate "collapsed" summary, so hidden reasoning costs exactly one row.
+    /// `elapsed` is rendered only when the caller measured it: no reasoning
+    /// timing exists in the projection today, so the bare form is what ships
+    /// rather than a fabricated duration.
+    pub(crate) fn collapsed_title(elapsed: Option<Duration>) -> Line<'static> {
+        Self::row(elapsed.map_or_else(
+            || "Thought".to_owned(),
+            |elapsed| format!("Thought for {}", thought_duration(elapsed)),
+        ))
+    }
+
+    fn row(label: String) -> Line<'static> {
         Line::from(Span::styled(
-            title,
+            label,
             Style::default()
                 .fg(RolePalette::thinking())
                 .add_modifier(Modifier::BOLD),
         ))
+    }
+}
+
+/// Human-scale reasoning duration: under a minute keeps one decimal, from a
+/// minute up the remainder drops to whole seconds behind the minute count.
+fn thought_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        format!("{}m{:.0}s", elapsed.as_secs() / 60, seconds % 60.0)
     }
 }
 
@@ -661,6 +686,23 @@ fn short_tool_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsed_thinking_is_one_row_naming_the_thought_and_its_duration() {
+        assert_eq!(line_text(&ThinkingBlock::title()), "Thinking");
+        assert_eq!(line_text(&ThinkingBlock::collapsed_title(None)), "Thought");
+        for (elapsed, expected) in [
+            (Duration::from_millis(1_800), "Thought for 1.8s"),
+            (Duration::from_millis(59_940), "Thought for 59.9s"),
+            (Duration::from_secs(60), "Thought for 1m0s"),
+            (Duration::from_secs(125), "Thought for 2m5s"),
+        ] {
+            assert_eq!(
+                line_text(&ThinkingBlock::collapsed_title(Some(elapsed))),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn thinking_mode_streams_then_collapses_unless_expanded() {
