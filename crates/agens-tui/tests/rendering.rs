@@ -3266,6 +3266,54 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
 }
 
 #[test]
+fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
+    let (width, height) = (80_u16, 30_u16);
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width, height });
+    start_execution(&mut tui, 9, "explore");
+
+    renderer.render(tui.view()).unwrap();
+    let bottom = composer_bottom_row(&renderer);
+    assert_eq!(
+        rendered_row(&renderer, "Main") as u16,
+        bottom + 1,
+        "an inactive notice must not leave a dead row under the composer: {:?}",
+        rendered_line(&renderer, usize::from(bottom + 1))
+    );
+    assert_eq!(
+        rendered_row(&renderer, "model —") as u16,
+        height - 1,
+        "the status bar keeps the last row"
+    );
+
+    tui.handle(Event::Key(Key::CtrlC));
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(
+        composer_bottom_row(&renderer),
+        bottom,
+        "showing a notice must not move the composer"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "Press Ctrl+C again to exit") as u16,
+        bottom + 1,
+        "an active notice owns the row under the composer"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "Main") as u16,
+        bottom + 2,
+        "the tree follows the notice without a gap"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "model —") as u16,
+        height - 1,
+        "the status bar keeps the last row with a notice too"
+    );
+}
+
+#[test]
 fn idle_bottom_chrome_leaves_at_most_three_rows_below_the_composer() {
     let height = 24_u16;
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
@@ -3312,8 +3360,12 @@ fn elided_subagent_tree_keeps_a_running_branch_and_the_affordance_as_its_last_ro
     );
     assert_eq!(
         rendered_row(&renderer, "Tab to focus"),
-        usize::from(height - 2),
+        rendered_row(&renderer, "Plan #10") + 1,
         "the affordance survives elision as the last tree row: {text:?}"
+    );
+    assert!(
+        rendered_row(&renderer, "Tab to focus") < usize::from(height - 1),
+        "the status bar keeps the last row: {text:?}"
     );
     assert!(
         !text.contains("Main"),

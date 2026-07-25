@@ -1075,7 +1075,8 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(area, state.input);
+    let notice = notice_spans(&state);
+    let layout = screen_layout(area, state.input, !notice.is_empty());
 
     let transcript_width = layout
         .transcript
@@ -1181,7 +1182,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     }
 
     if layout.notice.height > 0 {
-        render_notice(frame, layout.notice, &state);
+        render_notice(frame, layout.notice, notice);
     }
 
     if layout.tree.height > 0 {
@@ -1670,6 +1671,13 @@ struct BottomChrome {
     footer: u16,
 }
 
+/// Where the reserved bottom rows actually land on screen.
+struct ChromeBands {
+    notice: Rect,
+    tree: Rect,
+    footer: Rect,
+}
+
 impl BottomChrome {
     fn rows(self) -> u16 {
         self.notice
@@ -1689,6 +1697,26 @@ impl BottomChrome {
             notice,
             tree,
             footer,
+        }
+    }
+
+    /// Places the reserved rows inside their region: the notice and the tree hug
+    /// the composer and the status bar keeps the last row, so the rows a missing
+    /// notice does not claim become a gap above the status bar instead of dead
+    /// air under the composer. The region keeps its full reserved height either
+    /// way, which is what keeps the composer a function of terminal height only.
+    fn placed(self, region: Rect, notice_shown: bool) -> ChromeBands {
+        let notice = if notice_shown { self.notice } else { 0 };
+        let band = |y: u16, height: u16| Rect {
+            x: region.x,
+            y,
+            width: region.width,
+            height,
+        };
+        ChromeBands {
+            notice: band(region.y, notice),
+            tree: band(region.y.saturating_add(notice), self.tree),
+            footer: band(region.bottom().saturating_sub(self.footer), self.footer),
         }
     }
 }
@@ -1730,7 +1758,7 @@ fn composer_rows(height: u16, input: &str) -> u16 {
     }
 }
 
-fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
     let area = conversation_surface(area);
     let composer_rows = composer_rows(area.height, input).min(area.height);
     let chrome = bottom_chrome(area.height).fitted(area.height.saturating_sub(composer_rows));
@@ -1741,23 +1769,24 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     let chunks = Layout::vertical([
         Constraint::Length(transcript_rows),
         Constraint::Length(composer_rows),
-        Constraint::Length(chrome.notice),
-        Constraint::Length(chrome.tree),
-        Constraint::Length(chrome.footer),
+        Constraint::Length(chrome.rows()),
     ])
     .split(area);
 
     let gutter = Margin::new(chrome_gutter(area.width), 0);
+    let bands = chrome.placed(chunks[2].inner(gutter), notice_shown);
+
     ScreenLayout {
         transcript: chunks[0],
         composer: chunks[1].inner(gutter),
-        notice: chunks[2].inner(gutter),
-        tree: chunks[3].inner(gutter),
-        footer: chunks[4].inner(gutter),
+        notice: bands.notice,
+        tree: bands.tree,
+        footer: bands.footer,
     }
 }
 
-fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
+/// Builds the notice row content, empty when nothing needs announcing.
+fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
     let mut left = Vec::new();
     if state.quit_armed {
         left.push(Span::styled(
@@ -1790,12 +1819,14 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
             Style::default().fg(widgets::RolePalette::muted()),
         ));
     }
-    if !left.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(left)).wrap(Wrap { trim: false }),
-            area,
-        );
-    }
+    left
+}
+
+fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'static>>) {
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// Navigable subagent tree rendered between the composer and the status bar.
@@ -3236,6 +3267,13 @@ where
         }
     }
 
+    /// Geometry of the current screen, so hit tests and scroll bounds address the
+    /// same rows the renderer paints.
+    fn screen_layout(&self) -> ScreenLayout {
+        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
+        screen_layout(area, &self.input, !notice_spans(&self.view()).is_empty())
+    }
+
     /// Selects a transcript from a click on the subagent tree.
     ///
     /// Tree rows are addressed by row, not column: the root is `Main` and each
@@ -3245,8 +3283,7 @@ where
         if self.executions.is_empty() || self.dialog.is_some() || self.palette_open {
             return None;
         }
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input);
+        let layout = self.screen_layout();
         if layout.tree.height == 0 || row < layout.tree.y || row >= layout.tree.bottom() {
             return None;
         }
@@ -3829,9 +3866,8 @@ where
         if self.dialog.is_some() || self.palette_open {
             return None;
         }
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input);
+        let layout = self.screen_layout();
         let content_y = layout.transcript.y.saturating_add(1);
         let content_x = layout
             .transcript
@@ -3870,9 +3906,8 @@ where
     }
 
     fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input);
+        let layout = self.screen_layout();
         let content_width = layout
             .transcript
             .width
@@ -4417,8 +4452,7 @@ where
     }
 
     fn max_scroll_offset(&self) -> u16 {
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input);
+        let layout = self.screen_layout();
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         let content_width = layout
             .transcript
@@ -4435,8 +4469,7 @@ where
     /// its area spends one row on the top rule and one on the scroll indicator,
     /// so a larger step would skip content between consecutive pages.
     fn transcript_page_rows(&self) -> u16 {
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input)
+        self.screen_layout()
             .transcript
             .height
             .saturating_sub(2)
@@ -5012,8 +5045,7 @@ where
     }
 
     fn jump_to_user_message(&mut self, previous: bool) {
-        let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input);
+        let layout = self.screen_layout();
         let content_width = layout
             .transcript
             .width
@@ -7129,10 +7161,7 @@ mod runtime_tests {
             .get(&TranscriptId::Main)
             .unwrap()
             .scroll_offset;
-        let transcript_row = screen_layout(Rect::new(0, 0, tui.size.0, tui.size.1), &tui.input)
-            .transcript
-            .y
-            .saturating_add(1);
+        let transcript_row = tui.screen_layout().transcript.y.saturating_add(1);
         tui.handle(Event::MouseDown {
             column: TRANSCRIPT_CONTENT_INDENT,
             row: transcript_row,
@@ -7550,7 +7579,7 @@ mod runtime_tests {
 
     #[test]
     fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
-        let layout = screen_layout(Rect::new(0, 0, 120, 24), "");
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "", true);
         for band in [layout.composer, layout.notice, layout.tree, layout.footer] {
             assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
             assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
@@ -7564,7 +7593,7 @@ mod runtime_tests {
         );
 
         for width in 0..=64_u16 {
-            let layout = screen_layout(Rect::new(0, 0, width, 24), "");
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "", false);
             assert!(layout.composer.right() <= width, "width {width}");
             assert!(
                 layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
