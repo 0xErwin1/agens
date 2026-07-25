@@ -4160,8 +4160,7 @@ fn tui_file_candidates_with_limit(
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    NativeTools::open(project_root)
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?
+    open_native_tools(project_root, bootstrap.tool_limits())?
         .tui_file_candidates(limit)
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
 }
@@ -4189,8 +4188,7 @@ fn expand_tui_file_reference(bootstrap: &Bootstrap, prompt: &str) -> Result<Stri
     let project_root = bootstrap
         .project_root()
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let tools = NativeTools::open(project_root)
-        .map_err(|_| CliError::configuration("native tools are unavailable"))?;
+    let tools = open_native_tools(project_root, bootstrap.tool_limits())?;
     let mut expanded = String::with_capacity(prompt.len());
 
     for segment in prompt.split_inclusive(char::is_whitespace) {
@@ -5665,6 +5663,26 @@ impl Bootstrap {
     }
 }
 
+/// Converts configured tool bounds into the runtime shape the tools crate owns.
+fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {
+    agens_tools::NativeToolLimits {
+        max_list_entries: settings.max_list_entries,
+        max_search_entries: settings.max_search_entries,
+        max_search_results: settings.max_search_results,
+        max_search_depth: settings.max_search_depth,
+        operation_timeout: std::time::Duration::from_millis(settings.operation_timeout_ms),
+        bash_timeout: std::time::Duration::from_millis(settings.bash_timeout_ms),
+    }
+}
+
+fn open_native_tools(
+    project_root: &Path,
+    settings: ToolLimitSettings,
+) -> Result<NativeTools, CliError> {
+    NativeTools::open_with_limits(project_root, native_tool_limits(settings))
+        .map_err(|_| CliError::configuration("native tools are unavailable"))
+}
+
 /// Applies the configuration precedence contract for a turn's iteration cap:
 /// a command-line value always wins over the configured one.
 fn effective_max_iterations(flag: Option<usize>, configured: Option<usize>) -> Option<usize> {
@@ -6557,10 +6575,10 @@ fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     #[cfg(test)]
     PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
 
-    let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(
-        NativeTools::open(project_root)
-            .map_err(|_| CliError::configuration("native tools are unavailable"))?,
-    )));
+    let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
+        project_root,
+        bootstrap.tool_limits(),
+    )?)));
     let mcp_registry = Arc::new(Mutex::new(load_configured_mcp_registry(
         bootstrap,
         project_root,
@@ -15468,6 +15486,39 @@ mod tests {
         assert_eq!(bootstrap.default_agent(), Some("reviewer"));
         assert_eq!(bootstrap.reasoning_effort(), Some("high"));
         assert_eq!(bootstrap.subagent_limits().max_concurrency, 2);
+    }
+
+    #[test]
+    fn configured_tool_limits_reach_the_native_tool_runtime() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-tool-limits",
+            Some(
+                "[tools]\nmax_list_entries = 5\nmax_search_entries = 6\nmax_search_results = 7\nmax_search_depth = 8\noperation_timeout_ms = 900\nbash_timeout_ms = 1500\n",
+            ),
+            None,
+        );
+
+        let limits = native_tool_limits(bootstrap.tool_limits());
+
+        assert_eq!(limits.max_list_entries, 5);
+        assert_eq!(limits.max_search_entries, 6);
+        assert_eq!(limits.max_search_results, 7);
+        assert_eq!(limits.max_search_depth, 8);
+        assert_eq!(
+            limits.operation_timeout,
+            std::time::Duration::from_millis(900)
+        );
+        assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn default_configuration_keeps_the_runtime_tool_limits_unchanged() {
+        let bootstrap = bootstrap_from_configuration("config-tool-defaults", None, None);
+
+        assert_eq!(
+            native_tool_limits(bootstrap.tool_limits()),
+            agens_tools::NativeToolLimits::default()
+        );
     }
 
     #[test]

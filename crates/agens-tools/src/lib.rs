@@ -3582,6 +3582,7 @@ pub struct NativeToolLimits {
     pub max_search_results: usize,
     pub max_search_depth: usize,
     pub operation_timeout: Duration,
+    pub bash_timeout: Duration,
 }
 
 impl Default for NativeToolLimits {
@@ -3592,6 +3593,7 @@ impl Default for NativeToolLimits {
             max_search_results: DEFAULT_MAX_SEARCH_RESULTS,
             max_search_depth: DEFAULT_MAX_SEARCH_DEPTH,
             operation_timeout: DEFAULT_FILE_OPERATION_TIMEOUT,
+            bash_timeout: DEFAULT_BASH_TIMEOUT,
         }
     }
 }
@@ -4791,7 +4793,7 @@ impl NativeToolCatalog {
                         Some(timeout) => Duration::from_millis(timeout),
                         None => return Ok(ToolOutput::failure("bash: timeout must be an integer")),
                     },
-                    None => DEFAULT_BASH_TIMEOUT,
+                    None => self.tools.limits.bash_timeout,
                 };
                 self.tools.bash(
                     BashInput::new(command)
@@ -4842,7 +4844,9 @@ fn validate_limits(limits: &NativeToolLimits) -> Result<(), Error> {
     if limits.max_list_entries == 0
         || limits.max_search_entries == 0
         || limits.max_search_results == 0
+        || limits.max_search_depth == 0
         || limits.operation_timeout.is_zero()
+        || limits.bash_timeout.is_zero()
     {
         return Err(Error::Tool(
             "native tool limits must be greater than zero".into(),

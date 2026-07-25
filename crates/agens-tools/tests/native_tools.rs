@@ -530,6 +530,44 @@ fn catalog_applies_a_positive_bash_timeout_override() {
 }
 
 #[test]
+fn catalog_falls_back_to_the_configured_bash_timeout() {
+    let root = project_root();
+    let limits = NativeToolLimits {
+        bash_timeout: Duration::from_millis(25),
+        ..NativeToolLimits::default()
+    };
+    let catalog = NativeToolCatalog::new(NativeTools::open_with_limits(&root, limits).unwrap());
+
+    assert_eq!(
+        catalog
+            .execute(
+                "native::bash",
+                json!({"command": "sleep 1"}),
+                &ToolExecutionContext::with_timeout(Duration::from_secs(2)),
+            )
+            .unwrap(),
+        ToolOutput::failure(
+            "[stdout]\n[stderr]\n[bash: timed out after 25ms]\n[exit status: unavailable]\n"
+        )
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn rejects_a_zero_bash_timeout() {
+    let root = project_root();
+    let limits = NativeToolLimits {
+        bash_timeout: Duration::ZERO,
+        ..NativeToolLimits::default()
+    };
+
+    assert!(NativeTools::open_with_limits(&root, limits).is_err());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn reads_a_project_relative_file() {
     let root = project_root();
     fs::write(root.join("notes.txt"), "project note").unwrap();
@@ -744,6 +782,7 @@ fn list_and_search_fail_when_configured_work_budgets_are_exhausted() {
         max_search_results: 2,
         max_search_depth: 1,
         operation_timeout: Duration::from_secs(1),
+        bash_timeout: Duration::from_secs(1),
     };
     let tools = NativeTools::open_with_limits(&root, limits).unwrap();
 
@@ -896,6 +935,7 @@ fn glob_lists_relative_doublestar_matches_and_reports_truncation() {
             max_search_results: 10,
             max_search_depth: 32,
             operation_timeout: Duration::from_secs(1),
+            bash_timeout: Duration::from_secs(1),
         },
     )
     .unwrap();
