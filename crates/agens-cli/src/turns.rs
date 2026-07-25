@@ -11,8 +11,9 @@ use agens_core::{
 use agens_store::SessionStore;
 
 use crate::tools::task::default_model;
+use crate::tui::provider::TuiProvider;
 use crate::tui::session::{CompletedSubagentTurn, TuiSessionContext};
-use crate::{Bootstrap, CliError, TuiProvider};
+use crate::{Bootstrap, CliError};
 
 pub(crate) fn next_session_metadata(
     bootstrap: &Bootstrap,

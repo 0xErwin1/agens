@@ -3,9 +3,9 @@ use agens_store::{SessionStore, StoredSession};
 use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
 use agens_tui::{Conversation, DialogEntry, DialogView};
 
-use crate::TuiProvider;
 use crate::headless::HeadlessChatRequest;
 use crate::model_registry::TuiModelSelector;
+use crate::tui::provider::TuiProvider;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TuiSessionContext {
