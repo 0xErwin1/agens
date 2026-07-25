@@ -18,10 +18,10 @@ use agens_core::{
 use agens_tools::{
     AgentCatalog, AgentModelValidationError, AgentModelValidator, CommandCatalog,
     CommandDefinition, DispatchTool, EffectiveCapabilitySet, SkillCatalog, TaskControlAction,
-    TaskControlTool, TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry,
-    TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskMessageTool,
-    TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError, TaskSkill,
-    TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
+    TaskControlTool, TaskExecutionEvent, TaskExecutionId, TaskExecutionLifecycle,
+    TaskExecutionRegistry, TaskInvocation, TaskLaunchMode, TaskMessageSource, TaskMessageTarget,
+    TaskMessageTool, TaskModelResolutionError, TaskRunContext, TaskRunner, TaskRunnerError,
+    TaskSkill, TaskTerminalState, TaskTool, TaskTurnRequest, TaskTurnResult, ToolDispatchRequest,
     ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     markdown::{self, FrontmatterValue, MarkdownRoot},
 };
@@ -1488,6 +1488,46 @@ fn task_mailboxes_are_typed_fifo_bounded_and_reject_siblings_or_terminal_targets
                 "late".into(),
             )
             .is_err()
+    );
+}
+
+#[test]
+fn terminal_execution_notices_reach_the_main_mailbox_within_its_bounds() {
+    let registry = TaskExecutionRegistry::new();
+    let id = registry.admit(TaskLaunchMode::Background).unwrap();
+    registry.finish(
+        id,
+        TaskTerminalState::Completed,
+        ToolOutput::success("done"),
+    );
+
+    assert!(
+        registry
+            .send_message(
+                TaskMessageSource::Execution(id),
+                TaskMessageTarget::Main,
+                "terminal source is refused".into(),
+            )
+            .is_err()
+    );
+    registry
+        .notify_main(id, "subagent #1 finished".into())
+        .unwrap();
+    assert!(
+        registry
+            .notify_main(TaskExecutionId::from_value(99), "unknown".into())
+            .is_err()
+    );
+    assert!(registry.notify_main(id, String::new()).is_err());
+    assert!(registry.notify_main(id, "x".repeat(8 * 1024 + 1)).is_err());
+
+    let inbox = registry.drain_messages(TaskMessageTarget::Main);
+    assert_eq!(
+        inbox
+            .iter()
+            .map(|message| (message.source(), message.content()))
+            .collect::<Vec<_>>(),
+        vec![(TaskMessageSource::Execution(id), "subagent #1 finished")]
     );
 }
 

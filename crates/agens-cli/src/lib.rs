@@ -6738,7 +6738,7 @@ struct TuiTaskLifecycleBridge {
     lifecycle: Arc<Mutex<Option<TaskExecutionLifecycle>>>,
     terminal_results: Arc<Mutex<BTreeMap<u64, String>>>,
     completed_turns: Arc<Mutex<BTreeMap<u64, CompletedSubagentTurn>>>,
-    persist_completed: Option<Arc<dyn Fn(CompletedSubagentTurn) + Send + Sync>>,
+    persist_completed: Option<Arc<dyn Fn(CompletedSubagentTurn) -> bool + Send + Sync>>,
 }
 
 impl TuiTaskLifecycleBridge {
@@ -6770,7 +6770,9 @@ impl TuiTaskLifecycleBridge {
                     &BridgeCancel::new(),
                     None,
                 );
+                return false;
             }
+            true
         }));
         self
     }
@@ -6813,6 +6815,7 @@ impl TuiTaskLifecycleBridge {
             TuiSubagentEvent::started(id, &agent, request.description(), presentation),
         ));
         let events = self.events.clone();
+        let registry = self.controls.0.clone();
         let terminal_results = Arc::clone(&self.terminal_results);
         let completed_turns = Arc::clone(&self.completed_turns);
         let persist_completed = self.persist_completed.clone();
@@ -6879,12 +6882,14 @@ impl TuiTaskLifecycleBridge {
                             .lock()
                             .ok()
                             .and_then(|mut turns| turns.remove(&id));
-                        if matches!(event, TuiExecutionEvent::Completed { .. })
-                            && let (Some(turn), Some(persist)) =
-                                (completed_turn, &persist_completed)
-                        {
-                            persist(turn);
-                        }
+                        let persisted = matches!(event, TuiExecutionEvent::Completed { .. })
+                            && match (completed_turn, &persist_completed) {
+                                (Some(turn), Some(persist)) => persist(turn),
+                                _ => false,
+                            };
+                        notify_main_of_terminal_subagent(
+                            &registry, &events, id, &agent, fallback, persisted,
+                        );
                         return;
                     }
                 }
@@ -6946,6 +6951,44 @@ impl TuiTaskLifecycleBridge {
 
     fn publish(&self, event: TuiRuntimeEvent) {
         let _ = self.events.publish(event, &BridgeCancel::new(), None);
+    }
+}
+
+/// A finished background subagent is otherwise only shown to the user, never told to the model.
+/// The notice stays a pointer rather than the payload: the persisted turn remains the source of
+/// truth, and the bounded untrusted mailbox delivers this on the next main turn without starting
+/// one.
+fn notify_main_of_terminal_subagent(
+    registry: &TaskExecutionRegistry,
+    events: &BridgeTx<TuiRuntimeEvent>,
+    id: u64,
+    agent: &str,
+    state: &str,
+    persisted: bool,
+) {
+    let record = if persisted {
+        "The full result is recorded in this session history"
+    } else {
+        "No durable result was recorded"
+    };
+    let notice = format!(
+        "subagent #{id} ({agent}) finished with state={state} completed_at={} (unix seconds). \
+         {record}; run task_control action=status id={id} for the recorded outcome.",
+        current_session_timestamp()
+    );
+
+    if registry
+        .notify_main(agens_tools::TaskExecutionId::from_value(id), notice)
+        .is_err()
+    {
+        let _ = events.publish(
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                id,
+                TuiSubagentErrorKind::Runtime,
+            )),
+            &BridgeCancel::new(),
+            None,
+        );
     }
 }
 
@@ -17315,6 +17358,104 @@ mod tests {
                 .map(|agent| agent.name.as_str()),
             Some("primary")
         );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
+        let temporary = tui_session_directory("subagent-completion-notice");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let (events, _receiver) = BridgeTx::bounded(16);
+        let controls = TuiTaskControls::default();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_progress_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::new(Mutex::new(Vec::new())),
+                Vec::new(),
+            )
+            .with_lifecycle_bridge(lifecycle_bridge),
+        )
+        .unwrap();
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+        let launched_at = current_session_timestamp();
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &session, "review task", true, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        (0..100)
+            .find_map(|_| {
+                let identifier = session.lock().unwrap().identifier;
+                if identifier.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                identifier
+            })
+            .expect("a completed background subagent persists one durable turn");
+
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TaskMailboxProvider::new(
+            RecordingMailboxProvider {
+                queued: Arc::clone(&queued),
+            },
+            Some(controls.0.clone()),
+            TaskMessageTarget::Main,
+        );
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+
+        let queued = queued.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].len(), 1);
+        assert_eq!(queued[0][0].role, Role::User);
+        let [MessagePart::Text(notice)] = queued[0][0].parts.as_slice() else {
+            panic!("a mailbox notice is text: {:?}", queued[0][0].parts)
+        };
+        let (label, detail) = notice
+            .split_once('\n')
+            .expect("mailbox notices are labelled untrusted");
+        assert_eq!(label, "[coordination source=subagent:1 untrusted=true]");
+        let completed_at = detail
+            .split_once("completed_at=")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("the notice states when the subagent finished");
+        assert!(completed_at >= launched_at);
+        assert_eq!(
+            detail,
+            format!(
+                "subagent #1 (reviewer) finished with state=completed completed_at={completed_at} \
+                 (unix seconds). The full result is recorded in this session history; run \
+                 task_control action=status id=1 for the recorded outcome."
+            )
+        );
+
+        drop(queued);
         std::fs::remove_dir_all(temporary).unwrap();
     }
 

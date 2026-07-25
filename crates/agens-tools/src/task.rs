@@ -249,6 +249,22 @@ impl DispatchTool for TaskMessageTool {
     }
 }
 
+fn enqueue_message(
+    mailbox: &mut TaskMailbox,
+    source: TaskMessageSource,
+    content: String,
+) -> Result<(), TaskRegistryError> {
+    if mailbox.messages.len() >= MAX_TASK_MESSAGES_PER_TARGET
+        || mailbox.bytes + content.len() > MAX_TASK_MAILBOX_BYTES
+    {
+        return Err(TaskRegistryError::MessageLimit);
+    }
+
+    mailbox.bytes += content.len();
+    mailbox.messages.push_back(TaskMessage { source, content });
+    Ok(())
+}
+
 fn parse_execution_id(arguments: &Value) -> Result<TaskExecutionId, Error> {
     arguments
         .get("id")
@@ -494,15 +510,34 @@ impl TaskExecutionRegistry {
                 &mut execution.mailbox
             }
         };
-        if mailbox.messages.len() >= MAX_TASK_MESSAGES_PER_TARGET
-            || mailbox.bytes + content.len() > MAX_TASK_MAILBOX_BYTES
-        {
+        enqueue_message(mailbox, source, content)
+    }
+
+    /// Queues a lifecycle notice for the main agent. `send_message` refuses a terminal source
+    /// because a finished execution must not keep talking, yet the completion notice itself is
+    /// only available once the execution is already terminal.
+    pub fn notify_main(
+        &self,
+        id: TaskExecutionId,
+        content: String,
+    ) -> Result<(), TaskRegistryError> {
+        if content.is_empty() || content.len() > MAX_TASK_MESSAGE_BYTES {
             return Err(TaskRegistryError::MessageLimit);
         }
 
-        mailbox.bytes += content.len();
-        mailbox.messages.push_back(TaskMessage { source, content });
-        Ok(())
+        let mut registry = self
+            .inner
+            .lock()
+            .map_err(|_| TaskRegistryError::UnknownExecution)?;
+        if !registry.executions.contains_key(&id) {
+            return Err(TaskRegistryError::UnknownExecution);
+        }
+
+        enqueue_message(
+            &mut registry.main_mailbox,
+            TaskMessageSource::Execution(id),
+            content,
+        )
     }
 
     pub fn drain_messages(&self, target: TaskMessageTarget) -> Vec<TaskMessage> {
