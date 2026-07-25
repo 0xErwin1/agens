@@ -1,5 +1,6 @@
 pub(crate) mod engine;
 pub(crate) mod metrics;
+pub(crate) mod session;
 
 use crate::CliDependencies;
 use crate::bootstrap::bootstrap;

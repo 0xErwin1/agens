@@ -16,7 +16,6 @@ use agens_tools::{
 };
 use agens_tui::TuiSubmitOrigin;
 
-use crate::TuiSessionContext;
 use crate::error::{CliError, ExitStatus};
 use crate::permissions::{
     AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
@@ -24,6 +23,7 @@ use crate::permissions::{
 };
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
+use crate::tui::session::TuiSessionContext;
 
 pub(crate) struct RegisteredNativeTool {
     pub(crate) name: String,

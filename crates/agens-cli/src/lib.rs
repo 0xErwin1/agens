@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -25,9 +24,13 @@ use agens_config::{
     expand_environment, expand_environment_with_commands, parse_toml_document,
     validate_toml_document,
 };
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use agens_core::SessionMetadata;
 use agens_core::{
     AgentDefinition, AttemptKey, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    RecoveryOutcome, RetryBoundary, Role, SessionAttemptStatus, SessionMetadata,
+    RecoveryOutcome, RetryBoundary, Role, SessionAttemptStatus,
 };
 #[cfg(test)]
 use agens_core::{
@@ -68,10 +71,13 @@ use agens_store::PermissionGrantStore;
 use agens_store::{ModelPreference, PreferenceStore, SessionCursor, SessionStore, StoredSession};
 #[cfg(test)]
 use agens_tools::TaskTerminalState;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use agens_tools::ToolDispatcher;
 use agens_tools::{
-    AgentCatalog, AgentModelValidator, CommandCatalog, CommandDefinition, EffectiveCapabilitySet,
-    McpEndpointSummary, McpRegistry, McpStatusHandle, McpStatusSnapshot, ReadFileInput,
-    SkillCatalog, ToolDispatcher,
+    AgentCatalog, AgentModelValidator, CommandCatalog, CommandDefinition, McpEndpointSummary,
+    McpRegistry, McpStatusHandle, McpStatusSnapshot, ReadFileInput, SkillCatalog,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -240,6 +246,15 @@ use tui::engine::{run_tui_prompt, run_tui_prompt_with};
 // calls these unqualified. Remove this re-export once the test module moves.
 use tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use tui::run_tui;
+use tui::session::{
+    ActiveAgentRuntime, AgentRotationError, ResumeDraft, TuiSessionContext,
+    current_session_timestamp, parse_recovery_action, recovery_confirmation_dialog,
+    reset_tui_session, resume_retry_notice, rotate_active_agent, session_dialog_entry,
+};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use tui::session::{CompletedSubagentTurn, TuiSessionMutationError, session_relative_age};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -540,454 +555,6 @@ fn execute_command(
     };
 
     commands::dispatch(parsed, dependencies, cancellation)
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct TuiSessionContext {
-    identifier: Option<i64>,
-    metadata: Option<SessionMetadata>,
-    messages: Vec<Message>,
-    restored_history: Vec<Conversation>,
-    active_agent: Option<ActiveAgentRuntime>,
-    pending_system_reminder: Option<String>,
-    selection: Option<TuiModelSelector>,
-    provider: Option<TuiProvider>,
-    chatgpt_unavailable: bool,
-    resume_error: Option<String>,
-    resume_notice: Option<String>,
-    agent_correction_pending: bool,
-    resume_draft: Option<ResumeDraft>,
-    selected_subagent: Option<String>,
-    dangerous_mode: bool,
-    running: bool,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct ResumeDraft(String);
-
-impl ResumeDraft {
-    fn new(prompt: String) -> Self {
-        Self(prompt)
-    }
-
-    fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl std::ops::Deref for ResumeDraft {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl fmt::Debug for ResumeDraft {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ResumeDraft([REDACTED])")
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CompletedSubagentTurn {
-    id: u64,
-    agent: String,
-    task: String,
-    final_result: String,
-    tool_uses: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TuiSessionMutationError {
-    Busy,
-}
-
-fn reset_tui_session(context: &mut TuiSessionContext) -> Result<(), TuiSessionMutationError> {
-    if context.running {
-        return Err(TuiSessionMutationError::Busy);
-    }
-
-    *context = TuiSessionContext::fresh();
-    Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ActiveAgentRuntime {
-    name: String,
-    model: Option<String>,
-    system_prompt: String,
-    capabilities: EffectiveCapabilitySet,
-}
-impl ActiveAgentRuntime {
-    fn build(
-        agent: &AgentDefinition,
-        inherited_model: Option<&str>,
-        project: &str,
-        dispatcher: &ToolDispatcher,
-        validator: &dyn AgentModelValidator,
-    ) -> Result<Self, AgentRotationError> {
-        if agent
-            .model
-            .as_deref()
-            .is_some_and(|model| validator.validate_model(model).is_err())
-        {
-            return Err(AgentRotationError::ModelUnavailable);
-        }
-        let model = agent
-            .model
-            .as_deref()
-            .or(inherited_model)
-            .map(str::to_owned);
-        Ok(Self {
-            name: agent.name.clone(),
-            model,
-            system_prompt: agent.system_prompt.clone(),
-            capabilities: EffectiveCapabilitySet::from_agent(agent, project, dispatcher),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentRotationError {
-    Busy,
-    ModelUnavailable,
-    Persistence,
-}
-fn rotate_active_agent(
-    context: &mut TuiSessionContext,
-    candidate: &AgentDefinition,
-    inherited_model: Option<&str>,
-    project: &str,
-    dispatcher: &ToolDispatcher,
-    validator: &dyn AgentModelValidator,
-    store: Option<&mut SessionStore>,
-) -> Result<(), AgentRotationError> {
-    if context.running {
-        return Err(AgentRotationError::Busy);
-    }
-    let next =
-        ActiveAgentRuntime::build(candidate, inherited_model, project, dispatcher, validator)?;
-    let reminder = context.active_agent.as_ref().and_then(|current| {
-        next.capabilities
-            .is_expansion_from(&current.capabilities)
-            .then(|| {
-                format!(
-                    "Agent capabilities expanded: {} -> {}.",
-                    current.name, next.name
-                )
-            })
-    });
-
-    let metadata = match (&context.metadata, store) {
-        (Some(metadata), Some(store)) => {
-            let mut metadata = metadata.clone();
-            metadata.active_agent = next.name.clone();
-            metadata.updated_at = session_timestamp().ok_or(AgentRotationError::Persistence)?;
-            store
-                .update_session(&metadata)
-                .map_err(|_| AgentRotationError::Persistence)?;
-            Some(metadata)
-        }
-        (Some(_), None) => return Err(AgentRotationError::Persistence),
-        (None, _) => None,
-    };
-
-    context.active_agent = Some(next);
-    context.metadata = metadata;
-    if reminder.is_some() {
-        context.pending_system_reminder = reminder;
-    }
-
-    Ok(())
-}
-
-fn session_timestamp() -> Option<i64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-}
-
-fn current_session_timestamp() -> i64 {
-    session_timestamp().unwrap_or_default()
-}
-
-fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
-    let mut parts = action_id.split(':');
-    let (Some("session"), Some("recover"), Some(session_id), Some(attempt_id), None) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) else {
-        return None;
-    };
-
-    AttemptKey::new(session_id.parse().ok()?, attempt_id.parse().ok()?).ok()
-}
-
-fn session_dialog_entry(
-    session: &StoredSession,
-    current_session: Option<i64>,
-    all_projects: bool,
-    now: i64,
-) -> DialogEntry {
-    let metadata = &session.metadata;
-    let age = session_relative_age(metadata.updated_at, now);
-    let turns = if metadata.completed_turn_count == 1 {
-        "1 turn".to_owned()
-    } else {
-        format!("{} turns", metadata.completed_turn_count)
-    };
-    let current = (current_session == Some(metadata.id)).then_some(" · current");
-    let root = all_projects.then(|| format!(" · root={}", compact_session_root(&metadata.project)));
-    let attempt_status = session
-        .latest_attempt
-        .as_ref()
-        .map(|attempt| {
-            format!(
-                " · Attempt: {}",
-                session_attempt_status_label(attempt.status())
-            )
-        })
-        .unwrap_or_default();
-    let row_detail = format!("{turns} · {age}");
-    let selected_detail = format!(
-        "Turns: {} · Agent: {}{}\nProvider: {} · Model: {}\nEffort: {} · Updated: {} ({}){} · ID: {} · {}{}",
-        metadata.completed_turn_count,
-        metadata.active_agent,
-        current.unwrap_or_default(),
-        metadata.provider_id.as_deref().unwrap_or("current runtime"),
-        metadata.model_id.as_deref().unwrap_or("current runtime"),
-        metadata
-            .reasoning_effort
-            .map(agens_core::ReasoningEffort::as_str)
-            .unwrap_or_else(|| {
-                if metadata.provider_id.is_some() || metadata.model_id.is_some() {
-                    "Default"
-                } else {
-                    "current runtime"
-                }
-            }),
-        metadata.updated_at,
-        age,
-        root.as_deref().unwrap_or_default(),
-        metadata.id,
-        metadata.title,
-        attempt_status,
-    );
-
-    DialogEntry::action_with_metadata(
-        format!("#{} {}", metadata.id, metadata.title),
-        row_detail,
-        format!(
-            "{} {} {} {}",
-            metadata.id, metadata.title, metadata.project, metadata.active_agent
-        ),
-        selected_detail,
-        format!("session:{}", metadata.id),
-    )
-}
-
-fn session_attempt_status_label(status: agens_core::SessionAttemptStatus) -> &'static str {
-    match status {
-        agens_core::SessionAttemptStatus::Running => "running",
-        agens_core::SessionAttemptStatus::Completed => "completed",
-        agens_core::SessionAttemptStatus::Cancelled => "cancelled",
-        agens_core::SessionAttemptStatus::Failed => "failed",
-        agens_core::SessionAttemptStatus::ProviderError => "provider error",
-        agens_core::SessionAttemptStatus::Interrupted => "interrupted",
-    }
-}
-
-fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'static str> {
-    match status {
-        SessionAttemptStatus::Cancelled
-        | SessionAttemptStatus::Interrupted
-        | SessionAttemptStatus::Failed
-        | SessionAttemptStatus::ProviderError => {
-            Some("Recovered failed prompt · Enter retry · Esc discard")
-        }
-        SessionAttemptStatus::Running | SessionAttemptStatus::Completed => None,
-    }
-}
-
-fn recovery_confirmation_dialog(
-    metadata: &SessionMetadata,
-    attempt: &agens_core::SessionAttemptSummary,
-    refusal: Option<&str>,
-) -> DialogView {
-    let mut help = format!(
-        "Session: {} · ID: {}\nStatus: running\nStarted: {}\nThis may invalidate an attempt still running in another process.",
-        metadata.title,
-        metadata.id,
-        attempt.started_at(),
-    );
-    if let Some(refusal) = refusal {
-        help.push('\n');
-        help.push_str(refusal);
-    }
-
-    DialogView::selection(
-        "Recover interrupted attempt",
-        Some(help),
-        vec![
-            DialogEntry::action(
-                "Recover interrupted attempt",
-                format!(
-                    "session:recover:{}:{}",
-                    attempt.key().session_id(),
-                    attempt.key().attempt_id()
-                ),
-            ),
-            DialogEntry::cancel("Cancel"),
-        ],
-    )
-}
-
-fn compact_session_root(root: &str) -> String {
-    const MAX_CHARS: usize = 30;
-    let character_count = root.chars().count();
-    if character_count <= MAX_CHARS {
-        return root.into();
-    }
-
-    format!(
-        "...{}",
-        root.chars()
-            .skip(character_count - MAX_CHARS)
-            .collect::<String>()
-    )
-}
-
-fn session_relative_age(updated_at: i64, now: i64) -> String {
-    let age = now.saturating_sub(updated_at);
-    match age {
-        ..=0 => "now".into(),
-        1..=59 => format!("{age}s ago"),
-        60..=3_599 => format!("{}m ago", age / 60),
-        3_600..=86_399 => format!("{}h ago", age / 3_600),
-        _ => format!("{}d ago", age / 86_400),
-    }
-}
-
-impl TuiSessionContext {
-    fn fresh() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    fn resumed(
-        identifier: i64,
-        metadata: SessionMetadata,
-        messages: Vec<Message>,
-        active_agent: ActiveAgentRuntime,
-    ) -> Self {
-        Self {
-            identifier: Some(identifier),
-            metadata: Some(metadata),
-            messages,
-            restored_history: Vec::new(),
-            active_agent: Some(active_agent),
-            pending_system_reminder: None,
-            selection: None,
-            provider: None,
-            chatgpt_unavailable: false,
-            resume_error: None,
-            resume_notice: None,
-            agent_correction_pending: false,
-            resume_draft: None,
-            selected_subagent: None,
-            dangerous_mode: false,
-            running: false,
-        }
-    }
-
-    fn restored(
-        identifier: i64,
-        metadata: SessionMetadata,
-        messages: Vec<Message>,
-        restored_history: Vec<Conversation>,
-    ) -> Self {
-        Self {
-            identifier: Some(identifier),
-            metadata: Some(metadata),
-            messages,
-            restored_history,
-            active_agent: None,
-            pending_system_reminder: None,
-            selection: None,
-            provider: None,
-            chatgpt_unavailable: false,
-            resume_error: None,
-            resume_notice: None,
-            agent_correction_pending: false,
-            resume_draft: None,
-            selected_subagent: None,
-            dangerous_mode: false,
-            running: false,
-        }
-    }
-
-    fn note(&self) -> String {
-        if let Some(notice) = &self.resume_notice {
-            return notice.clone();
-        }
-        if let Some(error) = &self.resume_error {
-            return error.clone();
-        }
-        let identifier = self
-            .identifier
-            .expect("resumed TUI session context always has an identifier");
-        let metadata = self
-            .metadata
-            .as_ref()
-            .expect("resumed TUI session context always has metadata");
-        format!(
-            "Resumed session {identifier}: agent={} turns={}",
-            metadata.active_agent, metadata.completed_turn_count
-        )
-    }
-
-    fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
-        request.dangerous_mode = self.dangerous_mode;
-        if self.identifier.is_some() {
-            request.history = self.messages.clone();
-            request.session = self.metadata.clone();
-        }
-
-        let selected_model = self.selection.as_ref().map(|selection| {
-            request.model = Some(selection.model().to_owned());
-            request.request_config = selection.request_config().clone();
-            request.session_reasoning_effort = selection.reasoning_effort_value();
-            selection.model()
-        });
-        if let Some(agent) = &self.active_agent {
-            let overrides_selection = selected_model.is_some_and(|selected| {
-                agent
-                    .model
-                    .as_deref()
-                    .is_some_and(|model| model != selected)
-            });
-            if request.model.is_none() || overrides_selection {
-                request.model = agent.model.clone();
-            }
-            if overrides_selection {
-                request.request_config = Default::default();
-                request.session_reasoning_effort = None;
-            }
-            request
-                .system_prompt
-                .get_or_insert_with(|| agent.system_prompt.clone());
-            request.active_agent = Some(agent.name.clone());
-            request.effective_capabilities = Some(agent.capabilities.clone());
-        }
-        request.pending_system_reminder = self.pending_system_reminder.clone();
-
-        request
-    }
 }
 
 #[repr(usize)]
