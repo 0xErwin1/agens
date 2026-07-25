@@ -887,11 +887,11 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
 
 #[test]
 fn subagent_tree_renders_below_the_composer_and_owns_the_navigation_hints() {
-    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 30)).unwrap());
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 50)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.handle(Event::Resize {
         width: 100,
-        height: 30,
+        height: 50,
     });
     tui.begin_submission("delegate");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
@@ -2426,7 +2426,7 @@ fn session_loading_uses_exact_local_state_without_running_the_composer() {
 
 #[test]
 fn u15_c1b_renderer_shows_selected_and_all_active_recent_executions() {
-    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 24)).unwrap());
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 50)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.set_agent_catalog(["reviewer", "writer", "tester", "triage"]);
     tui.select_agent("reviewer");
@@ -2844,7 +2844,7 @@ fn subagent_terminal_status_and_elapsed_are_frozen_and_low_dimensions_are_safe()
 
 #[test]
 fn execution_strip_shows_main_and_at_most_three_prioritized_children() {
-    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 24)).unwrap());
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 50)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     for (id, agent, event) in [
         (1, "old", TuiExecutionEvent::ForegroundStarted { id: 1 }),
@@ -3204,8 +3204,64 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
 }
 
 #[test]
-fn elided_subagent_tree_keeps_the_navigation_hint_as_its_last_row() {
+fn idle_bottom_chrome_leaves_at_most_three_rows_below_the_composer() {
+    let height = 24_u16;
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width: 72, height });
+
+    renderer.render(tui.view()).unwrap();
+    let bottom = composer_bottom_row(&renderer);
+    let gap = height
+        .saturating_sub(1)
+        .saturating_sub(bottom)
+        .saturating_sub(1);
+
+    assert!(
+        gap <= 3,
+        "the idle screen keeps at most three blank chrome rows: composer bottom {bottom}, gap {gap}"
+    );
+}
+
+#[test]
+fn elided_subagent_tree_keeps_a_running_branch_and_the_affordance_as_its_last_row() {
     let height = 14_u16;
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width: 72, height });
+    for (id, agent) in [(9_u64, "explore"), (10, "plan"), (11, "build")] {
+        start_execution(&mut tui, id, agent);
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "build".into(),
+        event: TuiExecutionEvent::Completed { id: 11 },
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(
+        text.contains("Plan #10"),
+        "the elided tree keeps a running branch: {text:?}"
+    );
+    assert!(
+        !text.contains("Build #11"),
+        "a finished branch is elided before a running one: {text:?}"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "Tab to focus"),
+        usize::from(height - 2),
+        "the affordance survives elision as the last tree row: {text:?}"
+    );
+    assert!(
+        !text.contains("Main"),
+        "the root is elided before a running branch: {text:?}"
+    );
+}
+
+#[test]
+fn elided_subagent_tree_reports_the_hidden_branch_count() {
+    let height = 24_u16;
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.handle(Event::Resize { width: 72, height });
@@ -3217,17 +3273,8 @@ fn elided_subagent_tree_keeps_the_navigation_hint_as_its_last_row() {
     let text = rendered_text(&renderer);
 
     assert!(
-        text.contains("Main"),
-        "the elided tree keeps its root: {text:?}"
-    );
-    assert_eq!(
-        rendered_row(&renderer, "Tab focus"),
-        usize::from(height - 2),
-        "the navigation hint survives elision as the last tree row: {text:?}"
-    );
-    assert!(
-        !text.contains("Explore #9"),
-        "branches beyond the reserved rows are elided: {text:?}"
+        text.contains("+2 more · Tab to focus"),
+        "the elision row states the hidden branch count and keeps the affordance: {text:?}"
     );
 }
 

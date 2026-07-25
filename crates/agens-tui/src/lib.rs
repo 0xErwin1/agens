@@ -1636,8 +1636,14 @@ const MAX_TREE_EXECUTIONS: usize = 3;
 /// Child activity rows shown under the focused branch.
 const MAX_TREE_ACTIVITIES: usize = 2;
 /// Widest subagent tree the renderer can produce: the root, every branch, the
-/// activities of the focused branch and the navigation hint.
+/// activities of the focused branch and the affordance row.
 const MAX_TREE_ROWS: u16 = 1 + MAX_TREE_EXECUTIONS as u16 + MAX_TREE_ACTIVITIES as u16 + 1;
+/// Narrowest tree worth reserving: one branch plus the affordance row that
+/// absorbs everything elided.
+const MIN_TREE_ROWS: u16 = 2;
+/// Screen rows required per reserved tree row, so a 24-row terminal reserves
+/// `MIN_TREE_ROWS` and only taller screens pay for deeper trees.
+const SCREEN_ROWS_PER_TREE_ROW: u16 = 10;
 
 /// Rows reserved below the composer for the notice, the subagent tree and the
 /// status bar.
@@ -1675,17 +1681,16 @@ impl BottomChrome {
 ///
 /// The budget deliberately ignores what the notice and the tree currently hold
 /// so the composer never moves while chrome content appears and disappears;
-/// content wider than its budget is elided instead. The region never claims
-/// more than a third of the screen, and the composer keeps priority below the
-/// heights where each band becomes affordable.
+/// content taller than its budget is elided instead. The tree reserves only a
+/// couple of rows on a common terminal so an idle screen shows no wide gap, and
+/// the composer keeps priority below the heights where each band becomes
+/// affordable.
 fn bottom_chrome(height: u16) -> BottomChrome {
     let notice = u16::from(height >= 7);
     let footer = u16::from(height >= 12);
+    let affordable = (height / 3).saturating_sub(notice).saturating_sub(footer);
     let tree = if height >= TREE_MIN_SCREEN_HEIGHT {
-        (height / 3)
-            .saturating_sub(notice)
-            .saturating_sub(footer)
-            .min(MAX_TREE_ROWS)
+        affordable.min((height / SCREEN_ROWS_PER_TREE_ROW).clamp(MIN_TREE_ROWS, MAX_TREE_ROWS))
     } else {
         0
     };
@@ -1782,23 +1787,51 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'
 /// root, each running or recently finished execution is a branch, and the
 /// focused branch expands into its live tool activity. Its keybinding hints
 /// live here rather than on the in-transcript card.
-fn subagent_tree_lines(state: &ViewState<'_>) -> Vec<Line<'static>> {
-    if state.executions.is_empty() {
+///
+/// The reserved region is sized from the terminal height alone, so a taller
+/// tree elides from its least informative rows: child activities first, then
+/// the root, then the branches the caller's ordering ranks last. `ViewState`
+/// already ranks running executions before finished ones, so elision keeps live
+/// work visible. The affordance row always closes the tree and reports how many
+/// branches it hides.
+fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'static>> {
+    if state.executions.is_empty() || rows == 0 {
         return Vec::new();
     }
 
-    let mut lines = vec![Line::from(Span::styled(
-        "Main".to_owned(),
-        tree_row_style(state, TranscriptId::Main),
-    ))];
-
-    let shown = state
+    let body = usize::from(rows).saturating_sub(1);
+    let branches = state
         .executions
         .iter()
-        .take(MAX_TREE_EXECUTIONS)
+        .copied()
+        .take(body.min(MAX_TREE_EXECUTIONS))
         .collect::<Vec<_>>();
-    for (index, execution) in shown.iter().enumerate() {
-        let last = index + 1 == shown.len();
+    let spare = body.saturating_sub(branches.len());
+
+    let mut lines = Vec::new();
+    if spare > 0 {
+        lines.push(Line::from(Span::styled(
+            "Main".to_owned(),
+            tree_row_style(state, TranscriptId::Main),
+        )));
+    }
+    lines.extend(tree_branch_lines(state, &branches, spare.saturating_sub(1)));
+    lines.push(tree_affordance_line(
+        state.executions.len().saturating_sub(branches.len()),
+    ));
+    lines
+}
+
+fn tree_branch_lines(
+    state: &ViewState<'_>,
+    branches: &[&TuiExecution],
+    activity_rows: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut activity_budget = activity_rows.min(MAX_TREE_ACTIVITIES);
+
+    for (index, execution) in branches.iter().enumerate() {
+        let last = index + 1 == branches.len();
         lines.push(Line::from(vec![
             Span::styled(
                 if last { "└─ " } else { "├─ " }.to_owned(),
@@ -1818,7 +1851,10 @@ fn subagent_tree_lines(state: &ViewState<'_>) -> Vec<Line<'static>> {
             .execution_activities
             .iter()
             .filter(|activity| activity.parent == execution.id)
+            .take(activity_budget)
             .collect::<Vec<_>>();
+        activity_budget = activity_budget.saturating_sub(children.len());
+
         for (child_index, activity) in children.iter().enumerate() {
             lines.push(Line::from(vec![
                 Span::styled(
@@ -1848,28 +1884,21 @@ fn subagent_tree_lines(state: &ViewState<'_>) -> Vec<Line<'static>> {
             ]));
         }
     }
-
-    lines.push(Line::from(Span::styled(
-        "Tab focus · Enter inspect · Ctrl+B background".to_owned(),
-        Style::default().fg(widgets::RolePalette::chrome()),
-    )));
     lines
 }
 
-/// Elides the deepest tree rows when the reserved region is narrower than the
-/// tree, keeping the navigation hint as the last visible row.
-fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'static>> {
-    let mut lines = subagent_tree_lines(state);
-    let rows = usize::from(rows);
-    if lines.len() <= rows {
-        return lines;
-    }
-    let Some(hint) = lines.pop().filter(|_| rows > 0) else {
-        return Vec::new();
+/// Closes the tree with its navigation affordance, folding the branches that
+/// did not fit into the same row so the hidden count stays discoverable.
+fn tree_affordance_line(hidden_branches: usize) -> Line<'static> {
+    let text = if hidden_branches == 0 {
+        "Tab focus · Enter inspect · Ctrl+B background".to_owned()
+    } else {
+        format!("+{hidden_branches} more · Tab to focus")
     };
-    lines.truncate(rows.saturating_sub(1));
-    lines.push(hint);
-    lines
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(widgets::RolePalette::chrome()),
+    ))
 }
 
 fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
@@ -4385,12 +4414,15 @@ where
         saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
     }
 
+    /// Rows a page advances, bounded by the rows the transcript actually shows:
+    /// its area spends one row on the top rule and one on the scroll indicator,
+    /// so a larger step would skip content between consecutive pages.
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         screen_layout(area, &self.input)
             .transcript
             .height
-            .saturating_sub(1)
+            .saturating_sub(2)
             .max(1)
     }
 
