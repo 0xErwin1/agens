@@ -61,17 +61,21 @@ fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize
     cell_index(renderer, text) % usize::from(renderer.terminal().backend().buffer().area.width)
 }
 
+/// Columns of breathing room the bottom chrome keeps on both sides on terminals
+/// wide enough to afford it. Every helper below assumes such a width.
+const CHROME_GUTTER: u16 = 4;
+
 fn composer_top_row(renderer: &RatatuiRenderer<TestBackend>) -> u16 {
     let buffer = renderer.terminal().backend().buffer();
     (0..buffer.area.height)
-        .find(|row| buffer[(0, *row)].symbol() == "┌")
+        .find(|row| buffer[(CHROME_GUTTER, *row)].symbol() == "┌")
         .expect("composer top border should be rendered")
 }
 
 fn composer_bottom_row(renderer: &RatatuiRenderer<TestBackend>) -> u16 {
     let buffer = renderer.terminal().backend().buffer();
     (0..buffer.area.height)
-        .find(|row| buffer[(0, *row)].symbol() == "└")
+        .find(|row| buffer[(CHROME_GUTTER, *row)].symbol() == "└")
         .expect("composer bottom border should be rendered")
 }
 
@@ -146,10 +150,68 @@ fn empty_composer_renders_a_complete_dock() {
     let buffer = renderer.terminal().backend().buffer();
     let composer_top = height - 7;
     let composer_bottom = height - 5;
-    assert_eq!(buffer[(0, composer_top)].symbol(), "┌");
-    assert_eq!(buffer[(width - 1, composer_top)].symbol(), "┐");
-    assert_eq!(buffer[(0, composer_bottom)].symbol(), "└");
-    assert_eq!(buffer[(width - 1, composer_bottom)].symbol(), "┘");
+    assert_eq!(buffer[(CHROME_GUTTER, composer_top)].symbol(), "┌");
+    assert_eq!(
+        buffer[(width - 1 - CHROME_GUTTER, composer_top)].symbol(),
+        "┐"
+    );
+    assert_eq!(buffer[(CHROME_GUTTER, composer_bottom)].symbol(), "└");
+    assert_eq!(
+        buffer[(width - 1 - CHROME_GUTTER, composer_bottom)].symbol(),
+        "┘"
+    );
+}
+
+#[test]
+fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free() {
+    let (width, height) = (120_u16, 24_u16);
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width, height });
+    tui.handle(Event::Key(Key::CtrlC));
+    start_execution(&mut tui, 9, "explore");
+
+    renderer.render(tui.view()).unwrap();
+    let top = composer_top_row(&renderer);
+    let bottom = composer_bottom_row(&renderer);
+    let buffer = renderer.terminal().backend().buffer();
+
+    assert_eq!(buffer[(CHROME_GUTTER, top)].symbol(), "┌");
+    assert_eq!(buffer[(width - 1 - CHROME_GUTTER, top)].symbol(), "┐");
+    assert_eq!(buffer[(CHROME_GUTTER, bottom)].symbol(), "└");
+    assert_eq!(buffer[(width - 1 - CHROME_GUTTER, bottom)].symbol(), "┘");
+    for row in top..=bottom {
+        for column in 0..CHROME_GUTTER {
+            assert_eq!(
+                buffer[(column, row)].symbol(),
+                " ",
+                "left gutter must stay blank at column {column} row {row}"
+            );
+            assert_eq!(
+                buffer[(width - 1 - column, row)].symbol(),
+                " ",
+                "right gutter must stay blank at column {} row {row}",
+                width - 1 - column
+            );
+        }
+    }
+
+    assert_eq!(
+        rendered_column(&renderer, "Tab focus"),
+        usize::from(CHROME_GUTTER),
+        "the subagent tree starts at the shared gutter"
+    );
+    assert_eq!(
+        rendered_column(&renderer, "Press Ctrl+C again to exit"),
+        usize::from(CHROME_GUTTER + 1),
+        "the notice starts at the shared gutter plus its own leading space"
+    );
+    assert_eq!(
+        rendered_column(&renderer, "model —"),
+        usize::from(CHROME_GUTTER + 1),
+        "the status bar starts at the shared gutter plus its own leading space"
+    );
 }
 
 #[test]
@@ -3280,15 +3342,15 @@ fn elided_subagent_tree_reports_the_hidden_branch_count() {
 
 #[test]
 fn bottom_chrome_degrades_without_panicking_on_small_terminals() {
-    for (width, height) in [
-        (1_u16, 1_u16),
-        (1, 2),
-        (2, 1),
-        (4, 3),
-        (10, 7),
-        (20, 12),
-        (24, 14),
-        (40, 20),
+    for (width, height, gutter) in [
+        (1_u16, 1_u16, 0_u16),
+        (1, 2, 0),
+        (2, 1, 0),
+        (4, 3, 0),
+        (10, 7, 0),
+        (20, 12, 0),
+        (24, 14, 0),
+        (40, 20, CHROME_GUTTER),
     ] {
         let mut renderer =
             RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
@@ -3308,12 +3370,19 @@ fn bottom_chrome_degrades_without_panicking_on_small_terminals() {
         if height >= 2 {
             let buffer = renderer.terminal().backend().buffer();
             let top = (0..height)
-                .find(|row| buffer[(0, *row)].symbol() == "┌")
+                .find(|row| buffer[(gutter, *row)].symbol() == "┌")
                 .unwrap_or_else(|| panic!("no composer top at {width}x{height}: {text:?}"));
             assert!(
-                (top + 1..height).any(|row| buffer[(0, row)].symbol() == "└"),
+                (top + 1..height).any(|row| buffer[(gutter, row)].symbol() == "└"),
                 "the composer keeps priority over decorative chrome at {width}x{height}: {text:?}"
             );
+            if width >= 2 {
+                assert_eq!(
+                    buffer[(width - 1 - gutter, top)].symbol(),
+                    "┐",
+                    "the gutter stays symmetric at {width}x{height}: {text:?}"
+                );
+            }
         }
     }
 }

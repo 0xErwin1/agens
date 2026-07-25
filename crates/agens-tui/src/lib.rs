@@ -52,7 +52,7 @@ use crossterm::{
 use ratatui::{
     Terminal as RatatuiTerminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Padding, Paragraph, Wrap},
@@ -1197,7 +1197,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if layout.footer.height > 0 {
         frame.render_widget(
             Paragraph::new(widgets::MetricFooter::text(
-                area.width,
+                layout.footer.width,
                 widgets::FooterContext {
                     model: state.provider_model,
                     effort: state.reasoning_effort,
@@ -1629,6 +1629,22 @@ fn conversation_surface(area: Rect) -> Rect {
     area
 }
 
+/// Columns kept free on both sides of every bottom band.
+///
+/// The bottom chrome shares the gutter the transcript already indents its
+/// content by, so the composer box, the notice, the subagent tree and the status
+/// bar all start on one column instead of three different ones.
+const CHROME_GUTTER: u16 = TRANSCRIPT_CONTENT_INDENT;
+/// Narrowest composer box that still earns a gutter. Below it the gutter is
+/// spent on input room instead of symmetry.
+const MIN_GUTTERED_COMPOSER_WIDTH: u16 = 24;
+
+/// Gutter a terminal of this width can afford, shrinking one column at a time so
+/// a narrow terminal degrades to a flush composer instead of a starved one.
+fn chrome_gutter(width: u16) -> u16 {
+    CHROME_GUTTER.min(width.saturating_sub(MIN_GUTTERED_COMPOSER_WIDTH) / 2)
+}
+
 /// Minimum terminal height before the subagent tree may claim rows.
 const TREE_MIN_SCREEN_HEIGHT: u16 = 14;
 /// Executions shown as tree branches, matching the navigable transcript set.
@@ -1731,12 +1747,13 @@ fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
     ])
     .split(area);
 
+    let gutter = Margin::new(chrome_gutter(area.width), 0);
     ScreenLayout {
         transcript: chunks[0],
-        composer: chunks[1],
-        notice: chunks[2],
-        tree: chunks[3],
-        footer: chunks[4],
+        composer: chunks[1].inner(gutter),
+        notice: chunks[2].inner(gutter),
+        tree: chunks[3].inner(gutter),
+        footer: chunks[4].inner(gutter),
     }
 }
 
@@ -7529,5 +7546,31 @@ mod runtime_tests {
             last_page.contains(&(Cow::Borrowed("ctrl+a"), Cow::Borrowed("current project"))),
             "{last_page:?}"
         );
+    }
+
+    #[test]
+    fn bottom_chrome_bands_share_one_gutter_that_collapses_on_narrow_terminals() {
+        let layout = screen_layout(Rect::new(0, 0, 120, 24), "");
+        for band in [layout.composer, layout.notice, layout.tree, layout.footer] {
+            assert_eq!(band.x, CHROME_GUTTER, "{band:?}");
+            assert_eq!(band.width, 120 - 2 * CHROME_GUTTER, "{band:?}");
+        }
+        assert_eq!(layout.transcript.x, 0);
+        assert_eq!(layout.transcript.width, 120);
+
+        assert_eq!(
+            [0_u16, 1, 24, 26, 28, 30, 32, 120].map(chrome_gutter),
+            [0, 0, 0, 1, 2, 3, 4, 4]
+        );
+
+        for width in 0..=64_u16 {
+            let layout = screen_layout(Rect::new(0, 0, width, 24), "");
+            assert!(layout.composer.right() <= width, "width {width}");
+            assert!(
+                layout.composer.width >= width.min(MIN_GUTTERED_COMPOSER_WIDTH),
+                "width {width} starves the composer: {:?}",
+                layout.composer
+            );
+        }
     }
 }
