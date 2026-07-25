@@ -23,8 +23,7 @@ use agens_config::ToolLimitSettings;
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_config::{
-    ConfiguredValue, Origin, ResolvedSettings, expand_environment,
-    expand_environment_with_commands, parse_toml_document, resolve_paths, starter_document,
+    expand_environment, expand_environment_with_commands, parse_toml_document,
     validate_toml_document,
 };
 use agens_core::{
@@ -94,6 +93,7 @@ use agens_tui::{
 mod bootstrap;
 mod chatgpt_auth;
 mod cli;
+mod commands;
 mod diagnostics;
 mod dispatch;
 mod error;
@@ -107,11 +107,9 @@ mod test_support;
 mod tools;
 mod turns;
 
-use bootstrap::{
-    ProviderSource, discover_project_root, effective_max_iterations,
-    seed_configured_reasoning_effort,
-};
+use bootstrap::{ProviderSource, effective_max_iterations, seed_configured_reasoning_effort};
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
+use commands::config::{create_configuration_file, run_config};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -509,93 +507,6 @@ fn execute_command(
         Some(cli::Command::Sessions { action }) => run_sessions(action, dependencies),
         Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
     }
-}
-
-fn run_config(
-    action: cli::ConfigAction,
-    dependencies: &CliDependencies,
-) -> Result<String, CliError> {
-    match action {
-        cli::ConfigAction::Init => run_config_init(dependencies),
-        cli::ConfigAction::Doctor => {
-            let bootstrap = bootstrap(dependencies)?;
-            Ok(format!(
-                "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n\n{}",
-                bootstrap.paths.global_config.display(),
-                source_status(bootstrap.global_loaded),
-                bootstrap.paths.project_config.display(),
-                source_status(bootstrap.project_loaded),
-                bootstrap.model.as_deref().unwrap_or("-"),
-                effective_settings_report(bootstrap.settings())
-            ))
-        }
-    }
-}
-
-/// Writes a documented starter configuration for the current project. Refuses
-/// to touch an existing file: the command creates configuration, it never
-/// rewrites what a user already wrote.
-fn run_config_init(dependencies: &CliDependencies) -> Result<String, CliError> {
-    let current_directory = (dependencies.current_directory)()?;
-    let home_directory = (dependencies.home_directory)();
-    let environment = (dependencies.environment)();
-    let project_root = discover_project_root(&current_directory).unwrap_or(current_directory);
-    let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
-
-    if (dependencies.read_file)(&paths.project_config)?.is_some() {
-        return Err(CliError::configuration(format!(
-            "configuration already exists at {}",
-            paths.project_config.display()
-        )));
-    }
-
-    (dependencies.create_file)(&paths.project_config, &starter_document())?;
-
-    Ok(format!("Wrote {}\n", paths.project_config.display()))
-}
-
-fn create_configuration_file(path: &Path, contents: &str) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|_| CliError::configuration("configuration directory is unavailable"))?;
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|_| CliError::configuration("configuration file cannot be created"))?;
-    file.write_all(contents.as_bytes())
-        .map_err(|_| CliError::configuration("configuration file cannot be written"))
-}
-
-/// Renders every catalog setting with its effective value and the layer that
-/// supplied it. Reads only configuration; credentials are never consulted.
-fn effective_settings_report(settings: &ResolvedSettings) -> String {
-    let width = settings
-        .iter()
-        .map(|(path, _)| path.chars().count())
-        .max()
-        .unwrap_or_default();
-    let mut report = String::from("Settings:\n");
-
-    for (path, setting) in settings.iter() {
-        let value = match &setting.value {
-            ConfiguredValue::Bool(value) => value.to_string(),
-            ConfiguredValue::Integer(value) => value.to_string(),
-            ConfiguredValue::Text(value) => value.clone(),
-            ConfiguredValue::Absent => "-".to_owned(),
-        };
-        let origin = match setting.origin {
-            Origin::Default => "default",
-            Origin::Global => "global",
-            Origin::Project => "project",
-            Origin::Environment => "environment",
-        };
-        report.push_str(&format!("  {path:<width$}  {value:<12}  {origin}\n"));
-    }
-
-    report
 }
 
 fn run_auth(
@@ -5046,10 +4957,6 @@ fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {
     }
 
     value.as_str().map(ToOwned::to_owned)
-}
-
-fn source_status(loaded: bool) -> &'static str {
-    if loaded { "loaded" } else { "missing" }
 }
 
 #[cfg(test)]
