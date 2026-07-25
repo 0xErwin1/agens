@@ -6116,8 +6116,9 @@ fn completed_session_turn_from_events(
 
 fn completed_subagent_session_turn(
     turn: &CompletedSubagentTurn,
+    call_id: &str,
 ) -> Result<CompletedSessionTurn, CliError> {
-    let call_id = format!("subagent:{}", turn.id);
+    let call_id = call_id.to_owned();
     let agent = sanitize_subagent_persistence(&turn.agent);
     let task = sanitize_subagent_persistence(&turn.task);
     let final_result = sanitize_subagent_persistence(&turn.final_result);
@@ -6158,6 +6159,26 @@ fn completed_subagent_session_turn(
         .map_err(|_| CliError::storage("completed session could not be encoded"))?;
     CompletedSessionTurn::new(messages)
         .map_err(|_| CliError::storage("completed session could not be encoded"))
+}
+
+const SUBAGENT_CALL_ID_PREFIX: &str = "subagent:";
+
+/// A subagent tool-call id must be unique inside the session, not merely inside the process:
+/// execution ids restart at one in every process, so a resumed session would otherwise persist a
+/// duplicate call id and make the whole history unencodable for the provider.
+fn next_subagent_call_id(history: &[Message]) -> String {
+    let highest = history
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            MessagePart::ToolCall { id, .. } => id.strip_prefix(SUBAGENT_CALL_ID_PREFIX),
+            _ => None,
+        })
+        .filter_map(|value| value.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0);
+
+    format!("{SUBAGENT_CALL_ID_PREFIX}{}", highest.saturating_add(1))
 }
 
 fn sanitize_subagent_persistence(value: &str) -> String {
@@ -6205,8 +6226,16 @@ fn persist_completed_subagent_turn(
     )?;
     let mut store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    let persisted_history = context
+        .identifier
+        .and_then(|identifier| store.load_session_for_resume(identifier).ok())
+        .map(|session| session.messages);
+    let call_id = next_subagent_call_id(persisted_history.as_deref().unwrap_or(&context.messages));
     let metadata = store
-        .persist_completed_session_turn(&metadata, &completed_subagent_session_turn(&turn)?)
+        .persist_completed_session_turn(
+            &metadata,
+            &completed_subagent_session_turn(&turn, &call_id)?,
+        )
         .map_err(|_| CliError::storage("completed session could not be saved"))?;
     let messages = store
         .load_session_for_resume(metadata.id)
@@ -9850,7 +9879,7 @@ mod tests {
             tool_uses: 1,
         };
 
-        let messages = completed_subagent_session_turn(&turn)
+        let messages = completed_subagent_session_turn(&turn, "subagent:1")
             .unwrap()
             .messages()
             .to_vec();
@@ -9867,6 +9896,42 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    #[test]
+    fn p1c1_persisted_subagent_call_ids_stay_unique_when_execution_ids_restart() {
+        let temporary = tui_session_directory("subagent-call-id-uniqueness");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let turn = |final_result: &str| CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "review the patch".into(),
+            final_result: final_result.into(),
+            tool_uses: 1,
+        };
+
+        persist_completed_subagent_turn(&bootstrap, &session, turn("first")).unwrap();
+        persist_completed_subagent_turn(&bootstrap, &session, turn("second")).unwrap();
+
+        let messages = session.lock().unwrap().messages.clone();
+        let call_ids = messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            call_ids,
+            vec!["subagent:1".to_owned(), "subagent:2".to_owned()]
+        );
+        agens_providers::encode_openai_response_request_with_messages("gpt-4.1", &messages, &[])
+            .expect("a resumed subagent history must encode for the provider");
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
