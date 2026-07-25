@@ -119,6 +119,7 @@ Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.l
 
 - `sessions.db` stores completed turn events.
 - `permissions.db` stores project-scoped permission grants.
+- `preferences.db` stores the last model and reasoning effort chosen in the terminal UI. A new session reuses them only when neither a CLI flag nor configuration names a model.
 
 Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. Native filesystem operations are confined beneath the project root, and process tools remain permission-gated and bounded.
 
@@ -134,7 +135,7 @@ The workspace contains seven crates:
 | `agens-config` | TOML validation, merging, expansion, paths, MCP definitions, and permission rules |
 | `agens-providers` | OpenAI and ChatGPT authentication and streaming adapters |
 | `agens-tools` | Native tools, permission dispatch, MCP transports, and reusable skill/sub-agent library contracts |
-| `agens-store` | SQLite completed turns and persisted project grants |
+| `agens-store` | SQLite completed turns, persisted project grants, and remembered selections |
 | `agens-tui` | Terminal rendering and input over the shared runtime |
 | `agens-cli` | Command parsing, adapter wiring, and the `agens` binaries |
 

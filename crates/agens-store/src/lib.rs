@@ -6,7 +6,8 @@ use std::{
 
 use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, MessagePart,
-    PermissionDecision, PermissionPattern, ProjectPermissionGrant, TurnEvent, TurnState,
+    PermissionDecision, PermissionPattern, ProjectPermissionGrant, ReasoningEffort, RequestConfig,
+    TurnEvent, TurnState,
 };
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
@@ -31,6 +32,10 @@ const PERMISSION_GRANTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
     ExpectedIndexColumnSignature::new(0, 1, "project"),
     ExpectedIndexColumnSignature::new(1, 0, "id"),
 ];
+
+const PREFERENCES_DATABASE: &str = "preferences.db";
+const PREFERENCES_SCHEMA_VERSION: i64 = 1;
+const MAX_PREFERENCE_MODEL_BYTES: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
 struct ExpectedColumnSignature {
@@ -670,6 +675,211 @@ fn decode_pattern(
             .map_err(|_| PermissionGrantStoreError::invalid("invalid stored grant pattern")),
         _ => Err(PermissionGrantStoreError::invalid(
             "invalid stored grant pattern",
+        )),
+    }
+}
+
+/// The model and reasoning effort a user last chose explicitly.
+///
+/// Both travel together: an effort that outlived its model would be applied to a model that never
+/// supported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPreference {
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl ModelPreference {
+    pub fn new(model: impl Into<String>, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        Self {
+            model: model.into(),
+            reasoning_effort,
+        }
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreferenceStoreError {
+    message: String,
+}
+
+impl PreferenceStoreError {
+    fn operation(operation: &str, path: &Path, error: impl fmt::Display) -> Self {
+        Self {
+            message: format!("preferences {operation} at {}: {error}", path.display()),
+        }
+    }
+
+    fn detail(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PreferenceStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PreferenceStoreError {}
+
+/// Runtime state for choices the user expects to outlive a session.
+///
+/// It is deliberately a separate database from sessions and grants: the preference has no
+/// relationship to either schema, and hand-authored configuration stays untouched.
+pub struct PreferenceStore {
+    database_path: PathBuf,
+    connection: Connection,
+}
+
+impl PreferenceStore {
+    pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, PreferenceStoreError> {
+        let data_directory = data_directory.as_ref();
+        fs::create_dir_all(data_directory).map_err(|error| {
+            PreferenceStoreError::operation("create data directory", data_directory, error)
+        })?;
+        restrict_permissions(data_directory, 0o700)
+            .map_err(|error| PreferenceStoreError::detail(error.to_string()))?;
+
+        let database_path = data_directory.join(PREFERENCES_DATABASE);
+        let connection = Connection::open(&database_path).map_err(|error| {
+            PreferenceStoreError::operation("open database", &database_path, error)
+        })?;
+        restrict_permissions(&database_path, 0o600)
+            .map_err(|error| PreferenceStoreError::detail(error.to_string()))?;
+        initialize_preferences_schema(&connection, &database_path)?;
+
+        Ok(Self {
+            database_path,
+            connection,
+        })
+    }
+
+    pub fn database_path(&self) -> PathBuf {
+        self.database_path.clone()
+    }
+
+    pub fn remember_model(
+        &mut self,
+        preference: &ModelPreference,
+    ) -> Result<(), PreferenceStoreError> {
+        if !valid_preference_model(&preference.model) {
+            return Err(PreferenceStoreError::detail(
+                "remembered model identifier is invalid",
+            ));
+        }
+
+        self.connection
+            .execute(
+                "INSERT INTO model_preference (id, model, reasoning_effort)
+                 VALUES (1, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET model = ?1, reasoning_effort = ?2",
+                params![
+                    preference.model,
+                    preference.reasoning_effort.map(ReasoningEffort::as_str),
+                ],
+            )
+            .map_err(|error| {
+                PreferenceStoreError::operation("save model preference", &self.database_path, error)
+            })?;
+        Ok(())
+    }
+
+    pub fn remembered_model(&self) -> Result<Option<ModelPreference>, PreferenceStoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT model, reasoning_effort FROM model_preference WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                error => Err(PreferenceStoreError::operation(
+                    "read model preference",
+                    &self.database_path,
+                    error,
+                )),
+            })?;
+        let Some((model, reasoning_effort)) = row else {
+            return Ok(None);
+        };
+        if !valid_preference_model(&model) {
+            return Err(PreferenceStoreError::detail(
+                "stored model preference is invalid",
+            ));
+        }
+        let reasoning_effort = reasoning_effort
+            .map(|effort| {
+                RequestConfig::with_reasoning_effort(&effort)
+                    .map_err(|_| {
+                        PreferenceStoreError::detail("stored reasoning effort is unsupported")
+                    })?
+                    .reasoning_effort()
+                    .ok_or_else(|| {
+                        PreferenceStoreError::detail("stored reasoning effort is unsupported")
+                    })
+            })
+            .transpose()?;
+
+        Ok(Some(ModelPreference {
+            model,
+            reasoning_effort,
+        }))
+    }
+}
+
+fn valid_preference_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= MAX_PREFERENCE_MODEL_BYTES
+        && model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
+        })
+}
+
+fn initialize_preferences_schema(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), PreferenceStoreError> {
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| {
+            PreferenceStoreError::operation("read schema version", database_path, error)
+        })?;
+
+    match version {
+        0 => connection
+            .execute_batch(&format!(
+                "
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS model_preference (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    model TEXT NOT NULL CHECK(model <> ''),
+                    reasoning_effort TEXT
+                );
+                PRAGMA user_version = {PREFERENCES_SCHEMA_VERSION};
+                COMMIT;
+                "
+            ))
+            .map_err(|error| {
+                PreferenceStoreError::operation("initialize schema", database_path, error)
+            }),
+        PREFERENCES_SCHEMA_VERSION => Ok(()),
+        unsupported => Err(PreferenceStoreError::operation(
+            "check schema version",
+            database_path,
+            format!("unsupported schema version {unsupported}"),
         )),
     }
 }
