@@ -10,9 +10,8 @@ use agens_core::{
 };
 use agens_store::SessionStore;
 
-use crate::{
-    Bootstrap, CliError, CompletedSubagentTurn, TuiProvider, TuiSessionContext, default_model,
-};
+use crate::tools::task::default_model;
+use crate::{Bootstrap, CliError, CompletedSubagentTurn, TuiProvider, TuiSessionContext};
 
 pub(crate) fn next_session_metadata(
     bootstrap: &Bootstrap,

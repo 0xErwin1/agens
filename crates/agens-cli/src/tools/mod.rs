@@ -2,3 +2,4 @@
 //! subagent wiring for the production CLI.
 
 pub(crate) mod runtime;
+pub(crate) mod task;

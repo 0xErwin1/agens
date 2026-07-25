@@ -25,12 +25,13 @@ use crate::session::attempt::{
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
 };
 use crate::tools::runtime::production_tool_runtime_for_parent;
+use crate::tools::task::ProductionTuiTaskRuntime;
 use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
     Bootstrap, ProductionPermissionGate, ProductionPermissionPrompter,
     ProductionPermissionResolver, ProductionPromptAuthorization, ProductionToolDispatcher,
-    ProductionTuiTaskRuntime, TaskMailboxProvider, TtyPermissionPrompter, TuiAgentModelValidator,
-    TuiProvider, cancellation_result, effective_max_iterations, explicit_task_delegation_prompt,
+    TaskMailboxProvider, TtyPermissionPrompter, TuiAgentModelValidator, TuiProvider,
+    cancellation_result, effective_max_iterations, explicit_task_delegation_prompt,
     operation_diagnostics, permission_policy, record_parent_terminal, tui_agent_catalog,
 };
 
