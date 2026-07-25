@@ -107,6 +107,17 @@ fn failure(status: ExitStatus, stderr: impl Into<String>) -> CommandResult {
     }
 }
 
+/// A failure whose stderr is already clap's own fully rendered error text
+/// (its own `error: ` prefix and usage block). Unlike [`failure`], this does
+/// NOT add another `error: ` wrapper.
+fn preformatted_failure(status: ExitStatus, stderr: impl Into<String>) -> CommandResult {
+    CommandResult {
+        status,
+        stdout: String::new(),
+        stderr: stderr.into(),
+    }
+}
+
 /// `config doctor`'s report over an empty global and project configuration.
 /// Every catalog setting therefore falls back to its documented default.
 const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
@@ -215,12 +226,14 @@ fn table_a_root_shapes_hold() {
                 name: "--resume abc is an unknown command shape",
                 argv: argv(&["--resume", "abc"]),
                 dependencies,
-                expected: failure(
+                // clap rejects the `--resume` value itself (a value-validation
+                // error), which is a different rendering shape than an
+                // unrecognized subcommand; sourced from the same Table B
+                // module as `parser_surface_baseline::unrecognized_subcommand_message`
+                // so it still updates only via that module.
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!(
-                        "usage: {}",
-                        parser_surface_baseline::UNKNOWN_COMMAND_MESSAGE
-                    ),
+                    parser_surface_baseline::resume_invalid_value_message("abc"),
                 ),
                 _temporary: temporary,
             }
@@ -232,12 +245,9 @@ fn table_a_root_shapes_hold() {
                 name: "a bare non-numeric word is an unknown command",
                 argv: argv(&["abc"]),
                 dependencies,
-                expected: failure(
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!(
-                        "usage: {}",
-                        parser_surface_baseline::UNKNOWN_COMMAND_MESSAGE
-                    ),
+                    parser_surface_baseline::unrecognized_subcommand_message("abc"),
                 ),
                 _temporary: temporary,
             }
@@ -784,9 +794,9 @@ fn table_a_models_and_sessions_hold() {
                 name: "models rejects any argument",
                 argv: argv(&["models", "extra"]),
                 dependencies,
-                expected: failure(
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!("usage: {}", parser_surface_baseline::MODELS_EXTRA_MESSAGE),
+                    parser_surface_baseline::MODELS_EXTRA_MESSAGE,
                 ),
                 _temporary: temporary,
             }
@@ -930,30 +940,52 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) fn root_help() -> String {
-        format!(
-            "Agens is a coding agent CLI\n\nUsage: agens <command>\n\nCommands:\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  config    inspect configuration\n  models    list provider models\n  sessions  inspect completed turns\n\nVersion: {VERSION}\n"
-        )
-    }
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    \n  auth      \n  chat      \n  models    \n  sessions  \n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")
     }
 
-    pub(crate) const CONFIG_HELP: &str = "Usage: agens config <doctor|init>\n";
-    pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str =
-        "config requires the doctor or init subcommand";
-    pub(crate) const AUTH_HELP: &str = "Usage: agens auth <status|login|logout>\n";
-    pub(crate) const CHAT_HELP: &str = "Usage: agens chat [flags] <prompt>\n";
+    pub(crate) const CONFIG_HELP: &str = "Usage: config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = "Usage: config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const AUTH_HELP: &str = "Usage: auth [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CHAT_HELP: &str = "Usage: chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
     /// D1: `chat foo --help` is Usage(2) today (`--help` here is read as an
-    /// unrecognized flag, not as a request for help). Phase 1 accepts this
-    /// becoming Success(0) under clap.
+    /// unrecognized flag, not as a request for help). Under clap, the same
+    /// leftover-token loop still classifies `--help` here as an unknown
+    /// flag (it never reaches clap's own help interception once "foo" has
+    /// already started filling the trailing catch-all), so this stays
+    /// Usage(2) with the same body-owned message: NO delta observed here,
+    /// unlike what the design anticipated.
     pub(crate) const CHAT_FOO_HELP_MESSAGE: &str = "chat received an unknown flag";
-    pub(crate) const MODELS_HELP: &str = "Usage: agens models\n";
-    pub(crate) const SESSIONS_HELP: &str = "Usage: agens sessions <list|show|rm>\n";
-    pub(crate) const UNKNOWN_COMMAND_MESSAGE: &str = "unknown command; run agens --help";
-    pub(crate) const MODELS_EXTRA_MESSAGE: &str = "models does not accept arguments";
-    pub(crate) const CHAT_MODEL_MISSING_VALUE_MESSAGE: &str = "chat --model requires a value";
+    pub(crate) const MODELS_HELP: &str = "Usage: models\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const SESSIONS_HELP: &str = "Usage: sessions [ARGUMENTS]...\n\nArguments:\n  [ARGUMENTS]...  \n\nOptions:\n  -h, --help  Print help\n";
+
+    /// clap's rendering embeds the offending token, so this can no longer be
+    /// a single shared literal the way the hand-rolled parser's one static
+    /// message was; it is a function of the invalid subcommand name.
+    pub(crate) fn unrecognized_subcommand_message(token: &str) -> String {
+        format!(
+            "error: unrecognized subcommand '{token}'\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+        )
+    }
+
+    /// `--resume <non-numeric>` fails clap's own value parsing for the
+    /// `--resume` option; this is a distinct clap error shape (no `Usage:`
+    /// line) from an unrecognized subcommand, so it cannot share
+    /// `unrecognized_subcommand_message`.
+    pub(crate) fn resume_invalid_value_message(token: &str) -> String {
+        format!(
+            "error: invalid value '{token}' for '--resume [<SESSION_ID>]': invalid digit found in string\n\nFor more information, try '--help'.\n"
+        )
+    }
+
+    pub(crate) const MODELS_EXTRA_MESSAGE: &str = "error: unexpected argument 'extra' found\n\nUsage: models\n\nFor more information, try '--help'.\n";
+    pub(crate) const CHAT_MODEL_MISSING_VALUE_MESSAGE: &str = "error: a value is required for '--model <MODEL>' but none was supplied\n\nFor more information, try '--help'.\n";
+    /// Unlike the other clap-owned cases above, this stays a body-owned
+    /// message: `ChatArgs.prompt` is an unbounded `Vec<String>` (see
+    /// `cli.rs`), so clap itself never errors on zero prompt tokens; the
+    /// domain check in `chat_request` still produces this exact text.
     pub(crate) const CHAT_MISSING_PROMPT_MESSAGE: &str = "chat requires a prompt argument";
 }
 
@@ -969,7 +1001,7 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "help",
                 argv: argv(&["help"]),
                 dependencies,
-                expected: success(baseline::root_help()),
+                expected: success(baseline::ROOT_HELP),
                 _temporary: temporary,
             }
         },
@@ -980,7 +1012,7 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "--help",
                 argv: argv(&["--help"]),
                 dependencies,
-                expected: success(baseline::root_help()),
+                expected: success(baseline::ROOT_HELP),
                 _temporary: temporary,
             }
         },
@@ -991,7 +1023,7 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "-h",
                 argv: argv(&["-h"]),
                 dependencies,
-                expected: success(baseline::root_help()),
+                expected: success(baseline::ROOT_HELP),
                 _temporary: temporary,
             }
         },
@@ -1046,9 +1078,9 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "config with no subcommand",
                 argv: argv(&["config"]),
                 dependencies,
-                expected: failure(
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!("usage: {}", baseline::CONFIG_MISSING_SUBCOMMAND_MESSAGE),
+                    baseline::CONFIG_MISSING_SUBCOMMAND_MESSAGE,
                 ),
                 _temporary: temporary,
             }
@@ -1118,9 +1150,9 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "an unknown top-level command",
                 argv: argv(&["frobnicate"]),
                 dependencies,
-                expected: failure(
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!("usage: {}", baseline::UNKNOWN_COMMAND_MESSAGE),
+                    baseline::unrecognized_subcommand_message("frobnicate"),
                 ),
                 _temporary: temporary,
             }
@@ -1132,10 +1164,7 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "models extra",
                 argv: argv(&["models", "extra"]),
                 dependencies,
-                expected: failure(
-                    ExitStatus::Usage,
-                    format!("usage: {}", baseline::MODELS_EXTRA_MESSAGE),
-                ),
+                expected: preformatted_failure(ExitStatus::Usage, baseline::MODELS_EXTRA_MESSAGE),
                 _temporary: temporary,
             }
         },
@@ -1146,9 +1175,9 @@ fn table_b_parser_surface_baseline_holds() {
                 name: "chat --model with no value",
                 argv: argv(&["chat", "--model"]),
                 dependencies,
-                expected: failure(
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!("usage: {}", baseline::CHAT_MODEL_MISSING_VALUE_MESSAGE),
+                    baseline::CHAT_MODEL_MISSING_VALUE_MESSAGE,
                 ),
                 _temporary: temporary,
             }
