@@ -65,6 +65,7 @@ use agens_tui::{
 };
 
 mod chatgpt_auth;
+mod cli;
 mod model_registry;
 
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
@@ -497,11 +498,25 @@ pub struct CliError {
     status: ExitStatus,
     category: &'static str,
     message: String,
+    preformatted: bool,
 }
 
 impl CliError {
     fn usage(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Usage, "usage", message)
+    }
+
+    /// Wraps text clap has already fully rendered (its own `error: ` prefix
+    /// and usage block). `error_result` emits `message` verbatim instead of
+    /// wrapping it in the `error: {category}: {message}` envelope, which
+    /// would otherwise double the `error: ` prefix.
+    fn preformatted_usage(message: impl Into<String>) -> Self {
+        Self {
+            status: ExitStatus::Usage,
+            category: "usage",
+            message: message.into(),
+            preformatted: true,
+        }
     }
 
     fn configuration(message: impl Into<String>) -> Self {
@@ -607,6 +622,7 @@ impl CliError {
             status,
             category,
             message: message.into(),
+            preformatted: false,
         }
     }
 
@@ -753,7 +769,11 @@ fn error_result(arguments: &[String], error: CliError) -> CommandResult {
         } else {
             String::new()
         },
-        stderr: format!("error: {error}\n"),
+        stderr: if error.preformatted {
+            error.message.clone()
+        } else {
+            format!("error: {error}\n")
+        },
     }
 }
 
