@@ -8,9 +8,10 @@
 //! unless the case belongs to [`parser_surface_baseline`].
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use agens::{CliDependencies, CommandResult, ExitStatus, execute};
+use agens::{CliDependencies, CommandResult, ExitStatus, execute, execute_os};
 
 /// A private, per-case working directory. Real disk is only touched by
 /// commands that call `bootstrap` (session storage, credential files); every
@@ -100,6 +101,472 @@ fn failure(status: ExitStatus, stderr: impl Into<String>) -> CommandResult {
         stdout: String::new(),
         stderr: format!("error: {}\n", stderr.into()),
     }
+}
+
+/// `config doctor`'s report over an empty global and project configuration.
+/// Every catalog setting therefore falls back to its documented default.
+const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
+    "Settings:\n",
+    "  options.debug               true          default\n",
+    "  options.data_dir            -             default\n",
+    "  provider.type               -             default\n",
+    "  provider.model              -             default\n",
+    "  provider.base_url           -             default\n",
+    "  agent.system_prompt         -             default\n",
+    "  agent.max_iterations        -             default\n",
+    "  agent.parallel_tool_calls   true          default\n",
+    "  agent.default_agent         -             default\n",
+    "  agent.reasoning_effort      -             default\n",
+    "  ui.collapse_thinking        false         default\n",
+    "  tools.max_list_entries      1000          default\n",
+    "  tools.max_search_entries    10000         default\n",
+    "  tools.max_search_results    100           default\n",
+    "  tools.max_search_depth      32            default\n",
+    "  tools.operation_timeout_ms  5000          default\n",
+    "  tools.bash_timeout_ms       120000        default\n",
+    "  subagents.max_iterations    16            default\n",
+    "  subagents.max_concurrency   4             default\n",
+    "  subagents.max_output_chars  65536         default\n",
+    "  mcp_defaults.timeout_ms     10000         default\n",
+    "  mcp_defaults.max_retries    0             default\n",
+);
+
+fn config_global_config_path(temporary: &TemporaryDirectory) -> PathBuf {
+    temporary.home().join(".config/agens/config.toml")
+}
+
+fn config_project_config_path(temporary: &TemporaryDirectory) -> PathBuf {
+    temporary.project_root().join(".agens/config.toml")
+}
+
+#[test]
+fn table_a_root_shapes_hold() {
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("root-empty");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+            Case {
+                name: "[] resumes with no session",
+                argv: argv(&[]),
+                dependencies,
+                expected: success("resume=None\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-resume-flag-alone");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+            Case {
+                name: "--resume alone resumes with no session",
+                argv: argv(&["--resume"]),
+                dependencies,
+                expected: success("resume=None\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-resume-flag-with-id");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+            Case {
+                name: "--resume 42 resumes session 42",
+                argv: argv(&["--resume", "42"]),
+                dependencies,
+                expected: success("resume=Some(42)\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-bare-integer");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+            Case {
+                name: "a bare integer resumes that session",
+                argv: argv(&["42"]),
+                dependencies,
+                expected: success("resume=Some(42)\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            // R1: `i64::parse` accepts a leading minus, so a bare negative
+            // integer resumes a (nonsensical) negative session id today.
+            let temporary = TemporaryDirectory::new("root-negative-integer");
+            let dependencies = base_dependencies(&temporary)
+                .with_tui_launcher(|_, resume| Ok(format!("resume={resume:?}")));
+            Case {
+                name: "a bare negative integer resumes session -5 today (R1)",
+                argv: argv(&["-5"]),
+                dependencies,
+                expected: success("resume=Some(-5)\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-resume-non-numeric");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "--resume abc is an unknown command shape",
+                argv: argv(&["--resume", "abc"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    format!(
+                        "usage: {}",
+                        parser_surface_baseline::UNKNOWN_COMMAND_MESSAGE
+                    ),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("root-bare-word");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "a bare non-numeric word is an unknown command",
+                argv: argv(&["abc"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    format!(
+                        "usage: {}",
+                        parser_surface_baseline::UNKNOWN_COMMAND_MESSAGE
+                    ),
+                ),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
+#[test]
+fn table_a_root_shapes_reject_non_utf8_argv() {
+    let temporary = TemporaryDirectory::new("root-non-utf8");
+    let dependencies = base_dependencies(&temporary);
+
+    let non_utf8_argument = {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0xff, 0xfe])
+    };
+    let actual = execute_os([OsString::from("chat"), non_utf8_argument], &dependencies);
+
+    assert_eq!(
+        actual,
+        failure(
+            ExitStatus::Usage,
+            "usage: command arguments must be valid UTF-8"
+        )
+    );
+}
+
+#[test]
+fn table_a_config_holds() {
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("config-doctor-valid");
+            let dependencies = base_dependencies(&temporary);
+            let expected_stdout = format!(
+                "Agens config doctor\nGlobal:  {} (missing)\nProject: {} (missing)\nModel:   -\nStatus:  valid\n\n{}",
+                config_global_config_path(&temporary).display(),
+                config_project_config_path(&temporary).display(),
+                CONFIG_DOCTOR_DEFAULT_SETTINGS,
+            );
+            Case {
+                name: "config doctor over an empty configuration is valid",
+                argv: argv(&["config", "doctor"]),
+                dependencies,
+                expected: success(expected_stdout),
+                _temporary: temporary,
+            }
+        },
+        {
+            // A project configuration that defines `[mcp]` is rejected by
+            // `bootstrap` before the doctor report is built; this is the
+            // documented stdout-on-failure special case (`error_result`).
+            let temporary = TemporaryDirectory::new("config-doctor-invalid");
+            let mut files = BTreeMap::new();
+            files.insert(config_project_config_path(&temporary), "[mcp]\n".to_owned());
+            let dependencies = CliDependencies::for_test(
+                temporary.project_root(),
+                Some(temporary.home()),
+                BTreeMap::new(),
+                files,
+            );
+            Case {
+                name: "config doctor over an invalid configuration reports invalid on stdout too",
+                argv: argv(&["config", "doctor"]),
+                dependencies,
+                expected: CommandResult {
+                    status: ExitStatus::Configuration,
+                    stdout: "Agens config doctor\nStatus:  invalid\n".to_owned(),
+                    stderr: "error: config: project configuration cannot define MCP servers\n"
+                        .to_owned(),
+                },
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("config-init-no-existing-file");
+            let dependencies = base_dependencies(&temporary).with_create_file(|_, _| Ok(()));
+            let expected_stdout = format!(
+                "Wrote {}\n",
+                config_project_config_path(&temporary).display()
+            );
+            Case {
+                name: "config init writes a starter file when none exists",
+                argv: argv(&["config", "init"]),
+                dependencies,
+                expected: success(expected_stdout),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("config-init-existing-file");
+            let mut files = BTreeMap::new();
+            files.insert(
+                config_project_config_path(&temporary),
+                "[tools]\n".to_owned(),
+            );
+            let dependencies = CliDependencies::for_test(
+                temporary.project_root(),
+                Some(temporary.home()),
+                BTreeMap::new(),
+                files,
+            )
+            .with_create_file(|_, _| panic!("init must not overwrite an existing configuration"));
+            let expected_stderr = format!(
+                "config: configuration already exists at {}",
+                config_project_config_path(&temporary).display()
+            );
+            Case {
+                name: "config init refuses to replace an existing file",
+                argv: argv(&["config", "init"]),
+                dependencies,
+                expected: failure(ExitStatus::Configuration, expected_stderr),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
+#[test]
+fn table_a_auth_holds() {
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("auth-status-no-credentials");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status with no stored credentials",
+                argv: argv(&["auth", "status"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Authentication,
+                    "auth: ChatGPT credentials are unavailable or invalid",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-status-openai-api");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status openai-api with no stored credentials",
+                argv: argv(&["auth", "status", "openai-api"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Authentication,
+                    "auth: OpenAI API credentials are unavailable or invalid",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-status-openai-chatgpt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status openai-chatgpt with no stored credentials",
+                argv: argv(&["auth", "status", "openai-chatgpt"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Authentication,
+                    "auth: ChatGPT credentials are unavailable or invalid",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-status-bogus-provider");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status bogus is an unsupported provider",
+                argv: argv(&["auth", "status", "bogus"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-login-browser");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login delegates to the (unavailable) test double",
+                argv: argv(&["auth", "login"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Unavailable,
+                    "unavailable: this command is not implemented yet",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-login-device-auth");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login --device-auth delegates to the (unavailable) test double",
+                argv: argv(&["auth", "login", "--device-auth"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Unavailable,
+                    "unavailable: this command is not implemented yet",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // No `--api-key` value and a non-interactive, EOF stdin: the
+            // stdin read succeeds with zero bytes, which normalizes to an
+            // empty key and is rejected.
+            let temporary = TemporaryDirectory::new("auth-login-api-key-empty-stdin");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key openai-api with empty stdin",
+                argv: argv(&["auth", "login", "api-key", "openai-api"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: auth login api-key requires a non-empty API key",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-login-api-key-wrong-provider");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key openai-chatgpt is unsupported",
+                argv: argv(&["auth", "login", "api-key", "openai-chatgpt"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: API-key login supports only openai-api",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-login-api-key-junk-trailer");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key openai-api rejects trailing junk arguments",
+                argv: argv(&["auth", "login", "api-key", "openai-api", "junk"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: auth login api-key accepts only an optional --api-key value",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            // D3: `--device-auth` before `api-key` is NOT a recognized
+            // shape at all today; it falls through to the generic "auth
+            // requires status, login, or logout" usage error. This is
+            // load-bearing for Phase 1, which must add an explicit guard
+            // to keep clap from silently accepting and ignoring the flag.
+            let temporary = TemporaryDirectory::new("auth-login-device-auth-api-key-d3");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login --device-auth api-key openai-api is rejected today (D3)",
+                argv: argv(&["auth", "login", "--device-auth", "api-key", "openai-api"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: auth requires status, login, or logout",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-logout-openai-api");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth logout openai-api with nothing stored",
+                argv: argv(&["auth", "logout", "openai-api"]),
+                dependencies,
+                expected: success("No credentials stored for openai-api.\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-logout-openai-chatgpt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth logout openai-chatgpt with nothing stored",
+                argv: argv(&["auth", "logout", "openai-chatgpt"]),
+                dependencies,
+                expected: success("No credentials stored for openai-chatgpt.\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-logout-bogus");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth logout bogus is an unsupported provider",
+                argv: argv(&["auth", "logout", "bogus"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-no-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth with no subcommand",
+                argv: argv(&["auth"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: auth requires status, login, or logout",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("auth-unknown-subcommand");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth bogus is an unknown subcommand",
+                argv: argv(&["auth", "bogus"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: auth requires status, login, or logout",
+                ),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
 }
 
 /// The parser-rendering surface Phase 1 (clap adoption) is explicitly
