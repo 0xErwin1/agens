@@ -4189,7 +4189,7 @@ fn complete_tui_turn(
             if let Some(partial) = failure.partial {
                 session.identifier = Some(partial.metadata.id);
                 session.metadata = Some(partial.metadata);
-                session.messages = partial.messages;
+                adopt_turn_history(session, partial.messages);
             }
 
             return Err(failure.error);
@@ -4197,11 +4197,56 @@ fn complete_tui_turn(
     };
     session.identifier = Some(completion.metadata.id);
     session.metadata = Some(completion.metadata);
-    session.messages = completion.messages;
+    adopt_turn_history(session, completion.messages);
     if consumed_reminder {
         session.pending_system_reminder = None;
     }
     Ok(completion.text)
+}
+
+/// A background subagent turn can be persisted after the foreground turn reloaded the session, so
+/// adopting the turn's history alone would drop that turn from the in-process request history for
+/// the rest of the process even though the store keeps it.
+fn adopt_turn_history(session: &mut TuiSessionContext, history: Vec<Message>) {
+    let preserved = missing_subagent_turns(&session.messages, &history);
+    session.messages = history;
+    session.messages.extend(preserved);
+}
+
+fn missing_subagent_turns(previous: &[Message], history: &[Message]) -> Vec<Message> {
+    let known = history
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(subagent_call_id)
+        .collect::<BTreeSet<_>>();
+
+    previous
+        .windows(3)
+        .filter(|window| {
+            let [user, assistant, tool] = window else {
+                return false;
+            };
+            let Some(call_id) = assistant.parts.iter().find_map(subagent_call_id) else {
+                return false;
+            };
+
+            user.role == Role::User
+                && !known.contains(call_id)
+                && tool.parts.iter().any(|part| match part {
+                    MessagePart::ToolResult { tool_call_id, .. } => tool_call_id == call_id,
+                    _ => false,
+                })
+        })
+        .flatten()
+        .cloned()
+        .collect()
+}
+
+fn subagent_call_id(part: &MessagePart) -> Option<&str> {
+    match part {
+        MessagePart::ToolCall { id, .. } if id.starts_with(SUBAGENT_CALL_ID_PREFIX) => Some(id),
+        _ => None,
+    }
 }
 
 fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> Option<TuiProvider> {
@@ -9979,6 +10024,76 @@ mod tests {
                 is_error: false,
             }]
         );
+    }
+
+    #[test]
+    fn p1c4_completing_a_turn_keeps_a_subagent_turn_persisted_mid_flight() {
+        let subagent_turn = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("review the patch".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: "subagent:1".into(),
+                        name: "native::task".into(),
+                        input: r#"{"agent":"reviewer","description":"review the patch"}"#.into(),
+                    },
+                    MessagePart::Reasoning("3 tool uses".into()),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "subagent:1".into(),
+                    content: "approved".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let foreground_turn = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("summarize the patch".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("summary".into())],
+            },
+        ];
+        let mut session = TuiSessionContext {
+            identifier: Some(7),
+            messages: subagent_turn.clone(),
+            ..TuiSessionContext::fresh()
+        };
+        let completion = HeadlessChatCompletion {
+            text: "summary".into(),
+            metadata: SessionMetadata {
+                id: 7,
+                project: "project".into(),
+                title: "conversation".into(),
+                active_agent: "primary".into(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 1,
+                completed_turn_count: 1,
+                resumable: true,
+            },
+            messages: foreground_turn.clone(),
+        };
+
+        assert_eq!(
+            complete_tui_turn(&mut session, Ok(completion), false).unwrap(),
+            "summary"
+        );
+
+        let mut expected = foreground_turn;
+        expected.extend(subagent_turn);
+        assert_eq!(session.messages, expected);
     }
 
     #[test]
