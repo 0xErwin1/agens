@@ -1105,9 +1105,10 @@ fn run_chat(
         return Ok("Usage: agens chat [flags] <prompt>\n".to_owned());
     }
 
-    let request = parse_chat_request(arguments)?;
+    let mut request = parse_chat_request(arguments)?;
     cancellation_result(cancellation)?;
     let bootstrap = bootstrap(dependencies)?;
+    seed_configured_reasoning_effort(&mut request, &bootstrap);
     let output = (dependencies.headless_chat)(request, &bootstrap, cancellation)?;
     cancellation_result(cancellation)?;
 
@@ -4128,6 +4129,7 @@ fn run_tui_prompt_with(
                 .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
             request.system_prompt = Some(parent_skill_system_prompt(&base, &skills));
         }
+        seed_configured_reasoning_effort(&mut request, bootstrap);
         request
     };
     let consumed_reminder = request.pending_system_reminder.is_some();
@@ -4990,15 +4992,23 @@ fn persisted_agent_resolution_error(error: PersistedAgentResolutionError) -> Cli
     }
 }
 
+/// A resumed session keeps the agent it was persisted with; a fresh one starts
+/// from the configured default. An unresolvable name is not fatal here: it
+/// falls through the same recovery path a stale persisted agent takes.
+fn initial_active_agent_name(context: &TuiSessionContext, bootstrap: &Bootstrap) -> String {
+    context
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.active_agent.clone())
+        .or_else(|| bootstrap.default_agent().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "primary".into())
+}
+
 fn reconcile_persisted_active_agent(
     bootstrap: &Bootstrap,
     context: &mut TuiSessionContext,
 ) -> Result<AgentDefinition, CliError> {
-    let name = context
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.active_agent.clone())
-        .unwrap_or_else(|| "primary".into());
+    let name = initial_active_agent_name(context, bootstrap);
     let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
     let catalog = tui_agent_catalog(bootstrap, &validator)?;
     let unvalidated_catalog = tui_task_agent_catalog(bootstrap)?;
@@ -5675,6 +5685,24 @@ fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLim
         operation_timeout: std::time::Duration::from_millis(settings.operation_timeout_ms),
         bash_timeout: std::time::Duration::from_millis(settings.bash_timeout_ms),
     }
+}
+
+/// Applies the configured reasoning effort to a request that carries none.
+/// An explicit model selection or `/effort` choice already populated the
+/// request config, and must not be overwritten by the configured default.
+fn seed_configured_reasoning_effort(request: &mut HeadlessChatRequest, bootstrap: &Bootstrap) {
+    if request.request_config.reasoning_effort().is_some() {
+        return;
+    }
+    let Some(effort) = bootstrap.reasoning_effort() else {
+        return;
+    };
+    let Ok(config) = agens_core::RequestConfig::with_reasoning_effort(effort) else {
+        return;
+    };
+
+    request.session_reasoning_effort = config.reasoning_effort();
+    request.request_config = config;
 }
 
 /// Converts configured subagent bounds into the runtime shape the task tool
@@ -15534,6 +15562,95 @@ mod tests {
             std::time::Duration::from_millis(900)
         );
         assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn a_fresh_session_starts_from_the_configured_default_agent() {
+        let configured = bootstrap_from_configuration(
+            "config-default-agent",
+            Some("[agent]\ndefault_agent = \"reviewer\"\n"),
+            None,
+        );
+        let unconfigured = bootstrap_from_configuration("config-no-default-agent", None, None);
+        let fresh = TuiSessionContext::fresh();
+
+        assert_eq!(initial_active_agent_name(&fresh, &configured), "reviewer");
+        assert_eq!(initial_active_agent_name(&fresh, &unconfigured), "primary");
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_its_persisted_agent_over_the_configured_default() {
+        let configured = bootstrap_from_configuration(
+            "config-default-agent-resumed",
+            Some("[agent]\ndefault_agent = \"reviewer\"\n"),
+            None,
+        );
+        let metadata = SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "planner".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: true,
+        };
+        let resumed = TuiSessionContext::restored(7, metadata, Vec::new(), Vec::new());
+
+        assert_eq!(initial_active_agent_name(&resumed, &configured), "planner");
+    }
+
+    #[test]
+    fn the_configured_reasoning_effort_seeds_a_request_that_carries_none() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-effort",
+            Some("[agent]\nreasoning_effort = \"high\"\n"),
+            None,
+        );
+        let mut request = parse_chat_request(&["work".into()]).unwrap();
+
+        seed_configured_reasoning_effort(&mut request, &bootstrap);
+
+        assert_eq!(
+            request.request_config.reasoning_effort(),
+            Some(agens_core::ReasoningEffort::High)
+        );
+        assert_eq!(
+            request.session_reasoning_effort,
+            Some(agens_core::ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn an_explicit_effort_survives_the_configured_default() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-effort-explicit",
+            Some("[agent]\nreasoning_effort = \"high\"\n"),
+            None,
+        );
+        let mut request = parse_chat_request(&["work".into()]).unwrap();
+        request.request_config = agens_core::RequestConfig::with_reasoning_effort("low").unwrap();
+
+        seed_configured_reasoning_effort(&mut request, &bootstrap);
+
+        assert_eq!(
+            request.request_config.reasoning_effort(),
+            Some(agens_core::ReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn an_absent_configured_effort_leaves_the_request_untouched() {
+        let bootstrap = bootstrap_from_configuration("config-effort-absent", None, None);
+        let mut request = parse_chat_request(&["work".into()]).unwrap();
+
+        seed_configured_reasoning_effort(&mut request, &bootstrap);
+
+        assert_eq!(request.request_config.reasoning_effort(), None);
+        assert_eq!(request.session_reasoning_effort, None);
     }
 
     #[test]
