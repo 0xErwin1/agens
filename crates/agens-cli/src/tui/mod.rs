@@ -1,4 +1,5 @@
 pub(crate) mod engine;
+pub(crate) mod metrics;
 
 use crate::CliDependencies;
 use crate::bootstrap::bootstrap;

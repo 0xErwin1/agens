@@ -21,11 +21,9 @@ use agens_tui::{
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use crate::permissions::ParseToolInput;
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
+use crate::tui::metrics::sanitize_tui_metric;
 use crate::turns::persist_completed_subagent_turn;
-use crate::{
-    Bootstrap, CompletedSubagentTurn, TuiSessionContext, current_session_timestamp,
-    sanitize_tui_metric,
-};
+use crate::{Bootstrap, CompletedSubagentTurn, TuiSessionContext, current_session_timestamp};
 
 #[cfg(test)]
 type ProductionTaskProbe = Arc<
