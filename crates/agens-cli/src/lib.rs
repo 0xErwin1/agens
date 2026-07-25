@@ -13985,7 +13985,7 @@ mod tests {
         let restored_render = render_tui_test_backend(&tui, 120, 50);
         for expected in [
             "previous request",
-            "Thinking · collapsed",
+            "Thought",
             "previous answer",
             "persisted reminder",
             "second request",
