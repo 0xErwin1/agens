@@ -14,11 +14,12 @@ use agens_tools::{
 };
 
 use crate::error::CliError;
+use crate::tools::runner::ProductionTaskRunner;
 use crate::tools::task::{TaskParentSelection, default_model, register_production_task_tool};
 use crate::{
-    Bootstrap, ProductionMcpRuntime, ProductionTaskRunner, RegisteredNativeTool,
-    SharedToolDispatcher, discover_skill_catalog, load_configured_mcp_registry,
-    mcp_model_tool_name, native_model_tool_name, remote_function_tool,
+    Bootstrap, ProductionMcpRuntime, RegisteredNativeTool, SharedToolDispatcher,
+    discover_skill_catalog, load_configured_mcp_registry, mcp_model_tool_name,
+    native_model_tool_name, remote_function_tool,
 };
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
