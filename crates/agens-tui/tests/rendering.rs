@@ -562,7 +562,7 @@ fn multiline_wrapped_user_message_uses_one_accented_identity() {
     assert!(text.contains("deliberately long user"), "{text:?}");
     assert!(text.contains("Second source line."), "{text:?}");
     let user = cell_for_text(&renderer, "❯");
-    assert_eq!(user.fg, Color::Rgb(0xff, 0xb4, 0x54));
+    assert_eq!(user.fg, Color::Rgb(0x73, 0xd0, 0xff));
     assert!(user.modifier.contains(Modifier::BOLD));
 }
 
@@ -1688,36 +1688,31 @@ fn renderer_renders_practical_markdown_semantics() {
             .modifier
             .contains(Modifier::ITALIC)
     );
+    // Emphasis is weight, slant and underline: prose never acquires a hue.
+    let body = Color::Rgb(0xbf, 0xbd, 0xb6);
+    let inline_code = cell_for_text(&renderer, "INLINE_TOKEN");
+    assert_eq!(inline_code.fg, body);
     assert_eq!(
-        cell_for_text(&renderer, "INLINE_TOKEN").fg,
-        Color::Rgb(0xe6, 0xb4, 0x50)
+        inline_code.bg,
+        Color::Rgb(0x1a, 0x1f, 0x29),
+        "inline code is set apart by its panel, not by a colour"
     );
     let link = cell_for_text(&renderer, "LINKTOKEN");
-    assert_eq!(link.fg, Color::Rgb(0x59, 0xc2, 0xff));
+    assert_eq!(link.fg, body);
     assert!(link.modifier.contains(Modifier::UNDERLINED));
-    assert_eq!(
-        cell_for_text(&renderer, "STRONGTOKEN").fg,
-        Color::Rgb(0xff, 0xb4, 0x54)
-    );
-    assert_eq!(
-        cell_for_text(&renderer, "Result").fg,
-        Color::Rgb(0xff, 0xb4, 0x54),
-        "H1 should use strong accent"
-    );
+    assert_eq!(cell_for_text(&renderer, "STRONGTOKEN").fg, body);
+    assert_eq!(cell_for_text(&renderer, "Result").fg, body);
     assert!(
         cell_for_text(&renderer, "Result")
             .modifier
             .contains(Modifier::UNDERLINED),
         "H1 should underline for hierarchy"
     );
-    assert_eq!(
-        cell_for_text(&renderer, "EMPHASISTOKEN").fg,
-        Color::Rgb(0xd2, 0xa6, 0xff)
-    );
-    // List markers use tool accent, not base gray.
+    assert_eq!(cell_for_text(&renderer, "EMPHASISTOKEN").fg, body);
     assert_eq!(
         cell_for_text(&renderer, "•").fg,
-        Color::Rgb(0x59, 0xc2, 0xff)
+        Color::Rgb(0x5c, 0x67, 0x73),
+        "list markers are chrome"
     );
 }
 

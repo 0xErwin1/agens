@@ -239,11 +239,13 @@ impl ThinkingBlock {
     /// Accent bar the reasoning rows carry.
     ///
     /// A visible body breathes while it streams and holds still once the reader
-    /// pinned it open; a hidden thought is finished chrome and carries none.
+    /// pinned it open; a hidden thought is finished chrome and carries none. A
+    /// pinned-open thought is neither live nor an outcome, so its bar stays grey
+    /// rather than claiming a state colour of its own.
     pub(crate) const fn accent(mode: ExpandMode) -> Option<RowAccent> {
         match mode {
-            ExpandMode::Streaming => Some(RowAccent::Wave(RolePalette::thinking())),
-            ExpandMode::Expanded => Some(RowAccent::Still(RolePalette::thinking())),
+            ExpandMode::Streaming => Some(RowAccent::Wave(RowState::Running.color())),
+            ExpandMode::Expanded => Some(RowAccent::Still(RolePalette::muted())),
             ExpandMode::Collapsed => None,
         }
     }
@@ -271,7 +273,7 @@ impl ThinkingBlock {
         Line::from(Span::styled(
             label,
             Style::default()
-                .fg(RolePalette::thinking())
+                .fg(RolePalette::muted())
                 .add_modifier(Modifier::BOLD),
         ))
     }
@@ -306,25 +308,34 @@ impl ToolRow {
     /// The closing rail glyph lives in the shared gutter, not in this row, so
     /// the footer never starts left of the rows it closes.
     ///
-    /// `size` carries the computed result size (lines/bytes) as muted trailing
-    /// metadata; it is never a fabricated per-call token count.
+    /// A successful status is muted metadata: the outcome already reads from the
+    /// rail's colour, so only a failure earns a coloured word. `size` carries the
+    /// computed result size (lines/bytes) as muted trailing metadata; it is never
+    /// a fabricated per-call token count.
     pub(crate) fn result_footer(
         tool_name: &str,
         status: &str,
-        color: ratatui::style::Color,
+        failed: bool,
         size: Option<&str>,
     ) -> Line<'static> {
+        let status_color = if failed {
+            RolePalette::error()
+        } else {
+            RolePalette::muted()
+        };
         let mut spans = vec![
             Span::styled(
                 short_tool_name(tool_name),
                 Style::default()
-                    .fg(RolePalette::tool())
+                    .fg(RolePalette::assistant())
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" · ", Style::default().fg(RolePalette::muted())),
             Span::styled(
                 status.to_owned(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
         ];
         if let Some(size) = size {
@@ -340,7 +351,7 @@ impl ToolRow {
     pub(crate) fn collapsed_output() -> Line<'static> {
         Line::from(Span::styled(
             "output collapsed · Ctrl+O to expand",
-            Style::default().fg(RolePalette::chrome()),
+            Style::default().fg(RolePalette::muted()),
         ))
     }
 
@@ -362,7 +373,7 @@ impl ToolRow {
             Span::styled(preview, Style::default().fg(RolePalette::error())),
             Span::styled(
                 " · Ctrl+O for full output",
-                Style::default().fg(RolePalette::chrome()),
+                Style::default().fg(RolePalette::muted()),
             ),
         ])
     }
@@ -370,8 +381,10 @@ impl ToolRow {
 
 /// Typed verb + operand header for a tool call.
 ///
-/// Renders `verb operand [suffix]` with a bold verb, the operand in the path
-/// accent, and muted trailing metadata. Bash renders as a `$ command` shell
+/// Renders `verb operand [suffix]` with the verb in primary bold, the operand in
+/// the transcript's single accent, and muted trailing metadata. The row's words
+/// never encode the call's outcome; that lives in the bullet and the accent bar.
+/// Bash renders as a `$ command` shell
 /// prompt. Unknown and MCP tools fall back to the short tool name plus a
 /// single-line, whitespace-collapsed summary of their arguments — never a raw
 /// JSON dump. The operand is truncated with an ellipsis to fit `content_width`
@@ -383,7 +396,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
         Style::default().fg(RolePalette::muted())
     } else {
         Style::default()
-            .fg(RolePalette::tool())
+            .fg(RolePalette::assistant())
             .add_modifier(Modifier::BOLD)
     };
 
@@ -403,7 +416,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
     }
     spans.push(Span::styled(
         operand,
-        Style::default().fg(RolePalette::path()),
+        Style::default().fg(RolePalette::accent_active()),
     ));
     if let Some(suffix) = parts.suffix {
         spans.push(Span::raw(" "));
@@ -675,7 +688,7 @@ impl BlockContent for ToolCallBlock<'_> {
                     Line::from(Span::styled(
                         format!("Tools · batch {batch}"),
                         Style::default()
-                            .fg(RolePalette::tool())
+                            .fg(RolePalette::muted())
                             .add_modifier(Modifier::BOLD),
                     )),
                     RowBullet::Group(self.state),
@@ -701,7 +714,7 @@ impl BlockContent for ToolCallBlock<'_> {
     }
 
     fn accent(&self) -> Color {
-        RolePalette::tool()
+        self.state.color()
     }
 
     fn is_groupable(&self) -> bool {
@@ -782,7 +795,7 @@ fn bounded_preview(body: &[Line<'static>]) -> Vec<Line<'static>> {
     let mut preview = body[..PREVIEW_HEAD_LINES].to_vec();
     preview.push(Line::from(Span::styled(
         format!("… {hidden} more lines · Ctrl+O for full output"),
-        Style::default().fg(RolePalette::chrome()),
+        Style::default().fg(RolePalette::muted()),
     )));
     preview.extend_from_slice(&body[body.len() - PREVIEW_TAIL_LINES..]);
     preview
@@ -1100,10 +1113,10 @@ mod tests {
             .map(|index| Line::from(format!("row {index}")))
             .collect();
         let block = ToolResultBlock {
-            footer: ToolRow::result_footer("read", "Success", RolePalette::success(), None),
+            footer: ToolRow::result_footer("read", "Success", false, None),
             collapsed_body: vec![ToolRow::collapsed_output()],
             full_body,
-            accent: RolePalette::tool(),
+            accent: RolePalette::accent_active(),
             groupable: false,
         };
 
@@ -1166,19 +1179,14 @@ mod tests {
 
     #[test]
     fn tool_result_block_selects_body_by_display_mode_and_shows_result_size() {
-        let footer = ToolRow::result_footer(
-            "read",
-            "Success",
-            RolePalette::success(),
-            Some("2 lines · 21 B"),
-        );
+        let footer = ToolRow::result_footer("read", "Success", false, Some("2 lines · 21 B"));
         assert!(line_text(&footer).contains("2 lines · 21 B"));
 
         let block = ToolResultBlock {
             footer,
             collapsed_body: vec![ToolRow::collapsed_output()],
             full_body: vec![Line::from("full output")],
-            accent: RolePalette::tool(),
+            accent: RolePalette::accent_active(),
             groupable: false,
         };
         assert_eq!(block.mode_on_finish(), DisplayMode::Collapsed);
@@ -1243,7 +1251,7 @@ mod tests {
         );
 
         let result = |groupable| ToolResultBlock {
-            footer: ToolRow::result_footer("read", "Success", RolePalette::success(), None),
+            footer: ToolRow::result_footer("read", "Success", false, None),
             collapsed_body: vec![ToolRow::collapsed_output()],
             full_body: vec![Line::from("body")],
             accent: RolePalette::success(),
@@ -1270,11 +1278,13 @@ mod tests {
 
         assert_eq!(
             ThinkingBlock::accent(ExpandMode::Streaming),
-            Some(RowAccent::Wave(RolePalette::thinking()))
+            Some(RowAccent::Wave(RowState::Running.color())),
+            "a streaming thought breathes in the live accent, not a hue of its own"
         );
         assert_eq!(
             ThinkingBlock::accent(ExpandMode::Expanded),
-            Some(RowAccent::Still(RolePalette::thinking()))
+            Some(RowAccent::Still(RolePalette::muted())),
+            "a pinned-open thought is neither live nor an outcome"
         );
         assert_eq!(
             ThinkingBlock::accent(ExpandMode::Collapsed),
@@ -1329,7 +1339,7 @@ mod tests {
 
     #[test]
     fn collapsed_failure_keeps_a_visible_reason_line() {
-        let footer = ToolRow::result_footer("bash", "Failure", RolePalette::error(), None);
+        let footer = ToolRow::result_footer("bash", "Failure", true, None);
         let block = ToolResultBlock {
             footer,
             collapsed_body: vec![ToolRow::collapsed_failure(

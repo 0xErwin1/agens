@@ -216,7 +216,7 @@ pub(super) fn unaccented_row(line: Line<'static>) -> Line<'static> {
 fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlock {
     match item {
         ConversationItem::Info(text) => {
-            RenderedBlock::plain(label_lines("INFO", RolePalette::info(), text))
+            RenderedBlock::plain(label_lines("INFO", RolePalette::muted(), text))
         }
         ConversationItem::User(text) => user_block(text),
         ConversationItem::Assistant(text) => {
@@ -315,6 +315,7 @@ fn tool_result_block(
     }
 
     let (result_state, duration) = tool_state(context.events, call_id, is_error);
+    let failed = result_state == ToolResultState::Failure;
     let color = result_color(result_state);
     let tool_name = tool_name_for_call(context.conversation, call_id);
     let status = format!("{result_state:?}{}", duration_label(duration));
@@ -325,7 +326,7 @@ fn tool_result_block(
     };
     let size = result_size_label(output);
     let block = ToolResultBlock {
-        footer: ToolRow::result_footer(&tool_name, &status, color, Some(&size)),
+        footer: ToolRow::result_footer(&tool_name, &status, failed, Some(&size)),
         collapsed_body,
         full_body: tool_result_body(call_id, output, context.content_width).to_vec(),
         accent: color,
@@ -351,11 +352,11 @@ fn user_block(text: &str) -> RenderedBlock {
         let line = Line::from(Span::styled(
             source_line.to_owned(),
             Style::default()
-                .fg(RolePalette::user())
+                .fg(RolePalette::assistant())
                 .add_modifier(Modifier::BOLD),
         ));
         rows.push(if rows.is_empty() {
-            BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::user_bar()))
+            BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::accent_active()))
         } else {
             BlockLine::new(line)
         });
@@ -383,7 +384,7 @@ fn error_lines(error: &crate::ActionableError) -> Vec<Line<'static>> {
         ]),
         Line::from(Span::styled(
             format!("└ Action: {}", error.action),
-            Style::default().fg(RolePalette::warning()),
+            Style::default().fg(RolePalette::muted()),
         )),
     ]
 }
@@ -617,7 +618,7 @@ fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
     let mut spans = vec![Span::styled(
         group.verb.label(group.count, group.running),
         Style::default()
-            .fg(RolePalette::tool())
+            .fg(RolePalette::assistant())
             .add_modifier(Modifier::BOLD),
     )];
     if group.failed > 0 {
@@ -629,7 +630,7 @@ fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
     if !group.running {
         spans.push(Span::styled(
             " · Ctrl+O to expand",
-            Style::default().fg(RolePalette::chrome()),
+            Style::default().fg(RolePalette::muted()),
         ));
     }
 
@@ -696,7 +697,7 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
     markdown_lines(
         &mut described,
         &bounded_visible_tool_output(output),
-        Style::default().fg(RolePalette::chrome()),
+        Style::default().fg(RolePalette::muted()),
         "",
         content_width,
     );
@@ -735,11 +736,14 @@ fn subagent_card_block(
     let mut title = vec![Span::styled(
         agent,
         Style::default()
-            .fg(RolePalette::tool())
+            .fg(RolePalette::accent_active())
             .add_modifier(Modifier::BOLD),
     )];
     if !summary.is_empty() {
-        title.push(Span::raw(format!("{TITLE_SEPARATOR}{summary}")));
+        title.push(Span::styled(
+            format!("{TITLE_SEPARATOR}{summary}"),
+            Style::default().fg(RolePalette::assistant()),
+        ));
     }
     rows.push(BlockLine::with_bullet(
         Line::from(title),
@@ -770,13 +774,13 @@ fn subagent_card_block(
             &format!("{status} · {presentation}{}", duration_label(elapsed)),
             content_width,
         ),
-        Style::default().fg(subagent_status_color(card.status)),
+        Style::default().fg(RolePalette::muted()),
     ))));
 
     for activity in card.activities.iter().take(3) {
-        rows.push(BlockLine::new(Line::from(bounded_single_line(
-            &format!("· {activity}"),
-            content_width,
+        rows.push(BlockLine::new(Line::from(Span::styled(
+            bounded_single_line(&format!("· {activity}"), content_width),
+            Style::default().fg(RolePalette::muted()),
         ))));
     }
     let hidden = card.tool_uses.saturating_sub(card.activities.len().min(3));
@@ -808,7 +812,7 @@ fn subagent_status_color(status: Option<crate::TuiSubagentStatus>) -> Color {
         Some(crate::TuiSubagentStatus::Success) => RolePalette::success(),
         Some(crate::TuiSubagentStatus::Failure) => RolePalette::error(),
         Some(crate::TuiSubagentStatus::Cancelled) => RolePalette::warning(),
-        None => RolePalette::tool(),
+        None => RolePalette::accent_active(),
     }
 }
 
@@ -972,7 +976,7 @@ fn thinking_lines(
         markdown_lines(
             lines,
             text,
-            Style::default().fg(RolePalette::chrome()),
+            Style::default().fg(RolePalette::muted()),
             "",
             content_width,
         );
@@ -1007,7 +1011,7 @@ pub(super) fn detail_lines(
             } if !conversation_is_authoritative && !is_task_tool_name(name) => line(
                 &mut lines,
                 "TOOLS",
-                Color::Magenta,
+                RolePalette::muted(),
                 format!("┌ {call_id} {name}\n  input: {input}"),
             ),
             TuiRuntimeEvent::ToolEnded {
@@ -1024,7 +1028,12 @@ pub(super) fn detail_lines(
                 call_id,
                 lines: diff,
             } if !conversation_is_authoritative => {
-                line(&mut lines, "DIFF", Color::Yellow, format!("{call_id}:"));
+                line(
+                    &mut lines,
+                    "DIFF",
+                    RolePalette::muted(),
+                    format!("{call_id}:"),
+                );
                 for change in diff {
                     diff_line(&mut lines, change.number, change.kind, &change.text);
                 }
@@ -1150,20 +1159,22 @@ impl MarkdownRenderer {
             Event::Code(code) => self.text(
                 &code,
                 self.current_style()
-                    .fg(RolePalette::warning())
                     .bg(code_block_background())
                     .add_modifier(Modifier::BOLD),
             ),
             Event::SoftBreak | Event::HardBreak => self.finish_line(),
             Event::Rule => {
                 self.finish_line();
-                self.text("────────────────", self.base_style.fg(Color::DarkGray));
+                self.text(
+                    "────────────────",
+                    self.base_style.fg(RolePalette::chrome()),
+                );
                 self.finish_line();
             }
             Event::TaskListMarker(checked) => self.text(
                 if checked { "[x] " } else { "[ ] " },
                 self.base_style
-                    .fg(RolePalette::tool())
+                    .fg(RolePalette::muted())
                     .add_modifier(Modifier::BOLD),
             ),
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
@@ -1196,7 +1207,7 @@ impl MarkdownRenderer {
                 self.text(
                     &format!("{}{marker}", "  ".repeat(depth)),
                     self.base_style
-                        .fg(RolePalette::tool())
+                        .fg(RolePalette::muted())
                         .add_modifier(Modifier::BOLD),
                 );
             }
@@ -1265,7 +1276,9 @@ impl MarkdownRenderer {
                 {
                     self.text(
                         &format!(" ({destination})"),
-                        self.base_style.fg(Color::Blue).add_modifier(Modifier::DIM),
+                        self.base_style
+                            .fg(RolePalette::muted())
+                            .add_modifier(Modifier::DIM),
                     );
                 }
             }
@@ -1389,31 +1402,19 @@ impl MarkdownRenderer {
     fn current_style(&self) -> Style {
         let mut style = self.base_style;
         if let Some(level) = self.heading {
-            style = style
-                .fg(match level {
-                    HeadingLevel::H1 => RolePalette::user_bar(),
-                    HeadingLevel::H2 => RolePalette::brand(),
-                    _ => RolePalette::tool(),
-                })
-                .add_modifier(Modifier::BOLD);
+            style = style.add_modifier(Modifier::BOLD);
             if matches!(level, HeadingLevel::H1) {
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
         }
         if self.strong > 0 {
-            style = style
-                .fg(RolePalette::user_bar())
-                .add_modifier(Modifier::BOLD);
+            style = style.add_modifier(Modifier::BOLD);
         }
         if self.emphasis > 0 {
-            style = style
-                .fg(RolePalette::thinking())
-                .add_modifier(Modifier::ITALIC);
+            style = style.add_modifier(Modifier::ITALIC);
         }
         if !self.links.is_empty() {
-            style = style
-                .fg(RolePalette::tool())
-                .add_modifier(Modifier::UNDERLINED);
+            style = style.add_modifier(Modifier::UNDERLINED);
         }
         style
     }
@@ -1425,7 +1426,7 @@ impl MarkdownRenderer {
         if !self.prefix.is_empty() {
             self.spans.push(Span::styled(
                 self.prefix.clone(),
-                self.base_style.fg(Color::DarkGray),
+                self.base_style.fg(RolePalette::chrome()),
             ));
         }
         if self.code_block {
@@ -2217,6 +2218,16 @@ mod tests {
             .expect("row should be rendered with a gutter")
     }
 
+    /// Style of the span whose text contains `needle`.
+    fn span_style(lines: &[Line<'static>], needle: &str) -> Style {
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains(needle))
+            .map(|span| span.style)
+            .unwrap_or_else(|| panic!("{needle:?} should be rendered"))
+    }
+
     /// Accent-column span of the row containing `needle`.
     fn accent_span(lines: &[Line<'static>], needle: &str) -> Span<'static> {
         lines
@@ -2421,7 +2432,7 @@ mod tests {
         );
         let thinking = accent_span(&plain, "Thinking");
         assert_eq!(thinking.content, "┃");
-        assert_eq!(thinking.style.fg, Some(RolePalette::thinking()));
+        assert_eq!(thinking.style.fg, Some(RolePalette::muted()));
     }
 
     #[test]
@@ -2573,6 +2584,185 @@ mod tests {
             );
         }
         conversation
+    }
+
+    /// Every colour a settled, successful transcript screen may paint.
+    ///
+    /// Two greys carry text and chrome, one accent marks operands and live work,
+    /// and the success hue is spent on the state channel alone.
+    const SETTLED_PALETTE: [Color; 4] = [
+        RolePalette::assistant(),
+        RolePalette::muted(),
+        RolePalette::accent_active(),
+        RolePalette::success(),
+    ];
+
+    fn settled_conversation(is_error: bool) -> Conversation {
+        let mut conversation = Conversation::new("delegate the work");
+        conversation
+            .apply(crate::ConversationEvent::ReasoningDelta(
+                "weighing the options".into(),
+            ))
+            .expect("reasoning should project");
+        conversation
+            .apply(crate::ConversationEvent::ToolCall {
+                call_id: "bash-1".into(),
+                name: "native::bash".into(),
+                input: "{}".into(),
+                parsed: agens_core::ToolInput::Bash {
+                    command: "cargo test".into(),
+                },
+            })
+            .expect("call should project");
+        conversation
+            .apply(crate::ConversationEvent::ToolResult {
+                call_id: "bash-1".into(),
+                output: "exit 1: command not found".into(),
+                is_error,
+            })
+            .expect("result should project");
+        conversation
+            .apply(crate::ConversationEvent::MarkdownFinal(
+                "# Heading\n\n**done** with _one_ note and a `token`.\n\n- item".into(),
+            ))
+            .expect("prose should project");
+        conversation
+    }
+
+    fn settled_lines(is_error: bool) -> Vec<Line<'static>> {
+        let conversation = settled_conversation(is_error);
+        let mut modes = BTreeMap::new();
+        modes.insert("bash-1".to_owned(), DisplayMode::Collapsed);
+        conversation_lines(
+            &conversation,
+            &[],
+            &modes,
+            80,
+            ConversationRenderState {
+                collapse_thinking: true,
+                thinking_streaming: false,
+                assistant_streaming: false,
+                now: Duration::ZERO,
+            },
+        )
+    }
+
+    #[test]
+    fn a_settled_transcript_paints_two_greys_one_accent_and_the_state_colour() {
+        for span in settled_lines(false).iter().flat_map(|line| &line.spans) {
+            let Some(foreground) = span.style.fg else {
+                continue;
+            };
+            assert!(
+                SETTLED_PALETTE.contains(&foreground),
+                "{:?} paints {foreground:?}, outside the transcript palette",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn failure_is_the_only_row_text_the_transcript_paints_in_a_warning_colour() {
+        let lines = settled_lines(true);
+        let error_text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| span.style.fg == Some(RolePalette::error()))
+            .map(|span| span.content.trim().to_owned())
+            .filter(|content| !matches!(content.as_str(), "┃" | "❙" | "◆" | "◈" | "└"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            error_text,
+            vec!["Failure".to_owned(), "exit 1: command not found".to_owned()],
+            "outside the state channel only the failure itself is coloured"
+        );
+
+        for span in lines.iter().flat_map(|line| &line.spans) {
+            let Some(foreground) = span.style.fg else {
+                continue;
+            };
+            assert!(
+                SETTLED_PALETTE.contains(&foreground) || foreground == RolePalette::error(),
+                "{:?} paints {foreground:?}",
+                span.content
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_and_trailing_metadata_are_muted_not_accented() {
+        let mut conversation = Conversation::new("prompt");
+        conversation
+            .apply(crate::ConversationEvent::ReasoningDelta(
+                "weighing the options".into(),
+            ))
+            .expect("reasoning should project");
+        let lines = lines_at(&conversation, &BTreeMap::new());
+        assert_eq!(
+            span_style(&lines, "Thinking").fg,
+            Some(RolePalette::muted())
+        );
+        assert_eq!(
+            span_style(&lines, "weighing the options").fg,
+            Some(RolePalette::muted())
+        );
+
+        let settled = settled_lines(false);
+        assert_eq!(
+            span_style(&settled, "output collapsed").fg,
+            Some(RolePalette::muted())
+        );
+        assert_eq!(
+            span_style(&settled, "Success").fg,
+            Some(RolePalette::muted())
+        );
+        assert_eq!(
+            span_style(&settled, "1 lines · 25 B").fg,
+            Some(RolePalette::muted())
+        );
+    }
+
+    #[test]
+    fn row_text_never_repeats_the_state_its_bullet_already_carries() {
+        let header_styles = |is_error: bool| {
+            let lines = settled_lines(is_error);
+            lines
+                .iter()
+                .find(|line| line_text(line).contains("cargo test"))
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .skip(2)
+                        .map(|span| span.style)
+                        .collect::<Vec<_>>()
+                })
+                .expect("the call header should render")
+        };
+        assert_eq!(
+            header_styles(false),
+            header_styles(true),
+            "the header's words read the same however the call ended"
+        );
+
+        let succeeded = settled_lines(false);
+        assert_eq!(
+            bullet_style(&succeeded, "cargo test").fg,
+            Some(RolePalette::success())
+        );
+        assert_eq!(
+            bullet_style(&settled_lines(true), "cargo test").fg,
+            Some(RolePalette::error())
+        );
+        assert_eq!(
+            span_style(&succeeded, "cargo test").fg,
+            Some(RolePalette::accent_active()),
+            "the operand keeps the one accent the transcript spends"
+        );
+        assert_eq!(
+            span_style(&succeeded, "$").fg,
+            Some(RolePalette::muted()),
+            "a shell prompt is chrome, not a verb"
+        );
     }
 
     #[test]

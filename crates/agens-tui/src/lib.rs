@@ -2041,9 +2041,9 @@ fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
     let selected = state.execution_selection == Some(id);
     let active = state.active_transcript == id;
     let color = if selected {
-        widgets::RolePalette::brand()
+        widgets::RolePalette::accent_active()
     } else if active {
-        widgets::RolePalette::tool()
+        widgets::RolePalette::assistant()
     } else {
         widgets::RolePalette::muted()
     };
@@ -2115,16 +2115,16 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
         let (label, color, text, card) = match entry {
-            TranscriptEntry::User(text) => ("USER", widgets::RolePalette::success(), text, false),
+            TranscriptEntry::User(text) => ("USER", widgets::RolePalette::muted(), text, false),
             TranscriptEntry::Assistant(text) => {
-                ("ASSISTANT", widgets::RolePalette::assistant(), text, false)
+                ("ASSISTANT", widgets::RolePalette::muted(), text, false)
             }
             TranscriptEntry::Reasoning(text) => {
-                ("THINKING", widgets::RolePalette::thinking(), text, false)
+                ("THINKING", widgets::RolePalette::muted(), text, false)
             }
             TranscriptEntry::Error(text) => ("ERROR", widgets::RolePalette::error(), text, true),
-            TranscriptEntry::Info(text) => ("INFO", widgets::RolePalette::info(), text, false),
-            TranscriptEntry::Tool(text) => ("TOOL", Color::Magenta, text, true),
+            TranscriptEntry::Info(text) => ("INFO", widgets::RolePalette::muted(), text, false),
+            TranscriptEntry::Tool(text) => ("TOOL", widgets::RolePalette::muted(), text, true),
         };
         let label_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
         if card {
@@ -2139,7 +2139,7 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
             if matches!(entry, TranscriptEntry::Error(_)) {
                 lines.push(Line::from(Span::styled(
                     "  │ Action: retry the request or inspect the runtime error.",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(widgets::RolePalette::muted()),
                 )));
             }
             lines.push(Line::from(Span::styled("  └", Style::default().fg(color))));
