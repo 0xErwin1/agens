@@ -347,6 +347,17 @@ pub enum TuiProviderOutcome {
     Backgrounded,
 }
 
+/// Who asked for a turn the composition layer is about to run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiSubmitOrigin {
+    /// A prompt the user submitted for the main agent.
+    User,
+    /// A prompt the user submitted for the armed subagent to run in the background.
+    Background,
+    /// A turn the runtime scheduled after a background subagent finished.
+    SubagentCompletion,
+}
+
 /// A visible conversation entry in chronological order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptEntry {
@@ -2630,6 +2641,7 @@ pub struct Tui<E> {
     dangerous_mode: bool,
     executions: Vec<TuiExecution>,
     execution_selection: Option<TranscriptId>,
+    pending_auto_turns: usize,
     now: Duration,
     next_runtime_ordinal: u64,
 }
@@ -2679,6 +2691,7 @@ where
             dangerous_mode: false,
             executions: Vec::new(),
             execution_selection: None,
+            pending_auto_turns: 0,
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
         }
@@ -2903,6 +2916,57 @@ where
         self.conversation = Some(Conversation::new(prompt));
         {
             let record = self.active_record_mut();
+            record.tool_display_modes.clear();
+            record.collapse_thinking = false;
+            record.thinking_user_pinned = false;
+        }
+        self.set_running(true);
+        self.assistant_streaming = true;
+    }
+
+    /// Starts the turn a finished background subagent scheduled, but only at a safe point.
+    ///
+    /// The shared runtime rejects a concurrent turn, and firing over a composer the user is
+    /// typing into would submit their unfinished prompt, so a scheduled turn waits for the next
+    /// idle moment instead of being dropped. Every completion queued while waiting is carried by
+    /// the single turn this returns.
+    pub fn take_ready_auto_turn(&mut self) -> Option<String> {
+        if self.pending_auto_turns == 0 || !self.auto_turn_is_safe() {
+            return None;
+        }
+
+        let finished = std::mem::take(&mut self.pending_auto_turns);
+        self.begin_auto_turn(finished);
+        Some(auto_turn_prompt(finished))
+    }
+
+    fn auto_turn_is_safe(&self) -> bool {
+        !self.running
+            && !self.session_loading
+            && self.input.is_empty()
+            && self.dialog.is_none()
+            && !self.palette_open
+    }
+
+    /// Opens the runtime-scheduled turn without a user prompt: the transcript records why the
+    /// turn is running as a notice, because the user did not ask for it.
+    fn begin_auto_turn(&mut self, finished: usize) {
+        let notice = auto_turn_notice(finished);
+        self.status = None;
+        if let Some(conversation) = self.conversation.take() {
+            self.completed_conversations.push(conversation);
+        }
+        self.runtime_events.clear();
+        self.turn_duration = None;
+        self.latest_usage = None;
+        self.transcript.push(TranscriptEntry::Info(notice.clone()));
+        self.conversation = Some(Conversation::new(String::new()));
+        self.project_conversation(ConversationEvent::Info(notice));
+        {
+            let record = self
+                .transcripts
+                .get_mut(&TranscriptId::Main)
+                .expect("main transcript always exists");
             record.tool_display_modes.clear();
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
@@ -3810,10 +3874,15 @@ where
         {
             return;
         }
+        let finished_in_background = execution.state == TuiExecutionState::BackgroundRunning
+            && !matches!(state, TuiExecutionState::BackgroundRunning);
         execution.state = state;
         execution.last_activity = self.now;
         if !matches!(state, TuiExecutionState::BackgroundRunning) {
             execution.terminal_at = Some(self.now);
+        }
+        if finished_in_background {
+            self.pending_auto_turns = self.pending_auto_turns.saturating_add(1);
         }
         if state == TuiExecutionState::BackgroundRunning
             && let Some(card) = self.conversation.as_mut().and_then(|conversation| {
@@ -5233,6 +5302,36 @@ where
     }
 }
 
+fn auto_turn_subject(finished: usize) -> String {
+    if finished == 1 {
+        "1 background subagent".to_owned()
+    } else {
+        format!("{finished} background subagents")
+    }
+}
+
+/// Opening text for a runtime-scheduled turn.
+///
+/// It is not a user message and must never read like one: the completion notices themselves
+/// arrive as bounded coordination messages, so this only states who scheduled the turn and where
+/// the recorded outcome lives.
+fn auto_turn_prompt(finished: usize) -> String {
+    format!(
+        "[coordination source=runtime untrusted=false]\n{} finished. The completion notices \
+         accompany this turn unless an earlier turn already delivered them, and \
+         `task_control action=status` returns a recorded outcome. The runtime scheduled this \
+         turn; the user did not send it.",
+        auto_turn_subject(finished)
+    )
+}
+
+fn auto_turn_notice(finished: usize) -> String {
+    format!(
+        "Continuing automatically: {} finished.",
+        auto_turn_subject(finished)
+    )
+}
+
 fn status_matches_execution(status: TuiSubagentStatus, state: TuiExecutionState) -> bool {
     matches!(
         (status, state),
@@ -5743,7 +5842,7 @@ pub fn run_with_default_progress_submit(
     + 'static,
     submit: impl Fn(
         String,
-        bool,
+        TuiSubmitOrigin,
         mpsc::Sender<TurnEvent>,
         BridgeTx<TuiRuntimeEvent>,
     ) -> TuiProviderOutcome
@@ -5777,7 +5876,12 @@ where
         + Send
         + Sync
         + 'static,
-    F: Fn(String, bool, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+    F: Fn(
+            String,
+            TuiSubmitOrigin,
+            mpsc::Sender<TurnEvent>,
+            BridgeTx<TuiRuntimeEvent>,
+        ) -> TuiProviderOutcome
         + Send
         + Sync
         + 'static,
@@ -5813,7 +5917,12 @@ where
         + Send
         + Sync
         + 'static,
-    F: Fn(String, bool, mpsc::Sender<TurnEvent>, BridgeTx<TuiRuntimeEvent>) -> TuiProviderOutcome
+    F: Fn(
+            String,
+            TuiSubmitOrigin,
+            mpsc::Sender<TurnEvent>,
+            BridgeTx<TuiRuntimeEvent>,
+        ) -> TuiProviderOutcome
         + Send
         + Sync
         + 'static,
@@ -5884,7 +5993,7 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, false, sender, metrics);
+                    let outcome = submit(prompt, TuiSubmitOrigin::User, sender, metrics);
                     let _ = completion_sender.send(outcome);
                 });
             })
@@ -5923,6 +6032,19 @@ where
                 )
                 .as_confirm(),
             );
+            dirty = true;
+        }
+        if active_route.is_none()
+            && let Some(prompt) = tui.take_ready_auto_turn()
+        {
+            let submit = Arc::clone(&submit);
+            let sender = sender.clone();
+            let metrics = metrics_sender.clone();
+            let completion_sender = completion_sender.clone();
+            thread::spawn(move || {
+                let outcome = submit(prompt, TuiSubmitOrigin::SubagentCompletion, sender, metrics);
+                let _ = completion_sender.send(outcome);
+            });
             dirty = true;
         }
         render_progress_frame(tui, &mut renderer, &mut frame_schedule, now, dirty)?;
@@ -5973,7 +6095,7 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, true, sender, metrics);
+                    let outcome = submit(prompt, TuiSubmitOrigin::Background, sender, metrics);
                     let _ = completion_sender.send(outcome);
                 });
             }

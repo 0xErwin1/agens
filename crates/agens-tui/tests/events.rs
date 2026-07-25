@@ -3225,3 +3225,124 @@ fn parsed_tool_input_reaches_restore_with_qualified_name_stripped() {
         }
     );
 }
+
+fn finish_background_child(tui: &mut Tui<FakeEngine>, id: u64) {
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
+        TuiSubagentEvent::started(
+            id,
+            "reviewer",
+            format!("review-{id}"),
+            TuiExecutionState::BackgroundRunning,
+        ),
+    ));
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id },
+    });
+}
+
+#[test]
+fn a_finished_background_subagent_fires_one_main_turn_while_idle() {
+    let mut tui = Tui::new(FakeEngine::default());
+    finish_background_child(&mut tui, 7);
+
+    let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
+
+    assert!(prompt.starts_with("[coordination source=runtime"));
+    assert!(prompt.contains("1 background subagent"));
+    assert!(tui.view().running);
+    assert!(tui.take_ready_auto_turn().is_none());
+}
+
+#[test]
+fn a_finished_foreground_subagent_never_fires_a_main_turn() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Completed { id: 7 },
+    });
+
+    assert_eq!(tui.take_ready_auto_turn(), None);
+}
+
+#[test]
+fn a_running_turn_defers_the_auto_turn_instead_of_dropping_it() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("user work");
+    finish_background_child(&mut tui, 7);
+
+    assert_eq!(tui.take_ready_auto_turn(), None);
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: Some(Duration::from_secs(1)),
+    });
+
+    assert!(tui.take_ready_auto_turn().is_some());
+}
+
+#[test]
+fn a_composer_with_text_defers_the_auto_turn_instead_of_dropping_it() {
+    let mut tui = Tui::new(FakeEngine::default());
+    for character in "half typed".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    finish_background_child(&mut tui, 7);
+
+    assert_eq!(tui.take_ready_auto_turn(), None);
+
+    for _ in 0.."half typed".len() {
+        tui.handle(Event::Key(Key::Backspace));
+    }
+
+    assert!(tui.take_ready_auto_turn().is_some());
+}
+
+#[test]
+fn simultaneous_background_completions_coalesce_into_one_auto_turn() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("user work");
+    for id in [7, 8, 9] {
+        finish_background_child(&mut tui, id);
+    }
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Completed,
+        duration: Some(Duration::from_secs(1)),
+    });
+
+    let prompt = tui.take_ready_auto_turn().expect("idle schedules the turn");
+
+    assert!(prompt.contains("3 background subagents"));
+    assert_eq!(tui.take_ready_auto_turn(), None);
+}
+
+#[test]
+fn the_auto_turn_is_cancellable_and_never_fabricates_a_user_prompt() {
+    let mut tui = Tui::new(FakeEngine::default());
+    finish_background_child(&mut tui, 7);
+    tui.take_ready_auto_turn().expect("idle schedules the turn");
+
+    let view = tui.view();
+    let conversation = view
+        .conversation
+        .expect("the auto turn opens a conversation");
+    assert!(conversation.user.is_empty());
+    assert_eq!(
+        conversation.info,
+        vec!["Continuing automatically: 1 background subagent finished.".to_owned()]
+    );
+    assert!(
+        !tui.transcript()
+            .iter()
+            .any(|entry| matches!(entry, TranscriptEntry::User(_)))
+    );
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
+    assert_eq!(tui.view().turn_state, Some(TurnState::Cancelled));
+}

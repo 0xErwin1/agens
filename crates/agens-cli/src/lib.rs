@@ -55,7 +55,7 @@ use agens_tui::{
     SessionDialogScope, ToolResultState, Tui, TuiExecutionEvent, TuiPermissionBridge,
     TuiPermissionReply, TuiPermissionRequest, TuiPresentation, TuiProviderOutcome,
     TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiRuntimeEvent, TuiSubagentErrorKind,
-    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome,
+    TuiSubagentEvent, TuiSubagentStatus, TuiSubmissionOutcome, TuiSubmitOrigin,
     run_with_default_progress_submit_with_permissions_and_task_controls,
 };
 
@@ -3873,7 +3873,7 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
         move |request, progress, cancellation| {
             route_router.route_request_with_cancellation(request, progress, cancellation)
         },
-        move |prompt, background, progress, metrics| {
+        move |prompt, origin, progress, metrics| {
             let task_events = metrics.clone();
             let turn_cancellation =
                 HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
@@ -3933,16 +3933,21 @@ fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<Stri
             ) {
                 return tui_provider_outcome(Err(error));
             }
-            match selected_tui_task_skips_parent(
-                launch_selected_tui_task(
-                    &mut task_runtime,
-                    &router.session,
-                    &prompt,
-                    background,
-                    &turn_cancellation,
-                ),
-                &lifecycle_bridge,
-            ) {
+            let selected_launch = if origin_launches_selected_subagent(origin) {
+                selected_tui_task_skips_parent(
+                    launch_selected_tui_task(
+                        &mut task_runtime,
+                        &router.session,
+                        &prompt,
+                        matches!(origin, TuiSubmitOrigin::Background),
+                        &turn_cancellation,
+                    ),
+                    &lifecycle_bridge,
+                )
+            } else {
+                Ok(false)
+            };
+            match selected_launch {
                 Ok(true) => return TuiProviderOutcome::Backgrounded,
                 Ok(false) => {}
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -8770,6 +8775,15 @@ fn launch_selected_tui_task(
         }
         Err(HeadlessTurnPortError::TimedOut) => Err(CliError::runtime(HeadlessTurnError::TimedOut)),
         Err(_) => Err(CliError::runtime(HeadlessTurnError::Tool)),
+    }
+}
+
+/// A subagent armed for the user's next prompt must survive a turn the user never submitted, so a
+/// runtime-scheduled turn leaves the arming in place and runs the main agent instead.
+fn origin_launches_selected_subagent(origin: TuiSubmitOrigin) -> bool {
+    match origin {
+        TuiSubmitOrigin::User | TuiSubmitOrigin::Background => true,
+        TuiSubmitOrigin::SubagentCompletion => false,
     }
 }
 
@@ -17359,6 +17373,37 @@ mod tests {
         assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
         assert_ne!(probe[0].0, probe[1].0);
         assert!(reply.join().unwrap());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_runtime_scheduled_turn_never_consumes_the_armed_subagent() {
+        let temporary = tui_session_directory("auto-turn-armed-subagent");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        assert_eq!(
+            select_tui_subagent(&bootstrap, "reviewer", &session),
+            Ok("Subagent: reviewer.".to_owned())
+        );
+
+        assert!(origin_launches_selected_subagent(TuiSubmitOrigin::User));
+        assert!(origin_launches_selected_subagent(
+            TuiSubmitOrigin::Background
+        ));
+        assert!(!origin_launches_selected_subagent(
+            TuiSubmitOrigin::SubagentCompletion
+        ));
+        assert_eq!(
+            session.lock().unwrap().selected_subagent.as_deref(),
+            Some("reviewer")
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
