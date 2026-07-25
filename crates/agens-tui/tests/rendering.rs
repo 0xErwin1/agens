@@ -61,6 +61,31 @@ fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize
     cell_index(renderer, text) % usize::from(renderer.terminal().backend().buffer().area.width)
 }
 
+fn composer_top_row(renderer: &RatatuiRenderer<TestBackend>) -> u16 {
+    let buffer = renderer.terminal().backend().buffer();
+    (0..buffer.area.height)
+        .find(|row| buffer[(0, *row)].symbol() == "┌")
+        .expect("composer top border should be rendered")
+}
+
+fn composer_bottom_row(renderer: &RatatuiRenderer<TestBackend>) -> u16 {
+    let buffer = renderer.terminal().backend().buffer();
+    (0..buffer.area.height)
+        .find(|row| buffer[(0, *row)].symbol() == "└")
+        .expect("composer bottom border should be rendered")
+}
+
+fn start_execution(tui: &mut Tui<FakeEngine>, id: u64, agent: &str) {
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: agent.into(),
+        event: TuiExecutionEvent::ForegroundStarted { id },
+    });
+    apply_subagent(
+        tui,
+        TuiSubagentEvent::started(id, agent, "task", TuiExecutionState::ForegroundRunning),
+    );
+}
+
 fn cell_index(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
     let buffer = renderer.terminal().backend().buffer();
     let width = text.chars().count();
@@ -119,8 +144,8 @@ fn empty_composer_renders_a_complete_dock() {
     renderer.render(tui.view()).unwrap();
 
     let buffer = renderer.terminal().backend().buffer();
-    let composer_top = height - 4;
-    let composer_bottom = height - 2;
+    let composer_top = height - 7;
+    let composer_bottom = height - 5;
     assert_eq!(buffer[(0, composer_top)].symbol(), "┌");
     assert_eq!(buffer[(width - 1, composer_top)].symbol(), "┐");
     assert_eq!(buffer[(0, composer_bottom)].symbol(), "└");
@@ -1075,7 +1100,7 @@ fn unknown_fence_language_uses_neutral_panel_style() {
 
 #[test]
 fn paragraph_to_fence_has_one_blank_transition_row() {
-    let terminal = Terminal::new(TestBackend::new(48, 14)).unwrap();
+    let terminal = Terminal::new(TestBackend::new(48, 20)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
@@ -3047,6 +3072,168 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
             child.contains(child_row),
             "missing {child_row:?}: {child:?}"
         );
+    }
+}
+
+#[test]
+fn conversation_owns_the_first_row_under_every_notice_condition() {
+    type ArmNotice = fn(&mut Tui<FakeEngine>);
+
+    let notices: [(&str, ArmNotice); 4] = [
+        ("Press Ctrl+C again to exit", |tui| {
+            tui.handle(Event::Key(Key::CtrlC));
+        }),
+        ("Recovered failed prompt", |tui| {
+            tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+                message: "Recovered failed prompt.".into(),
+                presentation: TuiPresentation::new("provider", "model", "session #1"),
+                history: Vec::new(),
+                draft: Some("failed prompt".into()),
+                resume_error: None,
+            });
+        }),
+        ("danger", |tui| tui.set_dangerous_mode(true)),
+        ("status-sentinel", |tui| tui.add_info("status-sentinel")),
+    ];
+
+    for (needle, arm) in notices {
+        let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 30)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 30,
+        });
+        arm(&mut tui);
+
+        renderer.render(tui.view()).unwrap();
+
+        assert!(
+            !rendered_line(&renderer, 0).contains(needle),
+            "{needle:?} must not band the first row: {:?}",
+            rendered_line(&renderer, 0)
+        );
+        let notice_row = rendered_row(&renderer, needle) as u16;
+        assert!(
+            notice_row > composer_bottom_row(&renderer),
+            "{needle:?} belongs to the bottom chrome: notice {notice_row} composer bottom {}",
+            composer_bottom_row(&renderer)
+        );
+    }
+}
+
+#[test]
+fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
+    let height = 30_u16;
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width: 80, height });
+
+    renderer.render(tui.view()).unwrap();
+    let idle_top = composer_top_row(&renderer);
+    let idle_bottom = composer_bottom_row(&renderer);
+    assert!(
+        idle_bottom + 3 < height,
+        "the composer is parked above the reserved bottom chrome: bottom {idle_bottom}"
+    );
+    assert!(
+        !rendered_line(&renderer, 0).contains('┌'),
+        "the conversation owns the first row: {:?}",
+        rendered_line(&renderer, 0)
+    );
+
+    tui.handle(Event::Key(Key::CtrlC));
+    start_execution(&mut tui, 9, "explore");
+    start_execution(&mut tui, 10, "plan");
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(
+        (composer_top_row(&renderer), composer_bottom_row(&renderer)),
+        (idle_top, idle_bottom),
+        "notices and the subagent tree must not move the composer"
+    );
+    let notice_row = rendered_row(&renderer, "Press Ctrl+C again to exit") as u16;
+    let tree_row = rendered_row(&renderer, "Tab focus") as u16;
+    let footer_row = rendered_row(&renderer, "model —") as u16;
+    assert!(
+        idle_bottom < notice_row && notice_row < tree_row && tree_row < footer_row,
+        "bottom chrome order is notice, tree, status bar: {notice_row} {tree_row} {footer_row}"
+    );
+
+    tui.handle(Event::Key(Key::CtrlC));
+    tui.handle(Event::Key(Key::Escape));
+    renderer.render(tui.view()).unwrap();
+    assert_eq!(
+        (composer_top_row(&renderer), composer_bottom_row(&renderer)),
+        (idle_top, idle_bottom),
+        "clearing a notice must not move the composer either"
+    );
+}
+
+#[test]
+fn elided_subagent_tree_keeps_the_navigation_hint_as_its_last_row() {
+    let height = 14_u16;
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(72, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width: 72, height });
+    for (id, agent) in [(9_u64, "explore"), (10, "plan"), (11, "build")] {
+        start_execution(&mut tui, id, agent);
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(
+        text.contains("Main"),
+        "the elided tree keeps its root: {text:?}"
+    );
+    assert_eq!(
+        rendered_row(&renderer, "Tab focus"),
+        usize::from(height - 2),
+        "the navigation hint survives elision as the last tree row: {text:?}"
+    );
+    assert!(
+        !text.contains("Explore #9"),
+        "branches beyond the reserved rows are elided: {text:?}"
+    );
+}
+
+#[test]
+fn bottom_chrome_degrades_without_panicking_on_small_terminals() {
+    for (width, height) in [
+        (1_u16, 1_u16),
+        (1, 2),
+        (2, 1),
+        (4, 3),
+        (10, 7),
+        (20, 12),
+        (24, 14),
+        (40, 20),
+    ] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize { width, height });
+        tui.handle(Event::Key(Key::CtrlC));
+        start_execution(&mut tui, 9, "explore");
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        assert_eq!(
+            text.chars().count(),
+            usize::from(width) * usize::from(height),
+            "{width}x{height}"
+        );
+        if height >= 2 {
+            let buffer = renderer.terminal().backend().buffer();
+            let top = (0..height)
+                .find(|row| buffer[(0, *row)].symbol() == "┌")
+                .unwrap_or_else(|| panic!("no composer top at {width}x{height}: {text:?}"));
+            assert!(
+                (top + 1..height).any(|row| buffer[(0, row)].symbol() == "└"),
+                "the composer keeps priority over decorative chrome at {width}x{height}: {text:?}"
+            );
+        }
     }
 }
 

@@ -1075,11 +1075,7 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let area = frame.area();
-    let layout = screen_layout(area, state.input, chrome_rows(&state));
-
-    if layout.notice.height > 0 {
-        render_notice(frame, layout.notice, &state);
-    }
+    let layout = screen_layout(area, state.input);
 
     let transcript_width = layout
         .transcript
@@ -1184,9 +1180,16 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         }
     }
 
+    if layout.notice.height > 0 {
+        render_notice(frame, layout.notice, &state);
+    }
+
     if layout.tree.height > 0 {
         frame.render_widget(
-            Paragraph::new(Text::from(subagent_tree_lines(&state))),
+            Paragraph::new(Text::from(fitted_subagent_tree_lines(
+                &state,
+                layout.tree.height,
+            ))),
             layout.tree,
         );
     }
@@ -1611,25 +1614,11 @@ fn dialog_empty_message(dialog: &DialogView) -> &str {
 }
 
 struct ScreenLayout {
-    notice: Rect,
     transcript: Rect,
     composer: Rect,
+    notice: Rect,
     tree: Rect,
     footer: Rect,
-}
-
-/// Optional chrome bands competing with the transcript for vertical space.
-#[derive(Clone, Copy)]
-struct ChromeRows {
-    notice: bool,
-    tree: u16,
-}
-
-fn chrome_rows(state: &ViewState<'_>) -> ChromeRows {
-    ChromeRows {
-        notice: notice_should_show(state),
-        tree: subagent_tree_rows(state),
-    }
 }
 
 fn conversation_surface(area: Rect) -> Rect {
@@ -1643,18 +1632,69 @@ const TREE_MIN_SCREEN_HEIGHT: u16 = 14;
 const MAX_TREE_EXECUTIONS: usize = 3;
 /// Child activity rows shown under the focused branch.
 const MAX_TREE_ACTIVITIES: usize = 2;
+/// Widest subagent tree the renderer can produce: the root, every branch, the
+/// activities of the focused branch and the navigation hint.
+const MAX_TREE_ROWS: u16 = 1 + MAX_TREE_EXECUTIONS as u16 + MAX_TREE_ACTIVITIES as u16 + 1;
 
-fn screen_layout(area: Rect, input: &str, chrome: ChromeRows) -> ScreenLayout {
-    let area = conversation_surface(area);
-    // Reclaim a row when idle chrome would be empty (no danger / status / recovery).
-    let notice_rows = u16::from(area.height >= 7 && chrome.notice);
-    let footer_rows = u16::from(area.height >= 12);
-    let tree_rows = if area.height >= TREE_MIN_SCREEN_HEIGHT {
-        chrome.tree.min(area.height / 3)
+/// Rows reserved below the composer for the notice, the subagent tree and the
+/// status bar.
+#[derive(Clone, Copy)]
+struct BottomChrome {
+    notice: u16,
+    tree: u16,
+    footer: u16,
+}
+
+impl BottomChrome {
+    fn rows(self) -> u16 {
+        self.notice
+            .saturating_add(self.tree)
+            .saturating_add(self.footer)
+    }
+
+    /// Sheds the tree before the notice and the status bar so the composer
+    /// keeps priority when it leaves fewer rows than the height budget assumes.
+    fn fitted(self, rows: u16) -> Self {
+        let footer = self.footer.min(rows);
+        let notice = self.notice.min(rows.saturating_sub(footer));
+        let tree = self
+            .tree
+            .min(rows.saturating_sub(footer).saturating_sub(notice));
+        Self {
+            notice,
+            tree,
+            footer,
+        }
+    }
+}
+
+/// Sizes the bottom chrome region from the terminal height alone.
+///
+/// The budget deliberately ignores what the notice and the tree currently hold
+/// so the composer never moves while chrome content appears and disappears;
+/// content wider than its budget is elided instead. The region never claims
+/// more than a third of the screen, and the composer keeps priority below the
+/// heights where each band becomes affordable.
+fn bottom_chrome(height: u16) -> BottomChrome {
+    let notice = u16::from(height >= 7);
+    let footer = u16::from(height >= 12);
+    let tree = if height >= TREE_MIN_SCREEN_HEIGHT {
+        (height / 3)
+            .saturating_sub(notice)
+            .saturating_sub(footer)
+            .min(MAX_TREE_ROWS)
     } else {
         0
     };
-    let composer_rows = match area.height {
+    BottomChrome {
+        notice,
+        tree,
+        footer,
+    }
+}
+
+fn composer_rows(height: u16, input: &str) -> u16 {
+    match height {
         0 => 0,
         1 => 1,
         2..=6 => 2,
@@ -1663,41 +1703,33 @@ fn screen_layout(area: Rect, input: &str, chrome: ChromeRows) -> ScreenLayout {
             let input_lines = input.chars().filter(|character| *character == '\n').count() + 1;
             saturating_u16(input_lines.saturating_add(2)).clamp(3, 8)
         }
-    };
+    }
+}
+
+fn screen_layout(area: Rect, input: &str) -> ScreenLayout {
+    let area = conversation_surface(area);
+    let composer_rows = composer_rows(area.height, input).min(area.height);
+    let chrome = bottom_chrome(area.height).fitted(area.height.saturating_sub(composer_rows));
     let transcript_rows = area
         .height
-        .saturating_sub(notice_rows)
         .saturating_sub(composer_rows)
-        .saturating_sub(tree_rows)
-        .saturating_sub(footer_rows);
+        .saturating_sub(chrome.rows());
     let chunks = Layout::vertical([
-        Constraint::Length(notice_rows),
         Constraint::Length(transcript_rows),
         Constraint::Length(composer_rows),
-        Constraint::Length(tree_rows),
-        Constraint::Length(footer_rows),
+        Constraint::Length(chrome.notice),
+        Constraint::Length(chrome.tree),
+        Constraint::Length(chrome.footer),
     ])
     .split(area);
 
     ScreenLayout {
-        notice: chunks[0],
-        transcript: chunks[1],
-        composer: chunks[2],
+        transcript: chunks[0],
+        composer: chunks[1],
+        notice: chunks[2],
         tree: chunks[3],
         footer: chunks[4],
     }
-}
-
-/// Whether a transient notice row is warranted.
-///
-/// Active-turn feedback deliberately does not appear here: the working
-/// indicator lives at the end of the transcript and the subagent tree lives
-/// under the composer, so this band is reserved for warnings and recovery.
-fn notice_should_show(state: &ViewState<'_>) -> bool {
-    state.quit_armed
-        || state.recovered_failed_prompt
-        || state.dangerous_mode
-        || state.status.is_some_and(|value| !value.is_empty())
 }
 
 fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, state: &ViewState<'_>) {
@@ -1821,8 +1853,20 @@ fn subagent_tree_lines(state: &ViewState<'_>) -> Vec<Line<'static>> {
     lines
 }
 
-fn subagent_tree_rows(state: &ViewState<'_>) -> u16 {
-    saturating_u16(subagent_tree_lines(state).len())
+/// Elides the deepest tree rows when the reserved region is narrower than the
+/// tree, keeping the navigation hint as the last visible row.
+fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'static>> {
+    let mut lines = subagent_tree_lines(state);
+    let rows = usize::from(rows);
+    if lines.len() <= rows {
+        return lines;
+    }
+    let Some(hint) = lines.pop().filter(|_| rows > 0) else {
+        return Vec::new();
+    };
+    lines.truncate(rows.saturating_sub(1));
+    lines.push(hint);
+    lines
 }
 
 fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
@@ -3158,7 +3202,7 @@ where
             return None;
         }
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
+        let layout = screen_layout(area, &self.input);
         if layout.tree.height == 0 || row < layout.tree.y || row >= layout.tree.bottom() {
             return None;
         }
@@ -3743,7 +3787,7 @@ where
         }
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input, chrome_rows(&view));
+        let layout = screen_layout(area, &self.input);
         let content_y = layout.transcript.y.saturating_add(1);
         let content_x = layout
             .transcript
@@ -3784,7 +3828,7 @@ where
     fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
         let view = self.view();
-        let layout = screen_layout(area, &self.input, chrome_rows(&view));
+        let layout = screen_layout(area, &self.input);
         let content_width = layout
             .transcript
             .width
@@ -4330,7 +4374,7 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
+        let layout = screen_layout(area, &self.input);
         let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
         let content_width = layout
             .transcript
@@ -4345,7 +4389,7 @@ where
 
     fn transcript_page_rows(&self) -> u16 {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        screen_layout(area, &self.input, chrome_rows(&self.view()))
+        screen_layout(area, &self.input)
             .transcript
             .height
             .saturating_sub(1)
@@ -4922,7 +4966,7 @@ where
 
     fn jump_to_user_message(&mut self, previous: bool) {
         let area = Rect::new(0, 0, self.size.0.max(1), self.size.1.max(1));
-        let layout = screen_layout(area, &self.input, chrome_rows(&self.view()));
+        let layout = screen_layout(area, &self.input);
         let content_width = layout
             .transcript
             .width
@@ -7038,14 +7082,10 @@ mod runtime_tests {
             .get(&TranscriptId::Main)
             .unwrap()
             .scroll_offset;
-        let transcript_row = screen_layout(
-            Rect::new(0, 0, tui.size.0, tui.size.1),
-            &tui.input,
-            chrome_rows(&tui.view()),
-        )
-        .transcript
-        .y
-        .saturating_add(1);
+        let transcript_row = screen_layout(Rect::new(0, 0, tui.size.0, tui.size.1), &tui.input)
+            .transcript
+            .y
+            .saturating_add(1);
         tui.handle(Event::MouseDown {
             column: TRANSCRIPT_CONTENT_INDENT,
             row: transcript_row,
