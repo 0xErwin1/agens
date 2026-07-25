@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc::Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::Parser as _;
+
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
     ConfiguredValue, McpDefaultSettings, McpTransport, Origin, ResolvedSettings, SubagentSettings,
@@ -782,35 +784,35 @@ fn execute_command(
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    match arguments {
-        [] => run_tui(dependencies, None),
-        [resume] if resume == "--resume" => run_tui(dependencies, None),
-        [resume, identifier] if resume == "--resume" && identifier.parse::<i64>().is_ok() => {
-            run_tui(dependencies, identifier.parse().ok())
+    if let Some(identifier) = cli::resume_shorthand(arguments) {
+        return run_tui(dependencies, Some(identifier));
+    }
+
+    let parsed = match cli::Cli::try_parse_from(arguments.iter()) {
+        Ok(parsed) => parsed,
+        Err(error) => return cli::clap_outcome(error),
+    };
+
+    match parsed.command {
+        None => run_tui(dependencies, parsed.resume.flatten()),
+        Some(cli::Command::Config { action }) => run_config(action, dependencies),
+        Some(cli::Command::Auth { arguments }) => run_auth(&arguments, dependencies, cancellation),
+        Some(cli::Command::Chat(chat_arguments)) => {
+            run_chat(chat_arguments, dependencies, cancellation)
         }
-        [identifier] if identifier.parse::<i64>().is_ok() => {
-            run_tui(dependencies, identifier.parse().ok())
-        }
-        [command] if is_help(command) => Ok(root_help()),
-        [command] if is_version(command) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
-        [command, rest @ ..] if command == "config" => run_config(rest, dependencies),
-        [command, rest @ ..] if command == "auth" => run_auth(rest, dependencies, cancellation),
-        [command, rest @ ..] if command == "chat" => run_chat(rest, dependencies, cancellation),
-        [command, rest @ ..] if command == "models" => run_models(rest),
-        [command, rest @ ..] if command == "sessions" => run_sessions(rest, dependencies),
-        _ => Err(CliError::usage("unknown command; run agens --help")),
+        Some(cli::Command::Models) => run_models(),
+        Some(cli::Command::Sessions { arguments }) => run_sessions(&arguments, dependencies),
+        Some(cli::Command::Version) => Ok(format!("agens {}\n", env!("CARGO_PKG_VERSION"))),
     }
 }
 
-fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
-    if arguments.iter().any(|argument| is_help(argument)) {
-        return Ok("Usage: agens config <doctor|init>\n".to_owned());
-    }
-
-    match arguments {
-        [command] if is_help(command) => Ok("Usage: agens config <doctor|init>\n".to_owned()),
-        [command] if command == "init" => run_config_init(dependencies),
-        [command] if command == "doctor" => {
+fn run_config(
+    action: cli::ConfigAction,
+    dependencies: &CliDependencies,
+) -> Result<String, CliError> {
+    match action {
+        cli::ConfigAction::Init => run_config_init(dependencies),
+        cli::ConfigAction::Doctor => {
             let bootstrap = bootstrap(dependencies)?;
             Ok(format!(
                 "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n\n{}",
@@ -822,9 +824,6 @@ fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<St
                 effective_settings_report(bootstrap.settings())
             ))
         }
-        _ => Err(CliError::usage(
-            "config requires the doctor or init subcommand",
-        )),
     }
 }
 
@@ -899,12 +898,17 @@ fn run_auth(
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
+    // `auth` captures its trailing tokens as a raw `Vec<String>` (see
+    // `cli.rs`), so clap's own help interception only fires when `--help`
+    // is the very first token; once any other token has started filling
+    // that vector, a later `--help` is just another leftover string. This
+    // check restores today's "help wins anywhere" precedence for the
+    // positions clap cannot reach.
     if arguments.iter().any(|argument| is_help(argument)) {
         return Ok("Usage: agens auth <status|login|logout>\n".to_owned());
     }
 
     match arguments {
-        [command] if is_help(command) => Ok("Usage: agens auth <status|login|logout>\n".to_owned()),
         [command] if command == "status" => {
             let bootstrap = bootstrap(dependencies)?;
             let state =
@@ -1205,15 +1209,11 @@ fn chatgpt_login_error(error: LoginError) -> CliError {
 }
 
 fn run_chat(
-    arguments: &[String],
+    arguments: cli::ChatArgs,
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
-    if matches!(arguments, [argument] if is_help(argument)) {
-        return Ok("Usage: agens chat [flags] <prompt>\n".to_owned());
-    }
-
-    let mut request = parse_chat_request(arguments)?;
+    let mut request = chat_request(arguments)?;
     cancellation_result(cancellation)?;
     let bootstrap = bootstrap(dependencies)?;
     seed_configured_reasoning_effort(&mut request, &bootstrap);
@@ -1223,27 +1223,21 @@ fn run_chat(
     Ok(format!("{output}\n"))
 }
 
-fn run_models(arguments: &[String]) -> Result<String, CliError> {
-    if arguments.iter().any(|argument| is_help(argument)) {
-        return Ok("Usage: agens models\n".to_owned());
-    }
-
-    match arguments {
-        [command] if is_help(command) => Ok("Usage: agens models\n".to_owned()),
-        [] => model_registry::bundled_openai_models()
-            .map(|models| model_registry::format_models(&models))
-            .map_err(|_| CliError::unavailable("model registry is unavailable")),
-        _ => Err(CliError::usage("models does not accept arguments")),
-    }
+fn run_models() -> Result<String, CliError> {
+    model_registry::bundled_openai_models()
+        .map(|models| model_registry::format_models(&models))
+        .map_err(|_| CliError::unavailable("model registry is unavailable"))
 }
 
 fn run_sessions(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
+    // See the matching comment in `run_auth`: `sessions` also captures its
+    // trailing tokens as a raw `Vec<String>`, so this restores "help wins
+    // anywhere" for positions clap's own interception cannot reach.
     if arguments.iter().any(|argument| is_help(argument)) {
         return Ok("Usage: agens sessions <list|show|rm>\n".to_owned());
     }
 
     match arguments {
-        [command] if is_help(command) => Ok("Usage: agens sessions <list|show|rm>\n".to_owned()),
         [command] if command == "list" => {
             let bootstrap = bootstrap(dependencies)?;
             let store = SessionStore::open(&bootstrap.data_directory)
@@ -5536,15 +5530,50 @@ fn ensure_active_tui_agent_runtime(
     Ok(())
 }
 
-fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliError> {
-    let mut request = HeadlessChatRequest {
-        prompt: String::new(),
+/// Builds the headless chat request from clap-parsed flags. clap already
+/// owns the shape and type of `--model`/`--system`/`--max-iterations`/
+/// `--mode`/`--dangerously-allow-all`; this function keeps the domain
+/// validation clap cannot express (arity of the prompt, `--max-iterations`
+/// range, `--mode` enum) and reproduces, on `arguments.prompt`, the same
+/// left-to-right scan the hand-rolled parser used: the first non-flag,
+/// non-blank token becomes the prompt, any further token is rejected, and
+/// any leftover token that still looks like a flag (because clap did not
+/// recognize it) is rejected as an unknown flag.
+fn chat_request(arguments: cli::ChatArgs) -> Result<HeadlessChatRequest, CliError> {
+    let max_iterations = match arguments.max_iterations {
+        Some(0) => return Err(CliError::usage("chat --max-iterations must be >= 1")),
+        other => other,
+    };
+
+    let mode = match arguments.mode.as_deref() {
+        None | Some("edit") => PermissionMode::Edit,
+        Some("chat") => PermissionMode::Chat,
+        Some(_) => return Err(CliError::usage("chat --mode must be chat or edit")),
+    };
+
+    let mut prompt = String::new();
+    for token in &arguments.prompt {
+        if token.starts_with('-') {
+            return Err(CliError::usage("chat received an unknown flag"));
+        }
+        if prompt.is_empty() && !token.trim().is_empty() {
+            prompt = token.trim().to_owned();
+        } else {
+            return Err(CliError::usage("chat accepts one prompt argument"));
+        }
+    }
+    if prompt.is_empty() {
+        return Err(CliError::usage("chat requires a prompt argument"));
+    }
+
+    Ok(HeadlessChatRequest {
+        prompt,
         history: Vec::new(),
-        model: None,
-        system_prompt: None,
-        max_iterations: None,
-        mode: PermissionMode::Edit,
-        dangerously_allow_all: false,
+        model: arguments.model,
+        system_prompt: arguments.system,
+        max_iterations,
+        mode,
+        dangerously_allow_all: arguments.dangerously_allow_all,
         dangerous_mode: false,
         request_config: agens_core::RequestConfig::default(),
         session_reasoning_effort: None,
@@ -5553,65 +5582,19 @@ fn parse_chat_request(arguments: &[String]) -> Result<HeadlessChatRequest, CliEr
         effective_capabilities: None,
         pending_system_reminder: None,
         skills: None,
-    };
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        match argument.as_str() {
-            "--model" => {
-                request.model = Some(required_flag_value(arguments, &mut index, "--model")?)
-            }
-            "--system" => {
-                request.system_prompt =
-                    Some(required_flag_value(arguments, &mut index, "--system")?)
-            }
-            "--max-iterations" => {
-                let value = required_flag_value(arguments, &mut index, "--max-iterations")?;
-                let parsed = value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|value| *value > 0)
-                    .ok_or_else(|| CliError::usage("chat --max-iterations must be >= 1"))?;
-                request.max_iterations = Some(parsed);
-            }
-            "--mode" => {
-                let value = required_flag_value(arguments, &mut index, "--mode")?;
-                request.mode = match value.as_str() {
-                    "edit" => PermissionMode::Edit,
-                    "chat" => PermissionMode::Chat,
-                    _ => return Err(CliError::usage("chat --mode must be chat or edit")),
-                };
-            }
-            "--dangerously-allow-all" => request.dangerously_allow_all = true,
-            argument if argument.starts_with('-') => {
-                return Err(CliError::usage("chat received an unknown flag"));
-            }
-            prompt if request.prompt.is_empty() && !prompt.trim().is_empty() => {
-                request.prompt = prompt.trim().to_owned();
-            }
-            _ => return Err(CliError::usage("chat accepts one prompt argument")),
-        }
-        index += 1;
-    }
-
-    if request.prompt.is_empty() {
-        return Err(CliError::usage("chat requires a prompt argument"));
-    }
-
-    Ok(request)
+    })
 }
 
-fn required_flag_value(
-    arguments: &[String],
-    index: &mut usize,
-    flag: &str,
-) -> Result<String, CliError> {
-    *index += 1;
-    arguments
-        .get(*index)
-        .filter(|value| !value.starts_with('-'))
-        .cloned()
-        .ok_or_else(|| CliError::usage(format!("chat {flag} requires a value")))
+#[cfg(test)]
+fn chat_args_with_prompt(prompt: &str) -> cli::ChatArgs {
+    cli::ChatArgs {
+        model: None,
+        system: None,
+        max_iterations: None,
+        mode: None,
+        dangerously_allow_all: false,
+        prompt: vec![prompt.to_owned()],
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -9487,19 +9470,13 @@ fn source_status(loaded: bool) -> &'static str {
     if loaded { "loaded" } else { "missing" }
 }
 
+/// `auth` and `sessions` capture their trailing arguments as a raw
+/// `Vec<String>` (see `cli.rs`) rather than a typed clap `Subcommand`, so
+/// clap's own help interception only fires when `--help` is the very first
+/// token. This restores today's "help wins anywhere in the argument list"
+/// precedence for those two commands.
 fn is_help(argument: &str) -> bool {
     matches!(argument, "--help" | "-h" | "help")
-}
-
-fn is_version(argument: &str) -> bool {
-    matches!(argument, "--version" | "-V" | "version")
-}
-
-fn root_help() -> String {
-    format!(
-        "Agens is a coding agent CLI\n\nUsage: agens <command>\n\nCommands:\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  config    inspect configuration\n  models    list provider models\n  sessions  inspect completed turns\n\nVersion: {}\n",
-        env!("CARGO_PKG_VERSION")
-    )
 }
 
 #[cfg(test)]
@@ -11744,8 +11721,8 @@ mod tests {
                 let active = context.active_agent.as_ref().unwrap();
                 assert_eq!(active.name, "primary", "{provider} {model}");
                 assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
-                let request =
-                    context.apply_to(parse_chat_request(&["first submission".into()]).unwrap());
+                let request = context
+                    .apply_to(chat_request(chat_args_with_prompt("first submission")).unwrap());
                 assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
                 assert_eq!(
                     request.request_config.reasoning_effort(),
@@ -11784,7 +11761,7 @@ mod tests {
         );
 
         assert_eq!(effective_tui_model(&bootstrap, &context), "gpt-5.5");
-        let request = context.apply_to(parse_chat_request(&["work".into()]).unwrap());
+        let request = context.apply_to(chat_request(chat_args_with_prompt("work")).unwrap());
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(
             request.session_reasoning_effort,
@@ -12181,7 +12158,7 @@ mod tests {
                 Some(model),
                 "{provider} {model}"
             );
-            let request = context.apply_to(parse_chat_request(&["review".into()]).unwrap());
+            let request = context.apply_to(chat_request(chat_args_with_prompt("review")).unwrap());
             assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
             assert_eq!(
                 request.request_config.reasoning_effort(),
@@ -15683,7 +15660,7 @@ mod tests {
             Ok(())
         });
 
-        let report = run_config(&["init".to_owned()], &dependencies).expect("init should run");
+        let report = run_config(cli::ConfigAction::Init, &dependencies).expect("init should run");
 
         let written = written.lock().unwrap();
         let (path, contents) = written.first().expect("init should write exactly one file");
@@ -15710,7 +15687,7 @@ mod tests {
         )
         .with_create_file(|_, _| panic!("init must not write over an existing configuration"));
 
-        let error = run_config(&["init".to_owned()], &dependencies)
+        let error = run_config(cli::ConfigAction::Init, &dependencies)
             .expect_err("init must refuse an existing file");
 
         assert_eq!(error.status, ExitStatus::Configuration);
@@ -15742,7 +15719,8 @@ mod tests {
             ]),
         );
 
-        let report = run_config(&["doctor".to_owned()], &dependencies).expect("doctor should run");
+        let report =
+            run_config(cli::ConfigAction::Doctor, &dependencies).expect("doctor should run");
 
         assert!(report.contains("Status:  valid\n"));
         assert!(report.contains("tools.max_search_depth      8             global\n"));
@@ -15849,7 +15827,7 @@ mod tests {
             Some("[agent]\nreasoning_effort = \"high\"\n"),
             None,
         );
-        let mut request = parse_chat_request(&["work".into()]).unwrap();
+        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
 
         seed_configured_reasoning_effort(&mut request, &bootstrap);
 
@@ -15870,7 +15848,7 @@ mod tests {
             Some("[agent]\nreasoning_effort = \"high\"\n"),
             None,
         );
-        let mut request = parse_chat_request(&["work".into()]).unwrap();
+        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
         request.request_config = agens_core::RequestConfig::with_reasoning_effort("low").unwrap();
 
         seed_configured_reasoning_effort(&mut request, &bootstrap);
@@ -15884,7 +15862,7 @@ mod tests {
     #[test]
     fn an_absent_configured_effort_leaves_the_request_untouched() {
         let bootstrap = bootstrap_from_configuration("config-effort-absent", None, None);
-        let mut request = parse_chat_request(&["work".into()]).unwrap();
+        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
 
         seed_configured_reasoning_effort(&mut request, &bootstrap);
 
