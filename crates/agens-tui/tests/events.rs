@@ -3497,3 +3497,22 @@ fn the_file_picker_takes_navigation_keys_before_the_subagent_strip() {
 
     assert_eq!(tui.input(), "@crates/agens-tui/src/lib.rs");
 }
+
+#[test]
+fn a_background_submission_leaves_no_file_picker_behind_for_escape() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.set_file_candidates(file_candidates());
+    tui.set_agent_catalog(["reviewer"]);
+    tui.select_agent("reviewer");
+    typed(&mut tui, "review @src/lib");
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlB)),
+        Action::SubmitBackground("review @src/lib".to_owned())
+    );
+    assert!(tui.input().is_empty());
+    assert!(tui.view().file_picker.is_none());
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+}

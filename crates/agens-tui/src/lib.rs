@@ -4333,7 +4333,7 @@ where
             match widgets::OverlayShell::topmost(
                 self.palette_open,
                 self.dialog.as_ref().map(|dialog| dialog.overlay_kind),
-                self.file_picker.is_some(),
+                self.file_picker_open(),
             ) {
                 Some(widgets::OverlayKind::Palette) => {
                     self.palette_open = false;
@@ -4355,7 +4355,7 @@ where
             return self.handle_selection_dialog_key(key);
         }
 
-        if !self.palette_open && self.file_picker.is_none() && !self.executions.is_empty() {
+        if !self.palette_open && !self.file_picker_open() && !self.executions.is_empty() {
             match key {
                 Key::Tab => {
                     self.focus_execution_strip();
@@ -4562,11 +4562,11 @@ where
                 self.complete_palette_selection();
                 Action::Render
             }
-            Key::Up | Key::Down if self.file_picker.is_some() => {
+            Key::Up | Key::Down if self.file_picker_open() => {
                 self.move_file_picker_selection(key == Key::Down);
                 Action::Render
             }
-            Key::Tab | Key::Enter if self.file_picker.is_some() => {
+            Key::Tab | Key::Enter if self.file_picker_open() => {
                 self.complete_file_picker_selection();
                 Action::Render
             }
@@ -5245,6 +5245,12 @@ where
             return None;
         }
         Some(query)
+    }
+
+    /// Whether the picker holds the overlay layer, judged by the live token so a
+    /// stale anchor left behind by a submission never answers a key.
+    fn file_picker_open(&self) -> bool {
+        self.file_picker_query().is_some()
     }
 
     fn file_picker_match_count(&self) -> usize {
