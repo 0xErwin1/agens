@@ -25,7 +25,7 @@ use agens_core::{
     HeadlessTurnError, HeadlessTurnPortError, Message, MessagePart, PermissionDecision,
     PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
     RecoveryOutcome, RetryBoundary, Role, SessionAttemptStatus, SessionMetadata, TurnEvent,
-    TurnProgressSink, TurnProvider, TurnState, run_headless_turn_with_max_iterations_and_progress,
+    TurnProgressSink, TurnState,
 };
 #[cfg(test)]
 use agens_core::{
@@ -37,10 +37,15 @@ use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
 };
 use agens_providers::{
-    ChatGptAuthState, ChatGptResponsesProvider, DiagnosticRef, OpenAiFunctionTool,
-    OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
-    ProviderDiagnosticEvent, ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+    ChatGptAuthState, DiagnosticRef, OpenAiFunctionTool, ProviderDiagnosticKind,
     load_chatgpt_auth_state,
+};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use agens_providers::{
+    OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticEvent,
+    ProviderDiagnosticScope,
 };
 use agens_store::{
     ModelPreference, PermissionGrantStore, PreferenceStore, SessionCursor, SessionStore,
@@ -55,14 +60,13 @@ use agens_tools::{
     McpStatusHandle, McpStatusSnapshot, McpStdioTransport, McpStdioTransportConfig, McpTimeouts,
     McpTransport as McpTransportPort, McpTransportError, NativeToolCatalog,
     PermissionPromptContext, ReadFileInput, RemoteToolMetadata, SkillCatalog,
-    TaskExecutionRegistry, TaskLaunchMode, TaskMessageSource, TaskMessageTarget, TaskRunnerError,
-    TaskTurnRequest, ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    TaskExecutionRegistry, TaskLaunchMode, TaskMessageSource, TaskMessageTarget,
+    ToolDispatchRequest, ToolDispatcher, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use agens_tools::{TaskRunContext, TaskRunner, TaskTurnResult};
+use agens_tools::{TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult};
 use agens_tui::{
     BridgeCancel, BridgeTx, Conversation, DialogEntry, DialogView, DiffLine, DiffLineKind,
     Engine as TuiEngine, PaletteEntry, PaletteEntryKind, SessionDialogCursor, SessionDialogRequest,
@@ -101,15 +105,13 @@ use diagnostics::{
     DIAGNOSTIC_FILE_COUNT_LIMIT, DIAGNOSTIC_REFERENCE_SEQUENCE, SafeDiagnosticStore,
 };
 use diagnostics::{
-    DIAGNOSTIC_FILE_LIMIT_BYTES, diagnostic_store, next_diagnostic_reference,
-    operation_diagnostics, record_agent_diagnostic, record_parent_terminal,
-    record_subagent_terminal,
+    DIAGNOSTIC_FILE_LIMIT_BYTES, next_diagnostic_reference, operation_diagnostics,
+    record_agent_diagnostic, record_parent_terminal, record_subagent_terminal,
 };
 use error::cancellation_result;
 use headless::{
-    DiscardCompletedTurnRepository, HeadlessChatCompletion, HeadlessChatFailure,
-    block_on_headless_turn, run_production_headless_chat,
-    run_production_headless_chat_with_progress,
+    HeadlessChatCompletion, HeadlessChatFailure, block_on_headless_turn,
+    run_production_headless_chat, run_production_headless_chat_with_progress,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -132,18 +134,22 @@ use session::attempt::{
 use test_support::{reset_tui_resume_test_counters, tui_resume_test_counters};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use tools::child::{ChildRunError, TaskMailboxProvider};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use tools::runner::map_task_turn_error;
 use tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use tools::runtime::{
-    is_dangerous_child_native_tool, open_native_tools, production_child_tool_runtime,
-    production_tool_runtime, task_execution_limits,
+    is_dangerous_child_native_tool, open_native_tools, production_tool_runtime,
+    task_execution_limits,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tools::runtime::{
-    native_tool_limits, production_dangerous_child_tool_runtime,
+    native_tool_limits, production_child_tool_runtime, production_dangerous_child_tool_runtime,
     production_tool_runtime_with_task_runner,
 };
 #[cfg(test)]
@@ -4812,369 +4818,6 @@ fn chat_args_with_prompt(prompt: &str) -> cli::ChatArgs {
         mode: None,
         dangerously_allow_all: false,
         prompt: vec![prompt.to_owned()],
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ChildRunError {
-    Authentication,
-    Cancelled,
-    Context,
-    Network,
-    TimedOut,
-    Provider,
-    Protocol,
-    RateLimited,
-    Rejected,
-    Server,
-    Tool,
-    IterationLimit,
-    Runtime,
-}
-
-impl ChildRunError {
-    const fn diagnostic_class(self) -> ProviderDiagnosticClass {
-        match self {
-            Self::Authentication => ProviderDiagnosticClass::Authentication,
-            Self::Cancelled => ProviderDiagnosticClass::Cancelled,
-            Self::Context => ProviderDiagnosticClass::Context,
-            Self::Network => ProviderDiagnosticClass::Network,
-            Self::TimedOut => ProviderDiagnosticClass::Deadline,
-            Self::Provider => ProviderDiagnosticClass::Provider,
-            Self::Protocol => ProviderDiagnosticClass::Protocol,
-            Self::RateLimited => ProviderDiagnosticClass::RateLimited,
-            Self::Rejected => ProviderDiagnosticClass::Rejected,
-            Self::Server => ProviderDiagnosticClass::Server,
-            Self::Tool => ProviderDiagnosticClass::Tool,
-            Self::IterationLimit | Self::Runtime => ProviderDiagnosticClass::Runtime,
-        }
-    }
-
-    const fn tui_kind(self) -> Option<TuiSubagentErrorKind> {
-        match self {
-            Self::Cancelled | Self::TimedOut => None,
-            Self::Authentication => Some(TuiSubagentErrorKind::Authentication),
-            Self::Context => Some(TuiSubagentErrorKind::Context),
-            Self::Network => Some(TuiSubagentErrorKind::Network),
-            Self::Provider => Some(TuiSubagentErrorKind::Provider),
-            Self::Protocol => Some(TuiSubagentErrorKind::Protocol),
-            Self::RateLimited => Some(TuiSubagentErrorKind::RateLimited),
-            Self::Rejected => Some(TuiSubagentErrorKind::Rejected),
-            Self::Server => Some(TuiSubagentErrorKind::Server),
-            Self::Tool => Some(TuiSubagentErrorKind::Tool),
-            Self::IterationLimit | Self::Runtime => Some(TuiSubagentErrorKind::Runtime),
-        }
-    }
-
-    const fn task_runner_error(self) -> TaskRunnerError {
-        match self {
-            Self::Cancelled => TaskRunnerError::Cancelled,
-            Self::TimedOut => TaskRunnerError::TimedOut,
-            Self::Authentication
-            | Self::Context
-            | Self::Network
-            | Self::Provider
-            | Self::Protocol
-            | Self::RateLimited
-            | Self::Rejected
-            | Self::Server => TaskRunnerError::ProviderFailure,
-            Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
-            Self::IterationLimit => TaskRunnerError::IterationLimit,
-        }
-    }
-}
-
-fn child_run_error(error: HeadlessTurnError) -> ChildRunError {
-    match error {
-        HeadlessTurnError::Authentication => ChildRunError::Authentication,
-        HeadlessTurnError::Cancelled => ChildRunError::Cancelled,
-        HeadlessTurnError::ProviderContext => ChildRunError::Context,
-        HeadlessTurnError::ProviderNetwork => ChildRunError::Network,
-        HeadlessTurnError::TimedOut => ChildRunError::TimedOut,
-        HeadlessTurnError::Provider => ChildRunError::Provider,
-        HeadlessTurnError::ProviderProtocol => ChildRunError::Protocol,
-        HeadlessTurnError::ProviderRateLimited => ChildRunError::RateLimited,
-        HeadlessTurnError::ProviderRejected => ChildRunError::Rejected,
-        HeadlessTurnError::ProviderServer => ChildRunError::Server,
-        HeadlessTurnError::Tool => ChildRunError::Tool,
-        HeadlessTurnError::MaxIterations => ChildRunError::IterationLimit,
-        _ => ChildRunError::Runtime,
-    }
-}
-
-struct ProductionTaskExecutionContext<'a> {
-    bootstrap: &'a Bootstrap,
-    project_root: &'a Path,
-    dangerous_mode: bool,
-    cancellation: &'a HeadlessTurnCancellation,
-    progress: Option<&'a TurnProgressSink>,
-    diagnostic_reference: &'a str,
-    task_registry: &'a TaskExecutionRegistry,
-    execution_id: agens_tools::TaskExecutionId,
-}
-
-fn run_production_task(
-    request: TaskTurnRequest,
-    context: ProductionTaskExecutionContext<'_>,
-) -> Result<String, ChildRunError> {
-    let ProductionTaskExecutionContext {
-        bootstrap,
-        project_root,
-        dangerous_mode,
-        cancellation,
-        progress,
-        diagnostic_reference,
-        task_registry,
-        execution_id,
-    } = context;
-    let messages = vec![
-        Message {
-            role: Role::System,
-            parts: vec![MessagePart::Text(task_system_prompt(&request))],
-        },
-        Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text(request.description().to_owned())],
-        },
-    ];
-    let (provider_tools, tool_runtime) = production_child_tool_runtime(
-        project_root,
-        bootstrap.tool_limits(),
-        dangerous_mode,
-        task_registry.clone(),
-        execution_id,
-    )
-    .map_err(|_| ChildRunError::Runtime)?;
-    let diagnostic_store = diagnostic_store(bootstrap);
-    let diagnostic_sink = Arc::new(move |event: ProviderDiagnosticEvent| {
-        diagnostic_store.record(&event);
-    });
-    let provider_diagnostics = ProviderDiagnostics::new(
-        diagnostic_reference.to_owned(),
-        ProviderDiagnosticScope::Subagent,
-        diagnostic_sink,
-    )
-    .map_err(|_| ChildRunError::Runtime)?;
-
-    match bootstrap.provider_type() {
-        Some("openai-api") => {
-            let api_key = bootstrap
-                .openai_api_key
-                .clone()
-                .ok_or(ChildRunError::Runtime)?;
-            let provider =
-                OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
-                    api_key,
-                    bootstrap.provider_base_url(),
-                    request.model().to_owned(),
-                    messages,
-                    provider_tools,
-                    std::time::Duration::from_secs(120),
-                )
-                .map(|provider| {
-                    provider
-                        .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
-                        .with_request_config(request.request_config().clone())
-                        .with_diagnostics(provider_diagnostics)
-                })
-                .map_err(|_| ChildRunError::Runtime)?;
-            run_isolated_task_turn(
-                provider,
-                tool_runtime,
-                project_root,
-                dangerous_mode,
-                cancellation,
-                progress,
-                TaskMailboxContext {
-                    registry: task_registry.clone(),
-                    target: TaskMessageTarget::Execution(execution_id),
-                },
-            )
-        }
-        Some("openai-chatgpt") => {
-            let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
-                &bootstrap.paths.credentials,
-                bootstrap.provider_base_url(),
-                None,
-                request.model().to_owned(),
-                task_system_prompt(&request),
-                messages,
-                provider_tools,
-                std::time::Duration::from_secs(120),
-            )
-            .map(|provider| {
-                provider
-                    .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
-                    .with_request_config(request.request_config().clone())
-                    .with_diagnostics(provider_diagnostics)
-            })
-            .map_err(|_| ChildRunError::Runtime)?;
-            run_isolated_task_turn(
-                provider,
-                tool_runtime,
-                project_root,
-                dangerous_mode,
-                cancellation,
-                progress,
-                TaskMailboxContext {
-                    registry: task_registry.clone(),
-                    target: TaskMessageTarget::Execution(execution_id),
-                },
-            )
-        }
-        _ => Err(ChildRunError::Runtime),
-    }
-}
-
-fn task_system_prompt(request: &TaskTurnRequest) -> String {
-    request
-        .skills()
-        .iter()
-        .fold(request.system_prompt().to_owned(), |prompt, skill| {
-            format!("{prompt}\n\n## {}\n{}", skill.name(), skill.instructions())
-        })
-}
-
-struct TaskMailboxProvider<P> {
-    inner: P,
-    registry: Option<TaskExecutionRegistry>,
-    target: TaskMessageTarget,
-}
-
-impl<P> TaskMailboxProvider<P> {
-    fn new(inner: P, registry: Option<TaskExecutionRegistry>, target: TaskMessageTarget) -> Self {
-        Self {
-            inner,
-            registry,
-            target,
-        }
-    }
-}
-
-impl<P: TurnProvider + Send> TurnProvider for TaskMailboxProvider<P> {
-    fn queue_user_messages(&mut self, messages: Vec<Message>) -> Result<(), HeadlessTurnPortError> {
-        self.inner.queue_user_messages(messages)
-    }
-
-    async fn next_parts(
-        &mut self,
-        events: &[TurnEvent],
-        cancellation: &HeadlessTurnCancellation,
-    ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
-        let messages = self
-            .registry
-            .as_ref()
-            .map(|registry| registry.drain_messages(self.target))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|message| Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text(format!(
-                    "[coordination source={} untrusted=true]\n{}",
-                    task_message_source_label(message.source()),
-                    message.content(),
-                ))],
-            })
-            .collect::<Vec<_>>();
-        self.inner.queue_user_messages(messages)?;
-        self.inner.next_parts(events, cancellation).await
-    }
-}
-
-fn task_message_source_label(source: TaskMessageSource) -> String {
-    match source {
-        TaskMessageSource::Main => "main".into(),
-        TaskMessageSource::User => "user".into(),
-        TaskMessageSource::Execution(id) => format!("subagent:{}", id.value()),
-    }
-}
-
-struct TaskMailboxContext {
-    registry: TaskExecutionRegistry,
-    target: TaskMessageTarget,
-}
-
-fn run_isolated_task_turn<P>(
-    provider: P,
-    tool_runtime: SharedToolDispatcher,
-    project_root: &Path,
-    dangerous_mode: bool,
-    cancellation: &HeadlessTurnCancellation,
-    progress: Option<&TurnProgressSink>,
-    mailbox: TaskMailboxContext,
-) -> Result<String, ChildRunError>
-where
-    P: ProgressAwareProvider + Send,
-{
-    let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
-    let policy = PermissionPolicy::new(
-        PermissionMode::Edit,
-        [
-            "native::read",
-            "native::task_control",
-            "native::task_message",
-        ]
-        .into_iter()
-        .map(|tool| {
-            PermissionRule::global(
-                PermissionDecision::Allow,
-                PermissionPattern::Exact(tool.into()),
-                PermissionPattern::Any,
-            )
-        })
-        .collect(),
-    );
-    let grants = Arc::new(Mutex::new(Vec::new()));
-    let session = PermissionSession::new();
-    let pending = Arc::new(Mutex::new(BTreeMap::new()));
-    let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut repository = DiscardCompletedTurnRepository;
-    let project = project_root.display().to_string();
-    let mut gate = ProductionPermissionGate::new(
-        policy.clone(),
-        Arc::clone(&grants),
-        session,
-        project.clone(),
-        Arc::clone(&tool_runtime),
-        Arc::clone(&pending),
-        Arc::clone(&prompts),
-    )
-    .with_dangerous_override(dangerous_mode);
-    let mut resolver = ChildPermissionResolver;
-    let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
-    let snapshot = block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
-        &mut provider,
-        &mut gate,
-        &mut resolver,
-        &mut dispatcher,
-        &mut repository,
-        cancellation,
-        16,
-        progress,
-    ))
-    .map_err(|_| ChildRunError::Runtime)?
-    .map_err(child_run_error)?;
-
-    Ok(snapshot
-        .events()
-        .iter()
-        .filter_map(|event| match event {
-            TurnEvent::ProviderPart(MessagePart::Text(text)) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect())
-}
-
-struct ChildPermissionResolver;
-
-impl HeadlessPermissionResolver for ChildPermissionResolver {
-    fn resolve(
-        &mut self,
-        _: &HeadlessToolCall,
-        _: &HeadlessTurnCancellation,
-    ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
-    {
-        std::future::ready(Ok(PermissionDecision::Deny))
     }
 }
 
