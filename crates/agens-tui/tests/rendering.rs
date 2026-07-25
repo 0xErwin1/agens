@@ -3266,6 +3266,46 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
 }
 
 #[test]
+fn tree_affordance_advertises_background_only_while_a_branch_runs_in_foreground() {
+    let (width, height) = (100_u16, 30_u16);
+    let mut renderer =
+        RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize { width, height });
+    start_execution(&mut tui, 9, "explore");
+
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        "a foreground branch can still be backgrounded: {:?}",
+        rendered_text(&renderer)
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::Backgrounded { id: 9 },
+    });
+    renderer.render(tui.view()).unwrap();
+    let backgrounded = rendered_text(&renderer);
+    assert!(
+        backgrounded.contains("Tab focus · Enter inspect"),
+        "focus and inspect always apply: {backgrounded:?}"
+    );
+    assert!(
+        !backgrounded.contains("Ctrl+B"),
+        "an already backgrounded branch must not advertise Ctrl+B: {backgrounded:?}"
+    );
+
+    start_execution(&mut tui, 10, "plan");
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("Tab focus · Enter inspect · Ctrl+B background"),
+        "a new foreground branch brings the hint back: {:?}",
+        rendered_text(&renderer)
+    );
+}
+
+#[test]
 fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
     let (width, height) = (80_u16, 30_u16);
     let mut renderer =

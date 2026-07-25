@@ -1863,9 +1863,13 @@ fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16) -> Vec<Line<'sta
             tree_row_style(state, TranscriptId::Main),
         )));
     }
+    let backgroundable = branches
+        .iter()
+        .any(|execution| execution.state == TuiExecutionState::ForegroundRunning);
     lines.extend(tree_branch_lines(state, &branches, spare.saturating_sub(1)));
     lines.push(tree_affordance_line(
         state.executions.len().saturating_sub(branches.len()),
+        backgroundable,
     ));
     lines
 }
@@ -1937,11 +1941,16 @@ fn tree_branch_lines(
 
 /// Closes the tree with its navigation affordance, folding the branches that
 /// did not fit into the same row so the hidden count stays discoverable.
-fn tree_affordance_line(hidden_branches: usize) -> Line<'static> {
-    let text = if hidden_branches == 0 {
+///
+/// Backgrounding only applies to a branch still running in the foreground, so
+/// the hint is dropped when no shown branch can accept it.
+fn tree_affordance_line(hidden_branches: usize, backgroundable: bool) -> Line<'static> {
+    let text = if hidden_branches > 0 {
+        format!("+{hidden_branches} more · Tab to focus")
+    } else if backgroundable {
         "Tab focus · Enter inspect · Ctrl+B background".to_owned()
     } else {
-        format!("+{hidden_branches} more · Tab to focus")
+        "Tab focus · Enter inspect".to_owned()
     };
     Line::from(Span::styled(
         text,
