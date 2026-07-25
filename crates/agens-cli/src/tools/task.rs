@@ -14,6 +14,7 @@ use agens_tools::{
 };
 use agens_tui::TuiPermissionBridge;
 
+use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use crate::error::CliError;
 use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionPrompter, ProductionPermissionResolver,
@@ -22,9 +23,8 @@ use crate::permissions::{
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{
-    AuthorizedNativeTaskRuntime, Bootstrap, ProductionToolDispatcher, TaskModelValidator,
-    next_diagnostic_reference, record_subagent_terminal, task_model_catalog,
-    tui_task_agent_catalog,
+    Bootstrap, TaskModelValidator, next_diagnostic_reference, record_subagent_terminal,
+    task_model_catalog, tui_task_agent_catalog,
 };
 
 pub(crate) struct ProductionTuiTaskRuntime {

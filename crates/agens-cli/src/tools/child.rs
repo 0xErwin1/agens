@@ -21,10 +21,11 @@ use agens_tools::{
 };
 
 use crate::diagnostics::diagnostic_store;
+use crate::dispatch::ProductionToolDispatcher;
 use crate::headless::DiscardCompletedTurnRepository;
 use crate::permissions::{ProductionPermissionGate, SharedToolDispatcher};
 use crate::tools::runtime::production_child_tool_runtime;
-use crate::{Bootstrap, ProductionToolDispatcher, TuiSubagentErrorKind, block_on_headless_turn};
+use crate::{Bootstrap, TuiSubagentErrorKind, block_on_headless_turn};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ChildRunError {

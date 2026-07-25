@@ -14,9 +14,10 @@ use agens_tools::{
     RemoteToolMetadata, ToolDispatcher,
 };
 
+use crate::Bootstrap;
+use crate::dispatch::RegisteredMcpTool;
 use crate::error::CliError;
 use crate::permissions::SharedToolDispatcher;
-use crate::{Bootstrap, RegisteredMcpTool};
 
 pub(crate) struct ProductionMcpRuntime {
     pub(crate) registry: Arc<Mutex<McpRegistry>>,
