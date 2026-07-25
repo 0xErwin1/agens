@@ -2710,7 +2710,7 @@ impl TuiRuntimeRouter {
                 return Ok(TuiSubmissionOutcome::SafeDialog(
                     DialogView::selection(
                         "Select project file",
-                        Some("Choose one approved file | Esc cancel"),
+                        Some("Choose one approved file"),
                         entries,
                     )
                     .with_empty_message("No approved project files are available.")
@@ -3652,13 +3652,8 @@ fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
             )
         })
         .collect();
-    DialogView::read_only(
-        "MCP servers",
-        Some("Type to search | Enter details | r refresh | Esc close"),
-        entries,
-        "mcp",
-    )
-    .with_empty_message("No MCP servers configured.")
+    DialogView::read_only("MCP servers", None::<&str>, entries, "mcp")
+        .with_empty_message("No MCP servers configured.")
 }
 
 fn diagnostics_dialog(data_directory: &Path) -> DialogView {
@@ -3697,7 +3692,7 @@ fn diagnostics_dialog(data_directory: &Path) -> DialogView {
 
     DialogView::read_only(
         "Runtime diagnostics",
-        Some("Sanitized local events | Type to search | Enter details | Esc close"),
+        Some("Sanitized local events"),
         entries,
         "diagnostics",
     )

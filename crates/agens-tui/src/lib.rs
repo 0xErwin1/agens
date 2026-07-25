@@ -1558,6 +1558,9 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
     } else if dialog.interactive {
         labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("select")));
     }
+    if dialog.refresh_id.is_some() {
+        labels.push((Cow::Borrowed("r"), Cow::Borrowed("refresh")));
+    }
     labels.push((Cow::Borrowed("esc"), Cow::Borrowed("close")));
     labels
 }
@@ -3113,12 +3116,7 @@ where
                 .unwrap_or_default()
         };
         self.show_selection_dialog(
-            DialogView::selection(
-                "Subagents",
-                Some("Up/Down navigate | Enter inspect | Esc cancel"),
-                entries,
-            )
-            .with_selected(selected),
+            DialogView::selection("Subagents", None::<&str>, entries).with_selected(selected),
         );
     }
 

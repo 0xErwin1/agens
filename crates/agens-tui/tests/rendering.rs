@@ -2019,6 +2019,40 @@ fn read_only_dialog_renders_explicit_empty_and_clipped_selected_details() {
 }
 
 #[test]
+fn refreshable_dialog_footer_carries_the_refresh_shortcut() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.show_selection_dialog(DialogView::read_only(
+        "MCP servers",
+        None::<&str>,
+        vec![DialogEntry::read_only(
+            "remote  http  enabled/ready",
+            "remote",
+            "Source: global",
+        )],
+        "mcp",
+    ));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("refresh"), "derived footer: {text:?}");
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose a model",
+        None::<&str>,
+        vec![DialogEntry::action("gpt-4.1", "model:gpt-4.1")],
+    ));
+    renderer.render(tui.view()).unwrap();
+
+    assert!(
+        !rendered_text(&renderer).contains("refresh"),
+        "only refreshable dialogs advertise the shortcut: {:?}",
+        rendered_text(&renderer)
+    );
+}
+
+#[test]
 fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation() {
     let backend = TestBackend::new(34, 10);
     let terminal = Terminal::new(backend).unwrap();
