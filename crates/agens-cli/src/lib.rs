@@ -11,10 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
-    McpDefaultSettings, McpTransport, ResolvedSettings, SubagentSettings, ToolLimitSettings,
-    expand_environment, expand_environment_with_commands, extract_permission_rules, mcp_servers,
-    merge_toml_documents, parse_toml_document, resolve_paths, resolve_settings,
-    validate_toml_document,
+    ConfiguredValue, McpDefaultSettings, McpTransport, Origin, ResolvedSettings, SubagentSettings,
+    ToolLimitSettings, expand_environment, expand_environment_with_commands,
+    extract_permission_rules, mcp_servers, merge_toml_documents, parse_toml_document,
+    resolve_paths, resolve_settings, validate_toml_document,
 };
 use agens_core::{
     AgentDefinition, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
@@ -779,16 +779,46 @@ fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<St
         [command] if command == "doctor" => {
             let bootstrap = bootstrap(dependencies)?;
             Ok(format!(
-                "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n",
+                "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n\n{}",
                 bootstrap.paths.global_config.display(),
                 source_status(bootstrap.global_loaded),
                 bootstrap.paths.project_config.display(),
                 source_status(bootstrap.project_loaded),
-                bootstrap.model.as_deref().unwrap_or("-")
+                bootstrap.model.as_deref().unwrap_or("-"),
+                effective_settings_report(bootstrap.settings())
             ))
         }
         _ => Err(CliError::usage("config requires the doctor subcommand")),
     }
+}
+
+/// Renders every catalog setting with its effective value and the layer that
+/// supplied it. Reads only configuration; credentials are never consulted.
+fn effective_settings_report(settings: &ResolvedSettings) -> String {
+    let width = settings
+        .iter()
+        .map(|(path, _)| path.chars().count())
+        .max()
+        .unwrap_or_default();
+    let mut report = String::from("Settings:\n");
+
+    for (path, setting) in settings.iter() {
+        let value = match &setting.value {
+            ConfiguredValue::Bool(value) => value.to_string(),
+            ConfiguredValue::Integer(value) => value.to_string(),
+            ConfiguredValue::Text(value) => value.clone(),
+            ConfiguredValue::Absent => "-".to_owned(),
+        };
+        let origin = match setting.origin {
+            Origin::Default => "default",
+            Origin::Global => "global",
+            Origin::Project => "project",
+            Origin::Environment => "environment",
+        };
+        report.push_str(&format!("  {path:<width$}  {value:<12}  {origin}\n"));
+    }
+
+    report
 }
 
 fn run_auth(
@@ -15558,6 +15588,40 @@ mod tests {
             std::time::Duration::from_millis(900)
         );
         assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn config_doctor_reports_effective_values_with_their_origin() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-doctor-report-{}", std::process::id()));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([
+                (
+                    config_home.join("config.toml"),
+                    "[tools]\nmax_search_depth = 8\n".to_owned(),
+                ),
+                (
+                    project_root.join(".agens/config.toml"),
+                    "[tools]\nmax_search_results = 25\n".to_owned(),
+                ),
+            ]),
+        );
+
+        let report = run_config(&["doctor".to_owned()], &dependencies).expect("doctor should run");
+
+        assert!(report.contains("Status:  valid\n"));
+        assert!(report.contains("tools.max_search_depth      8             global\n"));
+        assert!(report.contains("tools.max_search_results    25            project\n"));
+        assert!(report.contains("tools.max_list_entries      1000          default\n"));
+        assert!(report.contains("agent.default_agent         -             default\n"));
     }
 
     #[test]
