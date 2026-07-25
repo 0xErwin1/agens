@@ -155,12 +155,14 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                         })
                         .collect()
                 });
-            let timeout_ms = server
-                .get("timeout_ms")
-                .and_then(toml::Value::as_integer)
-                .and_then(|timeout| u64::try_from(timeout).ok())
-                .filter(|timeout| *timeout > 0)
-                .unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+            let timeout_ms = match server.get("timeout_ms") {
+                None => DEFAULT_MCP_TIMEOUT_MS,
+                Some(value) => value
+                    .as_integer()
+                    .and_then(|timeout| u64::try_from(timeout).ok())
+                    .filter(|timeout| *timeout > 0)
+                    .ok_or_else(|| invalid_field(&path, "timeout_ms"))?,
+            };
             let url = server
                 .get("url")
                 .and_then(toml::Value::as_str)
@@ -298,6 +300,252 @@ pub fn parse_toml_document(input: &str) -> Result<toml::Table, toml::de::Error> 
     input.parse()
 }
 
+/// Accepted shape of a single configuration setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingKind {
+    Bool,
+    Integer { minimum: i64, maximum: i64 },
+    Text { max_chars: usize },
+    Choice(&'static [&'static str]),
+}
+
+impl SettingKind {
+    fn accepts(self, value: &toml::Value) -> bool {
+        match self {
+            Self::Bool => value.is_bool(),
+            Self::Integer { minimum, maximum } => value
+                .as_integer()
+                .is_some_and(|integer| (minimum..=maximum).contains(&integer)),
+            Self::Text { max_chars } => value
+                .as_str()
+                .is_some_and(|text| text.chars().count() <= max_chars),
+            Self::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
+        }
+    }
+}
+
+/// Value a setting takes when no configuration file provides one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingValue {
+    Bool(bool),
+    Integer(i64),
+    Text(&'static str),
+    Absent,
+}
+
+pub struct SettingSpec {
+    pub path: &'static str,
+    pub kind: SettingKind,
+    pub default: SettingValue,
+    pub doc: &'static str,
+}
+
+impl SettingSpec {
+    pub fn table(&self) -> &'static str {
+        self.split().0
+    }
+
+    pub fn key(&self) -> &'static str {
+        self.split().1
+    }
+
+    fn split(&self) -> (&'static str, &'static str) {
+        self.path
+            .split_once('.')
+            .expect("every setting path is qualified by its table")
+    }
+}
+
+const REASONING_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+const UNBOUNDED_TEXT: SettingKind = SettingKind::Text {
+    max_chars: usize::MAX,
+};
+
+/// Single source of truth for the fixed configuration surface. The validator,
+/// the effective-configuration report, and the generated starter file all read
+/// this catalog, so a key exists in exactly one place.
+///
+/// Entries are grouped by table and stay contiguous: consumers that render the
+/// catalog as TOML rely on that ordering. `[mcp.<name>]` and `[permissions]`
+/// are deliberately absent — they are open namespaces, not fixed keys.
+pub const SETTINGS: &[SettingSpec] = &[
+    SettingSpec {
+        path: "options.debug",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(false),
+        doc: "Emit diagnostic records for provider and tool activity.",
+    },
+    SettingSpec {
+        path: "options.data_dir",
+        kind: UNBOUNDED_TEXT,
+        default: SettingValue::Absent,
+        doc: "Directory holding sessions and permission grants.",
+    },
+    SettingSpec {
+        path: "provider.type",
+        kind: UNBOUNDED_TEXT,
+        default: SettingValue::Absent,
+        doc: "Provider to use; resolved from credentials when absent.",
+    },
+    SettingSpec {
+        path: "provider.model",
+        kind: UNBOUNDED_TEXT,
+        default: SettingValue::Absent,
+        doc: "Model identifier requested from the provider.",
+    },
+    SettingSpec {
+        path: "provider.base_url",
+        kind: UNBOUNDED_TEXT,
+        default: SettingValue::Absent,
+        doc: "Override for the provider endpoint.",
+    },
+    SettingSpec {
+        path: "agent.system_prompt",
+        kind: UNBOUNDED_TEXT,
+        default: SettingValue::Absent,
+        doc: "Replacement for the assembled system prompt.",
+    },
+    SettingSpec {
+        path: "agent.max_iterations",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 1_000,
+        },
+        default: SettingValue::Absent,
+        doc: "Maximum provider round trips in a single turn.",
+    },
+    SettingSpec {
+        path: "agent.parallel_tool_calls",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(true),
+        doc: "Advertise parallel tool calls to the provider.",
+    },
+    SettingSpec {
+        path: "agent.default_agent",
+        kind: SettingKind::Text { max_chars: 64 },
+        default: SettingValue::Absent,
+        doc: "Primary agent a new session starts with.",
+    },
+    SettingSpec {
+        path: "agent.reasoning_effort",
+        kind: SettingKind::Choice(REASONING_EFFORTS),
+        default: SettingValue::Absent,
+        doc: "Default reasoning effort requested from the model.",
+    },
+    SettingSpec {
+        path: "ui.collapse_thinking",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(false),
+        doc: "Collapse reasoning blocks in the transcript.",
+    },
+    SettingSpec {
+        path: "ui.truncate_tool_output",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(false),
+        doc: "Bound tool output before it reaches the transcript.",
+    },
+    SettingSpec {
+        path: "tools.max_list_entries",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 100_000,
+        },
+        default: SettingValue::Integer(1_000),
+        doc: "Maximum entries returned by the list tool.",
+    },
+    SettingSpec {
+        path: "tools.max_search_entries",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 1_000_000,
+        },
+        default: SettingValue::Integer(10_000),
+        doc: "Maximum filesystem entries a search may visit.",
+    },
+    SettingSpec {
+        path: "tools.max_search_results",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 10_000,
+        },
+        default: SettingValue::Integer(100),
+        doc: "Maximum matches a search may return.",
+    },
+    SettingSpec {
+        path: "tools.max_search_depth",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 256,
+        },
+        default: SettingValue::Integer(32),
+        doc: "Maximum directory depth a search may descend.",
+    },
+    SettingSpec {
+        path: "tools.operation_timeout_ms",
+        kind: SettingKind::Integer {
+            minimum: 100,
+            maximum: 600_000,
+        },
+        default: SettingValue::Integer(5_000),
+        doc: "Timeout for a single filesystem tool operation.",
+    },
+    SettingSpec {
+        path: "tools.bash_timeout_ms",
+        kind: SettingKind::Integer {
+            minimum: 1_000,
+            maximum: 3_600_000,
+        },
+        default: SettingValue::Integer(120_000),
+        doc: "Timeout for a bash tool invocation.",
+    },
+    SettingSpec {
+        path: "subagents.max_iterations",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 64,
+        },
+        default: SettingValue::Integer(16),
+        doc: "Maximum provider round trips inside a subagent.",
+    },
+    SettingSpec {
+        path: "subagents.max_concurrency",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 16,
+        },
+        default: SettingValue::Integer(4),
+        doc: "Maximum subagents running at once.",
+    },
+    SettingSpec {
+        path: "subagents.max_output_chars",
+        kind: SettingKind::Integer {
+            minimum: 1_024,
+            maximum: 1_048_576,
+        },
+        default: SettingValue::Integer(65_536),
+        doc: "Maximum characters a subagent may return.",
+    },
+    SettingSpec {
+        path: "mcp_defaults.timeout_ms",
+        kind: SettingKind::Integer {
+            minimum: 1,
+            maximum: 600_000,
+        },
+        default: SettingValue::Integer(DEFAULT_MCP_TIMEOUT_MS as i64),
+        doc: "Request timeout for servers that omit their own.",
+    },
+    SettingSpec {
+        path: "mcp_defaults.max_retries",
+        kind: SettingKind::Integer {
+            minimum: 0,
+            maximum: 8,
+        },
+        default: SettingValue::Integer(0),
+        doc: "Retry budget for servers that omit their own.",
+    },
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigValidationError {
     field: String,
@@ -312,50 +560,14 @@ impl fmt::Display for ConfigValidationError {
 impl std::error::Error for ConfigValidationError {}
 
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
-    reject_unknown_fields(
-        document,
-        "",
-        &["options", "provider", "agent", "ui", "mcp", "permissions"],
-    )?;
+    let mut root_tables = catalog_tables();
+    root_tables.extend_from_slice(&["mcp", "permissions"]);
+    reject_unknown_fields(document, "", &root_tables)?;
 
-    validate_named_table(
-        document,
-        "options",
-        &["debug", "data_dir"],
-        |table, path| {
-            validate_optional(table, "debug", path, toml::Value::is_bool)?;
-            validate_optional(table, "data_dir", path, toml::Value::is_str)
-        },
-    )?;
-    validate_named_table(
-        document,
-        "provider",
-        &["type", "model", "base_url"],
-        |table, path| {
-            validate_optional(table, "type", path, toml::Value::is_str)?;
-            validate_optional(table, "model", path, toml::Value::is_str)?;
-            validate_optional(table, "base_url", path, toml::Value::is_str)
-        },
-    )?;
-    validate_named_table(
-        document,
-        "agent",
-        &["system_prompt", "max_iterations", "parallel_tool_calls"],
-        |table, path| {
-            validate_optional(table, "system_prompt", path, toml::Value::is_str)?;
-            validate_optional(table, "max_iterations", path, toml::Value::is_integer)?;
-            validate_optional(table, "parallel_tool_calls", path, toml::Value::is_bool)
-        },
-    )?;
-    validate_named_table(
-        document,
-        "ui",
-        &["collapse_thinking", "truncate_tool_output"],
-        |table, path| {
-            validate_optional(table, "collapse_thinking", path, toml::Value::is_bool)?;
-            validate_optional(table, "truncate_tool_output", path, toml::Value::is_bool)
-        },
-    )?;
+    for table in catalog_tables() {
+        validate_catalog_table(document, table)?;
+    }
+
     validate_named_table(
         document,
         "permissions",
@@ -366,6 +578,45 @@ pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValida
         },
     )?;
     validate_mcp(document)
+}
+
+fn catalog_tables() -> Vec<&'static str> {
+    let mut tables: Vec<&'static str> = Vec::new();
+    for spec in SETTINGS {
+        if !tables.contains(&spec.table()) {
+            tables.push(spec.table());
+        }
+    }
+
+    tables
+}
+
+fn catalog_entries(table: &str) -> impl Iterator<Item = &'static SettingSpec> + use<'_> {
+    SETTINGS.iter().filter(move |spec| spec.table() == table)
+}
+
+fn validate_catalog_table(
+    document: &toml::Table,
+    name: &'static str,
+) -> Result<(), ConfigValidationError> {
+    let Some(value) = document.get(name) else {
+        return Ok(());
+    };
+    let table = value.as_table().ok_or_else(|| invalid_field("", name))?;
+
+    let allowed: Vec<&str> = catalog_entries(name).map(SettingSpec::key).collect();
+    reject_unknown_fields(table, name, &allowed)?;
+
+    for spec in catalog_entries(name) {
+        let Some(value) = table.get(spec.key()) else {
+            continue;
+        };
+        if !spec.kind.accepts(value) {
+            return Err(invalid_field(name, spec.key()));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn merge_toml_documents(mut global: toml::Table, project: toml::Table) -> toml::Table {
@@ -887,10 +1138,14 @@ fn validate_mcp(document: &toml::Table) -> Result<(), ConfigValidationError> {
         validate_optional(server, "url", &path, toml::Value::is_str)?;
         validate_optional(server, "headers", &path, is_string_table)?;
         validate_optional(server, "max_retries", &path, toml::Value::is_integer)?;
-        validate_optional(server, "timeout_ms", &path, toml::Value::is_integer)?;
+        validate_optional(server, "timeout_ms", &path, is_positive_integer)?;
     }
 
     Ok(())
+}
+
+fn is_positive_integer(value: &toml::Value) -> bool {
+    value.as_integer().is_some_and(|integer| integer > 0)
 }
 
 fn is_string_array(value: &toml::Value) -> bool {
