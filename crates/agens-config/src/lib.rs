@@ -784,6 +784,44 @@ fn unsigned_setting(resolved: &ResolvedSettings, path: &'static str) -> u64 {
     u64::try_from(integer_setting(resolved, path)).unwrap_or_default()
 }
 
+/// Renders a starter configuration from the catalog: every fixed key, its one
+/// line of documentation, and its default, all commented out.
+///
+/// Rendering from the catalog is what keeps the starter file and the validator
+/// from drifting apart. A key with no default is shown without a value, since
+/// there is no default to suggest.
+pub fn starter_document() -> String {
+    let mut document = String::from(
+        "# Agens configuration.\n# Every key is optional; the value shown is the default.\n",
+    );
+    let mut current = "";
+
+    for spec in SETTINGS {
+        if spec.table() != current {
+            document.push_str(&format!("\n[{}]\n", spec.table()));
+            current = spec.table();
+        }
+
+        document.push_str(&format!("# {}\n", spec.doc));
+        match spec.default {
+            SettingValue::Bool(value) => {
+                document.push_str(&format!("# {} = {value}\n", spec.key()));
+            }
+            SettingValue::Integer(value) => {
+                document.push_str(&format!("# {} = {value}\n", spec.key()));
+            }
+            SettingValue::Text(value) => {
+                document.push_str(&format!("# {} = \"{value}\"\n", spec.key()));
+            }
+            SettingValue::Absent => {
+                document.push_str(&format!("# {} =\n", spec.key()));
+            }
+        }
+    }
+
+    document
+}
+
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
     let mut root_tables = catalog_tables();
     root_tables.extend_from_slice(&["mcp", "permissions"]);

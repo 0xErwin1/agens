@@ -105,6 +105,10 @@ deny = ["bash(rm *)"]
 
 The optional `[options].data_dir` changes the runtime-state directory. Environment expressions are supported by the configuration parser. MCP server definitions are global-only; project configuration cannot define them.
 
+Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` bounds the task tool (`max_iterations`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own, and `[agent]` also accepts `default_agent` and `reasoning_effort`. Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
+
+Every key is validated on load: an unknown key, a wrong type, or a value outside its documented range fails startup and names the offending field. The authoritative list is the settings catalog in `crates/agens-config`; `agens config init` renders it as a commented starter file at `<project-root>/.agens/config.toml` and refuses to overwrite an existing one.
+
 Inspect resolved paths and validation status with:
 
 ```sh

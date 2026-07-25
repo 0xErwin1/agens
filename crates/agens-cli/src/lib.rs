@@ -14,7 +14,7 @@ use agens_config::{
     ConfiguredValue, McpDefaultSettings, McpTransport, Origin, ResolvedSettings, SubagentSettings,
     ToolLimitSettings, expand_environment, expand_environment_with_commands,
     extract_permission_rules, mcp_servers, merge_toml_documents, parse_toml_document,
-    resolve_paths, resolve_settings, validate_toml_document,
+    resolve_paths, resolve_settings, starter_document, validate_toml_document,
 };
 use agens_core::{
     AgentDefinition, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
@@ -362,6 +362,8 @@ type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
 type Environment = Box<dyn Fn() -> BTreeMap<String, String>>;
 type ConfigReader = Box<dyn Fn(&Path) -> Result<Option<String>, CliError>>;
+/// Creates a configuration file, failing when one already exists.
+type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
 type HeadlessChat = Box<
     dyn Fn(HeadlessChatRequest, &Bootstrap, &HeadlessTurnCancellation) -> Result<String, CliError>,
 >;
@@ -373,6 +375,7 @@ pub struct CliDependencies {
     home_directory: HomeDirectory,
     environment: Environment,
     read_file: ConfigReader,
+    create_file: ConfigCreator,
     headless_chat: HeadlessChat,
     tui_launcher: TuiLauncher,
     auth_login: AuthLogin,
@@ -396,6 +399,7 @@ impl CliDependencies {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(_) => Err(CliError::configuration("configuration file is unavailable")),
             }),
+            create_file: Box::new(create_configuration_file),
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(run_production_tui),
             auth_login: Box::new(run_production_auth_login),
@@ -413,10 +417,19 @@ impl CliDependencies {
             home_directory: Box::new(move || home_directory.clone()),
             environment: Box::new(move || environment.clone()),
             read_file: Box::new(move |path| Ok(files.get(path).cloned())),
+            create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             auth_login: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
         }
+    }
+
+    pub fn with_create_file(
+        mut self,
+        handler: impl Fn(&Path, &str) -> Result<(), CliError> + 'static,
+    ) -> Self {
+        self.create_file = Box::new(handler);
+        self
     }
 
     pub fn with_headless_chat(
@@ -771,11 +784,12 @@ fn execute_command(
 
 fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<String, CliError> {
     if arguments.iter().any(|argument| is_help(argument)) {
-        return Ok("Usage: agens config doctor\n".to_owned());
+        return Ok("Usage: agens config <doctor|init>\n".to_owned());
     }
 
     match arguments {
-        [command] if is_help(command) => Ok("Usage: agens config doctor\n".to_owned()),
+        [command] if is_help(command) => Ok("Usage: agens config <doctor|init>\n".to_owned()),
+        [command] if command == "init" => run_config_init(dependencies),
         [command] if command == "doctor" => {
             let bootstrap = bootstrap(dependencies)?;
             Ok(format!(
@@ -788,8 +802,47 @@ fn run_config(arguments: &[String], dependencies: &CliDependencies) -> Result<St
                 effective_settings_report(bootstrap.settings())
             ))
         }
-        _ => Err(CliError::usage("config requires the doctor subcommand")),
+        _ => Err(CliError::usage(
+            "config requires the doctor or init subcommand",
+        )),
     }
+}
+
+/// Writes a documented starter configuration for the current project. Refuses
+/// to touch an existing file: the command creates configuration, it never
+/// rewrites what a user already wrote.
+fn run_config_init(dependencies: &CliDependencies) -> Result<String, CliError> {
+    let current_directory = (dependencies.current_directory)()?;
+    let home_directory = (dependencies.home_directory)();
+    let environment = (dependencies.environment)();
+    let project_root = discover_project_root(&current_directory).unwrap_or(current_directory);
+    let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
+
+    if (dependencies.read_file)(&paths.project_config)?.is_some() {
+        return Err(CliError::configuration(format!(
+            "configuration already exists at {}",
+            paths.project_config.display()
+        )));
+    }
+
+    (dependencies.create_file)(&paths.project_config, &starter_document())?;
+
+    Ok(format!("Wrote {}\n", paths.project_config.display()))
+}
+
+fn create_configuration_file(path: &Path, contents: &str) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| CliError::configuration("configuration directory is unavailable"))?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| CliError::configuration("configuration file cannot be created"))?;
+    file.write_all(contents.as_bytes())
+        .map_err(|_| CliError::configuration("configuration file cannot be written"))
 }
 
 /// Renders every catalog setting with its effective value and the layer that
@@ -15588,6 +15641,60 @@ mod tests {
             std::time::Duration::from_millis(900)
         );
         assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn config_init_writes_a_starter_file_the_validator_accepts() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-config-init-{}", std::process::id()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&written);
+        let dependencies = CliDependencies::for_test(
+            temporary.join("project"),
+            Some(temporary.join("home")),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .with_create_file(move |path, contents| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), contents.to_owned()));
+            Ok(())
+        });
+
+        let report = run_config(&["init".to_owned()], &dependencies).expect("init should run");
+
+        let written = written.lock().unwrap();
+        let (path, contents) = written.first().expect("init should write exactly one file");
+        assert_eq!(written.len(), 1);
+        assert!(path.ends_with(".agens/config.toml"));
+        assert!(report.contains(".agens/config.toml"));
+        validate_toml_document(&parse_toml_document(contents).expect("starter file must parse"))
+            .expect("starter file must validate");
+    }
+
+    #[test]
+    fn config_init_refuses_to_replace_an_existing_configuration() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-config-init-existing-{}", std::process::id()));
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::new(),
+            BTreeMap::from([(
+                project_root.join(".agens/config.toml"),
+                "[tools]\nmax_search_depth = 4\n".to_owned(),
+            )]),
+        )
+        .with_create_file(|_, _| panic!("init must not write over an existing configuration"));
+
+        let error = run_config(&["init".to_owned()], &dependencies)
+            .expect_err("init must refuse an existing file");
+
+        assert_eq!(error.status, ExitStatus::Configuration);
+        assert!(error.message.contains("already exists"));
     }
 
     #[test]
