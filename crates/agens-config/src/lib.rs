@@ -559,6 +559,231 @@ impl fmt::Display for ConfigValidationError {
 
 impl std::error::Error for ConfigValidationError {}
 
+/// Layer a resolved setting came from. Ordered by precedence, lowest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Default,
+    Global,
+    Project,
+    Environment,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfiguredValue {
+    Bool(bool),
+    Integer(i64),
+    Text(String),
+    Absent,
+}
+
+impl ConfiguredValue {
+    fn read(value: &toml::Value, kind: SettingKind) -> Option<Self> {
+        match kind {
+            SettingKind::Bool => value.as_bool().map(Self::Bool),
+            SettingKind::Integer { .. } => value.as_integer().map(Self::Integer),
+            SettingKind::Text { .. } | SettingKind::Choice(_) => {
+                value.as_str().map(|text| Self::Text(text.to_owned()))
+            }
+        }
+    }
+}
+
+impl From<SettingValue> for ConfiguredValue {
+    fn from(value: SettingValue) -> Self {
+        match value {
+            SettingValue::Bool(value) => Self::Bool(value),
+            SettingValue::Integer(value) => Self::Integer(value),
+            SettingValue::Text(value) => Self::Text(value.to_owned()),
+            SettingValue::Absent => Self::Absent,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedSetting {
+    pub value: ConfiguredValue,
+    pub origin: Origin,
+}
+
+/// Effective value and origin of every catalog setting, in catalog order.
+#[derive(Clone, Debug, Default)]
+pub struct ResolvedSettings {
+    entries: Vec<(&'static str, ResolvedSetting)>,
+}
+
+impl ResolvedSettings {
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &ResolvedSetting)> {
+        self.entries.iter().map(|(path, setting)| (*path, setting))
+    }
+
+    pub fn get(&self, path: &str) -> Option<&ResolvedSetting> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| *candidate == path)
+            .map(|(_, setting)| setting)
+    }
+
+    pub fn value(&self, path: &str) -> Option<&ConfiguredValue> {
+        self.get(path).map(|setting| &setting.value)
+    }
+
+    pub fn origin(&self, path: &str) -> Origin {
+        self.get(path)
+            .map_or(Origin::Default, |setting| setting.origin)
+    }
+
+    pub fn boolean(&self, path: &str) -> Option<bool> {
+        match self.value(path) {
+            Some(ConfiguredValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn integer(&self, path: &str) -> Option<i64> {
+        match self.value(path) {
+            Some(ConfiguredValue::Integer(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn text(&self, path: &str) -> Option<&str> {
+        match self.value(path) {
+            Some(ConfiguredValue::Text(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves every catalog setting against the configuration layers.
+///
+/// `expanded` is the merged document after `$VAR` substitution; a value the
+/// substitution changed is attributed to the environment, since that is where
+/// the effective value actually came from.
+pub fn resolve_settings(
+    global: &toml::Table,
+    project: &toml::Table,
+    expanded: &toml::Table,
+) -> ResolvedSettings {
+    let mut entries = Vec::with_capacity(SETTINGS.len());
+
+    for spec in SETTINGS {
+        let documented = lookup_setting(project, spec)
+            .map(|value| (Origin::Project, value))
+            .or_else(|| lookup_setting(global, spec).map(|value| (Origin::Global, value)));
+        let effective = lookup_setting(expanded, spec);
+
+        let setting = match (documented, effective) {
+            (Some((origin, raw)), Some(effective)) => ResolvedSetting {
+                origin: if raw == effective {
+                    origin
+                } else {
+                    Origin::Environment
+                },
+                value: effective,
+            },
+            (Some((origin, raw)), None) => ResolvedSetting { value: raw, origin },
+            (None, _) => ResolvedSetting {
+                value: spec.default.into(),
+                origin: Origin::Default,
+            },
+        };
+
+        entries.push((spec.path, setting));
+    }
+
+    ResolvedSettings { entries }
+}
+
+fn lookup_setting(document: &toml::Table, spec: &SettingSpec) -> Option<ConfiguredValue> {
+    let value = document
+        .get(spec.table())
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(spec.key()))?;
+
+    ConfiguredValue::read(value, spec.kind)
+}
+
+/// Native tool bounds as configured. Converted to runtime types at the tool
+/// boundary; this crate owns configuration shapes, not runtime shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolLimitSettings {
+    pub max_list_entries: usize,
+    pub max_search_entries: usize,
+    pub max_search_results: usize,
+    pub max_search_depth: usize,
+    pub operation_timeout_ms: u64,
+    pub bash_timeout_ms: u64,
+}
+
+impl From<&ResolvedSettings> for ToolLimitSettings {
+    fn from(resolved: &ResolvedSettings) -> Self {
+        Self {
+            max_list_entries: size_setting(resolved, "tools.max_list_entries"),
+            max_search_entries: size_setting(resolved, "tools.max_search_entries"),
+            max_search_results: size_setting(resolved, "tools.max_search_results"),
+            max_search_depth: size_setting(resolved, "tools.max_search_depth"),
+            operation_timeout_ms: unsigned_setting(resolved, "tools.operation_timeout_ms"),
+            bash_timeout_ms: unsigned_setting(resolved, "tools.bash_timeout_ms"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubagentSettings {
+    pub max_iterations: usize,
+    pub max_concurrency: usize,
+    pub max_output_chars: usize,
+}
+
+impl From<&ResolvedSettings> for SubagentSettings {
+    fn from(resolved: &ResolvedSettings) -> Self {
+        Self {
+            max_iterations: size_setting(resolved, "subagents.max_iterations"),
+            max_concurrency: size_setting(resolved, "subagents.max_concurrency"),
+            max_output_chars: size_setting(resolved, "subagents.max_output_chars"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpDefaultSettings {
+    pub timeout_ms: u64,
+    pub max_retries: u32,
+}
+
+impl From<&ResolvedSettings> for McpDefaultSettings {
+    fn from(resolved: &ResolvedSettings) -> Self {
+        Self {
+            timeout_ms: unsigned_setting(resolved, "mcp_defaults.timeout_ms"),
+            max_retries: u32::try_from(integer_setting(resolved, "mcp_defaults.max_retries"))
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Falls back to the catalog default when a value is absent or out of range,
+/// so a caller that skipped validation still gets a usable configuration.
+fn integer_setting(resolved: &ResolvedSettings, path: &'static str) -> i64 {
+    let fallback = SETTINGS
+        .iter()
+        .find(|spec| spec.path == path)
+        .and_then(|spec| match spec.default {
+            SettingValue::Integer(value) => Some(value),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    resolved.integer(path).unwrap_or(fallback)
+}
+
+fn size_setting(resolved: &ResolvedSettings, path: &'static str) -> usize {
+    usize::try_from(integer_setting(resolved, path)).unwrap_or_default()
+}
+
+fn unsigned_setting(resolved: &ResolvedSettings, path: &'static str) -> u64 {
+    u64::try_from(integer_setting(resolved, path)).unwrap_or_default()
+}
+
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
     let mut root_tables = catalog_tables();
     root_tables.extend_from_slice(&["mcp", "permissions"]);

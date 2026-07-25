@@ -11,8 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope,
-    McpTransport, expand_environment, expand_environment_with_commands, extract_permission_rules,
-    mcp_servers, merge_toml_documents, parse_toml_document, resolve_paths, validate_toml_document,
+    McpDefaultSettings, McpTransport, ResolvedSettings, SubagentSettings, ToolLimitSettings,
+    expand_environment, expand_environment_with_commands, extract_permission_rules, mcp_servers,
+    merge_toml_documents, parse_toml_document, resolve_paths, resolve_settings,
+    validate_toml_document,
 };
 use agens_core::{
     AgentDefinition, AttemptKey, BeginSessionAttemptError, CompletedSessionTurn,
@@ -5512,6 +5514,14 @@ pub struct Bootstrap {
     max_iterations: Option<usize>,
     parallel_tool_calls: bool,
     collapse_thinking: bool,
+    debug: bool,
+    truncate_tool_output: bool,
+    default_agent: Option<String>,
+    reasoning_effort: Option<String>,
+    tool_limits: ToolLimitSettings,
+    subagent_limits: SubagentSettings,
+    mcp_defaults: McpDefaultSettings,
+    settings: ResolvedSettings,
     openai_api_key: Option<String>,
     data_directory: PathBuf,
     project_root: Option<PathBuf>,
@@ -5538,6 +5548,14 @@ impl Clone for Bootstrap {
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
             collapse_thinking: self.collapse_thinking,
+            debug: self.debug,
+            truncate_tool_output: self.truncate_tool_output,
+            default_agent: self.default_agent.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            tool_limits: self.tool_limits,
+            subagent_limits: self.subagent_limits,
+            mcp_defaults: self.mcp_defaults,
+            settings: self.settings.clone(),
             openai_api_key: self.openai_api_key.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
@@ -5551,6 +5569,38 @@ impl Clone for Bootstrap {
 impl Bootstrap {
     pub fn paths(&self) -> &ConfigPaths {
         &self.paths
+    }
+
+    pub fn settings(&self) -> &ResolvedSettings {
+        &self.settings
+    }
+
+    pub fn tool_limits(&self) -> ToolLimitSettings {
+        self.tool_limits
+    }
+
+    pub fn subagent_limits(&self) -> SubagentSettings {
+        self.subagent_limits
+    }
+
+    pub fn mcp_defaults(&self) -> McpDefaultSettings {
+        self.mcp_defaults
+    }
+
+    pub fn debug(&self) -> bool {
+        self.debug
+    }
+
+    pub fn truncate_tool_output(&self) -> bool {
+        self.truncate_tool_output
+    }
+
+    pub fn default_agent(&self) -> Option<&str> {
+        self.default_agent.as_deref()
+    }
+
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
     }
 
     pub fn model(&self) -> Option<&str> {
@@ -5615,6 +5665,12 @@ impl Bootstrap {
     }
 }
 
+/// Applies the configuration precedence contract for a turn's iteration cap:
+/// a command-line value always wins over the configured one.
+fn effective_max_iterations(flag: Option<usize>, configured: Option<usize>) -> Option<usize> {
+    flag.or(configured)
+}
+
 pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
     let current_directory = (dependencies.current_directory)()?;
     let home_directory = (dependencies.home_directory)();
@@ -5631,14 +5687,17 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     }
     let permission_rules = extract_permission_rules(&global, &project)
         .map_err(|_| CliError::configuration("permission configuration is invalid"))?;
+    let documented_global = global.clone();
+    let documented_project = project.clone();
     let global = expand_global_mcp(global, &environment)?;
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
+    let settings = resolve_settings(&documented_global, &documented_project, &document);
 
     let mcp_servers = mcp_servers(&document)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
     let credentials = (dependencies.read_file)(&paths.credentials)?;
-    let configured_provider = string_value(&document, &["provider", "type"]);
+    let configured_provider = settings.text("provider.type").map(ToOwned::to_owned);
     let provider_source = match configured_provider.as_deref() {
         None => ProviderSource::Auto,
         Some("openai-chatgpt") => ProviderSource::ExplicitChatGpt,
@@ -5647,30 +5706,29 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
     let provider_type =
         resolve_provider_type(configured_provider, credentials.as_deref(), &environment);
     Ok(Bootstrap {
-        model: string_value(&document, &["provider", "model"]),
+        model: settings.text("provider.model").map(ToOwned::to_owned),
         provider_type,
         provider_source,
-        provider_base_url: string_value(&document, &["provider", "base_url"]),
-        system_prompt: string_value(&document, &["agent", "system_prompt"]),
-        max_iterations: document
-            .get("agent")
-            .and_then(toml::Value::as_table)
-            .and_then(|agent| agent.get("max_iterations"))
-            .and_then(toml::Value::as_integer)
+        provider_base_url: settings.text("provider.base_url").map(ToOwned::to_owned),
+        system_prompt: settings.text("agent.system_prompt").map(ToOwned::to_owned),
+        max_iterations: settings
+            .integer("agent.max_iterations")
             .and_then(|value| usize::try_from(value).ok())
             .filter(|value| *value > 0),
-        parallel_tool_calls: document
-            .get("agent")
-            .and_then(toml::Value::as_table)
-            .and_then(|agent| agent.get("parallel_tool_calls"))
-            .and_then(toml::Value::as_bool)
+        parallel_tool_calls: settings
+            .boolean("agent.parallel_tool_calls")
             .unwrap_or(true),
-        collapse_thinking: document
-            .get("ui")
-            .and_then(toml::Value::as_table)
-            .and_then(|ui| ui.get("collapse_thinking"))
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false),
+        collapse_thinking: settings.boolean("ui.collapse_thinking").unwrap_or(false),
+        debug: settings.boolean("options.debug").unwrap_or(false),
+        truncate_tool_output: settings.boolean("ui.truncate_tool_output").unwrap_or(false),
+        default_agent: settings.text("agent.default_agent").map(ToOwned::to_owned),
+        reasoning_effort: settings
+            .text("agent.reasoning_effort")
+            .map(ToOwned::to_owned),
+        tool_limits: ToolLimitSettings::from(&settings),
+        subagent_limits: SubagentSettings::from(&settings),
+        mcp_defaults: McpDefaultSettings::from(&settings),
+        settings,
         openai_api_key: openai_api_key(credentials.as_deref(), &environment),
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
@@ -6036,7 +6094,10 @@ where
             let mut provider =
                 TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
             cancellation_result(context.cancellation)?;
-            let snapshot = match request.max_iterations.or(context.bootstrap.max_iterations) {
+            let snapshot = match effective_max_iterations(
+                request.max_iterations,
+                context.bootstrap.max_iterations,
+            ) {
                 Some(max_iterations) => {
                     block_on_headless_turn(run_headless_turn_with_max_iterations_and_progress(
                         &mut provider,
@@ -15312,6 +15373,109 @@ mod tests {
         let bootstrap = bootstrap(&dependencies).expect("UI configuration should be valid");
 
         assert!(bootstrap.collapse_thinking);
+    }
+
+    fn bootstrap_from_configuration(
+        label: &str,
+        global: Option<&str>,
+        project: Option<&str>,
+    ) -> Bootstrap {
+        let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+        let mut files = BTreeMap::new();
+        if let Some(global) = global {
+            files.insert(config_home.join("config.toml"), global.to_owned());
+        }
+        if let Some(project) = project {
+            files.insert(project_root.join(".agens/config.toml"), project.to_owned());
+        }
+
+        let dependencies = CliDependencies::for_test(
+            project_root,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        );
+
+        bootstrap(&dependencies).expect("configuration fixture should be valid")
+    }
+
+    #[test]
+    fn bootstrap_defaults_reproduce_the_limits_the_runtime_hardcoded() {
+        let bootstrap = bootstrap_from_configuration("config-defaults", None, None);
+
+        let tools = bootstrap.tool_limits();
+        assert_eq!(tools.max_list_entries, 1_000);
+        assert_eq!(tools.max_search_entries, 10_000);
+        assert_eq!(tools.max_search_results, 100);
+        assert_eq!(tools.max_search_depth, 32);
+        assert_eq!(tools.operation_timeout_ms, 5_000);
+        assert_eq!(tools.bash_timeout_ms, 120_000);
+
+        let subagents = bootstrap.subagent_limits();
+        assert_eq!(subagents.max_iterations, 16);
+        assert_eq!(subagents.max_concurrency, 4);
+        assert_eq!(subagents.max_output_chars, 65_536);
+
+        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 10_000);
+        assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
+        assert!(!bootstrap.debug());
+        assert!(!bootstrap.truncate_tool_output());
+        assert_eq!(bootstrap.default_agent(), None);
+        assert_eq!(bootstrap.reasoning_effort(), None);
+    }
+
+    #[test]
+    fn project_configuration_overrides_global_settings_and_records_the_origin() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-precedence",
+            Some("[tools]\nmax_search_depth = 8\nmax_search_results = 25\n"),
+            Some("[tools]\nmax_search_depth = 4\n"),
+        );
+
+        assert_eq!(bootstrap.tool_limits().max_search_depth, 4);
+        assert_eq!(bootstrap.tool_limits().max_search_results, 25);
+        assert_eq!(
+            bootstrap.settings().origin("tools.max_search_depth"),
+            agens_config::Origin::Project
+        );
+        assert_eq!(
+            bootstrap.settings().origin("tools.max_search_results"),
+            agens_config::Origin::Global
+        );
+        assert_eq!(
+            bootstrap.settings().origin("tools.max_list_entries"),
+            agens_config::Origin::Default
+        );
+    }
+
+    #[test]
+    fn configured_behavioral_settings_reach_bootstrap() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-behavior",
+            Some(
+                "[options]\ndebug = true\n\n[agent]\ndefault_agent = \"reviewer\"\nreasoning_effort = \"high\"\n\n[ui]\ntruncate_tool_output = true\n\n[subagents]\nmax_concurrency = 2\n",
+            ),
+            None,
+        );
+
+        assert!(bootstrap.debug());
+        assert!(bootstrap.truncate_tool_output());
+        assert_eq!(bootstrap.default_agent(), Some("reviewer"));
+        assert_eq!(bootstrap.reasoning_effort(), Some("high"));
+        assert_eq!(bootstrap.subagent_limits().max_concurrency, 2);
+    }
+
+    #[test]
+    fn a_command_line_iteration_cap_overrides_the_configured_one() {
+        assert_eq!(effective_max_iterations(Some(9), Some(5)), Some(9));
+        assert_eq!(effective_max_iterations(None, Some(5)), Some(5));
+        assert_eq!(effective_max_iterations(Some(9), None), Some(9));
+        assert_eq!(effective_max_iterations(None, None), None);
     }
 
     fn tui_session_messages() -> Vec<Message> {
