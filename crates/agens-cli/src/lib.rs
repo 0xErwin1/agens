@@ -3,11 +3,10 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, mpsc::Receiver};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser as _;
 
@@ -27,14 +26,16 @@ use agens_core::{
     SessionMessage, SessionMessageError, SessionMetadata, TurnEvent, TurnProgressSink,
     TurnProvider, TurnState, run_headless_turn_with_max_iterations_and_progress,
 };
+#[cfg(test)]
+use agens_providers::ProviderDiagnosticComponent;
 use agens_providers::chatgpt_login::{
     LoginCancellation, LoginError, remove_provider_entry, upsert_provider_entry,
 };
 use agens_providers::{
     ChatGptAuthState, ChatGptResponsesProvider, DiagnosticRef, OpenAiFunctionTool,
     OpenAiResponsesProvider, ProgressAwareProvider, ProviderDiagnosticClass,
-    ProviderDiagnosticComponent, ProviderDiagnosticEvent, ProviderDiagnosticKind,
-    ProviderDiagnosticScope, ProviderDiagnostics, load_chatgpt_auth_state,
+    ProviderDiagnosticEvent, ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+    load_chatgpt_auth_state,
 };
 use agens_store::{
     ModelPreference, PermissionGrantStore, PreferenceStore, SessionCursor, SessionStore,
@@ -68,6 +69,7 @@ use agens_tui::{
 mod bootstrap;
 mod chatgpt_auth;
 mod cli;
+mod diagnostics;
 mod error;
 mod model_registry;
 #[cfg(test)]
@@ -78,6 +80,17 @@ use bootstrap::{
     seed_configured_reasoning_effort,
 };
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use diagnostics::{
+    DIAGNOSTIC_FILE_COUNT_LIMIT, DIAGNOSTIC_REFERENCE_SEQUENCE, SafeDiagnosticStore,
+};
+use diagnostics::{
+    DIAGNOSTIC_FILE_LIMIT_BYTES, diagnostic_store, next_diagnostic_reference,
+    operation_diagnostics, record_agent_diagnostic, record_parent_terminal,
+    record_subagent_terminal,
+};
 use error::cancellation_result;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -90,10 +103,6 @@ pub use model_registry::{TuiModelSelector, TuiModelSource};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
-const DIAGNOSTIC_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
-const DIAGNOSTIC_FILE_COUNT_LIMIT: usize = 4;
-static DIAGNOSTIC_REFERENCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static DIAGNOSTIC_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
     "connect",
@@ -144,236 +153,6 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("select", "Select a project file", "", Some("select")),
     ("quit", "Exit Agens", "", None),
 ];
-
-#[derive(Clone)]
-struct SafeDiagnosticStore {
-    directory: PathBuf,
-    enabled: bool,
-}
-
-impl SafeDiagnosticStore {
-    /// Capture is what `options.debug` switches: disabled, nothing about a
-    /// failure is written to disk.
-    fn with_capture(data_directory: PathBuf, enabled: bool) -> Self {
-        Self {
-            directory: data_directory.join("diagnostics"),
-            enabled,
-        }
-    }
-
-    fn record(&self, event: &ProviderDiagnosticEvent) {
-        if !self.enabled {
-            return;
-        }
-        let _guard = DIAGNOSTIC_FILE_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _ = self.write(event);
-    }
-
-    fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
-        ensure_private_diagnostics_directory(&self.directory)?;
-        let line = diagnostic_json_line(event)?;
-        let active = self.active_path();
-        let existing_size = match fs::symlink_metadata(&active) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
-            Ok(_) => {
-                return Err(std::io::Error::other(
-                    "diagnostics path is not a regular file",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error),
-        };
-        if existing_size.saturating_add(line.len() as u64) > DIAGNOSTIC_FILE_LIMIT_BYTES {
-            self.rotate()?;
-        }
-
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(active)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(&line)
-    }
-
-    fn active_path(&self) -> PathBuf {
-        self.directory
-            .join(format!("agens-{}.jsonl", std::process::id()))
-    }
-
-    fn rotated_path(&self, generation: usize) -> PathBuf {
-        self.directory
-            .join(format!("agens-{}.{}.jsonl", std::process::id(), generation))
-    }
-
-    fn rotate(&self) -> std::io::Result<()> {
-        let oldest = self.rotated_path(DIAGNOSTIC_FILE_COUNT_LIMIT - 1);
-        match fs::remove_file(oldest) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        for generation in (1..DIAGNOSTIC_FILE_COUNT_LIMIT - 1).rev() {
-            let source = self.rotated_path(generation);
-            let destination = self.rotated_path(generation + 1);
-            match fs::rename(source, destination) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
-        }
-        match fs::rename(self.active_path(), self.rotated_path(1)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-fn ensure_private_diagnostics_directory(directory: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
-        }
-        Ok(_) => Err(std::io::Error::other("diagnostics path is not a directory")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(directory)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<u8>> {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let mut line = serde_json::to_vec(&serde_json::json!({
-        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
-        "reference": event.reference.as_str(),
-        "scope": event.scope.as_str(),
-        "component": event.component.as_str(),
-        "event": event.event.as_str(),
-        "attempt": event.attempt,
-        "max_attempts": event.max_attempts,
-        "delay_ms": event.delay_ms,
-        "status": event.status,
-        "class": event.class.map(ProviderDiagnosticClass::as_str),
-    }))
-    .map_err(std::io::Error::other)?;
-    line.push(b'\n');
-    Ok(line)
-}
-
-struct OperationDiagnostics {
-    reference: String,
-    provider: ProviderDiagnostics,
-}
-
-fn operation_diagnostics(
-    bootstrap: &Bootstrap,
-    scope: ProviderDiagnosticScope,
-    reference: Option<&str>,
-) -> OperationDiagnostics {
-    let reference = reference.map_or_else(next_diagnostic_reference, str::to_owned);
-    let store = diagnostic_store(bootstrap);
-    let sink = Arc::new(move |event: ProviderDiagnosticEvent| store.record(&event));
-    let provider = ProviderDiagnostics::new(reference.clone(), scope, sink)
-        .expect("generated diagnostics references are valid");
-    OperationDiagnostics {
-        reference,
-        provider,
-    }
-}
-
-fn diagnostic_store(bootstrap: &Bootstrap) -> SafeDiagnosticStore {
-    SafeDiagnosticStore::with_capture(bootstrap.data_directory().to_path_buf(), bootstrap.debug())
-}
-
-fn next_diagnostic_reference() -> String {
-    let sequence = DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let mixed = timestamp
-        .rotate_left(17)
-        .wrapping_add(sequence.wrapping_mul(0x9e37_79b9))
-        ^ u64::from(std::process::id());
-    format!("{:08x}", mixed as u32)
-}
-
-fn record_subagent_terminal(
-    bootstrap: &Bootstrap,
-    reference: &str,
-    class: ProviderDiagnosticClass,
-) {
-    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
-        return;
-    };
-    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
-        reference,
-        scope: ProviderDiagnosticScope::Subagent,
-        component: ProviderDiagnosticComponent::Subagent,
-        event: ProviderDiagnosticKind::Terminal,
-        attempt: 0,
-        max_attempts: 0,
-        delay_ms: None,
-        status: None,
-        class: Some(class),
-    });
-}
-
-fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
-    if error.message == agens_core::HeadlessTaskTerminal::ModelUnavailable.message() {
-        return;
-    }
-    let class = match error.category {
-        "auth" => ProviderDiagnosticClass::Authentication,
-        "cancelled" => ProviderDiagnosticClass::Cancelled,
-        "provider" => ProviderDiagnosticClass::Provider,
-        "timeout" => ProviderDiagnosticClass::Deadline,
-        "tool" => ProviderDiagnosticClass::Tool,
-        _ => ProviderDiagnosticClass::Runtime,
-    };
-    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
-        return;
-    };
-    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
-        reference,
-        scope: ProviderDiagnosticScope::Parent,
-        component: ProviderDiagnosticComponent::Responses,
-        event: ProviderDiagnosticKind::Terminal,
-        attempt: 0,
-        max_attempts: 0,
-        delay_ms: None,
-        status: None,
-        class: Some(class),
-    });
-}
-
-fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
-    let Ok(reference) = DiagnosticRef::new(next_diagnostic_reference()) else {
-        return;
-    };
-    diagnostic_store(bootstrap).record(&ProviderDiagnosticEvent {
-        reference,
-        scope: ProviderDiagnosticScope::Parent,
-        component: ProviderDiagnosticComponent::Agent,
-        event,
-        attempt: 0,
-        max_attempts: 0,
-        delay_ms: None,
-        status: None,
-        class: Some(ProviderDiagnosticClass::Runtime),
-    });
-}
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
