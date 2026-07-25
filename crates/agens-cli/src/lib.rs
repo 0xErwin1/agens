@@ -69,8 +69,14 @@ use agens_tui::{
 mod chatgpt_auth;
 mod cli;
 mod model_registry;
+#[cfg(test)]
+mod test_support;
 
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use test_support::{reset_tui_resume_test_counters, tui_resume_test_counters};
 
 pub use model_registry::{TuiModelSelector, TuiModelSource};
 
@@ -5208,14 +5214,6 @@ fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
         .join("\n"))
 }
 
-#[cfg(test)]
-thread_local! {
-    static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static TUI_RESUME_PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PRODUCTION_TOOL_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PRODUCTION_PROVIDER_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 struct LoadedTuiSessionResume {
     session: StoredSession,
     retry_boundary: Option<RetryBoundary>,
@@ -5227,24 +5225,6 @@ impl std::ops::Deref for LoadedTuiSessionResume {
     fn deref(&self) -> &Self::Target {
         &self.session
     }
-}
-
-#[cfg(test)]
-fn reset_tui_resume_test_counters() {
-    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(0));
-    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(0));
-    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(0));
-    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-fn tui_resume_test_counters() -> (usize, usize, usize, usize) {
-    (
-        TUI_RESUME_LOAD_CALLS.with(std::cell::Cell::get),
-        TUI_RESUME_PROJECTION_CALLS.with(std::cell::Cell::get),
-        PRODUCTION_TOOL_RUNTIME_CALLS.with(std::cell::Cell::get),
-        PRODUCTION_PROVIDER_RUNTIME_CALLS.with(std::cell::Cell::get),
-    )
 }
 
 fn resume_tui_session(
@@ -5262,7 +5242,7 @@ fn load_tui_session_for_resume(
     identifier: i64,
 ) -> Result<LoadedTuiSessionResume, CliError> {
     #[cfg(test)]
-    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
+    test_support::note_tui_resume_load();
 
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -5309,7 +5289,7 @@ fn prepare_loaded_tui_session_resume(
         return Err(CliError::storage("saved session is unavailable"));
     }
     #[cfg(test)]
-    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
+    test_support::note_tui_resume_projection();
     let restored_history =
         Conversation::from_messages_with_parser(&session.messages, |name, input| {
             let bare = name
@@ -5954,7 +5934,7 @@ fn run_production_headless_chat_with_progress(
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     #[cfg(test)]
-    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
+    test_support::note_production_provider_runtime();
 
     let source = bootstrap
         .provider_type()
@@ -6694,7 +6674,7 @@ fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     #[cfg(test)]
-    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
+    test_support::note_production_tool_runtime();
 
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
         project_root,
