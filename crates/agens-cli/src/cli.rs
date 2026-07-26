@@ -104,13 +104,16 @@ pub(crate) struct ChatArgs {
     pub(crate) mode: Option<String>,
     #[arg(long)]
     pub(crate) dangerously_allow_all: bool,
-    // Every trailing token that clap does not recognize as one of the
-    // flags above: the prompt itself, any extra positional, and any
-    // unrecognized flag. Arity and unknown-flag detection stay in the
-    // command body so their exact wording survives clap adoption. This is
-    // a plain comment, not a doc comment: a doc comment here becomes the
-    // rendered `--help` text for this argument.
-    #[arg(allow_hyphen_values = true)]
+    // Every trailing token clap does not recognize as one of the flags
+    // above: the prompt itself, any extra positional, and any
+    // unrecognized flag. `allow_hyphen_values` is intentionally NOT set
+    // here: without it, clap keeps matching `--model`/`--system`/etc. as
+    // flags no matter where they appear relative to the prompt, and only
+    // genuinely unrecognized hyphen-prefixed tokens fall through to this
+    // positional for the command body to reject. Arity and unknown-flag
+    // detection stay in the command body so their exact wording survives
+    // clap adoption. This is a plain comment, not a doc comment: a doc
+    // comment here becomes the rendered `--help` text for this argument.
     pub(crate) prompt: Vec<String>,
 }
 

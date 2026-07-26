@@ -687,17 +687,6 @@ fn table_a_chat_holds() {
                 _temporary: temporary,
             }
         },
-        {
-            let temporary = TemporaryDirectory::new("chat-unknown-flag");
-            let dependencies = base_dependencies(&temporary);
-            Case {
-                name: "chat rejects an unrecognized flag",
-                argv: argv(&["chat", "--bogus", "hi"]),
-                dependencies,
-                expected: failure(ExitStatus::Usage, "usage: chat received an unknown flag"),
-                _temporary: temporary,
-            }
-        },
     ];
 
     run_table_a(cases);
@@ -869,14 +858,13 @@ mod parser_surface_baseline {
     /// `auth` with no subcommand renders byte-identical to `auth --help`.
     pub(crate) const AUTH_MISSING_SUBCOMMAND_MESSAGE: &str = AUTH_HELP;
     pub(crate) const CHAT_HELP: &str = "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
-    /// D1: `chat foo --help` is Usage(2) today (`--help` here is read as an
-    /// unrecognized flag, not as a request for help). Under clap, the same
-    /// leftover-token loop still classifies `--help` here as an unknown
-    /// flag (it never reaches clap's own help interception once "foo" has
-    /// already started filling the trailing catch-all), so this stays
-    /// Usage(2) with the same body-owned message: NO delta observed here,
-    /// unlike what the design anticipated.
-    pub(crate) const CHAT_FOO_HELP_MESSAGE: &str = "chat received an unknown flag";
+    /// D1 (ratified): `chat foo --help` goes from Usage(2) to Success(0).
+    /// `ChatArgs.prompt` no longer sets `allow_hyphen_values`, so clap keeps
+    /// matching `--help` as a flag no matter where it appears relative to
+    /// the prompt token, and renders `chat`'s own help exactly as `chat
+    /// --help` does. This is the ratified delta, not "no delta observed" —
+    /// an earlier revision of this baseline was stale.
+    pub(crate) const CHAT_UNKNOWN_FLAG_MESSAGE: &str = "error: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n";
     pub(crate) const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
     pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  \n  show  \n  rm    \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
@@ -1110,12 +1098,23 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-chat-foo-help-d1");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "chat foo --help is Usage(2) today (D1)",
+                name: "chat foo --help is Success(0), the ratified D1 delta",
                 argv: argv(&["chat", "foo", "--help"]),
                 dependencies,
-                expected: failure(
+                expected: success(baseline::CHAT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-chat-unknown-flag");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat rejects an unrecognized flag with clap's own rendering",
+                argv: argv(&["chat", "--bogus", "hi"]),
+                dependencies,
+                expected: preformatted_failure(
                     ExitStatus::Usage,
-                    format!("usage: {}", baseline::CHAT_FOO_HELP_MESSAGE),
+                    baseline::CHAT_UNKNOWN_FLAG_MESSAGE,
                 ),
                 _temporary: temporary,
             }
