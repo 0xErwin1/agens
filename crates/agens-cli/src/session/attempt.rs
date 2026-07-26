@@ -205,7 +205,7 @@ pub(crate) fn run_session_attempt_lifecycle(
         store,
         metadata,
         prompt,
-        runtime,
+        |_attempt| runtime(),
         |store, write| {
             write_terminal_attempt(store, write, &crate::headless::interrupted_turn_note(&[]))
         },
@@ -226,7 +226,7 @@ pub(crate) fn run_session_attempt_lifecycle_with_terminal_writer(
     store: &mut SessionStore,
     mut metadata: SessionMetadata,
     prompt: String,
-    runtime: impl FnOnce() -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
+    runtime: impl FnOnce(AttemptKey) -> Result<(CompletedTurnSnapshot, CompletedSessionTurn), CliError>,
     terminal_writer: impl FnOnce(
         &mut SessionStore,
         TerminalAttemptWrite<'_>,
@@ -241,7 +241,7 @@ pub(crate) fn run_session_attempt_lifecycle_with_terminal_writer(
     };
     metadata.id = attempt.key().session_id();
 
-    let (snapshot, turn) = match runtime() {
+    let (snapshot, turn) = match runtime(attempt.key()) {
         Ok(completion) => completion,
         Err(error) => {
             let partial = terminal_writer(
@@ -468,7 +468,7 @@ mod tests {
             &mut store,
             terminal_failure,
             "terminal failure".into(),
-            || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
+            |_attempt| Err(CliError::runtime(HeadlessTurnError::Cancelled)),
             |_, _| Err(()),
         )
         .unwrap_err();
@@ -697,7 +697,7 @@ mod tests {
             &mut store,
             metadata.clone(),
             "explore the runtime".into(),
-            || Err(CliError::runtime(HeadlessTurnError::TimedOut)),
+            |_attempt| Err(CliError::runtime(HeadlessTurnError::TimedOut)),
             |store, write| {
                 assert_eq!(write.status, agens_core::SessionAttemptStatus::Cancelled);
 
@@ -824,7 +824,7 @@ mod tests {
             &mut store,
             terminal_metadata.clone(),
             "terminal retry prompt".into(),
-            || Err(CliError::runtime(HeadlessTurnError::Cancelled)),
+            |_attempt| Err(CliError::runtime(HeadlessTurnError::Cancelled)),
             |_, _| Err(()),
         )
         .unwrap_err();

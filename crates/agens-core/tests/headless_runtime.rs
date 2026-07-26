@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
+    AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     MessagePart, PermissionDecision, ToolResultFacts, TurnEvent, TurnProgressSink, TurnProvider,
@@ -34,6 +34,7 @@ fn progress_sink_receives_state_and_provider_events_before_completion() {
         &mut repository,
         &HeadlessTurnCancellation::new(),
         Some(&progress),
+        None,
     ))
     .unwrap();
 
@@ -46,6 +47,60 @@ fn progress_sink_receives_state_and_provider_events_before_completion() {
             TurnEvent::StateChanged(TurnState::Completed),
         ]
     );
+}
+
+#[test]
+fn a_fact_emitted_in_a_real_attempt_carries_that_attempts_identity() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let progress: TurnProgressSink = {
+        let observed = Arc::clone(&observed);
+        Arc::new(move |event| observed.lock().unwrap().push(event))
+    };
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 0\"}".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Allow],
+    };
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher {
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 0")
+            .with_facts(ToolResultFacts::Bash { exit_code: Some(0) }))],
+        ..ToolDispatcher::default()
+    };
+    let mut repository = Repository::default();
+    let attempt = AttemptKey::new(7, 3).unwrap();
+
+    block_on_ready(run_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+        Some(&progress),
+        Some(attempt),
+    ))
+    .unwrap();
+
+    let observed = observed.lock().unwrap();
+    let identity = observed
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResultFacts { identity, .. } => Some(identity),
+            _ => None,
+        })
+        .expect("a facts event must be observed");
+
+    assert_eq!(identity.session_id, Some(7));
+    assert_eq!(identity.attempt_id, Some(3));
 }
 
 #[test]
@@ -84,6 +139,7 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
         &mut repository,
         &HeadlessTurnCancellation::new(),
         Some(&progress),
+        None,
     ))
     .unwrap();
 
@@ -851,6 +907,7 @@ fn cancellation_during_preflight_runs_nothing_and_during_execution_keeps_complet
         &mut repository,
         &execution_cancellation,
         Some(&progress_sink),
+        None,
     ));
 
     assert_eq!(execution_result, Err(HeadlessTurnError::Cancelled));

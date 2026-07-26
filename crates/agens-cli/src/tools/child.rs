@@ -310,6 +310,8 @@ struct TaskMailboxContext {
     target: TaskMessageTarget,
 }
 
+/// Runs a subagent's isolated turn with no session attempt of its own, so the
+/// facts it emits carry no `session_id`/`attempt_id`.
 fn run_isolated_task_turn<P>(
     provider: P,
     tool_runtime: SharedToolDispatcher,
@@ -367,6 +369,7 @@ where
         cancellation,
         16,
         progress,
+        None,
     ))
     .map_err(|_| ChildRunError::Runtime)?
     .map_err(child_run_error)?;

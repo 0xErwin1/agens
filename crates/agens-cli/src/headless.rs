@@ -444,7 +444,7 @@ where
         &mut store,
         metadata,
         request.prompt.clone(),
-        || {
+        |attempt_key| {
             let mut provider = build_provider(
                 model,
                 provider_messages(&request, context.include_system_prompt),
@@ -487,6 +487,7 @@ where
                         context.cancellation,
                         max_iterations,
                         headless_progress,
+                        Some(attempt_key),
                     ))
                 }
                 None => block_on_headless_turn(agens_core::run_headless_turn_with_progress(
@@ -497,6 +498,7 @@ where
                     &mut repository,
                     context.cancellation,
                     headless_progress,
+                    Some(attempt_key),
                 )),
             }?
             .map_err(CliError::runtime)?;

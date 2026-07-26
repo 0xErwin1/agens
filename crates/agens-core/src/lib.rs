@@ -1366,10 +1366,12 @@ pub async fn run_headless_turn(
         repository,
         cancellation,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_headless_turn_with_progress(
     provider: &mut impl TurnProvider,
     permission_gate: &mut impl HeadlessPermissionGate,
@@ -1378,6 +1380,7 @@ pub async fn run_headless_turn_with_progress(
     repository: &mut impl CompletedTurnRepository,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     run_headless_turn_with_iteration_limit(
         provider,
@@ -1388,6 +1391,7 @@ pub async fn run_headless_turn_with_progress(
         cancellation,
         None,
         progress,
+        attempt,
     )
     .await
 }
@@ -1410,6 +1414,7 @@ pub async fn run_headless_turn_with_max_iterations(
         cancellation,
         max_iterations,
         None,
+        None,
     )
     .await
 }
@@ -1424,6 +1429,7 @@ pub async fn run_headless_turn_with_max_iterations_and_progress(
     cancellation: &HeadlessTurnCancellation,
     max_iterations: usize,
     progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
     run_headless_turn_with_iteration_limit(
         provider,
@@ -1434,6 +1440,7 @@ pub async fn run_headless_turn_with_max_iterations_and_progress(
         cancellation,
         Some(max_iterations),
         progress,
+        attempt,
     )
     .await
 }
@@ -1448,8 +1455,12 @@ async fn run_headless_turn_with_iteration_limit(
     cancellation: &HeadlessTurnCancellation,
     max_iterations: Option<usize>,
     progress: Option<&TurnProgressSink>,
+    attempt: Option<AttemptKey>,
 ) -> Result<CompletedTurnSnapshot, HeadlessTurnError> {
-    let mut coordinator = TurnCoordinator::new();
+    let mut coordinator = match attempt {
+        Some(key) => TurnCoordinator::for_attempt(key),
+        None => TurnCoordinator::new(),
+    };
     coordinator.begin().map_err(|_| HeadlessTurnError::State)?;
     let mut progress_cursor = 0;
     flush_progress(&coordinator, progress, &mut progress_cursor);

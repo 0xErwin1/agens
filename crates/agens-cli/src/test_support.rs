@@ -514,6 +514,7 @@ pub(crate) fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) 
         &mut BatchRepository { fail_persistence },
         &cancellation,
         Some(&progress),
+        None,
     ));
     let terminal = result
         .as_ref()
