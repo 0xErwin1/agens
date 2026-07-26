@@ -10,28 +10,9 @@ use agens_core::{
     TurnState,
 };
 use agens_store::SessionStore;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-
-struct MigrationFaultGuard {
-    path: std::path::PathBuf,
-}
-
-impl MigrationFaultGuard {
-    fn set(database: &std::path::Path, point: &str) -> Self {
-        let path = std::path::PathBuf::from(format!("{}.migration-fault", database.display()));
-        fs::write(&path, point).unwrap();
-
-        Self { path }
-    }
-}
-
-impl Drop for MigrationFaultGuard {
-    fn drop(&mut self) {
-        fs::remove_file(&self.path).unwrap();
-    }
-}
 
 fn data_directory() -> std::path::PathBuf {
     let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -81,11 +62,104 @@ fn completed_snapshot_with_all_persisted_variants() -> CompletedTurnSnapshot {
     CompletedTurnSnapshot::from_persisted_events(coordinator.events().to_vec()).unwrap()
 }
 
-fn create_supported_session_schema(connection: &Connection, index_sql: &str) {
+/// The exact v5 normalized session schema, reproduced verbatim so that
+/// `validate_normalized_session_schema`'s statement-by-statement comparison matches after
+/// whitespace normalization. Any drift here from `agens-store`'s own schema strings makes these
+/// fixtures fail for the wrong reason.
+fn full_normalized_v5_schema() -> &'static str {
+    "CREATE TABLE sessions (
+        id INTEGER PRIMARY KEY,
+        project TEXT NOT NULL CHECK(project <> ''),
+        title TEXT NOT NULL,
+        active_agent TEXT NOT NULL CHECK(active_agent <> ''),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_turn_count >= 0),
+        resumable INTEGER NOT NULL DEFAULT 0 CHECK(resumable IN(0, 1)),
+        provider_id TEXT CHECK(provider_id <> '' AND length(provider_id) <= 64),
+        model_id TEXT CHECK(model_id <> '' AND length(model_id) <= 64),
+        reasoning_effort TEXT CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')),
+        CHECK(resumable = (completed_turn_count > 0))
+    );
+    CREATE TABLE turns (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        completed_at INTEGER NOT NULL,
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+    );
+    CREATE TABLE messages (
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        turn_sequence INTEGER NOT NULL CHECK(turn_sequence > 0),
+        role TEXT NOT NULL CHECK(role IN('system', 'user', 'assistant', 'tool')),
+        PRIMARY KEY(session_id, sequence),
+        FOREIGN KEY(session_id, turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE CASCADE
+    );
+    CREATE TABLE message_parts (
+        session_id INTEGER NOT NULL,
+        message_sequence INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence >= 0),
+        kind TEXT NOT NULL CHECK(kind IN('text', 'reasoning', 'tool_call', 'tool_result')),
+        text TEXT,
+        call_id TEXT,
+        name TEXT,
+        input_json TEXT,
+        content TEXT,
+        is_error INTEGER CHECK(is_error IN(0, 1)),
+        PRIMARY KEY(session_id, message_sequence, sequence),
+        FOREIGN KEY(session_id, message_sequence) REFERENCES messages(session_id, sequence) ON DELETE CASCADE,
+        CHECK((kind IN('text', 'reasoning') AND text IS NOT NULL AND call_id IS NULL AND name IS NULL AND input_json IS NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_call' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NOT NULL AND name <> '' AND input_json IS NOT NULL AND content IS NULL AND is_error IS NULL) OR (kind = 'tool_result' AND text IS NULL AND call_id IS NOT NULL AND call_id <> '' AND name IS NULL AND input_json IS NULL AND content IS NOT NULL AND is_error IS NOT NULL))
+    );
+    CREATE INDEX sessions_list ON sessions(resumable, updated_at DESC, id DESC);
+    CREATE INDEX messages_turn_order ON messages(session_id, turn_sequence, sequence);
+    CREATE INDEX parts_message_order ON message_parts(session_id, message_sequence, sequence);
+    CREATE TABLE session_attempts (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
+        failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
+        retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        completed_turn_sequence INTEGER,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
+        CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
+              (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
+              (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
+    );
+    CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
+    CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
+    CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);"
+}
+
+/// Seeds a fully migrated ledger (all three known migrations already recorded) alongside the
+/// legacy archive tables (with a caller-controlled index shape) and the exact v5 normalized
+/// schema, so `SessionStore::open` skips migration entirely and exercises only the post-open
+/// `validate_v5_schema` shape check.
+fn seed_migrated_agens_db(connection: &Connection, legacy_index_sql: &str) {
     connection
         .execute_batch(&format!(
-            "CREATE TABLE completed_turns (id INTEGER PRIMARY KEY);
-             CREATE TABLE completed_turn_events (
+            "CREATE TABLE schema_migrations (
+                 id TEXT PRIMARY KEY,
+                 applied_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations (id, applied_at) VALUES
+                 ('0001_permission_grants', 0),
+                 ('0002_model_preference', 0),
+                 ('0003_sessions_v5', 0);
+             CREATE TABLE legacy_turns (
+                 id INTEGER PRIMARY KEY,
+                 status TEXT NOT NULL CHECK(status = 'non_resumable'),
+                 reason TEXT NOT NULL,
+                 source_event_count INTEGER NOT NULL CHECK(source_event_count >= 0)
+             );
+             CREATE TABLE legacy_turn_events (
                  turn_id INTEGER NOT NULL,
                  sequence INTEGER NOT NULL,
                  kind TEXT NOT NULL,
@@ -96,196 +170,14 @@ fn create_supported_session_schema(connection: &Connection, index_sql: &str) {
                  input TEXT,
                  content TEXT,
                  is_error INTEGER,
-                 PRIMARY KEY (turn_id, sequence),
-                 FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
+                 PRIMARY KEY(turn_id, sequence),
+                 FOREIGN KEY(turn_id) REFERENCES legacy_turns(id) ON DELETE CASCADE
              );
-             {index_sql}
-             PRAGMA user_version = 1;"
+             {legacy_index_sql}
+             {}",
+            full_normalized_v5_schema()
         ))
         .unwrap();
-}
-
-fn create_populated_wal_v1_fixture(directory: &std::path::Path) {
-    let database = directory.join("sessions.db");
-    let connection = Connection::open(database).unwrap();
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .unwrap();
-    create_supported_session_schema(
-        &connection,
-        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-         ON completed_turn_events(turn_id, sequence);",
-    );
-    connection
-        .execute_batch(
-            "INSERT INTO completed_turns(id) VALUES(7), (8), (11), (13);
-              INSERT INTO completed_turn_events VALUES
-                 (7, 1, 'state_changed', 'requesting', NULL, NULL, NULL, NULL, NULL, NULL),
-                 (7, 2, 'provider_part', NULL, 'text', NULL, NULL, NULL, 'WAL content', NULL),
-                 (7, 3, 'provider_part', NULL, 'tool_call', 'call-1', 'tool', '{\"key\":true}', NULL, NULL),
-                 (11, 1, 'tool_result', NULL, NULL, 'call-1', NULL, NULL, 'result\nwith punctuation: !?', 0),
-                 (11, 2, 'tool_result', NULL, NULL, 'call-2', NULL, NULL, 'error', 1);",
-        )
-        .unwrap();
-}
-
-type V1Event = (
-    i64,
-    i64,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-);
-
-#[derive(Debug, PartialEq)]
-struct V1Contents {
-    turns: Vec<i64>,
-    events: Vec<V1Event>,
-}
-
-fn v1_contents(connection: &Connection) -> V1Contents {
-    let turns = connection
-        .prepare("SELECT id FROM completed_turns ORDER BY id")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    let events = connection
-        .prepare(
-            "SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content,
-                    is_error
-             FROM completed_turn_events ORDER BY turn_id, sequence",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-
-    V1Contents { turns, events }
-}
-
-fn archive_contents(connection: &Connection) -> V1Contents {
-    let turns = connection
-        .prepare("SELECT id FROM legacy_turns ORDER BY id")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    let events = connection
-        .prepare(
-            "SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content,
-                    is_error
-             FROM legacy_turn_events ORDER BY turn_id, sequence",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-
-    V1Contents { turns, events }
-}
-
-fn table_signature(connection: &Connection, table: &str) -> Vec<(i64, String, String, i64, i64)> {
-    connection
-        .prepare(&format!("PRAGMA table_info('{table}')"))
-        .unwrap()
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(5)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-}
-
-fn foreign_key_signature(
-    connection: &Connection,
-    table: &str,
-) -> Vec<(String, String, String, String)> {
-    connection
-        .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-}
-
-fn index_signature(connection: &Connection, table: &str) -> Vec<(String, i64, String)> {
-    connection
-        .prepare(&format!("PRAGMA index_list('{table}')"))
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(1)?, row.get(2)?, row.get(3)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap()
-}
-
-fn exact_v1_manifest(connection: &Connection) -> String {
-    let lines = connection
-        .prepare(
-            "SELECT 'schema|' || type || '|' || name || '|' || quote(sql)
-             FROM sqlite_schema WHERE type IN ('index', 'table') AND name LIKE 'completed_turn%'
-             UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
-             UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
-             UNION ALL SELECT 'completed_turns|' || id FROM completed_turns
-             UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
-                 quote(kind) || '|' || quote(state) || '|' || quote(part_kind) || '|' ||
-                 quote(call_id) || '|' || quote(name) || '|' || quote(input) || '|' ||
-                 quote(content) || '|' || quote(is_error)
-             FROM completed_turn_events ORDER BY 1",
-        )
-        .unwrap()
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-
-    format!("version=1\nquick_check=ok\n{}\n", lines.join("\n"))
 }
 
 fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
@@ -300,47 +192,8 @@ fn block_on_ready<T>(future: impl Future<Output = T>) -> T {
 }
 
 #[test]
-fn opens_populated_wal_v1_as_v5_smoke() {
-    let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
-
-    let store = SessionStore::open(&directory).unwrap();
-    let database = store.database_path();
-    let connection = Connection::open(&database).unwrap();
-
-    assert!(directory.join("sessions.db.v1.bak").exists());
-    assert_eq!(
-        connection
-            .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        4
-    );
-    assert!(
-        connection
-            .query_row("SELECT count(*) FROM completed_turns", [], |row| row
-                .get::<_, i64>(0))
-            .is_err()
-    );
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        5
-    );
-    drop(connection);
-    drop(store);
-
-    SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("sessions.db.v1.bak.1").exists());
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
 fn normalized_v5_schema() {
     let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
 
     let store = SessionStore::open(&directory).unwrap();
     let connection = Connection::open(store.database_path()).unwrap();
@@ -361,12 +214,6 @@ fn normalized_v5_schema() {
         .unwrap()
         .join(" ");
 
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        5
-    );
     assert!(schema.contains("CREATE TABLE sessions"));
     assert!(schema.contains("CREATE TABLE turns"));
     assert!(schema.contains("CREATE TABLE messages"));
@@ -383,582 +230,6 @@ fn normalized_v5_schema() {
 }
 
 #[test]
-fn v4_to_v5_attempt_schema_is_exact_atomic_and_ignores_json() {
-    let directory = data_directory();
-    let database = directory.join("sessions.db");
-    SessionStore::open(&directory).unwrap();
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute(
-            "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at, completed_turn_count, resumable) VALUES (91, 'project', 'title', 'primary', 1, 2, 1, 1)",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute(
-            "INSERT INTO turns (session_id, sequence, completed_at) VALUES (91, 1, 2)",
-            [],
-        )
-        .unwrap();
-    connection
-        .execute_batch(
-            "DROP INDEX session_attempts_latest;
-             DROP INDEX session_attempts_one_running;
-             DROP INDEX session_attempts_session_sequence;
-             DROP TABLE session_attempts;
-             PRAGMA user_version = 4;",
-        )
-        .unwrap();
-    drop(connection);
-    fs::write(
-        directory.join("alternate-session.json"),
-        "{\"ignored\":true}",
-    )
-    .unwrap();
-
-    let fault = MigrationFaultGuard::set(&database, "before-v5-commit");
-    assert!(SessionStore::open(&directory).is_err());
-
-    let connection = Connection::open(&database).unwrap();
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        4
-    );
-    assert!(
-        connection
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_attempts'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .is_err()
-    );
-    drop(connection);
-    drop(fault);
-
-    let store = SessionStore::open(&directory).unwrap();
-    let connection = Connection::open(store.database_path()).unwrap();
-    assert_eq!(
-        connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        5
-    );
-    assert_eq!(
-        table_signature(&connection, "session_attempts"),
-        vec![
-            (0, "id".into(), "INTEGER".into(), 0, 1),
-            (1, "session_id".into(), "INTEGER".into(), 1, 0),
-            (2, "sequence".into(), "INTEGER".into(), 1, 0),
-            (3, "status".into(), "TEXT".into(), 1, 0),
-            (4, "failure_kind".into(), "TEXT".into(), 0, 0),
-            (5, "retry_prompt".into(), "TEXT".into(), 0, 0),
-            (6, "started_at".into(), "INTEGER".into(), 1, 0),
-            (7, "finished_at".into(), "INTEGER".into(), 0, 0),
-            (8, "completed_turn_sequence".into(), "INTEGER".into(), 0, 0),
-        ]
-    );
-    assert_eq!(
-        foreign_key_signature(&connection, "session_attempts"),
-        vec![
-            (
-                "turns".into(),
-                "session_id".into(),
-                "session_id".into(),
-                "SET NULL".into(),
-            ),
-            (
-                "turns".into(),
-                "completed_turn_sequence".into(),
-                "sequence".into(),
-                "SET NULL".into(),
-            ),
-            (
-                "sessions".into(),
-                "session_id".into(),
-                "id".into(),
-                "CASCADE".into(),
-            ),
-        ]
-    );
-    assert_eq!(
-        index_signature(&connection, "session_attempts"),
-        vec![
-            ("session_attempts_latest".into(), 0, "c".into()),
-            ("session_attempts_one_running".into(), 1, "c".into()),
-            ("session_attempts_session_sequence".into(), 1, "c".into()),
-        ]
-    );
-    assert_eq!(
-        connection
-            .query_row("SELECT count(*) FROM session_attempts", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap(),
-        0
-    );
-    assert!(
-        connection
-            .query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'alternate-session'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .is_err()
-    );
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn migration_preserves_v1_losslessly() {
-    let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
-    let database = directory.join("sessions.db");
-    let source = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-    let expected = v1_contents(&source);
-    drop(source);
-
-    let store = SessionStore::open(&directory).unwrap();
-    let archive = Connection::open(store.database_path()).unwrap();
-
-    assert_eq!(archive_contents(&archive), expected);
-    assert_eq!(
-        archive
-            .query_row("SELECT count(*) FROM legacy_turns", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        4
-    );
-    assert_eq!(
-        archive
-            .query_row("SELECT count(*) FROM legacy_turn_events", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        5
-    );
-    assert_eq!(
-        archive
-            .prepare("SELECT id, status, reason, source_event_count FROM legacy_turns ORDER BY id",)
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap(),
-        vec![
-            (
-                7,
-                "non_resumable".into(),
-                "v1 lacks session/user/project/title/agent/timestamps".into(),
-                3
-            ),
-            (
-                8,
-                "non_resumable".into(),
-                "v1 lacks session/user/project/title/agent/timestamps".into(),
-                0
-            ),
-            (
-                11,
-                "non_resumable".into(),
-                "v1 lacks session/user/project/title/agent/timestamps".into(),
-                2
-            ),
-            (
-                13,
-                "non_resumable".into(),
-                "v1 lacks session/user/project/title/agent/timestamps".into(),
-                0
-            ),
-        ]
-    );
-    assert_eq!(
-        archive
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'
-                 AND name IN ('sessions', 'turns', 'messages', 'message_parts')",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        4
-    );
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn migration_validates_schema_and_reopen_contract() {
-    let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
-    let source = Connection::open_with_flags(
-        directory.join("sessions.db"),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let expected = v1_contents(&source);
-    drop(source);
-
-    let store = SessionStore::open(&directory).unwrap();
-    let database = store.database_path();
-    drop(store);
-
-    let archive = Connection::open(&database).unwrap();
-    assert_eq!(
-        table_signature(&archive, "legacy_turns"),
-        vec![
-            (0, "id".into(), "INTEGER".into(), 0, 1),
-            (1, "status".into(), "TEXT".into(), 1, 0),
-            (2, "reason".into(), "TEXT".into(), 1, 0),
-            (3, "source_event_count".into(), "INTEGER".into(), 1, 0),
-        ]
-    );
-    assert_eq!(
-        table_signature(&archive, "legacy_turn_events"),
-        vec![
-            (0, "turn_id".into(), "INTEGER".into(), 1, 1),
-            (1, "sequence".into(), "INTEGER".into(), 1, 2),
-            (2, "kind".into(), "TEXT".into(), 1, 0),
-            (3, "state".into(), "TEXT".into(), 0, 0),
-            (4, "part_kind".into(), "TEXT".into(), 0, 0),
-            (5, "call_id".into(), "TEXT".into(), 0, 0),
-            (6, "name".into(), "TEXT".into(), 0, 0),
-            (7, "input".into(), "TEXT".into(), 0, 0),
-            (8, "content".into(), "TEXT".into(), 0, 0),
-            (9, "is_error".into(), "INTEGER".into(), 0, 0),
-        ]
-    );
-    assert_eq!(
-        foreign_key_signature(&archive, "legacy_turn_events"),
-        vec![(
-            "legacy_turns".into(),
-            "turn_id".into(),
-            "id".into(),
-            "CASCADE".into(),
-        )]
-    );
-    assert_eq!(
-        index_signature(&archive, "legacy_turn_events"),
-        vec![
-            ("legacy_turn_events_turn_sequence".into(), 1, "c".into(),),
-            (
-                "sqlite_autoindex_legacy_turn_events_1".into(),
-                1,
-                "pk".into(),
-            ),
-        ]
-    );
-    assert_eq!(archive_contents(&archive), expected);
-    assert_eq!(
-        archive
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE type = 'table'
-                 AND name IN ('completed_turns', 'completed_turn_events')",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        archive
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        5
-    );
-    assert_eq!(
-        archive
-            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
-            .unwrap(),
-        "wal"
-    );
-    drop(archive);
-
-    SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("sessions.db.v1.bak.1").exists());
-
-    let tampered = Connection::open(&database).unwrap();
-    tampered
-        .execute_batch(
-            "PRAGMA writable_schema = ON;
-             UPDATE sqlite_schema
-             SET sql = replace(sql, 'ON DELETE CASCADE', 'ON DELETE NO ACTION')
-             WHERE type = 'table' AND name = 'legacy_turn_events';
-             PRAGMA writable_schema = OFF;",
-        )
-        .unwrap();
-    drop(tampered);
-
-    assert!(SessionStore::open(&directory).is_err());
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn rejects_tampered_v1_before_destructive_finalization() {
-    let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
-    let database = directory.join("sessions.db");
-    let tampered = Connection::open(&database).unwrap();
-    tampered
-        .execute_batch(
-            "PRAGMA writable_schema = ON;
-             UPDATE sqlite_schema
-             SET sql = replace(sql, 'FOREIGN KEY (turn_id) REFERENCES completed_turns(id)',
-                               'FOREIGN KEY (turn_id) REFERENCES completed_turns(id) ON DELETE CASCADE')
-             WHERE type = 'table' AND name = 'completed_turn_events';
-             PRAGMA writable_schema = OFF;",
-        )
-        .unwrap();
-    drop(tampered);
-
-    assert!(SessionStore::open(&directory).is_err());
-
-    let source = Connection::open(&database).unwrap();
-    assert_eq!(
-        source
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-    assert_eq!(v1_contents(&source).turns, vec![7, 8, 11, 13]);
-    assert_eq!(
-        source
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name = 'legacy_turns'",
-                [],
-                |row| { row.get::<_, i64>(0) }
-            )
-            .unwrap(),
-        0
-    );
-    assert!(!directory.join("sessions.db.v1.bak").exists());
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn migration_faults_preserve_v1_or_recover_only_a_committed_v4() {
-    for (point, commits) in [
-        ("after-backup-step", false),
-        ("after-backup-finalize", false),
-        ("after-backup-install", false),
-        ("after-backup-parent-fsync", false),
-        ("during-mutation", false),
-        ("before-commit", false),
-        ("after-commit-before-reopen", true),
-    ] {
-        let directory = data_directory();
-        create_populated_wal_v1_fixture(&directory);
-        let database = directory.join("sessions.db");
-        let source =
-            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let expected = v1_contents(&source);
-        drop(source);
-
-        let fault = MigrationFaultGuard::set(&database, point);
-        assert!(
-            SessionStore::open(&directory).is_err(),
-            "{point} must fail closed"
-        );
-        drop(fault);
-
-        let inspected = Connection::open(&database).unwrap();
-        let version = inspected
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap();
-        if commits {
-            assert_eq!(version, 4, "{point} may expose only a committed v4");
-            assert_eq!(archive_contents(&inspected), expected);
-            assert!(
-                inspected
-                    .query_row("SELECT count(*) FROM completed_turns", [], |row| row
-                        .get::<_, i64>(0))
-                    .is_err()
-            );
-        } else {
-            assert_eq!(version, 1, "{point} must roll back to v1");
-            assert_eq!(v1_contents(&inspected), expected);
-            assert_eq!(
-                inspected
-                    .query_row(
-                        "SELECT count(*) FROM sqlite_schema WHERE name IN ('legacy_turns', 'legacy_turn_events')",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap(),
-                0
-            );
-        }
-        drop(inspected);
-
-        let retried = SessionStore::open(&directory).unwrap();
-        let recovered = Connection::open(retried.database_path()).unwrap();
-        assert_eq!(
-            archive_contents(&recovered),
-            expected,
-            "{point} retry content"
-        );
-        drop(recovered);
-        drop(retried);
-        assert!(!directory.join("sessions.db.v1.bak.2").exists());
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-}
-
-#[test]
-fn migration_retry_uses_a_new_backup_suffix_without_clobbering_collision() {
-    let directory = data_directory();
-    create_populated_wal_v1_fixture(&directory);
-    let existing_backup = directory.join("sessions.db.v1.bak");
-    fs::write(&existing_backup, "do not replace").unwrap();
-
-    let fault = MigrationFaultGuard::set(&directory.join("sessions.db"), "before-commit");
-    assert!(SessionStore::open(&directory).is_err());
-    drop(fault);
-
-    SessionStore::open(&directory).unwrap();
-    assert_eq!(fs::read(&existing_backup).unwrap(), b"do not replace");
-    assert!(directory.join("sessions.db.v1.bak.1").exists());
-    assert!(directory.join("sessions.db.v1.bak.2").exists());
-
-    SessionStore::open(&directory).unwrap();
-    assert!(!directory.join("sessions.db.v1.bak.3").exists());
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn creates_a_verified_wal_snapshot_and_exact_v1_manifest() {
-    let directory = data_directory();
-    let database = directory.join("sessions.db");
-    let writer = Connection::open(&database).unwrap();
-    writer.pragma_update(None, "journal_mode", "WAL").unwrap();
-    create_supported_session_schema(
-        &writer,
-        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-         ON completed_turn_events(turn_id, sequence);",
-    );
-    writer
-        .execute_batch(
-            "INSERT INTO completed_turns(id) VALUES(7), (8), (11);
-             INSERT INTO completed_turn_events
-              VALUES(7, 3, 'provider_part', NULL, 'text', NULL, NULL, NULL,
-                     'WAL content', NULL),
-                    (7, 4, 'provider_part', NULL, 'tool_call', 'call-1', 'tool', '{}',
-                     NULL, NULL),
-                    (11, 1, 'state_changed', 'completed', NULL, NULL, NULL, NULL,
-                     NULL, NULL),
-                    (11, 2, 'tool_result', NULL, NULL, 'call-2', NULL, NULL,
-                     'result', 0);",
-        )
-        .unwrap();
-
-    SessionStore::open(&directory).unwrap();
-    let backup = directory.join("sessions.db.v1.bak");
-    let manifest = fs::read_to_string(backup.with_extension("bak.manifest")).unwrap();
-    let snapshot = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-
-    let expected = V1Contents {
-        turns: vec![7, 8, 11],
-        events: vec![
-            (
-                7,
-                3,
-                "provider_part".into(),
-                None,
-                Some("text".into()),
-                None,
-                None,
-                None,
-                Some("WAL content".into()),
-                None,
-            ),
-            (
-                7,
-                4,
-                "provider_part".into(),
-                None,
-                Some("tool_call".into()),
-                Some("call-1".into()),
-                Some("tool".into()),
-                Some("{}".into()),
-                None,
-                None,
-            ),
-            (
-                11,
-                1,
-                "state_changed".into(),
-                Some("completed".into()),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ),
-            (
-                11,
-                2,
-                "tool_result".into(),
-                None,
-                None,
-                Some("call-2".into()),
-                None,
-                None,
-                Some("result".into()),
-                Some(0),
-            ),
-        ],
-    };
-    assert_eq!(v1_contents(&snapshot), expected);
-    assert_eq!(manifest, exact_v1_manifest(&snapshot));
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn preserves_existing_backup_and_stale_temp_with_a_deterministic_suffix() {
-    let directory = data_directory();
-    let database = directory.join("sessions.db");
-    let connection = Connection::open(&database).unwrap();
-    create_supported_session_schema(
-        &connection,
-        "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-         ON completed_turn_events(turn_id, sequence);",
-    );
-    drop(connection);
-    fs::write(directory.join("sessions.db.v1.bak"), "existing").unwrap();
-    fs::write(directory.join("sessions.db.v1.bak.1.tmp"), "stale").unwrap();
-
-    SessionStore::open(&directory).unwrap();
-    let backup = directory.join("sessions.db.v1.bak.2");
-
-    assert_eq!(backup, directory.join("sessions.db.v1.bak.2"));
-    assert_eq!(
-        fs::read(directory.join("sessions.db.v1.bak")).unwrap(),
-        b"existing"
-    );
-    assert_eq!(
-        fs::read(directory.join("sessions.db.v1.bak.1.tmp")).unwrap(),
-        b"stale"
-    );
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
 fn fresh_v5_legacy_coexistence() {
     let directory = data_directory();
     let first = completed_snapshot("first");
@@ -966,15 +237,8 @@ fn fresh_v5_legacy_coexistence() {
 
     let stored_turns = {
         let mut store = SessionStore::open(&directory).unwrap();
-        assert_eq!(store.database_path(), directory.join("sessions.db"));
-        assert!(!directory.join("permissions.db").exists());
+        assert_eq!(store.database_path(), directory.join("agens.db"));
         let database = Connection::open(store.database_path()).unwrap();
-        assert_eq!(
-            database
-                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            5
-        );
         assert_eq!(
             database
                 .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
@@ -1038,52 +302,29 @@ fn rolls_back_a_completed_turn_when_an_event_write_fails() {
 }
 
 #[test]
-fn rejects_unsupported_session_schema_versions_with_path_and_operation_context() {
-    let directory = data_directory();
-    let database = directory.join("sessions.db");
-    Connection::open(&database)
-        .unwrap()
-        .pragma_update(None, "user_version", 999)
-        .unwrap();
-
-    let error = SessionStore::open(&directory).err().unwrap().to_string();
-
-    assert!(error.contains("sessions check schema version"));
-    assert!(error.contains(database.to_string_lossy().as_ref()));
-
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
 fn rejects_supported_versions_with_an_incompatible_session_schema_shape() {
     let directory = data_directory();
-    let database = directory.join("sessions.db");
+    let database = directory.join("agens.db");
     let connection = Connection::open(&database).unwrap();
+    seed_migrated_agens_db(
+        &connection,
+        "CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+         ON legacy_turn_events(turn_id, sequence);",
+    );
     connection
         .execute_batch(
-            "CREATE TABLE completed_turns (id TEXT PRIMARY KEY);
-             CREATE TABLE completed_turn_events (
-                 turn_id INTEGER NOT NULL,
-                 sequence INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 state TEXT,
-                 part_kind TEXT,
-                 call_id TEXT,
-                 name TEXT,
-                 input TEXT,
-                 content TEXT,
-                 is_error INTEGER,
-                 PRIMARY KEY (turn_id, sequence),
-                 FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
-             );",
+            "DROP TABLE sessions;
+             CREATE TABLE sessions (id INTEGER PRIMARY KEY);",
         )
         .unwrap();
-    connection.pragma_update(None, "user_version", 1).unwrap();
     drop(connection);
 
     let error = SessionStore::open(&directory).err().unwrap().to_string();
 
-    assert!(error.contains("sessions verify schema"));
+    assert!(
+        error.contains("sessions validate normalized schema"),
+        "{error}"
+    );
     assert!(error.contains(database.to_string_lossy().as_ref()));
 
     fs::remove_dir_all(directory).unwrap();
@@ -1094,51 +335,44 @@ fn accepts_only_the_exact_supported_session_indexes() {
     let fixtures = [
         (
             "supported",
-            "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-             ON completed_turn_events(turn_id, sequence);",
+            "CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+             ON legacy_turn_events(turn_id, sequence);",
             true,
         ),
         ("missing", "", false),
         (
             "wrong name",
             "CREATE UNIQUE INDEX wrong_turn_sequence
-             ON completed_turn_events(turn_id, sequence);",
+             ON legacy_turn_events(turn_id, sequence);",
             false,
         ),
         (
             "wrong uniqueness",
-            "CREATE INDEX completed_turn_events_turn_sequence
-             ON completed_turn_events(turn_id, sequence);",
+            "CREATE INDEX legacy_turn_events_turn_sequence
+             ON legacy_turn_events(turn_id, sequence);",
             false,
         ),
         (
             "wrong column order",
-            "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-             ON completed_turn_events(sequence, turn_id);",
+            "CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+             ON legacy_turn_events(sequence, turn_id);",
             false,
         ),
         (
             "extra index",
-            "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-             ON completed_turn_events(turn_id, sequence);
-             CREATE INDEX unexpected_completed_turn_events_kind
-             ON completed_turn_events(kind);",
-            false,
-        ),
-        (
-            "extra parent index",
-            "CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-             ON completed_turn_events(turn_id, sequence);
-             CREATE INDEX unexpected_completed_turns_id ON completed_turns(id);",
+            "CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+             ON legacy_turn_events(turn_id, sequence);
+             CREATE INDEX unexpected_legacy_turn_events_kind
+             ON legacy_turn_events(kind);",
             false,
         ),
     ];
 
-    for (name, index_sql, should_open) in fixtures {
+    for (name, legacy_index_sql, should_open) in fixtures {
         let directory = data_directory();
-        let database = directory.join("sessions.db");
+        let database = directory.join("agens.db");
         let connection = Connection::open(&database).unwrap();
-        create_supported_session_schema(&connection, index_sql);
+        seed_migrated_agens_db(&connection, legacy_index_sql);
         drop(connection);
 
         let result = SessionStore::open(&directory);

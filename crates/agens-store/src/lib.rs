@@ -1,6 +1,5 @@
 use std::{
-    fmt, fs,
-    io::Write,
+    fmt,
     path::{Path, PathBuf},
 };
 
@@ -9,8 +8,7 @@ use agens_core::{
     PermissionDecision, PermissionPattern, ProjectPermissionGrant, ReasoningEffort, RequestConfig,
     TurnEvent, TurnState,
 };
-use rusqlite::backup::Backup;
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 mod database;
 mod session_writer;
@@ -161,166 +159,6 @@ impl PermissionGrantStore {
 
     pub fn database_path(&self) -> PathBuf {
         self.database_path.clone()
-    }
-}
-
-impl SessionStore {
-    pub fn create_verified_v1_backup(&self) -> Result<PathBuf, SessionStoreError> {
-        let source =
-            Connection::open_with_flags(&self.database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(|error| {
-                    SessionStoreError::operation("open backup source", &self.database_path, error)
-                })?;
-        source
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| {
-                SessionStoreError::operation("configure backup source", &self.database_path, error)
-            })?;
-        source.execute_batch("BEGIN").map_err(|error| {
-            SessionStoreError::operation("snapshot backup source", &self.database_path, error)
-        })?;
-        validate_v1_schema(&source, &self.database_path)?;
-        let source_manifest = v1_manifest(&source).map_err(|error| {
-            SessionStoreError::operation("read backup source", &self.database_path, error)
-        })?;
-
-        for suffix in 0_u64.. {
-            let extension = if suffix == 0 {
-                "v1.bak".to_owned()
-            } else {
-                format!("v1.bak.{suffix}")
-            };
-            let backup_path =
-                PathBuf::from(format!("{}.{}", self.database_path.display(), extension));
-            let temporary_path = PathBuf::from(format!("{}.tmp", backup_path.display()));
-            let manifest_path = PathBuf::from(format!("{}.manifest", backup_path.display()));
-            let manifest_temporary_path = PathBuf::from(format!("{}.tmp", manifest_path.display()));
-
-            if backup_path.exists() || manifest_path.exists() {
-                continue;
-            }
-            let temporary = match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary_path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => {
-                    return Err(SessionStoreError::operation(
-                        "create backup temporary",
-                        &temporary_path,
-                        error,
-                    ));
-                }
-            };
-            drop(temporary);
-
-            let mut destination = Connection::open(&temporary_path).map_err(|error| {
-                SessionStoreError::operation("open backup destination", &temporary_path, error)
-            })?;
-            {
-                let backup = Backup::new(&source, &mut destination).map_err(|error| {
-                    SessionStoreError::operation("start backup", &temporary_path, error)
-                })?;
-                backup
-                    .run_to_completion(100, std::time::Duration::from_millis(10), None)
-                    .map_err(|error| {
-                        SessionStoreError::operation("copy backup", &temporary_path, error)
-                    })?;
-            }
-            migration_fault("after-backup-step", &self.database_path)?;
-            drop(destination);
-            fs::File::open(&temporary_path)
-                .and_then(|file| file.sync_all())
-                .map_err(|error| {
-                    SessionStoreError::operation("fsync backup", &temporary_path, error)
-                })?;
-
-            if let Err(error) = fs::hard_link(&temporary_path, &backup_path) {
-                let _ = fs::remove_file(&temporary_path);
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(SessionStoreError::operation(
-                    "install backup",
-                    &backup_path,
-                    error,
-                ));
-            }
-            migration_fault("after-backup-install", &self.database_path)?;
-            let verification =
-                Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .map_err(|error| {
-                        SessionStoreError::operation("reopen backup", &backup_path, error)
-                    })?;
-            let backup_manifest = verify_v1_backup(&source_manifest, &verification, &backup_path)?;
-            drop(verification);
-
-            let mut manifest = match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&manifest_temporary_path)
-            {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&backup_path);
-                    let _ = fs::remove_file(&temporary_path);
-                    continue;
-                }
-                Err(error) => {
-                    return Err(SessionStoreError::operation(
-                        "create manifest temporary",
-                        &manifest_temporary_path,
-                        error,
-                    ));
-                }
-            };
-            writeln!(manifest, "version=1\nquick_check=ok\n{backup_manifest}")
-                .and_then(|_| manifest.sync_all())
-                .map_err(|error| {
-                    SessionStoreError::operation(
-                        "write backup manifest",
-                        &manifest_temporary_path,
-                        error,
-                    )
-                })?;
-            drop(manifest);
-
-            if let Err(error) = fs::hard_link(&manifest_temporary_path, &manifest_path) {
-                let _ = fs::remove_file(&backup_path);
-                let _ = fs::remove_file(&temporary_path);
-                let _ = fs::remove_file(&manifest_temporary_path);
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    continue;
-                }
-                return Err(SessionStoreError::operation(
-                    "install backup manifest",
-                    &manifest_path,
-                    error,
-                ));
-            }
-            fs::remove_file(&temporary_path)
-                .and_then(|_| fs::remove_file(&manifest_temporary_path))
-                .map_err(|error| {
-                    SessionStoreError::operation("finalize backup", &backup_path, error)
-                })?;
-            migration_fault("after-backup-finalize", &self.database_path)?;
-            fs::File::open(
-                self.database_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".")),
-            )
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| {
-                SessionStoreError::operation("fsync backup parent", &backup_path, error)
-            })?;
-            migration_fault("after-backup-parent-fsync", &self.database_path)?;
-
-            return Ok(backup_path);
-        }
-
-        unreachable!("backup suffixes are unbounded")
     }
 }
 
@@ -661,8 +499,8 @@ impl std::error::Error for PreferenceStoreError {}
 
 /// Runtime state for choices the user expects to outlive a session.
 ///
-/// It is deliberately a separate database from sessions and grants: the preference has no
-/// relationship to either schema, and hand-authored configuration stays untouched.
+/// It shares the unified `agens.db` file with sessions and permission grants, each behind its
+/// own table with no cross-schema relationship; hand-authored configuration stays untouched.
 pub struct PreferenceStore {
     database_path: PathBuf,
     connection: Connection,
@@ -762,34 +600,7 @@ fn valid_preference_model(model: &str) -> bool {
         })
 }
 
-const SESSIONS_DATABASE: &str = "sessions.db";
-const SESSIONS_SCHEMA_VERSION: i64 = 5;
-const COMPLETED_TURNS_COLUMNS: [ExpectedColumnSignature; 1] = [ExpectedColumnSignature::new(
-    0, "id", "INTEGER", false, None, 1,
-)];
-const COMPLETED_TURN_EVENTS_COLUMNS: [ExpectedColumnSignature; 10] = [
-    ExpectedColumnSignature::new(0, "turn_id", "INTEGER", true, None, 1),
-    ExpectedColumnSignature::new(1, "sequence", "INTEGER", true, None, 2),
-    ExpectedColumnSignature::new(2, "kind", "TEXT", true, None, 0),
-    ExpectedColumnSignature::new(3, "state", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(4, "part_kind", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(5, "call_id", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(6, "name", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(7, "input", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(8, "content", "TEXT", false, None, 0),
-    ExpectedColumnSignature::new(9, "is_error", "INTEGER", false, None, 0),
-];
-const COMPLETED_TURN_EVENTS_INDEXES: [ExpectedIndexSignature; 2] = [
-    ExpectedIndexSignature::new(0, "completed_turn_events_turn_sequence", true, "c", false),
-    ExpectedIndexSignature::new(
-        1,
-        "sqlite_autoindex_completed_turn_events_1",
-        true,
-        "pk",
-        false,
-    ),
-];
-const COMPLETED_TURN_EVENTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
+const LEGACY_TURN_EVENTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
     ExpectedIndexColumnSignature::new(0, 0, "turn_id"),
     ExpectedIndexColumnSignature::new(1, 1, "sequence"),
 ];
@@ -879,6 +690,10 @@ impl SessionStoreError {
             message: format!("sessions {operation} at {}: {error}", path.display()),
         }
     }
+
+    fn from_database(error: database::DatabaseError) -> Self {
+        Self::operation(error.operation(), error.path(), error.detail())
+    }
 }
 
 impl fmt::Display for SessionStoreError {
@@ -902,70 +717,10 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, SessionStoreError> {
-        let data_directory = data_directory.as_ref();
-        fs::create_dir_all(data_directory).map_err(|error| {
-            SessionStoreError::operation("create data directory", data_directory, error)
-        })?;
-        restrict_session_permissions(data_directory, 0o700)?;
+        let (database_path, connection) = database::open_unified_database(data_directory.as_ref())
+            .map_err(SessionStoreError::from_database)?;
 
-        let database_path = data_directory.join(SESSIONS_DATABASE);
-        let mut connection = Connection::open(&database_path).map_err(|error| {
-            SessionStoreError::operation("open database", &database_path, error)
-        })?;
-        restrict_session_permissions(&database_path, 0o600)?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| {
-                SessionStoreError::operation("configure busy timeout", &database_path, error)
-            })?;
-        connection
-            .pragma_update(None, "foreign_keys", "ON")
-            .map_err(|error| {
-                SessionStoreError::operation("enable foreign keys", &database_path, error)
-            })?;
-
-        match session_schema_version(&connection, &database_path)? {
-            0 => {
-                initialize_v5_schema(&mut connection, &database_path)?;
-                connection
-                    .pragma_update(None, "journal_mode", "WAL")
-                    .map_err(|error| {
-                        SessionStoreError::operation("enable WAL", &database_path, error)
-                    })?;
-            }
-            1 => {
-                validate_v1_schema(&connection, &database_path)?;
-                let mut store = Self {
-                    database_path: database_path.clone(),
-                    connection,
-                };
-                store.create_verified_v1_backup()?;
-                migrate_v1_on_open(&mut store.connection, &store.database_path)?;
-                migrate_v4_on_open(&mut store.connection, &store.database_path)?;
-                return Ok(store);
-            }
-            2 => {
-                migrate_v2_on_open(&mut connection, &database_path)?;
-                migrate_v4_on_open(&mut connection, &database_path)?;
-            }
-            3 => {
-                migrate_v3_on_open(&mut connection, &database_path)?;
-                migrate_v4_on_open(&mut connection, &database_path)?;
-            }
-            4 => migrate_v4_on_open(&mut connection, &database_path)?,
-            5 => {
-                if validate_v5_schema(&connection, &database_path).is_err() {
-                    migrate_v5_retry_prompt_retention_on_open(&mut connection, &database_path)?;
-                }
-            }
-            unsupported => {
-                return Err(SessionStoreError::operation(
-                    "check schema version",
-                    &database_path,
-                    format!("unsupported schema version {unsupported}"),
-                ));
-            }
-        }
+        validate_v5_schema(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -1224,397 +979,6 @@ fn normalized_session_schema_v5_with_required_terminal_retry_prompts() -> String
     )
 }
 
-fn initialize_v5_schema(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| {
-            SessionStoreError::operation("start v2 initialization", database_path, error)
-        })?;
-    create_legacy_archive_schema(&transaction, database_path)?;
-    transaction
-        .execute_batch(&format!(
-            "{} PRAGMA user_version = {SESSIONS_SCHEMA_VERSION};",
-            normalized_session_schema_v5()
-        ))
-        .map_err(|error| {
-            SessionStoreError::operation("initialize v2 schema", database_path, error)
-        })?;
-    validate_v5_schema(&transaction, database_path)?;
-    transaction.commit().map_err(|error| {
-        SessionStoreError::operation("commit v2 initialization", database_path, error)
-    })
-}
-
-fn migrate_v4_on_open(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| {
-            SessionStoreError::operation("start v4 migration", database_path, error)
-        })?;
-    validate_v4_schema(&transaction, database_path)?;
-    transaction
-        .execute_batch(
-            "CREATE TABLE session_attempts (
-                 id INTEGER PRIMARY KEY,
-                 session_id INTEGER NOT NULL,
-                 sequence INTEGER NOT NULL CHECK(sequence > 0),
-                 status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
-                 failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
-                 retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
-                 started_at INTEGER NOT NULL,
-                 finished_at INTEGER,
-                 completed_turn_sequence INTEGER,
-                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-                 FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
-                 CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
-                       (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
-             );
-             CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
-             CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
-             CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);
-             PRAGMA user_version = 5;",
-        )
-        .map_err(|error| SessionStoreError::operation("migrate v4 schema", database_path, error))?;
-    migration_fault("before-v5-commit", database_path)?;
-    validate_v5_schema(&transaction, database_path)?;
-    transaction
-        .commit()
-        .map_err(|error| SessionStoreError::operation("commit v4 migration", database_path, error))
-}
-
-fn migrate_v5_retry_prompt_retention_on_open(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(
-        connection,
-        database_path,
-        &normalized_session_schema_v5_with_required_terminal_retry_prompts(),
-    )?;
-
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| {
-            SessionStoreError::operation("start v5 retry prompt migration", database_path, error)
-        })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE session_attempts RENAME TO session_attempts_previous;
-             CREATE TABLE session_attempts (
-                 id INTEGER PRIMARY KEY,
-                 session_id INTEGER NOT NULL,
-                 sequence INTEGER NOT NULL CHECK(sequence > 0),
-                 status TEXT NOT NULL CHECK(status IN('running', 'completed', 'cancelled', 'failed', 'provider_error', 'interrupted')),
-                 failure_kind TEXT CHECK(failure_kind IN('cancelled', 'failed', 'provider_error', 'interrupted')),
-                 retry_prompt TEXT CHECK(retry_prompt IS NULL OR (length(CAST(retry_prompt AS BLOB)) BETWEEN 1 AND 65536)),
-                 started_at INTEGER NOT NULL,
-                 finished_at INTEGER,
-                 completed_turn_sequence INTEGER,
-                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-                 FOREIGN KEY(session_id, completed_turn_sequence) REFERENCES turns(session_id, sequence) ON DELETE SET NULL,
-                 CHECK((status = 'running' AND failure_kind IS NULL AND retry_prompt IS NOT NULL AND finished_at IS NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'completed' AND failure_kind IS NULL AND retry_prompt IS NULL AND finished_at IS NOT NULL AND completed_turn_sequence IS NOT NULL) OR
-                       (status = 'cancelled' AND failure_kind = 'cancelled' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'failed' AND failure_kind = 'failed' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'provider_error' AND failure_kind = 'provider_error' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL) OR
-                       (status = 'interrupted' AND failure_kind = 'interrupted' AND finished_at IS NOT NULL AND completed_turn_sequence IS NULL))
-             );
-             INSERT INTO session_attempts
-             SELECT id, session_id, sequence, status, failure_kind, retry_prompt, started_at, finished_at, completed_turn_sequence
-             FROM session_attempts_previous;
-             DROP TABLE session_attempts_previous;
-             CREATE UNIQUE INDEX session_attempts_session_sequence ON session_attempts(session_id, sequence);
-             CREATE UNIQUE INDEX session_attempts_one_running ON session_attempts(session_id) WHERE status = 'running';
-             CREATE INDEX session_attempts_latest ON session_attempts(session_id, sequence DESC, id DESC);",
-        )
-        .map_err(|error| {
-            SessionStoreError::operation("migrate v5 retry prompt retention", database_path, error)
-        })?;
-    validate_v5_schema(&transaction, database_path)?;
-    transaction.commit().map_err(|error| {
-        SessionStoreError::operation("commit v5 retry prompt migration", database_path, error)
-    })
-}
-
-fn migrate_v2_on_open(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| {
-            SessionStoreError::operation("start v2 migration", database_path, error)
-        })?;
-    validate_v2_schema(&transaction, database_path)?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE sessions ADD COLUMN provider_id TEXT
-             CHECK(provider_id <> '' AND length(provider_id) <= 64);
-         ALTER TABLE sessions ADD COLUMN model_id TEXT
-             CHECK(model_id <> '' AND length(model_id) <= 64);
-         ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT
-             CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'));
-         PRAGMA user_version = 4;",
-        )
-        .map_err(|error| SessionStoreError::operation("migrate v2 schema", database_path, error))?;
-    migration_fault("before-v3-commit", database_path)?;
-    validate_v4_schema(&transaction, database_path)?;
-    transaction
-        .commit()
-        .map_err(|error| SessionStoreError::operation("commit v2 migration", database_path, error))
-}
-
-fn migrate_v3_on_open(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    validate_v3_schema(connection, database_path)?;
-    connection
-        .pragma_update(None, "foreign_keys", "OFF")
-        .map_err(|error| {
-            SessionStoreError::operation(
-                "disable foreign keys for v3 migration",
-                database_path,
-                error,
-            )
-        })?;
-
-    let migration = (|| {
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                SessionStoreError::operation("start v3 migration", database_path, error)
-            })?;
-        transaction
-            .execute_batch(
-                "CREATE TABLE sessions_v3_backup AS SELECT * FROM sessions;
-                 DROP TABLE sessions;
-                 CREATE TABLE sessions (
-                     id INTEGER PRIMARY KEY,
-                     project TEXT NOT NULL CHECK(project <> ''),
-                     title TEXT NOT NULL,
-                     active_agent TEXT NOT NULL CHECK(active_agent <> ''),
-                     created_at INTEGER NOT NULL,
-                     updated_at INTEGER NOT NULL,
-                     completed_turn_count INTEGER NOT NULL DEFAULT 0 CHECK(completed_turn_count >= 0),
-                     resumable INTEGER NOT NULL DEFAULT 0 CHECK(resumable IN(0, 1)),
-                     provider_id TEXT CHECK(provider_id <> '' AND length(provider_id) <= 64),
-                     model_id TEXT CHECK(model_id <> '' AND length(model_id) <= 64),
-                     reasoning_effort TEXT CHECK(reasoning_effort IN('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')),
-                     CHECK(resumable = (completed_turn_count > 0))
-                 );
-                 INSERT INTO sessions SELECT * FROM sessions_v3_backup;
-                 DROP TABLE sessions_v3_backup;
-                 CREATE INDEX sessions_list ON sessions(resumable, updated_at DESC, id DESC);
-                 PRAGMA user_version = 4;",
-            )
-            .map_err(|error| {
-                SessionStoreError::operation("migrate v3 schema", database_path, error)
-            })?;
-        migration_fault("before-v4-commit", database_path)?;
-        validate_v4_schema(&transaction, database_path)?;
-        transaction.commit().map_err(|error| {
-            SessionStoreError::operation("commit v3 migration", database_path, error)
-        })
-    })();
-
-    let foreign_keys = connection
-        .pragma_update(None, "foreign_keys", "ON")
-        .map_err(|error| {
-            SessionStoreError::operation(
-                "restore foreign keys after v3 migration",
-                database_path,
-                error,
-            )
-        });
-    migration?;
-    foreign_keys
-}
-
-fn validate_v1_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    let version = connection
-        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| {
-            SessionStoreError::operation("read schema version", database_path, error)
-        })?;
-
-    if version != 1 {
-        return Err(SessionStoreError::operation(
-            "check schema version",
-            database_path,
-            format!("unsupported schema version {version}"),
-        ));
-    }
-
-    let completed_turns_matches =
-        table_matches(connection, "completed_turns", &COMPLETED_TURNS_COLUMNS)
-            .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
-    let completed_turn_events_matches = table_matches(
-        connection,
-        "completed_turn_events",
-        &COMPLETED_TURN_EVENTS_COLUMNS,
-    )
-    .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
-    let foreign_key_matches = completed_turn_events_foreign_key_matches(connection)
-        .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
-    let indexes_match = completed_turn_events_indexes_match(connection)
-        .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
-    let completed_turns_indexes_match = completed_turns_indexes_match(connection)
-        .map_err(|error| SessionStoreError::operation("verify schema", database_path, error))?;
-
-    if !(completed_turns_matches
-        && completed_turn_events_matches
-        && foreign_key_matches
-        && indexes_match
-        && completed_turns_indexes_match)
-    {
-        return Err(SessionStoreError::operation(
-            "verify schema",
-            database_path,
-            "incompatible sessions schema",
-        ));
-    }
-
-    Ok(())
-}
-
-fn session_schema_version(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<i64, SessionStoreError> {
-    connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| SessionStoreError::operation("read schema version", database_path, error))
-}
-
-fn migrate_v1_on_open(
-    connection: &mut Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| {
-            SessionStoreError::operation("start v1 migration", database_path, error)
-        })?;
-
-    create_legacy_archive_schema(&transaction, database_path)?;
-    copy_legacy_turns(&transaction, database_path)?;
-    copy_legacy_turn_events(&transaction, database_path)?;
-    migration_fault("during-mutation", database_path)?;
-    validate_legacy_archive(&transaction, database_path)?;
-    finalize_v2_migration(&transaction, database_path)?;
-    migration_fault("before-commit", database_path)?;
-    transaction.commit().map_err(|error| {
-        SessionStoreError::operation("commit v1 migration", database_path, error)
-    })?;
-    migration_fault("after-commit-before-reopen", database_path)?;
-
-    let reopened = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| {
-            SessionStoreError::operation("reopen v2 migration", database_path, error)
-        })?;
-    validate_v4_schema(&reopened, database_path)
-}
-
-fn migration_fault(point: &str, database_path: &Path) -> Result<(), SessionStoreError> {
-    let fault_path = PathBuf::from(format!("{}.migration-fault", database_path.display()));
-    let injected = fs::read_to_string(&fault_path)
-        .map(|value| value.trim() == point)
-        .unwrap_or(false);
-
-    if injected {
-        return Err(SessionStoreError::operation(
-            "inject migration fault",
-            database_path,
-            point,
-        ));
-    }
-
-    Ok(())
-}
-
-fn create_legacy_archive_schema(
-    transaction: &Transaction<'_>,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    transaction
-        .execute_batch(
-            "CREATE TABLE legacy_turns (
-                 id INTEGER PRIMARY KEY,
-                 status TEXT NOT NULL CHECK(status = 'non_resumable'),
-                 reason TEXT NOT NULL,
-                 source_event_count INTEGER NOT NULL CHECK(source_event_count >= 0)
-             );
-             CREATE TABLE legacy_turn_events (
-                 turn_id INTEGER NOT NULL,
-                 sequence INTEGER NOT NULL,
-                 kind TEXT NOT NULL,
-                 state TEXT,
-                 part_kind TEXT,
-                 call_id TEXT,
-                 name TEXT,
-                 input TEXT,
-                 content TEXT,
-                 is_error INTEGER,
-                 PRIMARY KEY(turn_id, sequence),
-                 FOREIGN KEY(turn_id) REFERENCES legacy_turns(id) ON DELETE CASCADE
-             );
-             CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
-                 ON legacy_turn_events(turn_id, sequence);",
-        )
-        .map_err(|error| {
-            SessionStoreError::operation("create legacy archive", database_path, error)
-        })
-}
-
-fn copy_legacy_turns(
-    transaction: &Transaction<'_>,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    transaction
-        .execute(
-            "INSERT INTO legacy_turns(id, status, reason, source_event_count)
-             SELECT turns.id, 'non_resumable',
-                    'v1 lacks session/user/project/title/agent/timestamps',
-                    count(events.turn_id)
-             FROM completed_turns turns
-             LEFT JOIN completed_turn_events events ON events.turn_id = turns.id
-             GROUP BY turns.id",
-            [],
-        )
-        .map_err(|error| SessionStoreError::operation("copy legacy turns", database_path, error))?;
-    Ok(())
-}
-
-fn copy_legacy_turn_events(
-    transaction: &Transaction<'_>,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    transaction
-        .execute(
-            "INSERT INTO legacy_turn_events
-             SELECT turn_id, sequence, kind, state, part_kind, call_id, name, input, content, is_error
-             FROM completed_turn_events ORDER BY turn_id, sequence",
-            [],
-        )
-        .map_err(|error| SessionStoreError::operation("copy legacy turn events", database_path, error))?;
-    Ok(())
-}
-
 fn validate_legacy_archive(
     connection: &Connection,
     database_path: &Path,
@@ -1720,49 +1084,6 @@ fn validate_legacy_archive(
     }
 }
 
-fn finalize_v2_migration(
-    transaction: &Transaction<'_>,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    transaction
-        .execute_batch(&format!(
-            "{}
-                 DROP TABLE completed_turn_events;
-              DROP TABLE completed_turns;
-              PRAGMA user_version = 4;",
-            normalized_session_schema_v4()
-        ))
-        .map_err(|error| {
-            SessionStoreError::operation("finalize v1 migration", database_path, error)
-        })?;
-
-    validate_v4_schema(transaction, database_path)
-}
-
-fn validate_v2_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, NORMALIZED_SESSION_SCHEMA_V2)
-}
-
-fn validate_v3_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v3())
-}
-
-fn validate_v4_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), SessionStoreError> {
-    validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v4())
-}
-
 fn validate_v5_schema(
     connection: &Connection,
     database_path: &Path,
@@ -1863,35 +1184,6 @@ fn table_matches(
         ))
 }
 
-fn completed_turn_events_foreign_key_matches(connection: &Connection) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare("PRAGMA foreign_key_list('completed_turn_events')")?;
-    let keys = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(matches!(
-        keys.as_slice(),
-        [(0, 0, table, from, to, on_update, on_delete, matching)]
-            if table == "completed_turns"
-                && from == "turn_id"
-                && to == "id"
-                && on_update == "NO ACTION"
-                && on_delete == "NO ACTION"
-                && matching == "NONE"
-    ))
-}
-
 fn legacy_turn_events_foreign_key_matches(connection: &Connection) -> rusqlite::Result<bool> {
     let mut statement = connection.prepare("PRAGMA foreign_key_list('legacy_turn_events')")?;
     let keys = statement
@@ -1919,14 +1211,6 @@ fn legacy_turn_events_foreign_key_matches(connection: &Connection) -> rusqlite::
                 && on_delete == "CASCADE"
                 && matching == "NONE"
     ))
-}
-
-fn completed_turn_events_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
-    indexes_match(
-        connection,
-        "completed_turn_events",
-        &COMPLETED_TURN_EVENTS_INDEXES,
-    )
 }
 
 fn indexes_match(
@@ -1973,8 +1257,8 @@ fn indexes_match(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        if columns.len() != COMPLETED_TURN_EVENTS_INDEX_COLUMNS.len()
-            || !columns.iter().zip(COMPLETED_TURN_EVENTS_INDEX_COLUMNS).all(
+        if columns.len() != LEGACY_TURN_EVENTS_INDEX_COLUMNS.len()
+            || !columns.iter().zip(LEGACY_TURN_EVENTS_INDEX_COLUMNS).all(
                 |((sequence, column_id, name), expected)| {
                     *sequence == expected.sequence
                         && *column_id == expected.column_id
@@ -1995,58 +1279,6 @@ fn legacy_turn_events_indexes_match(connection: &Connection) -> rusqlite::Result
         "legacy_turn_events",
         &LEGACY_TURN_EVENTS_INDEXES,
     )
-}
-
-fn completed_turns_indexes_match(connection: &Connection) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare("PRAGMA index_list('completed_turns')")?;
-    let indexes = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(indexes.is_empty())
-}
-
-fn v1_manifest(connection: &Connection) -> rusqlite::Result<String> {
-    let mut statement = connection.prepare(
-        "SELECT 'schema|' || type || '|' || name || '|' || quote(sql)
-         FROM sqlite_schema WHERE type IN ('index', 'table') AND name LIKE 'completed_turn%'
-          UNION ALL SELECT 'turn_count|' || count(*) FROM completed_turns
-          UNION ALL SELECT 'event_count|' || count(*) FROM completed_turn_events
-          UNION ALL SELECT 'completed_turns|' || id FROM completed_turns
-          UNION ALL SELECT 'completed_turn_events|' || turn_id || '|' || sequence || '|' ||
-             quote(kind) || '|' || quote(state) || '|' || quote(part_kind) || '|' ||
-             quote(call_id) || '|' || quote(name) || '|' || quote(input) || '|' ||
-             quote(content) || '|' || quote(is_error)
-         FROM completed_turn_events ORDER BY 1",
-    )?;
-    let lines = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    Ok(lines.join("\n"))
-}
-
-fn verify_v1_backup(
-    source_manifest: &str,
-    backup: &Connection,
-    backup_path: &Path,
-) -> Result<String, SessionStoreError> {
-    let quick_check: String = backup
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|error| SessionStoreError::operation("quick check backup", backup_path, error))?;
-    validate_v1_schema(backup, backup_path)?;
-    let backup_manifest = v1_manifest(backup)
-        .map_err(|error| SessionStoreError::operation("read backup", backup_path, error))?;
-
-    if quick_check != "ok" || backup_manifest != source_manifest {
-        return Err(SessionStoreError::operation(
-            "verify backup",
-            backup_path,
-            "backup does not match the v1 snapshot",
-        ));
-    }
-
-    Ok(backup_manifest)
 }
 
 fn insert_legacy_turn_event(
@@ -2340,85 +1572,10 @@ fn decode_turn_state(value: Option<&str>) -> Result<TurnState, &'static str> {
     }
 }
 
-#[cfg(unix)]
-fn restrict_session_permissions(path: &Path, maximum_mode: u32) -> Result<(), SessionStoreError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = fs::metadata(path)
-        .map_err(|error| SessionStoreError::operation("inspect permissions", path, error))?;
-    let current_mode = metadata.mode() & 0o777;
-    let restricted_mode = current_mode & maximum_mode;
-
-    if restricted_mode != current_mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(restricted_mode))
-            .map_err(|error| SessionStoreError::operation("restrict permissions", path, error))?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_session_permissions(_: &Path, _: u32) -> Result<(), SessionStoreError> {
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use agens_core::Usage;
-
-    fn create_v1_fixture(connection: &Connection) {
-        connection
-            .execute_batch(
-                "CREATE TABLE completed_turns (id INTEGER PRIMARY KEY);
-                 CREATE TABLE completed_turn_events (
-                     turn_id INTEGER NOT NULL,
-                     sequence INTEGER NOT NULL,
-                     kind TEXT NOT NULL,
-                     state TEXT,
-                     part_kind TEXT,
-                     call_id TEXT,
-                     name TEXT,
-                     input TEXT,
-                     content TEXT,
-                     is_error INTEGER,
-                     PRIMARY KEY (turn_id, sequence),
-                     FOREIGN KEY (turn_id) REFERENCES completed_turns(id)
-                 );
-                 CREATE UNIQUE INDEX completed_turn_events_turn_sequence
-                 ON completed_turn_events(turn_id, sequence);
-                 PRAGMA user_version = 1;
-                 INSERT INTO completed_turns(id) VALUES(7), (8);
-                 INSERT INTO completed_turn_events
-                 VALUES(7, 1, 'provider_part', NULL, 'text', NULL, NULL, NULL,
-                        'original', NULL);",
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn rejects_tampered_v1_backup_content_and_eventless_turn_id() {
-        let source = Connection::open_in_memory().unwrap();
-        let backup = Connection::open_in_memory().unwrap();
-        create_v1_fixture(&source);
-        create_v1_fixture(&backup);
-
-        let source_manifest = v1_manifest(&source).unwrap();
-        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_ok());
-
-        backup
-            .execute("UPDATE completed_turn_events SET content = 'tampered'", [])
-            .unwrap();
-        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_err());
-
-        backup
-            .execute("UPDATE completed_turn_events SET content = 'original'", [])
-            .unwrap();
-        backup
-            .execute("UPDATE completed_turns SET id = 9 WHERE id = 8", [])
-            .unwrap();
-        assert!(verify_v1_backup(&source_manifest, &backup, Path::new("backup.db")).is_err());
-    }
 
     #[test]
     fn ignores_usage_events_when_converting_completed_history() {

@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 agens-core = { path = "../agens-core" }
-rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde_json = "1.0.150"
 
 [dev-dependencies]

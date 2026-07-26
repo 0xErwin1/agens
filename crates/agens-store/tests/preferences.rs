@@ -43,7 +43,14 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(ids, vec!["0001_permission_grants", "0002_model_preference"]);
+    assert_eq!(
+        ids,
+        vec![
+            "0001_permission_grants",
+            "0002_model_preference",
+            "0003_sessions_v5"
+        ]
+    );
     drop(connection);
 
     let mut reopened = PreferenceStore::open(&directory).unwrap();

@@ -834,7 +834,7 @@ fn sessions_list_uses_configured_data_directory_and_reports_empty_store() {
 
     assert_eq!(result.status, ExitStatus::Success);
     assert_eq!(result.stdout, "No saved sessions.\n");
-    assert!(data_directory.join("sessions.db").is_file());
+    assert!(data_directory.join("agens.db").is_file());
 }
 
 #[test]
@@ -1492,7 +1492,7 @@ fn injected_shutdown_cancels_headless_chat_with_deterministic_output_and_no_sess
         result.stderr,
         "error: cancelled: headless turn was cancelled\n"
     );
-    assert!(!data_directory.join("sessions.db").exists());
+    assert!(!data_directory.join("agens.db").exists());
 }
 
 #[test]
@@ -1683,7 +1683,7 @@ fn production_task_consolidates_durable_sessions_catalog_skills_and_isolation() 
         "No saved sessions.\n"
     );
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
             "SENTINEL_PROVIDER_ERROR",
@@ -2024,9 +2024,9 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
         &config_home,
         "parent task cancellation",
     );
-    assert_sqlite_has_interrupted_turn(&data_directory.join("sessions.db"));
+    assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
             "SENTINEL_PROVIDER_ERROR",
@@ -2089,7 +2089,7 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
     assert_no_saved_sessions(&temporary, &project_root, &config_home);
     assert_output_and_store_exclude_sentinels(
         &output,
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
             "SENTINEL_PROVIDER_ERROR",
@@ -2154,7 +2154,7 @@ fn production_binary_runs_chatgpt_subscription_without_an_api_key_and_persists_t
     );
     assert!(!diagnostics.contains("SENTINEL_CHATGPT_REFRESH"));
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &["SENTINEL_CHATGPT_REFRESH"],
     );
 
@@ -2238,7 +2238,7 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
             "error: auth: ChatGPT credentials are unavailable or invalid\n",
         );
         assert!(!format!("{output:?}").contains("SENTINEL"), "{name}");
-        assert!(data_directory.join("sessions.db").is_file(), "{name}");
+        assert!(data_directory.join("agens.db").is_file(), "{name}");
     }
 }
 
@@ -2322,7 +2322,7 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
                 "SENTINEL_CHATGPT_ERROR_BODY",
             ],
         );
-        assert!(data_directory.join("sessions.db").is_file(), "{name}");
+        assert!(data_directory.join("agens.db").is_file(), "{name}");
 
         server.join();
     }
@@ -2412,7 +2412,7 @@ fn production_binary_replays_chatgpt_native_and_mcp_tool_results_once() {
             .ends_with("\tprimary\t1\n")
         );
         assert_sqlite_has_no_sentinels(
-            &data_directory.join("sessions.db"),
+            &data_directory.join("agens.db"),
             &["SENTINEL_CHATGPT_TOOL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
         );
 
@@ -2471,9 +2471,9 @@ fn production_binary_cancels_chatgpt_subscription_without_persisting_a_turn() {
         &config_home,
         "cancel subscription request",
     );
-    assert_sqlite_has_interrupted_turn(&data_directory.join("sessions.db"));
+    assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &["SENTINEL_CHATGPT_CANCEL_ACCESS", "SENTINEL_CHATGPT_REFRESH"],
     );
 
@@ -3385,7 +3385,7 @@ fn production_binary_cancellation_has_deterministic_output_exit_and_no_persisten
         &config_home,
         "cancel production request",
     );
-    assert_sqlite_has_interrupted_turn(&data_directory.join("sessions.db"));
+    assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
 
     server.join();
 }
@@ -3436,7 +3436,7 @@ fn production_binary_sanitizes_remote_response_headers_and_body() {
             "SENTINEL_REMOTE_ERROR_BODY",
         ],
     );
-    assert!(data_directory.join("sessions.db").is_file());
+    assert!(data_directory.join("agens.db").is_file());
 
     server.join();
 }
@@ -3589,7 +3589,7 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
         );
     }
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
             "SENTINEL_MCP_PROTOCOL",
@@ -3743,17 +3743,14 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
     );
     assert!(!format!("{session:?}").contains("SENTINEL_MCP_REMOTE_BODY"));
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &[
             "SENTINEL_OPENAI_API_KEY",
             "SENTINEL_MCP_REMOTE_BODY",
             "SENTINEL_MCP_STDERR",
         ],
     );
-    assert_sqlite_contains_sentinels(
-        &data_directory.join("sessions.db"),
-        &["SENTINEL_MCP_ARGUMENT"],
-    );
+    assert_sqlite_contains_sentinels(&data_directory.join("agens.db"), &["SENTINEL_MCP_ARGUMENT"]);
 
     server.join();
 }
@@ -3834,11 +3831,11 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
         !matches!(part, MessagePart::ToolResult { content, .. } if content.contains("SENTINEL_NATIVE_OUTPUT"))
     }));
     assert_sqlite_has_no_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &["SENTINEL_OPENAI_API_KEY"],
     );
     assert_sqlite_contains_sentinels(
-        &data_directory.join("sessions.db"),
+        &data_directory.join("agens.db"),
         &["SENTINEL_NATIVE_ARGUMENT"],
     );
 
@@ -3891,10 +3888,10 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
                 &config_home,
                 "run broken MCP tool",
             );
-            assert_sqlite_has_interrupted_turn(&data_directory.join("sessions.db"));
+            assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
         } else {
             assert_no_saved_sessions(&temporary, &project_root, &config_home);
-            assert_sqlite_has_terminal_attempt_without_history(&data_directory.join("sessions.db"));
+            assert_sqlite_has_terminal_attempt_without_history(&data_directory.join("agens.db"));
         }
 
         server.join();

@@ -949,7 +949,7 @@ mod tests {
     fn failed_subagent_turn_persistence_publishes_a_runtime_error() {
         let temporary = tui_session_directory("subagent-persistence-failure");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        std::fs::create_dir_all(bootstrap.data_directory().join("sessions.db")).unwrap();
+        std::fs::create_dir_all(bootstrap.data_directory().join("agens.db")).unwrap();
         let (events, receiver) = BridgeTx::bounded(4);
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())

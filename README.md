@@ -119,11 +119,11 @@ Inspect resolved paths and validation status with:
 
 Credentials live in `auth.json` under the selected config home. `OPENAI_API_KEY` takes precedence for the OpenAI API provider. ChatGPT OAuth writes only its own provider entry and preserves other entries.
 
-Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.local/share}/agens`:
+Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.local/share}/agens` in a single `agens.db` SQLite file:
 
-- `sessions.db` stores completed turn events.
-- `permissions.db` stores project-scoped permission grants.
-- `preferences.db` stores the last model and reasoning effort chosen in the terminal UI. A new session reuses them only when neither a CLI flag nor configuration names a model.
+- Sessions and completed turn events.
+- Project-scoped permission grants.
+- The last model and reasoning effort chosen in the terminal UI. A new session reuses them only when neither a CLI flag nor configuration names a model.
 
 Credential and runtime-state directories/files are created with restrictive Unix permissions. CLI diagnostics and transport errors are designed to avoid exposing secret values. Native filesystem operations are confined beneath the project root, and process tools remain permission-gated and bounded.
 

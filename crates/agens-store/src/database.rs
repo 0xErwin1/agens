@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 2] = [
+const MIGRATIONS: [Migration; 3] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -60,6 +60,10 @@ const MIGRATIONS: [Migration; 2] = [
     Migration {
         id: "0002_model_preference",
         ddl: model_preference_ddl,
+    },
+    Migration {
+        id: "0003_sessions_v5",
+        ddl: sessions_v5_ddl,
     },
 ];
 
@@ -243,6 +247,42 @@ fn model_preference_ddl() -> String {
     );
     "
     .to_owned()
+}
+
+/// The archive tables that hold session history predating the normalized `sessions`/`turns`
+/// schema. Every unified database creates them empty; `SessionStore::list_completed_turns` and
+/// `load_completed_turn_for_resume` still read them, so migration 0003 must keep creating them
+/// verbatim rather than dropping them as unused.
+const LEGACY_ARCHIVE_SCHEMA: &str = "
+    CREATE TABLE legacy_turns (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL CHECK(status = 'non_resumable'),
+        reason TEXT NOT NULL,
+        source_event_count INTEGER NOT NULL CHECK(source_event_count >= 0)
+    );
+    CREATE TABLE legacy_turn_events (
+        turn_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        state TEXT,
+        part_kind TEXT,
+        call_id TEXT,
+        name TEXT,
+        input TEXT,
+        content TEXT,
+        is_error INTEGER,
+        PRIMARY KEY(turn_id, sequence),
+        FOREIGN KEY(turn_id) REFERENCES legacy_turns(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX legacy_turn_events_turn_sequence
+        ON legacy_turn_events(turn_id, sequence);
+";
+
+fn sessions_v5_ddl() -> String {
+    format!(
+        "{LEGACY_ARCHIVE_SCHEMA}{}",
+        crate::normalized_session_schema_v5()
+    )
 }
 
 #[cfg(unix)]
