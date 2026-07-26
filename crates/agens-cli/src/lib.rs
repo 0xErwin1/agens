@@ -82,7 +82,7 @@ use agens_tools::TaskTerminalState;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_tools::ToolDispatcher;
-use agens_tools::{AgentCatalog, AgentModelValidator, CommandCatalog, ReadFileInput, SkillCatalog};
+use agens_tools::{AgentCatalog, AgentModelValidator, CommandCatalog, SkillCatalog};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -236,6 +236,7 @@ use tools::child::{ChildRunError, TaskMailboxProvider};
 use tools::runner::{
     ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge, map_task_turn_error,
 };
+use tools::runtime::production_tool_runtime;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -243,7 +244,6 @@ use tools::runtime::{
     native_tool_limits, production_child_tool_runtime, production_dangerous_child_tool_runtime,
     production_tool_runtime_with_task_runner, task_execution_limits,
 };
-use tools::runtime::{open_native_tools, production_tool_runtime};
 use tools::task::default_model;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -265,6 +265,12 @@ use tui::engine::{run_tui_prompt, run_tui_prompt_with};
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tui::extensions::{start_tui_commands, start_tui_skills};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use tui::files::{
+    expand_tui_file_reference, tui_file_candidates_with_limit, tui_picker_file_candidates,
+};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -304,6 +310,7 @@ pub use bootstrap::{Bootstrap, bootstrap};
 pub use error::{CliError, CommandResult, ExitStatus};
 pub use headless::HeadlessChatRequest;
 pub use model_registry::{TuiModelSelector, TuiModelSource};
+pub use tui::files::tui_file_candidates;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
@@ -586,83 +593,6 @@ fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap:
     if let Some(project_root) = bootstrap.project_root() {
         tui.set_project(project_root.display().to_string());
     }
-}
-
-const TUI_SELECT_FILE_LIMIT: usize = 100;
-/// Hard cap on `@` picker entries: enumeration is one bounded walk of the
-/// project root, kept in memory for the whole session so no keystroke and no
-/// frame ever touches the filesystem.
-const TUI_PICKER_FILE_LIMIT: usize = 2_000;
-
-pub fn tui_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
-    tui_file_candidates_with_limit(bootstrap, TUI_SELECT_FILE_LIMIT)
-}
-
-fn tui_picker_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
-    tui_file_candidates_with_limit(bootstrap, TUI_PICKER_FILE_LIMIT)
-}
-
-/// Bounded, ignore-aware project files read through the confined native tools,
-/// so no candidate can ever name a path outside the project root.
-fn tui_file_candidates_with_limit(
-    bootstrap: &Bootstrap,
-    limit: usize,
-) -> Result<Vec<String>, CliError> {
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    open_native_tools(project_root, bootstrap.tool_limits())?
-        .tui_file_candidates(limit)
-        .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
-}
-
-fn selected_tui_file(bootstrap: &Bootstrap, selection: &str) -> Result<String, CliError> {
-    if selection.is_empty() || selection.chars().count() > 121 {
-        return Err(CliError::usage("selected file is invalid"));
-    }
-
-    tui_select_candidates(bootstrap)?
-        .into_iter()
-        .find(|candidate| candidate == selection)
-        .ok_or_else(|| CliError::usage("selected file is unavailable"))
-}
-
-fn tui_select_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
-    Ok(tui_file_candidates(bootstrap)?
-        .into_iter()
-        .filter(|path| path.chars().count() <= 121)
-        .take(64)
-        .collect())
-}
-
-fn expand_tui_file_reference(bootstrap: &Bootstrap, prompt: &str) -> Result<String, CliError> {
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let tools = open_native_tools(project_root, bootstrap.tool_limits())?;
-    let mut expanded = String::with_capacity(prompt.len());
-
-    for segment in prompt.split_inclusive(char::is_whitespace) {
-        let token = segment.trim_end_matches(char::is_whitespace);
-        let whitespace = &segment[token.len()..];
-        if let Some(path) = token.strip_prefix('@').filter(|path| !path.is_empty()) {
-            let output = tools
-                .read_file(ReadFileInput::new(path))
-                .map_err(|_| CliError::new(ExitStatus::Failure, "file", "read failed"))?;
-            if output.is_error {
-                return Err(CliError::new(ExitStatus::Failure, "file", output.content));
-            }
-            expanded.push_str(&format!(
-                "<file path=\"{path}\">\n{}\n</file>",
-                output.content
-            ));
-        } else {
-            expanded.push_str(token);
-        }
-        expanded.push_str(whitespace);
-    }
-
-    Ok(expanded)
 }
 
 fn complete_tui_turn(

@@ -30,15 +30,16 @@ use crate::tools::task::{
     production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
 };
 use crate::tui::extensions::{start_tui_commands, start_tui_skills};
+use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::provider::TuiCredentialResolver;
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::session::{ResumeDraft, TuiSessionContext};
 use crate::{
     Bootstrap, complete_tui_turn, configure_tui_project_identity, ensure_active_tui_agent_runtime,
-    expand_tui_file_reference, parent_skill_system_prompt, persist_pending_agent_correction,
-    report_tui_extension_collisions, resume_tui_session, resumed_subagent_cards,
-    seed_remembered_tui_selection, tui_picker_file_candidates, tui_session_presentation,
+    parent_skill_system_prompt, persist_pending_agent_correction, report_tui_extension_collisions,
+    resume_tui_session, resumed_subagent_cards, seed_remembered_tui_selection,
+    tui_session_presentation,
 };
 
 pub(crate) struct ProductionTuiEngine {
