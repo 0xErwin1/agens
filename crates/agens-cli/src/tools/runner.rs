@@ -589,3 +589,603 @@ pub(crate) fn map_task_turn_error(error: HeadlessTurnError) -> TaskRunnerError {
         _ => TaskRunnerError::ChildFailure,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{
+        PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+        PermissionSession,
+    };
+    use agens_store::SessionStore;
+    use agens_tools::{
+        SkillCatalog, TaskTerminalState, ToolDispatchRequest, ToolEvaluationOutcome,
+        ToolExecutionContext,
+    };
+    use agens_tui::TuiPermissionReply;
+
+    use super::*;
+    use crate::CliError;
+    use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
+    use crate::permissions::production_tui_permission_bridge;
+    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+    use crate::tools::task::production_tui_task_runtime_with_runner;
+
+    #[test]
+    fn production_task_error_mapping_reserves_provider_for_provider_failures() {
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::MaxIterations),
+            TaskRunnerError::IterationLimit
+        );
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::Provider),
+            TaskRunnerError::ProviderFailure
+        );
+        assert_eq!(
+            map_task_turn_error(HeadlessTurnError::Tool),
+            TaskRunnerError::ChildFailure
+        );
+    }
+
+    #[test]
+    fn p1c1_terminal_observer_excludes_non_completed_matrix() {
+        for (label, terminal) in [
+            ("cancelled", Some(TaskTerminalState::Cancelled)),
+            ("timed-out", Some(TaskTerminalState::Failed)),
+            ("incomplete", None),
+            ("failed", Some(TaskTerminalState::Failed)),
+        ] {
+            let temporary = tui_session_directory(&format!("p1c1-{label}"));
+            let bootstrap = tui_session_bootstrap(
+                &temporary,
+                &[(
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                )],
+            );
+            let (events, _receiver) = BridgeTx::bounded(8);
+            let controls = TuiTaskControls::default();
+            let session = Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }));
+            let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+                .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+            let mut runtime = production_tui_task_runtime_with_runner(
+                &bootstrap,
+                &SkillCatalog::default(),
+                production_tui_permission_bridge().0,
+                ProductionTaskRunner::with_probe(
+                    bootstrap.clone(),
+                    bootstrap.project_root().unwrap().to_path_buf(),
+                    Arc::new(Mutex::new(Vec::new())),
+                )
+                .with_lifecycle_bridge(lifecycle_bridge),
+            )
+            .unwrap();
+            runtime.authorized.gate.policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            );
+            let cancellation = HeadlessTurnCancellation::new();
+            let worker_session = Arc::clone(&session);
+            let worker_cancellation = cancellation.clone();
+            let worker = std::thread::spawn(move || {
+                launch_selected_tui_task(
+                    &mut runtime,
+                    &worker_session,
+                    "review task",
+                    false,
+                    &worker_cancellation,
+                )
+            });
+            let lifecycle = (0..100)
+                .find_map(|_| {
+                    let lifecycle = controls
+                        .0
+                        .lifecycle(agens_tools::TaskExecutionId::from_value(1));
+                    if lifecycle.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    lifecycle
+                })
+                .expect("running task should be observed");
+
+            assert!(session.lock().unwrap().identifier.is_none());
+            assert!(lifecycle.transition_to_background());
+            assert!(session.lock().unwrap().identifier.is_none());
+            if let Some(terminal) = terminal {
+                assert!(lifecycle.finish(terminal));
+            }
+            if label == "failed" {
+                assert!(!lifecycle.finish(TaskTerminalState::Completed));
+            }
+
+            cancellation.cancel();
+            let _ = worker.join().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+
+            assert!(session.lock().unwrap().identifier.is_none());
+            assert!(
+                SessionStore::open(bootstrap.data_directory())
+                    .unwrap()
+                    .list_sessions()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn u15_a1b2_selected_launch_uses_the_registered_production_task_runner() {
+        let temporary = tui_session_directory("selected-task-launch");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let (bridge, requests) = production_tui_permission_bridge();
+        let reply_bridge = bridge.clone();
+        let reply = std::thread::spawn(move || {
+            let request = requests
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("selected task should request permission");
+            reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
+        });
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            bridge,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let cancellation = HeadlessTurnCancellation::new();
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let mut dispatcher = runtime.dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::task",
+                    serde_json::json!({
+                        "agent": "reviewer",
+                        "description": "model task",
+                        "background": true,
+                    }),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("registered model task should authorize");
+        };
+        assert_eq!(
+            dispatcher
+                .execute(
+                    handle,
+                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+                )
+                .unwrap()
+                .content,
+            "Subagent #1 running in background"
+        );
+        drop(dispatcher);
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.len(), 2);
+        assert_eq!(probe[0].1, TaskLaunchMode::Background);
+        assert_eq!(probe[1].1, TaskLaunchMode::Foreground);
+        assert_ne!(probe[0].0, probe[1].0);
+        assert!(reply.join().unwrap());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
+        let temporary = tui_session_directory("p1b-child-events");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let (events, receiver) = BridgeTx::bounded(16);
+        let controls = TuiTaskControls::default();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls)
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_progress_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+                vec![
+                    TurnEvent::ProviderPart(MessagePart::Reasoning("inspect".into())),
+                    TurnEvent::ProviderPart(MessagePart::Text("partial".into())),
+                    TurnEvent::ToolCallRequested {
+                        id: "read-1".into(),
+                        name: "native::read".into(),
+                        input: format!("authorization {}", "x".repeat(300)),
+                    },
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        tool_call_id: "read-1".into(),
+                        content: format!("token {}", "y".repeat(300)),
+                        is_error: false,
+                    }),
+                ],
+            )
+            .with_lifecycle_bridge(lifecycle_bridge),
+        )
+        .unwrap();
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &session, "review task", false, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+
+        let mut received = Vec::new();
+        for _ in 0..8 {
+            match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                Ok(event) => received.push(event.into_parts().1),
+                Err(error) => {
+                    panic!("child event should reach the TUI bridge: {received:?}: {error}")
+                }
+            }
+        }
+        assert_eq!(
+            received,
+            vec![
+                TuiRuntimeEvent::TaskExecution {
+                    agent: "reviewer".into(),
+                    event: TuiExecutionEvent::ForegroundStarted { id: 1 },
+                },
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+                    1,
+                    "reviewer",
+                    "review task",
+                    agens_tui::TuiExecutionState::ForegroundRunning,
+                )),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(1, "partial")),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_call(
+                    1,
+                    "read-1",
+                    "native::read",
+                    "[redacted]",
+                )),
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::tool_result(
+                    1,
+                    "read-1",
+                    "[redacted]",
+                    false,
+                )),
+                TuiRuntimeEvent::TaskExecution {
+                    agent: "reviewer".into(),
+                    event: TuiExecutionEvent::Completed { id: 1 },
+                },
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
+                    1,
+                    TuiSubagentStatus::Success,
+                    "probe",
+                )),
+            ]
+        );
+        assert_eq!(probe.lock().unwrap().len(), 1);
+        let session_id = (0..100)
+            .find_map(|_| {
+                let identifier = session.lock().unwrap().identifier;
+                if identifier.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                identifier
+            })
+            .expect("completed terminal should persist exactly one durable turn");
+        let stored = SessionStore::open(bootstrap.data_directory())
+            .unwrap()
+            .load_session_for_resume(session_id)
+            .unwrap();
+        assert_eq!(stored.metadata.completed_turn_count, 1);
+        assert_eq!(stored.messages.len(), 3);
+        assert_eq!(
+            stored.messages[2].parts[0],
+            MessagePart::ToolResult {
+                tool_call_id: "subagent:1".into(),
+                content: "probe".into(),
+                is_error: false,
+            }
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn failed_subagent_turn_persistence_publishes_a_runtime_error() {
+        let temporary = tui_session_directory("subagent-persistence-failure");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        std::fs::create_dir_all(bootstrap.data_directory().join("sessions.db")).unwrap();
+        let (events, receiver) = BridgeTx::bounded(4);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let persist = bridge
+            .persist_completed
+            .clone()
+            .expect("session writer should be installed");
+
+        persist(CompletedSubagentTurn {
+            id: 7,
+            agent: "reviewer".into(),
+            task: "review task".into(),
+            final_result: "done".into(),
+            tool_uses: 1,
+        });
+
+        assert_eq!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("persistence failure should reach the TUI bridge")
+                .into_parts()
+                .1,
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
+                7,
+                TuiSubagentErrorKind::Runtime,
+            ))
+        );
+        assert!(session.lock().unwrap().identifier.is_none());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn production_runner_error_publication_orders_sanitized_typed_failure_before_terminal() {
+        for (
+            source,
+            expected_error,
+            expected_kind,
+            expected_execution,
+            expected_status,
+            expected_result,
+        ) in [
+            (
+                ChildRunError::Authentication,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Authentication),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Context,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Context),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Network,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Network),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Provider,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Provider),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Protocol,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Protocol),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::RateLimited,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::RateLimited),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Rejected,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Rejected),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Server,
+                TaskRunnerError::ProviderFailure,
+                Some(TuiSubagentErrorKind::Server),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Tool,
+                TaskRunnerError::ChildFailure,
+                Some(TuiSubagentErrorKind::Tool),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Runtime,
+                TaskRunnerError::ChildFailure,
+                Some(TuiSubagentErrorKind::Runtime),
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+            (
+                ChildRunError::Cancelled,
+                TaskRunnerError::Cancelled,
+                None,
+                TuiExecutionEvent::Cancelled { id: 1 },
+                TuiSubagentStatus::Cancelled,
+                "cancelled",
+            ),
+            (
+                ChildRunError::TimedOut,
+                TaskRunnerError::TimedOut,
+                None,
+                TuiExecutionEvent::Failed { id: 1 },
+                TuiSubagentStatus::Failure,
+                "failed",
+            ),
+        ] {
+            let temporary = tui_session_directory("runner-error-publication");
+            let bootstrap = tui_session_bootstrap(
+                &temporary,
+                &[(
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                )],
+            );
+            let (events, receiver) = BridgeTx::bounded(8);
+            let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default());
+            let mut runtime = production_tui_task_runtime_with_runner(
+                &bootstrap,
+                &SkillCatalog::default(),
+                production_tui_permission_bridge().0,
+                ProductionTaskRunner::with_failure_probe(
+                    bootstrap.clone(),
+                    bootstrap.project_root().unwrap().to_path_buf(),
+                    source,
+                    "provider-token=super-secret-error-detail",
+                )
+                .with_lifecycle_bridge(lifecycle_bridge),
+            )
+            .unwrap();
+            runtime.authorized.gate.policy = PermissionPolicy::new(
+                PermissionMode::Edit,
+                vec![PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::Exact("native::task".into()),
+                    PermissionPattern::Any,
+                )],
+            );
+            let session = Arc::new(Mutex::new(TuiSessionContext {
+                selected_subagent: Some("reviewer".into()),
+                ..TuiSessionContext::fresh()
+            }));
+
+            assert_eq!(
+                launch_selected_tui_task(
+                    &mut runtime,
+                    &session,
+                    "review task",
+                    false,
+                    &HeadlessTurnCancellation::new(),
+                ),
+                Err(CliError::runtime(HeadlessTurnError::Tool))
+            );
+
+            let mut expected = vec![
+                TuiRuntimeEvent::TaskExecution {
+                    agent: "reviewer".into(),
+                    event: TuiExecutionEvent::ForegroundStarted { id: 1 },
+                },
+                TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+                    1,
+                    "reviewer",
+                    "review task",
+                    agens_tui::TuiExecutionState::ForegroundRunning,
+                )),
+            ];
+            if let Some(kind) = expected_kind {
+                expected.push(TuiRuntimeEvent::SubagentExecution(
+                    TuiSubagentEvent::error_with_reference(1, kind, "abc12345"),
+                ));
+            }
+            expected.push(TuiRuntimeEvent::TaskExecution {
+                agent: "reviewer".into(),
+                event: expected_execution,
+            });
+            expected.push(TuiRuntimeEvent::SubagentExecution(
+                TuiSubagentEvent::terminal(1, expected_status, expected_result),
+            ));
+
+            let received = (0..expected.len())
+                .map(|_| {
+                    receiver
+                        .recv_timeout(std::time::Duration::from_secs(1))
+                        .expect("runner failure should publish every bridge event")
+                        .into_parts()
+                        .1
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(received, expected);
+            assert!(
+                received
+                    .iter()
+                    .all(|event| !format!("{event:?}").contains("super-secret"))
+            );
+            assert!(
+                receiver
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                    .is_err(),
+                "runner failure must publish exactly one terminal"
+            );
+            assert_eq!(expected_error, source.task_runner_error());
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+}

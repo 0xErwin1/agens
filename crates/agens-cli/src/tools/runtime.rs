@@ -349,3 +349,350 @@ pub(crate) fn is_dangerous_child_native_tool(name: &str) -> bool {
         name == *registered || name == registered.strip_prefix("native::").unwrap_or_default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use agens_core::{
+        HeadlessTurnCancellation, PermissionDecision, PermissionMode, PermissionPattern,
+        PermissionPolicy, PermissionRule, PermissionSession,
+    };
+    use agens_tools::{
+        TaskExecutionRegistry, TaskLaunchMode, TaskRunContext, TaskRunner, TaskRunnerError,
+        TaskTurnRequest, TaskTurnResult, ToolDispatchRequest, ToolEvaluationOutcome,
+        ToolExecutionContext,
+    };
+
+    use super::*;
+    use crate::test_support::{
+        bootstrap_from_configuration, tui_session_bootstrap, tui_session_bootstrap_for_provider,
+        tui_session_directory,
+    };
+    use crate::tui::agents::task_model_catalog;
+
+    #[test]
+    fn configured_tool_limits_reach_the_native_tool_runtime() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-tool-limits",
+            Some(
+                "[tools]\nmax_list_entries = 5\nmax_search_entries = 6\nmax_search_results = 7\nmax_search_depth = 8\noperation_timeout_ms = 900\nbash_timeout_ms = 1500\n",
+            ),
+            None,
+        );
+
+        let limits = native_tool_limits(bootstrap.tool_limits());
+
+        assert_eq!(limits.max_list_entries, 5);
+        assert_eq!(limits.max_search_entries, 6);
+        assert_eq!(limits.max_search_results, 7);
+        assert_eq!(limits.max_search_depth, 8);
+        assert_eq!(
+            limits.operation_timeout,
+            std::time::Duration::from_millis(900)
+        );
+        assert_eq!(limits.bash_timeout, std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn default_configuration_keeps_the_runtime_tool_limits_unchanged() {
+        let bootstrap = bootstrap_from_configuration("config-tool-defaults", None, None);
+
+        assert_eq!(
+            native_tool_limits(bootstrap.tool_limits()),
+            agens_tools::NativeToolLimits::default()
+        );
+    }
+
+    #[test]
+    fn configured_subagent_limits_bound_the_task_registry() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-subagent-limits",
+            Some("[subagents]\nmax_iterations = 3\nmax_concurrency = 1\nmax_output_chars = 2048\n"),
+            None,
+        );
+
+        let registry =
+            TaskExecutionRegistry::with_limits(task_execution_limits(bootstrap.subagent_limits()));
+
+        assert_eq!(registry.limits().max_iterations, 3);
+        assert_eq!(registry.limits().max_output_chars, 2_048);
+        assert!(registry.admit(TaskLaunchMode::Background).is_some());
+        assert!(registry.admit(TaskLaunchMode::Background).is_none());
+    }
+
+    #[test]
+    fn default_configuration_keeps_the_runtime_subagent_limits_unchanged() {
+        let bootstrap = bootstrap_from_configuration("config-subagent-defaults", None, None);
+
+        assert_eq!(
+            task_execution_limits(bootstrap.subagent_limits()),
+            agens_tools::TaskExecutionLimits::default()
+        );
+    }
+
+    #[test]
+    fn dangerous_child_catalog_is_exact_and_never_recursive() {
+        let temporary = tui_session_directory("dangerous-child-catalog");
+        let project_root = temporary.join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let (provider_tools, dispatcher) =
+            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
+                .unwrap();
+        let provider_names = provider_tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_names,
+            [
+                "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch",
+            ]
+        );
+
+        let dispatcher = dispatcher.lock().unwrap();
+        for name in [
+            "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch",
+        ] {
+            assert_eq!(
+                dispatcher.canonical_identity(name),
+                dispatcher.canonical_identity(&format!("native::{name}")),
+                "{name} must have one native dispatcher identity"
+            );
+        }
+        for rejected in [
+            "task",
+            "native::task",
+            "skill",
+            "native::skill",
+            "files::first",
+            "native::unregistered",
+        ] {
+            assert_eq!(
+                dispatcher.canonical_identity(rejected),
+                None,
+                "{rejected} must be rejected before execution"
+            );
+            assert!(
+                dispatcher
+                    .evaluate(
+                        &PermissionPolicy::new(
+                            PermissionMode::Edit,
+                            vec![PermissionRule::global(
+                                PermissionDecision::Allow,
+                                PermissionPattern::Any,
+                                PermissionPattern::Any,
+                            )],
+                        ),
+                        &[],
+                        &PermissionSession::new(),
+                        ToolDispatchRequest::new("project", rejected, serde_json::json!({})),
+                    )
+                    .is_err(),
+                "{rejected} must fail dispatcher evaluation before execution"
+            );
+        }
+        drop(dispatcher);
+
+        let task_registry = TaskExecutionRegistry::new();
+        let execution_id = task_registry.admit(TaskLaunchMode::Foreground).unwrap();
+        let (mode_off_tools, mode_off_dispatcher) = production_child_tool_runtime(
+            &project_root,
+            ToolLimitSettings::default(),
+            false,
+            task_registry,
+            execution_id,
+        )
+        .unwrap();
+        assert_eq!(
+            mode_off_tools
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>(),
+            ["read", "task_control", "task_message"]
+        );
+        assert!(
+            mode_off_dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::read")
+                .is_some()
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn production_task_catalog_includes_built_ins_and_dispatches_requested_call() {
+        struct RecordingTaskRunner(Arc<Mutex<Vec<(String, TaskLaunchMode)>>>);
+
+        impl TaskRunner for RecordingTaskRunner {
+            fn run(
+                &self,
+                request: TaskTurnRequest,
+                context: &TaskRunContext,
+            ) -> Result<TaskTurnResult, TaskRunnerError> {
+                self.0.lock().unwrap().push((
+                    request.agent_name().to_owned(),
+                    context.execution().unwrap().mode(),
+                ));
+                Ok(TaskTurnResult {
+                    output: request.description().to_owned(),
+                    iterations: 1,
+                })
+            }
+        }
+
+        let temporary = tui_session_directory("conditional-task-catalog");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[
+                (
+                    "alpha",
+                    "---\nname: alpha\ndescription: default\nmode: subagent\npermissions: []\n---\nDefault work.\n",
+                ),
+                (
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: review\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                ),
+            ],
+        );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+            &bootstrap,
+            bootstrap.project_root().unwrap(),
+            Some(&SkillCatalog::default()),
+            RecordingTaskRunner(Arc::clone(&calls)),
+        )
+        .unwrap();
+        let task = provider_tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("eligible catalog should expose task");
+        assert_eq!(
+            task.description(),
+            "Dispatch an isolated eligible subagent task in the foreground or background"
+        );
+        assert_eq!(
+            task.parameters()["properties"]["agent"]["enum"],
+            serde_json::json!(["alpha", "explore", "general", "reviewer"])
+        );
+        assert_eq!(
+            task.parameters()["properties"]["model"]["enum"],
+            serde_json::json!(task_model_catalog(&bootstrap).unwrap())
+        );
+        let task_schema = task.parameters().to_string();
+        assert!(task_schema.contains("Explore the codebase without modifying files"));
+        assert!(task_schema.contains("Handle a general delegated coding task"));
+        assert!(!task_schema.contains("You are the read-only exploration subagent"));
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+        let context = ToolExecutionContext::from_headless_adapter(cancellation.adapter_view());
+        let mut dispatcher = dispatcher.lock().unwrap();
+        for arguments in [
+            serde_json::json!({"agent":"reviewer","background":true,"description":"selected"}),
+            serde_json::json!({"description":"default"}),
+        ] {
+            let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+                .evaluate(
+                    &policy,
+                    &[],
+                    &PermissionSession::new(),
+                    ToolDispatchRequest::new("project", "task", arguments),
+                )
+                .unwrap()
+            else {
+                panic!("provider task call should authorize");
+            };
+            dispatcher.execute(handle, &context).unwrap();
+        }
+        drop(dispatcher);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                ("reviewer".to_owned(), TaskLaunchMode::Background),
+                ("alpha".to_owned(), TaskLaunchMode::Foreground),
+            ]
+        );
+
+        for provider in ["openai-api", "openai-chatgpt"] {
+            let provider_temporary = tui_session_directory(provider);
+            let bootstrap =
+                tui_session_bootstrap_for_provider(&provider_temporary, &[], provider, "gpt-4.1");
+            let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+                &bootstrap,
+                bootstrap.project_root().unwrap(),
+                Some(&SkillCatalog::default()),
+                RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
+            )
+            .unwrap();
+
+            let task = provider_tools
+                .iter()
+                .find(|tool| tool.name() == "task")
+                .expect("built-in subagents should expose task for both providers");
+            assert_eq!(
+                task.parameters()["properties"]["agent"]["enum"],
+                serde_json::json!(["explore", "general"])
+            );
+            assert_eq!(
+                task.parameters()["properties"]["model"]["enum"],
+                serde_json::json!(task_model_catalog(&bootstrap).unwrap())
+            );
+            assert!(
+                task.parameters()["properties"]["model"]["enum"]
+                    .as_array()
+                    .is_some_and(|models| !models.is_empty() && models.len() <= 256)
+            );
+            assert!(
+                dispatcher
+                    .lock()
+                    .unwrap()
+                    .canonical_identity("native::task")
+                    .is_some()
+            );
+
+            std::fs::remove_dir_all(provider_temporary).unwrap();
+        }
+
+        let override_temporary = tui_session_directory("overridden-built-ins");
+        let bootstrap = tui_session_bootstrap(
+            &override_temporary,
+            &[
+                (
+                    "explore",
+                    "---\nname: explore\ndescription: primary override\nmode: primary\npermissions: []\n---\nPrimary work.\n",
+                ),
+                (
+                    "general",
+                    "---\nname: general\ndescription: all override\nmode: all\npermissions: []\n---\nAll work.\n",
+                ),
+            ],
+        );
+        let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
+            &bootstrap,
+            bootstrap.project_root().unwrap(),
+            Some(&SkillCatalog::default()),
+            RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
+        )
+        .unwrap();
+
+        assert!(provider_tools.iter().all(|tool| tool.name() != "task"));
+        let dispatcher = dispatcher.lock().unwrap();
+        assert_eq!(dispatcher.canonical_identity("task"), None);
+        assert_eq!(dispatcher.canonical_identity("native::task"), None);
+        drop(dispatcher);
+        std::fs::remove_dir_all(override_temporary).unwrap();
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}

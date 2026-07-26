@@ -393,3 +393,189 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
         std::future::ready(Ok(PermissionDecision::Deny))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use agens_tools::TaskLaunchMode;
+    use agens_tui::BridgeTx;
+
+    use super::*;
+    use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
+    use crate::permissions::production_tui_permission_bridge;
+    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+    use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
+    use crate::tools::task::production_tui_task_runtime_with_runner;
+    use crate::tui::session::{TuiSessionContext, current_session_timestamp};
+
+    struct RecordingMailboxProvider {
+        queued: Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    impl TurnProvider for RecordingMailboxProvider {
+        fn queue_user_messages(
+            &mut self,
+            messages: Vec<Message>,
+        ) -> Result<(), HeadlessTurnPortError> {
+            self.queued.lock().unwrap().push(messages);
+            Ok(())
+        }
+
+        async fn next_parts(
+            &mut self,
+            _: &[TurnEvent],
+            _: &HeadlessTurnCancellation,
+        ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+            Ok(vec![MessagePart::Text("ok".into())])
+        }
+    }
+
+    #[test]
+    fn task_mailbox_provider_injects_typed_user_messages_only_at_request_safe_points() {
+        let registry = TaskExecutionRegistry::new();
+        let id = registry.admit(TaskLaunchMode::Background).unwrap();
+        registry
+            .send_message(
+                TaskMessageSource::Main,
+                TaskMessageTarget::Execution(id),
+                "first".into(),
+            )
+            .unwrap();
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TaskMailboxProvider::new(
+            RecordingMailboxProvider {
+                queued: Arc::clone(&queued),
+            },
+            Some(registry.clone()),
+            TaskMessageTarget::Execution(id),
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+        registry
+            .send_message(
+                TaskMessageSource::User,
+                TaskMessageTarget::Execution(id),
+                "second".into(),
+            )
+            .unwrap();
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+
+        let queued = queued.lock().unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0][0].role, Role::User);
+        assert_eq!(
+            queued[0][0].parts,
+            [MessagePart::Text(
+                "[coordination source=main untrusted=true]\nfirst".into()
+            )]
+        );
+        assert_eq!(
+            queued[1][0].parts,
+            [MessagePart::Text(
+                "[coordination source=user untrusted=true]\nsecond".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
+        let temporary = tui_session_directory("subagent-completion-notice");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let (events, _receiver) = BridgeTx::bounded(16);
+        let controls = TuiTaskControls::default();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+        let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
+            .with_session_writer(bootstrap.clone(), Arc::clone(&session));
+        let mut runtime = production_tui_task_runtime_with_runner(
+            &bootstrap,
+            &agens_tools::SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_progress_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::new(Mutex::new(Vec::new())),
+                Vec::new(),
+            )
+            .with_lifecycle_bridge(lifecycle_bridge),
+        )
+        .unwrap();
+        runtime.authorized.gate.policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let cancellation = HeadlessTurnCancellation::new();
+        let launched_at = current_session_timestamp();
+
+        assert_eq!(
+            launch_selected_tui_task(&mut runtime, &session, "review task", true, &cancellation),
+            Ok(TuiSelectedTaskLaunch::Dispatched)
+        );
+        (0..100)
+            .find_map(|_| {
+                let identifier = session.lock().unwrap().identifier;
+                if identifier.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                identifier
+            })
+            .expect("a completed background subagent persists one durable turn");
+
+        let queued = Arc::new(Mutex::new(Vec::new()));
+        let mut provider = TaskMailboxProvider::new(
+            RecordingMailboxProvider {
+                queued: Arc::clone(&queued),
+            },
+            Some(controls.0.clone()),
+            TaskMessageTarget::Main,
+        );
+        block_on_headless_turn(provider.next_parts(&[], &cancellation))
+            .unwrap()
+            .unwrap();
+
+        let queued = queued.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].len(), 1);
+        assert_eq!(queued[0][0].role, Role::User);
+        let [MessagePart::Text(notice)] = queued[0][0].parts.as_slice() else {
+            panic!("a mailbox notice is text: {:?}", queued[0][0].parts)
+        };
+        let (label, detail) = notice
+            .split_once('\n')
+            .expect("mailbox notices are labelled untrusted");
+        assert_eq!(label, "[coordination source=subagent:1 untrusted=true]");
+        let completed_at = detail
+            .split_once("completed_at=")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("the notice states when the subagent finished");
+        assert!(completed_at >= launched_at);
+        assert_eq!(
+            detail,
+            format!(
+                "subagent #1 (reviewer) finished with state=completed completed_at={completed_at} \
+                 (unix seconds). The full result is recorded in this session history; run \
+                 task_control action=status id=1 for the recorded outcome."
+            )
+        );
+
+        drop(queued);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}

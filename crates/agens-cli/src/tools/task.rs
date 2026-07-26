@@ -268,3 +268,97 @@ pub(crate) fn default_model(bootstrap: &Bootstrap) -> &'static str {
         _ => "gpt-4.1",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use agens_core::{
+        HeadlessTurnCancellation, PermissionDecision, PermissionPattern, PermissionPolicy,
+        PermissionRule,
+    };
+    use agens_tools::{
+        TaskLaunchMode, ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext,
+    };
+
+    use super::*;
+    use crate::permissions::production_tui_permission_bridge;
+    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+
+    #[test]
+    fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {
+        let temporary = tui_session_directory("production-task-runtime");
+        let mut bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        bootstrap.model = Some("gpt-5.6-sol".into());
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        let runtime = production_tui_task_runtime_with_runner_and_parent_config(
+            &bootstrap,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            ProductionTaskRunner::with_probe(
+                bootstrap.clone(),
+                bootstrap.project_root().unwrap().to_path_buf(),
+                Arc::clone(&probe),
+            ),
+            agens_core::RequestConfig::with_reasoning_effort("high").unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            runtime
+                .provider_tools
+                .iter()
+                .any(|tool| tool.name() == "task")
+        );
+        let mut dispatcher = runtime.dispatcher.lock().unwrap();
+        assert_eq!(
+            dispatcher.canonical_identity("task"),
+            dispatcher.canonical_identity("native::task")
+        );
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::task",
+                    serde_json::json!({"agent":"reviewer","description":"probe"}),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("registered task should authorize");
+        };
+        let cancellation = HeadlessTurnCancellation::new();
+        let output = dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+            )
+            .unwrap();
+        assert_eq!(output.content, "probe");
+        let probe = probe.lock().unwrap();
+        assert_eq!(probe.len(), 1);
+        assert_eq!(probe[0].1, TaskLaunchMode::Foreground);
+        assert_eq!(probe[0].2, "gpt-5.6-sol");
+        assert_eq!(probe[0].3, Some(agens_core::ReasoningEffort::High));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}
