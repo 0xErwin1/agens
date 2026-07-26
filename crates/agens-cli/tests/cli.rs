@@ -494,10 +494,9 @@ fn help_and_version_are_successful_without_bootstrapping_configuration() {
             .contains("Usage: agens [OPTIONS] [COMMAND]\n")
     );
     assert_eq!(chat_help.status, ExitStatus::Success);
-    assert!(
-        chat_help
-            .stdout
-            .contains("Usage: agens chat [OPTIONS] [PROMPT]...\n")
+    assert_eq!(
+        chat_help.stdout,
+        "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n"
     );
     assert_eq!(version.status, ExitStatus::Success);
     assert_eq!(version.stdout, "agens 0.1.0\n");
@@ -1025,20 +1024,33 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
         BTreeMap::new(),
     );
 
-    for arguments in [
-        ["config", "doctor", "--help"].as_slice(),
-        ["auth", "status", "--help"].as_slice(),
-        ["auth", "login", "--help"].as_slice(),
-        ["auth", "logout", "--help"].as_slice(),
-        ["models", "--help"].as_slice(),
-        ["sessions", "list", "--help"].as_slice(),
-        ["sessions", "show", "--help"].as_slice(),
-        ["sessions", "rm", "--help"].as_slice(),
+    // `config`/`auth`/`sessions` render the SAME generic usage line for
+    // every one of their own subcommands' `--help` (matching the
+    // historical `.any(is_help)` precedent that never distinguished which
+    // subcommand asked); only `models` has no nested subcommands of its
+    // own. Each rendering therefore has a known, exact expected text —
+    // `starts_with("Usage: agens ")` cannot hold post-clap because every
+    // rendering now leads with an `about` line before the `Usage:` block.
+    const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  \n  login   \n  logout  \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    const MODELS_HELP: &str =
+        "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
+    const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  \n  show  \n  rm    \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+
+    for (arguments, expected) in [
+        (["config", "doctor", "--help"].as_slice(), CONFIG_HELP),
+        (["auth", "status", "--help"].as_slice(), AUTH_HELP),
+        (["auth", "login", "--help"].as_slice(), AUTH_HELP),
+        (["auth", "logout", "--help"].as_slice(), AUTH_HELP),
+        (["models", "--help"].as_slice(), MODELS_HELP),
+        (["sessions", "list", "--help"].as_slice(), SESSIONS_HELP),
+        (["sessions", "show", "--help"].as_slice(), SESSIONS_HELP),
+        (["sessions", "rm", "--help"].as_slice(), SESSIONS_HELP),
     ] {
         let result = execute(arguments, &dependencies);
 
         assert_eq!(result.status, ExitStatus::Success, "{arguments:?}");
-        assert!(result.stdout.contains("Usage: agens "), "{arguments:?}");
+        assert_eq!(result.stdout, expected, "{arguments:?}");
     }
 }
 
