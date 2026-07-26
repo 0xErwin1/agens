@@ -28,6 +28,7 @@ use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGpt
 use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::TuiModelSelector;
+use crate::resolve_provider_type;
 use crate::session::attempt::active_session_attempts;
 use crate::tools::task::default_model;
 use crate::tui::agents::{
@@ -45,15 +46,15 @@ use crate::tui::provider::{
     ChatGptCredentialSnapshot, TuiCredentialResolver, TuiProvider, TuiProviderStatus,
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
+use crate::tui::resume::{
+    commit_tui_session_resume, load_tui_session_for_resume, prepare_loaded_tui_session_resume,
+    resume_tui_session, tui_project_identifier,
+};
 use crate::tui::session::{
     TuiSessionContext, current_session_timestamp, parse_recovery_action,
     recovery_confirmation_dialog, reset_tui_session, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
-use crate::{
-    commit_tui_session_resume, load_tui_session_for_resume, prepare_loaded_tui_session_resume,
-    resolve_provider_type, resume_tui_session, tui_project_identifier,
-};
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 

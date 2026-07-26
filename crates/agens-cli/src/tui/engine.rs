@@ -35,13 +35,15 @@ use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::models::seed_remembered_tui_selection;
 use crate::tui::provider::TuiCredentialResolver;
+use crate::tui::resume::{
+    ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
+};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::session::{ResumeDraft, TuiSessionContext};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
 use crate::{
-    Bootstrap, configure_tui_project_identity, ensure_active_tui_agent_runtime,
-    parent_skill_system_prompt, report_tui_extension_collisions, resume_tui_session,
-    resumed_subagent_cards,
+    Bootstrap, configure_tui_project_identity, parent_skill_system_prompt,
+    report_tui_extension_collisions,
 };
 
 pub(crate) struct ProductionTuiEngine {

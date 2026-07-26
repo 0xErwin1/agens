@@ -6,6 +6,7 @@ pub(crate) mod files;
 pub(crate) mod metrics;
 pub(crate) mod models;
 pub(crate) mod provider;
+pub(crate) mod resume;
 pub(crate) mod router;
 pub(crate) mod session;
 pub(crate) mod turn;

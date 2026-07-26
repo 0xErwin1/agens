@@ -13,13 +13,13 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::bootstrap::Bootstrap;
 use crate::diagnostics::record_agent_diagnostic;
-use crate::ensure_active_tui_agent_runtime;
 use crate::error::CliError;
 use crate::model_registry::{TuiModelSelector, TuiModelSource};
 use crate::tools::runtime::production_tool_runtime;
 use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::provider::TuiProvider;
+use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::session::{
     AgentRotationError, TuiSessionContext, current_session_timestamp, rotate_active_agent,
 };
