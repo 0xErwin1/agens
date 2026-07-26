@@ -406,7 +406,10 @@ mod tests {
                 "call-1",
                 "exit 1".into(),
                 true,
-                Some(agens_core::ToolResultFacts::Bash { exit_code: Some(1) }),
+                Some(agens_core::ToolResultFacts::Bash {
+                    outcome: agens_core::ToolOutcome::Failed,
+                    exit_code: Some(1),
+                }),
             )
             .unwrap();
         let facts_event = facts_source

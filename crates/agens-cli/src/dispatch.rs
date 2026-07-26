@@ -393,12 +393,13 @@ mod tests {
     use crate::tui::agents::select_tui_subagent;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
     use crate::tui::session::TuiSessionContext;
-    use agens_core::ToolResultFacts;
+    use agens_core::{ToolOutcome, ToolResultFacts};
     use std::path::Path;
 
     #[test]
     fn sanitized_tool_failure_keeps_its_facts() {
         let output = ToolOutput::failure("bash: exit 127").with_facts(ToolResultFacts::Bash {
+            outcome: ToolOutcome::Failed,
             exit_code: Some(127),
         });
 
@@ -411,6 +412,7 @@ mod tests {
         assert_eq!(
             converted.facts,
             Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Failed,
                 exit_code: Some(127)
             })
         );

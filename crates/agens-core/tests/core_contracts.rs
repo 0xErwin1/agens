@@ -7,8 +7,8 @@ use agens_core::{
     AttemptKey, CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
     CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, PermissionDecision,
     PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest, PermissionRule,
-    PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolResultFacts, TurnCoordinator,
-    TurnEvent, TurnEventError, TurnState, TurnTransitionError,
+    PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolOutcome, ToolResultFacts,
+    TurnCoordinator, TurnEvent, TurnEventError, TurnState, TurnTransitionError, WriteMagnitude,
 };
 
 #[derive(Default)]
@@ -759,7 +759,10 @@ fn completed_turn_with_tool_result_facts_still_persists_and_validates() {
             "call-1",
             "exit 1".into(),
             true,
-            Some(ToolResultFacts::Bash { exit_code: Some(1) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Failed,
+                exit_code: Some(1),
+            }),
         )
         .unwrap();
     coordinator
@@ -787,7 +790,13 @@ fn completed_turn_with_tool_result_facts_still_persists_and_validates() {
             assert_eq!(identity.attempt_id, None);
             assert_eq!(identity.sequence, 1);
             assert_eq!(identity.dispatch_id, None);
-            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(1) });
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Bash {
+                    outcome: ToolOutcome::Failed,
+                    exit_code: Some(1)
+                }
+            );
         }
         other => panic!("expected a facts event immediately after the tool result, got {other:?}"),
     }
@@ -857,7 +866,10 @@ fn persisted_history_containing_tool_result_facts_is_rejected() {
             "call-1",
             "exit 0".into(),
             false,
-            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            }),
         )
         .unwrap();
     let facts_event = facts_source
@@ -926,7 +938,12 @@ fn accept_tool_result_orders_facts_between_result_and_state_change() {
             false,
             Some(ToolResultFacts::Write {
                 path: "a.txt".into(),
-                bytes_written: 3,
+                outcome: ToolOutcome::Succeeded,
+                written: Some(WriteMagnitude {
+                    is_new_file: true,
+                    bytes_written: 3,
+                    lines_written: 1,
+                }),
             }),
         )
         .unwrap();
@@ -951,7 +968,12 @@ fn accept_tool_result_orders_facts_between_result_and_state_change() {
                 *facts,
                 ToolResultFacts::Write {
                     path: "a.txt".into(),
-                    bytes_written: 3,
+                    outcome: ToolOutcome::Succeeded,
+                    written: Some(WriteMagnitude {
+                        is_new_file: true,
+                        bytes_written: 3,
+                        lines_written: 1,
+                    }),
                 }
             );
         }
@@ -1006,7 +1028,10 @@ fn rejected_tool_result_with_facts_emits_nothing() {
             "call-1",
             "result".into(),
             false,
-            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            }),
         ),
         Err(TurnEventError::UnexpectedToolResult {
             tool_call_id: "call-1".into(),
@@ -1045,7 +1070,10 @@ fn multiple_tool_calls_keep_each_facts_event_with_its_own_result() {
             "call-2",
             "exit 2".into(),
             true,
-            Some(ToolResultFacts::Bash { exit_code: Some(2) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Failed,
+                exit_code: Some(2),
+            }),
         )
         .unwrap();
 
@@ -1065,7 +1093,13 @@ fn multiple_tool_calls_keep_each_facts_event_with_its_own_result() {
             assert_eq!(identity.attempt_id, None);
             assert_eq!(identity.sequence, 1);
             assert_eq!(identity.dispatch_id, None);
-            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(2) });
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Bash {
+                    outcome: ToolOutcome::Failed,
+                    exit_code: Some(2)
+                }
+            );
         }
         other => panic!("expected a facts event, got {other:?}"),
     }
@@ -1094,7 +1128,10 @@ fn fact_identity_defaults_to_none_for_a_freshly_constructed_coordinator() {
             "call-1",
             "exit 0".into(),
             false,
-            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            }),
         )
         .unwrap();
 
@@ -1132,7 +1169,10 @@ fn coordinator_for_attempt_fills_identity_with_session_and_attempt_ids() {
             "call-1",
             "exit 0".into(),
             false,
-            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            }),
         )
         .unwrap();
 
@@ -1172,7 +1212,10 @@ fn fact_sequence_is_monotonic_and_gap_free_across_three_calls_in_one_turn() {
                 id,
                 "exit 0".into(),
                 false,
-                Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+                Some(ToolResultFacts::Bash {
+                    outcome: ToolOutcome::Succeeded,
+                    exit_code: Some(0),
+                }),
             )
             .unwrap();
     }
@@ -1298,7 +1341,12 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
             false,
             Some(ToolResultFacts::Write {
                 path: "a.txt".into(),
-                bytes_written: 11,
+                outcome: ToolOutcome::Succeeded,
+                written: Some(WriteMagnitude {
+                    is_new_file: true,
+                    bytes_written: 11,
+                    lines_written: 1,
+                }),
             }),
         )
         .unwrap();
@@ -1307,7 +1355,10 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
             "call-b",
             "exit 0".into(),
             false,
-            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            }),
         )
         .unwrap();
 
@@ -1331,7 +1382,12 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
                 *facts,
                 ToolResultFacts::Write {
                     path: "a.txt".into(),
-                    bytes_written: 11,
+                    outcome: ToolOutcome::Succeeded,
+                    written: Some(WriteMagnitude {
+                        is_new_file: true,
+                        bytes_written: 11,
+                        lines_written: 1,
+                    }),
                 }
             );
         }
@@ -1352,7 +1408,13 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
             assert_eq!(identity.attempt_id, None);
             assert_eq!(identity.sequence, 2);
             assert_eq!(identity.dispatch_id, None);
-            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(0) });
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Bash {
+                    outcome: ToolOutcome::Succeeded,
+                    exit_code: Some(0)
+                }
+            );
         }
         other => panic!("expected call-b's facts event, got {other:?}"),
     }

@@ -17,9 +17,9 @@ use std::{
 };
 
 use agens_core::{
-    Error, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter, PermissionDecision,
-    PermissionPolicy, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
-    ToolResultFacts,
+    EditMagnitude, Error, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
+    PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
+    ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -3773,14 +3773,20 @@ impl NativeTools {
         ));
 
         match result {
-            Ok(()) => {
+            Ok(is_new_file) => {
                 let bytes_written = input.content.len();
+                let lines_written = input.content.lines().count();
 
                 Ok(
                     ToolOutput::success(format!("wrote {}", input.path.display())).with_facts(
                         ToolResultFacts::Write {
                             path: input.path.display().to_string(),
-                            bytes_written,
+                            outcome: ToolOutcome::Succeeded,
+                            written: Some(WriteMagnitude {
+                                is_new_file,
+                                bytes_written,
+                                lines_written,
+                            }),
                         },
                     ),
                 )
@@ -4291,7 +4297,13 @@ impl NativeTools {
         let output = wait_for_readers(stdout_reader, stderr_reader)
             .map_err(|_| Error::Tool("bash: output reader failed".into()))?;
 
+        let outcome = if status.success() {
+            ToolOutcome::Succeeded
+        } else {
+            ToolOutcome::Failed
+        };
         let facts = ToolResultFacts::Bash {
+            outcome,
             exit_code: status.code(),
         };
 
@@ -4996,7 +5008,7 @@ fn write_file_confined(
     path: &Path,
     content: &[u8],
     context: Option<&ToolExecutionContext>,
-) -> Result<(), ToolOutput> {
+) -> Result<bool, ToolOutput> {
     use std::{
         ffi::CString,
         os::fd::{AsRawFd, FromRawFd},
@@ -5061,7 +5073,7 @@ fn write_file_confined(
             libc::unlinkat(directory.as_raw_fd(), temp_name.as_ptr(), 0);
         }
     }
-    result
+    result.map(|()| existing.is_none())
 }
 
 #[cfg(unix)]
@@ -5107,8 +5119,11 @@ fn edit_file_confined(
     Ok(
         ToolOutput::success(diff.text).with_facts(ToolResultFacts::Edit {
             path: path.display().to_string(),
-            lines_added: diff.lines_added,
-            lines_removed: diff.lines_removed,
+            outcome: ToolOutcome::Succeeded,
+            changed: Some(EditMagnitude {
+                lines_added: diff.lines_added,
+                lines_removed: diff.lines_removed,
+            }),
         }),
     )
 }
@@ -5285,11 +5300,11 @@ mod native_tool_tests {
     }
 
     #[test]
-    fn write_reports_relative_path_and_byte_count() {
+    fn write_reports_a_comparable_magnitude_for_a_new_file() {
         let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
-        let body = "café \u{1F600}";
+        let body = "café \u{1F600}\nsecond line";
 
         let output = tools
             .write_file(WriteFileInput::new("notes.txt", body))
@@ -5300,9 +5315,36 @@ mod native_tool_tests {
             output.facts(),
             Some(&ToolResultFacts::Write {
                 path: "notes.txt".into(),
-                bytes_written: body.len(),
+                outcome: ToolOutcome::Succeeded,
+                written: Some(WriteMagnitude {
+                    is_new_file: true,
+                    bytes_written: body.len(),
+                    lines_written: 2,
+                }),
             })
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overwriting_an_existing_file_is_distinguishable_from_creating_one() {
+        let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
+        let root = project_root();
+        fs::write(root.join("notes.txt"), "before").unwrap();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let output = tools
+            .write_file(WriteFileInput::new("notes.txt", "after"))
+            .unwrap();
+
+        assert!(!output.is_error);
+        match output.facts() {
+            Some(ToolResultFacts::Write { written, .. }) => {
+                assert_eq!(written.map(|written| written.is_new_file), Some(false));
+            }
+            other => panic!("expected write facts, got {other:?}"),
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -5333,8 +5375,11 @@ mod native_tool_tests {
             output.facts(),
             Some(&ToolResultFacts::Edit {
                 path: "notes.txt".into(),
-                lines_added: 3,
-                lines_removed: 1,
+                outcome: ToolOutcome::Succeeded,
+                changed: Some(EditMagnitude {
+                    lines_added: 3,
+                    lines_removed: 1,
+                }),
             })
         );
         assert_eq!(diff_added, 3);
@@ -5344,11 +5389,14 @@ mod native_tool_tests {
     }
 
     #[test]
-    fn bash_reports_its_exit_code() {
+    fn bash_reports_its_exit_code_and_outcome() {
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
 
-        for (command, expected) in [("exit 0", 0), ("exit 3", 3)] {
+        for (command, expected_code, expected_outcome) in [
+            ("exit 0", 0, ToolOutcome::Succeeded),
+            ("exit 3", 3, ToolOutcome::Failed),
+        ] {
             let output = tools
                 .bash(BashInput::new(command).with_timeout(Duration::from_secs(5)))
                 .unwrap();
@@ -5356,7 +5404,8 @@ mod native_tool_tests {
             assert_eq!(
                 output.facts(),
                 Some(&ToolResultFacts::Bash {
-                    exit_code: Some(expected)
+                    outcome: expected_outcome,
+                    exit_code: Some(expected_code)
                 })
             );
         }

@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agens_core::{Error, ToolResultFacts};
+use agens_core::{EditMagnitude, Error, ToolOutcome, ToolResultFacts};
 use agens_tools::{
     BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
     NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
@@ -454,7 +454,10 @@ fn bash_killed_by_a_signal_reports_exit_code_none() {
     assert!(output.is_error);
     assert_eq!(
         output.facts(),
-        Some(&ToolResultFacts::Bash { exit_code: None })
+        Some(&ToolResultFacts::Bash {
+            outcome: ToolOutcome::Failed,
+            exit_code: None
+        })
     );
 
     fs::remove_dir_all(root).unwrap();
@@ -775,8 +778,11 @@ fn native_catalog_preserves_edit_facts() {
         output.facts(),
         Some(&ToolResultFacts::Edit {
             path: "notes.txt".into(),
-            lines_added: 1,
-            lines_removed: 1,
+            outcome: ToolOutcome::Succeeded,
+            changed: Some(EditMagnitude {
+                lines_added: 1,
+                lines_removed: 1,
+            }),
         })
     );
 

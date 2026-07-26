@@ -600,11 +600,43 @@ impl FactPath {
     }
 }
 
+/// The outcome the harness itself recorded for a call: the same distinction
+/// it already places in `ToolOutput::is_error`, plus the pre-execution
+/// denial case in which no tool ran and there is nothing to measure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolOutcome {
+    Succeeded,
+    Failed,
+    Denied,
+}
+
+/// The size of a completed `write`, reported so it is comparable to an
+/// `edit`'s line counts. Without `is_new_file` and `lines_written`, a
+/// full-file replacement would read only as "N bytes written" beside a
+/// three-line edit, with no way to tell the two magnitudes apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteMagnitude {
+    pub is_new_file: bool,
+    pub bytes_written: usize,
+    pub lines_written: usize,
+}
+
+/// The size of a completed `edit`, taken from the same diff computation the
+/// tool already rendered as its result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditMagnitude {
+    pub lines_added: usize,
+    pub lines_removed: usize,
+}
+
 /// Typed values a native tool reports about a call it has just completed.
 ///
 /// Each variant carries only data the tool already produced while executing;
 /// nothing here is derived, scored, or interpreted. Absence of facts means the
-/// harness reported none for that call, not that the call was uneventful.
+/// harness reported none for that call, not that the call was uneventful. A
+/// magnitude is `None` exactly when the tool did not run to completion, since
+/// a failed or denied call has no content to measure.
 ///
 /// Marked `#[non_exhaustive]` because further variants are expected as more
 /// tools report facts, and downstream crates already match on this enum with
@@ -614,14 +646,21 @@ impl FactPath {
 pub enum ToolResultFacts {
     Write {
         path: String,
-        bytes_written: usize,
+        outcome: ToolOutcome,
+        written: Option<WriteMagnitude>,
     },
     Edit {
         path: String,
-        lines_added: usize,
-        lines_removed: usize,
+        outcome: ToolOutcome,
+        changed: Option<EditMagnitude>,
     },
+    /// Paths touched by a command are out of scope for this passive layer:
+    /// the harness observes only the process's own exit status, not the
+    /// filesystem effects of what it ran, so a `bash` call that mutates
+    /// files is invisible here. Those paths are re-derived from git at the
+    /// delivery gate instead of being reported by this variant.
     Bash {
+        outcome: ToolOutcome,
         exit_code: Option<i32>,
     },
 }

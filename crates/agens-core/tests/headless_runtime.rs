@@ -6,8 +6,8 @@ use agens_core::{
     AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    MessagePart, PermissionDecision, ToolResultFacts, TurnEvent, TurnProgressSink, TurnProvider,
-    TurnState, run_headless_turn, run_headless_turn_with_max_iterations,
+    MessagePart, PermissionDecision, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink,
+    TurnProvider, TurnState, run_headless_turn, run_headless_turn_with_max_iterations,
     run_headless_turn_with_progress,
 };
 
@@ -71,8 +71,12 @@ fn a_fact_emitted_in_a_real_attempt_carries_that_attempts_identity() {
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
-        outputs: vec![Ok(HeadlessToolOutput::success("exit 0")
-            .with_facts(ToolResultFacts::Bash { exit_code: Some(0) }))],
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 0").with_facts(
+            ToolResultFacts::Bash {
+                outcome: ToolOutcome::Succeeded,
+                exit_code: Some(0),
+            },
+        ))],
         ..ToolDispatcher::default()
     };
     let mut repository = Repository::default();
@@ -125,8 +129,12 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
-        outputs: vec![Ok(HeadlessToolOutput::success("exit 2")
-            .with_facts(ToolResultFacts::Bash { exit_code: Some(2) }))],
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 2").with_facts(
+            ToolResultFacts::Bash {
+                outcome: ToolOutcome::Failed,
+                exit_code: Some(2),
+            },
+        ))],
         ..ToolDispatcher::default()
     };
     let mut repository = Repository::default();
@@ -152,7 +160,13 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
     match observed.get(tool_result_index + 1) {
         Some(TurnEvent::ToolResultFacts { identity, facts }) => {
             assert_eq!(identity.tool_call_id, "call-1");
-            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(2) });
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Bash {
+                    outcome: ToolOutcome::Failed,
+                    exit_code: Some(2)
+                }
+            );
         }
         other => panic!("expected a facts event after the tool result, got {other:?}"),
     }
@@ -175,8 +189,12 @@ fn headless_turn_snapshot_omits_tool_result_facts() {
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
-        outputs: vec![Ok(HeadlessToolOutput::success("exit 2")
-            .with_facts(ToolResultFacts::Bash { exit_code: Some(2) }))],
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 2").with_facts(
+            ToolResultFacts::Bash {
+                outcome: ToolOutcome::Failed,
+                exit_code: Some(2),
+            },
+        ))],
         ..ToolDispatcher::default()
     };
     let mut repository = Repository::default();
