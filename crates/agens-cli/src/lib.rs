@@ -30,10 +30,6 @@ use agens_core::Role;
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_core::SessionMetadata;
 #[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use agens_core::TurnEvent;
-#[cfg(test)]
 use agens_core::{
     CompletedSessionTurn, HeadlessPermissionGate, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessTurnPortError, PermissionDecision, PermissionPattern, PermissionPolicy,
@@ -55,14 +51,6 @@ use agens_tools::ToolDispatcher;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tools::{CommandCatalog, SkillCatalog};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use agens_tools::{TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use agens_tools::{TaskLaunchMode, ToolDispatchRequest, ToolEvaluationOutcome};
 use agens_tui::TuiSubagentErrorKind;
 
 mod bootstrap;
@@ -97,27 +85,23 @@ use error::cancellation_result;
 use headless::block_on_headless_turn;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use headless::{provider_messages, run_production_headless_chat_with_progress};
+// calls this unqualified. Remove this re-export once the test module moves.
+use headless::run_production_headless_chat_with_progress;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use permissions::{ProductionPermissionGate, permission_policy};
+// calls this unqualified. Remove this re-export once the test module moves.
+use permissions::ProductionPermissionGate;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
-    BatchTool, ProductionBatchInput, native_batch_call, rotation_agent, rotation_dispatcher,
-    run_production_batch_with_policy, tui_session_directory,
+    BatchTool, ProductionBatchInput, native_batch_call, run_production_batch_with_policy,
+    tui_session_directory,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tools::runtime::production_dangerous_child_tool_runtime;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use tui::agents::BundledModelValidator;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -138,16 +122,8 @@ use tui::router::TuiRuntimeRouter;
 use tui::run_tui;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use tui::session::{ActiveAgentRuntime, TuiSessionContext};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use tui::session::{AgentRotationError, rotate_active_agent};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
-use turns::completed_session_turn;
+use tui::session::TuiSessionContext;
 
 pub use bootstrap::{Bootstrap, bootstrap};
 pub use deps::CliDependencies;
@@ -289,299 +265,7 @@ fn execute_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agens_core::{CompletedTurnSnapshot, PermissionRule, ToolAccess, TurnState};
-
-    #[test]
-    fn subagent_message_and_cancellation_leave_the_primary_agent_unchanged() {
-        let registry = TaskExecutionRegistry::new();
-        let id = registry.admit(TaskLaunchMode::Background).unwrap();
-        let dispatcher = rotation_dispatcher();
-        let primary = rotation_agent("primary", None, false);
-        let active = ActiveAgentRuntime::build(
-            &primary,
-            Some("gpt-5.5"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-        )
-        .unwrap();
-        let session = TuiSessionContext {
-            active_agent: Some(active),
-            ..TuiSessionContext::fresh()
-        };
-
-        registry
-            .send_message(
-                TaskMessageSource::User,
-                TaskMessageTarget::Execution(id),
-                "continue".into(),
-            )
-            .unwrap();
-        assert!(registry.cancel(id));
-
-        assert_eq!(
-            session
-                .active_agent
-                .as_ref()
-                .map(|agent| agent.name.as_str()),
-            Some("primary")
-        );
-        assert_eq!(
-            session
-                .active_agent
-                .as_ref()
-                .and_then(|agent| agent.model.as_deref()),
-            Some("gpt-5.5")
-        );
-    }
-
-    #[test]
-    fn idle_agent_rotation_restores_runtime_and_queues_expansion_reminders_atomically() {
-        let temporary = std::env::temp_dir().join(format!(
-            "agens-agent-rotation-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let dispatcher = rotation_dispatcher();
-        let primary = rotation_agent("primary", Some("gpt-4.1"), false);
-        let reviewer = rotation_agent("reviewer", Some("gpt-4o"), true);
-        let mut store = SessionStore::open(&temporary).unwrap();
-        let metadata = SessionMetadata {
-            id: 0,
-            project: "project".into(),
-            title: "title".into(),
-            active_agent: "primary".into(),
-            provider_id: None,
-            model_id: None,
-            reasoning_effort: None,
-            created_at: 1,
-            updated_at: 1,
-            completed_turn_count: 0,
-            resumable: false,
-        };
-        let turn = CompletedSessionTurn::new(vec![
-            SessionMessage::try_from(Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text("first".into())],
-            })
-            .unwrap(),
-        ])
-        .unwrap();
-        let metadata = store
-            .persist_completed_session_turn(&metadata, &turn)
-            .unwrap();
-        let primary_runtime = ActiveAgentRuntime::build(
-            &primary,
-            None,
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-        )
-        .unwrap();
-        let mut context =
-            TuiSessionContext::resumed(1, metadata.clone(), Vec::new(), primary_runtime);
-        let original = context.clone();
-        context.running = true;
-        let busy_original = context.clone();
-
-        let busy = rotate_active_agent(
-            &mut context,
-            &reviewer,
-            Some("gpt-4.1"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-            Some(&mut store),
-        );
-        assert_eq!(busy, Err(AgentRotationError::Busy));
-        assert_eq!(context, busy_original);
-        context.running = false;
-        assert_eq!(
-            SessionStore::open(&temporary)
-                .unwrap()
-                .load_session_for_resume(1)
-                .unwrap()
-                .metadata
-                .active_agent,
-            "primary"
-        );
-
-        let mut conflicting = metadata.clone();
-        conflicting.title = "changed elsewhere".into();
-        conflicting.updated_at = 2;
-        let conflicting = store
-            .persist_completed_session_turn(&conflicting, &turn)
-            .unwrap();
-        let rollback = rotate_active_agent(
-            &mut context,
-            &reviewer,
-            Some("gpt-4.1"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-            Some(&mut store),
-        );
-        assert_eq!(rollback, Err(AgentRotationError::Persistence));
-        assert_eq!(context, original);
-
-        context.metadata = Some(conflicting);
-        rotate_active_agent(
-            &mut context,
-            &reviewer,
-            Some("gpt-4.1"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-            Some(&mut store),
-        )
-        .unwrap();
-        assert_eq!(
-            context.pending_system_reminder.as_deref(),
-            Some("Agent capabilities expanded: primary -> reviewer.")
-        );
-
-        let request = context.apply_to(HeadlessChatRequest {
-            prompt: "next".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
-        assert_eq!(request.active_agent.as_deref(), Some("reviewer"));
-        assert_eq!(request.model.as_deref(), Some("gpt-4o"));
-        assert_eq!(request.system_prompt.as_deref(), Some("You are reviewer."));
-        assert_eq!(
-            request.effective_capabilities,
-            context
-                .active_agent
-                .as_ref()
-                .map(|agent| agent.capabilities.clone())
-        );
-        assert_eq!(
-            provider_messages(&request, false),
-            vec![
-                Message {
-                    role: Role::System,
-                    parts: vec![MessagePart::Text(
-                        "Agent capabilities expanded: primary -> reviewer.".into(),
-                    )],
-                },
-                Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text("next".into())],
-                },
-            ]
-        );
-
-        rotate_active_agent(
-            &mut context,
-            &reviewer,
-            Some("gpt-4.1"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-            Some(&mut store),
-        )
-        .unwrap();
-        assert_eq!(
-            context.pending_system_reminder.as_deref(),
-            Some("Agent capabilities expanded: primary -> reviewer.")
-        );
-
-        let policy = permission_policy(
-            &[],
-            "project",
-            PermissionMode::Edit,
-            &Arc::new(Mutex::new(rotation_dispatcher())),
-            request.effective_capabilities.as_ref(),
-        )
-        .unwrap();
-        assert!(matches!(
-            rotation_dispatcher()
-                .evaluate(
-                    &policy,
-                    &[],
-                    &PermissionSession::new(),
-                    ToolDispatchRequest::new(
-                        "project",
-                        "native::read",
-                        serde_json::json!({"target":"file"})
-                    ),
-                )
-                .unwrap(),
-            ToolEvaluationOutcome::Authorized(_)
-        ));
-
-        let snapshot = CompletedTurnSnapshot::from_persisted_events(vec![
-            TurnEvent::StateChanged(TurnState::Requesting),
-            TurnEvent::StateChanged(TurnState::Streaming),
-            TurnEvent::ProviderPart(MessagePart::Text("answer".into())),
-            TurnEvent::StateChanged(TurnState::Completed),
-        ])
-        .unwrap();
-        let turn = completed_session_turn(
-            "next",
-            &snapshot,
-            request.pending_system_reminder.as_deref(),
-        )
-        .unwrap();
-        let persisted = store
-            .persist_completed_session_turn(context.metadata.as_ref().unwrap(), &turn)
-            .unwrap();
-        context.metadata = Some(persisted);
-        context.pending_system_reminder = None;
-        let reopened = SessionStore::open(&temporary)
-            .unwrap()
-            .load_session_for_resume(1)
-            .unwrap();
-        assert_eq!(reopened.metadata.active_agent, "reviewer");
-        let reminder = reopened
-            .messages
-            .iter()
-            .find(|message| message.role == Role::System)
-            .unwrap();
-        assert_eq!(
-            reminder.parts,
-            vec![MessagePart::Text(
-                "Agent capabilities expanded: primary -> reviewer.".into()
-            )]
-        );
-        assert!(context.pending_system_reminder.is_none());
-
-        let mut no_expansion = TuiSessionContext::resumed(
-            1,
-            reopened.metadata,
-            reopened.messages,
-            context.active_agent.clone().unwrap(),
-        );
-        no_expansion.metadata = None;
-        rotate_active_agent(
-            &mut no_expansion,
-            &reviewer,
-            Some("gpt-4.1"),
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-            None,
-        )
-        .unwrap();
-        assert!(no_expansion.pending_system_reminder.is_none());
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
+    use agens_core::{PermissionRule, ToolAccess};
 
     mod model_registry {
         use super::*;
