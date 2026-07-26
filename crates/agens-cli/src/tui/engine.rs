@@ -837,4 +837,249 @@ mod tests {
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
+
+    #[test]
+    fn tui_model_and_effort_commands_reach_each_provider_with_latest_selection_only() {
+        for provider_type in ["openai-api", "openai-chatgpt"] {
+            for model in ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+                let request = run_tui_model_effort_provider_case(provider_type, model);
+
+                assert_eq!(request["model"], model, "{provider_type}: {model}");
+                assert_eq!(request["reasoning"]["effort"], "max", "{request}");
+                assert!(
+                    !request["input"].to_string().contains("gpt-4.1"),
+                    "{provider_type} request input retained the replaced model: {request}"
+                );
+            }
+        }
+    }
+
+    fn run_tui_model_effort_provider_case(
+        provider_type: &str,
+        selected_model: &str,
+    ) -> serde_json::Value {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-tui-model-effort-{provider_type}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after Unix epoch")
+                .as_nanos()
+        ));
+        let project_root = temporary.join("project");
+        let config_home = temporary.join("config");
+        let data_directory = temporary.join("data");
+        std::fs::create_dir_all(project_root.join(".git"))
+            .expect("project marker should be created");
+        std::fs::create_dir_all(&config_home).expect("config directory should be created");
+
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("mock provider should bind");
+        let address = listener
+            .local_addr()
+            .expect("mock provider should have an address");
+        let expected_path = match provider_type {
+            "openai-chatgpt" => "POST /codex/responses HTTP/1.1\r\n",
+            _ => "POST /responses HTTP/1.1\r\n",
+        };
+        let worker = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("mock provider should accept the selected request");
+            let mut reader = BufReader::new(stream.try_clone().expect("stream should clone"));
+            let mut request_line = String::new();
+            reader
+                .read_line(&mut request_line)
+                .expect("request line should be readable");
+            assert_eq!(request_line, expected_path);
+
+            let mut content_length = None;
+            loop {
+                let mut header = String::new();
+                reader
+                    .read_line(&mut header)
+                    .expect("request header should be readable");
+                if header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length: ") {
+                    content_length = Some(
+                        value
+                            .trim()
+                            .parse::<usize>()
+                            .expect("content length should be numeric"),
+                    );
+                }
+            }
+
+            let mut body =
+                vec![0_u8; content_length.expect("request should include content length")];
+            std::io::Read::read_exact(&mut reader, &mut body)
+                .expect("request body should be readable");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"selected answer\"}\n\ndata: {\"type\":\"response.completed\"}\n\n")
+                .expect("mock response should be written");
+
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("provider request should be valid JSON")
+        });
+
+        if provider_type == "openai-chatgpt" {
+            std::fs::write(
+                config_home.join("auth.json"),
+                r#"{"openai-chatgpt":{"access_token":"header.eyJleHAiOjE4OTM0NTYwMDB9.signature","refresh_token":"refresh","account_id":"account","expires_at":"2030-01-01T00:00:00Z"}}"#,
+            )
+            .expect("ChatGPT credentials should be written");
+        } else {
+            std::fs::write(
+                config_home.join("auth.json"),
+                r#"{"openai-api":{"api_key":"test-key"}}"#,
+            )
+            .expect("OpenAI API credentials should be written");
+        }
+
+        let dependencies = CliDependencies::for_test(
+            project_root,
+            Some(temporary.join("home")),
+            BTreeMap::from([
+                (
+                    "AGENS_CONFIG_HOME".to_owned(),
+                    config_home.display().to_string(),
+                ),
+                ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+            ]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"{provider_type}\"\nmodel = \"gpt-4.1\"\nbase_url = \"http://{address}\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            )]),
+        );
+        let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let cancellation = HeadlessTurnCancellation::new();
+
+        let previous_model = if provider_type == "openai-chatgpt" {
+            "gpt-5.4"
+        } else {
+            "o3"
+        };
+        let commands = [
+            (
+                format!("/model {previous_model}"),
+                format!("Model: {previous_model}."),
+            ),
+            (
+                "/effort high".to_owned(),
+                "Reasoning effort: high.".to_owned(),
+            ),
+            (
+                format!("/model {selected_model}"),
+                format!("Model: {selected_model}."),
+            ),
+            (
+                "/effort max".to_owned(),
+                "Reasoning effort: max.".to_owned(),
+            ),
+        ];
+        for (command, expected) in commands {
+            assert_eq!(
+                run_tui_prompt(&bootstrap, &command, &cancellation, &session, None)
+                    .expect("valid TUI selection should succeed"),
+                expected
+            );
+        }
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/model unavailable",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect_err("invalid model should be refused")
+            .to_string(),
+            format!(
+                "config: model is unavailable for {}",
+                if provider_type == "openai-chatgpt" {
+                    "ChatGPT subscription"
+                } else {
+                    "OpenAI API"
+                }
+            )
+        );
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/effort unsupported",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect_err("invalid effort should be refused")
+            .to_string(),
+            "config: reasoning effort is unsupported"
+        );
+        let runtime_bootstrap = TuiRuntimeRouter::new(
+            bootstrap.clone(),
+            Arc::clone(&session),
+            Arc::new(Mutex::new(None)),
+            Arc::new(CommandCatalog::default()),
+            Arc::new(SkillCatalog::default()),
+        )
+        .turn_bootstrap()
+        .expect("turn provider credentials should resolve freshly");
+        assert_eq!(
+            run_tui_prompt(
+                &runtime_bootstrap,
+                "next request",
+                &cancellation,
+                &session,
+                None
+            )
+            .expect("selected prompt should complete"),
+            "selected answer"
+        );
+
+        let persisted = SessionStore::open(&data_directory)
+            .unwrap()
+            .load_session_for_resume(1)
+            .unwrap();
+        assert_eq!(
+            persisted.metadata.provider_id.as_deref(),
+            Some(provider_type)
+        );
+        assert_eq!(persisted.metadata.model_id.as_deref(), Some(selected_model));
+        assert_eq!(
+            persisted
+                .metadata
+                .reasoning_effort
+                .map(agens_core::ReasoningEffort::as_str),
+            Some("max")
+        );
+        assert!(!format!("{persisted:?}").contains("test-key"));
+        assert!(!format!("{persisted:?}").contains("refresh"));
+
+        let reopened = resume_tui_session(
+            &bootstrap,
+            persisted.metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::with_environment(BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "test-key".into(),
+            )])),
+        )
+        .expect("persisted selection should reopen");
+        let reopened_selection = reopened.selection.unwrap();
+        assert_eq!(reopened_selection.model(), selected_model);
+        assert!(reopened_selection.metadata_known());
+        assert_eq!(reopened_selection.reasoning_effort(), Some("max"));
+
+        let request = worker.join().expect("mock provider should finish");
+        std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
+        request
+    }
 }
