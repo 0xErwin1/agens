@@ -160,10 +160,6 @@ use bootstrap::ProviderSource;
 use bootstrap::effective_max_iterations;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use bootstrap::seed_configured_reasoning_effort;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 #[cfg(test)]
@@ -239,7 +235,9 @@ use session::attempt::{
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use test_support::{reset_tui_resume_test_counters, tui_resume_test_counters};
+use test_support::{
+    bootstrap_from_configuration, reset_tui_resume_test_counters, tui_resume_test_counters,
+};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -6514,122 +6512,6 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_retains_the_ui_collapse_thinking_setting() {
-        let temporary =
-            std::env::temp_dir().join(format!("agens-collapse-thinking-{}", std::process::id()));
-        let config_home = temporary.join("config");
-        let dependencies = CliDependencies::for_test(
-            temporary.join("project"),
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            BTreeMap::from([(
-                config_home.join("config.toml"),
-                "[ui]\ncollapse_thinking = true\n".to_owned(),
-            )]),
-        );
-
-        let bootstrap = bootstrap(&dependencies).expect("UI configuration should be valid");
-
-        assert!(bootstrap.collapse_thinking);
-    }
-
-    fn bootstrap_from_configuration(
-        label: &str,
-        global: Option<&str>,
-        project: Option<&str>,
-    ) -> Bootstrap {
-        let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
-        let config_home = temporary.join("config");
-        let project_root = temporary.join("project");
-        let mut files = BTreeMap::new();
-        if let Some(global) = global {
-            files.insert(config_home.join("config.toml"), global.to_owned());
-        }
-        if let Some(project) = project {
-            files.insert(project_root.join(".agens/config.toml"), project.to_owned());
-        }
-
-        let dependencies = CliDependencies::for_test(
-            project_root,
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            files,
-        );
-
-        bootstrap(&dependencies).expect("configuration fixture should be valid")
-    }
-
-    #[test]
-    fn bootstrap_defaults_reproduce_the_limits_the_runtime_hardcoded() {
-        let bootstrap = bootstrap_from_configuration("config-defaults", None, None);
-
-        let tools = bootstrap.tool_limits();
-        assert_eq!(tools.max_list_entries, 1_000);
-        assert_eq!(tools.max_search_entries, 10_000);
-        assert_eq!(tools.max_search_results, 100);
-        assert_eq!(tools.max_search_depth, 32);
-        assert_eq!(tools.operation_timeout_ms, 5_000);
-        assert_eq!(tools.bash_timeout_ms, 120_000);
-
-        let subagents = bootstrap.subagent_limits();
-        assert_eq!(subagents.max_iterations, 16);
-        assert_eq!(subagents.max_concurrency, 4);
-        assert_eq!(subagents.max_output_chars, 65_536);
-
-        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 10_000);
-        assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
-        assert!(bootstrap.debug());
-        assert_eq!(bootstrap.default_agent(), None);
-        assert_eq!(bootstrap.reasoning_effort(), None);
-    }
-
-    #[test]
-    fn project_configuration_overrides_global_settings_and_records_the_origin() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-precedence",
-            Some("[tools]\nmax_search_depth = 8\nmax_search_results = 25\n"),
-            Some("[tools]\nmax_search_depth = 4\n"),
-        );
-
-        assert_eq!(bootstrap.tool_limits().max_search_depth, 4);
-        assert_eq!(bootstrap.tool_limits().max_search_results, 25);
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_search_depth"),
-            agens_config::Origin::Project
-        );
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_search_results"),
-            agens_config::Origin::Global
-        );
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_list_entries"),
-            agens_config::Origin::Default
-        );
-    }
-
-    #[test]
-    fn configured_behavioral_settings_reach_bootstrap() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-behavior",
-            Some(
-                "[options]\ndebug = true\n\n[agent]\ndefault_agent = \"reviewer\"\nreasoning_effort = \"high\"\n\n[subagents]\nmax_concurrency = 2\n",
-            ),
-            None,
-        );
-
-        assert!(bootstrap.debug());
-        assert_eq!(bootstrap.default_agent(), Some("reviewer"));
-        assert_eq!(bootstrap.reasoning_effort(), Some("high"));
-        assert_eq!(bootstrap.subagent_limits().max_concurrency, 2);
-    }
-
-    #[test]
     fn configured_tool_limits_reach_the_native_tool_runtime() {
         let bootstrap = bootstrap_from_configuration(
             "config-tool-limits",
@@ -6742,19 +6624,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_are_captured_unless_debug_is_disabled() {
-        let enabled = bootstrap_from_configuration("config-debug-default", None, None);
-        let disabled = bootstrap_from_configuration(
-            "config-debug-off",
-            Some("[options]\ndebug = false\n"),
-            None,
-        );
-
-        assert!(enabled.debug());
-        assert!(!disabled.debug());
-    }
-
-    #[test]
     fn the_removed_tool_output_key_is_no_longer_accepted() {
         let document = parse_toml_document("[ui]\ntruncate_tool_output = true\n").unwrap();
 
@@ -6801,56 +6670,6 @@ mod tests {
     }
 
     #[test]
-    fn the_configured_reasoning_effort_seeds_a_request_that_carries_none() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-effort",
-            Some("[agent]\nreasoning_effort = \"high\"\n"),
-            None,
-        );
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(
-            request.request_config.reasoning_effort(),
-            Some(agens_core::ReasoningEffort::High)
-        );
-        assert_eq!(
-            request.session_reasoning_effort,
-            Some(agens_core::ReasoningEffort::High)
-        );
-    }
-
-    #[test]
-    fn an_explicit_effort_survives_the_configured_default() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-effort-explicit",
-            Some("[agent]\nreasoning_effort = \"high\"\n"),
-            None,
-        );
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-        request.request_config = agens_core::RequestConfig::with_reasoning_effort("low").unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(
-            request.request_config.reasoning_effort(),
-            Some(agens_core::ReasoningEffort::Low)
-        );
-    }
-
-    #[test]
-    fn an_absent_configured_effort_leaves_the_request_untouched() {
-        let bootstrap = bootstrap_from_configuration("config-effort-absent", None, None);
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(request.request_config.reasoning_effort(), None);
-        assert_eq!(request.session_reasoning_effort, None);
-    }
-
-    #[test]
     fn configured_subagent_limits_bound_the_task_registry() {
         let bootstrap = bootstrap_from_configuration(
             "config-subagent-limits",
@@ -6885,14 +6704,6 @@ mod tests {
             native_tool_limits(bootstrap.tool_limits()),
             agens_tools::NativeToolLimits::default()
         );
-    }
-
-    #[test]
-    fn a_command_line_iteration_cap_overrides_the_configured_one() {
-        assert_eq!(effective_max_iterations(Some(9), Some(5)), Some(9));
-        assert_eq!(effective_max_iterations(None, Some(5)), Some(5));
-        assert_eq!(effective_max_iterations(Some(9), None), Some(9));
-        assert_eq!(effective_max_iterations(None, None), None);
     }
 
     fn tui_session_messages() -> Vec<Message> {

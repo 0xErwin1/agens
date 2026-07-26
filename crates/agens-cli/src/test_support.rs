@@ -1,8 +1,14 @@
 //! Shared call counters used by the production TUI-resume and tool/provider
-//! runtime tests. Kept in one place so every consumer increments through a
-//! named function instead of reaching across a module boundary into a
-//! `thread_local!`.
+//! runtime tests, plus fixture helpers shared by more than one module's test
+//! suite. Kept in one place so every consumer reaches a named function
+//! instead of duplicating fixture setup or reaching across a module boundary
+//! into a `thread_local!`.
 #![cfg(test)]
+
+use std::collections::BTreeMap;
+
+use crate::CliDependencies;
+use crate::bootstrap::{Bootstrap, bootstrap};
 
 thread_local! {
     static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -41,4 +47,38 @@ pub(crate) fn tui_resume_test_counters() -> (usize, usize, usize, usize) {
         PRODUCTION_TOOL_RUNTIME_CALLS.with(std::cell::Cell::get),
         PRODUCTION_PROVIDER_RUNTIME_CALLS.with(std::cell::Cell::get),
     )
+}
+
+/// Bootstraps a `Bootstrap` fixture from optional global/project TOML
+/// fragments, isolated under a unique temporary directory named after
+/// `label`. Shared by `bootstrap.rs`'s own tests and by test clusters in
+/// other modules that need a configured `Bootstrap` without repeating its
+/// setup.
+pub(crate) fn bootstrap_from_configuration(
+    label: &str,
+    global: Option<&str>,
+    project: Option<&str>,
+) -> Bootstrap {
+    let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    let mut files = BTreeMap::new();
+    if let Some(global) = global {
+        files.insert(config_home.join("config.toml"), global.to_owned());
+    }
+    if let Some(project) = project {
+        files.insert(project_root.join(".agens/config.toml"), project.to_owned());
+    }
+
+    let dependencies = CliDependencies::for_test(
+        project_root,
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    );
+
+    bootstrap(&dependencies).expect("configuration fixture should be valid")
 }
