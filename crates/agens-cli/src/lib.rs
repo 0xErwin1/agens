@@ -175,9 +175,9 @@ use session::attempt::attempt_failure_status;
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
     BatchTool, ProductionBatchInput, bootstrap_from_configuration, native_batch_call,
-    reset_tui_resume_test_counters, run_production_batch, run_production_batch_with_policy,
-    tui_resume_test_counters, tui_session_bootstrap, tui_session_bootstrap_for_provider,
-    tui_session_directory,
+    render_tui_test_backend, reset_tui_resume_test_counters, run_production_batch,
+    run_production_batch_with_policy, tui_resume_test_counters, tui_session_bootstrap,
+    tui_session_bootstrap_for_provider, tui_session_directory,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -1411,83 +1411,6 @@ mod tests {
                 .is_error
         );
         assert!(!temporary.join("escape.txt").exists());
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()
-     {
-        let temporary =
-            std::env::temp_dir().join(format!("agens-u18-project-header-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temporary);
-        let project_root = temporary.join("non-agens-project");
-        std::fs::create_dir_all(project_root.join(".git")).unwrap();
-        let config_home = temporary.join("config");
-        let project_bootstrap = bootstrap(&CliDependencies::for_test(
-            project_root.clone(),
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            BTreeMap::from([(
-                config_home.join("config.toml"),
-                format!(
-                    "[options]\ndata_dir = \"{}\"\n",
-                    temporary.join("data").display()
-                ),
-            )]),
-        ))
-        .unwrap();
-        let project = project_root.display().to_string();
-        let mut tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(None)),
-        });
-
-        configure_tui_project_identity(&mut tui, &project_bootstrap);
-        assert_eq!(tui.view().project, project);
-        tui.set_presentation("openai-api", "gpt-4.1", "new session");
-        let new_session_header = render_tui_test_backend(&tui, 120, 24);
-        assert!(
-            new_session_header.contains("non-agens-project"),
-            "{new_session_header:?}"
-        );
-
-        tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
-            message: "Resumed session 7".into(),
-            presentation: TuiPresentation::new("openai-api", "gpt-4.1", "session #7"),
-            history: Vec::new(),
-            draft: None,
-            resume_error: None,
-        });
-        let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
-        assert!(
-            resumed_session_header.contains("non-agens-project"),
-            "{resumed_session_header:?}"
-        );
-
-        let no_project_directory = temporary.join("no-project");
-        std::fs::create_dir_all(&no_project_directory).unwrap();
-        let no_project_bootstrap = bootstrap(&CliDependencies::for_test(
-            no_project_directory,
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            BTreeMap::new(),
-        ))
-        .unwrap();
-        let mut fallback_tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(None)),
-        });
-
-        configure_tui_project_identity(&mut fallback_tui, &no_project_bootstrap);
-        assert_eq!(fallback_tui.view().project, "agens");
-        let fallback_render = render_tui_test_backend(&fallback_tui, 120, 24);
-        // Project basename lives in the operational footer (not "project …" header chrome).
-        assert!(fallback_render.contains("agens"), "{fallback_render:?}");
-
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -5474,20 +5397,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn second_control_c_uses_the_owned_turn_cancellation_before_quit() {
-        let cancellation = HeadlessTurnCancellation::new();
-        let mut tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(Some(cancellation.clone()))),
-        });
-        tui.set_running(true);
-
-        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-        assert!(!cancellation.is_cancelled());
-        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
-        assert!(cancellation.is_cancelled());
-    }
-
     fn open_running_tui_select(
         tui: &mut Tui<ProductionTuiEngine>,
         router: &TuiRuntimeRouter,
@@ -5524,21 +5433,6 @@ mod tests {
             panic!("Enter should submit through the production TUI path");
         };
         input
-    }
-
-    fn render_tui_test_backend(tui: &Tui<ProductionTuiEngine>, width: u16, height: u16) -> String {
-        let terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        let mut renderer = agens_tui::RatatuiRenderer::new(terminal);
-        agens_tui::Renderer::render(&mut renderer, tui.view()).unwrap();
-        renderer
-            .terminal()
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect()
     }
 
     fn open_tui_palette_dialog(

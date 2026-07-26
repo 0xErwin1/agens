@@ -16,7 +16,7 @@ use agens_core::{
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
-use agens_tui::{BridgeCancel, BridgeTx, TuiRuntimeEvent};
+use agens_tui::{BridgeCancel, BridgeTx, Tui, TuiRuntimeEvent};
 
 use crate::CliDependencies;
 use crate::bootstrap::{Bootstrap, bootstrap};
@@ -26,6 +26,7 @@ use crate::permissions::{
     NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, ProductionPromptAuthorization,
 };
+use crate::tui::engine::ProductionTuiEngine;
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 
 thread_local! {
@@ -523,4 +524,23 @@ pub(crate) fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) 
             .map(|envelope| envelope.into_parts().1)
             .collect(),
     }
+}
+
+pub(crate) fn render_tui_test_backend(
+    tui: &Tui<ProductionTuiEngine>,
+    width: u16,
+    height: u16,
+) -> String {
+    let terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    let mut renderer = agens_tui::RatatuiRenderer::new(terminal);
+    agens_tui::Renderer::render(&mut renderer, tui.view()).unwrap();
+    renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
 }
