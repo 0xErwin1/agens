@@ -102,3 +102,103 @@ fn effective_settings_report(settings: &ResolvedSettings) -> String {
 fn source_status(loaded: bool) -> &'static str {
     if loaded { "loaded" } else { "missing" }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use agens_config::{parse_toml_document, validate_toml_document};
+
+    use super::*;
+    use crate::ExitStatus;
+
+    #[test]
+    fn config_init_writes_a_starter_file_the_validator_accepts() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-config-init-{}", std::process::id()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&written);
+        let dependencies = CliDependencies::for_test(
+            temporary.join("project"),
+            Some(temporary.join("home")),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .with_create_file(move |path, contents| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), contents.to_owned()));
+            Ok(())
+        });
+
+        let report = run_config(cli::ConfigAction::Init, &dependencies).expect("init should run");
+
+        let written = written.lock().unwrap();
+        let (path, contents) = written.first().expect("init should write exactly one file");
+        assert_eq!(written.len(), 1);
+        assert!(path.ends_with(".agens/config.toml"));
+        assert!(report.contains(".agens/config.toml"));
+        validate_toml_document(&parse_toml_document(contents).expect("starter file must parse"))
+            .expect("starter file must validate");
+    }
+
+    #[test]
+    fn config_init_refuses_to_replace_an_existing_configuration() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-config-init-existing-{}", std::process::id()));
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::new(),
+            BTreeMap::from([(
+                project_root.join(".agens/config.toml"),
+                "[tools]\nmax_search_depth = 4\n".to_owned(),
+            )]),
+        )
+        .with_create_file(|_, _| panic!("init must not write over an existing configuration"));
+
+        let error = run_config(cli::ConfigAction::Init, &dependencies)
+            .expect_err("init must refuse an existing file");
+
+        assert_eq!(error.status(), ExitStatus::Configuration);
+        assert!(error.message.contains("already exists"));
+    }
+
+    #[test]
+    fn config_doctor_reports_effective_values_with_their_origin() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-doctor-report-{}", std::process::id()));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([
+                (
+                    config_home.join("config.toml"),
+                    "[tools]\nmax_search_depth = 8\n".to_owned(),
+                ),
+                (
+                    project_root.join(".agens/config.toml"),
+                    "[tools]\nmax_search_results = 25\n".to_owned(),
+                ),
+            ]),
+        );
+
+        let report =
+            run_config(cli::ConfigAction::Doctor, &dependencies).expect("doctor should run");
+
+        assert!(report.contains("Status:  valid\n"));
+        assert!(report.contains("tools.max_search_depth      8             global\n"));
+        assert!(report.contains("tools.max_search_results    25            project\n"));
+        assert!(report.contains("tools.max_list_entries      1000          default\n"));
+        assert!(report.contains("agent.default_agent         -             default\n"));
+    }
+}
