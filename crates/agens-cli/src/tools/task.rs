@@ -22,10 +22,8 @@ use crate::permissions::{
 };
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
-use crate::{
-    Bootstrap, TaskModelValidator, next_diagnostic_reference, record_subagent_terminal,
-    task_model_catalog, tui_task_agent_catalog,
-};
+use crate::tui::agents::{TaskModelValidator, task_model_catalog, tui_task_agent_catalog};
+use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
 
 pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) provider_tools: Vec<OpenAiFunctionTool>,

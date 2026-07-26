@@ -32,12 +32,12 @@ use crate::session::attempt::{
 use crate::tools::child::TaskMailboxProvider;
 use crate::tools::runtime::production_tool_runtime_for_parent;
 use crate::tools::task::ProductionTuiTaskRuntime;
+use crate::tui::agents::{TuiAgentModelValidator, tui_agent_catalog};
 use crate::tui::provider::TuiProvider;
 use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
-    Bootstrap, TuiAgentModelValidator, cancellation_result, effective_max_iterations,
-    explicit_task_delegation_prompt, operation_diagnostics, record_parent_terminal,
-    tui_agent_catalog,
+    Bootstrap, cancellation_result, effective_max_iterations, explicit_task_delegation_prompt,
+    operation_diagnostics, record_parent_terminal,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

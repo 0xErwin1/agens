@@ -30,6 +30,10 @@ use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::TuiModelSelector;
 use crate::session::attempt::active_session_attempts;
 use crate::tools::task::default_model;
+use crate::tui::agents::{
+    persist_pending_agent_correction, rotate_tui_agent, select_tui_subagent,
+    tui_agent_catalog_for_context, tui_subagent_catalog,
+};
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{RESERVED_TUI_COMMANDS, render_tui_help, resolved_tui_palette};
 use crate::tui::files::{selected_tui_file, tui_select_candidates};
@@ -47,10 +51,8 @@ use crate::tui::session::{
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
 use crate::{
-    commit_tui_session_resume, load_tui_session_for_resume, persist_pending_agent_correction,
-    prepare_loaded_tui_session_resume, resolve_provider_type, resume_tui_session, rotate_tui_agent,
-    select_tui_subagent, tui_agent_catalog_for_context, tui_project_identifier,
-    tui_subagent_catalog,
+    commit_tui_session_resume, load_tui_session_for_resume, prepare_loaded_tui_session_resume,
+    resolve_provider_type, resume_tui_session, tui_project_identifier,
 };
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";

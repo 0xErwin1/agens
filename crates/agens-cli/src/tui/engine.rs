@@ -29,6 +29,7 @@ use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
     production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
 };
+use crate::tui::agents::persist_pending_agent_correction;
 use crate::tui::extensions::{start_tui_commands, start_tui_skills};
 use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -39,8 +40,8 @@ use crate::tui::session::{ResumeDraft, TuiSessionContext};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
 use crate::{
     Bootstrap, configure_tui_project_identity, ensure_active_tui_agent_runtime,
-    parent_skill_system_prompt, persist_pending_agent_correction, report_tui_extension_collisions,
-    resume_tui_session, resumed_subagent_cards,
+    parent_skill_system_prompt, report_tui_extension_collisions, resume_tui_session,
+    resumed_subagent_cards,
 };
 
 pub(crate) struct ProductionTuiEngine {
