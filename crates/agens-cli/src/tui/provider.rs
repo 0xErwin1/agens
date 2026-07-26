@@ -159,3 +159,26 @@ pub(crate) fn restore_chatgpt_credentials(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::tui_session_directory;
+
+    #[test]
+    fn tui_provider_availability_uses_complete_current_credentials_without_exposing_them() {
+        let temporary = tui_session_directory("provider-status");
+        let credentials = temporary.join("auth.json");
+        std::fs::write(
+            &credentials,
+            r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let resolver = TuiCredentialResolver::with_environment(BTreeMap::new());
+
+        let statuses =
+            TuiProvider::ALL.map(|provider| resolver.status(&credentials, provider).label());
+        assert_eq!(statuses, ["ready", "credential required"]);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}
