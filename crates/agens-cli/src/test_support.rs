@@ -670,6 +670,20 @@ pub(crate) fn persist_tui_session(
         .unwrap()
 }
 
+pub(crate) fn persist_tui_session_metadata(
+    store: &mut SessionStore,
+    project: &str,
+    title: &str,
+    active_agent: &str,
+    updated_at: i64,
+) -> SessionMetadata {
+    let mut metadata = persist_tui_session(store, project, title);
+    metadata.active_agent = active_agent.into();
+    metadata.updated_at = updated_at;
+    store.update_session(&metadata).unwrap();
+    metadata
+}
+
 pub(crate) fn open_tui_palette_dialog(
     tui: &mut Tui<ProductionTuiEngine>,
     router: &TuiRuntimeRouter,

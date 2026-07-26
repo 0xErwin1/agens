@@ -341,3 +341,918 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     context.active_agent = Some(active_agent);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{
+        PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+        PermissionSession, Role, SessionMetadata,
+    };
+    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome};
+    use agens_tui::{Event, Key, Tui, TuiPermissionBridge};
+    use rusqlite::Connection;
+
+    use super::*;
+    use crate::commands::chat::{chat_args_with_prompt, chat_request};
+    use crate::session::attempt::attempt_failure_status;
+    use crate::test_support::{
+        persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
+        reset_tui_resume_test_counters, rotation_dispatcher, tui_project, tui_resume_test_counters,
+        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
+        tui_session_messages,
+    };
+    use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
+    use crate::tools::task::production_tui_task_runtime;
+    use crate::tui::engine::ProductionTuiEngine;
+    use crate::tui::models::apply_tui_model;
+
+    #[test]
+    fn tui_session_list_filters_current_project_and_resume_preserves_typed_history() {
+        let temporary = tui_session_directory("filter-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let current = persist_tui_session(&mut store, &tui_project(&temporary), "current");
+        persist_tui_session(
+            &mut store,
+            &temporary.join("other").display().to_string(),
+            "other",
+        );
+
+        assert_eq!(list_tui_sessions(&bootstrap).unwrap(), "1\t1 event(s)");
+
+        reset_tui_resume_test_counters();
+        let resumed = resume_tui_session(
+            &bootstrap,
+            current.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(resumed.identifier, Some(current.id));
+        assert_eq!(resumed.metadata, Some(current));
+        assert_eq!(resumed.messages, tui_session_messages());
+        assert!(resumed.active_agent.is_none());
+        assert_eq!(resumed.restored_history.len(), 1);
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    fn session_attempt_count(store: &SessionStore) -> i64 {
+        Connection::open(store.database_path())
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM session_attempts", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn assert_restored_retry_draft_ui(outcome: TuiSubmissionOutcome, retry_prompt: &str) {
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        assert!(tui.begin_session_load());
+        assert!(tui.apply_submission_outcome(outcome).is_none());
+        let view = tui.view();
+        assert_eq!(view.input, retry_prompt);
+        assert_eq!(view.focus, agens_tui::TranscriptFocus::Composer);
+        assert!(view.following_bottom);
+        assert_eq!(
+            view.status,
+            Some("Recovered failed prompt · Enter retry · Esc discard")
+        );
+        assert!(view.completed_conversations.is_empty());
+        assert!(!view.running);
+        let rendered = render_tui_test_backend(&tui, 120, 24);
+        assert!(rendered.contains(retry_prompt), "{rendered:?}");
+        assert!(
+            rendered.contains("Recovered failed prompt · Enter retry · Esc discard"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn zero_turn_failed_tui_resume_restores_draft_without_runtime_or_attempt_creation() {
+        let temporary = tui_session_directory("failed-draft-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = SessionMetadata {
+            id: 0,
+            project: tui_project(&temporary),
+            title: "failed".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let retry_prompt = "retry exact café 🙂";
+        let attempt = store
+            .begin_session_attempt(&metadata, retry_prompt.into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+            .unwrap();
+        let attempt_count = session_attempt_count(&store);
+        drop(store);
+
+        reset_tui_resume_test_counters();
+        let loaded = load_tui_session_for_resume(&bootstrap, attempt.key().session_id()).unwrap();
+        assert_eq!(
+            loaded.retry_boundary.as_ref().map(RetryBoundary::prompt),
+            Some(retry_prompt)
+        );
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            attempt.key().session_id(),
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert!(!format!("{prepared:?}").contains(retry_prompt));
+        assert_eq!(
+            prepared.note(),
+            "Recovered failed prompt · Enter retry · Esc discard"
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let expected = session.lock().unwrap().clone();
+        let outcome = commit_tui_session_resume(
+            &bootstrap,
+            &session,
+            &expected,
+            prepared,
+            &TuiRouteCancellation::new(),
+        )
+        .unwrap();
+        assert!(session.lock().unwrap().resume_draft.is_none());
+        assert_restored_retry_draft_ui(outcome.clone(), retry_prompt);
+        let TuiSubmissionOutcome::SessionResumed {
+            message,
+            history,
+            draft,
+            ..
+        } = outcome
+        else {
+            panic!("expected resumed outcome");
+        };
+        assert_eq!(
+            message,
+            "Recovered failed prompt · Enter retry · Esc discard"
+        );
+        assert!(history.is_empty());
+        assert_eq!(draft.as_deref(), Some(retry_prompt));
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+
+        let reopened = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let unchanged_attempt_count = session_attempt_count(&reopened);
+        assert_eq!(unchanged_attempt_count, attempt_count);
+        assert_eq!(
+            reopened
+                .load_session_for_resume(attempt.key().session_id())
+                .unwrap()
+                .latest_attempt
+                .unwrap()
+                .status(),
+            SessionAttemptStatus::Failed
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn completed_history_resume_adds_failed_draft_without_duplicate_user_message() {
+        let temporary = tui_session_directory("history-failed-draft");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "history");
+        let retry_prompt = "failed next prompt";
+        let attempt = store
+            .begin_session_attempt(&metadata, retry_prompt.into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::ProviderError, 40)
+            .unwrap();
+        drop(store);
+
+        let loaded = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            metadata.id,
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(prepared.messages, tui_session_messages());
+        assert_eq!(prepared.restored_history.len(), 1);
+        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert_eq!(
+            prepared.note(),
+            "Recovered failed prompt · Enter retry · Esc discard"
+        );
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .all(|message| message.role != Role::User
+                    || message.parts != [MessagePart::Text(retry_prompt.into())])
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn completed_resume_without_retry_draft_and_cancelled_timeout_taxonomy_stay_explicit() {
+        let temporary = tui_session_directory("completed-no-draft");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "completed");
+        drop(store);
+
+        let loaded = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        assert!(loaded.retry_boundary.is_none());
+        let prepared = prepare_loaded_tui_session_resume(
+            &bootstrap,
+            metadata.id,
+            loaded,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert!(prepared.resume_draft.is_none());
+        assert!(prepared.note().starts_with("Resumed session"));
+        assert_eq!(
+            resume_retry_notice(SessionAttemptStatus::Cancelled),
+            Some("Recovered failed prompt · Enter retry · Esc discard")
+        );
+        assert_eq!(
+            attempt_failure_status(&CliError::runtime(HeadlessTurnError::TimedOut)),
+            SessionAttemptStatus::Cancelled
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_resume_commit_discards_cancelled_stale_and_invalid_preparations() {
+        let temporary = tui_session_directory("atomic-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "atomic");
+        let attempt = store
+            .begin_session_attempt(&metadata, "atomic preserved draft".into())
+            .unwrap();
+        store
+            .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
+            .unwrap();
+        drop(store);
+        let credentials = TuiCredentialResolver::production();
+        let prepared = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &credentials,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared.resume_draft.as_deref(),
+            Some("atomic preserved draft")
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let original = session.lock().unwrap().clone();
+
+        let cancelled = TuiRouteCancellation::new();
+        cancelled.cancel();
+        assert_eq!(
+            commit_tui_session_resume(
+                &bootstrap,
+                &session,
+                &original,
+                prepared.clone(),
+                &cancelled,
+            )
+            .unwrap(),
+            TuiSubmissionOutcome::RouteCancelled
+        );
+        assert_eq!(*session.lock().unwrap(), original);
+
+        session.lock().unwrap().dangerous_mode = true;
+        let newer = session.lock().unwrap().clone();
+        assert_eq!(
+            commit_tui_session_resume(
+                &bootstrap,
+                &session,
+                &original,
+                prepared.clone(),
+                &TuiRouteCancellation::new(),
+            )
+            .unwrap(),
+            TuiSubmissionOutcome::RouteCancelled
+        );
+        assert_eq!(*session.lock().unwrap(), newer);
+
+        *session.lock().unwrap() = original.clone();
+        let accepted = TuiRouteCancellation::new();
+        assert!(matches!(
+            commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted,)
+                .unwrap(),
+            TuiSubmissionOutcome::SessionResumed { .. }
+        ));
+        assert!(!accepted.cancel());
+        let committed = session.lock().unwrap();
+        assert_eq!(committed.identifier, Some(metadata.id));
+        assert_eq!(committed.messages, tui_session_messages());
+        assert!(committed.restored_history.is_empty());
+        drop(committed);
+
+        let mut invalid = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
+        invalid.session.messages = vec![Message {
+            role: Role::Assistant,
+            parts: vec![MessagePart::Text("orphan".into())],
+        }];
+        let before_error = session.lock().unwrap().clone();
+        assert!(
+            prepare_loaded_tui_session_resume(&bootstrap, metadata.id, invalid, &credentials,)
+                .is_err()
+        );
+        assert_eq!(*session.lock().unwrap(), before_error);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn first_runtime_materialization_after_resume_preserves_permission_denial() {
+        let temporary = tui_session_directory("lazy-resume-runtime");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "lazy");
+        drop(store);
+        let skills = SkillCatalog::default();
+        reset_tui_resume_test_counters();
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &skills,
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+        let session = Arc::new(Mutex::new(resumed));
+        let (permission_bridge, _) = TuiPermissionBridge::channel();
+        let (events, _) = agens_tui::BridgeTx::bounded(8);
+        let runtime = production_tui_task_runtime(
+            &bootstrap,
+            &skills,
+            permission_bridge,
+            TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
+            agens_core::RequestConfig::default(),
+            "abc12345".to_owned(),
+        )
+        .unwrap();
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
+        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("primary")
+        );
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Deny,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = runtime
+            .dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    tui_project(&temporary),
+                    "task",
+                    serde_json::json!({"agent":"explore","description":"inspect"}),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(outcome, ToolEvaluationOutcome::Denied));
+        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn resumed_primary_inherits_every_effective_pinned_model_and_compatible_effort() {
+        for provider in ["openai-api", "openai-chatgpt"] {
+            for model in [
+                "gpt-5.5",
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ] {
+                let temporary =
+                    tui_session_directory(&format!("resume-primary-{provider}-{model}"));
+                let bootstrap =
+                    tui_session_bootstrap_for_provider(&temporary, &[], provider, model);
+                let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+                let mut metadata =
+                    persist_tui_session(&mut store, &tui_project(&temporary), "inherited");
+                metadata.provider_id = Some(provider.into());
+                metadata.model_id = Some(model.into());
+                metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
+                store.update_session_selection(&metadata).unwrap();
+                drop(store);
+
+                let resumed = resume_tui_session(
+                    &bootstrap,
+                    metadata.id,
+                    &SkillCatalog::default(),
+                    &TuiCredentialResolver::production(),
+                )
+                .unwrap();
+                assert!(resumed.active_agent.is_none());
+                let session = Arc::new(Mutex::new(resumed));
+                let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
+
+                ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+
+                let context = session.lock().unwrap();
+                let active = context.active_agent.as_ref().unwrap();
+                assert_eq!(active.name, "primary", "{provider} {model}");
+                assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
+                let request = context
+                    .apply_to(chat_request(chat_args_with_prompt("first submission")).unwrap());
+                assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+                assert_eq!(
+                    request.request_config.reasoning_effort(),
+                    Some(agens_core::ReasoningEffort::High),
+                    "{provider} {model}"
+                );
+                drop(context);
+
+                std::fs::remove_dir_all(temporary).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn model_switch_invalidates_and_rematerializes_inherited_primary_without_stale_model() {
+        let temporary = tui_session_directory("active-agent-model-switch");
+        let bootstrap =
+            tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref()),
+            Some("gpt-5.5")
+        );
+
+        apply_tui_model(&bootstrap, "gpt-5.6-sol", &session).unwrap();
+        assert!(session.lock().unwrap().active_agent.is_none());
+        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+
+        let context = session.lock().unwrap();
+        assert_eq!(
+            context
+                .active_agent
+                .as_ref()
+                .and_then(|agent| agent.model.as_deref()),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            context
+                .selection
+                .as_ref()
+                .unwrap()
+                .reasoning_effort_default(),
+            Some("medium")
+        );
+        drop(context);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn stale_persisted_agent_falls_back_to_primary_warns_and_persists_correction() {
+        let temporary = tui_session_directory("stale-active-agent-fallback");
+        let stale_definition = "---\nname: retired\ndescription: retired\nmode: primary\npermissions:\n  - allow native::read\n---\nRetired work.\n";
+        let bootstrap = tui_session_bootstrap(&temporary, &[("retired", stale_definition)]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "stale",
+            "retired",
+            100,
+        );
+        drop(store);
+        std::fs::remove_file(
+            bootstrap
+                .paths
+                .global_config
+                .with_file_name("agents")
+                .join("retired.md"),
+        )
+        .unwrap();
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resumed.note(),
+            "Agent 'retired' is unavailable; resumed with primary."
+        );
+        assert_eq!(resumed.metadata.as_ref().unwrap().active_agent, "primary");
+        assert!(resumed.active_agent.is_none());
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "retired"
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let expected = session.lock().unwrap().clone();
+        let outcome = commit_tui_session_resume(
+            &bootstrap,
+            &session,
+            &expected,
+            resumed,
+            &TuiRouteCancellation::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            TuiSubmissionOutcome::SessionResumed { message, .. }
+                if message == "Agent 'retired' is unavailable; resumed with primary."
+        ));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "primary"
+        );
+        assert!(!session.lock().unwrap().agent_correction_pending);
+        assert!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .unwrap()
+                .capabilities
+                .descriptors()
+                .is_empty()
+        );
+        let diagnostics = std::fs::read_to_string(
+            bootstrap
+                .data_directory()
+                .join("diagnostics")
+                .join(format!("agens-{}.jsonl", std::process::id())),
+        )
+        .unwrap();
+        assert!(diagnostics.contains(r#""event":"agent_fallback""#));
+        assert!(!diagnostics.contains("Retired work"));
+        assert!(!diagnostics.contains(&tui_project(&temporary)));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn explicit_unavailable_agent_model_and_ineligible_primary_are_hard_errors() {
+        for (case, definition, active_agent, expected) in [
+            (
+                "explicit-model",
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: gpt-4o\npermissions: []\n---\nReview.\n",
+                "reviewer",
+                "agent model is unavailable",
+            ),
+            (
+                "ineligible-primary",
+                "---\nname: primary\ndescription: primary\nmode: subagent\npermissions: []\n---\nWrong mode.\n",
+                "primary",
+                "primary agent is unavailable",
+            ),
+        ] {
+            let temporary = tui_session_directory(case);
+            let bootstrap = tui_session_bootstrap_for_provider(
+                &temporary,
+                &[(active_agent, definition)],
+                "openai-chatgpt",
+                "gpt-5.5",
+            );
+            let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+            let metadata = persist_tui_session_metadata(
+                &mut store,
+                &tui_project(&temporary),
+                case,
+                active_agent,
+                100,
+            );
+            drop(store);
+
+            let error = resume_tui_session(
+                &bootstrap,
+                metadata.id,
+                &SkillCatalog::default(),
+                &TuiCredentialResolver::production(),
+            )
+            .unwrap_err();
+            assert_eq!(error.message, expected, "{case}");
+            assert_eq!(
+                SessionStore::open(bootstrap.data_directory())
+                    .unwrap()
+                    .load_session_for_resume(metadata.id)
+                    .unwrap()
+                    .metadata
+                    .active_agent,
+                active_agent,
+                "{case}"
+            );
+            let diagnostics = std::fs::read_to_string(
+                bootstrap
+                    .data_directory()
+                    .join("diagnostics")
+                    .join(format!("agens-{}.jsonl", std::process::id())),
+            )
+            .unwrap();
+            assert!(diagnostics.contains(r#""event":"agent_unavailable""#));
+            assert!(!diagnostics.contains(definition));
+
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_agent_models_use_the_provider_aware_effective_registry() {
+        for (provider, model, expected_effort) in [
+            ("openai-api", "gpt-4o", None),
+            ("openai-chatgpt", "gpt-5.4", None),
+            ("openai-api", "gpt-5.6-luna", None),
+            ("openai-chatgpt", "gpt-5.6-luna", None),
+            (
+                "openai-api",
+                "gpt-5.5",
+                Some(agens_core::ReasoningEffort::High),
+            ),
+            (
+                "openai-chatgpt",
+                "gpt-5.5",
+                Some(agens_core::ReasoningEffort::High),
+            ),
+        ] {
+            let temporary = tui_session_directory(&format!("explicit-{provider}-{model}"));
+            let definition = format!(
+                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: {model}\npermissions: []\n---\nReview.\n"
+            );
+            let bootstrap = tui_session_bootstrap_for_provider(
+                &temporary,
+                &[("reviewer", &definition)],
+                provider,
+                "gpt-5.5",
+            );
+            let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+            let mut metadata = persist_tui_session_metadata(
+                &mut store,
+                &tui_project(&temporary),
+                "explicit",
+                "reviewer",
+                100,
+            );
+            metadata.provider_id = Some(provider.into());
+            metadata.model_id = Some("gpt-5.5".into());
+            metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
+            store.update_session_selection(&metadata).unwrap();
+            drop(store);
+            let resumed = resume_tui_session(
+                &bootstrap,
+                metadata.id,
+                &SkillCatalog::default(),
+                &TuiCredentialResolver::production(),
+            )
+            .unwrap();
+            let session = Arc::new(Mutex::new(resumed));
+
+            ensure_active_tui_agent_runtime(
+                &bootstrap,
+                &session,
+                &Arc::new(Mutex::new(rotation_dispatcher())),
+            )
+            .unwrap();
+
+            let context = session.lock().unwrap();
+            assert_eq!(context.active_agent.as_ref().unwrap().name, "reviewer");
+            assert_eq!(
+                context.active_agent.as_ref().unwrap().model.as_deref(),
+                Some(model),
+                "{provider} {model}"
+            );
+            let request = context.apply_to(chat_request(chat_args_with_prompt("review")).unwrap());
+            assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
+            assert_eq!(
+                request.request_config.reasoning_effort(),
+                expected_effort,
+                "{provider} {model}"
+            );
+            drop(context);
+            std::fs::remove_dir_all(temporary).unwrap();
+        }
+    }
+
+    #[test]
+    fn barrier_resume_loader_is_local_and_discards_its_late_cancelled_result() {
+        let temporary = tui_session_directory("barrier-resume");
+        let stale_definition = "---\nname: retired\ndescription: retired\nmode: primary\npermissions: []\n---\nRetired.\n";
+        let bootstrap = tui_session_bootstrap(&temporary, &[("retired", stale_definition)]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "barrier",
+            "retired",
+            100,
+        );
+        drop(store);
+        std::fs::remove_file(
+            bootstrap
+                .paths
+                .global_config
+                .with_file_name("agents")
+                .join("retired.md"),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let original = session.lock().unwrap().clone();
+        let cancellation = TuiRouteCancellation::new();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn({
+            let bootstrap = bootstrap.clone();
+            let session = Arc::clone(&session);
+            let original = original.clone();
+            let cancellation = cancellation.clone();
+            move || {
+                reset_tui_resume_test_counters();
+                started_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                let prepared = resume_tui_session(
+                    &bootstrap,
+                    metadata.id,
+                    &SkillCatalog::default(),
+                    &TuiCredentialResolver::production(),
+                )
+                .unwrap();
+                let outcome = commit_tui_session_resume(
+                    &bootstrap,
+                    &session,
+                    &original,
+                    prepared,
+                    &cancellation,
+                )
+                .unwrap();
+                (outcome, tui_resume_test_counters())
+            }
+        });
+        started_receiver.recv().unwrap();
+
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        tui.set_presentation("old-provider", "old-model", "session #1");
+        tui.begin_submission("old prompt");
+        tui.finish_submission(Ok("old answer".into()));
+        for character in "preserved draft".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        assert!(tui.begin_session_load());
+        assert!(tui.view().session_loading);
+        assert!(!tui.view().running);
+        assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
+
+        assert!(cancellation.cancel());
+        tui.cancel_session_load();
+        release_sender.send(()).unwrap();
+        let (outcome, counters) = worker.join().unwrap();
+        assert_eq!(outcome, TuiSubmissionOutcome::RouteCancelled);
+        assert_eq!(counters, (1, 1, 0, 0));
+        assert_eq!(*session.lock().unwrap(), original);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "retired"
+        );
+        assert_eq!(tui.view().provider_model, "old-provider / old-model");
+        assert_eq!(tui.input(), "preserved draft");
+        assert_eq!(tui.view().conversation.unwrap().user, "old prompt");
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn p1c2_resume_parser_restores_only_complete_standard_subagent_turns() {
+        let messages = vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("review the patch".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::ToolCall {
+                        id: "subagent:42".into(),
+                        name: "native::task".into(),
+                        input: r#"{"agent":"reviewer","description":"review the patch"}"#.into(),
+                    },
+                    MessagePart::Reasoning("3 tool uses".into()),
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "subagent:42".into(),
+                    content: "approved".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        assert_eq!(
+            resumed_subagent_cards(&messages),
+            vec![TuiRuntimeEvent::RestoredCompletedSubagent {
+                id: 42,
+                agent: "reviewer".into(),
+                task_summary: "review the patch".into(),
+                final_result: "approved".into(),
+                tool_uses: 3,
+            }]
+        );
+
+        let mut duplicate = messages.clone();
+        duplicate.extend(messages.clone());
+        assert_eq!(resumed_subagent_cards(&duplicate).len(), 1);
+
+        let mut failed = messages;
+        failed[2].parts = vec![MessagePart::ToolResult {
+            tool_call_id: "subagent:42".into(),
+            content: "failed".into(),
+            is_error: true,
+        }];
+        assert!(resumed_subagent_cards(&failed).is_empty());
+
+        let mut malformed = duplicate[..3].to_vec();
+        malformed[1].parts[0] = MessagePart::ToolCall {
+            id: "subagent:43".into(),
+            name: "native::task".into(),
+            input: "not json".into(),
+        };
+        assert!(resumed_subagent_cards(&malformed).is_empty());
+
+        let incomplete = duplicate[..2].to_vec();
+        assert!(resumed_subagent_cards(&incomplete).is_empty());
+
+        let mut transient = duplicate[..3].to_vec();
+        transient[2].parts = vec![MessagePart::ToolResult {
+            tool_call_id: "subagent:43".into(),
+            content: "cancelled".into(),
+            is_error: true,
+        }];
+        assert!(resumed_subagent_cards(&transient).is_empty());
+    }
+}
