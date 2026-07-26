@@ -1161,6 +1161,44 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
     run_table_a(cases);
 }
 
+/// C2-R2: `agens chat help` is the one shape where the bare `help` token
+/// must win over `ChatArgs.prompt` (a `Vec<String>`, so clap itself would
+/// otherwise happily bind `"help"` as the prompt and run a real turn). Only
+/// the single-argument shape is special-cased, matching the pre-clap
+/// `is_help` precedent: `chat foo help` and `chat help foo` are ordinary
+/// two-token prompts, not a help request.
+#[test]
+fn table_b_chat_bare_help_word_holds() {
+    use parser_surface_baseline as baseline;
+
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("bare-help-chat-alone");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat help (bare word, sole argument) renders chat's help",
+                argv: argv(&["chat", "help"]),
+                dependencies,
+                expected: success(baseline::CHAT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-chat-not-sole-argument");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "chat foo help is an ordinary two-token prompt, not a help request",
+                argv: argv(&["chat", "foo", "help"]),
+                dependencies,
+                expected: failure(ExitStatus::Usage, "usage: chat accepts one prompt argument"),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
 #[test]
 fn table_b_parser_surface_baseline_holds() {
     use parser_surface_baseline as baseline;

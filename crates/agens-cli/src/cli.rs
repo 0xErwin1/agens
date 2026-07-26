@@ -175,7 +175,7 @@ fn unrecognized_argument_error(token: &str) -> clap::Error {
 /// `config`/`auth`/`models`/`sessions` treat a help token ANYWHERE in their
 /// own arguments as a request for help, even alongside an otherwise-invalid
 /// shape — the historical `.any(is_help)` precedent from the hand-rolled
-/// parser.
+/// parser. `chat` has its own narrower rule, [`chat_help_override`].
 ///
 /// clap already resolves help correctly for every VALID shape on its own,
 /// including deeply nested subcommands (`config init --help`, `auth login
@@ -210,6 +210,9 @@ pub(crate) fn subcommand_help_override(
     let [name, rest @ ..] = arguments else {
         return None;
     };
+    if name == "chat" {
+        return chat_help_override(rest);
+    }
     if !matches!(name.as_str(), "config" | "auth" | "models" | "sessions") {
         return None;
     }
@@ -222,6 +225,28 @@ pub(crate) fn subcommand_help_override(
     }
 
     let canonical = [name.clone(), "--help".to_owned()];
+    Some(match Cli::try_parse_from(canonical.iter()) {
+        Err(error) => clap_outcome(error),
+        Ok(_) => unreachable!("`--help` always yields a clap DisplayHelp error"),
+    })
+}
+
+/// `chat`'s prompt is an unbounded `Vec<String>`, so clap has no shape that
+/// ever rejects a bare `"help"` token there: it always parses successfully
+/// as a one-word prompt. The historical hand-rolled parser special-cased
+/// exactly one shape — a single argument that is a help alias — and nothing
+/// wider, so `chat foo help` and `chat help foo` remain ordinary prompts,
+/// not a help request; there is no way to pass a literal one-word prompt of
+/// `"help"` without this ambiguity, and that trade-off is the restored
+/// pre-clap behavior, not a gap introduced here. `--help`/`-h` are already
+/// handled natively by clap regardless of position and never reach this
+/// function.
+fn chat_help_override(rest: &[String]) -> Option<Result<String, crate::CliError>> {
+    if !matches!(rest, [only] if only == "help") {
+        return None;
+    }
+
+    let canonical = ["chat".to_owned(), "--help".to_owned()];
     Some(match Cli::try_parse_from(canonical.iter()) {
         Err(error) => clap_outcome(error),
         Ok(_) => unreachable!("`--help` always yields a clap DisplayHelp error"),
