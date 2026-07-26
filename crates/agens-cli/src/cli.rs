@@ -10,7 +10,7 @@
 //! those cases; every other parse failure carries clap's own wording.
 
 use clap::error::ErrorKind;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -125,6 +125,66 @@ pub(crate) fn resume_shorthand(arguments: &[String]) -> Option<i64> {
         [identifier] => identifier.parse::<i64>().ok(),
         _ => None,
     }
+}
+
+fn is_help(argument: &str) -> bool {
+    matches!(argument, "--help" | "-h" | "help")
+}
+
+fn is_version(argument: &str) -> bool {
+    matches!(argument, "--version" | "-V" | "version")
+}
+
+/// clap honors `--help`/`-h`/`--version`/`-V`/`help`/`version` (and treats a
+/// bare `--` as "no more options", falling through to the TUI) regardless of
+/// any trailing token, which silently discards garbage that the historical
+/// single-argument matcher rejected. Detects those two shapes ahead of
+/// parsing and returns the `clap::Error` that reproduces the historical
+/// Usage(2) outcome; `None` means clap should parse `arguments` normally.
+pub(crate) fn root_shape_conflict(arguments: &[String]) -> Option<clap::Error> {
+    if matches!(arguments, [only] if only == "--") {
+        return Some(unrecognized_argument_error("--"));
+    }
+    if let [first, ..] = arguments
+        && arguments.len() > 1
+        && (is_help(first) || is_version(first))
+    {
+        return Some(unrecognized_argument_error(first));
+    }
+    None
+}
+
+fn unrecognized_argument_error(token: &str) -> clap::Error {
+    Cli::command().error(
+        ErrorKind::UnknownArgument,
+        format!("unrecognized argument '{token}'"),
+    )
+}
+
+/// `config`/`auth`/`models`/`sessions` treat a help token ANYWHERE in their
+/// own arguments as a request for that subcommand's help, even alongside an
+/// otherwise-invalid shape — the historical `.any(is_help)` precedent that
+/// clap's own subcommand-shape validation does not reproduce on its own.
+/// Returns the rendered help outcome when this precedent applies; `None`
+/// means clap should parse `arguments` normally.
+pub(crate) fn subcommand_help_override(
+    arguments: &[String],
+) -> Option<Result<String, crate::CliError>> {
+    let [name, rest @ ..] = arguments else {
+        return None;
+    };
+    if !matches!(name.as_str(), "config" | "auth" | "models" | "sessions") {
+        return None;
+    }
+    if !rest.iter().any(|argument| is_help(argument)) {
+        return None;
+    }
+
+    let canonical = [name.clone(), "--help".to_owned()];
+    Some(match Cli::try_parse_from(canonical.iter()) {
+        Err(error) => clap_outcome(error),
+        Ok(_) => unreachable!("`--help` always yields a clap DisplayHelp error"),
+    })
 }
 
 /// clap's rendered text is emitted verbatim: it already carries its own

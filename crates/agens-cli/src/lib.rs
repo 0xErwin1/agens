@@ -163,6 +163,14 @@ fn execute_command(
         return run_tui(dependencies, Some(identifier));
     }
 
+    if let Some(error) = cli::root_shape_conflict(arguments) {
+        return cli::clap_outcome(error);
+    }
+
+    if let Some(result) = cli::subcommand_help_override(arguments) {
+        return result;
+    }
+
     let parsed = match cli::Cli::try_parse_from(arguments.iter()) {
         Ok(parsed) => parsed,
         Err(error) => return cli::clap_outcome(error),
