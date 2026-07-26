@@ -360,7 +360,8 @@ fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
 #[cfg(test)]
 mod tests {
     use agens_core::{
-        PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
+        MessagePart, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+        PermissionSession, TurnEvent,
     };
     use agens_store::PermissionGrantStore;
     use agens_tools::{SkillCatalog, ToolDispatcher};
@@ -375,7 +376,9 @@ mod tests {
         PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
         ProductionPromptAuthorization, production_tui_permission_bridge,
     };
-    use crate::test_support::{RecordingPrompt, tui_session_bootstrap, tui_session_directory};
+    use crate::test_support::{
+        RecordingPrompt, run_production_batch, tui_session_bootstrap, tui_session_directory,
+    };
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls};
     use crate::tools::task::production_tui_task_runtime_with_runner;
     use crate::tui::agents::select_tui_subagent;
@@ -907,5 +910,45 @@ mod tests {
         assert!(runtime.authorized.gate.grants.lock().unwrap().is_empty());
 
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn production_dispatcher_preserves_safe_native_failure_reason() {
+        let outcome = run_production_batch(
+            "safe-native-failure",
+            vec![PermissionPromptAnswer::AllowOnce],
+            vec![MessagePart::ToolCall {
+                id: "glob".into(),
+                name: "native::glob".into(),
+                input: serde_json::json!({
+                    "pattern": "**/*.md",
+                    "_inject_tool_failure": "glob: entry limit of 10000 exceeded",
+                })
+                .to_string(),
+            }],
+            None,
+            None,
+            false,
+        );
+
+        assert!(outcome.result.is_ok());
+        assert!(outcome.progress.iter().any(|event| matches!(
+            event,
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                content,
+                is_error: true,
+                ..
+            }) if content == "glob: entry limit of 10000 exceeded"
+        )));
+        assert_eq!(
+            sanitized_native_tool_failure(
+                "glob: /home/user/private token=SECRET remote body details"
+            ),
+            "tool execution failed"
+        );
+        assert_eq!(
+            sanitized_native_tool_failure("glob: path is outside project root"),
+            "glob: path validation failed"
+        );
     }
 }

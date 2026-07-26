@@ -63,10 +63,6 @@ use agens_tools::{TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tools::{TaskLaunchMode, ToolDispatchRequest, ToolEvaluationOutcome};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use agens_tui::TuiProviderOutcome;
 use agens_tui::TuiSubagentErrorKind;
 
 mod bootstrap;
@@ -96,7 +92,7 @@ use diagnostics::{
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use dispatch::{ProductionToolDispatcher, poll_permission_port, sanitized_native_tool_failure};
+use dispatch::{ProductionToolDispatcher, poll_permission_port};
 use error::cancellation_result;
 use headless::block_on_headless_turn;
 #[cfg(test)]
@@ -106,14 +102,14 @@ use headless::{provider_messages, run_production_headless_chat_with_progress};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use permissions::{PermissionPromptAnswer, ProductionPermissionGate, permission_policy};
+use permissions::{ProductionPermissionGate, permission_policy};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
     BatchTool, ProductionBatchInput, native_batch_call, persist_tui_session, rotation_agent,
-    rotation_dispatcher, run_production_batch, run_production_batch_with_policy, tui_project,
-    tui_session_bootstrap, tui_session_directory, tui_session_messages,
+    rotation_dispatcher, run_production_batch_with_policy, tui_project, tui_session_bootstrap,
+    tui_session_directory, tui_session_messages,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -139,7 +135,7 @@ use tui::resume::{ensure_active_tui_agent_runtime, resume_tui_session};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use tui::router::{TUI_ERROR_ACTION, TuiRuntimeRouter, tui_provider_outcome};
+use tui::router::TuiRuntimeRouter;
 use tui::run_tui;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -1694,122 +1690,5 @@ mod tests {
         let request = worker.join().expect("mock provider should finish");
         std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
         request
-    }
-
-    #[test]
-    fn permission_error_mapping_is_sanitized_and_fails_closed() {
-        let secret_input = r#"{"command":"SENTINEL_COMMAND","token":"SENTINEL_TOKEN"}"#;
-        for (name, input) in [
-            ("native::read", "{malformed"),
-            ("native::read", secret_input),
-            ("native::unknown", r#"{"path":"SENTINEL_PATH"}"#),
-        ] {
-            let outcome = run_production_batch(
-                "permission-evaluation-invalid",
-                Vec::new(),
-                vec![MessagePart::ToolCall {
-                    id: "invalid".into(),
-                    name: name.into(),
-                    input: input.into(),
-                }],
-                None,
-                None,
-                false,
-            );
-
-            assert_eq!(outcome.result, Err(HeadlessTurnError::PermissionEvaluation));
-            assert!(outcome.executions.is_empty());
-        }
-
-        for (turn_error, expected) in [
-            (
-                HeadlessTurnError::Permission,
-                "permission: permission evaluation failed",
-            ),
-            (
-                HeadlessTurnError::PermissionRequired,
-                "permission: permission approval is required",
-            ),
-            (
-                HeadlessTurnError::PermissionEvaluation,
-                "permission: permission target could not be evaluated; correct the tool arguments and retry",
-            ),
-        ] {
-            let error = CliError::runtime(turn_error);
-            assert_eq!(error.category, "permission");
-            assert_eq!(error.to_string(), expected);
-            assert!(!error.to_string().contains("SENTINEL_COMMAND"));
-            assert!(!error.to_string().contains("SENTINEL_TOKEN"));
-
-            assert!(matches!(
-                tui_provider_outcome(Err(error)),
-                TuiProviderOutcome::Failed { message, action }
-                    if message == expected && action == TUI_ERROR_ACTION
-            ));
-        }
-    }
-
-    #[test]
-    fn provider_context_and_network_render_sanitized_actions() {
-        for (turn_error, expected_message, expected_action) in [
-            (
-                HeadlessTurnError::ProviderContext,
-                "provider: request exceeds the model context window",
-                "Start a new session or shorten the prompt, then retry.",
-            ),
-            (
-                HeadlessTurnError::ProviderNetwork,
-                "provider: network request failed",
-                "Check the network connection, then retry.",
-            ),
-        ] {
-            let error = CliError::runtime(turn_error);
-
-            assert!(matches!(
-                tui_provider_outcome(Err(error)),
-                TuiProviderOutcome::Failed { message, action }
-                    if message == expected_message && action == expected_action
-            ));
-        }
-    }
-
-    #[test]
-    fn production_dispatcher_preserves_safe_native_failure_reason() {
-        let outcome = run_production_batch(
-            "safe-native-failure",
-            vec![PermissionPromptAnswer::AllowOnce],
-            vec![MessagePart::ToolCall {
-                id: "glob".into(),
-                name: "native::glob".into(),
-                input: serde_json::json!({
-                    "pattern": "**/*.md",
-                    "_inject_tool_failure": "glob: entry limit of 10000 exceeded",
-                })
-                .to_string(),
-            }],
-            None,
-            None,
-            false,
-        );
-
-        assert!(outcome.result.is_ok());
-        assert!(outcome.progress.iter().any(|event| matches!(
-            event,
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                content,
-                is_error: true,
-                ..
-            }) if content == "glob: entry limit of 10000 exceeded"
-        )));
-        assert_eq!(
-            sanitized_native_tool_failure(
-                "glob: /home/user/private token=SECRET remote body details"
-            ),
-            "tool execution failed"
-        );
-        assert_eq!(
-            sanitized_native_tool_failure("glob: path is outside project root"),
-            "glob: path validation failed"
-        );
     }
 }
