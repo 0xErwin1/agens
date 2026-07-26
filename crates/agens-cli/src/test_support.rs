@@ -7,9 +7,26 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use agens_core::{
+    CompletedTurnRepository, CompletedTurnSnapshot, HeadlessTurnCancellation, HeadlessTurnError,
+    HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
+    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProgressSink, TurnProvider,
+};
+use agens_store::PermissionGrantStore;
+use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
+use agens_tui::{BridgeCancel, BridgeTx, TuiRuntimeEvent};
 
 use crate::CliDependencies;
 use crate::bootstrap::{Bootstrap, bootstrap};
+use crate::dispatch::ProductionToolDispatcher;
+use crate::error::CliError;
+use crate::permissions::{
+    NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
+    ProductionPermissionResolver, ProductionPromptAuthorization,
+};
+use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 
 thread_local! {
     static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -137,4 +154,373 @@ pub(crate) fn tui_session_bootstrap_for_provider(
         )]),
     ))
     .unwrap()
+}
+
+/// A native tool that records every path it acts on into a shared log and can
+/// be told, per call, to inject a permission-evaluator failure or a
+/// tool-execution failure. Backs the production-turn permission-batch
+/// harness below.
+pub(crate) struct BatchTool {
+    pub(crate) name: String,
+    pub(crate) calls: Arc<Mutex<Vec<String>>>,
+    pub(crate) cancellation: Option<HeadlessTurnCancellation>,
+}
+
+impl DispatchTool for BatchTool {
+    fn permission_target(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String, agens_core::Error> {
+        if arguments
+            .get("_inject_permission_evaluator_failure")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(agens_core::Error::Tool(
+                "injected permission evaluator failure".into(),
+            ));
+        }
+
+        NativePermissionTarget::parse(&self.name, arguments)
+            .map(NativePermissionTarget::into_value)
+            .map_err(|error| agens_core::Error::Tool(error.to_string()))
+    }
+
+    fn execute(
+        &mut self,
+        _: &ToolExecutionContext,
+        arguments: serde_json::Value,
+    ) -> Result<ToolOutput, agens_core::Error> {
+        let path = self.permission_target(&arguments)?;
+        self.calls
+            .lock()
+            .expect("tool calls should be available")
+            .push(path.clone());
+        if let Some(message) = arguments
+            .get("_inject_tool_failure")
+            .and_then(serde_json::Value::as_str)
+        {
+            return Ok(ToolOutput::failure(message));
+        }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.cancel();
+        }
+        Ok(ToolOutput::success(format!("executed {path}")))
+    }
+}
+
+struct BatchProvider {
+    iterations: Vec<Result<Vec<MessagePart>, HeadlessTurnPortError>>,
+}
+
+impl TurnProvider for BatchProvider {
+    fn next_parts(
+        &mut self,
+        _: &[TurnEvent],
+        _: &HeadlessTurnCancellation,
+    ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+    {
+        std::future::ready(self.iterations.remove(0))
+    }
+}
+
+struct BatchRepository {
+    fail_persistence: bool,
+}
+
+impl CompletedTurnRepository for BatchRepository {
+    fn persist_completed_turn(
+        &mut self,
+        _: CompletedTurnSnapshot,
+    ) -> impl std::future::Future<Output = Result<(), agens_core::CompletedTurnStoreError>> + Send
+    {
+        if self.fail_persistence {
+            std::future::ready(Err(agens_core::CompletedTurnStoreError::new(
+                "database unavailable",
+            )))
+        } else {
+            std::future::ready(Ok(()))
+        }
+    }
+}
+
+pub(crate) struct RecordingPrompt {
+    pub(crate) answers: Vec<PermissionPromptAnswer>,
+    pub(crate) calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl PermissionPrompter for RecordingPrompt {
+    fn prompt(
+        &mut self,
+        context: &agens_tools::PermissionPromptContext,
+        _: &HeadlessTurnCancellation,
+    ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+        self.calls
+            .lock()
+            .expect("prompt calls should be available")
+            .push(context.target_identifier.clone());
+        Ok(self.answers.remove(0))
+    }
+}
+
+pub(crate) fn batch_call(id: &str, path: &str) -> MessagePart {
+    MessagePart::ToolCall {
+        id: id.into(),
+        name: "native::read".into(),
+        input: format!(r#"{{"path":"{path}"}}"#),
+    }
+}
+
+pub(crate) fn native_batch_call(id: &str, name: &str, arguments: serde_json::Value) -> MessagePart {
+    MessagePart::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input: serde_json::to_string(&arguments).expect("native test arguments should encode"),
+    }
+}
+
+fn batch_policy() -> PermissionPolicy {
+    PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Ask,
+            PermissionPattern::Exact("native::read".into()),
+            PermissionPattern::Any,
+        )],
+    )
+}
+
+/// The full outcome of one production-turn permission batch: the headless
+/// turn result plus every prompt, tool execution, turn-progress event, and
+/// TUI metrics envelope it produced. Shared by the permission-gate,
+/// dispatcher, and TUI-metrics test clusters that all drive the same
+/// production headless-turn wiring end to end.
+pub(crate) struct BatchOutcome {
+    pub(crate) result: Result<CompletedTurnSnapshot, HeadlessTurnError>,
+    pub(crate) prompts: Vec<String>,
+    pub(crate) executions: Vec<String>,
+    pub(crate) progress: Vec<TurnEvent>,
+    pub(crate) metrics: Vec<TuiRuntimeEvent>,
+}
+
+pub(crate) struct ProductionBatchInput<'a> {
+    directory_name: &'a str,
+    answers: Vec<PermissionPromptAnswer>,
+    calls: Vec<MessagePart>,
+    cancellation: Option<HeadlessTurnCancellation>,
+    provider_error: Option<HeadlessTurnPortError>,
+    fail_persistence: bool,
+    policy: PermissionPolicy,
+    bypass: bool,
+    dangerous_override: bool,
+}
+
+impl<'a> ProductionBatchInput<'a> {
+    pub(crate) fn new(
+        directory_name: &'a str,
+        answers: Vec<PermissionPromptAnswer>,
+        calls: Vec<MessagePart>,
+    ) -> Self {
+        Self {
+            directory_name,
+            answers,
+            calls,
+            cancellation: None,
+            provider_error: None,
+            fail_persistence: false,
+            policy: batch_policy(),
+            bypass: false,
+            dangerous_override: false,
+        }
+    }
+
+    pub(crate) fn with_runtime(
+        mut self,
+        cancellation: Option<HeadlessTurnCancellation>,
+        provider_error: Option<HeadlessTurnPortError>,
+        fail_persistence: bool,
+    ) -> Self {
+        self.cancellation = cancellation;
+        self.provider_error = provider_error;
+        self.fail_persistence = fail_persistence;
+        self
+    }
+
+    pub(crate) fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    pub(crate) fn with_bypass(mut self) -> Self {
+        self.bypass = true;
+        self
+    }
+
+    pub(crate) fn with_dangerous_override(mut self) -> Self {
+        self.dangerous_override = true;
+        self
+    }
+}
+
+fn run_ready<T>(
+    future: impl std::future::Future<Output = Result<T, HeadlessTurnError>>,
+) -> Result<T, HeadlessTurnError> {
+    let mut future = std::pin::pin!(future);
+    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
+
+    match future.as_mut().poll(context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => panic!("batch ports must complete synchronously"),
+    }
+}
+
+/// Drives one production headless turn through the real permission gate,
+/// resolver, and tool dispatcher wiring, using the given directory name to
+/// isolate the grant store, and returns everything the batch produced.
+pub(crate) fn run_production_batch(
+    directory_name: &str,
+    answers: Vec<PermissionPromptAnswer>,
+    calls: Vec<MessagePart>,
+    cancellation: Option<HeadlessTurnCancellation>,
+    provider_error: Option<HeadlessTurnPortError>,
+    fail_persistence: bool,
+) -> BatchOutcome {
+    run_production_batch_with_policy(
+        ProductionBatchInput::new(directory_name, answers, calls).with_runtime(
+            cancellation,
+            provider_error,
+            fail_persistence,
+        ),
+    )
+}
+
+pub(crate) fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) -> BatchOutcome {
+    let ProductionBatchInput {
+        directory_name,
+        answers,
+        calls,
+        cancellation,
+        provider_error,
+        fail_persistence,
+        policy,
+        bypass,
+        dangerous_override,
+    } = input;
+    let directory =
+        std::env::temp_dir().join(format!("agens-{directory_name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let executions = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+    let mut dispatcher_guard = dispatcher.lock().expect("dispatcher should be available");
+    for name in [
+        "native::read",
+        "native::list",
+        "native::glob",
+        "native::grep",
+        "native::webfetch",
+        "native::write",
+    ] {
+        dispatcher_guard
+            .register_native(
+                name,
+                if name == "native::write" {
+                    agens_core::ToolAccess::Write
+                } else {
+                    agens_core::ToolAccess::ReadOnly
+                },
+                BatchTool {
+                    name: name.into(),
+                    calls: Arc::clone(&executions),
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .expect("batch tool should register");
+    }
+    drop(dispatcher_guard);
+    let grants = Arc::new(Mutex::new(Vec::new()));
+    let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+    let pending_prompts = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut gate = ProductionPermissionGate::new(
+        policy.clone(),
+        Arc::clone(&grants),
+        if bypass {
+            PermissionSession::with_temporary_bypass()
+        } else {
+            PermissionSession::new()
+        },
+        "project".into(),
+        Arc::clone(&dispatcher),
+        Arc::clone(&allowed),
+        Arc::clone(&pending_prompts),
+    )
+    .with_dangerous_override(dangerous_override);
+    let mut resolver = ProductionPermissionResolver::new(
+        RecordingPrompt {
+            answers,
+            calls: Arc::clone(&prompts),
+        },
+        PermissionGrantStore::open(&directory).expect("grant store should open"),
+        grants,
+        pending_prompts,
+        ProductionPromptAuthorization {
+            policy,
+            session: PermissionSession::new(),
+            project: "project".into(),
+            dispatcher: Arc::clone(&dispatcher),
+            allowed: Arc::clone(&allowed),
+        },
+    );
+    let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+    let mut provider = BatchProvider {
+        iterations: provider_error
+            .map(Err)
+            .into_iter()
+            .chain(std::iter::once(Ok(calls)))
+            .chain(std::iter::once(Ok(vec![MessagePart::Text(
+                "complete".into(),
+            )])))
+            .collect(),
+    };
+    let progress_events = Arc::new(Mutex::new(Vec::new()));
+    let (metrics_sender, metrics_receiver) = BridgeTx::bounded(16);
+    let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
+        metrics_sender,
+        BridgeCancel::new(),
+        "test-model",
+    )));
+    let progress: TurnProgressSink = {
+        let progress_events = Arc::clone(&progress_events);
+        let metrics = Arc::clone(&metrics);
+        Arc::new(move |event| {
+            metrics.lock().unwrap().observe(&event);
+            progress_events.lock().unwrap().push(event);
+        })
+    };
+    let cancellation = cancellation.unwrap_or_default();
+    let result = run_ready(agens_core::run_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut tool_dispatcher,
+        &mut BatchRepository { fail_persistence },
+        &cancellation,
+        Some(&progress),
+    ));
+    let terminal = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| CliError::runtime(*error));
+    finish_tui_metrics(&metrics, &terminal);
+    std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+
+    BatchOutcome {
+        result,
+        prompts: prompts.lock().unwrap().clone(),
+        executions: executions.lock().unwrap().clone(),
+        progress: progress_events.lock().unwrap().clone(),
+        metrics: std::iter::from_fn(|| metrics_receiver.try_recv().ok())
+            .map(|envelope| envelope.into_parts().1)
+            .collect(),
+    }
 }
