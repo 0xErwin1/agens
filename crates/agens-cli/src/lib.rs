@@ -183,7 +183,7 @@ use tui::engine::ProductionTuiEngine;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use tui::engine::{configure_tui_project_identity, run_tui_prompt, run_tui_prompt_with};
+use tui::engine::{run_tui_prompt, run_tui_prompt_with};
 use tui::models::tui_model_source;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -221,11 +221,7 @@ use tui::session::{AgentRotationError, rotate_active_agent};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
-use tui::turn::complete_tui_turn;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use tui::turn::{effective_tui_model, tui_session_presentation};
+use tui::turn::effective_tui_model;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -671,117 +667,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_tui_turn_clears_reminders_only_after_successful_persistence() {
-        let metadata = SessionMetadata {
-            id: 1,
-            project: "project".into(),
-            title: "title".into(),
-            active_agent: "reviewer".into(),
-            provider_id: None,
-            model_id: None,
-            reasoning_effort: None,
-            created_at: 1,
-            updated_at: 2,
-            completed_turn_count: 2,
-            resumable: true,
-        };
-        let mut context = TuiSessionContext::fresh();
-        context.pending_system_reminder = Some("reminder".into());
-
-        assert_eq!(
-            complete_tui_turn(
-                &mut context,
-                Ok(HeadlessChatCompletion {
-                    text: "answer".into(),
-                    metadata: metadata.clone(),
-                    messages: Vec::new(),
-                }),
-                true,
-            )
-            .unwrap(),
-            "answer"
-        );
-        assert_eq!(context.metadata, Some(metadata));
-        assert!(context.pending_system_reminder.is_none());
-
-        context.pending_system_reminder = Some("reminder".into());
-        assert!(
-            complete_tui_turn(&mut context, Err(CliError::storage("failed").into()), true).is_err()
-        );
-        assert_eq!(context.pending_system_reminder.as_deref(), Some("reminder"));
-    }
-
-    #[test]
-    fn p1c4_completing_a_turn_keeps_a_subagent_turn_persisted_mid_flight() {
-        let subagent_turn = vec![
-            Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text("review the patch".into())],
-            },
-            Message {
-                role: Role::Assistant,
-                parts: vec![
-                    MessagePart::ToolCall {
-                        id: "subagent:1".into(),
-                        name: "native::task".into(),
-                        input: r#"{"agent":"reviewer","description":"review the patch"}"#.into(),
-                    },
-                    MessagePart::Reasoning("3 tool uses".into()),
-                ],
-            },
-            Message {
-                role: Role::Tool,
-                parts: vec![MessagePart::ToolResult {
-                    tool_call_id: "subagent:1".into(),
-                    content: "approved".into(),
-                    is_error: false,
-                }],
-            },
-        ];
-        let foreground_turn = vec![
-            Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text("summarize the patch".into())],
-            },
-            Message {
-                role: Role::Assistant,
-                parts: vec![MessagePart::Text("summary".into())],
-            },
-        ];
-        let mut session = TuiSessionContext {
-            identifier: Some(7),
-            messages: subagent_turn.clone(),
-            ..TuiSessionContext::fresh()
-        };
-        let completion = HeadlessChatCompletion {
-            text: "summary".into(),
-            metadata: SessionMetadata {
-                id: 7,
-                project: "project".into(),
-                title: "conversation".into(),
-                active_agent: "primary".into(),
-                provider_id: None,
-                model_id: None,
-                reasoning_effort: None,
-                created_at: 1,
-                updated_at: 1,
-                completed_turn_count: 1,
-                resumable: true,
-            },
-            messages: foreground_turn.clone(),
-        };
-
-        assert_eq!(
-            complete_tui_turn(&mut session, Ok(completion), false).unwrap(),
-            "summary"
-        );
-
-        let mut expected = foreground_turn;
-        expected.extend(subagent_turn);
-        assert_eq!(session.messages, expected);
-    }
-
-    #[test]
     fn p1c2_resume_parser_restores_only_complete_standard_subagent_turns() {
         let messages = vec![
             Message {
@@ -975,52 +860,6 @@ mod tests {
                 "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
             );
         }
-    }
-
-    #[test]
-    fn fresh_tui_presentation_projects_resolved_model_effort_and_context() {
-        let known_root = tui_session_directory("fresh-presentation-known");
-        let known_bootstrap =
-            tui_session_bootstrap_for_provider(&known_root, &[], "openai-api", "gpt-5.6-sol");
-        let mut known_tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(None)),
-        });
-        known_tui.apply_presentation(tui_session_presentation(
-            &known_bootstrap,
-            &TuiSessionContext::fresh(),
-        ));
-        configure_tui_project_identity(&mut known_tui, &known_bootstrap);
-        let known = render_tui_test_backend(&known_tui, 140, 14);
-
-        assert!(
-            known.contains("gpt-5.6-sol · medium · 0/1.1m (0%)"),
-            "{known:?}"
-        );
-        assert!(!known.contains("model · default · ctx —"), "{known:?}");
-
-        let unknown_root = tui_session_directory("fresh-presentation-unknown");
-        let unknown_bootstrap =
-            tui_session_bootstrap_for_provider(&unknown_root, &[], "openai-api", "gpt-future-1");
-        let mut unknown_tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(None)),
-        });
-        unknown_tui.apply_presentation(tui_session_presentation(
-            &unknown_bootstrap,
-            &TuiSessionContext::fresh(),
-        ));
-        let unknown = render_tui_test_backend(&unknown_tui, 140, 14);
-
-        assert!(
-            unknown.contains("gpt-future-1 · effort — · ctx —"),
-            "{unknown:?}"
-        );
-        assert!(
-            !unknown.contains("gpt-future-1 · effort — · 0/"),
-            "{unknown:?}"
-        );
-
-        std::fs::remove_dir_all(known_root).unwrap();
-        std::fs::remove_dir_all(unknown_root).unwrap();
     }
 
     #[test]
