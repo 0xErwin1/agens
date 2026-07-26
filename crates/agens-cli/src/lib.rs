@@ -225,6 +225,7 @@ use session::attempt::attempt_failure_status;
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
     bootstrap_from_configuration, reset_tui_resume_test_counters, tui_resume_test_counters,
+    tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -333,12 +334,8 @@ use tui::turn::complete_tui_turn;
 use tui::turn::{effective_tui_model, tui_session_presentation};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use turns::{
-    MAX_PERSISTED_SUBAGENT_RESULT_CHARS, SUBAGENT_RESULT_TRUNCATION_MARKER, completed_session_turn,
-    completed_session_turn_from_events, completed_subagent_session_turn,
-    persist_completed_subagent_turn,
-};
+// calls this unqualified. Remove this re-export once the test module moves.
+use turns::completed_session_turn;
 
 pub use bootstrap::{Bootstrap, bootstrap};
 pub use deps::CliDependencies;
@@ -482,7 +479,7 @@ mod tests {
     use super::*;
     use agens_core::{
         AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot,
-        Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState, Usage,
+        Error as ToolError, PermissionRule, ToolAccess, TurnProvider, TurnState,
     };
     use agens_tui::{Action, Event, Key};
     use rusqlite::Connection;
@@ -1212,120 +1209,6 @@ mod tests {
     }
 
     #[test]
-    fn completed_session_turn_ignores_usage_without_changing_output_history_order() {
-        let events = [
-            TurnEvent::StateChanged(TurnState::Requesting),
-            TurnEvent::ProviderPart(MessagePart::Text("before usage".into())),
-            TurnEvent::Usage(Usage {
-                input_tokens: Some(5),
-                output_tokens: Some(3),
-                total_tokens: Some(8),
-                context_window: Some(16),
-            }),
-            TurnEvent::ProviderPart(MessagePart::Reasoning("after usage".into())),
-            TurnEvent::StateChanged(TurnState::Completed),
-        ];
-
-        let turn = completed_session_turn_from_events("prompt", &events, None)
-            .expect("completed session turn should exclude presentation usage");
-
-        assert_eq!(
-            turn.messages(),
-            &[
-                Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text("prompt".into())],
-                },
-                Message {
-                    role: Role::Assistant,
-                    parts: vec![
-                        MessagePart::Text("before usage".into()),
-                        MessagePart::Reasoning("after usage".into()),
-                    ],
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn completed_session_turn_keeps_role_boundaries_around_usage() {
-        let events = [
-            TurnEvent::ProviderPart(MessagePart::Text("before tool".into())),
-            TurnEvent::Usage(Usage::default()),
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                tool_call_id: "call-1".into(),
-                content: "tool output".into(),
-                is_error: false,
-            }),
-            TurnEvent::Usage(Usage {
-                input_tokens: None,
-                output_tokens: Some(0),
-                total_tokens: None,
-                context_window: None,
-            }),
-            TurnEvent::ProviderPart(MessagePart::Text("after tool".into())),
-        ];
-
-        let turn = completed_session_turn_from_events("prompt", &events, None)
-            .expect("completed session turn should exclude presentation usage");
-
-        assert_eq!(
-            turn.messages(),
-            &[
-                Message {
-                    role: Role::User,
-                    parts: vec![MessagePart::Text("prompt".into())],
-                },
-                Message {
-                    role: Role::Assistant,
-                    parts: vec![MessagePart::Text("before tool".into())],
-                },
-                Message {
-                    role: Role::Tool,
-                    parts: vec![MessagePart::ToolResult {
-                        tool_call_id: "call-1".into(),
-                        content: "tool output".into(),
-                        is_error: false,
-                    }],
-                },
-                Message {
-                    role: Role::Assistant,
-                    parts: vec![MessagePart::Text("after tool".into())],
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn p1c1_completed_subagent_turn_redacts_and_bounds_durable_content() {
-        let turn = CompletedSubagentTurn {
-            id: 1,
-            agent: "reviewer".into(),
-            task: format!("authorization {}", "x".repeat(300)),
-            final_result: "token=result".into(),
-            tool_uses: 1,
-        };
-
-        let messages = completed_subagent_session_turn(&turn, "subagent:1")
-            .unwrap()
-            .messages()
-            .to_vec();
-
-        assert_eq!(
-            messages[0].parts,
-            vec![MessagePart::Text("[redacted]".into())]
-        );
-        assert_eq!(
-            messages[2].parts,
-            vec![MessagePart::ToolResult {
-                tool_call_id: "subagent:1".into(),
-                content: "[withheld: 12 characters matched a credential pattern]".into(),
-                is_error: false,
-            }]
-        );
-    }
-
-    #[test]
     fn p1c4_completing_a_turn_keeps_a_subagent_turn_persisted_mid_flight() {
         let subagent_turn = vec![
             Message {
@@ -1393,88 +1276,6 @@ mod tests {
         let mut expected = foreground_turn;
         expected.extend(subagent_turn);
         assert_eq!(session.messages, expected);
-    }
-
-    #[test]
-    fn p1c1_persisted_subagent_result_stays_bounded_and_marks_every_loss() {
-        let subagent_turn = |final_result: String| CompletedSubagentTurn {
-            id: 1,
-            agent: "reviewer".into(),
-            task: "review the patch".into(),
-            final_result,
-            tool_uses: 1,
-        };
-        let persisted_result = |turn: &CompletedSubagentTurn| {
-            let messages = completed_subagent_session_turn(turn, "subagent:1")
-                .unwrap()
-                .messages()
-                .to_vec();
-            match &messages[2].parts[0] {
-                MessagePart::ToolResult { content, .. } => content.clone(),
-                part => panic!("subagent turns persist a tool result: {part:?}"),
-            }
-        };
-
-        let long = persisted_result(&subagent_turn("a".repeat(70_000)));
-        assert!(long.starts_with(&"a".repeat(MAX_PERSISTED_SUBAGENT_RESULT_CHARS)));
-        assert!(long.ends_with(SUBAGENT_RESULT_TRUNCATION_MARKER));
-        assert_eq!(
-            long.chars().count(),
-            MAX_PERSISTED_SUBAGENT_RESULT_CHARS + SUBAGENT_RESULT_TRUNCATION_MARKER.chars().count()
-        );
-
-        let bounded = persisted_result(&subagent_turn("a".repeat(300)));
-        assert_eq!(bounded, "a".repeat(300));
-
-        let with_secret = persisted_result(&subagent_turn(
-            "usable finding\napi_key=abcd\ntrailing finding".into(),
-        ));
-        assert_eq!(
-            with_secret,
-            "usable finding\n[withheld: 12 characters matched a credential pattern]\ntrailing finding"
-        );
-
-        let only_secret = persisted_result(&subagent_turn("token=abcd".into()));
-        assert_eq!(
-            only_secret,
-            "[withheld: 10 characters matched a credential pattern]"
-        );
-    }
-
-    #[test]
-    fn p1c1_persisted_subagent_call_ids_stay_unique_when_execution_ids_restart() {
-        let temporary = tui_session_directory("subagent-call-id-uniqueness");
-        let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let turn = |final_result: &str| CompletedSubagentTurn {
-            id: 1,
-            agent: "reviewer".into(),
-            task: "review the patch".into(),
-            final_result: final_result.into(),
-            tool_uses: 1,
-        };
-
-        persist_completed_subagent_turn(&bootstrap, &session, turn("first")).unwrap();
-        persist_completed_subagent_turn(&bootstrap, &session, turn("second")).unwrap();
-
-        let messages = session.lock().unwrap().messages.clone();
-        let call_ids = messages
-            .iter()
-            .flat_map(|message| message.parts.iter())
-            .filter_map(|part| match part {
-                MessagePart::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            call_ids,
-            vec!["subagent:1".to_owned(), "subagent:2".to_owned()]
-        );
-        agens_providers::encode_openai_response_request_with_messages("gpt-4.1", &messages, &[])
-            .expect("a resumed subagent history must encode for the provider");
-
-        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]
@@ -6316,19 +6117,6 @@ mod tests {
         transcript_count
     }
 
-    fn tui_session_directory(label: &str) -> PathBuf {
-        let temporary = std::env::temp_dir().join(format!(
-            "agens-tui-session-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(temporary.join("project/.git")).unwrap();
-        temporary
-    }
-
     fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> String {
         for character in input.chars() {
             tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
@@ -6462,41 +6250,6 @@ mod tests {
 
     fn tui_project(temporary: &Path) -> String {
         temporary.join("project").display().to_string()
-    }
-
-    fn tui_session_bootstrap(temporary: &Path, agents: &[(&str, &str)]) -> Bootstrap {
-        tui_session_bootstrap_for_provider(temporary, agents, "openai-api", "gpt-4.1")
-    }
-
-    fn tui_session_bootstrap_for_provider(
-        temporary: &Path,
-        agents: &[(&str, &str)],
-        provider: &str,
-        model: &str,
-    ) -> Bootstrap {
-        let config_home = temporary.join("config");
-        let data_directory = temporary.join("data");
-        let agents_directory = config_home.join("agents");
-        std::fs::create_dir_all(&agents_directory).unwrap();
-        for (name, contents) in agents {
-            std::fs::write(agents_directory.join(format!("{name}.md")), contents).unwrap();
-        }
-        bootstrap(&CliDependencies::for_test(
-            temporary.join("project"),
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            BTreeMap::from([(
-                config_home.join("config.toml"),
-                format!(
-                    "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
-                    data_directory.display()
-                ),
-            )]),
-        ))
-        .unwrap()
     }
 
     #[test]
