@@ -11,7 +11,9 @@ use agens_core::{
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 mod database;
+mod fact_store;
 mod session_writer;
+pub use fact_store::{ToolFactStore, ToolFactStoreError};
 pub use session_writer::{SessionCursor, SessionPage, StoredSession};
 
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [

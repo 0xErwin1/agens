@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 3] = [
+const MIGRATIONS: [Migration; 4] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -64,6 +64,10 @@ const MIGRATIONS: [Migration; 3] = [
     Migration {
         id: "0003_sessions_v5",
         ddl: sessions_v5_ddl,
+    },
+    Migration {
+        id: "0004_tool_result_facts",
+        ddl: tool_result_facts_ddl,
     },
 ];
 
@@ -285,6 +289,47 @@ fn sessions_v5_ddl() -> String {
     )
 }
 
+/// The evidence ledger a running turn writes tool-result facts to. Keyed by
+/// `(attempt_id, sequence)` rather than by turn: a `turns` row only exists once
+/// a turn completes, but facts are produced mid-turn, so the attempt is the
+/// only durable key available at write time. `tool_call_id` is a correlation
+/// column, not part of that key. `path_status` distinguishes a variant that
+/// carries no path (`not_applicable`) from one whose reported path violated
+/// the `FactPath` contract (`unrepresentable`) — collapsing both to a NULL
+/// `path` would make an unrepresentable path indistinguishable from an absent
+/// one.
+fn tool_result_facts_ddl() -> String {
+    "
+    CREATE TABLE tool_result_facts (
+        id INTEGER PRIMARY KEY,
+        session_id INTEGER NOT NULL,
+        attempt_id INTEGER NOT NULL,
+        sequence INTEGER NOT NULL CHECK(sequence > 0),
+        tool_call_id TEXT NOT NULL,
+        tool TEXT NOT NULL CHECK(tool IN ('write','edit','bash','read','search')),
+        outcome TEXT NOT NULL CHECK(outcome IN ('succeeded','failed','denied')),
+        path TEXT,
+        path_status TEXT NOT NULL CHECK(path_status IN ('relative','unrepresentable','not_applicable')),
+        exit_code INTEGER,
+        is_new_file INTEGER,
+        bytes_written INTEGER,
+        lines_written INTEGER,
+        lines_added INTEGER,
+        lines_removed INTEGER,
+        match_count INTEGER,
+        truncated INTEGER,
+        recorded_at INTEGER NOT NULL,
+        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+        FOREIGN KEY(attempt_id) REFERENCES session_attempts(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX tool_result_facts_attempt_sequence
+        ON tool_result_facts(attempt_id, sequence);
+    CREATE INDEX tool_result_facts_call
+        ON tool_result_facts(session_id, tool_call_id);
+    "
+    .to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -396,6 +441,66 @@ mod tests {
 
         drop(first_connection);
         drop(second_connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_0004_is_purely_additive_and_creates_the_tool_result_facts_table() {
+        let directory = data_directory();
+        let (_, connection) = open_unified_database(&directory).unwrap();
+
+        for pre_existing_table in [
+            "sessions",
+            "session_attempts",
+            "permission_grants",
+            "model_preference",
+        ] {
+            let column_count: i64 = connection
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{pre_existing_table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                column_count > 0,
+                "{pre_existing_table} must be unchanged by migration 0004"
+            );
+        }
+
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('tool_result_facts') ORDER BY cid")
+            .unwrap();
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(
+            columns,
+            vec![
+                "id",
+                "session_id",
+                "attempt_id",
+                "sequence",
+                "tool_call_id",
+                "tool",
+                "outcome",
+                "path",
+                "path_status",
+                "exit_code",
+                "is_new_file",
+                "bytes_written",
+                "lines_written",
+                "lines_added",
+                "lines_removed",
+                "match_count",
+                "truncated",
+                "recorded_at",
+            ]
+        );
+
         fs::remove_dir_all(directory).unwrap();
     }
 
