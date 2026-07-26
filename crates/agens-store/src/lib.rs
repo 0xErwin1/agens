@@ -32,8 +32,6 @@ const PERMISSION_GRANTS_INDEX_COLUMNS: [ExpectedIndexColumnSignature; 2] = [
     ExpectedIndexColumnSignature::new(1, 0, "id"),
 ];
 
-const PREFERENCES_DATABASE: &str = "preferences.db";
-const PREFERENCES_SCHEMA_VERSION: i64 = 1;
 const MAX_PREFERENCE_MODEL_BYTES: usize = 64;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -525,30 +523,6 @@ fn permission_grants_index_matches(connection: &Connection) -> rusqlite::Result<
         ))
 }
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), PermissionGrantStoreError> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    let metadata = fs::metadata(path).map_err(|error| {
-        PermissionGrantStoreError::operation("inspect permissions", path, error)
-    })?;
-    let current_mode = metadata.mode() & 0o777;
-    let restricted_mode = current_mode & maximum_mode;
-
-    if restricted_mode != current_mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(restricted_mode)).map_err(
-            |error| PermissionGrantStoreError::operation("restrict permissions", path, error),
-        )?;
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_: &Path, _: u32) -> Result<(), PermissionGrantStoreError> {
-    Ok(())
-}
-
 fn insert_grant(
     transaction: &Transaction<'_>,
     grant: &ProjectPermissionGrant,
@@ -671,6 +645,10 @@ impl PreferenceStoreError {
             message: message.into(),
         }
     }
+
+    fn from_database(error: database::DatabaseError) -> Self {
+        Self::operation(error.operation(), error.path(), error.detail())
+    }
 }
 
 impl fmt::Display for PreferenceStoreError {
@@ -692,20 +670,8 @@ pub struct PreferenceStore {
 
 impl PreferenceStore {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, PreferenceStoreError> {
-        let data_directory = data_directory.as_ref();
-        fs::create_dir_all(data_directory).map_err(|error| {
-            PreferenceStoreError::operation("create data directory", data_directory, error)
-        })?;
-        restrict_permissions(data_directory, 0o700)
-            .map_err(|error| PreferenceStoreError::detail(error.to_string()))?;
-
-        let database_path = data_directory.join(PREFERENCES_DATABASE);
-        let connection = Connection::open(&database_path).map_err(|error| {
-            PreferenceStoreError::operation("open database", &database_path, error)
-        })?;
-        restrict_permissions(&database_path, 0o600)
-            .map_err(|error| PreferenceStoreError::detail(error.to_string()))?;
-        initialize_preferences_schema(&connection, &database_path)?;
+        let (database_path, connection) = database::open_unified_database(data_directory.as_ref())
+            .map_err(PreferenceStoreError::from_database)?;
 
         Ok(Self {
             database_path,
@@ -794,42 +760,6 @@ fn valid_preference_model(model: &str) -> bool {
         && model.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/')
         })
-}
-
-fn initialize_preferences_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), PreferenceStoreError> {
-    let version = connection
-        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| {
-            PreferenceStoreError::operation("read schema version", database_path, error)
-        })?;
-
-    match version {
-        0 => connection
-            .execute_batch(&format!(
-                "
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS model_preference (
-                    id INTEGER PRIMARY KEY CHECK(id = 1),
-                    model TEXT NOT NULL CHECK(model <> ''),
-                    reasoning_effort TEXT
-                );
-                PRAGMA user_version = {PREFERENCES_SCHEMA_VERSION};
-                COMMIT;
-                "
-            ))
-            .map_err(|error| {
-                PreferenceStoreError::operation("initialize schema", database_path, error)
-            }),
-        PREFERENCES_SCHEMA_VERSION => Ok(()),
-        unsupported => Err(PreferenceStoreError::operation(
-            "check schema version",
-            database_path,
-            format!("unsupported schema version {unsupported}"),
-        )),
-    }
 }
 
 const SESSIONS_DATABASE: &str = "sessions.db";

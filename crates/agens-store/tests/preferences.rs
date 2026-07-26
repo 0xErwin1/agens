@@ -28,20 +28,23 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
     {
         let mut store = PreferenceStore::open(&directory).unwrap();
         assert_eq!(store.remembered_model().unwrap(), None);
-        assert_eq!(store.database_path(), directory.join("preferences.db"));
+        assert_eq!(store.database_path(), directory.join("agens.db"));
 
         store.remember_model(&first).unwrap();
         assert_eq!(store.remembered_model().unwrap(), Some(first));
     }
 
-    let database = directory.join("preferences.db");
-    assert_eq!(
-        Connection::open(&database)
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
+    let database = directory.join("agens.db");
+    let connection = Connection::open(&database).unwrap();
+    let ids: Vec<String> = connection
+        .prepare("SELECT id FROM schema_migrations ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(ids, vec!["0001_permission_grants", "0002_model_preference"]);
+    drop(connection);
 
     let mut reopened = PreferenceStore::open(&directory).unwrap();
     reopened.remember_model(&second).unwrap();
@@ -85,7 +88,7 @@ fn a_corrupted_effort_is_reported_instead_of_silently_dropped() {
             .unwrap();
     }
 
-    Connection::open(directory.join("preferences.db"))
+    Connection::open(directory.join("agens.db"))
         .unwrap()
         .execute("UPDATE model_preference SET reasoning_effort = 'turbo'", [])
         .unwrap();
@@ -96,6 +99,24 @@ fn a_corrupted_effort_is_reported_instead_of_silently_dropped() {
             .remembered_model()
             .is_err()
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn corrupt_database_open_failure_uses_the_preferences_prefix() {
+    let directory = data_directory();
+    let database = directory.join("agens.db");
+    fs::write(&database, "not a sqlite database").unwrap();
+
+    let error = PreferenceStore::open(&directory).err().unwrap().to_string();
+
+    assert!(
+        error.starts_with("preferences check database layout"),
+        "{error}"
+    );
+    assert!(!error.contains("permission grants"), "{error}");
+    assert!(error.contains(database.to_string_lossy().as_ref()));
 
     fs::remove_dir_all(directory).unwrap();
 }

@@ -3,7 +3,8 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use agens_store::PermissionGrantStore;
+use agens_core::{PermissionPattern, ProjectPermissionGrant};
+use agens_store::{ModelPreference, PermissionGrantStore, PreferenceStore};
 use rusqlite::Connection;
 
 static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
@@ -53,7 +54,7 @@ fn the_ledger_records_each_applied_migration_once() {
 
     assert_eq!(
         rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-        vec!["0001_permission_grants"]
+        vec!["0001_permission_grants", "0002_model_preference"]
     );
 
     let user_version: i64 = Connection::open(store.database_path())
@@ -106,6 +107,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
         rows,
         vec![
             ("0001_permission_grants".to_owned(), rows[0].1),
+            ("0002_model_preference".to_owned(), rows[1].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -143,6 +145,129 @@ fn a_database_with_tables_but_no_ledger_is_rejected_as_an_unrecognized_layout() 
 
     let after = fs::read(&database_path).unwrap();
     assert_eq!(before, after);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn two_stores_writing_concurrently_in_one_process_do_not_corrupt_or_spuriously_fail() {
+    let directory = data_directory();
+
+    let mut preference_store = PreferenceStore::open(&directory).unwrap();
+    let mut permission_store = PermissionGrantStore::open(&directory).unwrap();
+
+    assert_eq!(
+        preference_store.database_path(),
+        permission_store.database_path()
+    );
+
+    let preference = ModelPreference::new("gpt-5.5", None);
+    let grant = ProjectPermissionGrant::allow(
+        "project-a",
+        PermissionPattern::Exact("native::edit".into()),
+        PermissionPattern::Any,
+    );
+
+    preference_store.remember_model(&preference).unwrap();
+    permission_store
+        .append_grants(std::slice::from_ref(&grant))
+        .unwrap();
+
+    assert_eq!(
+        preference_store.remembered_model().unwrap(),
+        Some(preference)
+    );
+    assert_eq!(
+        permission_store.grants_for_project("project-a").unwrap(),
+        vec![grant]
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn legacy_database_files_are_neither_read_nor_modified() {
+    let directory = data_directory();
+
+    let legacy_files = ["permissions.db", "preferences.db", "sessions.db"];
+    let legacy_contents = b"legacy fixture bytes, never read or written by the unified path";
+    for name in legacy_files {
+        fs::write(directory.join(name), legacy_contents).unwrap();
+    }
+    let before: Vec<(std::fs::Metadata, Vec<u8>)> = legacy_files
+        .iter()
+        .map(|name| {
+            let path = directory.join(name);
+            (fs::metadata(&path).unwrap(), fs::read(&path).unwrap())
+        })
+        .collect();
+
+    let mut preference_store = PreferenceStore::open(&directory).unwrap();
+    let mut permission_store = PermissionGrantStore::open(&directory).unwrap();
+    preference_store
+        .remember_model(&ModelPreference::new("gpt-5.5", None))
+        .unwrap();
+    permission_store
+        .append_grants(&[ProjectPermissionGrant::allow(
+            "project-a",
+            PermissionPattern::Any,
+            PermissionPattern::Any,
+        )])
+        .unwrap();
+    drop(preference_store);
+    drop(permission_store);
+
+    for (name, (metadata_before, contents_before)) in legacy_files.iter().zip(before) {
+        let path = directory.join(name);
+        let metadata_after = fs::metadata(&path).unwrap();
+        let contents_after = fs::read(&path).unwrap();
+
+        assert_eq!(metadata_before.len(), metadata_after.len(), "{name}");
+        assert_eq!(contents_before, contents_after, "{name}");
+        assert!(!directory.join(format!("{name}-wal")).exists(), "{name}");
+        assert!(!directory.join(format!("{name}-shm")).exists(), "{name}");
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_partially_applied_database_is_completed() {
+    let directory = data_directory();
+    let database_path = directory.join("agens.db");
+
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (
+                     id TEXT PRIMARY KEY,
+                     applied_at INTEGER NOT NULL
+                 );
+                 INSERT INTO schema_migrations (id, applied_at)
+                 VALUES ('0001_permission_grants', 0);
+                 CREATE TABLE permission_grants (
+                     id INTEGER PRIMARY KEY,
+                     project TEXT NOT NULL,
+                     decision TEXT NOT NULL,
+                     tool_kind TEXT NOT NULL,
+                     tool_value TEXT,
+                     target_kind TEXT NOT NULL,
+                     target_value TEXT
+                 );
+                 CREATE INDEX permission_grants_project
+                     ON permission_grants(project, id);",
+            )
+            .unwrap();
+    }
+
+    let store = PermissionGrantStore::open(&directory).unwrap();
+    let rows = ledger_rows(&store.database_path());
+
+    assert_eq!(
+        rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["0001_permission_grants", "0002_model_preference"]
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }

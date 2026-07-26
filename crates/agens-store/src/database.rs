@@ -52,10 +52,16 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 1] = [Migration {
-    id: "0001_permission_grants",
-    ddl: permission_grants_ddl,
-}];
+const MIGRATIONS: [Migration; 2] = [
+    Migration {
+        id: "0001_permission_grants",
+        ddl: permission_grants_ddl,
+    },
+    Migration {
+        id: "0002_model_preference",
+        ddl: model_preference_ddl,
+    },
+];
 
 /// Opens the single `agens.db` file inside `data_directory`, applying the full open contract on
 /// every call: directory and file permissions, `busy_timeout`, `foreign_keys`, the layout guard,
@@ -228,6 +234,17 @@ fn permission_grants_ddl() -> String {
     .to_owned()
 }
 
+fn model_preference_ddl() -> String {
+    "
+    CREATE TABLE model_preference (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        model TEXT NOT NULL CHECK(model <> ''),
+        reasoning_effort TEXT
+    );
+    "
+    .to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -302,6 +319,60 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
             .unwrap();
 
+        assert_eq!(busy_timeout, 5000);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn journal_mode(connection: &Connection) -> String {
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn foreign_keys(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Neither an integration test nor a store method can observe `foreign_keys`, since it is a
+    /// per-connection setting with no on-disk trace and `open_unified_database` is `pub(crate)`.
+    /// This is also the empirical resolution of the design's one open question: whether a SECOND
+    /// connection issuing `PRAGMA journal_mode = WAL` while a first connection holds the same file
+    /// open returns `wal` or fails. Measured here, not inferred: both connections stay open
+    /// simultaneously and both must report the full pragma set.
+    #[test]
+    fn pragmas_are_uniform_regardless_of_which_store_opens_first() {
+        let directory = data_directory();
+
+        let (_, first_connection) = open_unified_database(&directory).unwrap();
+        let (_, second_connection) = open_unified_database(&directory).unwrap();
+
+        assert_eq!(journal_mode(&first_connection), "wal");
+        assert_eq!(journal_mode(&second_connection), "wal");
+        assert_eq!(foreign_keys(&first_connection), 1);
+        assert_eq!(foreign_keys(&second_connection), 1);
+
+        drop(first_connection);
+        drop(second_connection);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_reopened_connection_observes_the_full_pragma_set() {
+        let directory = data_directory();
+
+        let (_, first_connection) = open_unified_database(&directory).unwrap();
+        drop(first_connection);
+
+        let (_, reopened_connection) = open_unified_database(&directory).unwrap();
+
+        assert_eq!(journal_mode(&reopened_connection), "wal");
+        assert_eq!(foreign_keys(&reopened_connection), 1);
+        let busy_timeout: i64 = reopened_connection
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(busy_timeout, 5000);
 
         fs::remove_dir_all(directory).unwrap();
