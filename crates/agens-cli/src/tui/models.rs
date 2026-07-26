@@ -258,3 +258,174 @@ pub(crate) fn apply_tui_effort(
     };
     Ok(format!("Reasoning effort: {effort}."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::chat::{chat_args_with_prompt, chat_request};
+    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+
+    fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
+        PreferenceStore::open(bootstrap.data_directory())
+            .unwrap()
+            .remember_model(&ModelPreference::new(model, effort))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_new_session_inherits_the_remembered_model_and_its_effort() {
+        let temporary = tui_session_directory("remembered-selection-fresh");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        remember(
+            &bootstrap,
+            "gpt-5.5",
+            Some(agens_core::ReasoningEffort::High),
+        );
+        let mut context = TuiSessionContext::fresh();
+
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            None
+        );
+
+        assert_eq!(
+            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            "gpt-5.5"
+        );
+        let request = context.apply_to(chat_request(chat_args_with_prompt("work")).unwrap());
+        assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(
+            request.session_reasoning_effort,
+            Some(agens_core::ReasoningEffort::High)
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_configured_or_flagged_model_outranks_the_remembered_one() {
+        let temporary = tui_session_directory("remembered-selection-outranked");
+        let configured = tui_session_bootstrap(&temporary, &[]);
+        remember(
+            &configured,
+            "gpt-5.5",
+            Some(agens_core::ReasoningEffort::High),
+        );
+        let mut context = TuiSessionContext::fresh();
+
+        assert_eq!(
+            seed_remembered_tui_selection(&configured, &mut context),
+            None
+        );
+        assert!(context.selection.is_none());
+        assert_eq!(
+            crate::tui::turn::effective_tui_model(&configured, &context),
+            "gpt-4.1"
+        );
+
+        // A model flag reaches the same resolved slot as a configured model, so it outranks the
+        // remembered pick through the same branch.
+        let mut flagged = configured.clone();
+        flagged.model = Some("o3".into());
+        let mut context = TuiSessionContext::fresh();
+
+        assert_eq!(seed_remembered_tui_selection(&flagged, &mut context), None);
+        assert!(context.selection.is_none());
+        assert_eq!(
+            crate::tui::turn::effective_tui_model(&flagged, &context),
+            "o3"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn an_unavailable_remembered_model_falls_back_visibly() {
+        let temporary = tui_session_directory("remembered-selection-unavailable");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        remember(&bootstrap, "gpt-5.4", None);
+        let mut context = TuiSessionContext::fresh();
+
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            Some(
+                "Remembered model gpt-5.4 is unavailable for OpenAI API; using gpt-4.1.".to_owned()
+            )
+        );
+        assert!(context.selection.is_none());
+        assert_eq!(
+            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            "gpt-4.1"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn an_effort_the_remembered_model_lost_falls_back_visibly() {
+        let temporary = tui_session_directory("remembered-selection-effort");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        remember(
+            &bootstrap,
+            "gpt-4.1",
+            Some(agens_core::ReasoningEffort::High),
+        );
+        let mut context = TuiSessionContext::fresh();
+
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            Some(
+                "Remembered reasoning effort is unsupported by gpt-4.1; using Default.".to_owned()
+            )
+        );
+        let selection = context.selection.as_ref().unwrap();
+        assert_eq!(selection.model(), "gpt-4.1");
+        assert_eq!(selection.reasoning_effort(), None);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn choosing_a_model_and_an_effort_remembers_both_for_the_next_session() {
+        let temporary = tui_session_directory("remembered-selection-write");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+
+        apply_tui_model(&bootstrap, "gpt-5.5", &session).unwrap();
+        apply_tui_effort(&bootstrap, "high", &session).unwrap();
+
+        let remembered = PreferenceStore::open(bootstrap.data_directory())
+            .unwrap()
+            .remembered_model()
+            .unwrap()
+            .unwrap();
+        assert_eq!(remembered.model(), "gpt-5.5");
+        assert_eq!(
+            remembered.reasoning_effort(),
+            Some(agens_core::ReasoningEffort::High)
+        );
+
+        let mut context = TuiSessionContext::fresh();
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            None
+        );
+        assert_eq!(
+            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            "gpt-5.5"
+        );
+        assert_eq!(
+            context
+                .selection
+                .as_ref()
+                .and_then(TuiModelSelector::reasoning_effort),
+            Some("high")
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}
