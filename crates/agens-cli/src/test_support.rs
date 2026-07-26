@@ -13,7 +13,7 @@ use agens_core::{
     AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot, Error as ToolError,
     HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError, MessagePart,
     PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-    PermissionSession, ToolAccess, TurnEvent, TurnProgressSink, TurnProvider,
+    PermissionSession, SessionMetadata, ToolAccess, TurnEvent, TurnProgressSink, TurnProvider,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
@@ -23,12 +23,14 @@ use crate::CliDependencies;
 use crate::bootstrap::{Bootstrap, bootstrap};
 use crate::dispatch::ProductionToolDispatcher;
 use crate::error::CliError;
+use crate::headless::HeadlessChatCompletion;
 use crate::permissions::{
     NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, ProductionPromptAuthorization,
 };
-use crate::tui::engine::ProductionTuiEngine;
+use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
+use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 
 thread_local! {
     static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -585,4 +587,58 @@ pub(crate) fn rotation_dispatcher() -> ToolDispatcher {
         .register_native("native::read", ToolAccess::ReadOnly, RotationTool)
         .unwrap();
     dispatcher
+}
+
+pub(crate) fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> String {
+    for character in input.chars() {
+        tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
+    }
+    let agens_tui::Action::Submit(input) = tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
+    else {
+        panic!("Enter should submit through the production TUI path");
+    };
+    input
+}
+
+pub(crate) fn submit_tui_command(
+    tui: &mut Tui<ProductionTuiEngine>,
+    router: &TuiRuntimeRouter,
+    bootstrap: &Bootstrap,
+    input: &str,
+    captured: &Arc<Mutex<Vec<crate::headless::HeadlessChatRequest>>>,
+) {
+    let input = enter_tui_input(tui, input);
+    let Some(prompt) = tui.apply_submission_outcome(router.route(input)) else {
+        return;
+    };
+    let result = run_tui_prompt_with(
+        bootstrap,
+        &prompt,
+        &router.session,
+        Some(Arc::clone(&router.skills)),
+        {
+            let captured = Arc::clone(captured);
+            move |request| {
+                captured.lock().unwrap().push(request);
+                Ok(HeadlessChatCompletion {
+                    text: "captured".into(),
+                    metadata: SessionMetadata {
+                        id: 1,
+                        project: "project".into(),
+                        title: "captured".into(),
+                        active_agent: "build".into(),
+                        provider_id: None,
+                        model_id: None,
+                        reasoning_effort: None,
+                        created_at: 1,
+                        updated_at: 1,
+                        completed_turn_count: 1,
+                        resumable: true,
+                    },
+                    messages: Vec::new(),
+                })
+            }
+        },
+    );
+    tui.finish_provider_turn(tui_provider_outcome(result));
 }
