@@ -10,14 +10,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot, Error as ToolError,
-    HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError, MessagePart,
-    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-    PermissionSession, SessionMetadata, ToolAccess, TurnEvent, TurnProgressSink, TurnProvider,
+    AgentDefinition, AgentMode, CompletedSessionTurn, CompletedTurnRepository,
+    CompletedTurnSnapshot, Error as ToolError, HeadlessTurnCancellation, HeadlessTurnError,
+    HeadlessTurnPortError, Message, MessagePart, PermissionDecision, PermissionMode,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role, SessionMessage,
+    SessionMetadata, ToolAccess, TurnEvent, TurnProgressSink, TurnProvider,
 };
-use agens_store::PermissionGrantStore;
+use agens_store::{PermissionGrantStore, SessionStore};
 use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
-use agens_tui::{BridgeCancel, BridgeTx, Tui, TuiRuntimeEvent};
+use agens_tui::{
+    Action, BridgeCancel, BridgeTx, Event, Key, Tui, TuiRouteProgress, TuiRouteRequest,
+    TuiRuntimeEvent,
+};
 
 use crate::CliDependencies;
 use crate::bootstrap::{Bootstrap, bootstrap};
@@ -598,6 +602,102 @@ pub(crate) fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -
         panic!("Enter should submit through the production TUI path");
     };
     input
+}
+
+pub(crate) fn tui_project(temporary: &Path) -> String {
+    temporary.join("project").display().to_string()
+}
+
+pub(crate) fn tui_session_messages() -> Vec<Message> {
+    vec![
+        Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("previous request".into())],
+        },
+        Message {
+            role: Role::Assistant,
+            parts: vec![
+                MessagePart::Reasoning("previous reasoning".into()),
+                MessagePart::ToolCall {
+                    id: "resume-call".into(),
+                    name: "read".into(),
+                    input: "{}".into(),
+                },
+                MessagePart::Text("previous answer".into()),
+            ],
+        },
+        Message {
+            role: Role::Tool,
+            parts: vec![MessagePart::ToolResult {
+                tool_call_id: "resume-call".into(),
+                content: "previous result".into(),
+                is_error: false,
+            }],
+        },
+    ]
+}
+
+pub(crate) fn persist_tui_session(
+    store: &mut SessionStore,
+    project: &str,
+    title: &str,
+) -> SessionMetadata {
+    let turn = CompletedSessionTurn::new(
+        tui_session_messages()
+            .into_iter()
+            .map(SessionMessage::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap(),
+    )
+    .unwrap();
+    store
+        .persist_completed_session_turn(
+            &SessionMetadata {
+                id: 0,
+                project: project.into(),
+                title: title.into(),
+                active_agent: "primary".into(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 1,
+                completed_turn_count: 0,
+                resumable: false,
+            },
+            &turn,
+        )
+        .unwrap()
+}
+
+pub(crate) fn open_tui_palette_dialog(
+    tui: &mut Tui<ProductionTuiEngine>,
+    router: &TuiRuntimeRouter,
+    prefix: &str,
+    expected_route: &str,
+    progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+) {
+    for character in prefix.chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::Enter)) else {
+        panic!("palette Enter should open a dialog");
+    };
+    assert_eq!(route_id, expected_route);
+    let outcome = router.route_request(TuiRouteRequest::OpenDialog(route_id), progress);
+    assert!(tui.apply_submission_outcome(outcome).is_none());
+}
+
+pub(crate) fn dispatch_tui_dialog_selection(
+    tui: &mut Tui<ProductionTuiEngine>,
+    router: &TuiRuntimeRouter,
+    progress: std::sync::mpsc::Sender<TuiRouteProgress>,
+) {
+    let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
+        panic!("dialog Enter should dispatch an action");
+    };
+    let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
+    assert!(tui.apply_submission_outcome(outcome).is_none());
 }
 
 pub(crate) fn submit_tui_command(

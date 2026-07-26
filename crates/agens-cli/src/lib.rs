@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 #[cfg(test)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
@@ -43,10 +43,6 @@ use agens_core::{
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary, SessionAttemptStatus};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use agens_providers::chatgpt_login::upsert_provider_entry;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -116,15 +112,7 @@ mod tools;
 mod tui;
 mod turns;
 
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use bootstrap::ProviderSource;
 use bootstrap::effective_max_iterations;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -163,11 +151,12 @@ use session::attempt::attempt_failure_status;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
-    BatchTool, ProductionBatchInput, bootstrap_from_configuration, enter_tui_input,
-    native_batch_call, render_tui_test_backend, reset_tui_resume_test_counters, rotation_agent,
-    rotation_dispatcher, run_production_batch, run_production_batch_with_policy,
-    submit_tui_command, tui_resume_test_counters, tui_session_bootstrap,
-    tui_session_bootstrap_for_provider, tui_session_directory,
+    BatchTool, ProductionBatchInput, bootstrap_from_configuration, dispatch_tui_dialog_selection,
+    enter_tui_input, native_batch_call, open_tui_palette_dialog, persist_tui_session,
+    render_tui_test_backend, reset_tui_resume_test_counters, rotation_agent, rotation_dispatcher,
+    run_production_batch, run_production_batch_with_policy, submit_tui_command, tui_project,
+    tui_resume_test_counters, tui_session_bootstrap, tui_session_bootstrap_for_provider,
+    tui_session_directory, tui_session_messages,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -202,10 +191,6 @@ use tui::models::tui_model_source;
 use tui::models::{apply_tui_effort, apply_tui_model, seed_remembered_tui_selection};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use tui::provider::restore_chatgpt_credentials;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tui::provider::{TuiCredentialResolver, TuiProvider};
 #[cfg(test)]
@@ -219,7 +204,7 @@ use tui::resume::{
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use tui::router::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome, tui_provider_outcome};
+use tui::router::{TUI_ERROR_ACTION, TuiRuntimeRouter, tui_provider_outcome};
 use tui::run_tui;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -2792,47 +2777,6 @@ mod tests {
     }
 
     #[test]
-    fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
-        let temporary = tui_session_directory("enter-local-routing");
-        let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
-        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let router = TuiRuntimeRouter::new(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-        );
-        let cancellation = Arc::new(Mutex::new(None));
-        let mut tui = Tui::new(ProductionTuiEngine { cancellation });
-        let input = enter_tui_input(&mut tui, "/unknown");
-        let provider_invocations =
-            usize::from(tui.apply_submission_outcome(router.route(input)).is_some());
-        assert_eq!(provider_invocations, 0);
-        assert!(tui.transcript().is_empty());
-        assert!(tui.view().dialog.is_some());
-
-        session.lock().unwrap().running = true;
-        let input = enter_tui_input(&mut tui, "/new");
-        tui.apply_submission_outcome(router.route(input));
-        assert!(tui.view().dialog.is_some());
-
-        session.lock().unwrap().running = false;
-        let input = enter_tui_input(&mut tui, "/new");
-        tui.apply_submission_outcome(router.route(input));
-        assert!(tui.transcript().is_empty());
-        assert_eq!(tui.view().status, Some("Started a new session."));
-
-        let input = enter_tui_input(&mut tui, &format!("/resume {}", metadata.id));
-        tui.apply_submission_outcome(router.route(input));
-        assert_eq!(tui.view().session, format!("session #{}", metadata.id));
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
     fn dialog_recovery_is_confirmed_private_local_safe_and_retryable() {
         let temporary = tui_session_directory("recovery-dialog");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
@@ -2963,78 +2907,6 @@ mod tests {
         );
         assert!(matches!(stale, TuiSubmissionOutcome::Dialog(_)));
 
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn tui_model_effort_and_help_palette_routes_open_local_overlays_and_dispatch_once() {
-        let temporary = tui_session_directory("local-overlays");
-        let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let cancellation = Arc::new(Mutex::new(None));
-        let mut tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::clone(&cancellation),
-        });
-        let router = TuiRuntimeRouter::new(
-            bootstrap,
-            Arc::clone(&session),
-            cancellation,
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-        );
-        tui.set_palette_entries(router.palette_entries().to_vec());
-        let (progress, _) = std::sync::mpsc::channel();
-
-        for (prefix, route_id, expected) in [
-            ("/mo", "model", ["Choose model", "gpt-4.1 (current)"]),
-            ("/ef", "effort", ["Choose effort", "Default"]),
-            ("/he", "help", ["Commands and skills", "/connect"]),
-        ] {
-            for character in prefix.chars() {
-                tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
-            }
-            let agens_tui::Action::OpenDialog(actual_route) =
-                tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
-            else {
-                panic!("palette Enter should open the selected overlay");
-            };
-            assert_eq!(actual_route, route_id);
-            let outcome = router.route_request(
-                agens_tui::TuiRouteRequest::OpenDialog(actual_route),
-                progress.clone(),
-            );
-            assert!(tui.apply_submission_outcome(outcome).is_none());
-            let text = render_tui_test_backend(&tui, 80, 24);
-            assert!(text.contains(expected[0]), "{route_id}: {text:?}");
-            assert!(text.contains(expected[1]), "{route_id}: {text:?}");
-
-            if route_id == "help" {
-                assert_eq!(
-                    tui.handle(agens_tui::Event::Key(agens_tui::Key::CtrlC)),
-                    agens_tui::Action::Render
-                );
-                continue;
-            }
-            tui.handle(agens_tui::Event::Key(agens_tui::Key::Down));
-            let agens_tui::Action::DialogAction(action_id) =
-                tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter))
-            else {
-                panic!("dialog Enter should emit one action ID");
-            };
-            let outcome = router.route_request(
-                agens_tui::TuiRouteRequest::DialogAction(action_id),
-                progress.clone(),
-            );
-            assert!(tui.apply_submission_outcome(outcome).is_none());
-            assert!(tui.view().dialog.is_none());
-        }
-
-        assert!(session.lock().unwrap().messages.is_empty());
-        assert!(
-            tui.transcript()
-                .iter()
-                .all(|entry| !matches!(entry, agens_tui::TranscriptEntry::User(_)))
-        );
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
@@ -4024,364 +3896,6 @@ mod tests {
     }
 
     #[test]
-    fn tui_connect_and_disconnect_overlays_select_flows_and_cancel_without_credentials_mutation() {
-        let temporary = tui_session_directory("auth-overlays");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        let initial_credentials = r#"{"openai-api":{"api_key":"preserved"}}"#;
-        std::fs::write(&credentials_path, initial_credentials).unwrap();
-        let flows = Arc::new(Mutex::new(Vec::new()));
-        let coordinator = ChatGptAuthCoordinator::with_authenticator({
-            let flows = Arc::clone(&flows);
-            move |flow, _, publish| {
-                flows.lock().unwrap().push(flow);
-                publish(ChatGptAuthProgress::BrowserUrl("auth-url".into()));
-                Ok(test_chatgpt_credentials("new-access"))
-            }
-        });
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let cancellation = Arc::new(Mutex::new(None));
-        let mut tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::clone(&cancellation),
-        });
-        let router = TuiRuntimeRouter::with_auth_coordinator(
-            tui_session_bootstrap(&temporary, &[]),
-            Arc::clone(&session),
-            cancellation,
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-            coordinator,
-        );
-        tui.set_palette_entries(router.palette_entries().to_vec());
-        let (progress, _) = std::sync::mpsc::channel();
-
-        for (prefix, down, flow) in [
-            ("/co", false, ChatGptAuthFlow::Browser),
-            ("/co", true, ChatGptAuthFlow::Device),
-        ] {
-            open_tui_palette_dialog(&mut tui, &router, prefix, "connect", progress.clone());
-            if down {
-                tui.handle(Event::Key(Key::Down));
-            }
-            dispatch_tui_dialog_selection(&mut tui, &router, progress.clone());
-            assert_eq!(flows.lock().unwrap().last(), Some(&flow));
-        }
-
-        open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress.clone());
-        let connected = std::fs::read_to_string(&credentials_path).unwrap();
-        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
-        let after_cancel = std::fs::read_to_string(&credentials_path).unwrap();
-        assert_eq!(after_cancel, connected);
-        open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress);
-        dispatch_tui_dialog_selection(&mut tui, &router, std::sync::mpsc::channel().0);
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_history() {
-        let temporary = tui_session_directory("auth-router");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        std::fs::write(
-            &credentials_path,
-            r#"{"openai-api":{"api_key":"preserved"},"other":{"value":"kept"}}"#,
-        )
-        .unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.provider_source = ProviderSource::Auto;
-        bootstrap.provider_type = Some("openai-api".into());
-        bootstrap.openai_api_key = Some("preserved".into());
-        let flows = Arc::new(Mutex::new(Vec::new()));
-        let coordinator = ChatGptAuthCoordinator::with_authenticator({
-            let flows = Arc::clone(&flows);
-            move |flow, _, publish| {
-                flows.lock().unwrap().push(flow);
-                publish(ChatGptAuthProgress::BrowserUrl("auth-url".into()));
-                Ok(test_chatgpt_credentials("new-access"))
-            }
-        });
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let router = TuiRuntimeRouter::with_auth_coordinator(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-            coordinator,
-        );
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-
-        assert!(matches!(
-            router.route_with_progress("/connect --device-auth".into(), progress_tx),
-            TuiSubmissionOutcome::LocalInfo(_)
-        ));
-        assert_eq!(progress_rx.try_iter().count(), 1);
-        assert_eq!(*flows.lock().unwrap(), vec![ChatGptAuthFlow::Device]);
-        let context = session.lock().unwrap();
-        assert_eq!(context.provider, Some(TuiProvider::OpenAiChatGpt));
-        assert!(context.messages.is_empty());
-        drop(context);
-        let configured = router.bootstrap().unwrap();
-        assert_eq!(configured.provider_type(), Some("openai-api"));
-        let connected = std::fs::read_to_string(&credentials_path).unwrap();
-        assert!(connected.contains("new-access"));
-
-        assert!(router.disconnect().is_ok());
-        assert_eq!(
-            session.lock().unwrap().provider,
-            Some(TuiProvider::OpenAiApi)
-        );
-        let stored = std::fs::read_to_string(&credentials_path).unwrap();
-        assert!(stored.contains("preserved"));
-        assert!(stored.contains("kept"));
-        assert!(!stored.contains("new-access"));
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn runtime_chatgpt_refresh_atomicity_preserves_intervening_unrelated_provider_write() {
-        let temporary = tui_session_directory("refresh-rollback");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        let before = br#"{"openai-api":{"api_key":"preserved"},"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#;
-        std::fs::write(&credentials_path, before).unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.provider_source = ProviderSource::Auto;
-        bootstrap.provider_type = Some("openai-api".into());
-        bootstrap.openai_api_key = Some("preserved".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            running: true,
-            ..TuiSessionContext::fresh()
-        }));
-        let original_runtime = session.lock().unwrap().clone();
-        let router = TuiRuntimeRouter::with_auth_coordinator(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
-                Ok(test_chatgpt_credentials("new-access"))
-            }),
-        )
-        .with_credential_restorer(|path, snapshot| {
-            upsert_provider_entry(path, "other-provider", serde_json::json!({"key": "kept"}))
-                .map_err(|_| CliError::storage("unrelated provider write failed"))?;
-            restore_chatgpt_credentials(path, snapshot)
-        });
-
-        assert!(
-            router
-                .connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0)
-                .is_err()
-        );
-        let mut expected = serde_json::from_slice::<serde_json::Value>(before).unwrap();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .insert("other-provider".into(), serde_json::json!({"key": "kept"}));
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&credentials_path).unwrap())
-                .unwrap(),
-            expected
-        );
-        assert_eq!(*session.lock().unwrap(), original_runtime);
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn runtime_chatgpt_refresh_atomicity_disconnects_explicit_chatgpt_fail_closed() {
-        let temporary = tui_session_directory("explicit-disconnect");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        std::fs::write(
-            &credentials_path,
-            r#"{"openai-api":{"api_key":"preserved"},"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#,
-        )
-        .unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.provider_source = ProviderSource::ExplicitChatGpt;
-        bootstrap.provider_type = Some("openai-chatgpt".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            provider: Some(TuiProvider::OpenAiChatGpt),
-            ..TuiSessionContext::fresh()
-        }));
-        ensure_active_tui_agent_runtime(
-            &bootstrap,
-            &session,
-            &Arc::new(Mutex::new(rotation_dispatcher())),
-        )
-        .unwrap();
-        let router = TuiRuntimeRouter::new(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-        );
-
-        assert!(router.disconnect().is_ok());
-        assert_eq!(session.lock().unwrap().provider, None);
-        assert!(session.lock().unwrap().chatgpt_unavailable);
-        assert!(session.lock().unwrap().active_agent.is_none());
-        let error = match router.turn_bootstrap() {
-            Ok(_) => panic!("disconnected ChatGPT runtime must be unavailable"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.to_string(),
-            "auth: ChatGPT credentials are unavailable; run /connect"
-        );
-        assert!(
-            !std::fs::read_to_string(&credentials_path)
-                .unwrap()
-                .contains("old-access")
-        );
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn runtime_chatgpt_refresh_atomicity_fails_closed_when_credential_restore_fails() {
-        let temporary = tui_session_directory("restore-failure");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        std::fs::write(
-            &credentials_path,
-            r#"{"openai-api":{"api_key":"preserved"}}"#,
-        )
-        .unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.provider_source = ProviderSource::Auto;
-        bootstrap.provider_type = Some("openai-api".into());
-        bootstrap.openai_api_key = Some("preserved".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            running: true,
-            ..TuiSessionContext::fresh()
-        }));
-        let router = TuiRuntimeRouter::with_auth_coordinator(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
-                Ok(test_chatgpt_credentials("new-access"))
-            }),
-        )
-        .with_credential_restorer(|_, _| Err(CliError::storage("injected restore failure")));
-
-        let outcome = auth_route_outcome(
-            router.connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0),
-        );
-        assert!(matches!(
-            outcome,
-            TuiSubmissionOutcome::LocalActionableError { message, .. }
-                if message == "store: ChatGPT credential recovery failed"
-        ));
-        assert!(session.lock().unwrap().chatgpt_unavailable);
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn runtime_chatgpt_refresh_atomicity_preserves_runtime_on_credential_write_failures() {
-        let temporary = tui_session_directory("credential-write-failures");
-        let config_home = temporary.join("config");
-        std::fs::create_dir_all(&config_home).unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.paths.credentials = config_home.clone();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            provider: Some(TuiProvider::OpenAiApi),
-            ..TuiSessionContext::fresh()
-        }));
-        let original_runtime = session.lock().unwrap().clone();
-        let router = TuiRuntimeRouter::with_auth_coordinator(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-            ChatGptAuthCoordinator::with_authenticator(|_, _, _| {
-                Ok(test_chatgpt_credentials("new-access"))
-            }),
-        );
-
-        for outcome in [
-            auth_route_outcome(
-                router.connect(ChatGptAuthFlow::Browser, std::sync::mpsc::channel().0),
-            ),
-            auth_route_outcome(router.disconnect()),
-        ] {
-            assert!(matches!(
-                outcome,
-                TuiSubmissionOutcome::LocalActionableError { message, .. }
-                    if message == "ChatGPT credentials could not be saved"
-            ));
-            assert_eq!(*session.lock().unwrap(), original_runtime);
-        }
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn runtime_chatgpt_refresh_atomicity_leaves_auto_unavailable_after_disconnect_rebuild_failure()
-    {
-        let temporary = tui_session_directory("auto-disconnect-failure");
-        let config_home = temporary.join("config");
-        let credentials_path = config_home.join("auth.json");
-        std::fs::create_dir_all(&config_home).unwrap();
-        std::fs::write(
-            &credentials_path,
-            r#"{"openai-chatgpt":{"access_token":"old-access","refresh_token":"old-refresh","account_id":"old-account","expires_at":"2099-01-01T00:00:00Z"}}"#,
-        )
-        .unwrap();
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.provider_source = ProviderSource::Auto;
-        bootstrap.provider_type = Some("openai-chatgpt".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
-            provider: Some(TuiProvider::OpenAiChatGpt),
-            ..TuiSessionContext::fresh()
-        }));
-        let router = TuiRuntimeRouter::new(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-        );
-
-        assert!(router.disconnect().is_err());
-        assert!(session.lock().unwrap().chatgpt_unavailable);
-        assert!(
-            !std::fs::read_to_string(&credentials_path)
-                .unwrap()
-                .contains("old-access")
-        );
-
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    fn test_chatgpt_credentials(
-        access_token: &str,
-    ) -> agens_providers::chatgpt_login::ChatGptCredentials {
-        agens_providers::chatgpt_login::ChatGptCredentials {
-            access_token: access_token.into(),
-            refresh_token: "refresh".into(),
-            account_id: "account".into(),
-            expires_at: "2099-01-01T00:00:00Z".into(),
-        }
-    }
-
-    #[test]
     fn tui_session_busy_agent_command_leaves_context_and_store_unchanged() {
         let temporary = tui_session_directory("busy-agent-command");
         let bootstrap = tui_session_bootstrap(
@@ -4598,36 +4112,6 @@ mod tests {
         transcript_count
     }
 
-    fn open_tui_palette_dialog(
-        tui: &mut Tui<ProductionTuiEngine>,
-        router: &TuiRuntimeRouter,
-        prefix: &str,
-        expected_route: &str,
-        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
-    ) {
-        for character in prefix.chars() {
-            tui.handle(Event::Key(Key::Char(character)));
-        }
-        let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::Enter)) else {
-            panic!("palette Enter should open a dialog");
-        };
-        assert_eq!(route_id, expected_route);
-        let outcome = router.route_request(TuiRouteRequest::OpenDialog(route_id), progress);
-        assert!(tui.apply_submission_outcome(outcome).is_none());
-    }
-
-    fn dispatch_tui_dialog_selection(
-        tui: &mut Tui<ProductionTuiEngine>,
-        router: &TuiRuntimeRouter,
-        progress: std::sync::mpsc::Sender<TuiRouteProgress>,
-    ) {
-        let Action::DialogAction(action_id) = tui.handle(Event::Key(Key::Enter)) else {
-            panic!("dialog Enter should dispatch an action");
-        };
-        let outcome = router.route_request(TuiRouteRequest::DialogAction(action_id), progress);
-        assert!(tui.apply_submission_outcome(outcome).is_none());
-    }
-
     fn dispatch_tui_session_page(
         tui: &mut Tui<ProductionTuiEngine>,
         router: &TuiRuntimeRouter,
@@ -4639,10 +4123,6 @@ mod tests {
         };
         let outcome = router.route_request(TuiRouteRequest::SessionPage(request), progress);
         assert!(tui.apply_submission_outcome(outcome).is_none());
-    }
-
-    fn tui_project(temporary: &Path) -> String {
-        temporary.join("project").display().to_string()
     }
 
     #[test]
@@ -4691,35 +4171,6 @@ mod tests {
         assert_eq!(initial_active_agent_name(&resumed, &configured), "planner");
     }
 
-    fn tui_session_messages() -> Vec<Message> {
-        vec![
-            Message {
-                role: Role::User,
-                parts: vec![MessagePart::Text("previous request".into())],
-            },
-            Message {
-                role: Role::Assistant,
-                parts: vec![
-                    MessagePart::Reasoning("previous reasoning".into()),
-                    MessagePart::ToolCall {
-                        id: "resume-call".into(),
-                        name: "read".into(),
-                        input: "{}".into(),
-                    },
-                    MessagePart::Text("previous answer".into()),
-                ],
-            },
-            Message {
-                role: Role::Tool,
-                parts: vec![MessagePart::ToolResult {
-                    tool_call_id: "resume-call".into(),
-                    content: "previous result".into(),
-                    is_error: false,
-                }],
-            },
-        ]
-    }
-
     fn append_tui_session_turn(
         store: &mut SessionStore,
         metadata: &SessionMetadata,
@@ -4750,39 +4201,6 @@ mod tests {
         .unwrap();
         store
             .persist_completed_session_turn(metadata, &turn)
-            .unwrap()
-    }
-
-    fn persist_tui_session(
-        store: &mut SessionStore,
-        project: &str,
-        title: &str,
-    ) -> SessionMetadata {
-        let turn = CompletedSessionTurn::new(
-            tui_session_messages()
-                .into_iter()
-                .map(SessionMessage::try_from)
-                .collect::<Result<_, _>>()
-                .unwrap(),
-        )
-        .unwrap();
-        store
-            .persist_completed_session_turn(
-                &SessionMetadata {
-                    id: 0,
-                    project: project.into(),
-                    title: title.into(),
-                    active_agent: "primary".into(),
-                    provider_id: None,
-                    model_id: None,
-                    reasoning_effort: None,
-                    created_at: 1,
-                    updated_at: 1,
-                    completed_turn_count: 0,
-                    resumable: false,
-                },
-                &turn,
-            )
             .unwrap()
     }
 
