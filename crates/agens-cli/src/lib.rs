@@ -1,12 +1,8 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
-#[cfg(test)]
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 
@@ -59,26 +55,13 @@ use agens_core::{TurnEvent, TurnState};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
-use agens_providers::DiagnosticRef;
-#[cfg(test)]
-use agens_providers::ProviderDiagnosticComponent;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use agens_providers::ProviderDiagnosticKind;
+use agens_providers::OpenAiResponsesProvider;
 #[cfg(test)]
 use agens_providers::chatgpt_login::LoginError;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_providers::chatgpt_login::upsert_provider_entry;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use agens_providers::{
-    OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticEvent,
-    ProviderDiagnosticScope,
-};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -195,13 +178,6 @@ use commands::chat::{chat_args_with_prompt, chat_request};
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use commands::config::run_config;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use diagnostics::{
-    DIAGNOSTIC_FILE_COUNT_LIMIT, DIAGNOSTIC_FILE_LIMIT_BYTES, DIAGNOSTIC_REFERENCE_SEQUENCE,
-    SafeDiagnosticStore,
-};
 use diagnostics::{
     next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
     record_subagent_terminal,
@@ -295,10 +271,6 @@ use tui::agents::{
     BundledModelValidator, initial_active_agent_name, list_tui_agents, rotate_tui_agent,
     select_tui_subagent, task_model_catalog,
 };
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use tui::dialogs::diagnostics_dialog;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -6770,38 +6742,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_capture_follows_the_debug_setting() {
-        let temporary =
-            std::env::temp_dir().join(format!("agens-diagnostic-capture-{}", std::process::id()));
-        std::fs::remove_dir_all(&temporary).ok();
-        std::fs::create_dir_all(&temporary).expect("test data directory should be creatable");
-        let event = ProviderDiagnosticEvent {
-            reference: DiagnosticRef::new("abcd1234".to_owned()).unwrap(),
-            scope: ProviderDiagnosticScope::Parent,
-            component: ProviderDiagnosticComponent::Responses,
-            event: ProviderDiagnosticKind::Terminal,
-            attempt: 0,
-            max_attempts: 0,
-            delay_ms: None,
-            status: None,
-            class: Some(ProviderDiagnosticClass::Provider),
-        };
-
-        SafeDiagnosticStore::with_capture(temporary.clone(), false).record(&event);
-        assert!(!temporary.join("diagnostics").exists());
-
-        SafeDiagnosticStore::with_capture(temporary.clone(), true).record(&event);
-        assert!(
-            std::fs::read_dir(temporary.join("diagnostics"))
-                .expect("enabled capture should create the directory")
-                .count()
-                > 0
-        );
-
-        std::fs::remove_dir_all(&temporary).ok();
-    }
-
-    #[test]
     fn diagnostics_are_captured_unless_debug_is_disabled() {
         let enabled = bootstrap_from_configuration("config-debug-default", None, None);
         let disabled = bootstrap_from_configuration(
@@ -11360,141 +11300,4 @@ fn reliability_integration_completion(
     let turn = completed_session_turn(prompt, &snapshot, None).unwrap();
 
     (snapshot, turn)
-}
-
-#[cfg(unix)]
-#[test]
-fn diagnostics_store_writes_only_allowlisted_jsonl_with_private_bounded_files() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let data_directory = std::env::temp_dir().join(format!(
-        "agens-safe-diagnostics-{}-{}",
-        std::process::id(),
-        DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&data_directory).expect("test data directory should be created");
-    let store = SafeDiagnosticStore::with_capture(data_directory.clone(), true);
-    let event = ProviderDiagnosticEvent {
-        reference: DiagnosticRef::new("abc12345".into()).expect("reference should be valid"),
-        scope: ProviderDiagnosticScope::Subagent,
-        component: ProviderDiagnosticComponent::Responses,
-        event: ProviderDiagnosticKind::RetryScheduled,
-        attempt: 1,
-        max_attempts: 3,
-        delay_ms: Some(275),
-        status: Some(429),
-        class: Some(ProviderDiagnosticClass::RateLimited),
-    };
-
-    store.record(&event);
-
-    let diagnostics_directory = data_directory.join("diagnostics");
-    assert_eq!(
-        std::fs::metadata(&diagnostics_directory)
-            .expect("diagnostics metadata should be readable")
-            .permissions()
-            .mode()
-            & 0o077,
-        0
-    );
-    let active = diagnostics_directory.join(format!("agens-{}.jsonl", std::process::id()));
-    let line = std::fs::read_to_string(&active).expect("diagnostic should be readable");
-    let object = serde_json::from_str::<serde_json::Value>(&line)
-        .expect("diagnostic should be JSON")
-        .as_object()
-        .expect("diagnostic should be an object")
-        .clone();
-    assert_eq!(
-        object.keys().map(String::as_str).collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            "attempt",
-            "class",
-            "component",
-            "delay_ms",
-            "event",
-            "max_attempts",
-            "reference",
-            "scope",
-            "status",
-            "timestamp_ms",
-        ])
-    );
-    assert_eq!(object["reference"], "abc12345");
-    assert!(!line.contains("prompt"));
-    assert!(!line.contains("authorization"));
-    assert_eq!(
-        std::fs::metadata(&active)
-            .expect("diagnostic file metadata should be readable")
-            .permissions()
-            .mode()
-            & 0o077,
-        0
-    );
-
-    for _ in 0..4 {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&active)
-            .expect("active diagnostics file should open")
-            .set_len(DIAGNOSTIC_FILE_LIMIT_BYTES)
-            .expect("test should fill diagnostics file");
-        store.record(&event);
-    }
-    assert_eq!(
-        std::fs::read_dir(&diagnostics_directory)
-            .expect("diagnostics directory should be readable")
-            .count(),
-        DIAGNOSTIC_FILE_COUNT_LIMIT
-    );
-    assert!(
-        std::fs::read_dir(&diagnostics_directory)
-            .expect("diagnostics directory should be readable")
-            .all(|entry| entry
-                .expect("diagnostic entry should be readable")
-                .metadata()
-                .expect("diagnostic metadata should be readable")
-                .len()
-                <= DIAGNOSTIC_FILE_LIMIT_BYTES)
-    );
-
-    std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
-}
-
-#[cfg(unix)]
-#[test]
-fn diagnostics_dialog_projects_only_safe_fields_and_relative_paths() {
-    use std::os::unix::fs::symlink;
-
-    let data_directory = std::env::temp_dir().join(format!(
-        "agens-diagnostics-dialog-{}-{}",
-        std::process::id(),
-        DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let diagnostics_directory = data_directory.join("diagnostics");
-    std::fs::create_dir_all(&diagnostics_directory)
-        .expect("diagnostics directory should be created");
-    std::fs::write(
-        diagnostics_directory.join("agens-42.jsonl"),
-        concat!(
-            "{\"timestamp_ms\":1,\"reference\":\"abc12345\",\"scope\":\"parent\",",
-            "\"component\":\"responses\",\"event\":\"terminal\",\"attempt\":3,",
-            "\"max_attempts\":3,\"delay_ms\":null,\"status\":429,",
-            "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n"
-        ),
-    )
-    .expect("diagnostic fixture should be written");
-    let outside = data_directory.join("outside.txt");
-    std::fs::write(&outside, "SENTINEL_OUTSIDE").expect("outside fixture should be written");
-    symlink(&outside, diagnostics_directory.join("agens-99.jsonl"))
-        .expect("diagnostic symlink should be created");
-
-    let rendered = format!("{:?}", diagnostics_dialog(&data_directory));
-
-    assert!(rendered.contains("abc12345"));
-    assert!(rendered.contains("diagnostics/agens-42.jsonl"));
-    assert!(!rendered.contains(&data_directory.display().to_string()));
-    assert!(!rendered.contains("SENTINEL_SECRET"));
-    assert!(!rendered.contains("SENTINEL_OUTSIDE"));
-
-    std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
 }
