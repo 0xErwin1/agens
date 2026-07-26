@@ -1,6 +1,7 @@
 use std::{
     fmt,
     future::Future,
+    path::{Component, Path},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -551,6 +552,52 @@ pub struct FactIdentity {
     pub attempt_id: Option<i64>,
     pub sequence: u64,
     pub dispatch_id: Option<u64>,
+}
+
+/// A path a tool reported, under the contract that every consumer comparing
+/// touched paths against a declared scope relies on: relative to the session
+/// root, normalized, and never absolute. An absolute path would carry no
+/// information about where the session root itself lives, silently breaking
+/// any comparison made against a scope declared in session-relative terms.
+///
+/// Construction is the only door, and it is total: a value that violates the
+/// contract (absolute, traversing outside the root, empty, containing a
+/// control character, or longer than [`FactPath::MAX_BYTES`]) is retained as
+/// unrepresentable rather than dropped or silently corrected, so the call
+/// that produced it stays visible while the pathological string itself never
+/// becomes readable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FactPath {
+    value: Option<String>,
+}
+
+impl FactPath {
+    /// Reported paths longer than this are retained as unrepresentable rather
+    /// than truncated, since a truncated path could resolve to a different
+    /// location than the one actually touched.
+    pub const MAX_BYTES: usize = 1024;
+
+    pub fn new(path: &str) -> Self {
+        let is_representable = !path.is_empty()
+            && path.len() <= Self::MAX_BYTES
+            && !path.chars().any(|character| character.is_control())
+            && !Path::new(path).is_absolute()
+            && !Path::new(path)
+                .components()
+                .any(|component| matches!(component, Component::ParentDir));
+
+        Self {
+            value: is_representable.then(|| path.to_owned()),
+        }
+    }
+
+    pub fn relative(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    pub const fn is_representable(&self) -> bool {
+        self.value.is_some()
+    }
 }
 
 /// Typed values a native tool reports about a call it has just completed.
@@ -2339,9 +2386,9 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::{
-        AttemptKey, CompletedTurnSnapshot, MessagePart, PermissionPattern, RecoveryOutcome,
-        RetryBoundary, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary,
-        TurnCoordinator, TurnEvent,
+        AttemptKey, CompletedTurnSnapshot, FactPath, MessagePart, PermissionPattern,
+        RecoveryOutcome, RetryBoundary, SessionAttemptFailureKind, SessionAttemptStatus,
+        SessionAttemptSummary, TurnCoordinator, TurnEvent,
     };
 
     #[test]
@@ -2496,5 +2543,66 @@ mod tests {
         let snapshot =
             CompletedTurnSnapshot::from_persisted_events(coordinator.events().to_vec()).unwrap();
         assert_eq!(snapshot.events(), coordinator.events());
+    }
+
+    #[test]
+    fn fact_path_rejects_an_absolute_path() {
+        let path = FactPath::new("/etc/passwd");
+
+        assert!(!path.is_representable());
+        assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_rejects_a_traversing_path() {
+        let path = FactPath::new("../secret.txt");
+
+        assert!(!path.is_representable());
+        assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_rejects_an_over_length_path() {
+        let over_length = "a".repeat(FactPath::MAX_BYTES + 1);
+
+        let path = FactPath::new(&over_length);
+
+        assert!(!path.is_representable());
+        assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_rejects_an_embedded_newline() {
+        let path = FactPath::new("notes\n.txt");
+
+        assert!(!path.is_representable());
+        assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_rejects_an_empty_path() {
+        let path = FactPath::new("");
+
+        assert!(!path.is_representable());
+        assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_accepts_a_representable_relative_path() {
+        let path = FactPath::new("src/lib.rs");
+
+        assert!(path.is_representable());
+        assert_eq!(path.relative(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn fact_path_status_distinguishes_representable_from_unrepresentable() {
+        let representable = FactPath::new("notes.txt");
+        let unrepresentable = FactPath::new("/notes.txt");
+
+        assert_ne!(
+            representable.is_representable(),
+            unrepresentable.is_representable()
+        );
     }
 }
