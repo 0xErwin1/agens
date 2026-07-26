@@ -262,7 +262,10 @@ fn corrupt_database_open_failure_includes_operation_and_path() {
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("permission grants enable WAL"), "{error}");
+    assert!(
+        error.contains("permission grants check database layout"),
+        "{error}"
+    );
     assert!(error.contains(database.to_string_lossy().as_ref()));
 
     fs::remove_dir_all(directory).unwrap();

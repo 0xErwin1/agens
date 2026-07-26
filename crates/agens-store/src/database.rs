@@ -58,11 +58,8 @@ const MIGRATIONS: [Migration; 1] = [Migration {
 }];
 
 /// Opens the single `agens.db` file inside `data_directory`, applying the full open contract on
-/// every call: directory and file permissions, `busy_timeout`, `foreign_keys`, `journal_mode`,
-/// and any pending migration.
-///
-/// This does not yet reject a foreign or unrecognized file layout; that guard is added on top of
-/// this open path once it exists.
+/// every call: directory and file permissions, `busy_timeout`, `foreign_keys`, the layout guard,
+/// `journal_mode`, and any pending migration.
 pub(crate) fn open_unified_database(
     data_directory: &Path,
 ) -> Result<(PathBuf, Connection), DatabaseError> {
@@ -81,6 +78,8 @@ pub(crate) fn open_unified_database(
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|error| DatabaseError::new("enable foreign keys", &database_path, error))?;
+
+    guard_layout(&connection, &database_path)?;
 
     let mode: String = connection
         .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -159,6 +158,59 @@ fn read_applied_migration_ids(
     Ok(ids)
 }
 
+/// Rejects a file that already holds user tables but no `schema_migrations` ledger.
+///
+/// A file in this shape is not an empty database and not one this open path has ever migrated —
+/// most plausibly a legacy or foreign SQLite file placed at `agens.db` by hand. Counting ledger
+/// ROWS rather than only checking for the ledger TABLE also covers a crash between the ledger's
+/// own bootstrap and the first migration's commit: an empty ledger with no other user tables is
+/// still a fresh, unmigrated database and is allowed to proceed.
+fn guard_layout(connection: &Connection, path: &Path) -> Result<(), DatabaseError> {
+    let user_table_count: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table'
+               AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
+               AND name != 'schema_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| DatabaseError::new("check database layout", path, error))?;
+
+    if user_table_count == 0 {
+        return Ok(());
+    }
+
+    let ledger_table_exists: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema
+             WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| DatabaseError::new("check database layout", path, error))?;
+
+    let ledger_row_count: i64 = if ledger_table_exists == 0 {
+        0
+    } else {
+        connection
+            .query_row("SELECT count(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| DatabaseError::new("check database layout", path, error))?
+    };
+
+    if ledger_row_count == 0 {
+        return Err(DatabaseError::new(
+            "check database layout",
+            path,
+            "unrecognized database layout",
+        ));
+    }
+
+    Ok(())
+}
+
 fn permission_grants_ddl() -> String {
     "
     CREATE TABLE permission_grants (
@@ -211,6 +263,34 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn migration_ids_are_unique_zero_padded_and_sorted() {
+        let ids: Vec<&str> = MIGRATIONS.iter().map(|migration| migration.id).collect();
+        let mut sorted_ids = ids.clone();
+        sorted_ids.sort_unstable();
+
+        assert_eq!(
+            ids, sorted_ids,
+            "MIGRATIONS must be declared in ascending lexicographic id order"
+        );
+
+        let unique_ids: BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique_ids.len(), ids.len(), "migration ids must be unique");
+
+        for id in &ids {
+            let prefix = id.split('_').next().unwrap();
+            assert_eq!(
+                prefix.len(),
+                4,
+                "migration id {id} must start with a 4-digit zero-padded prefix"
+            );
+            assert!(
+                prefix.chars().all(|character| character.is_ascii_digit()),
+                "migration id {id} must start with a numeric prefix"
+            );
+        }
     }
 
     #[test]

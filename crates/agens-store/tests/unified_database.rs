@@ -56,6 +56,12 @@ fn the_ledger_records_each_applied_migration_once() {
         vec!["0001_permission_grants"]
     );
 
+    let user_version: i64 = Connection::open(store.database_path())
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(user_version, 0);
+
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -103,6 +109,40 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
             ("9999_unknown".to_owned(), 0),
         ]
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_database_with_tables_but_no_ledger_is_rejected_as_an_unrecognized_layout() {
+    let directory = data_directory();
+    let database_path = directory.join("agens.db");
+
+    let ddl = "CREATE TABLE permission_grants (
+        id INTEGER PRIMARY KEY,
+        project TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        tool_kind TEXT NOT NULL,
+        tool_value TEXT,
+        target_kind TEXT NOT NULL,
+        target_value TEXT
+    );";
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute_batch(ddl).unwrap();
+    }
+    let before = fs::read(&database_path).unwrap();
+
+    let error = PermissionGrantStore::open(&directory)
+        .err()
+        .unwrap()
+        .to_string();
+
+    assert!(error.contains("check database layout"), "{error}");
+    assert!(error.contains(database_path.to_string_lossy().as_ref()));
+
+    let after = fs::read(&database_path).unwrap();
+    assert_eq!(before, after);
 
     fs::remove_dir_all(directory).unwrap();
 }
