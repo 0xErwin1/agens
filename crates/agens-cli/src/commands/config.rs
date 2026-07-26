@@ -96,11 +96,10 @@ fn ensure_private_configuration_directory(directory: &Path) -> std::io::Result<(
         Ok(_) => Err(std::io::Error::other(
             "configuration path is not a directory",
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(directory)
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory),
         Err(error) => Err(error),
     }
 }
@@ -278,7 +277,12 @@ mod tests {
         ));
         std::fs::remove_dir_all(&temporary).ok();
         std::fs::create_dir_all(&temporary).expect("test directory should be created");
-        let config_home = temporary.join("config");
+        // Several ancestors are missing (`a`, `a/b`, `a/b/c`), not just the
+        // leaf: `$HOME/.config/agens` is itself two levels below `$HOME` on a
+        // fresh account, and `DirBuilder::create` without `.recursive(true)`
+        // can only create ONE missing level, so a single-level fixture here
+        // would not exercise the bug this test pins.
+        let config_home = temporary.join("a/b/c/config");
         let target = config_home.join("config.toml");
 
         create_global_configuration_file(&target, "# starter\n")
