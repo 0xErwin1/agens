@@ -33,6 +33,10 @@ use crate::tools::task::default_model;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{RESERVED_TUI_COMMANDS, render_tui_help, resolved_tui_palette};
 use crate::tui::files::{selected_tui_file, tui_select_candidates};
+use crate::tui::models::{
+    apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
+    format_model_metadata, select_tui_effort, select_tui_model, tui_model_source,
+};
 use crate::tui::provider::{
     ChatGptCredentialSnapshot, TuiCredentialResolver, TuiProvider, TuiProviderStatus,
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
@@ -43,11 +47,10 @@ use crate::tui::session::{
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
 use crate::{
-    apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
-    commit_tui_session_resume, format_model_metadata, load_tui_session_for_resume,
-    persist_pending_agent_correction, prepare_loaded_tui_session_resume, resolve_provider_type,
-    resume_tui_session, rotate_tui_agent, select_tui_effort, select_tui_model, select_tui_subagent,
-    tui_agent_catalog_for_context, tui_model_source, tui_project_identifier, tui_subagent_catalog,
+    commit_tui_session_resume, load_tui_session_for_resume, persist_pending_agent_correction,
+    prepare_loaded_tui_session_resume, resolve_provider_type, resume_tui_session, rotate_tui_agent,
+    select_tui_subagent, tui_agent_catalog_for_context, tui_project_identifier,
+    tui_subagent_catalog,
 };
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
