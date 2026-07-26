@@ -490,3 +490,134 @@ pub(crate) fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, C
         .model_values()
         .map_err(CliError::unavailable)
 }
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{AgentMode, SessionMetadata};
+
+    use super::*;
+    use crate::test_support::{
+        bootstrap_from_configuration, persist_tui_session, rotation_dispatcher, tui_project,
+        tui_session_bootstrap, tui_session_directory,
+    };
+    use crate::tui::provider::TuiCredentialResolver;
+    use crate::tui::resume::resume_tui_session;
+
+    #[test]
+    fn explicit_agent_missing_keeps_active_primary_and_persisted_metadata_unchanged() {
+        let temporary = tui_session_directory("explicit-agent-missing");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "primary");
+        drop(store);
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(resumed));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
+        let before = session.lock().unwrap().clone();
+
+        let error = rotate_tui_agent(&bootstrap, "missing", &session, &SkillCatalog::default())
+            .unwrap_err();
+
+        assert_eq!(error.category, "usage");
+        assert_eq!(*session.lock().unwrap(), before);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .load_session_for_resume(metadata.id)
+                .unwrap()
+                .metadata
+                .active_agent,
+            "primary"
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_agent_selectors_expose_only_eligible_deterministic_options() {
+        let temporary = tui_session_directory("agent-selectors");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[
+                (
+                    "all",
+                    "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
+                ),
+                (
+                    "reviewer",
+                    "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+                ),
+            ],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+
+        assert_eq!(
+            list_tui_agents(&bootstrap, &session, AgentMode::Primary).unwrap(),
+            "Active agent: none. Available: primary, all."
+        );
+        assert_eq!(
+            list_tui_agents(&bootstrap, &session, AgentMode::Subagent).unwrap(),
+            "Subagent: none. Available: explore, general, reviewer."
+        );
+
+        let no_agents_temporary = tui_session_directory("no-agent-selectors");
+        let no_subagents = tui_session_bootstrap(&no_agents_temporary, &[]);
+        assert_eq!(
+            list_tui_agents(&no_subagents, &session, AgentMode::Subagent).unwrap(),
+            "Subagent: none. Available: explore, general."
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+        std::fs::remove_dir_all(no_agents_temporary).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_session_starts_from_the_configured_default_agent() {
+        let configured = bootstrap_from_configuration(
+            "config-default-agent",
+            Some("[agent]\ndefault_agent = \"reviewer\"\n"),
+            None,
+        );
+        let unconfigured = bootstrap_from_configuration("config-no-default-agent", None, None);
+        let fresh = TuiSessionContext::fresh();
+
+        assert_eq!(initial_active_agent_name(&fresh, &configured), "reviewer");
+        assert_eq!(initial_active_agent_name(&fresh, &unconfigured), "primary");
+    }
+
+    #[test]
+    fn a_resumed_session_keeps_its_persisted_agent_over_the_configured_default() {
+        let configured = bootstrap_from_configuration(
+            "config-default-agent-resumed",
+            Some("[agent]\ndefault_agent = \"reviewer\"\n"),
+            None,
+        );
+        let metadata = SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "planner".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: true,
+        };
+        let resumed = TuiSessionContext::restored(7, metadata, Vec::new(), Vec::new());
+
+        assert_eq!(initial_active_agent_name(&resumed, &configured), "planner");
+    }
+}
