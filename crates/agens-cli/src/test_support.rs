@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    CompletedTurnRepository, CompletedTurnSnapshot, HeadlessTurnCancellation, HeadlessTurnError,
-    HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
-    PermissionPolicy, PermissionRule, PermissionSession, TurnEvent, TurnProgressSink, TurnProvider,
+    AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot, Error as ToolError,
+    HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError, MessagePart,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+    PermissionSession, ToolAccess, TurnEvent, TurnProgressSink, TurnProvider,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
@@ -543,4 +544,45 @@ pub(crate) fn render_tui_test_backend(
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+pub(crate) struct RotationTool;
+
+impl DispatchTool for RotationTool {
+    fn execute(
+        &mut self,
+        _: &ToolExecutionContext,
+        _: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::success("unused"))
+    }
+}
+
+pub(crate) fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) -> AgentDefinition {
+    AgentDefinition {
+        name: name.into(),
+        description: format!("{name} agent"),
+        mode: AgentMode::Primary,
+        model: model.map(str::to_owned),
+        system_prompt: format!("You are {name}."),
+        permission_rules: allow_read
+            .then(|| {
+                PermissionRule::global(
+                    PermissionDecision::Allow,
+                    PermissionPattern::glob("native::read").unwrap(),
+                    PermissionPattern::Any,
+                )
+            })
+            .into_iter()
+            .collect(),
+        skills: Vec::new(),
+    }
+}
+
+pub(crate) fn rotation_dispatcher() -> ToolDispatcher {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::read", ToolAccess::ReadOnly, RotationTool)
+        .unwrap();
+    dispatcher
 }

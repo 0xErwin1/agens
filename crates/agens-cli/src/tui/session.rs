@@ -456,3 +456,163 @@ impl TuiSessionContext {
         request
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{MessagePart, PermissionMode, Role};
+
+    use super::*;
+    use crate::test_support::{rotation_agent, rotation_dispatcher};
+    use crate::tui::agents::BundledModelValidator;
+
+    #[test]
+    fn tui_session_reset_refuses_running_mutation_without_state_change() {
+        let mut context = TuiSessionContext::fresh();
+        context.identifier = Some(7);
+        context.running = true;
+        let original = context.clone();
+
+        assert_eq!(
+            reset_tui_session(&mut context),
+            Err(TuiSessionMutationError::Busy)
+        );
+        assert_eq!(context, original);
+    }
+
+    #[test]
+    fn tui_session_reset_clears_resumed_state_when_idle() {
+        let mut context = TuiSessionContext::fresh();
+        context.identifier = Some(7);
+        context.metadata = Some(SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 1,
+            resumable: true,
+        });
+        context.messages = vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("previous request".into())],
+        }];
+        context.selected_subagent = Some("reviewer".into());
+
+        reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
+
+        assert_eq!(context, TuiSessionContext::fresh());
+    }
+
+    #[test]
+    fn session_relative_age_uses_stable_boundaries() {
+        for (updated_at, expected) in [
+            (100_000, "now"),
+            (99_941, "59s ago"),
+            (99_940, "1m ago"),
+            (96_401, "59m ago"),
+            (96_400, "1h ago"),
+            (13_601, "23h ago"),
+            (13_600, "1d ago"),
+        ] {
+            assert_eq!(session_relative_age(updated_at, 100_000), expected);
+        }
+    }
+
+    #[test]
+    fn resumed_tui_session_preserves_typed_history_for_the_next_prompt() {
+        let metadata = SessionMetadata {
+            id: 7,
+            project: "project".into(),
+            title: "conversation".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 10,
+            updated_at: 20,
+            completed_turn_count: 1,
+            resumable: true,
+        };
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                parts: vec![
+                    MessagePart::Reasoning("previous reasoning".into()),
+                    MessagePart::ToolCall {
+                        id: "call-1".into(),
+                        name: "native::read".into(),
+                        input: r#"{"path":"notes.md"}"#.into(),
+                    },
+                ],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "previous result".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let dispatcher = rotation_dispatcher();
+        let active_agent = ActiveAgentRuntime::build(
+            &rotation_agent("primary", None, false),
+            None,
+            "project",
+            &dispatcher,
+            &BundledModelValidator,
+        )
+        .unwrap();
+        let request = TuiSessionContext::resumed(7, metadata, messages.clone(), active_agent)
+            .apply_to(HeadlessChatRequest {
+                prompt: "next question".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: None,
+            });
+
+        assert_eq!(request.prompt, "next question");
+        assert_eq!(request.history, messages);
+        assert_eq!(request.system_prompt.as_deref(), Some("You are primary."));
+        assert_eq!(request.session.as_ref().map(|session| session.id), Some(7));
+    }
+
+    #[test]
+    fn fresh_tui_session_does_not_reuse_prior_context() {
+        let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
+            prompt: "new question".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+        });
+
+        assert_eq!(request.system_prompt, None);
+    }
+}

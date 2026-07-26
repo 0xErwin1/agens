@@ -75,8 +75,8 @@ use agens_tools::{CommandCatalog, SkillCatalog};
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tools::{
-    DispatchTool, McpServerDescriptor, McpServerSource, McpServerTransport, TaskLaunchMode,
-    ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
+    McpServerDescriptor, McpServerSource, McpServerTransport, TaskLaunchMode, ToolDispatchRequest,
+    ToolEvaluationOutcome, ToolExecutionContext,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -175,9 +175,9 @@ use session::attempt::attempt_failure_status;
 // calls these unqualified. Remove this re-export once the test module moves.
 use test_support::{
     BatchTool, ProductionBatchInput, bootstrap_from_configuration, native_batch_call,
-    render_tui_test_backend, reset_tui_resume_test_counters, run_production_batch,
-    run_production_batch_with_policy, tui_resume_test_counters, tui_session_bootstrap,
-    tui_session_bootstrap_for_provider, tui_session_directory,
+    render_tui_test_backend, reset_tui_resume_test_counters, rotation_agent, rotation_dispatcher,
+    run_production_batch, run_production_batch_with_policy, tui_resume_test_counters,
+    tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -246,18 +246,16 @@ use tui::router::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome, tui_pr
 use tui::run_tui;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use tui::session::session_dialog_entry;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tui::session::{ActiveAgentRuntime, TuiSessionContext, resume_retry_notice};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use tui::session::{AgentRotationError, rotate_active_agent};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use tui::session::{
-    TuiSessionMutationError, reset_tui_session, session_dialog_entry, session_relative_age,
-};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -412,8 +410,8 @@ fn execute_command(
 mod tests {
     use super::*;
     use agens_core::{
-        AgentDefinition, AgentMode, CompletedTurnRepository, CompletedTurnSnapshot,
-        Error as ToolError, PermissionRule, ToolAccess, TurnState,
+        AgentMode, CompletedTurnRepository, CompletedTurnSnapshot, PermissionRule, ToolAccess,
+        TurnState,
     };
     use agens_tui::{Action, Event, Key};
     use rusqlite::Connection;
@@ -460,47 +458,6 @@ mod tests {
                 .and_then(|agent| agent.model.as_deref()),
             Some("gpt-5.5")
         );
-    }
-
-    struct RotationTool;
-
-    impl DispatchTool for RotationTool {
-        fn execute(
-            &mut self,
-            _: &ToolExecutionContext,
-            _: serde_json::Value,
-        ) -> Result<ToolOutput, ToolError> {
-            Ok(ToolOutput::success("unused"))
-        }
-    }
-
-    fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) -> AgentDefinition {
-        AgentDefinition {
-            name: name.into(),
-            description: format!("{name} agent"),
-            mode: AgentMode::Primary,
-            model: model.map(str::to_owned),
-            system_prompt: format!("You are {name}."),
-            permission_rules: allow_read
-                .then(|| {
-                    PermissionRule::global(
-                        PermissionDecision::Allow,
-                        PermissionPattern::glob("native::read").unwrap(),
-                        PermissionPattern::Any,
-                    )
-                })
-                .into_iter()
-                .collect(),
-            skills: Vec::new(),
-        }
-    }
-
-    fn rotation_dispatcher() -> ToolDispatcher {
-        let mut dispatcher = ToolDispatcher::new();
-        dispatcher
-            .register_native("native::read", ToolAccess::ReadOnly, RotationTool)
-            .unwrap();
-        dispatcher
     }
 
     #[test]
@@ -1102,48 +1059,6 @@ mod tests {
 
         std::fs::remove_dir_all(known_root).unwrap();
         std::fs::remove_dir_all(unknown_root).unwrap();
-    }
-
-    #[test]
-    fn tui_session_reset_refuses_running_mutation_without_state_change() {
-        let mut context = TuiSessionContext::fresh();
-        context.identifier = Some(7);
-        context.running = true;
-        let original = context.clone();
-
-        assert_eq!(
-            reset_tui_session(&mut context),
-            Err(TuiSessionMutationError::Busy)
-        );
-        assert_eq!(context, original);
-    }
-
-    #[test]
-    fn tui_session_reset_clears_resumed_state_when_idle() {
-        let mut context = TuiSessionContext::fresh();
-        context.identifier = Some(7);
-        context.metadata = Some(SessionMetadata {
-            id: 7,
-            project: "project".into(),
-            title: "conversation".into(),
-            active_agent: "primary".into(),
-            provider_id: None,
-            model_id: None,
-            reasoning_effort: None,
-            created_at: 1,
-            updated_at: 1,
-            completed_turn_count: 1,
-            resumable: true,
-        });
-        context.messages = vec![Message {
-            role: Role::User,
-            parts: vec![MessagePart::Text("previous request".into())],
-        }];
-        context.selected_subagent = Some("reviewer".into());
-
-        reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
-
-        assert_eq!(context, TuiSessionContext::fresh());
     }
 
     #[test]
@@ -4517,21 +4432,6 @@ mod tests {
     }
 
     #[test]
-    fn session_relative_age_uses_stable_boundaries() {
-        for (updated_at, expected) in [
-            (100_000, "now"),
-            (99_941, "59s ago"),
-            (99_940, "1m ago"),
-            (96_401, "59m ago"),
-            (96_400, "1h ago"),
-            (13_601, "23h ago"),
-            (13_600, "1d ago"),
-        ] {
-            assert_eq!(session_relative_age(updated_at, 100_000), expected);
-        }
-    }
-
-    #[test]
     fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         let temporary = tui_session_directory("resume-production-path");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
@@ -5699,77 +5599,6 @@ mod tests {
     }
 
     #[test]
-    fn resumed_tui_session_preserves_typed_history_for_the_next_prompt() {
-        let metadata = SessionMetadata {
-            id: 7,
-            project: "project".into(),
-            title: "conversation".into(),
-            active_agent: "primary".into(),
-            provider_id: None,
-            model_id: None,
-            reasoning_effort: None,
-            created_at: 10,
-            updated_at: 20,
-            completed_turn_count: 1,
-            resumable: true,
-        };
-        let messages = vec![
-            Message {
-                role: Role::Assistant,
-                parts: vec![
-                    MessagePart::Reasoning("previous reasoning".into()),
-                    MessagePart::ToolCall {
-                        id: "call-1".into(),
-                        name: "native::read".into(),
-                        input: r#"{"path":"notes.md"}"#.into(),
-                    },
-                ],
-            },
-            Message {
-                role: Role::Tool,
-                parts: vec![MessagePart::ToolResult {
-                    tool_call_id: "call-1".into(),
-                    content: "previous result".into(),
-                    is_error: false,
-                }],
-            },
-        ];
-
-        let dispatcher = rotation_dispatcher();
-        let active_agent = ActiveAgentRuntime::build(
-            &rotation_agent("primary", None, false),
-            None,
-            "project",
-            &dispatcher,
-            &BundledModelValidator,
-        )
-        .unwrap();
-        let request = TuiSessionContext::resumed(7, metadata, messages.clone(), active_agent)
-            .apply_to(HeadlessChatRequest {
-                prompt: "next question".into(),
-                history: Vec::new(),
-                model: None,
-                system_prompt: None,
-                max_iterations: None,
-                mode: PermissionMode::Edit,
-                dangerously_allow_all: false,
-                dangerous_mode: false,
-                request_config: agens_core::RequestConfig::default(),
-                session_reasoning_effort: None,
-                session: None,
-                active_agent: None,
-                effective_capabilities: None,
-                pending_system_reminder: None,
-                skills: None,
-            });
-
-        assert_eq!(request.prompt, "next question");
-        assert_eq!(request.history, messages);
-        assert_eq!(request.system_prompt.as_deref(), Some("You are primary."));
-        assert_eq!(request.session.as_ref().map(|session| session.id), Some(7));
-    }
-
-    #[test]
     fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_same_session() {
         let temporary = std::env::temp_dir().join(format!(
             "agens-resumed-headless-test-{}-{}",
@@ -6003,29 +5832,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(temporary).expect("temporary files should be removed");
-    }
-
-    #[test]
-    fn fresh_tui_session_does_not_reuse_prior_context() {
-        let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
-            prompt: "new question".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
-
-        assert_eq!(request.system_prompt, None);
     }
 
     #[test]
