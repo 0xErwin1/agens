@@ -175,19 +175,35 @@ fn unrecognized_argument_error(token: &str) -> clap::Error {
 /// `config`/`auth`/`models`/`sessions` treat a help token ANYWHERE in their
 /// own arguments as a request for help, even alongside an otherwise-invalid
 /// shape — the historical `.any(is_help)` precedent from the hand-rolled
-/// parser. clap already resolves help correctly for every VALID shape on
-/// its own, including deeply nested subcommands (`config init --help`,
-/// `auth login api-key --help`), by walking to the deepest matched
-/// subcommand: this override must stay out of clap's way there, or it
-/// clobbers that correct nested resolution with the top-level subcommand's
-/// help instead. So this only fires when clap would otherwise REJECT the
-/// shape outright because of a token it does not recognize alongside the
-/// help token (`config extra --help`, `models help`), reproducing the
-/// pre-clap precedent of falling back to the top-level subcommand's help
-/// for those unrecognized shapes. Returns `None` when clap should parse
-/// `arguments` normally — either because it resolves the shape itself
-/// (with or without help) or because the parse failure has nothing to do
-/// with a help token.
+/// parser.
+///
+/// clap already resolves help correctly for every VALID shape on its own,
+/// including deeply nested subcommands (`config init --help`, `auth login
+/// api-key --help`), by walking to the deepest matched subcommand, and it
+/// also auto-generates a `help` pseudo-subcommand for any command that has
+/// nested subcommands of its own (`config init help`, `auth login help`).
+/// This override must stay out of clap's way in both of those cases, or it
+/// clobbers that correct resolution with the top-level subcommand's help
+/// instead.
+///
+/// Where clap's own resolution is NOT enough is a leaf that takes a plain
+/// `String`/`Option<String>` positional rather than a nested subcommand
+/// (`auth status <PROVIDER>`, `auth logout <PROVIDER>`, `auth login api-key
+/// <PROVIDER>`, `sessions show <IDENTIFIER>`, `sessions rm <IDENTIFIER>`):
+/// clap has no way to know the bare word `"help"` is special there, so it
+/// happily binds it as the positional's value and parses the shape
+/// successfully (`auth status help`, `sessions show help`). This override
+/// re-checks those successful parses for a literal `"help"` token and wins
+/// over them, reproducing the pre-clap precedent. It also still fires, as
+/// before, when clap outright REJECTS the shape because of a token it does
+/// not recognize alongside a help alias (`config extra --help`, `models
+/// help`), falling back to the top-level subcommand's help for those
+/// unrecognized shapes.
+///
+/// Returns `None` when clap should parse `arguments` normally: either it
+/// resolves the shape itself (with or without help, including via its own
+/// `help` pseudo-subcommand) and no bare `"help"` positional is present, or
+/// the parse failure has nothing to do with a help token.
 pub(crate) fn subcommand_help_override(
     arguments: &[String],
 ) -> Option<Result<String, crate::CliError>> {
@@ -200,7 +216,8 @@ pub(crate) fn subcommand_help_override(
     if !rest.iter().any(|argument| is_help(argument)) {
         return None;
     }
-    if clap_resolves_natively(arguments) {
+    let bare_help_word_present = rest.iter().any(|argument| argument == "help");
+    if !bare_help_word_present && clap_resolves_natively(arguments) {
         return None;
     }
 

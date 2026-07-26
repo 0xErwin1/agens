@@ -1041,6 +1041,126 @@ mod parser_surface_baseline {
         "auth requires status, login, or logout";
 }
 
+/// C1-R2: a bare `help` token (not `--help`/`-h`) at a nested position must
+/// still win over whatever String-typed positional it would otherwise bind
+/// to. Every leaf command with a plain `String`/`Option<String>` positional
+/// (as opposed to a nested `#[command(subcommand)]`, where clap's own
+/// auto-generated `help` pseudo-subcommand already handles this) is covered
+/// here as one family, not as isolated shapes — that is exactly the
+/// distinction that let this regression land twice.
+#[test]
+fn table_b_bare_help_word_at_every_nesting_depth_holds() {
+    use parser_surface_baseline as baseline;
+
+    let cases = vec![
+        {
+            let temporary = TemporaryDirectory::new("bare-help-auth-status");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status help (bare word) still renders auth's help",
+                argv: argv(&["auth", "status", "help"]),
+                dependencies,
+                expected: success(baseline::AUTH_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-auth-logout");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth logout help (bare word) still renders auth's help",
+                argv: argv(&["auth", "logout", "help"]),
+                dependencies,
+                expected: success(baseline::AUTH_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-auth-login-api-key");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key help (bare word) still renders auth's help",
+                argv: argv(&["auth", "login", "api-key", "help"]),
+                dependencies,
+                expected: success(baseline::AUTH_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-sessions-show");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions show help (bare word) still renders sessions's help",
+                argv: argv(&["sessions", "show", "help"]),
+                dependencies,
+                expected: success(baseline::SESSIONS_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-sessions-rm");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions rm help (bare word) still renders sessions's help",
+                argv: argv(&["sessions", "rm", "help"]),
+                dependencies,
+                expected: success(baseline::SESSIONS_HELP),
+                _temporary: temporary,
+            }
+        },
+        // Regression guards: leaves with NO plain String positional resolve
+        // the bare `help` token through clap's own auto-generated `help`
+        // pseudo-subcommand already, and must keep doing so unaffected by
+        // the fix for the shapes above.
+        {
+            let temporary = TemporaryDirectory::new("bare-help-config-init");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config init help (bare word) renders config's help via clap's own subcommand",
+                argv: argv(&["config", "init", "help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-config-doctor");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config doctor help (bare word) renders config's help via clap's own subcommand",
+                argv: argv(&["config", "doctor", "help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-auth-login");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login help (bare word) renders auth's help via clap's own subcommand",
+                argv: argv(&["auth", "login", "help"]),
+                dependencies,
+                expected: success(baseline::AUTH_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("bare-help-sessions-list");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions list help (bare word) renders sessions's help via clap's own subcommand",
+                argv: argv(&["sessions", "list", "help"]),
+                dependencies,
+                expected: success(baseline::SESSIONS_HELP),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
 #[test]
 fn table_b_parser_surface_baseline_holds() {
     use parser_surface_baseline as baseline;
