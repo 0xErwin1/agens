@@ -167,10 +167,6 @@ fn execute_command(
         return cli::clap_outcome(error);
     }
 
-    if let Some(result) = cli::subcommand_help_override(arguments) {
-        return result;
-    }
-
     let parsed = match cli::Cli::try_parse_from(arguments.iter()) {
         Ok(parsed) => parsed,
         Err(error) => return cli::clap_outcome(error),

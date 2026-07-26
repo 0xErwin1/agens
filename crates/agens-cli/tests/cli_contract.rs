@@ -952,24 +952,24 @@ fn table_a_models_and_sessions_hold() {
 mod parser_surface_baseline {
     pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  sessions  inspect completed turns\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
+    pub(crate) const ROOT_HELP: &str = "Agens is a coding agent CLI\n\nUsage: agens [OPTIONS] [COMMAND]\n\nCommands:\n  config    inspect configuration\n  auth      inspect supported authentication\n  chat      run a headless agent turn\n  models    list provider models\n  sessions  inspect completed turns\n\nOptions:\n      --resume [<SESSION_ID>]  Resume the most recent session, or the given session id\n  -h, --help                   Print help\n  -V, --version                Print version\n";
 
     pub(crate) fn version_line() -> String {
         format!("agens {VERSION}\n")
     }
 
-    pub(crate) const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  report the effective configuration and where each setting came from\n  init    write a starter configuration file\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  report the effective configuration and where each setting came from\n  init    write a starter configuration file\n\nOptions:\n  -h, --help  Print help\n";
     /// `config` with no subcommand renders byte-identical to `config --help`:
     /// clap treats a required subcommand group with nothing supplied the
     /// same as an explicit help request.
     pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = CONFIG_HELP;
     pub(crate) const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
     pub(crate) const CONFIG_INIT_HELP: &str = "write a starter configuration file\n\nUsage: agens config init [OPTIONS]\n\nOptions:\n      --global  Write the starter configuration to the global path instead of the project path\n  -h, --help    Print help\n";
-    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  report authentication status for ChatGPT or an API-key provider\n  login   log in to ChatGPT or an API-key provider\n  logout  remove stored credentials for a provider\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  report authentication status for ChatGPT or an API-key provider\n  login   log in to ChatGPT or an API-key provider\n  logout  remove stored credentials for a provider\n\nOptions:\n  -h, --help  Print help\n";
     /// `auth` with no subcommand renders byte-identical to `auth --help`.
     pub(crate) const AUTH_MISSING_SUBCOMMAND_MESSAGE: &str = AUTH_HELP;
     pub(crate) const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n  help     Print this message or the help of the given subcommand(s)\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
+    pub(crate) const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
     pub(crate) const AUTH_LOGIN_API_KEY_HELP: &str = "log in with an API key instead of ChatGPT\n\nUsage: agens auth login api-key [OPTIONS] <PROVIDER>\n\nArguments:\n  <PROVIDER>  \n\nOptions:\n      --api-key <API_KEY>  \n  -h, --help               Print help\n";
     pub(crate) const CHAT_HELP: &str = "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
     /// D1 (ratified): `chat foo --help` goes from Usage(2) to Success(0).
@@ -981,7 +981,7 @@ mod parser_surface_baseline {
     pub(crate) const CHAT_UNKNOWN_FLAG_MESSAGE: &str = "error: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n";
     pub(crate) const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  list saved sessions\n  show  show a saved session's details\n  rm    remove a saved session\n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  list saved sessions\n  show  show a saved session's details\n  rm    remove a saved session\n\nOptions:\n  -h, --help  Print help\n";
     /// `sessions` with no subcommand renders byte-identical to `sessions --help`.
     pub(crate) const SESSIONS_MISSING_SUBCOMMAND_MESSAGE: &str = SESSIONS_HELP;
     pub(crate) const SESSIONS_LIST_HELP: &str =
@@ -1044,26 +1044,32 @@ mod parser_surface_baseline {
         "auth requires status, login, or logout";
 }
 
-/// C1-R2: a bare `help` token (not `--help`/`-h`) at a nested position must
-/// still win over whatever String-typed positional it would otherwise bind
-/// to. Every leaf command with a plain `String`/`Option<String>` positional
-/// (as opposed to a nested `#[command(subcommand)]`, where clap's own
-/// auto-generated `help` pseudo-subcommand already handles this) is covered
-/// here as one family, not as isolated shapes — that is exactly the
-/// distinction that let this regression land twice.
+/// Bare-word `help` was deliberately removed as a help path: the ONLY way to
+/// request help anywhere in this CLI is `-h`/`--help` (clap's own
+/// auto-generated `help` pseudo-subcommand is disabled via
+/// `disable_help_subcommand` on the root `Cli` command in `cli.rs`). A
+/// bare `"help"` token is now an ordinary argument, subject to whatever
+/// clap-derived shape governs its position: a plain `String`/`Option<String>`
+/// positional binds it as an ordinary value (`auth status help`, `sessions
+/// show help`) and the leaf's own body validation then rejects it on its own
+/// terms; a leaf with no positional of its own rejects it as an unexpected
+/// argument (`config init help`); a leaf with its own nested subcommand
+/// enum rejects it as an unrecognized subcommand (`auth login help`), since
+/// `"help"` no longer matches any subcommand name. This pins the whole
+/// family, not isolated shapes, since that family/isolated-shape distinction
+/// is exactly what let a bare-help regression land twice on the WAY IN
+/// (before this removal, when bare `help` was still a recognized alias).
 #[test]
 fn table_b_bare_help_word_at_every_nesting_depth_holds() {
-    use parser_surface_baseline as baseline;
-
     let cases = vec![
         {
             let temporary = TemporaryDirectory::new("bare-help-auth-status");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "auth status help (bare word) still renders auth's help",
+                name: "auth status help (bare word) is an ordinary provider value, not a help request",
                 argv: argv(&["auth", "status", "help"]),
                 dependencies,
-                expected: success(baseline::AUTH_HELP),
+                expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
                 _temporary: temporary,
             }
         },
@@ -1071,10 +1077,10 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-auth-logout");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "auth logout help (bare word) still renders auth's help",
+                name: "auth logout help (bare word) is an ordinary provider value, not a help request",
                 argv: argv(&["auth", "logout", "help"]),
                 dependencies,
-                expected: success(baseline::AUTH_HELP),
+                expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
                 _temporary: temporary,
             }
         },
@@ -1082,10 +1088,10 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-auth-login-api-key");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "auth login api-key help (bare word) still renders auth's help",
+                name: "auth login api-key help (bare word) is an ordinary provider value, not a help request",
                 argv: argv(&["auth", "login", "api-key", "help"]),
                 dependencies,
-                expected: success(baseline::AUTH_HELP),
+                expected: failure(ExitStatus::Usage, "usage: auth provider is unsupported"),
                 _temporary: temporary,
             }
         },
@@ -1093,10 +1099,13 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-sessions-show");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "sessions show help (bare word) still renders sessions's help",
+                name: "sessions show help (bare word) is an ordinary identifier value, not a help request",
                 argv: argv(&["sessions", "show", "help"]),
                 dependencies,
-                expected: success(baseline::SESSIONS_HELP),
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions show requires a numeric id",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1104,25 +1113,31 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-sessions-rm");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "sessions rm help (bare word) still renders sessions's help",
+                name: "sessions rm help (bare word) is an ordinary identifier value, not a help request",
                 argv: argv(&["sessions", "rm", "help"]),
                 dependencies,
-                expected: success(baseline::SESSIONS_HELP),
+                expected: failure(
+                    ExitStatus::Usage,
+                    "usage: sessions rm requires a numeric id",
+                ),
                 _temporary: temporary,
             }
         },
-        // Regression guards: leaves with NO plain String positional resolve
-        // the bare `help` token through clap's own auto-generated `help`
-        // pseudo-subcommand already, and must keep doing so unaffected by
-        // the fix for the shapes above.
+        // Leaves with NO plain String positional reject the bare `help`
+        // token as an unrecognized shape: clap no longer treats `"help"` as
+        // a subcommand name anywhere (`disable_help_subcommand` is a global
+        // setting, propagated to every nested subcommand).
         {
             let temporary = TemporaryDirectory::new("bare-help-config-init");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "config init help (bare word) renders config's help via clap's own subcommand",
+                name: "config init help (bare word) is rejected as an unexpected argument",
                 argv: argv(&["config", "init", "help"]),
                 dependencies,
-                expected: success(baseline::CONFIG_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument 'help' found\n\nUsage: agens config init [OPTIONS]\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1130,10 +1145,13 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-config-doctor");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "config doctor help (bare word) renders config's help via clap's own subcommand",
+                name: "config doctor help (bare word) is rejected as an unexpected argument",
                 argv: argv(&["config", "doctor", "help"]),
                 dependencies,
-                expected: success(baseline::CONFIG_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument 'help' found\n\nUsage: agens config doctor\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1141,10 +1159,13 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-auth-login");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "auth login help (bare word) renders auth's help via clap's own subcommand",
+                name: "auth login help (bare word) is rejected as an unrecognized subcommand",
                 argv: argv(&["auth", "login", "help"]),
                 dependencies,
-                expected: success(baseline::AUTH_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unrecognized subcommand 'help'\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1152,10 +1173,13 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
             let temporary = TemporaryDirectory::new("bare-help-sessions-list");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "sessions list help (bare word) renders sessions's help via clap's own subcommand",
+                name: "sessions list help (bare word) is rejected as an unexpected argument",
                 argv: argv(&["sessions", "list", "help"]),
                 dependencies,
-                expected: success(baseline::SESSIONS_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument 'help' found\n\nUsage: agens sessions list\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1167,22 +1191,30 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
 /// C2-R2: `agens chat help` is the one shape where the bare `help` token
 /// must win over `ChatArgs.prompt` (a `Vec<String>`, so clap itself would
 /// otherwise happily bind `"help"` as the prompt and run a real turn). Only
-/// the single-argument shape is special-cased, matching the pre-clap
-/// `is_help` precedent: `chat foo help` and `chat help foo` are ordinary
-/// two-token prompts, not a help request.
+/// the single-argument shape is now an ordinary one-word prompt like any
+/// other: bare-word `help` was deliberately removed as a help path
+/// everywhere in this CLI, `chat` included. `chat`'s prompt is an unbounded
+/// `Vec<String>`, so clap itself has no shape that ever rejects a bare
+/// `"help"` token there; it always parses as a one-word prompt and reaches
+/// the same headless-turn path as any other prompt (the test harness's
+/// unconfigured headless-turn stub, byte-identical to `chat hi`'s W-C
+/// counterpart in `table_b_ratified_deltas_hold`). `chat foo help` and `chat
+/// help foo` remain ordinary two-token prompts as before, unaffected by this
+/// removal.
 #[test]
 fn table_b_chat_bare_help_word_holds() {
-    use parser_surface_baseline as baseline;
-
     let cases = vec![
         {
             let temporary = TemporaryDirectory::new("bare-help-chat-alone");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "chat help (bare word, sole argument) renders chat's help",
+                name: "chat help (bare word, sole argument) sends \"help\" as an ordinary prompt, not a help request",
                 argv: argv(&["chat", "help"]),
                 dependencies,
-                expected: success(baseline::CHAT_HELP),
+                expected: failure(
+                    ExitStatus::Unavailable,
+                    "unavailable: this command is not implemented yet",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1211,10 +1243,18 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-help-word");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "help",
+                // Deliberate delta: bare-word `help` is no longer a help
+                // path anywhere in this CLI, including bare at the root.
+                // clap's auto-generated `help` pseudo-subcommand is
+                // disabled, so `"help"` fails subcommand resolution like
+                // any other unrecognized subcommand name.
+                name: "help (bare word) is rejected as an unrecognized subcommand, not root help",
                 argv: argv(&["help"]),
                 dependencies,
-                expected: success(baseline::ROOT_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("help", "agens [OPTIONS] [COMMAND]"),
+                ),
                 _temporary: temporary,
             }
         },
@@ -1511,17 +1551,26 @@ fn table_b_parser_surface_baseline_holds() {
                 _temporary: temporary,
             }
         },
-        // W1: `config`/`auth`/`models`/`sessions` treat a help token
-        // ANYWHERE in their own arguments as a request for that
-        // subcommand's help, even alongside an otherwise-invalid shape.
+        // W1 REVERT (deliberate): `config`/`auth`/`models`/`sessions` no
+        // longer treat a help token ANYWHERE in their own arguments as a
+        // request for that subcommand's help when the rest of the shape is
+        // invalid. Bare-word help was removed entirely, and `--help`
+        // combined with an invalid extra token is no different from any
+        // other invalid token: clap rejects the shape at the first offending
+        // token and never reaches `--help`. This reverts the earlier W1 fix
+        // as an accepted cost of deleting the bare-word-help machinery, not
+        // a regression to chase again.
         {
             let temporary = TemporaryDirectory::new("baseline-models-help-word");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "models help (bare word, non-flag) still renders help",
+                name: "models help (bare word) is rejected as an unexpected argument, not a help request",
                 argv: argv(&["models", "help"]),
                 dependencies,
-                expected: success(baseline::MODELS_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument 'help' found\n\nUsage: agens models\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1529,10 +1578,10 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-models-extra-then-help");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "models extra --help renders help despite the invalid extra argument",
+                name: "models extra --help now exits 2 on the invalid extra argument, not W1's help",
                 argv: argv(&["models", "extra", "--help"]),
                 dependencies,
-                expected: success(baseline::MODELS_HELP),
+                expected: preformatted_failure(ExitStatus::Usage, baseline::MODELS_EXTRA_MESSAGE),
                 _temporary: temporary,
             }
         },
@@ -1540,10 +1589,13 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-config-extra-then-help");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "config extra --help renders help despite the invalid extra subcommand",
+                name: "config extra --help now exits 2 on the invalid extra subcommand, not W1's help",
                 argv: argv(&["config", "extra", "--help"]),
                 dependencies,
-                expected: success(baseline::CONFIG_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("extra", "agens config <COMMAND>"),
+                ),
                 _temporary: temporary,
             }
         },
@@ -1551,10 +1603,13 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-auth-extra-then-help");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "auth extra --help renders help despite the invalid extra subcommand",
+                name: "auth extra --help now exits 2 on the invalid extra subcommand, not W1's help",
                 argv: argv(&["auth", "extra", "--help"]),
                 dependencies,
-                expected: success(baseline::AUTH_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("extra", "agens auth <COMMAND>"),
+                ),
                 _temporary: temporary,
             }
         },
@@ -1562,10 +1617,13 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-sessions-extra-then-help");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "sessions extra --help renders help despite the invalid extra subcommand",
+                name: "sessions extra --help now exits 2 on the invalid extra subcommand, not W1's help",
                 argv: argv(&["sessions", "extra", "--help"]),
                 dependencies,
-                expected: success(baseline::SESSIONS_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::unrecognized_subcommand_message("extra", "agens sessions <COMMAND>"),
+                ),
                 _temporary: temporary,
             }
         },
@@ -1573,10 +1631,13 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-config-doctor-extra-then-help");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "config doctor extra --help renders help despite the invalid trailing argument",
+                name: "config doctor extra --help now exits 2 on the invalid trailing argument, not W1's help",
                 argv: argv(&["config", "doctor", "extra", "--help"]),
                 dependencies,
-                expected: success(baseline::CONFIG_HELP),
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument 'extra' found\n\nUsage: agens config doctor\n\nFor more information, try '--help'.\n",
+                ),
                 _temporary: temporary,
             }
         },
@@ -1713,12 +1774,17 @@ fn table_b_parser_surface_baseline_holds() {
             let temporary = TemporaryDirectory::new("baseline-help-word-with-extra");
             let dependencies = base_dependencies(&temporary);
             Case {
-                name: "help chat is a usage error, not subcommand help",
+                // Deliberate delta: bare-word `help` is no longer special
+                // anywhere, so this is no longer `root_shape_conflict`'s
+                // manufactured "unrecognized argument" message; clap itself
+                // rejects "help" as an unrecognized subcommand before ever
+                // looking at the trailing "chat" token.
+                name: "help chat is rejected as an unrecognized subcommand, not subcommand help",
                 argv: argv(&["help", "chat"]),
                 dependencies,
                 expected: preformatted_failure(
                     ExitStatus::Usage,
-                    baseline::root_shape_conflict_message("help"),
+                    baseline::unrecognized_subcommand_message("help", "agens [OPTIONS] [COMMAND]"),
                 ),
                 _temporary: temporary,
             }

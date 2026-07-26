@@ -1033,7 +1033,7 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
     // has a known, exact expected text.
     const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
     const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
-    const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n  help     Print this message or the help of the given subcommand(s)\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
+    const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
     const AUTH_LOGOUT_HELP: &str = "remove stored credentials for a provider\n\nUsage: agens auth logout <PROVIDER>\n\nArguments:\n  <PROVIDER>  \n\nOptions:\n  -h, --help  Print help\n";
     const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
