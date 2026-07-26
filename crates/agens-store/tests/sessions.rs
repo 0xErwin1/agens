@@ -302,6 +302,23 @@ fn rolls_back_a_completed_turn_when_an_event_write_fails() {
 }
 
 #[test]
+fn corrupt_database_open_failure_uses_the_sessions_prefix() {
+    let directory = data_directory();
+    let database = directory.join("agens.db");
+    fs::write(&database, "not a sqlite database").unwrap();
+
+    let error = SessionStore::open(&directory).err().unwrap().to_string();
+
+    assert!(
+        error.starts_with("sessions check database layout"),
+        "{error}"
+    );
+    assert!(error.contains(database.to_string_lossy().as_ref()));
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn rejects_supported_versions_with_an_incompatible_session_schema_shape() {
     let directory = data_directory();
     let database = directory.join("agens.db");

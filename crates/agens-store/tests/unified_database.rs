@@ -216,15 +216,71 @@ fn two_stores_writing_concurrently_in_one_process_do_not_corrupt_or_spuriously_f
     fs::remove_dir_all(directory).unwrap();
 }
 
+/// Populates a legacy `permissions.db` with a real project-scoped grant, mirroring the pre-unified
+/// `permission_grants` shape rather than an inert text fixture.
+fn seed_legacy_permissions_database(path: &std::path::Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE permission_grants (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                tool_kind TEXT NOT NULL,
+                tool_value TEXT,
+                target_kind TEXT NOT NULL,
+                target_value TEXT
+            );
+            INSERT INTO permission_grants
+                (project, decision, tool_kind, tool_value, target_kind, target_value)
+            VALUES
+                ('legacy-project', 'allow', 'exact', 'native::edit', 'any', NULL);",
+        )
+        .unwrap();
+}
+
+/// Populates a legacy `preferences.db` with a real remembered model, mirroring the pre-unified
+/// `model_preference` shape rather than an inert text fixture.
+fn seed_legacy_preferences_database(path: &std::path::Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE model_preference (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                model TEXT NOT NULL CHECK(model <> ''),
+                reasoning_effort TEXT
+            );
+            INSERT INTO model_preference (id, model, reasoning_effort)
+            VALUES (1, 'legacy-model', 'high');",
+        )
+        .unwrap();
+}
+
+/// Populates a legacy v1 `sessions.db` with a real session row, mirroring the pre-unification
+/// on-disk shape rather than an inert text fixture.
+fn seed_legacy_sessions_database(path: &std::path::Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO sessions (title, created_at) VALUES ('legacy session', 0);",
+        )
+        .unwrap();
+}
+
 #[test]
 fn legacy_database_files_are_neither_read_nor_modified() {
     let directory = data_directory();
 
+    seed_legacy_permissions_database(&directory.join("permissions.db"));
+    seed_legacy_preferences_database(&directory.join("preferences.db"));
+    seed_legacy_sessions_database(&directory.join("sessions.db"));
+
     let legacy_files = ["permissions.db", "preferences.db", "sessions.db"];
-    let legacy_contents = b"legacy fixture bytes, never read or written by the unified path";
-    for name in legacy_files {
-        fs::write(directory.join(name), legacy_contents).unwrap();
-    }
     let before: Vec<(std::fs::Metadata, Vec<u8>)> = legacy_files
         .iter()
         .map(|name| {
@@ -236,6 +292,19 @@ fn legacy_database_files_are_neither_read_nor_modified() {
     let mut preference_store = PreferenceStore::open(&directory).unwrap();
     let mut permission_store = PermissionGrantStore::open(&directory).unwrap();
     let mut session_store = SessionStore::open(&directory).unwrap();
+
+    let unified_connection = Connection::open(preference_store.database_path()).unwrap();
+    let unified_grant_count: i64 = unified_connection
+        .query_row("SELECT count(*) FROM permission_grants", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unified_grant_count, 0);
+    drop(unified_connection);
+
+    assert_eq!(preference_store.remembered_model().unwrap(), None);
+    assert!(session_store.list_completed_turns().unwrap().is_empty());
+
     preference_store
         .remember_model(&ModelPreference::new("gpt-5.5", None))
         .unwrap();
