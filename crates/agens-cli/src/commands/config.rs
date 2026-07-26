@@ -88,6 +88,11 @@ pub(crate) fn create_global_configuration_file(
     write_new_configuration_file(path, contents)
 }
 
+/// The global configuration directory is always mode 0700 after this call,
+/// whether it was just created or already existed: an already-existing
+/// directory is chmod'd unconditionally, never left at whatever permissions
+/// it happened to carry (for example the default 0755 a plain `mkdir` or an
+/// older `agens` binary might have left behind).
 fn ensure_private_configuration_directory(directory: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {
@@ -298,6 +303,38 @@ mod tests {
             std::fs::read_to_string(&target).expect("global config file should be readable"),
             "# starter\n"
         );
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    #[test]
+    fn create_global_configuration_file_tightens_an_already_existing_loose_directory() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-config-init-global-tighten-existing-dir-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        let config_home = temporary.join("config");
+        std::fs::create_dir_all(&config_home).expect("test directory should be created");
+        std::fs::set_permissions(&config_home, fs::Permissions::from_mode(0o755))
+            .expect("test directory permissions should be set");
+        let mode_before = std::fs::metadata(&config_home)
+            .expect("global config directory should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode_before, 0o755);
+
+        let target = config_home.join("config.toml");
+        create_global_configuration_file(&target, "# starter\n")
+            .expect("global configuration file should be created");
+
+        let mode_after = std::fs::metadata(&config_home)
+            .expect("global config directory should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode_after, 0o700);
 
         std::fs::remove_dir_all(&temporary).ok();
     }
