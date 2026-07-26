@@ -434,9 +434,29 @@ fn bash_cancellation_kills_its_process_group_and_descendants() {
         output,
         ToolOutput::failure("[stdout]\n[stderr]\n[bash: cancelled]\n[exit status: unavailable]\n")
     );
+    assert_eq!(output.facts(), None);
     assert!(started.elapsed() < Duration::from_secs(2));
     thread::sleep(Duration::from_millis(1100));
     assert!(!marker.exists());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_killed_by_a_signal_reports_exit_code_none() {
+    let root = project_root();
+    let tools = NativeTools::open(&root).unwrap();
+
+    let output = tools
+        .bash(BashInput::new("kill -9 $$").with_timeout(Duration::from_secs(5)))
+        .unwrap();
+
+    assert!(output.is_error);
+    assert_eq!(
+        output.facts(),
+        Some(&ToolResultFacts::Bash { exit_code: None })
+    );
+
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -876,6 +876,10 @@ fn accept_tool_result_emits_no_facts_event() {
             TurnEvent::StateChanged(TurnState::Requesting),
         ]
     );
+    assert!(!coordinator.events().iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
+    )));
 }
 
 #[test]
@@ -951,6 +955,10 @@ fn accept_tool_result_with_facts_none_emits_no_facts_event() {
             TurnEvent::StateChanged(TurnState::Requesting),
         ]
     );
+    assert!(!coordinator.events().iter().any(|event| matches!(
+        event,
+        TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
+    )));
 }
 
 #[test]
@@ -1027,4 +1035,74 @@ fn multiple_tool_calls_keep_each_facts_event_with_its_own_result() {
         event,
         TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
     )));
+}
+
+#[test]
+fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-a".into(),
+            name: "write".into(),
+            input: "{\"path\":\"a.txt\"}".into(),
+        })
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-b".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    coordinator
+        .accept_tool_result_with_facts(
+            "call-a",
+            "wrote a.txt".into(),
+            false,
+            Some(ToolResultFacts::Write {
+                path: "a.txt".into(),
+                bytes_written: 11,
+            }),
+        )
+        .unwrap();
+    coordinator
+        .accept_tool_result_with_facts(
+            "call-b",
+            "exit 0".into(),
+            false,
+            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+        )
+        .unwrap();
+
+    assert_eq!(
+        &coordinator.events()[coordinator.events().len() - 5..],
+        &[
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-a".into(),
+                content: "wrote a.txt".into(),
+                is_error: false,
+            }),
+            TurnEvent::ToolResultFacts {
+                tool_call_id: "call-a".into(),
+                facts: ToolResultFacts::Write {
+                    path: "a.txt".into(),
+                    bytes_written: 11,
+                },
+            },
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-b".into(),
+                content: "exit 0".into(),
+                is_error: false,
+            }),
+            TurnEvent::ToolResultFacts {
+                tool_call_id: "call-b".into(),
+                facts: ToolResultFacts::Bash { exit_code: Some(0) },
+            },
+            TurnEvent::StateChanged(TurnState::Requesting),
+        ]
+    );
 }
