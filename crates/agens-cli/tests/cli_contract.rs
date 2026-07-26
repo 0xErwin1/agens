@@ -687,6 +687,71 @@ fn table_a_chat_holds() {
                 _temporary: temporary,
             }
         },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-model-after-prompt");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --model after the prompt is still threaded through",
+                argv: argv(&["chat", "hi", "--model", "gpt-4"]),
+                dependencies,
+                expected: success(
+                    "model=Some(\"gpt-4\") system=None max_iterations=None mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-system-after-prompt");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --system after the prompt is still threaded through",
+                argv: argv(&["chat", "hi", "--system", "sys"]),
+                dependencies,
+                expected: success(
+                    "model=None system=Some(\"sys\") max_iterations=None mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-max-iterations-after-prompt");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --max-iterations after the prompt is still threaded through",
+                argv: argv(&["chat", "hi", "--max-iterations", "3"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=Some(3) mode=Edit dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-mode-after-prompt");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --mode after the prompt is still threaded through",
+                argv: argv(&["chat", "hi", "--mode", "chat"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=None mode=Chat dangerously_allow_all=false prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("chat-flag-dangerously-allow-all-after-prompt");
+            let dependencies = echoing_chat_dependencies(&temporary);
+            Case {
+                name: "chat --dangerously-allow-all after the prompt is still threaded through",
+                argv: argv(&["chat", "hi", "--dangerously-allow-all"]),
+                dependencies,
+                expected: success(
+                    "model=None system=None max_iterations=None mode=Edit dangerously_allow_all=true prompt=\"hi\"\n",
+                ),
+                _temporary: temporary,
+            }
+        },
     ];
 
     run_table_a(cases);
@@ -892,6 +957,18 @@ mod parser_surface_baseline {
     }
 
     pub(crate) const MODELS_EXTRA_MESSAGE: &str = "error: unexpected argument 'extra' found\n\nUsage: agens models\n\nFor more information, try '--help'.\n";
+
+    /// W2: `--help`/`-h`/`--version`/`-V`/`help` are recognized as a
+    /// root-level request ONLY when they are the sole argument; clap itself
+    /// would otherwise honor the flag regardless of a trailing token, which
+    /// is exactly the regression this message closes. `cli::root_shape_conflict`
+    /// manufactures this via `Command::error`, so it carries clap's own
+    /// rendering even though clap never actually parsed this shape.
+    pub(crate) fn root_shape_conflict_message(token: &str) -> String {
+        format!(
+            "error: unrecognized argument '{token}'\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+        )
+    }
     pub(crate) const CHAT_MODEL_MISSING_VALUE_MESSAGE: &str = "error: a value is required for '--model <MODEL>' but none was supplied\n\nFor more information, try '--help'.\n";
     /// Unlike the other clap-owned cases above, this stays a body-owned
     /// message: `ChatArgs.prompt` is an unbounded `Vec<String>` (see
@@ -1221,6 +1298,164 @@ fn table_b_parser_surface_baseline_holds() {
                 expected: failure(
                     ExitStatus::Usage,
                     format!("usage: {}", baseline::CHAT_MISSING_PROMPT_MESSAGE),
+                ),
+                _temporary: temporary,
+            }
+        },
+        // W1: `config`/`auth`/`models`/`sessions` treat a help token
+        // ANYWHERE in their own arguments as a request for that
+        // subcommand's help, even alongside an otherwise-invalid shape.
+        {
+            let temporary = TemporaryDirectory::new("baseline-models-help-word");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "models help (bare word, non-flag) still renders help",
+                argv: argv(&["models", "help"]),
+                dependencies,
+                expected: success(baseline::MODELS_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-models-extra-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "models extra --help renders help despite the invalid extra argument",
+                argv: argv(&["models", "extra", "--help"]),
+                dependencies,
+                expected: success(baseline::MODELS_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-config-extra-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config extra --help renders help despite the invalid extra subcommand",
+                argv: argv(&["config", "extra", "--help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-extra-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth extra --help renders help despite the invalid extra subcommand",
+                argv: argv(&["auth", "extra", "--help"]),
+                dependencies,
+                expected: success(baseline::AUTH_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-sessions-extra-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions extra --help renders help despite the invalid extra subcommand",
+                argv: argv(&["sessions", "extra", "--help"]),
+                dependencies,
+                expected: success(baseline::SESSIONS_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-config-doctor-extra-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config doctor extra --help renders help despite the invalid trailing argument",
+                argv: argv(&["config", "doctor", "extra", "--help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_HELP),
+                _temporary: temporary,
+            }
+        },
+        // W2: help/version tokens are recognized as a root-level request
+        // ONLY when they are the sole argument; a trailing token is a
+        // usage error, matching the historical single-argument precedent.
+        {
+            let temporary = TemporaryDirectory::new("baseline-help-flag-with-extra");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "--help extra is a usage error, not a help render",
+                argv: argv(&["--help", "extra"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("--help"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-help-short-flag-with-extra");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "-h x is a usage error, not a help render",
+                argv: argv(&["-h", "x"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("-h"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-version-short-flag-with-extra");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "-V x is a usage error, not a version render",
+                argv: argv(&["-V", "x"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("-V"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-version-flag-with-extra");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "--version x is a usage error, not a version render",
+                argv: argv(&["--version", "x"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("--version"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-help-word-with-extra");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "help chat is a usage error, not subcommand help",
+                argv: argv(&["help", "chat"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("help"),
+                ),
+                _temporary: temporary,
+            }
+        },
+        // W3: a bare `--` must not fall through to the TUI launcher; it is
+        // not a recognized invocation shape.
+        {
+            let temporary = TemporaryDirectory::new("baseline-bare-option-terminator");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "a bare -- is a usage error, not a TUI launch",
+                argv: argv(&["--"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    baseline::root_shape_conflict_message("--"),
                 ),
                 _temporary: temporary,
             }
