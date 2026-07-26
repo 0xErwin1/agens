@@ -3756,7 +3756,7 @@ impl NativeTools {
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
         if let Err(output) = self.validate_relative(&input.path) {
-            return Ok(output);
+            return Ok(Self::failed_write_facts(&input.path, output));
         }
 
         #[cfg(unix)]
@@ -3791,8 +3791,19 @@ impl NativeTools {
                     ),
                 )
             }
-            Err(output) => Ok(output),
+            Err(output) => Ok(Self::failed_write_facts(&input.path, output)),
         }
+    }
+
+    /// Attaches `Write` failure facts to an already-sanitized failure output,
+    /// so a write that never completed is still visible to the mechanical
+    /// half of the divergence detector rather than leaving no trace at all.
+    fn failed_write_facts(path: &Path, output: ToolOutput) -> ToolOutput {
+        output.with_facts(ToolResultFacts::Write {
+            path: FactPath::new(&path.display().to_string()),
+            outcome: ToolOutcome::Failed,
+            written: None,
+        })
     }
 
     fn edit_file_with_context(
@@ -3801,13 +3812,19 @@ impl NativeTools {
         context: Option<&ToolExecutionContext>,
     ) -> Result<ToolOutput, Error> {
         if let Err(output) = self.validate_relative(&input.path) {
-            return Ok(output);
+            return Ok(Self::failed_edit_facts(&input.path, output));
         }
         if input.old.is_empty() {
-            return Ok(ToolOutput::failure("edit: old text is required"));
+            return Ok(Self::failed_edit_facts(
+                &input.path,
+                ToolOutput::failure("edit: old text is required"),
+            ));
         }
         if input.old == input.new {
-            return Ok(ToolOutput::failure("edit: old and new text must differ"));
+            return Ok(Self::failed_edit_facts(
+                &input.path,
+                ToolOutput::failure("edit: old and new text must differ"),
+            ));
         }
 
         #[cfg(unix)]
@@ -3824,7 +3841,17 @@ impl NativeTools {
             "edit: secure confined edits are unavailable on this platform",
         ));
 
-        Ok(result.unwrap_or_else(|output| output))
+        Ok(result.unwrap_or_else(|output| Self::failed_edit_facts(&input.path, output)))
+    }
+
+    /// Attaches `Edit` failure facts to an already-sanitized failure output,
+    /// for the same reason [`Self::failed_write_facts`] exists for writes.
+    fn failed_edit_facts(path: &Path, output: ToolOutput) -> ToolOutput {
+        output.with_facts(ToolResultFacts::Edit {
+            path: FactPath::new(&path.display().to_string()),
+            outcome: ToolOutcome::Failed,
+            changed: None,
+        })
     }
 
     pub fn list_directory(&self, input: ListDirectoryInput) -> Result<ToolOutput, Error> {
@@ -5429,7 +5456,7 @@ mod native_tool_tests {
     }
 
     #[test]
-    fn failing_tools_report_no_facts() {
+    fn failing_writes_and_edits_report_failure_facts_but_reads_do_not() {
         let root = project_root();
         fs::write(root.join("notes.txt"), "old").unwrap();
         let tools = NativeTools::open(&root).unwrap();
@@ -5438,13 +5465,103 @@ mod native_tool_tests {
             .write_file(WriteFileInput::new("../outside.txt", "x"))
             .unwrap();
         assert!(rejected_write.is_error);
-        assert_eq!(rejected_write.facts(), None);
+        match rejected_write.facts() {
+            Some(ToolResultFacts::Write {
+                path,
+                outcome,
+                written,
+            }) => {
+                assert!(!path.is_representable());
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*written, None);
+            }
+            other => panic!("expected write failure facts, got {other:?}"),
+        }
+
+        let unnameable_write = tools
+            .write_file(WriteFileInput::new(".", "content"))
+            .unwrap();
+        assert!(unnameable_write.is_error);
+        match unnameable_write.facts() {
+            Some(ToolResultFacts::Write {
+                path,
+                outcome,
+                written,
+            }) => {
+                assert_eq!(path.relative(), Some("."));
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*written, None);
+            }
+            other => panic!("expected write failure facts, got {other:?}"),
+        }
+
+        let rejected_edit = tools
+            .edit_file(EditFileInput::new("../outside.txt", "old", "new"))
+            .unwrap();
+        assert!(rejected_edit.is_error);
+        match rejected_edit.facts() {
+            Some(ToolResultFacts::Edit {
+                path,
+                outcome,
+                changed,
+            }) => {
+                assert!(!path.is_representable());
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*changed, None);
+            }
+            other => panic!("expected edit failure facts, got {other:?}"),
+        }
+
+        let empty_old_edit = tools
+            .edit_file(EditFileInput::new("notes.txt", "", "new"))
+            .unwrap();
+        assert!(empty_old_edit.is_error);
+        match empty_old_edit.facts() {
+            Some(ToolResultFacts::Edit {
+                path,
+                outcome,
+                changed,
+            }) => {
+                assert_eq!(path.relative(), Some("notes.txt"));
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*changed, None);
+            }
+            other => panic!("expected edit failure facts, got {other:?}"),
+        }
+
+        let identical_edit = tools
+            .edit_file(EditFileInput::new("notes.txt", "old", "old"))
+            .unwrap();
+        assert!(identical_edit.is_error);
+        match identical_edit.facts() {
+            Some(ToolResultFacts::Edit {
+                path,
+                outcome,
+                changed,
+            }) => {
+                assert_eq!(path.relative(), Some("notes.txt"));
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*changed, None);
+            }
+            other => panic!("expected edit failure facts, got {other:?}"),
+        }
 
         let missing_edit = tools
             .edit_file(EditFileInput::new("notes.txt", "missing", "new"))
             .unwrap();
         assert!(missing_edit.is_error);
-        assert_eq!(missing_edit.facts(), None);
+        match missing_edit.facts() {
+            Some(ToolResultFacts::Edit {
+                path,
+                outcome,
+                changed,
+            }) => {
+                assert_eq!(path.relative(), Some("notes.txt"));
+                assert_eq!(*outcome, ToolOutcome::Failed);
+                assert_eq!(*changed, None);
+            }
+            other => panic!("expected edit failure facts, got {other:?}"),
+        }
 
         let read = tools.read_file(ReadFileInput::new("notes.txt")).unwrap();
         assert!(!read.is_error);
