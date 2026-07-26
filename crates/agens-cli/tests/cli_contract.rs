@@ -2127,7 +2127,86 @@ fn table_b_ratified_deltas_hold() {
                 _temporary: temporary,
             }
         },
+        // The `--flag=value` equals form is accepted deliberately, the same
+        // species as ratified W-C (a clap idiom the hand-rolled parser did
+        // not implement, now honored). It is NOT rejected across the board:
+        // for a `bool` flag, an explicit `=value` is still an error, because
+        // clap's own generated shape for a plain switch takes no value at
+        // all. The credential-writing member of this family
+        // (`auth login api-key ... --api-key=k`) needs its own test with a
+        // throwaway `AGENS_CONFIG_HOME` and is pinned separately below in
+        // [`table_b_equals_flag_credential_write_is_pinned`]; it is not
+        // repeated here as a plain `Case` because it must assert file
+        // existence, never a credential value.
+        {
+            let temporary = TemporaryDirectory::new("ratified-config-init-global-equals-bool");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config init --global=true is rejected, a bool flag takes no explicit value",
+                argv: argv(&["config", "init", "--global=true"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected value 'true' for '--global' found; no more were expected\n\nUsage: agens config init --global\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-auth-login-device-auth-equals-bool");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login --device-auth=true is rejected, a bool flag takes no explicit value",
+                argv: argv(&["auth", "login", "--device-auth=true"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected value 'true' for '--device-auth' found; no more were expected\n\nUsage: agens auth login --device-auth\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
     ];
 
     run_table_a(cases);
+}
+
+/// W-F (round 4): `auth login api-key <provider> --api-key=k` went from a
+/// usage error under the hand-rolled parser to a real login under clap,
+/// exactly the way `--` at a non-lone position did under ratified W-C — an
+/// idiom the old parser refused that clap accepts. The maintainer left the
+/// behavior alone; this test only pins that it cannot regress silently. It
+/// writes real credentials, so it runs against a throwaway
+/// `AGENS_CONFIG_HOME` scoped to this case's own [`TemporaryDirectory`], and
+/// it asserts only that a credentials file now exists — never its contents.
+#[test]
+fn table_b_equals_flag_credential_write_is_pinned() {
+    let temporary = TemporaryDirectory::new("ratified-auth-login-api-key-equals-flag");
+    let config_home = temporary.path().join("throwaway-config-home");
+    let credentials_path = config_home.join("auth.json");
+    let mut environment = BTreeMap::new();
+    environment.insert(
+        "AGENS_CONFIG_HOME".to_owned(),
+        config_home.display().to_string(),
+    );
+    let dependencies = CliDependencies::for_test(
+        temporary.project_root(),
+        Some(temporary.home()),
+        environment,
+        BTreeMap::new(),
+    );
+
+    let actual = execute(
+        argv(&["auth", "login", "api-key", "openai-api", "--api-key=k"])
+            .iter()
+            .map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("Logged in to openai-api.\n"));
+    assert!(
+        credentials_path.is_file(),
+        "auth login api-key ... --api-key=k should write a credentials file, found none at {}",
+        credentials_path.display()
+    );
 }
