@@ -432,12 +432,23 @@ pub(crate) fn configure_tui_project_identity(
 mod tests {
     use std::collections::BTreeMap;
 
+    use agens_core::{
+        CompletedTurnRepository, CompletedTurnSnapshot, MessagePart, SessionMetadata, TurnEvent,
+        TurnState,
+    };
+    use agens_store::SessionStore;
     use agens_tui::{Action, Event, Key, TuiPresentation};
 
     use super::*;
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
-    use crate::test_support::render_tui_test_backend;
+    use crate::model_registry::TuiModelSelector;
+    use crate::test_support::{
+        persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
+        tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
+    };
+    use crate::tui::agents::BundledModelValidator;
+    use crate::tui::session::ActiveAgentRuntime;
 
     #[test]
     fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()
@@ -528,5 +539,302 @@ mod tests {
         assert!(!cancellation.is_cancelled());
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
         assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn tui_session_resume_fails_closed_for_cross_project_missing_and_legacy_records() {
+        let temporary = tui_session_directory("fail-closed");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        persist_tui_session(
+            &mut store,
+            &temporary.join("other").display().to_string(),
+            "other",
+        );
+        let saved_sessions = store.list_sessions().unwrap();
+        drop(store);
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let original = session.lock().unwrap().clone();
+
+        for command in ["/resume 1", "/resume 2"] {
+            assert_eq!(
+                run_tui_prompt(
+                    &bootstrap,
+                    command,
+                    &HeadlessTurnCancellation::new(),
+                    &session,
+                    None,
+                )
+                .unwrap_err()
+                .to_string(),
+                "store: saved session is unavailable"
+            );
+            assert_eq!(*session.lock().unwrap(), original);
+            assert_eq!(
+                SessionStore::open(bootstrap.data_directory())
+                    .unwrap()
+                    .list_sessions()
+                    .unwrap(),
+                saved_sessions
+            );
+        }
+
+        let legacy_temporary = tui_session_directory("legacy-fail-closed");
+        let legacy_bootstrap = tui_session_bootstrap(&legacy_temporary, &[]);
+        let mut legacy_store = SessionStore::open(legacy_bootstrap.data_directory()).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                legacy_store.persist_completed_turn(
+                    CompletedTurnSnapshot::from_persisted_events(vec![
+                        TurnEvent::StateChanged(TurnState::Requesting),
+                        TurnEvent::StateChanged(TurnState::Streaming),
+                        TurnEvent::ProviderPart(MessagePart::Text("legacy answer".into())),
+                        TurnEvent::StateChanged(TurnState::Completed),
+                    ])
+                    .unwrap(),
+                ),
+            )
+            .unwrap();
+        drop(legacy_store);
+        let legacy_session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let legacy_original = legacy_session.lock().unwrap().clone();
+        assert_eq!(
+            run_tui_prompt(
+                &legacy_bootstrap,
+                "/resume 1",
+                &HeadlessTurnCancellation::new(),
+                &legacy_session,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            "store: saved session is unavailable"
+        );
+        assert_eq!(*legacy_session.lock().unwrap(), legacy_original);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+        std::fs::remove_dir_all(legacy_temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_busy_resume_and_subagent_commands_leave_context_unchanged() {
+        let temporary = tui_session_directory("busy");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            identifier: Some(7),
+            selected_subagent: Some("reviewer".into()),
+            running: true,
+            ..TuiSessionContext::fresh()
+        }));
+        let original = session.lock().unwrap().clone();
+
+        for command in ["/resume 1", "/subagent reviewer"] {
+            assert_eq!(
+                run_tui_prompt(
+                    &bootstrap,
+                    command,
+                    &HeadlessTurnCancellation::new(),
+                    &session,
+                    None,
+                )
+                .unwrap_err()
+                .to_string(),
+                "runtime: headless turn entered an invalid state"
+            );
+            assert_eq!(*session.lock().unwrap(), original);
+        }
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_agent_command_rotates_to_an_eligible_primary_agent() {
+        let temporary = tui_session_directory("agent-command");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "all",
+                "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
+            )],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/agent all",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap(),
+            "Active agent: all."
+        );
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("all")
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_subagent_command_selects_an_exact_subagent() {
+        let temporary = tui_session_directory("subagent-command");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "reviewer",
+                "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+            )],
+        );
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        ensure_active_tui_agent_runtime(
+            &bootstrap,
+            &session,
+            &Arc::new(Mutex::new(rotation_dispatcher())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/subagent reviewer",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap(),
+            "Subagent: reviewer."
+        );
+        assert_eq!(
+            session.lock().unwrap().selected_subagent.as_deref(),
+            Some("reviewer")
+        );
+        assert_eq!(
+            session
+                .lock()
+                .unwrap()
+                .active_agent
+                .as_ref()
+                .map(|agent| agent.name.as_str()),
+            Some("primary")
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_new_command_synchronizes_idle_context() {
+        let temporary = tui_session_directory("new-command");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let dispatcher = rotation_dispatcher();
+        let active_agent = ActiveAgentRuntime::build(
+            &rotation_agent("primary", Some("gpt-4.1"), true),
+            None,
+            &tui_project(&temporary),
+            &dispatcher,
+            &BundledModelValidator,
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            identifier: Some(7),
+            metadata: Some(SessionMetadata {
+                id: 7,
+                project: tui_project(&temporary),
+                title: "conversation".into(),
+                active_agent: "primary".into(),
+                provider_id: None,
+                model_id: None,
+                reasoning_effort: None,
+                created_at: 1,
+                updated_at: 1,
+                completed_turn_count: 1,
+                resumable: true,
+            }),
+            messages: tui_session_messages(),
+            active_agent: Some(active_agent),
+            pending_system_reminder: Some("previous reminder".into()),
+            selection: Some(TuiModelSelector::new("gpt-4.1")),
+            selected_subagent: Some("reviewer".into()),
+            ..TuiSessionContext::fresh()
+        }));
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/new",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap(),
+            "Started a new session."
+        );
+        assert_eq!(*session.lock().unwrap(), TuiSessionContext::fresh());
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn tui_session_busy_agent_command_leaves_context_and_store_unchanged() {
+        let temporary = tui_session_directory("busy-agent-command");
+        let bootstrap = tui_session_bootstrap(
+            &temporary,
+            &[(
+                "all",
+                "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
+            )],
+        );
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
+        let saved_sessions = store.list_sessions().unwrap();
+        drop(store);
+        let session = Arc::new(Mutex::new(TuiSessionContext {
+            identifier: Some(metadata.id),
+            metadata: Some(metadata),
+            messages: tui_session_messages(),
+            selected_subagent: Some("reviewer".into()),
+            running: true,
+            ..TuiSessionContext::fresh()
+        }));
+        let original = session.lock().unwrap().clone();
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/agent all",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            "runtime: headless turn entered an invalid state"
+        );
+        assert_eq!(*session.lock().unwrap(), original);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .list_sessions()
+                .unwrap(),
+            saved_sessions
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 }
