@@ -1026,11 +1026,9 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
 
     // Each nested subcommand renders its OWN help: clap walks to the
     // deepest matched subcommand for any valid shape, so `config doctor
-    // --help` renders `doctor`'s help, not `config`'s (the earlier
-    // `subcommand_help_override` blanket rewrite of this was a regression,
-    // since fixed). `models` has no nested subcommands of its own, so it
-    // renders its own top-level help either way. Each rendering therefore
-    // has a known, exact expected text.
+    // --help` renders `doctor`'s help, not `config`'s. `models` has no
+    // nested subcommands of its own, so it renders its own top-level help
+    // either way. Each rendering therefore has a known, exact expected text.
     const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
     const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
     const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";

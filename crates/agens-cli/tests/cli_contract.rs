@@ -1188,19 +1188,16 @@ fn table_b_bare_help_word_at_every_nesting_depth_holds() {
     run_table_a(cases);
 }
 
-/// C2-R2: `agens chat help` is the one shape where the bare `help` token
-/// must win over `ChatArgs.prompt` (a `Vec<String>`, so clap itself would
-/// otherwise happily bind `"help"` as the prompt and run a real turn). Only
-/// the single-argument shape is now an ordinary one-word prompt like any
-/// other: bare-word `help` was deliberately removed as a help path
-/// everywhere in this CLI, `chat` included. `chat`'s prompt is an unbounded
-/// `Vec<String>`, so clap itself has no shape that ever rejects a bare
-/// `"help"` token there; it always parses as a one-word prompt and reaches
-/// the same headless-turn path as any other prompt (the test harness's
+/// `agens chat help` sends the bare word `help` as an ordinary one-word
+/// prompt, not a help request: bare-word `help` was deliberately removed as
+/// a help path everywhere in this CLI, `chat` included, and help for `chat`
+/// is available only via `-h`/`--help`. `chat`'s prompt is an unbounded
+/// `Vec<String>`, so clap itself has no shape that would ever intercept a
+/// bare `"help"` token there; it always binds as the prompt and reaches the
+/// same headless-turn path as any other prompt (the test harness's
 /// unconfigured headless-turn stub, byte-identical to `chat hi`'s W-C
 /// counterpart in `table_b_ratified_deltas_hold`). `chat foo help` and `chat
-/// help foo` remain ordinary two-token prompts as before, unaffected by this
-/// removal.
+/// help foo` remain ordinary two-token prompts, unaffected.
 #[test]
 fn table_b_chat_bare_help_word_holds() {
     let cases = vec![
