@@ -79,8 +79,8 @@ use agens_tools::TaskTerminalState;
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_tools::ToolDispatcher;
 use agens_tools::{
-    AgentCatalog, AgentModelValidator, CommandCatalog, CommandDefinition, McpEndpointSummary,
-    McpStatusSnapshot, ReadFileInput, SkillCatalog,
+    AgentCatalog, AgentModelValidator, CommandCatalog, McpEndpointSummary, McpStatusSnapshot,
+    ReadFileInput, SkillCatalog,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -105,9 +105,8 @@ use agens_tui::TuiSubmitOrigin;
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tui::{BridgeCancel, BridgeTx};
 use agens_tui::{
-    Conversation, DialogEntry, DialogView, Engine as TuiEngine, PaletteEntry, PaletteEntryKind,
-    Tui, TuiPresentation, TuiRouteCancellation, TuiRuntimeEvent, TuiSubagentErrorKind,
-    TuiSubmissionOutcome,
+    Conversation, DialogEntry, DialogView, Engine as TuiEngine, Tui, TuiPresentation,
+    TuiRouteCancellation, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubmissionOutcome,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -259,6 +258,10 @@ use tui::engine::{run_tui_prompt, run_tui_prompt_with};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
+use tui::extensions::{start_tui_commands, start_tui_skills};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
 use tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -297,56 +300,6 @@ pub use headless::HeadlessChatRequest;
 pub use model_registry::{TuiModelSelector, TuiModelSource};
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
-const RESERVED_TUI_COMMANDS: &[&str] = &[
-    "agent",
-    "connect",
-    "disconnect",
-    "diagnostics",
-    "effort",
-    "help",
-    "mcp",
-    "model",
-    "new",
-    "provider",
-    "quit",
-    "resume",
-    "select",
-    "sessions",
-    "subagent",
-    "subagents",
-];
-
-const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
-    ("connect", "Connect to ChatGPT", "[--device-auth]", None),
-    ("disconnect", "Disconnect ChatGPT credentials", "", None),
-    (
-        "diagnostics",
-        "Show sanitized runtime diagnostics",
-        "",
-        Some("diagnostics"),
-    ),
-    ("new", "Start a new session", "", None),
-    ("sessions", "List saved sessions", "", None),
-    ("resume", "Resume a saved session", "<id>", None),
-    ("agent", "List or select the primary agent", "[name]", None),
-    (
-        "provider",
-        "Select runtime provider",
-        "[name]",
-        Some("provider"),
-    ),
-    ("model", "List or select the model", "[name]", Some("model")),
-    (
-        "effort",
-        "Show or set reasoning effort",
-        "[level]",
-        Some("effort"),
-    ),
-    ("help", "Show commands and skills", "", Some("help")),
-    ("mcp", "Show configured MCP servers", "", Some("mcp")),
-    ("select", "Select a project file", "", Some("select")),
-    ("quit", "Exit Agens", "", None),
-];
 
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
@@ -582,78 +535,6 @@ fn execute_command(
     commands::dispatch(parsed, dependencies, cancellation)
 }
 
-fn start_tui_commands<E: TuiEngine>(
-    tui: &mut Tui<E>,
-    bootstrap: &Bootstrap,
-) -> Result<Arc<CommandCatalog>, CliError> {
-    let global_root = bootstrap
-        .paths
-        .global_config
-        .parent()
-        .ok_or_else(|| CliError::configuration("global command root is unavailable"))?
-        .join("commands");
-    let project_root = bootstrap
-        .paths
-        .project_config
-        .parent()
-        .ok_or_else(|| CliError::configuration("project command root is unavailable"))?
-        .join("commands");
-    let built_ins = RESERVED_TUI_COMMANDS
-        .iter()
-        .map(|name| {
-            CommandDefinition::new(*name, "Reserved TUI command", *name)
-                .expect("reserved TUI command names are valid")
-        })
-        .collect::<Vec<_>>();
-    let discovery = CommandCatalog::discover(&built_ins, global_root, project_root)
-        .map_err(CliError::configuration)?;
-
-    for diagnostic in discovery.diagnostics() {
-        tui.add_diagnostic(format!(
-            "Command diagnostic ({}): {}",
-            diagnostic.path().display(),
-            diagnostic.message()
-        ));
-    }
-    for name in discovery.shadowed() {
-        tui.add_diagnostic(format!(
-            "Command /{name} has multiple definitions; applied source precedence."
-        ));
-    }
-
-    Ok(Arc::new(discovery.catalog().clone()))
-}
-
-fn start_tui_skills<E: TuiEngine>(
-    tui: &mut Tui<E>,
-    bootstrap: &Bootstrap,
-) -> Result<Arc<SkillCatalog>, CliError> {
-    let discovery = discover_skill_catalog(bootstrap)?;
-    for diagnostic in discovery.diagnostics() {
-        tui.add_diagnostic(format!(
-            "Skill diagnostic ({}): {}",
-            diagnostic.path().display(),
-            diagnostic.message()
-        ));
-    }
-    for shadow in discovery.shadowed() {
-        tui.add_diagnostic(format!(
-            "Skill /{} has multiple definitions; applied source precedence.",
-            shadow.name()
-        ));
-    }
-
-    Ok(Arc::new(discovery.catalog().clone()))
-}
-
-fn discover_skill_catalog(bootstrap: &Bootstrap) -> Result<agens_tools::SkillDiscovery, CliError> {
-    SkillCatalog::discover(
-        bootstrap.paths.global_config.with_file_name("skills"),
-        bootstrap.paths.project_config.with_file_name("skills"),
-    )
-    .map_err(|_| CliError::configuration("skill catalog is unavailable"))
-}
-
 fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
     if skills.is_empty() {
         return base.to_owned();
@@ -693,89 +574,6 @@ fn report_tui_extension_collisions<E: TuiEngine>(
             skill.name()
         ));
     }
-}
-
-fn resolved_tui_palette(
-    commands: &CommandCatalog,
-    skills: &SkillCatalog,
-    has_subagents: bool,
-) -> Vec<PaletteEntry> {
-    let mut entries = TUI_PALETTE_BUILT_INS
-        .iter()
-        .map(|(name, description, hint, dialog_id)| {
-            let entry = PaletteEntry::new(*name, *description, *hint, PaletteEntryKind::BuiltIn);
-            let dialog_id = dialog_id.or(match *name {
-                "connect" | "disconnect" | "agent" => Some(*name),
-                "sessions" | "resume" => Some("sessions"),
-                _ => None,
-            });
-            dialog_id.map_or(entry.clone(), |route| entry.with_dialog(route))
-        })
-        .collect::<Vec<_>>();
-    if has_subagents {
-        entries.push(
-            PaletteEntry::new(
-                "subagent",
-                "Choose an eligible configured subagent",
-                "[name]",
-                PaletteEntryKind::BuiltIn,
-            )
-            .with_dialog("subagent"),
-        );
-        entries.push(PaletteEntry::new(
-            "subagents",
-            "Inspect current-session subagent transcripts",
-            "",
-            PaletteEntryKind::BuiltIn,
-        ));
-    }
-    let mut custom_commands = commands
-        .iter()
-        .filter(|command| !RESERVED_TUI_COMMANDS.contains(&command.name()))
-        .collect::<Vec<_>>();
-    custom_commands.sort_by_key(|command| command.name());
-    entries.extend(custom_commands.into_iter().map(|command| {
-        PaletteEntry::new(
-            command.name(),
-            command.description(),
-            "[arguments]",
-            PaletteEntryKind::Command,
-        )
-    }));
-    let mut resolved_skills = skills
-        .skills()
-        .filter(|skill| {
-            !RESERVED_TUI_COMMANDS.contains(&skill.name())
-                && commands.command(skill.name()).is_none()
-        })
-        .collect::<Vec<_>>();
-    resolved_skills.sort_by_key(|skill| skill.name());
-    entries.extend(resolved_skills.into_iter().map(|skill| {
-        PaletteEntry::new(
-            skill.name(),
-            skill.description(),
-            "[arguments]",
-            PaletteEntryKind::Skill,
-        )
-    }));
-    entries
-}
-
-fn render_tui_help(entries: &[PaletteEntry]) -> String {
-    let surface = entries
-        .iter()
-        .map(|entry| {
-            format!(
-                "/{} {}  [{}] {}",
-                entry.name(),
-                entry.argument_hint(),
-                entry.kind().label(),
-                entry.description()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("Available commands and skills:\n{surface}")
 }
 
 fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
