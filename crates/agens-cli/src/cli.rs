@@ -57,7 +57,12 @@ pub(crate) enum Command {
 #[derive(Subcommand, Debug)]
 pub(crate) enum ConfigAction {
     Doctor,
-    Init,
+    Init {
+        /// Write the starter configuration to the global path instead of
+        /// the project path.
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

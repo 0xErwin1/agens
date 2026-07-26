@@ -11,11 +11,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use agens_config::resolve_paths;
 use agens_core::HeadlessTurnCancellation;
 
 use crate::bootstrap::Bootstrap;
 use crate::commands::auth::run_production_auth_login;
-use crate::commands::config::create_configuration_file;
+use crate::commands::config::{create_configuration_file, create_global_configuration_file};
 use crate::error::CliError;
 use crate::headless::{HeadlessChatRequest, run_production_headless_chat};
 use crate::tui::engine::run_production_tui;
@@ -63,7 +64,21 @@ impl CliDependencies {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(_) => Err(CliError::configuration("configuration file is unavailable")),
             }),
-            create_file: Box::new(create_configuration_file),
+            create_file: Box::new(|path, contents| {
+                let home_directory = std::env::var_os("HOME").map(PathBuf::from);
+                let environment: BTreeMap<String, String> = std::env::vars()
+                    .filter(|(key, _)| !key.is_empty())
+                    .collect();
+                let global_config =
+                    resolve_paths(Path::new(""), home_directory.as_deref(), &environment)
+                        .global_config;
+
+                if path == global_config {
+                    create_global_configuration_file(path, contents)
+                } else {
+                    create_configuration_file(path, contents)
+                }
+            }),
             headless_chat: Box::new(run_production_headless_chat),
             tui_launcher: Box::new(run_production_tui),
             auth_login: Box::new(run_production_auth_login),

@@ -342,6 +342,47 @@ fn table_a_config_holds() {
             }
         },
         {
+            let temporary = TemporaryDirectory::new("config-init-global-no-existing-file");
+            let dependencies = base_dependencies(&temporary).with_create_file(|_, _| Ok(()));
+            let expected_stdout = format!(
+                "Wrote {}\n",
+                config_global_config_path(&temporary).display()
+            );
+            Case {
+                name: "config init --global writes a starter file to the global path",
+                argv: argv(&["config", "init", "--global"]),
+                dependencies,
+                expected: success(expected_stdout),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("config-init-global-existing-file");
+            let mut files = BTreeMap::new();
+            files.insert(
+                config_global_config_path(&temporary),
+                "[tools]\n".to_owned(),
+            );
+            let dependencies = CliDependencies::for_test(
+                temporary.project_root(),
+                Some(temporary.home()),
+                BTreeMap::new(),
+                files,
+            )
+            .with_create_file(|_, _| panic!("init --global must not overwrite an existing file"));
+            let expected_stderr = format!(
+                "config: configuration already exists at {}",
+                config_global_config_path(&temporary).display()
+            );
+            Case {
+                name: "config init --global refuses to replace an existing file",
+                argv: argv(&["config", "init", "--global"]),
+                dependencies,
+                expected: failure(ExitStatus::Configuration, expected_stderr),
+                _temporary: temporary,
+            }
+        },
+        {
             let temporary = TemporaryDirectory::new("config-init-existing-file");
             let mut files = BTreeMap::new();
             files.insert(

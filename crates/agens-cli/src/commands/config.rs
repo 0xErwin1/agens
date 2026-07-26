@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 
 use agens_config::{ConfiguredValue, Origin, ResolvedSettings, resolve_paths, starter_document};
@@ -17,7 +18,7 @@ pub(crate) fn run_config(
     dependencies: &CliDependencies,
 ) -> Result<String, CliError> {
     match action {
-        cli::ConfigAction::Init => run_config_init(dependencies),
+        cli::ConfigAction::Init { global } => run_config_init(dependencies, global),
         cli::ConfigAction::Doctor => {
             let bootstrap = bootstrap(dependencies)?;
             Ok(format!(
@@ -33,26 +34,32 @@ pub(crate) fn run_config(
     }
 }
 
-/// Writes a documented starter configuration for the current project. Refuses
-/// to touch an existing file: the command creates configuration, it never
-/// rewrites what a user already wrote.
-fn run_config_init(dependencies: &CliDependencies) -> Result<String, CliError> {
+/// Writes a documented starter configuration. Targets the project path by
+/// default, or the global path when `global` is set. Refuses to touch an
+/// existing file: the command creates configuration, it never rewrites what
+/// a user already wrote.
+fn run_config_init(dependencies: &CliDependencies, global: bool) -> Result<String, CliError> {
     let current_directory = (dependencies.current_directory)()?;
     let home_directory = (dependencies.home_directory)();
     let environment = (dependencies.environment)();
     let project_root = discover_project_root(&current_directory).unwrap_or(current_directory);
     let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
+    let target = if global {
+        &paths.global_config
+    } else {
+        &paths.project_config
+    };
 
-    if (dependencies.read_file)(&paths.project_config)?.is_some() {
+    if (dependencies.read_file)(target)?.is_some() {
         return Err(CliError::configuration(format!(
             "configuration already exists at {}",
-            paths.project_config.display()
+            target.display()
         )));
     }
 
-    (dependencies.create_file)(&paths.project_config, &starter_document())?;
+    (dependencies.create_file)(target, &starter_document())?;
 
-    Ok(format!("Wrote {}\n", paths.project_config.display()))
+    Ok(format!("Wrote {}\n", target.display()))
 }
 
 pub(crate) fn create_configuration_file(path: &Path, contents: &str) -> Result<(), CliError> {
@@ -61,6 +68,44 @@ pub(crate) fn create_configuration_file(path: &Path, contents: &str) -> Result<(
             .map_err(|_| CliError::configuration("configuration directory is unavailable"))?;
     }
 
+    write_new_configuration_file(path, contents)
+}
+
+/// Writes the starter configuration to the global path, privatizing the
+/// directory that holds it (mode 0700) rather than leaving it to the process
+/// umask. The global directory also holds `auth.json`, the stored
+/// credentials file, so a world- or group-readable directory would expose
+/// credentials the moment they are first written.
+pub(crate) fn create_global_configuration_file(
+    path: &Path,
+    contents: &str,
+) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        ensure_private_configuration_directory(parent)
+            .map_err(|_| CliError::configuration("configuration directory is unavailable"))?;
+    }
+
+    write_new_configuration_file(path, contents)
+}
+
+fn ensure_private_configuration_directory(directory: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        }
+        Ok(_) => Err(std::io::Error::other(
+            "configuration path is not a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(directory)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn write_new_configuration_file(path: &Path, contents: &str) -> Result<(), CliError> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -133,7 +178,8 @@ mod tests {
             Ok(())
         });
 
-        let report = run_config(cli::ConfigAction::Init, &dependencies).expect("init should run");
+        let report = run_config(cli::ConfigAction::Init { global: false }, &dependencies)
+            .expect("init should run");
 
         let written = written.lock().unwrap();
         let (path, contents) = written.first().expect("init should write exactly one file");
@@ -160,11 +206,96 @@ mod tests {
         )
         .with_create_file(|_, _| panic!("init must not write over an existing configuration"));
 
-        let error = run_config(cli::ConfigAction::Init, &dependencies)
+        let error = run_config(cli::ConfigAction::Init { global: false }, &dependencies)
             .expect_err("init must refuse an existing file");
 
         assert_eq!(error.status(), ExitStatus::Configuration);
         assert!(error.message.contains("already exists"));
+    }
+
+    #[test]
+    fn config_init_global_writes_the_starter_file_to_the_global_path() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-config-init-global-{}", std::process::id()));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&written);
+        let dependencies = CliDependencies::for_test(
+            temporary.join("project"),
+            Some(temporary.join("home")),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .with_create_file(move |path, contents| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), contents.to_owned()));
+            Ok(())
+        });
+
+        let report = run_config(cli::ConfigAction::Init { global: true }, &dependencies)
+            .expect("init --global should run");
+
+        let written = written.lock().unwrap();
+        let (path, contents) = written.first().expect("init should write exactly one file");
+        assert_eq!(written.len(), 1);
+        assert!(path.ends_with(".config/agens/config.toml"));
+        assert!(report.contains(".config/agens/config.toml"));
+        validate_toml_document(&parse_toml_document(contents).expect("starter file must parse"))
+            .expect("starter file must validate");
+    }
+
+    #[test]
+    fn config_init_global_refuses_to_replace_an_existing_configuration() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-config-init-global-existing-{}",
+            std::process::id()
+        ));
+        let home_directory = temporary.join("home");
+        let dependencies = CliDependencies::for_test(
+            temporary.join("project"),
+            Some(home_directory.clone()),
+            BTreeMap::new(),
+            BTreeMap::from([(
+                home_directory.join(".config/agens/config.toml"),
+                "[tools]\nmax_search_depth = 4\n".to_owned(),
+            )]),
+        )
+        .with_create_file(|_, _| panic!("init --global must not write over an existing file"));
+
+        let error = run_config(cli::ConfigAction::Init { global: true }, &dependencies)
+            .expect_err("init --global must refuse an existing file");
+
+        assert_eq!(error.status(), ExitStatus::Configuration);
+        assert!(error.message.contains("already exists"));
+    }
+
+    #[test]
+    fn create_global_configuration_file_creates_a_private_directory() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-config-init-global-private-dir-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::create_dir_all(&temporary).expect("test directory should be created");
+        let config_home = temporary.join("config");
+        let target = config_home.join("config.toml");
+
+        create_global_configuration_file(&target, "# starter\n")
+            .expect("global configuration file should be created");
+
+        let mode = std::fs::metadata(&config_home)
+            .expect("global config directory should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("global config file should be readable"),
+            "# starter\n"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
     }
 
     #[test]
