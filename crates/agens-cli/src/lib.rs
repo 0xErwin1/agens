@@ -48,8 +48,6 @@ use agens_core::{
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary, SessionAttemptStatus};
 #[cfg(test)]
-use agens_providers::chatgpt_login::LoginError;
-#[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_providers::chatgpt_login::upsert_provider_entry;
@@ -138,10 +136,6 @@ use bootstrap::effective_max_iterations;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use commands::auth::chatgpt_login_error;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -384,7 +378,7 @@ fn execute_strings(
     }
 }
 
-fn error_result(arguments: &[String], error: CliError) -> CommandResult {
+pub(crate) fn error_result(arguments: &[String], error: CliError) -> CommandResult {
     CommandResult {
         status: error.status(),
         stdout: if arguments == ["config", "doctor"] && error.status() == ExitStatus::Configuration
@@ -6829,26 +6823,5 @@ mod tests {
                 ..
             })
         ));
-    }
-}
-#[test]
-fn production_chatgpt_login_errors_render_fixed_sanitized_stages() {
-    for error in [
-        LoginError::Authentication("setup detail"),
-        LoginError::Authentication("callback request is invalid"),
-        LoginError::Authentication("authorization was denied"),
-        LoginError::TokenTransport,
-        LoginError::TokenStatus,
-        LoginError::TokenFormat,
-        LoginError::Account,
-        LoginError::Expiry,
-        LoginError::Cancelled,
-        LoginError::TimedOut,
-    ] {
-        let expected = format!("error: auth: {}\n", error.stage_message());
-        let result = error_result(&[], chatgpt_login_error(error));
-        assert_eq!(result.stderr, expected);
-        assert!(!result.stderr.contains("detail"));
-        assert_ne!(result.stderr, "error: auth: ChatGPT login failed\n");
     }
 }

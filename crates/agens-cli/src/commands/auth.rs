@@ -332,3 +332,31 @@ pub(crate) fn run_production_auth_login(
 pub(crate) fn chatgpt_login_error(error: LoginError) -> CliError {
     CliError::authentication(error.stage_message())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error_result;
+
+    #[test]
+    fn production_chatgpt_login_errors_render_fixed_sanitized_stages() {
+        for error in [
+            LoginError::Authentication("setup detail"),
+            LoginError::Authentication("callback request is invalid"),
+            LoginError::Authentication("authorization was denied"),
+            LoginError::TokenTransport,
+            LoginError::TokenStatus,
+            LoginError::TokenFormat,
+            LoginError::Account,
+            LoginError::Expiry,
+            LoginError::Cancelled,
+            LoginError::TimedOut,
+        ] {
+            let expected = format!("error: auth: {}\n", error.stage_message());
+            let result = error_result(&[], chatgpt_login_error(error));
+            assert_eq!(result.stderr, expected);
+            assert!(!result.stderr.contains("detail"));
+            assert_ne!(result.stderr, "error: auth: ChatGPT login failed\n");
+        }
+    }
+}
