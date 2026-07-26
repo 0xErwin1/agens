@@ -616,3 +616,19 @@ pub(crate) fn explicit_task_delegation_prompt(base: &str) -> String {
         format!("{base}\n\n{INSTRUCTION}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
+        let prompt = explicit_task_delegation_prompt("Base instructions.");
+
+        assert_eq!(
+            prompt,
+            "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
+        );
+        assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
+    }
+}
