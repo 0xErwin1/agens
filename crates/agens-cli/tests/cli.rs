@@ -3843,6 +3843,91 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
 }
 
 #[test]
+fn production_binary_records_a_completed_native_call_in_the_evidence_ledger() {
+    let temporary = TemporaryDirectory::new("production-evidence-ledger");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::bash".to_owned()],
+            response: native_tool_call_response(
+                "call_ledger_bash",
+                "native::bash",
+                r#"{"command":"exit 0"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["\"call_id\":\"call_ledger_bash\"".to_owned()],
+            response: text_response("ledger recorded"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    let output = isolated_agens_command(&temporary)
+        .args(["chat", "run a native bash command"])
+        .current_dir(&project_root)
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+        .output()
+        .expect("production binary should execute");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ledger recorded\n");
+
+    let connection = rusqlite::Connection::open(data_directory.join("agens.db"))
+        .expect("unified database should open");
+    let (session_id, attempt_id): (i64, i64) = connection
+        .query_row(
+            "SELECT id, (SELECT id FROM session_attempts WHERE session_id = sessions.id)
+             FROM sessions",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("a completed session and attempt should exist");
+    let (tool, outcome, exit_code, recorded_session_id, recorded_attempt_id): (
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT tool, outcome, exit_code, session_id, attempt_id FROM tool_result_facts",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("exactly one fact row should be recorded for the bash call");
+
+    assert_eq!(tool, "bash");
+    assert_eq!(outcome, "succeeded");
+    assert_eq!(exit_code, Some(0));
+    assert_eq!(recorded_session_id, session_id);
+    assert_eq!(recorded_attempt_id, attempt_id);
+
+    server.join();
+}
+
+#[test]
 fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_or_persistence() {
     for (name, mode, timeout_ms) in [
         ("timeout", "call-sleep", 20),

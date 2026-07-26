@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use agens_core::{
     BeginSessionAttemptError, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    PermissionMode, PermissionSession, Role, SessionMetadata, TurnEvent, TurnProgressSink,
-    run_headless_turn_with_max_iterations_and_progress,
+    CompletedTurnStoreError, FactIdentity, HeadlessTurnCancellation, HeadlessTurnError, Message,
+    MessagePart, PermissionMode, PermissionSession, Role, SessionMetadata, ToolResultFacts,
+    TurnEvent, TurnProgressSink, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
     ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider, ProgressAwareProvider,
     ProviderDiagnosticScope,
 };
-use agens_store::{PermissionGrantStore, SessionStore};
+use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
 use agens_tui::TuiPermissionBridge;
 
@@ -117,6 +117,34 @@ pub(crate) fn record_requested_subagent(
         && !requested.contains(&subagent)
     {
         requested.push(subagent);
+    }
+}
+
+/// Writes one fact to the evidence ledger, if its identity is ledger-eligible.
+///
+/// A fact with no `session_id`/`attempt_id` belongs to a turn running outside
+/// a session attempt (a subagent child turn) and is intentionally not
+/// ledger-writable, per the ledger's own key. A write failure is swallowed
+/// rather than propagated: the ledger is evidence about the turn, not part of
+/// the turn's own success criteria, so losing one row must never fail the
+/// user's work.
+fn record_tool_result_fact(
+    store: &Mutex<ToolFactStore>,
+    identity: &FactIdentity,
+    facts: &ToolResultFacts,
+) {
+    let (Some(session_id), Some(attempt_id)) = (identity.session_id, identity.attempt_id) else {
+        return;
+    };
+
+    if let Ok(mut store) = store.lock() {
+        let _ = store.record(
+            session_id,
+            attempt_id,
+            identity.sequence,
+            &identity.tool_call_id,
+            facts,
+        );
     }
 }
 
@@ -428,6 +456,13 @@ where
     let mut dispatcher = ProductionToolDispatcher::new(tool_runtime, pending);
     let mut store = SessionStore::open(context.bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
+    // The evidence ledger gets its own connection: the attempt lifecycle below
+    // holds `&mut store` for the whole runtime closure, so a sink installed
+    // alongside it cannot also borrow that connection.
+    let fact_store = Arc::new(Mutex::new(
+        ToolFactStore::open(context.bootstrap.data_directory())
+            .map_err(|_| CliError::storage("tool result facts ledger is unavailable"))?,
+    ));
     let metadata = next_session_metadata(
         context.bootstrap,
         &request.prompt,
@@ -462,6 +497,9 @@ where
             });
             let headless_progress: TurnProgressSink = Arc::new(move |event: TurnEvent| {
                 record_requested_subagent(&requested_subagents, &event);
+                if let TurnEvent::ToolResultFacts { identity, facts } = &event {
+                    record_tool_result_fact(&fact_store, identity, facts);
+                }
                 if let Some(progress) = &forwarded_progress {
                     progress(event);
                 }
@@ -636,6 +674,122 @@ mod tests {
             "Base instructions.\n\nWhen the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion."
         );
         assert_eq!(explicit_task_delegation_prompt(&prompt), prompt);
+    }
+
+    fn ledger_directory(label: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let suffix = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "agens-headless-ledger-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("ledger directory should be created");
+        directory
+    }
+
+    fn seed_session_and_attempt(directory: &std::path::Path) {
+        let connection = rusqlite::Connection::open(directory.join("agens.db")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (id, project, title, active_agent, created_at, updated_at)
+                 VALUES (1, 'project', 'title', 'build', 0, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_attempts (id, session_id, sequence, status, retry_prompt, started_at)
+                 VALUES (1, 1, 1, 'running', 'retry', 0)",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn bash_fact_event(coordinator: &mut agens_core::TurnCoordinator) -> TurnEvent {
+        coordinator.begin().unwrap();
+        coordinator
+            .accept_provider_part(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 0\"}".into(),
+            })
+            .unwrap();
+        coordinator.finish_provider_iteration().unwrap();
+        coordinator
+            .accept_tool_result(
+                "call-1",
+                "exit 0".into(),
+                false,
+                Some(agens_core::ToolResultFacts::Bash {
+                    outcome: agens_core::ToolOutcome::Succeeded,
+                    exit_code: Some(0),
+                }),
+            )
+            .unwrap();
+
+        coordinator
+            .events()
+            .iter()
+            .find(|event| matches!(event, TurnEvent::ToolResultFacts { .. }))
+            .cloned()
+            .expect("facts event must be present")
+    }
+
+    #[test]
+    fn a_child_turn_fact_is_not_ledger_written() {
+        let directory = ledger_directory("child-turn");
+        let store = Arc::new(Mutex::new(ToolFactStore::open(&directory).unwrap()));
+        seed_session_and_attempt(&directory);
+
+        let mut coordinator = agens_core::TurnCoordinator::new();
+        let TurnEvent::ToolResultFacts { identity, facts } = bash_fact_event(&mut coordinator)
+        else {
+            unreachable!("bash_fact_event always returns a ToolResultFacts event");
+        };
+        assert_eq!(identity.session_id, None);
+        assert_eq!(identity.attempt_id, None);
+
+        record_tool_result_fact(&store, &identity, &facts);
+
+        let recorded_count: i64 = rusqlite::Connection::open(directory.join("agens.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM tool_result_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 0);
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_write_failure_does_not_fail_the_turn() {
+        let directory = ledger_directory("write-failure");
+        let store = Arc::new(Mutex::new(ToolFactStore::open(&directory).unwrap()));
+
+        let key = agens_core::AttemptKey::new(1, 1).unwrap();
+        let mut coordinator = agens_core::TurnCoordinator::for_attempt(key);
+        let TurnEvent::ToolResultFacts { identity, facts } = bash_fact_event(&mut coordinator)
+        else {
+            unreachable!("bash_fact_event always returns a ToolResultFacts event");
+        };
+        assert_eq!(identity.session_id, Some(1));
+        assert_eq!(identity.attempt_id, Some(1));
+
+        // No `sessions`/`session_attempts` rows exist for id 1, so the insert
+        // violates the ledger's foreign keys and fails. Calling this must not
+        // panic: a failed write is evidence lost, not a failed turn.
+        record_tool_result_fact(&store, &identity, &facts);
+
+        let recorded_count: i64 = rusqlite::Connection::open(directory.join("agens.db"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM tool_result_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded_count, 0);
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
