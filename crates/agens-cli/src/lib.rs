@@ -8,10 +8,6 @@ use clap::Parser as _;
 
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use agens_config::ToolLimitSettings;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_config::{parse_toml_document, validate_toml_document};
 use agens_core::HeadlessTurnCancellation;
@@ -28,23 +24,15 @@ use agens_core::Role;
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_core::SessionMetadata;
 #[cfg(test)]
-use agens_core::{
-    CompletedSessionTurn, HeadlessPermissionGate, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessTurnPortError, PermissionDecision, PermissionPattern, PermissionPolicy,
-    PermissionSession, SessionMessage,
-};
+use agens_core::{CompletedSessionTurn, SessionMessage};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use agens_core::{HeadlessTurnError, Message, MessagePart};
+use agens_core::{Message, MessagePart};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_store::SessionStore;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use agens_tools::ToolDispatcher;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -75,31 +63,12 @@ use diagnostics::{
     next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
     record_subagent_terminal,
 };
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use dispatch::{ProductionToolDispatcher, poll_permission_port};
 use error::cancellation_result;
 use headless::block_on_headless_turn;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use headless::run_production_headless_chat_with_progress;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use permissions::ProductionPermissionGate;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use test_support::{
-    BatchTool, ProductionBatchInput, native_batch_call, run_production_batch_with_policy,
-    tui_session_directory,
-};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls these unqualified. Remove this re-export once the test module moves.
-use tools::runtime::production_dangerous_child_tool_runtime;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -263,203 +232,6 @@ fn execute_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agens_core::{PermissionRule, ToolAccess};
-
-    #[test]
-    fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
-        let ordinary_deny = PermissionPolicy::new(
-            PermissionMode::Edit,
-            vec![PermissionRule::global(
-                PermissionDecision::Deny,
-                PermissionPattern::Exact("native::write".into()),
-                PermissionPattern::Any,
-            )],
-        );
-        let ordinary = run_production_batch_with_policy(
-            ProductionBatchInput::new(
-                "dangerous-ordinary-deny",
-                Vec::new(),
-                vec![native_batch_call(
-                    "ordinary",
-                    "native::write",
-                    serde_json::json!({"path":"notes.md","content":"allowed"}),
-                )],
-            )
-            .with_policy(ordinary_deny)
-            .with_dangerous_override(),
-        );
-        assert!(ordinary.result.is_ok());
-        assert!(ordinary.prompts.is_empty());
-        assert_eq!(ordinary.executions, ["notes.md"]);
-
-        let hard_global_deny = PermissionPolicy::with_safety_predicates(
-            PermissionMode::Edit,
-            Vec::new(),
-            vec![agens_core::SafetyPredicate::GlobalDeny(Box::new(
-                agens_core::GlobalDenyPredicate {
-                    tool: PermissionPattern::Exact("native::write".into()),
-                    target: PermissionPattern::Any,
-                },
-            ))],
-        );
-        let global = run_production_batch_with_policy(
-            ProductionBatchInput::new(
-                "dangerous-global-deny",
-                Vec::new(),
-                vec![native_batch_call(
-                    "global",
-                    "native::write",
-                    serde_json::json!({"path":"blocked.md","content":"blocked"}),
-                )],
-            )
-            .with_policy(hard_global_deny)
-            .with_dangerous_override(),
-        );
-        assert!(global.result.is_ok());
-        assert!(global.prompts.is_empty());
-        assert!(global.executions.is_empty());
-
-        let chat = run_production_batch_with_policy(
-            ProductionBatchInput::new(
-                "dangerous-chat-write",
-                Vec::new(),
-                vec![native_batch_call(
-                    "chat",
-                    "native::write",
-                    serde_json::json!({"path":"blocked.md","content":"blocked"}),
-                )],
-            )
-            .with_policy(PermissionPolicy::new(PermissionMode::Chat, Vec::new()))
-            .with_dangerous_override(),
-        );
-        assert!(chat.result.is_ok());
-        assert!(chat.prompts.is_empty());
-        assert!(chat.executions.is_empty());
-
-        for (name, input) in [
-            ("native::write", "{malformed"),
-            (
-                "native::task",
-                r#"{"agent":"worker","description":"recursive"}"#,
-            ),
-            ("mcp::server::tool", r#"{}"#),
-            ("native::unregistered", r#"{}"#),
-        ] {
-            let rejected = run_production_batch_with_policy(
-                ProductionBatchInput::new(
-                    "dangerous-invalid",
-                    Vec::new(),
-                    vec![MessagePart::ToolCall {
-                        id: "rejected".into(),
-                        name: name.into(),
-                        input: input.into(),
-                    }],
-                )
-                .with_dangerous_override(),
-            );
-            assert_eq!(
-                rejected.result,
-                Err(HeadlessTurnError::PermissionEvaluation),
-                "{name} must be rejected before policy bypass"
-            );
-            assert!(rejected.prompts.is_empty());
-            assert!(rejected.executions.is_empty());
-        }
-
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
-        dispatcher
-            .lock()
-            .unwrap()
-            .register_native(
-                "native::write",
-                ToolAccess::Write,
-                BatchTool {
-                    name: "native::write".into(),
-                    calls: Arc::clone(&calls),
-                    cancellation: None,
-                },
-            )
-            .unwrap();
-        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
-        let mut gate = ProductionPermissionGate::new(
-            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
-            Arc::new(Mutex::new(Vec::new())),
-            PermissionSession::new(),
-            "project".into(),
-            Arc::clone(&dispatcher),
-            Arc::clone(&allowed),
-            Arc::new(Mutex::new(BTreeMap::new())),
-        )
-        .with_dangerous_override(true);
-        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
-        let call = HeadlessToolCall {
-            id: "once".into(),
-            name: "native::write".into(),
-            input: r#"{"path":"once.md","content":"once"}"#.into(),
-        };
-        let cancellation = HeadlessTurnCancellation::default();
-
-        assert_eq!(
-            poll_permission_port(gate.evaluate(&call, &cancellation)),
-            Ok(PermissionDecision::Allow)
-        );
-        assert!(
-            poll_permission_port(tool_dispatcher.dispatch(call.clone(), &cancellation)).is_ok()
-        );
-        assert_eq!(
-            poll_permission_port(tool_dispatcher.dispatch(call, &cancellation)),
-            Err(HeadlessTurnPortError::Tool)
-        );
-        assert_eq!(*calls.lock().unwrap(), ["once.md"]);
-
-        let oversized = "x".repeat(agens_core::MAX_PERMISSION_TARGET_BYTES + 1);
-        let oversized_call = HeadlessToolCall {
-            id: "oversized".into(),
-            name: "native::write".into(),
-            input: serde_json::json!({"path": oversized, "content": "blocked"}).to_string(),
-        };
-        assert_eq!(
-            poll_permission_port(gate.evaluate(&oversized_call, &cancellation)),
-            Err(HeadlessTurnPortError::Permission)
-        );
-
-        let temporary = tui_session_directory("dangerous-confined-write");
-        let project_root = temporary.join("project");
-        std::fs::create_dir_all(&project_root).unwrap();
-        let (_, dispatcher) =
-            production_dangerous_child_tool_runtime(&project_root, ToolLimitSettings::default())
-                .unwrap();
-        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
-        let mut gate = ProductionPermissionGate::new(
-            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
-            Arc::new(Mutex::new(Vec::new())),
-            PermissionSession::new(),
-            "project".into(),
-            Arc::clone(&dispatcher),
-            Arc::clone(&allowed),
-            Arc::new(Mutex::new(BTreeMap::new())),
-        )
-        .with_dangerous_override(true);
-        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
-        let escape = HeadlessToolCall {
-            id: "escape".into(),
-            name: "native::write".into(),
-            input: r#"{"path":"../escape.txt","content":"blocked"}"#.into(),
-        };
-
-        assert_eq!(
-            poll_permission_port(gate.evaluate(&escape, &cancellation)),
-            Ok(PermissionDecision::Allow)
-        );
-        assert!(
-            poll_permission_port(tool_dispatcher.dispatch(escape, &cancellation))
-                .expect("confined dispatcher should return a sanitized tool failure")
-                .is_error
-        );
-        assert!(!temporary.join("escape.txt").exists());
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
 
     #[test]
     fn the_removed_tool_output_key_is_no_longer_accepted() {
