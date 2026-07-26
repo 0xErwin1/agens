@@ -85,10 +85,9 @@ use agens_tools::{CommandCatalog, SkillCatalog};
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tools::{
-    DispatchTool, McpLimits, McpServerDescriptor, McpServerSource, McpServerTransport, McpTimeouts,
-    McpTransport as McpTransportPort, McpTransportError, PermissionPromptContext,
-    RemoteToolMetadata, TaskLaunchMode, ToolDispatchRequest, ToolEvaluationOutcome,
-    ToolExecutionContext, ToolOutput,
+    DispatchTool, McpServerDescriptor, McpServerSource, McpServerTransport,
+    PermissionPromptContext, RemoteToolMetadata, TaskLaunchMode, ToolDispatchRequest,
+    ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -186,10 +185,6 @@ use headless::block_on_headless_turn;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use headless::{provider_messages, run_production_headless_chat_with_progress};
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
-use mcp::ProductionMcpRuntime;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -8785,145 +8780,6 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
-    }
-
-    #[test]
-    fn production_mcp_runtime_reloads_dispatcher_and_retains_failed_generation() {
-        use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
-
-        struct TestTransport(VecDeque<agens_tools::McpResponse>);
-
-        impl McpTransportPort for TestTransport {
-            fn execute(
-                &mut self,
-                _: agens_tools::McpRequest,
-                _: &agens_tools::McpOperationContext,
-            ) -> Result<agens_tools::McpResponse, McpTransportError> {
-                Ok(self
-                    .0
-                    .pop_front()
-                    .expect("test transport response is configured"))
-            }
-
-            fn notify(
-                &mut self,
-                _: agens_tools::McpRequest,
-                _: &agens_tools::McpOperationContext,
-            ) -> Result<(), McpTransportError> {
-                Ok(())
-            }
-
-            fn close(
-                &mut self,
-                _: &agens_tools::McpOperationContext,
-            ) -> Result<(), McpTransportError> {
-                Ok(())
-            }
-        }
-
-        fn transport(name: &str) -> TestTransport {
-            TestTransport(
-                [
-                    agens_tools::McpResponse::Initialized(agens_tools::McpInitializeResult::new(
-                        "2025-06-18",
-                        serde_json::json!({"tools": {}}),
-                    )),
-                    agens_tools::McpResponse::ToolsListed(agens_tools::McpToolsPage::new(
-                        vec![agens_tools::McpToolDefinition {
-                            name: name.into(),
-                            description: Some(name.into()),
-                            input_schema: serde_json::json!({"type": "object"}),
-                            annotations: agens_tools::McpToolAnnotations {
-                                read_only_hint: Some(true),
-                            },
-                        }],
-                        None,
-                    )),
-                ]
-                .into(),
-            )
-        }
-
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let attempt_counter = Arc::clone(&attempts);
-        let registry = Arc::new(Mutex::new(McpRegistry::new()));
-        registry
-            .lock()
-            .unwrap()
-            .configure_server(
-                "files",
-                move || match attempt_counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel) {
-                    0 => Ok(Box::new(transport("old"))),
-                    1 => Err(McpTransportError::Transport("SENTINEL_SECRET".into())),
-                    _ => Ok(Box::new(transport("new"))),
-                },
-                McpTimeouts::new(
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                    Duration::from_secs(1),
-                )
-                .unwrap(),
-                McpLimits::default(),
-            )
-            .unwrap();
-        let mut runtime = ProductionMcpRuntime {
-            registry,
-            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
-        };
-
-        runtime.discover_server("files").unwrap();
-        let policy = PermissionPolicy::new(
-            PermissionMode::Edit,
-            vec![PermissionRule::global(
-                PermissionDecision::Allow,
-                PermissionPattern::Any,
-                PermissionPattern::Any,
-            )],
-        );
-        let ToolEvaluationOutcome::Authorized(handle) = runtime
-            .dispatcher
-            .lock()
-            .unwrap()
-            .evaluate(
-                &policy,
-                &[],
-                &PermissionSession::new(),
-                ToolDispatchRequest::new("project", "files_old", serde_json::json!({})),
-            )
-            .unwrap()
-        else {
-            panic!("discovered MCP tool must be callable through the dispatcher");
-        };
-
-        assert!(runtime.reload_server("files").unwrap().is_failed());
-        assert!(
-            runtime
-                .diagnostics()
-                .unwrap()
-                .iter()
-                .all(|diagnostic| !diagnostic.message.contains("SENTINEL_SECRET"))
-        );
-        assert!(
-            runtime
-                .dispatcher
-                .lock()
-                .unwrap()
-                .canonical_identity("files_old")
-                .is_some()
-        );
-
-        runtime.reload_server("files").unwrap();
-        let mut dispatcher = runtime.dispatcher.lock().unwrap();
-        assert!(dispatcher.canonical_identity("files_old").is_none());
-        assert!(dispatcher.canonical_identity("files_new").is_some());
-        assert!(
-            dispatcher
-                .execute(
-                    handle,
-                    &ToolExecutionContext::with_timeout(Duration::from_secs(1))
-                )
-                .is_err()
-        );
     }
 }
 #[test]
