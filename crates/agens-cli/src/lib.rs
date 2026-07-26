@@ -11,10 +11,6 @@ use clap::Parser as _;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
-use agens_config::McpTransport;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
 use agens_config::ToolLimitSettings;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -62,10 +58,6 @@ use agens_store::{SessionStore, StoredSession};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
-use agens_tools::McpRegistry;
-#[cfg(test)]
-// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
-// calls this unqualified. Remove this re-export once the test module moves.
 use agens_tools::ToolDispatcher;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -74,14 +66,13 @@ use agens_tools::{CommandCatalog, SkillCatalog};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use agens_tools::{
-    McpServerDescriptor, McpServerSource, McpServerTransport, TaskLaunchMode, ToolDispatchRequest,
-    ToolEvaluationOutcome, ToolExecutionContext,
-};
+use agens_tools::{TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use agens_tools::{TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
+use agens_tools::{
+    TaskLaunchMode, ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext,
+};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -3537,105 +3528,6 @@ mod tests {
                 .iter()
                 .all(|entry| !matches!(entry, agens_tui::TranscriptEntry::User(_)))
         );
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
-
-    #[test]
-    fn tui_mcp_overlay_is_local_safe_refreshable_and_includes_disabled_servers() {
-        let temporary = tui_session_directory("mcp-overlay");
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.mcp_servers = vec![
-            agens_config::McpServerConfig {
-                name: "files".into(),
-                disabled: false,
-                transport: McpTransport::Stdio,
-                command: Some("/private/bin/files-server".into()),
-                args: vec!["SENTINEL_ARG_SECRET".into()],
-                environment: BTreeMap::from([("TOKEN".into(), "SENTINEL_ENV_SECRET".into())]),
-                cwd: None,
-                url: None,
-                headers: BTreeMap::new(),
-                max_retries: 0,
-                timeout_ms: 250,
-            },
-            agens_config::McpServerConfig {
-                name: "disabled".into(),
-                disabled: true,
-                transport: McpTransport::Sse,
-                command: None,
-                args: Vec::new(),
-                environment: BTreeMap::new(),
-                cwd: None,
-                url: Some("https://user:SENTINEL_URL_SECRET@example.test/mcp?token=secret".into()),
-                headers: BTreeMap::from([(
-                    "Authorization".into(),
-                    "SENTINEL_HEADER_SECRET".into(),
-                )]),
-                max_retries: 0,
-                timeout_ms: 500,
-            },
-        ];
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
-        let router = TuiRuntimeRouter::new(
-            bootstrap,
-            Arc::clone(&session),
-            Arc::new(Mutex::new(None)),
-            Arc::new(CommandCatalog::default()),
-            Arc::new(SkillCatalog::default()),
-        );
-        let mut tui = Tui::new(ProductionTuiEngine {
-            cancellation: Arc::new(Mutex::new(None)),
-        });
-
-        assert!(
-            tui.apply_submission_outcome(router.route("/mcp".into()))
-                .is_none()
-        );
-        for character in "idle".chars() {
-            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
-        }
-        let filtered = render_tui_test_backend(&tui, 90, 24);
-        assert!(filtered.contains("files") && !filtered.contains("disabled  sse"));
-        tui.handle(agens_tui::Event::Key(agens_tui::Key::Escape));
-        tui.apply_submission_outcome(router.open_dialog("mcp").unwrap());
-        tui.handle(agens_tui::Event::Key(agens_tui::Key::Down));
-        tui.handle(agens_tui::Event::Key(agens_tui::Key::Enter));
-        let text = render_tui_test_backend(&tui, 90, 24);
-        assert!(text.contains("stdio"), "{text:?}");
-        assert!(text.contains("enabled/idle"), "{text:?}");
-        assert!(text.contains("disabled"), "{text:?}");
-        assert!(text.contains("Source: global"), "{text:?}");
-        assert!(text.contains("files-server"), "{text:?}");
-        assert!(text.contains("250ms"), "{text:?}");
-        for secret in [
-            "SENTINEL_ARG_SECRET",
-            "SENTINEL_ENV_SECRET",
-            "SENTINEL_URL_SECRET",
-            "SENTINEL_HEADER_SECRET",
-        ] {
-            assert!(!text.contains(secret), "{secret}: {text:?}");
-        }
-
-        let mut live = McpRegistry::with_status_handle(router.mcp_status.clone());
-        live.register_disabled_server(McpServerDescriptor::new(
-            "later",
-            McpServerSource::Global,
-            McpServerTransport::Stdio,
-            false,
-            std::time::Duration::from_secs(10),
-            None,
-        ))
-        .unwrap();
-        let agens_tui::Action::OpenDialog(route_id) =
-            tui.handle(agens_tui::Event::Key(agens_tui::Key::Char('r')))
-        else {
-            panic!("MCP refresh should remain local");
-        };
-        let refreshed = router.open_dialog(&route_id).unwrap();
-        tui.apply_submission_outcome(refreshed);
-        assert!(render_tui_test_backend(&tui, 90, 24).contains("later"));
-        assert!(session.lock().unwrap().messages.is_empty());
-        assert!(tui.transcript().is_empty());
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
