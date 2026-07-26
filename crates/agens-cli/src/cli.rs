@@ -139,6 +139,37 @@ pub(crate) fn resume_shorthand(arguments: &[String]) -> Option<i64> {
     }
 }
 
+/// `--resume=<value>` bypasses clap's flag/value disambiguation: an
+/// `=`-joined value is assigned directly and never mistaken for another
+/// flag, unlike a space-separated value. That disambiguation is exactly why
+/// `--resume -5` is a usage error instead of resolving to session -5, so
+/// without this normalization the `=` spelling would resume a negative
+/// session id for real. Splitting `--resume=-<digits>` into the equivalent
+/// two-token `--resume -<digits>` before parsing routes it through the
+/// identical disambiguation the space-separated form already goes through.
+/// Non-numeric or non-negative `=` values (`--resume=abc`, `--resume=5`) are
+/// left untouched: those either already fail with clap's own `invalid
+/// value` message, or are accepted deliberately.
+pub(crate) fn normalize_resume_equals_negative(arguments: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        match argument.strip_prefix("--resume=") {
+            Some(value) if is_negative_integer(value) => {
+                normalized.push("--resume".to_owned());
+                normalized.push(value.to_owned());
+            }
+            _ => normalized.push(argument.clone()),
+        }
+    }
+    normalized
+}
+
+fn is_negative_integer(value: &str) -> bool {
+    value.strip_prefix('-').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 fn is_help(argument: &str) -> bool {
     matches!(argument, "--help" | "-h")
 }

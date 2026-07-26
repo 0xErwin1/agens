@@ -159,6 +159,8 @@ fn execute_command(
     dependencies: &CliDependencies,
     cancellation: &HeadlessTurnCancellation,
 ) -> Result<String, CliError> {
+    let arguments = &cli::normalize_resume_equals_negative(arguments);
+
     if let Some(identifier) = cli::resume_shorthand(arguments) {
         return run_tui(dependencies, Some(identifier));
     }

@@ -1948,6 +1948,58 @@ fn table_b_ratified_deltas_hold() {
                 _temporary: temporary,
             }
         },
+        // W-B, equals spelling: the ratified "negative session ids are
+        // rejected" decision must hold regardless of spelling, not only for
+        // the space-separated form above. `--resume=<value>` bypasses
+        // clap's flag/value disambiguation entirely (an `=`-joined value is
+        // never mistaken for another flag), so without an explicit guard a
+        // negative session id would resume for real. `sessions show`/`rm`
+        // take a positional identifier, and clap has no `positional=value`
+        // syntax, so `sessions show=-1`/`rm=-1` are not a bypass of
+        // anything: the whole token is an unrecognized subcommand name,
+        // exactly as pinned below.
+        {
+            let temporary = TemporaryDirectory::new("ratified-resume-negative-equals");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: --resume=-5 is rejected by clap, not resolved to session -5",
+                argv: argv(&["--resume=-5"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument '-5' found\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-sessions-show-negative-equals");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: sessions show=-1 is an unrecognized subcommand, not a bypass",
+                argv: argv(&["sessions", "show=-1"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unrecognized subcommand 'show=-1'\n\nUsage: agens sessions <COMMAND>\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-sessions-rm-negative-equals");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: sessions rm=-1 is an unrecognized subcommand, not a bypass",
+                argv: argv(&["sessions", "rm=-1"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unrecognized subcommand 'rm=-1'\n\nUsage: agens sessions <COMMAND>\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
         // W-C: `--` is only rejected as the SOLE root argument
         // (`root_shape_conflict`); everywhere else clap's own "end of
         // options" handling consumes it and the shape runs for real. The
