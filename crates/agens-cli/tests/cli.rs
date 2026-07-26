@@ -1024,28 +1024,42 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
         BTreeMap::new(),
     );
 
-    // `config`/`auth`/`sessions` render the SAME generic usage line for
-    // every one of their own subcommands' `--help` (matching the
-    // historical `.any(is_help)` precedent that never distinguished which
-    // subcommand asked); only `models` has no nested subcommands of its
-    // own. Each rendering therefore has a known, exact expected text —
-    // `starts_with("Usage: agens ")` cannot hold post-clap because every
-    // rendering now leads with an `about` line before the `Usage:` block.
-    const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
-    const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  \n  login   \n  logout  \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    // Each nested subcommand renders its OWN help: clap walks to the
+    // deepest matched subcommand for any valid shape, so `config doctor
+    // --help` renders `doctor`'s help, not `config`'s (the earlier
+    // `subcommand_help_override` blanket rewrite of this was a regression,
+    // since fixed). `models` has no nested subcommands of its own, so it
+    // renders its own top-level help either way. Each rendering therefore
+    // has a known, exact expected text.
+    const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
+    const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
+    const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n  help     Print this message or the help of the given subcommand(s)\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
+    const AUTH_LOGOUT_HELP: &str = "remove stored credentials for a provider\n\nUsage: agens auth logout <PROVIDER>\n\nArguments:\n  <PROVIDER>  \n\nOptions:\n  -h, --help  Print help\n";
     const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
-    const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  \n  show  \n  rm    \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    const SESSIONS_LIST_HELP: &str =
+        "list saved sessions\n\nUsage: agens sessions list\n\nOptions:\n  -h, --help  Print help\n";
+    const SESSIONS_SHOW_HELP: &str = "show a saved session's details\n\nUsage: agens sessions show <IDENTIFIER>\n\nArguments:\n  <IDENTIFIER>  \n\nOptions:\n  -h, --help  Print help\n";
+    const SESSIONS_RM_HELP: &str = "remove a saved session\n\nUsage: agens sessions rm <IDENTIFIER>\n\nArguments:\n  <IDENTIFIER>  \n\nOptions:\n  -h, --help  Print help\n";
 
     for (arguments, expected) in [
-        (["config", "doctor", "--help"].as_slice(), CONFIG_HELP),
-        (["auth", "status", "--help"].as_slice(), AUTH_HELP),
-        (["auth", "login", "--help"].as_slice(), AUTH_HELP),
-        (["auth", "logout", "--help"].as_slice(), AUTH_HELP),
+        (
+            ["config", "doctor", "--help"].as_slice(),
+            CONFIG_DOCTOR_HELP,
+        ),
+        (["auth", "status", "--help"].as_slice(), AUTH_STATUS_HELP),
+        (["auth", "login", "--help"].as_slice(), AUTH_LOGIN_HELP),
+        (["auth", "logout", "--help"].as_slice(), AUTH_LOGOUT_HELP),
         (["models", "--help"].as_slice(), MODELS_HELP),
-        (["sessions", "list", "--help"].as_slice(), SESSIONS_HELP),
-        (["sessions", "show", "--help"].as_slice(), SESSIONS_HELP),
-        (["sessions", "rm", "--help"].as_slice(), SESSIONS_HELP),
+        (
+            ["sessions", "list", "--help"].as_slice(),
+            SESSIONS_LIST_HELP,
+        ),
+        (
+            ["sessions", "show", "--help"].as_slice(),
+            SESSIONS_SHOW_HELP,
+        ),
+        (["sessions", "rm", "--help"].as_slice(), SESSIONS_RM_HELP),
     ] {
         let result = execute(arguments, &dependencies);
 

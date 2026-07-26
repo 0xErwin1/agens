@@ -56,7 +56,9 @@ pub(crate) enum Command {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum ConfigAction {
+    #[command(about = "report the effective configuration and where each setting came from")]
     Doctor,
+    #[command(about = "write a starter configuration file")]
     Init {
         /// Write the starter configuration to the global path instead of
         /// the project path.
@@ -67,22 +69,23 @@ pub(crate) enum ConfigAction {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthAction {
-    Status {
-        provider: Option<String>,
-    },
+    #[command(about = "report authentication status for ChatGPT or an API-key provider")]
+    Status { provider: Option<String> },
+    #[command(about = "log in to ChatGPT or an API-key provider")]
     Login {
+        /// Use the device-code flow instead of opening a browser.
         #[arg(long)]
         device_auth: bool,
         #[command(subcommand)]
         method: Option<LoginMethod>,
     },
-    Logout {
-        provider: String,
-    },
+    #[command(about = "remove stored credentials for a provider")]
+    Logout { provider: String },
 }
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum LoginMethod {
+    #[command(about = "log in with an API key instead of ChatGPT")]
     ApiKey {
         provider: String,
         #[arg(long)]
@@ -92,8 +95,11 @@ pub(crate) enum LoginMethod {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum SessionsAction {
+    #[command(about = "list saved sessions")]
     List,
+    #[command(about = "show a saved session's details")]
     Show { identifier: String },
+    #[command(about = "remove a saved session")]
     Rm { identifier: String },
 }
 
@@ -167,11 +173,21 @@ fn unrecognized_argument_error(token: &str) -> clap::Error {
 }
 
 /// `config`/`auth`/`models`/`sessions` treat a help token ANYWHERE in their
-/// own arguments as a request for that subcommand's help, even alongside an
-/// otherwise-invalid shape — the historical `.any(is_help)` precedent that
-/// clap's own subcommand-shape validation does not reproduce on its own.
-/// Returns the rendered help outcome when this precedent applies; `None`
-/// means clap should parse `arguments` normally.
+/// own arguments as a request for help, even alongside an otherwise-invalid
+/// shape — the historical `.any(is_help)` precedent from the hand-rolled
+/// parser. clap already resolves help correctly for every VALID shape on
+/// its own, including deeply nested subcommands (`config init --help`,
+/// `auth login api-key --help`), by walking to the deepest matched
+/// subcommand: this override must stay out of clap's way there, or it
+/// clobbers that correct nested resolution with the top-level subcommand's
+/// help instead. So this only fires when clap would otherwise REJECT the
+/// shape outright because of a token it does not recognize alongside the
+/// help token (`config extra --help`, `models help`), reproducing the
+/// pre-clap precedent of falling back to the top-level subcommand's help
+/// for those unrecognized shapes. Returns `None` when clap should parse
+/// `arguments` normally — either because it resolves the shape itself
+/// (with or without help) or because the parse failure has nothing to do
+/// with a help token.
 pub(crate) fn subcommand_help_override(
     arguments: &[String],
 ) -> Option<Result<String, crate::CliError>> {
@@ -184,12 +200,28 @@ pub(crate) fn subcommand_help_override(
     if !rest.iter().any(|argument| is_help(argument)) {
         return None;
     }
+    if clap_resolves_natively(arguments) {
+        return None;
+    }
 
     let canonical = [name.clone(), "--help".to_owned()];
     Some(match Cli::try_parse_from(canonical.iter()) {
         Err(error) => clap_outcome(error),
         Ok(_) => unreachable!("`--help` always yields a clap DisplayHelp error"),
     })
+}
+
+/// True when clap either accepts `arguments` outright or rejects them with
+/// its own `DisplayHelp`/`DisplayVersion` outcome — the two cases where
+/// clap's native resolution must be left untouched.
+fn clap_resolves_natively(arguments: &[String]) -> bool {
+    match Cli::try_parse_from(arguments.iter()) {
+        Ok(_) => true,
+        Err(error) => matches!(
+            error.kind(),
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+        ),
+    }
 }
 
 /// clap's rendered text is emitted verbatim: it already carries its own

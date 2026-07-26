@@ -955,14 +955,19 @@ mod parser_surface_baseline {
         format!("agens {VERSION}\n")
     }
 
-    pub(crate) const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  \n  init    \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CONFIG_HELP: &str = "inspect configuration\n\nUsage: agens config <COMMAND>\n\nCommands:\n  doctor  report the effective configuration and where each setting came from\n  init    write a starter configuration file\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
     /// `config` with no subcommand renders byte-identical to `config --help`:
     /// clap treats a required subcommand group with nothing supplied the
     /// same as an explicit help request.
     pub(crate) const CONFIG_MISSING_SUBCOMMAND_MESSAGE: &str = CONFIG_HELP;
-    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  \n  login   \n  logout  \n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const CONFIG_INIT_HELP: &str = "write a starter configuration file\n\nUsage: agens config init [OPTIONS]\n\nOptions:\n      --global  Write the starter configuration to the global path instead of the project path\n  -h, --help    Print help\n";
+    pub(crate) const AUTH_HELP: &str = "inspect supported authentication\n\nUsage: agens auth <COMMAND>\n\nCommands:\n  status  report authentication status for ChatGPT or an API-key provider\n  login   log in to ChatGPT or an API-key provider\n  logout  remove stored credentials for a provider\n  help    Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
     /// `auth` with no subcommand renders byte-identical to `auth --help`.
     pub(crate) const AUTH_MISSING_SUBCOMMAND_MESSAGE: &str = AUTH_HELP;
+    pub(crate) const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n  help     Print this message or the help of the given subcommand(s)\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
+    pub(crate) const AUTH_LOGIN_API_KEY_HELP: &str = "log in with an API key instead of ChatGPT\n\nUsage: agens auth login api-key [OPTIONS] <PROVIDER>\n\nArguments:\n  <PROVIDER>  \n\nOptions:\n      --api-key <API_KEY>  \n  -h, --help               Print help\n";
     pub(crate) const CHAT_HELP: &str = "run a headless agent turn\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nArguments:\n  [PROMPT]...  \n\nOptions:\n      --model <MODEL>                    \n      --system <SYSTEM>                  \n      --max-iterations <MAX_ITERATIONS>  \n      --mode <chat|edit>                 \n      --dangerously-allow-all            \n  -h, --help                             Print help\n";
     /// D1 (ratified): `chat foo --help` goes from Usage(2) to Success(0).
     /// `ChatArgs.prompt` no longer sets `allow_hyphen_values`, so clap keeps
@@ -973,9 +978,11 @@ mod parser_surface_baseline {
     pub(crate) const CHAT_UNKNOWN_FLAG_MESSAGE: &str = "error: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n";
     pub(crate) const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";
-    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  \n  show  \n  rm    \n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
+    pub(crate) const SESSIONS_HELP: &str = "inspect completed turns\n\nUsage: agens sessions <COMMAND>\n\nCommands:\n  list  list saved sessions\n  show  show a saved session's details\n  rm    remove a saved session\n  help  Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help  Print help\n";
     /// `sessions` with no subcommand renders byte-identical to `sessions --help`.
     pub(crate) const SESSIONS_MISSING_SUBCOMMAND_MESSAGE: &str = SESSIONS_HELP;
+    pub(crate) const SESSIONS_LIST_HELP: &str =
+        "list saved sessions\n\nUsage: agens sessions list\n\nOptions:\n  -h, --help  Print help\n";
 
     /// clap's rendering embeds both the offending token and the usage line
     /// of whichever command group rejected it, so this can no longer be a
@@ -1409,6 +1416,76 @@ fn table_b_parser_surface_baseline_holds() {
                 argv: argv(&["config", "doctor", "extra", "--help"]),
                 dependencies,
                 expected: success(baseline::CONFIG_HELP),
+                _temporary: temporary,
+            }
+        },
+        // Nested help: clap resolves a VALID nested shape's help itself,
+        // walking to the deepest matched subcommand, rather than falling
+        // back to the top-level subcommand's help the way the W1 cases
+        // above do for an invalid shape.
+        {
+            let temporary = TemporaryDirectory::new("baseline-config-init-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config init --help renders init's own help, not config's",
+                argv: argv(&["config", "init", "--help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_INIT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-config-doctor-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "config doctor --help renders doctor's own help, not config's",
+                argv: argv(&["config", "doctor", "--help"]),
+                dependencies,
+                expected: success(baseline::CONFIG_DOCTOR_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-login-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login --help renders login's own help, not auth's",
+                argv: argv(&["auth", "login", "--help"]),
+                dependencies,
+                expected: success(baseline::AUTH_LOGIN_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-status-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth status --help renders status's own help, not auth's",
+                argv: argv(&["auth", "status", "--help"]),
+                dependencies,
+                expected: success(baseline::AUTH_STATUS_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-auth-login-api-key-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "auth login api-key --help renders api-key's own help, not auth's",
+                argv: argv(&["auth", "login", "api-key", "--help"]),
+                dependencies,
+                expected: success(baseline::AUTH_LOGIN_API_KEY_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("baseline-sessions-list-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "sessions list --help renders list's own help, not sessions's",
+                argv: argv(&["sessions", "list", "--help"]),
+                dependencies,
+                expected: success(baseline::SESSIONS_LIST_HELP),
                 _temporary: temporary,
             }
         },
