@@ -1619,6 +1619,31 @@ mod tests {
 
     #[test]
     fn ignores_tool_result_facts_events_when_converting_completed_history() {
+        let mut facts_source = agens_core::TurnCoordinator::new();
+        facts_source.begin().unwrap();
+        facts_source
+            .accept_provider_part(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 1\"}".into(),
+            })
+            .unwrap();
+        facts_source.finish_provider_iteration().unwrap();
+        facts_source
+            .accept_tool_result(
+                "call-1",
+                "exit 1".into(),
+                true,
+                Some(agens_core::ToolResultFacts::Bash { exit_code: Some(1) }),
+            )
+            .unwrap();
+        let facts_event = facts_source
+            .events()
+            .iter()
+            .find(|event| matches!(event, TurnEvent::ToolResultFacts { .. }))
+            .cloned()
+            .expect("facts event must be present in the source coordinator");
+
         let events = [
             TurnEvent::StateChanged(TurnState::Requesting),
             TurnEvent::StateChanged(TurnState::Streaming),
@@ -1628,10 +1653,7 @@ mod tests {
                 content: "exit 1".into(),
                 is_error: true,
             }),
-            TurnEvent::ToolResultFacts {
-                tool_call_id: "call-1".into(),
-                facts: agens_core::ToolResultFacts::Bash { exit_code: Some(1) },
-            },
+            facts_event,
             TurnEvent::ProviderPart(MessagePart::Text("after facts".into())),
             TurnEvent::StateChanged(TurnState::Completed),
         ];

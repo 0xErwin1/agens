@@ -4,7 +4,7 @@ use std::{
 };
 
 use agens_core::{
-    CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
+    AttemptKey, CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
     CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, PermissionDecision,
     PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest, PermissionRule,
     PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolResultFacts, TurnCoordinator,
@@ -198,7 +198,7 @@ fn coordinator_emits_deterministic_events_for_two_tool_iterations() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result("call-1", "found core".into(), false)
+        .accept_tool_result("call-1", "found core".into(), false, None)
         .unwrap();
     coordinator
         .accept_provider_part(MessagePart::Text("continue".into()))
@@ -212,7 +212,7 @@ fn coordinator_emits_deterministic_events_for_two_tool_iterations() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result("call-2", "package manifest".into(), false)
+        .accept_tool_result("call-2", "package manifest".into(), false, None)
         .unwrap();
     coordinator
         .accept_provider_part(MessagePart::Text("complete".into()))
@@ -275,7 +275,7 @@ fn coordinator_rejects_out_of_order_and_uncorrelated_tool_results() {
 
     coordinator.begin().unwrap();
     assert_eq!(
-        coordinator.accept_tool_result("call-1", "result".into(), false),
+        coordinator.accept_tool_result("call-1", "result".into(), false, None),
         Err(TurnEventError::UnexpectedToolResult {
             tool_call_id: "call-1".into(),
         })
@@ -291,7 +291,7 @@ fn coordinator_rejects_out_of_order_and_uncorrelated_tool_results() {
     coordinator.finish_provider_iteration().unwrap();
 
     assert_eq!(
-        coordinator.accept_tool_result("call-2", "result".into(), false),
+        coordinator.accept_tool_result("call-2", "result".into(), false, None),
         Err(TurnEventError::UnexpectedToolResult {
             tool_call_id: "call-2".into(),
         })
@@ -755,7 +755,7 @@ fn completed_turn_with_tool_result_facts_still_persists_and_validates() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result_with_facts(
+        .accept_tool_result(
             "call-1",
             "exit 1".into(),
             true,
@@ -780,13 +780,17 @@ fn completed_turn_with_tool_result_facts_still_persists_and_validates() {
             )
         })
         .expect("tool result event must be present");
-    assert_eq!(
-        events.get(tool_result_index + 1),
-        Some(&TurnEvent::ToolResultFacts {
-            tool_call_id: "call-1".into(),
-            facts: ToolResultFacts::Bash { exit_code: Some(1) },
-        })
-    );
+    match events.get(tool_result_index + 1) {
+        Some(TurnEvent::ToolResultFacts { identity, facts }) => {
+            assert_eq!(identity.tool_call_id, "call-1");
+            assert_eq!(identity.session_id, None);
+            assert_eq!(identity.attempt_id, None);
+            assert_eq!(identity.sequence, 1);
+            assert_eq!(identity.dispatch_id, None);
+            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(1) });
+        }
+        other => panic!("expected a facts event immediately after the tool result, got {other:?}"),
+    }
 
     let mut repository = RecordingCompletedTurnRepository::default();
     let persist_result = block_on_ready(coordinator.persist_completed_turn(&mut repository));
@@ -825,7 +829,7 @@ fn persisted_history_containing_tool_result_facts_is_rejected() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result("call-1", "exit 0".into(), false)
+        .accept_tool_result("call-1", "exit 0".into(), false, None)
         .unwrap();
     coordinator
         .accept_provider_part(MessagePart::Text("complete".into()))
@@ -837,13 +841,33 @@ fn persisted_history_containing_tool_result_facts_is_rejected() {
         .iter()
         .position(|event| matches!(event, TurnEvent::ToolResult(_)))
         .expect("tool result event must be present");
-    events.insert(
-        tool_result_index + 1,
-        TurnEvent::ToolResultFacts {
-            tool_call_id: "call-1".into(),
-            facts: ToolResultFacts::Bash { exit_code: Some(0) },
-        },
-    );
+
+    let mut facts_source = TurnCoordinator::new();
+    facts_source.begin().unwrap();
+    facts_source
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        })
+        .unwrap();
+    facts_source.finish_provider_iteration().unwrap();
+    facts_source
+        .accept_tool_result(
+            "call-1",
+            "exit 0".into(),
+            false,
+            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+        )
+        .unwrap();
+    let facts_event = facts_source
+        .events()
+        .iter()
+        .find(|event| matches!(event, TurnEvent::ToolResultFacts { .. }))
+        .cloned()
+        .expect("facts event must be present in the source coordinator");
+
+    events.insert(tool_result_index + 1, facts_event);
 
     assert!(CompletedTurnSnapshot::from_persisted_events(events).is_err());
 }
@@ -862,7 +886,7 @@ fn accept_tool_result_emits_no_facts_event() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result("call-1", "manifest".into(), false)
+        .accept_tool_result("call-1", "manifest".into(), false, None)
         .unwrap();
 
     assert_eq!(
@@ -878,12 +902,12 @@ fn accept_tool_result_emits_no_facts_event() {
     );
     assert!(!coordinator.events().iter().any(|event| matches!(
         event,
-        TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
+        TurnEvent::ToolResultFacts { identity, .. } if identity.tool_call_id == "call-1"
     )));
 }
 
 #[test]
-fn accept_tool_result_with_facts_orders_facts_between_result_and_state_change() {
+fn accept_tool_result_orders_facts_between_result_and_state_change() {
     let mut coordinator = TurnCoordinator::new();
 
     coordinator.begin().unwrap();
@@ -896,7 +920,7 @@ fn accept_tool_result_with_facts_orders_facts_between_result_and_state_change() 
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result_with_facts(
+        .accept_tool_result(
             "call-1",
             "wrote a.txt".into(),
             false,
@@ -907,28 +931,37 @@ fn accept_tool_result_with_facts_orders_facts_between_result_and_state_change() 
         )
         .unwrap();
 
+    let tail = &coordinator.events()[coordinator.events().len() - 3..];
     assert_eq!(
-        &coordinator.events()[coordinator.events().len() - 3..],
-        &[
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                tool_call_id: "call-1".into(),
-                content: "wrote a.txt".into(),
-                is_error: false,
-            }),
-            TurnEvent::ToolResultFacts {
-                tool_call_id: "call-1".into(),
-                facts: ToolResultFacts::Write {
+        tail[0],
+        TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "wrote a.txt".into(),
+            is_error: false,
+        })
+    );
+    match &tail[1] {
+        TurnEvent::ToolResultFacts { identity, facts } => {
+            assert_eq!(identity.tool_call_id, "call-1");
+            assert_eq!(identity.session_id, None);
+            assert_eq!(identity.attempt_id, None);
+            assert_eq!(identity.sequence, 1);
+            assert_eq!(identity.dispatch_id, None);
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Write {
                     path: "a.txt".into(),
                     bytes_written: 3,
-                },
-            },
-            TurnEvent::StateChanged(TurnState::Requesting),
-        ]
-    );
+                }
+            );
+        }
+        other => panic!("expected a facts event, got {other:?}"),
+    }
+    assert_eq!(tail[2], TurnEvent::StateChanged(TurnState::Requesting));
 }
 
 #[test]
-fn accept_tool_result_with_facts_none_emits_no_facts_event() {
+fn accept_tool_result_none_emits_no_facts_event() {
     let mut coordinator = TurnCoordinator::new();
 
     coordinator.begin().unwrap();
@@ -941,7 +974,7 @@ fn accept_tool_result_with_facts_none_emits_no_facts_event() {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result_with_facts("call-1", "manifest".into(), false, None)
+        .accept_tool_result("call-1", "manifest".into(), false, None)
         .unwrap();
 
     assert_eq!(
@@ -957,7 +990,7 @@ fn accept_tool_result_with_facts_none_emits_no_facts_event() {
     );
     assert!(!coordinator.events().iter().any(|event| matches!(
         event,
-        TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
+        TurnEvent::ToolResultFacts { identity, .. } if identity.tool_call_id == "call-1"
     )));
 }
 
@@ -969,7 +1002,7 @@ fn rejected_tool_result_with_facts_emits_nothing() {
     let events_before_rejection = coordinator.events().to_vec();
 
     assert_eq!(
-        coordinator.accept_tool_result_with_facts(
+        coordinator.accept_tool_result(
             "call-1",
             "result".into(),
             false,
@@ -1004,11 +1037,11 @@ fn multiple_tool_calls_keep_each_facts_event_with_its_own_result() {
     coordinator.finish_provider_iteration().unwrap();
 
     coordinator
-        .accept_tool_result_with_facts("call-1", "contents".into(), false, None)
+        .accept_tool_result("call-1", "contents".into(), false, None)
         .unwrap();
     assert_eq!(coordinator.state(), TurnState::Dispatching);
     coordinator
-        .accept_tool_result_with_facts(
+        .accept_tool_result(
             "call-2",
             "exit 2".into(),
             true,
@@ -1016,25 +1049,189 @@ fn multiple_tool_calls_keep_each_facts_event_with_its_own_result() {
         )
         .unwrap();
 
+    let tail = &coordinator.events()[coordinator.events().len() - 3..];
     assert_eq!(
-        &coordinator.events()[coordinator.events().len() - 3..],
-        &[
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                tool_call_id: "call-2".into(),
-                content: "exit 2".into(),
-                is_error: true,
-            }),
-            TurnEvent::ToolResultFacts {
-                tool_call_id: "call-2".into(),
-                facts: ToolResultFacts::Bash { exit_code: Some(2) },
-            },
-            TurnEvent::StateChanged(TurnState::Requesting),
-        ]
+        tail[0],
+        TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "call-2".into(),
+            content: "exit 2".into(),
+            is_error: true,
+        })
     );
+    match &tail[1] {
+        TurnEvent::ToolResultFacts { identity, facts } => {
+            assert_eq!(identity.tool_call_id, "call-2");
+            assert_eq!(identity.session_id, None);
+            assert_eq!(identity.attempt_id, None);
+            assert_eq!(identity.sequence, 1);
+            assert_eq!(identity.dispatch_id, None);
+            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(2) });
+        }
+        other => panic!("expected a facts event, got {other:?}"),
+    }
+    assert_eq!(tail[2], TurnEvent::StateChanged(TurnState::Requesting));
     assert!(!coordinator.events().iter().any(|event| matches!(
         event,
-        TurnEvent::ToolResultFacts { tool_call_id, .. } if tool_call_id == "call-1"
+        TurnEvent::ToolResultFacts { identity, .. } if identity.tool_call_id == "call-1"
     )));
+}
+
+#[test]
+fn fact_identity_defaults_to_none_for_a_freshly_constructed_coordinator() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result(
+            "call-1",
+            "exit 0".into(),
+            false,
+            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+        )
+        .unwrap();
+
+    let identity = coordinator
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResultFacts { identity, .. } => Some(identity),
+            _ => None,
+        })
+        .expect("facts event must be present");
+
+    assert_eq!(identity.session_id, None);
+    assert_eq!(identity.attempt_id, None);
+    assert_eq!(identity.sequence, 1);
+    assert_eq!(identity.dispatch_id, None);
+    assert_eq!(identity.tool_call_id, "call-1");
+}
+
+#[test]
+fn coordinator_for_attempt_fills_identity_with_session_and_attempt_ids() {
+    let mut coordinator = TurnCoordinator::for_attempt(AttemptKey::new(7, 42).unwrap());
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result(
+            "call-1",
+            "exit 0".into(),
+            false,
+            Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+        )
+        .unwrap();
+
+    let identity = coordinator
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResultFacts { identity, .. } => Some(identity),
+            _ => None,
+        })
+        .expect("facts event must be present");
+
+    assert_eq!(identity.session_id, Some(7));
+    assert_eq!(identity.attempt_id, Some(42));
+    assert_eq!(identity.sequence, 1);
+}
+
+#[test]
+fn fact_sequence_is_monotonic_and_gap_free_across_three_calls_in_one_turn() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    for id in ["call-1", "call-2", "call-3"] {
+        coordinator
+            .accept_provider_part(MessagePart::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 0\"}".into(),
+            })
+            .unwrap();
+    }
+    coordinator.finish_provider_iteration().unwrap();
+
+    for id in ["call-1", "call-2", "call-3"] {
+        coordinator
+            .accept_tool_result(
+                id,
+                "exit 0".into(),
+                false,
+                Some(ToolResultFacts::Bash { exit_code: Some(0) }),
+            )
+            .unwrap();
+    }
+
+    let sequences: Vec<u64> = coordinator
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            TurnEvent::ToolResultFacts { identity, .. } => Some(identity.sequence),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(sequences, vec![1, 2, 3]);
+}
+
+#[test]
+fn no_second_acceptance_entry_point_symbol_exists() {
+    let source = include_str!("../src/lib.rs");
+
+    assert!(
+        !source.contains("accept_tool_result_with_facts"),
+        "a second facts-taking acceptance function must not exist; every call site must state \
+         its choice explicitly through the single accept_tool_result entry point"
+    );
+}
+
+#[test]
+fn consume_generated_events_replay_path_emits_no_facts_event_for_a_persisted_tool_result() {
+    let mut coordinator = TurnCoordinator::new();
+
+    coordinator.begin().unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            input: "{\"command\":\"exit 0\"}".into(),
+        })
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+    coordinator
+        .accept_tool_result("call-1", "exit 0".into(), false, None)
+        .unwrap();
+    coordinator
+        .accept_provider_part(MessagePart::Text("complete".into()))
+        .unwrap();
+    coordinator.finish_provider_iteration().unwrap();
+
+    let persisted = coordinator.events().to_vec();
+    let replayed = CompletedTurnSnapshot::from_persisted_events(persisted)
+        .expect("replay of a facts-free persisted stream must validate");
+
+    assert!(
+        !replayed
+            .events()
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ToolResultFacts { .. })),
+        "replay must never regenerate a facts event for a persisted tool result"
+    );
 }
 
 #[test]
@@ -1059,7 +1256,7 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
     coordinator.finish_provider_iteration().unwrap();
 
     coordinator
-        .accept_tool_result_with_facts(
+        .accept_tool_result(
             "call-a",
             "wrote a.txt".into(),
             false,
@@ -1070,7 +1267,7 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
         )
         .unwrap();
     coordinator
-        .accept_tool_result_with_facts(
+        .accept_tool_result(
             "call-b",
             "exit 0".into(),
             false,
@@ -1078,31 +1275,50 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
         )
         .unwrap();
 
+    let tail = &coordinator.events()[coordinator.events().len() - 5..];
     assert_eq!(
-        &coordinator.events()[coordinator.events().len() - 5..],
-        &[
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                tool_call_id: "call-a".into(),
-                content: "wrote a.txt".into(),
-                is_error: false,
-            }),
-            TurnEvent::ToolResultFacts {
-                tool_call_id: "call-a".into(),
-                facts: ToolResultFacts::Write {
+        tail[0],
+        TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "call-a".into(),
+            content: "wrote a.txt".into(),
+            is_error: false,
+        })
+    );
+    match &tail[1] {
+        TurnEvent::ToolResultFacts { identity, facts } => {
+            assert_eq!(identity.tool_call_id, "call-a");
+            assert_eq!(identity.session_id, None);
+            assert_eq!(identity.attempt_id, None);
+            assert_eq!(identity.sequence, 1);
+            assert_eq!(identity.dispatch_id, None);
+            assert_eq!(
+                *facts,
+                ToolResultFacts::Write {
                     path: "a.txt".into(),
                     bytes_written: 11,
-                },
-            },
-            TurnEvent::ToolResult(MessagePart::ToolResult {
-                tool_call_id: "call-b".into(),
-                content: "exit 0".into(),
-                is_error: false,
-            }),
-            TurnEvent::ToolResultFacts {
-                tool_call_id: "call-b".into(),
-                facts: ToolResultFacts::Bash { exit_code: Some(0) },
-            },
-            TurnEvent::StateChanged(TurnState::Requesting),
-        ]
+                }
+            );
+        }
+        other => panic!("expected call-a's facts event, got {other:?}"),
+    }
+    assert_eq!(
+        tail[2],
+        TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "call-b".into(),
+            content: "exit 0".into(),
+            is_error: false,
+        })
     );
+    match &tail[3] {
+        TurnEvent::ToolResultFacts { identity, facts } => {
+            assert_eq!(identity.tool_call_id, "call-b");
+            assert_eq!(identity.session_id, None);
+            assert_eq!(identity.attempt_id, None);
+            assert_eq!(identity.sequence, 2);
+            assert_eq!(identity.dispatch_id, None);
+            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(0) });
+        }
+        other => panic!("expected call-b's facts event, got {other:?}"),
+    }
+    assert_eq!(tail[4], TurnEvent::StateChanged(TurnState::Requesting));
 }

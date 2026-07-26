@@ -482,7 +482,7 @@ pub enum TurnEvent {
     },
     ToolResult(MessagePart),
     ToolResultFacts {
-        tool_call_id: String,
+        identity: FactIdentity,
         facts: ToolResultFacts,
     },
 }
@@ -533,12 +533,36 @@ pub enum ToolInput {
     },
 }
 
+/// Identity of a single reported tool-result facts event, sufficient to order
+/// facts within a session and attribute them to the attempt that produced them.
+///
+/// `tool_call_id` alone is unique only within one provider call: it identifies
+/// neither the run nor the attempt, so a late fact from an abandoned attempt is
+/// indistinguishable from one belonging to the live attempt without the rest of
+/// this key. The total order within a session is `(session_id, attempt_id,
+/// sequence)`. `session_id` and `attempt_id` are `None` for turns that run
+/// outside a session attempt, such as subagent child turns; `dispatch_id` is
+/// reserved for the gRPC facade and is always `None` in this change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FactIdentity {
+    pub tool_call_id: String,
+    pub session_id: Option<i64>,
+    pub attempt_id: Option<i64>,
+    pub sequence: u64,
+    pub dispatch_id: Option<u64>,
+}
+
 /// Typed values a native tool reports about a call it has just completed.
 ///
 /// Each variant carries only data the tool already produced while executing;
 /// nothing here is derived, scored, or interpreted. Absence of facts means the
 /// harness reported none for that call, not that the call was uneventful.
+///
+/// Marked `#[non_exhaustive]` because AGN-47 and AGN-58 add further variants
+/// and downstream crates already match on this enum with a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ToolResultFacts {
     Write {
         path: String,
@@ -718,7 +742,7 @@ fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedT
                     events,
                     &mut event_index,
                     move |coordinator| {
-                        coordinator.accept_tool_result(&tool_call_id, content, is_error)
+                        coordinator.accept_tool_result(&tool_call_id, content, is_error, None)
                     },
                 )?;
             }
@@ -838,6 +862,8 @@ pub struct TurnCoordinator {
     pending_tool_calls: Vec<PendingToolCall>,
     completed_turn_persisted: bool,
     completed_turn_persistence_attempted: bool,
+    attempt_key: Option<AttemptKey>,
+    fact_sequence: u64,
 }
 
 impl Default for TurnCoordinator {
@@ -854,6 +880,24 @@ impl TurnCoordinator {
             pending_tool_calls: Vec::new(),
             completed_turn_persisted: false,
             completed_turn_persistence_attempted: false,
+            attempt_key: None,
+            fact_sequence: 0,
+        }
+    }
+
+    /// Builds a coordinator that knows the session attempt it belongs to, so
+    /// every fact it emits carries that attempt's `session_id`/`attempt_id`.
+    /// Callers with no attempt of their own (replay, subagent child turns)
+    /// use `new` instead, which leaves those ids `None`.
+    pub const fn for_attempt(key: AttemptKey) -> Self {
+        Self {
+            state: TurnState::Idle,
+            events: Vec::new(),
+            pending_tool_calls: Vec::new(),
+            completed_turn_persisted: false,
+            completed_turn_persistence_attempted: false,
+            attempt_key: Some(key),
+            fact_sequence: 0,
         }
     }
 
@@ -944,20 +988,12 @@ impl TurnCoordinator {
         Ok(())
     }
 
-    pub fn accept_tool_result(
-        &mut self,
-        tool_call_id: &str,
-        content: String,
-        is_error: bool,
-    ) -> Result<(), TurnEventError> {
-        self.accept_tool_result_with_facts(tool_call_id, content, is_error, None)
-    }
-
     /// Records a tool result and, when the harness reported them, the typed
-    /// facts for that call. The facts event is live-only: it is excluded from
-    /// persisted history and must never be regenerated during replay, which is
-    /// why replay uses `accept_tool_result` instead.
-    pub fn accept_tool_result_with_facts(
+    /// facts for that call. `facts` is `Option` rather than defaulted so every
+    /// caller states its choice explicitly, including replay, which always
+    /// passes `None`. The facts event is live-only: it is excluded from
+    /// persisted history and must never be regenerated during replay.
+    pub fn accept_tool_result(
         &mut self,
         tool_call_id: &str,
         content: String,
@@ -989,8 +1025,15 @@ impl TurnCoordinator {
             }));
 
         if let Some(facts) = facts {
+            self.fact_sequence = self.fact_sequence.saturating_add(1);
             self.events.push(TurnEvent::ToolResultFacts {
-                tool_call_id: tool_call_id.into(),
+                identity: FactIdentity {
+                    tool_call_id: tool_call_id.into(),
+                    session_id: self.attempt_key.map(AttemptKey::session_id),
+                    attempt_id: self.attempt_key.map(AttemptKey::attempt_id),
+                    sequence: self.fact_sequence,
+                    dispatch_id: None,
+                },
                 facts,
             });
         }
@@ -1503,12 +1546,7 @@ async fn run_headless_turn_with_iteration_limit(
             };
 
             coordinator
-                .accept_tool_result_with_facts(
-                    &call.id,
-                    output.content,
-                    output.is_error,
-                    output.facts,
-                )
+                .accept_tool_result(&call.id, output.content, output.is_error, output.facts)
                 .map_err(|_| fail_state(&mut coordinator))?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
             if let Err(error) = check_cancelled(&mut coordinator, cancellation) {
@@ -2402,7 +2440,7 @@ mod tests {
             ("repeated-error", repeated, true),
         ] {
             coordinator
-                .accept_tool_result(id, content, is_error)
+                .accept_tool_result(id, content, is_error, None)
                 .unwrap();
         }
 

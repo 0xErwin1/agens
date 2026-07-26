@@ -288,10 +288,31 @@ mod tests {
         let cancellation = agens_tui::BridgeCancel::new();
         let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "unknown-model");
 
-        publisher.observe(&TurnEvent::ToolResultFacts {
-            tool_call_id: "call-1".into(),
-            facts: agens_core::ToolResultFacts::Bash { exit_code: Some(1) },
-        });
+        let mut facts_source = agens_core::TurnCoordinator::new();
+        facts_source.begin().unwrap();
+        facts_source
+            .accept_provider_part(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 1\"}".into(),
+            })
+            .unwrap();
+        facts_source.finish_provider_iteration().unwrap();
+        facts_source
+            .accept_tool_result(
+                "call-1",
+                "exit 1".into(),
+                true,
+                Some(agens_core::ToolResultFacts::Bash { exit_code: Some(1) }),
+            )
+            .unwrap();
+        let facts_event = facts_source
+            .events()
+            .iter()
+            .find(|event| matches!(event, TurnEvent::ToolResultFacts { .. }))
+            .expect("facts event must be present in the source coordinator");
+
+        publisher.observe(facts_event);
 
         assert!(
             receiver

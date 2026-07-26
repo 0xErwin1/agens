@@ -52,7 +52,7 @@ fn completed_snapshot_with_all_persisted_variants() -> CompletedTurnSnapshot {
         .unwrap();
     coordinator.finish_provider_iteration().unwrap();
     coordinator
-        .accept_tool_result("call-1", "result".into(), false)
+        .accept_tool_result("call-1", "result".into(), false, None)
         .unwrap();
     coordinator
         .accept_provider_part(MessagePart::Text("final".into()))

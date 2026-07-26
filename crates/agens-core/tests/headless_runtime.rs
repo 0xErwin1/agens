@@ -93,13 +93,13 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
         .position(|event| matches!(event, TurnEvent::ToolResult(_)))
         .expect("tool result event must reach the progress sink");
 
-    assert_eq!(
-        observed.get(tool_result_index + 1),
-        Some(&TurnEvent::ToolResultFacts {
-            tool_call_id: "call-1".into(),
-            facts: ToolResultFacts::Bash { exit_code: Some(2) },
-        })
-    );
+    match observed.get(tool_result_index + 1) {
+        Some(TurnEvent::ToolResultFacts { identity, facts }) => {
+            assert_eq!(identity.tool_call_id, "call-1");
+            assert_eq!(*facts, ToolResultFacts::Bash { exit_code: Some(2) });
+        }
+        other => panic!("expected a facts event after the tool result, got {other:?}"),
+    }
 }
 
 #[test]
