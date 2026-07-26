@@ -5,7 +5,10 @@
 //! returns, not what it "should" return. Every assertion is a full-equality
 //! check on `(status, stdout, stderr)`. If a case here fails after a later
 //! phase, the parser's observable behavior changed and that is a defect,
-//! unless the case belongs to [`parser_surface_baseline`].
+//! unless the case belongs to [`parser_surface_baseline`] or to
+//! `table_b_ratified_deltas_hold`, whose cases the maintainer has explicitly
+//! accepted as deliberate behavior deltas from the pre-clap parser (not
+//! invariants to preserve).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -1733,6 +1736,279 @@ fn table_b_parser_surface_baseline_holds() {
                     ExitStatus::Usage,
                     baseline::root_shape_conflict_message("--"),
                 ),
+                _temporary: temporary,
+            }
+        },
+    ];
+
+    run_table_a(cases);
+}
+
+/// Ratified behavior deltas from `766bc0b` (round-2 verification, families
+/// W-A/W-B/W-C/W-D/W6). The maintainer accepted every case below as
+/// deliberate, NOT as an invariant to restore: this test pins the CURRENT
+/// behavior so it cannot drift again unnoticed, exactly the way
+/// [`table_b_parser_surface_baseline_holds`] pins the parser's rendering
+/// surface. Do not "improve" any of these without a new, explicit
+/// ratification — that is precisely what turned each of them into a defect
+/// the first time.
+#[test]
+fn table_b_ratified_deltas_hold() {
+    let cases = vec![
+        // W-A: clap rejects a repeated chat flag outright. The hand-rolled
+        // parser took last-wins and ran the turn; every later occurrence of
+        // the same flag is a shape error now, not a value override.
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-repeated-model");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-A: chat --model twice is rejected, not last-wins",
+                argv: argv(&["chat", "--model", "a", "--model", "b", "hi"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: the argument '--model <MODEL>' cannot be used multiple times\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-repeated-system");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-A: chat --system twice is rejected, not last-wins",
+                argv: argv(&["chat", "--system", "a", "--system", "b", "hi"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: the argument '--system <SYSTEM>' cannot be used multiple times\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-repeated-max-iterations");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-A: chat --max-iterations twice is rejected, not last-wins",
+                argv: argv(&[
+                    "chat",
+                    "--max-iterations",
+                    "1",
+                    "--max-iterations",
+                    "2",
+                    "hi",
+                ]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: the argument '--max-iterations <MAX_ITERATIONS>' cannot be used multiple times\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-repeated-mode");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-A: chat --mode twice is rejected, not last-wins",
+                argv: argv(&["chat", "--mode", "chat", "--mode", "edit", "hi"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: the argument '--mode <chat|edit>' cannot be used multiple times\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-repeated-dangerously-allow-all");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-A: chat --dangerously-allow-all twice is rejected, not last-wins",
+                argv: argv(&[
+                    "chat",
+                    "--dangerously-allow-all",
+                    "--dangerously-allow-all",
+                    "hi",
+                ]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: the argument '--dangerously-allow-all' cannot be used multiple times\n\nUsage: agens chat [OPTIONS] [PROMPT]...\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        // W-B: clap treats a leading `-` on a value as a flag by default, so
+        // a negative numeric argument is rejected instead of reaching the
+        // domain's own numeric parsing.
+        {
+            let temporary = TemporaryDirectory::new("ratified-resume-negative");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: --resume -5 is rejected by clap, not resolved to session -5",
+                argv: argv(&["--resume", "-5"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument '-5' found\n\nUsage: agens [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-sessions-show-negative");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: sessions show -1 is rejected by clap, not a numeric-id error",
+                argv: argv(&["sessions", "show", "-1"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument '-1' found\n\n  tip: to pass '-1' as a value, use '-- -1'\n\nUsage: agens sessions show <IDENTIFIER>\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-sessions-rm-negative");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-B: sessions rm -1 is rejected by clap, not a no-op success",
+                argv: argv(&["sessions", "rm", "-1"]),
+                dependencies,
+                expected: preformatted_failure(
+                    ExitStatus::Usage,
+                    "error: unexpected argument '-1' found\n\n  tip: to pass '-1' as a value, use '-- -1'\n\nUsage: agens sessions rm <IDENTIFIER>\n\nFor more information, try '--help'.\n",
+                ),
+                _temporary: temporary,
+            }
+        },
+        // W-C: `--` is only rejected as the SOLE root argument
+        // (`root_shape_conflict`); everywhere else clap's own "end of
+        // options" handling consumes it and the shape runs for real. The
+        // hand-rolled parser refused `--` at any position.
+        {
+            let temporary = TemporaryDirectory::new("ratified-models-double-dash");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-C: models -- runs, it is not rejected like a bare --",
+                argv: argv(&["models", "--"]),
+                dependencies,
+                expected: success(concat!(
+                    "ID\tNAME\tCONTEXT\tPRICE\n",
+                    "gpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\n",
+                    "gpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\n",
+                    "gpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\n",
+                    "gpt-4o\tGPT-4o\t128000\t$2.50/$10.00\n",
+                    "gpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\n",
+                    "o3\to3\t200000\t$2.00/$8.00\n",
+                    "o4-mini\to4-mini\t200000\t$1.10/$4.40\n",
+                )),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-config-init-double-dash");
+            let dependencies = base_dependencies(&temporary).with_create_file(|_, _| Ok(()));
+            let expected_stdout = format!(
+                "Wrote {}\n",
+                config_project_config_path(&temporary).display()
+            );
+            Case {
+                name: "W-C: config init -- writes the file, it does not refuse the shape",
+                argv: argv(&["config", "init", "--"]),
+                dependencies,
+                expected: success(expected_stdout),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-auth-logout-double-dash");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-C: auth logout -- openai-api performs the logout, it does not refuse the shape",
+                argv: argv(&["auth", "logout", "--", "openai-api"]),
+                dependencies,
+                expected: success("No credentials stored for openai-api.\n"),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-double-dash-before-prompt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-C: chat -- hi reaches the headless turn, it does not refuse the shape",
+                argv: argv(&["chat", "--", "hi"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Unavailable,
+                    "unavailable: this command is not implemented yet",
+                ),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-double-dash-after-prompt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-C: chat hi -- reaches the headless turn, it does not refuse the shape",
+                argv: argv(&["chat", "hi", "--"]),
+                dependencies,
+                expected: failure(
+                    ExitStatus::Unavailable,
+                    "unavailable: this command is not implemented yet",
+                ),
+                _temporary: temporary,
+            }
+        },
+        // W-D / W6: help in a non-first root position, or repeated on
+        // `chat`, now wins where the hand-rolled parser rejected it —
+        // `root_shape_conflict` only refuses a help/version alias that is
+        // the FIRST token with a trailing argument, and clap itself always
+        // honors `--help` as a flag regardless of position on `chat`.
+        {
+            let temporary = TemporaryDirectory::new("ratified-resume-then-help");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-D: --resume --help renders root help, it is not a usage error",
+                argv: argv(&["--resume", "--help"]),
+                dependencies,
+                expected: success(parser_surface_baseline::ROOT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-help-twice");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W-D: chat --help --help renders chat's help, it is not a usage error",
+                argv: argv(&["chat", "--help", "--help"]),
+                dependencies,
+                expected: success(parser_surface_baseline::CHAT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-help-before-prompt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W6: chat --help hi renders chat's help, it is not a usage error",
+                argv: argv(&["chat", "--help", "hi"]),
+                dependencies,
+                expected: success(parser_surface_baseline::CHAT_HELP),
+                _temporary: temporary,
+            }
+        },
+        {
+            let temporary = TemporaryDirectory::new("ratified-chat-help-after-prompt");
+            let dependencies = base_dependencies(&temporary);
+            Case {
+                name: "W6: chat hi --help renders chat's help, it is not a usage error",
+                argv: argv(&["chat", "hi", "--help"]),
+                dependencies,
+                expected: success(parser_surface_baseline::CHAT_HELP),
                 _temporary: temporary,
             }
         },
