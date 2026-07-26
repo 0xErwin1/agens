@@ -5,14 +5,15 @@
 use std::sync::{Arc, Mutex};
 
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
-#[cfg(test)]
-use agens_tools::CommandCatalog;
-use agens_tools::{SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
+use agens_tools::{
+    CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
+};
 use agens_tui::{
     BridgeCancel, Engine as TuiEngine, Tui, TuiProviderOutcome, TuiSubmissionOutcome,
     TuiSubmitOrigin, run_with_default_progress_submit_with_permissions_and_task_controls,
 };
 
+use crate::Bootstrap;
 use crate::bootstrap::seed_configured_reasoning_effort;
 use crate::diagnostics::next_diagnostic_reference;
 use crate::dispatch::{
@@ -41,10 +42,6 @@ use crate::tui::resume::{
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::session::{ResumeDraft, TuiSessionContext};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
-use crate::{
-    Bootstrap, configure_tui_project_identity, parent_skill_system_prompt,
-    report_tui_extension_collisions,
-};
 
 pub(crate) struct ProductionTuiEngine {
     pub(crate) cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -389,4 +386,44 @@ pub(crate) fn run_tui_prompt_with(
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     session.running = false;
     complete_tui_turn(&mut session, completion, consumed_reminder)
+}
+
+fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
+    if skills.is_empty() {
+        return base.to_owned();
+    }
+
+    let metadata = skills
+        .skills()
+        .map(|skill| format!("- {}: {}", skill.name(), skill.description()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "{base}\n\n## Available skills\nUse the `skill` tool to load instructions or declared resources only when needed.\n{metadata}"
+    )
+}
+
+pub(crate) fn report_tui_extension_collisions<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    commands: &CommandCatalog,
+    skills: &SkillCatalog,
+) {
+    for skill in skills
+        .skills()
+        .filter(|skill| commands.command(skill.name()).is_some())
+    {
+        tui.add_diagnostic(format!(
+            "Skill /{} is shadowed by a command; command routing wins.",
+            skill.name()
+        ));
+    }
+}
+
+pub(crate) fn configure_tui_project_identity(
+    tui: &mut Tui<ProductionTuiEngine>,
+    bootstrap: &Bootstrap,
+) {
+    if let Some(project_root) = bootstrap.project_root() {
+        tui.set_project(project_root.display().to_string());
+    }
 }

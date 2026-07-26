@@ -7,17 +7,13 @@ use std::path::{Path, PathBuf};
 
 use agens_config::{
     ConfigPaths, ConfigPermissionRule, McpDefaultSettings, McpTransport, ResolvedSettings,
-    SubagentSettings, ToolLimitSettings, extract_permission_rules, mcp_servers,
-    merge_toml_documents, resolve_paths, resolve_settings,
+    SubagentSettings, ToolLimitSettings, expand_environment, expand_environment_with_commands,
+    extract_permission_rules, mcp_servers, merge_toml_documents, parse_toml_document,
+    resolve_paths, resolve_settings, validate_toml_document,
 };
 use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
 
 use crate::{CliDependencies, CliError, HeadlessChatRequest};
-
-use super::{
-    expand_document, expand_global_mcp, load_toml, openai_api_key, resolve_provider_type,
-    string_value,
-};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderSource {
@@ -314,4 +310,192 @@ fn data_directory(
                 .unwrap_or_else(|| PathBuf::from(".local/share"))
                 .join("agens")
         })
+}
+
+fn load_toml(
+    path: &Path,
+    scope: &str,
+    dependencies: &CliDependencies,
+) -> Result<(toml::Table, bool), CliError> {
+    let Some(contents) = (dependencies.read_file)(path)? else {
+        return Ok((toml::Table::new(), false));
+    };
+
+    let document = parse_toml_document(&contents)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+    validate_toml_document(&document)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+
+    Ok((document, true))
+}
+
+fn expand_document(
+    mut document: toml::Table,
+    environment: &BTreeMap<String, String>,
+) -> Result<toml::Table, CliError> {
+    for (section, field) in [("options", "data_dir"), ("provider", "base_url")] {
+        if let Some(table) = document
+            .get_mut(section)
+            .and_then(toml::Value::as_table_mut)
+        {
+            expand_string_field(table, field, environment)?;
+        }
+    }
+    Ok(document)
+}
+
+fn expand_global_mcp(
+    mut document: toml::Table,
+    environment: &BTreeMap<String, String>,
+) -> Result<toml::Table, CliError> {
+    if let Some(servers) = document.get_mut("mcp").and_then(toml::Value::as_table_mut) {
+        for server in servers
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            if server
+                .get("disabled")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            for field in ["command", "cwd", "url"] {
+                expand_mcp_string_field(server, field, environment)?;
+            }
+            for field in ["env", "headers"] {
+                if let Some(values) = server.get_mut(field).and_then(toml::Value::as_table_mut) {
+                    for (_, value) in values.iter_mut() {
+                        expand_mcp_value_in_place(value, environment)?;
+                    }
+                }
+            }
+            if let Some(args) = server.get_mut("args").and_then(toml::Value::as_array_mut) {
+                for value in args {
+                    expand_mcp_value_in_place(value, environment)?;
+                }
+            }
+        }
+    }
+    Ok(document)
+}
+
+pub(crate) fn resolve_provider_type(
+    configured: Option<String>,
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    if matches!(configured.as_deref(), Some("openai-api" | "openai-chatgpt")) {
+        return configured;
+    }
+    let credentials =
+        credentials.and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok());
+    let chatgpt = credentials
+        .as_ref()
+        .and_then(|credentials| credentials.get("openai-chatgpt"));
+    if chatgpt.is_some_and(|entry| {
+        ["access_token", "refresh_token", "account_id", "expires_at"]
+            .iter()
+            .all(|field| {
+                entry
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            })
+    }) {
+        return Some("openai-chatgpt".to_owned());
+    }
+    if credentials
+        .as_ref()
+        .and_then(|credentials| credentials.get("openai-api"))
+        .and_then(|entry| entry.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+        || environment
+            .get("OPENAI_API_KEY")
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Some("openai-api".to_owned());
+    }
+    None
+}
+
+pub(crate) fn openai_api_key(
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    environment
+        .get("OPENAI_API_KEY")
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .or_else(|| {
+            credentials
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+                .and_then(|credentials| {
+                    credentials
+                        .get("openai-api")?
+                        .get("api_key")?
+                        .as_str()
+                        .filter(|key| !key.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+        })
+}
+
+fn expand_value_in_place(
+    value: &mut toml::Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(raw) = value.as_str() {
+        *value =
+            toml::Value::String(expand_environment(raw, environment).map_err(|_| {
+                CliError::configuration("configuration environment expansion failed")
+            })?);
+    }
+    Ok(())
+}
+
+fn expand_mcp_value_in_place(
+    value: &mut toml::Value,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(raw) = value.as_str() {
+        *value =
+            toml::Value::String(expand_environment_with_commands(raw, environment).map_err(
+                |_| CliError::configuration("configuration environment expansion failed"),
+            )?);
+    }
+    Ok(())
+}
+
+fn expand_string_field(
+    table: &mut toml::Table,
+    field: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(value) = table.get_mut(field) {
+        expand_value_in_place(value, environment)?;
+    }
+    Ok(())
+}
+
+fn expand_mcp_string_field(
+    table: &mut toml::Table,
+    field: &str,
+    environment: &BTreeMap<String, String>,
+) -> Result<(), CliError> {
+    if let Some(value) = table.get_mut(field) {
+        expand_mcp_value_in_place(value, environment)?;
+    }
+    Ok(())
+}
+
+fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {
+    let mut value = document.get(*path.first()?)?;
+
+    for key in &path[1..] {
+        value = value.as_table()?.get(*key)?;
+    }
+
+    value.as_str().map(ToOwned::to_owned)
 }

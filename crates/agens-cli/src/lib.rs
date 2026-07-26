@@ -1,10 +1,10 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::Path;
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 #[cfg(test)]
@@ -24,10 +24,10 @@ use agens_config::ToolLimitSettings;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
-use agens_config::{
-    expand_environment, expand_environment_with_commands, parse_toml_document,
-    validate_toml_document,
-};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use agens_config::{parse_toml_document, validate_toml_document};
 use agens_core::HeadlessTurnCancellation;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -101,6 +101,9 @@ use agens_tools::TaskTerminalState;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_tools::ToolDispatcher;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
 use agens_tools::{CommandCatalog, SkillCatalog};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -129,6 +132,9 @@ use agens_tui::TuiSubmitOrigin;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tui::{BridgeCancel, BridgeTx};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
 use agens_tui::{Engine as TuiEngine, Tui};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -212,6 +218,10 @@ use error::cancellation_result;
 use headless::block_on_headless_turn;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use headless::explicit_task_delegation_prompt;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use headless::{HeadlessChatCompletion, HeadlessChatFailure};
 #[cfg(test)]
@@ -289,11 +299,17 @@ use tui::agents::{
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use tui::dialogs::diagnostics_dialog;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
 use tui::engine::ProductionTuiEngine;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
-use tui::engine::{run_tui_prompt, run_tui_prompt_with};
+use tui::engine::{
+    configure_tui_project_identity, report_tui_extension_collisions, run_tui_prompt,
+    run_tui_prompt_with,
+};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -501,241 +517,6 @@ fn execute_command(
     };
 
     commands::dispatch(parsed, dependencies, cancellation)
-}
-
-fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
-    if skills.is_empty() {
-        return base.to_owned();
-    }
-
-    let metadata = skills
-        .skills()
-        .map(|skill| format!("- {}: {}", skill.name(), skill.description()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "{base}\n\n## Available skills\nUse the `skill` tool to load instructions or declared resources only when needed.\n{metadata}"
-    )
-}
-
-fn explicit_task_delegation_prompt(base: &str) -> String {
-    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion.";
-
-    if base.contains(INSTRUCTION) {
-        base.to_owned()
-    } else {
-        format!("{base}\n\n{INSTRUCTION}")
-    }
-}
-
-fn report_tui_extension_collisions<E: TuiEngine>(
-    tui: &mut Tui<E>,
-    commands: &CommandCatalog,
-    skills: &SkillCatalog,
-) {
-    for skill in skills
-        .skills()
-        .filter(|skill| commands.command(skill.name()).is_some())
-    {
-        tui.add_diagnostic(format!(
-            "Skill /{} is shadowed by a command; command routing wins.",
-            skill.name()
-        ));
-    }
-}
-
-fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap: &Bootstrap) {
-    if let Some(project_root) = bootstrap.project_root() {
-        tui.set_project(project_root.display().to_string());
-    }
-}
-
-fn load_toml(
-    path: &Path,
-    scope: &str,
-    dependencies: &CliDependencies,
-) -> Result<(toml::Table, bool), CliError> {
-    let Some(contents) = (dependencies.read_file)(path)? else {
-        return Ok((toml::Table::new(), false));
-    };
-
-    let document = parse_toml_document(&contents)
-        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
-    validate_toml_document(&document)
-        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
-
-    Ok((document, true))
-}
-
-fn expand_document(
-    mut document: toml::Table,
-    environment: &BTreeMap<String, String>,
-) -> Result<toml::Table, CliError> {
-    for (section, field) in [("options", "data_dir"), ("provider", "base_url")] {
-        if let Some(table) = document
-            .get_mut(section)
-            .and_then(toml::Value::as_table_mut)
-        {
-            expand_string_field(table, field, environment)?;
-        }
-    }
-    Ok(document)
-}
-
-fn expand_global_mcp(
-    mut document: toml::Table,
-    environment: &BTreeMap<String, String>,
-) -> Result<toml::Table, CliError> {
-    if let Some(servers) = document.get_mut("mcp").and_then(toml::Value::as_table_mut) {
-        for server in servers
-            .iter_mut()
-            .filter_map(|(_, value)| value.as_table_mut())
-        {
-            if server
-                .get("disabled")
-                .and_then(toml::Value::as_bool)
-                .unwrap_or(false)
-            {
-                continue;
-            }
-            for field in ["command", "cwd", "url"] {
-                expand_mcp_string_field(server, field, environment)?;
-            }
-            for field in ["env", "headers"] {
-                if let Some(values) = server.get_mut(field).and_then(toml::Value::as_table_mut) {
-                    for (_, value) in values.iter_mut() {
-                        expand_mcp_value_in_place(value, environment)?;
-                    }
-                }
-            }
-            if let Some(args) = server.get_mut("args").and_then(toml::Value::as_array_mut) {
-                for value in args {
-                    expand_mcp_value_in_place(value, environment)?;
-                }
-            }
-        }
-    }
-    Ok(document)
-}
-
-fn resolve_provider_type(
-    configured: Option<String>,
-    credentials: Option<&str>,
-    environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    if matches!(configured.as_deref(), Some("openai-api" | "openai-chatgpt")) {
-        return configured;
-    }
-    let credentials =
-        credentials.and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok());
-    let chatgpt = credentials
-        .as_ref()
-        .and_then(|credentials| credentials.get("openai-chatgpt"));
-    if chatgpt.is_some_and(|entry| {
-        ["access_token", "refresh_token", "account_id", "expires_at"]
-            .iter()
-            .all(|field| {
-                entry
-                    .get(*field)
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-            })
-    }) {
-        return Some("openai-chatgpt".to_owned());
-    }
-    if credentials
-        .as_ref()
-        .and_then(|credentials| credentials.get("openai-api"))
-        .and_then(|entry| entry.get("api_key"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.is_empty())
-        || environment
-            .get("OPENAI_API_KEY")
-            .is_some_and(|value| !value.is_empty())
-    {
-        return Some("openai-api".to_owned());
-    }
-    None
-}
-
-fn openai_api_key(
-    credentials: Option<&str>,
-    environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    environment
-        .get("OPENAI_API_KEY")
-        .filter(|key| !key.is_empty())
-        .cloned()
-        .or_else(|| {
-            credentials
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
-                .and_then(|credentials| {
-                    credentials
-                        .get("openai-api")?
-                        .get("api_key")?
-                        .as_str()
-                        .filter(|key| !key.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-        })
-}
-
-fn expand_value_in_place(
-    value: &mut toml::Value,
-    environment: &BTreeMap<String, String>,
-) -> Result<(), CliError> {
-    if let Some(raw) = value.as_str() {
-        *value =
-            toml::Value::String(expand_environment(raw, environment).map_err(|_| {
-                CliError::configuration("configuration environment expansion failed")
-            })?);
-    }
-    Ok(())
-}
-
-fn expand_mcp_value_in_place(
-    value: &mut toml::Value,
-    environment: &BTreeMap<String, String>,
-) -> Result<(), CliError> {
-    if let Some(raw) = value.as_str() {
-        *value =
-            toml::Value::String(expand_environment_with_commands(raw, environment).map_err(
-                |_| CliError::configuration("configuration environment expansion failed"),
-            )?);
-    }
-    Ok(())
-}
-
-fn expand_string_field(
-    table: &mut toml::Table,
-    field: &str,
-    environment: &BTreeMap<String, String>,
-) -> Result<(), CliError> {
-    if let Some(value) = table.get_mut(field) {
-        expand_value_in_place(value, environment)?;
-    }
-    Ok(())
-}
-
-fn expand_mcp_string_field(
-    table: &mut toml::Table,
-    field: &str,
-    environment: &BTreeMap<String, String>,
-) -> Result<(), CliError> {
-    if let Some(value) = table.get_mut(field) {
-        expand_mcp_value_in_place(value, environment)?;
-    }
-    Ok(())
-}
-
-fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {
-    let mut value = document.get(*path.first()?)?;
-
-    for key in &path[1..] {
-        value = value.as_table()?.get(*key)?;
-    }
-
-    value.as_str().map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

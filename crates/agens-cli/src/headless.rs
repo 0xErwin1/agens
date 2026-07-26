@@ -36,8 +36,8 @@ use crate::tui::agents::{TuiAgentModelValidator, tui_agent_catalog};
 use crate::tui::provider::TuiProvider;
 use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
-    Bootstrap, cancellation_result, effective_max_iterations, explicit_task_delegation_prompt,
-    operation_diagnostics, record_parent_terminal,
+    Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
+    record_parent_terminal,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -605,4 +605,14 @@ pub(crate) fn block_on_headless_turn<T>(
         .map_err(|_| CliError::runtime(HeadlessTurnError::Provider))?;
 
     Ok(runtime.block_on(future))
+}
+
+pub(crate) fn explicit_task_delegation_prompt(base: &str) -> String {
+    const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion.";
+
+    if base.contains(INSTRUCTION) {
+        base.to_owned()
+    } else {
+        format!("{base}\n\n{INSTRUCTION}")
+    }
 }

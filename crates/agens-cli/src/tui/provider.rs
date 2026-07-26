@@ -12,9 +12,9 @@ use std::sync::Arc;
 use agens_providers::chatgpt_login::{remove_provider_entry, upsert_provider_entry};
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
+use crate::bootstrap::openai_api_key;
 use crate::error::CliError;
 use crate::model_registry::TuiModelSource;
-use crate::openai_api_key;
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

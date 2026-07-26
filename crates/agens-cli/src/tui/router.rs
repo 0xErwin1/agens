@@ -23,12 +23,11 @@ use agens_tui::{
     TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
 };
 
-use crate::bootstrap::{Bootstrap, ProviderSource};
+use crate::bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::TuiModelSelector;
-use crate::resolve_provider_type;
 use crate::session::attempt::active_session_attempts;
 use crate::tools::task::default_model;
 use crate::tui::agents::{
