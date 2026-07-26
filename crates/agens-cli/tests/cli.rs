@@ -919,6 +919,87 @@ fn sessions_crud_uses_normalized_metadata_and_idempotent_removal() {
     assert_eq!(empty.stdout, "No saved sessions.\n");
 }
 
+/// Round-4 verification found `sessions rm -- <id>` unpinned for two
+/// members of the ratified W-C family (`--` is only refused as the sole
+/// root argument; everywhere else clap's "end of options" handling consumes
+/// it and the shape runs for real): a positive identifier and, more
+/// pointedly, a negative one that could never reach `rm` any other way
+/// (`sessions rm -1` alone is rejected by clap as an unrecognized argument,
+/// per ratified W-B). `sessions rm -- 1` genuinely deletes an existing
+/// session. `sessions rm -- -1` cannot ever delete a real row: session ids
+/// are validated `> 0` at persistence time (`SessionMetadata::validate`),
+/// so no session can ever carry a negative id, and `delete_session` is
+/// idempotent (it does not error when nothing matched, exactly like
+/// removing an already-removed id twice). The exit code for this shape
+/// still moved from 2 to 0, which is what this pins: a harmless no-op that
+/// reports success, not an actual deletion of anything that could exist.
+#[test]
+fn sessions_rm_after_a_double_dash_deletes_a_positive_identifier_and_no_ops_on_a_negative_one() {
+    let temporary = TemporaryDirectory::new("sessions-rm-double-dash");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    let dependencies = CliDependencies::for_test(
+        temporary.path().join("project"),
+        Some(temporary.path().join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!("[options]\ndata_dir = \"{}\"\n", data_directory.display()),
+        )]),
+    );
+    let metadata = SessionMetadata {
+        id: 1,
+        project: "project".into(),
+        title: "conversation".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let turn = CompletedSessionTurn::new(
+        vec![
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("hello".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("world".into())],
+            },
+        ]
+        .into_iter()
+        .map(SessionMessage::try_from)
+        .collect::<Result<_, _>>()
+        .expect("session messages should be valid"),
+    )
+    .expect("completed session turn should be valid");
+    let mut store = SessionStore::open(&data_directory).expect("session store should open");
+    store
+        .persist_completed_session_turn(&metadata, &turn)
+        .expect("normalized session should persist");
+
+    let remove_positive = execute(["sessions", "rm", "--", "1"], &dependencies);
+    let remove_negative = execute(["sessions", "rm", "--", "-1"], &dependencies);
+    let missing_positive = execute(["sessions", "show", "1"], &dependencies);
+
+    assert_eq!(remove_positive.status, ExitStatus::Success);
+    assert_eq!(remove_positive.stdout, "Removed session 1.\n");
+    assert_eq!(remove_negative.status, ExitStatus::Success);
+    assert_eq!(remove_negative.stdout, "Removed session -1.\n");
+    assert_eq!(missing_positive.status, ExitStatus::Failure);
+    assert_eq!(
+        missing_positive.stderr,
+        "error: store: saved session is unavailable\n"
+    );
+}
+
 #[test]
 fn config_doctor_rejects_semantically_invalid_configuration() {
     let temporary = TemporaryDirectory::new("semantic-config");

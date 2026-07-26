@@ -2210,3 +2210,34 @@ fn table_b_equals_flag_credential_write_is_pinned() {
         credentials_path.display()
     );
 }
+
+/// W-C family (round 4, unpinned member): `auth login --device-auth --`
+/// drops the trailing `--` and reaches `AuthAction::Login { device_auth:
+/// true, method: None }`, exactly like `auth login --device-auth` alone —
+/// clap's "end of options" handling consumes a `--` with nothing after it
+/// the same way it does everywhere else in this family. This must NOT
+/// start a real interactive device-code flow in a test, so the
+/// `auth_login` dependency is stubbed via `with_auth_login`, exactly as
+/// [`auth_login_selects_browser_or_device_flow_and_uses_the_compatible_credentials_path`]
+/// in `cli.rs` already does; the stub records that it was called with
+/// `device_auth = true` and returns immediately instead of blocking.
+#[test]
+fn table_b_device_auth_then_double_dash_reaches_the_device_flow_without_blocking() {
+    let temporary = TemporaryDirectory::new("ratified-auth-login-device-auth-double-dash");
+    let dependencies = base_dependencies(&temporary).with_auth_login(|_, device_auth, _| {
+        assert!(
+            device_auth,
+            "auth login --device-auth -- must select the device flow"
+        );
+        Ok(String::new())
+    });
+
+    let actual = execute(
+        argv(&["auth", "login", "--device-auth", "--"])
+            .iter()
+            .map(String::as_str),
+        &dependencies,
+    );
+
+    assert_eq!(actual, success("Logged in to ChatGPT.\n"));
+}
