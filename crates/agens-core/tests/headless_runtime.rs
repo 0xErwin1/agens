@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
+    AttemptKey, CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError, FactPath,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
     MessagePart, PermissionDecision, ToolOutcome, ToolResultFacts, TurnEvent, TurnProgressSink,
@@ -68,6 +68,7 @@ fn a_fact_emitted_in_a_real_attempt_carries_that_attempts_identity() {
     };
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
+        denial_facts: None,
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
@@ -126,6 +127,7 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
     };
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
+        denial_facts: None,
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
@@ -173,6 +175,105 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
 }
 
 #[test]
+fn a_denied_call_carries_the_gates_denial_facts() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let progress: TurnProgressSink = {
+        let observed = Arc::clone(&observed);
+        Arc::new(move |event| observed.lock().unwrap().push(event))
+    };
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                input: "{\"path\":\"secret.txt\"}".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Deny],
+        denial_facts: Some(ToolResultFacts::Write {
+            path: FactPath::new("secret.txt"),
+            outcome: ToolOutcome::Denied,
+            written: None,
+        }),
+    };
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher::default();
+    let mut repository = Repository::default();
+
+    block_on_ready(run_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+        Some(&progress),
+        None,
+    ))
+    .unwrap();
+
+    let observed = observed.lock().unwrap();
+    let facts = observed
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResultFacts { facts, .. } => Some(facts.clone()),
+            _ => None,
+        })
+        .expect("a denied call must still carry the gate's denial facts");
+
+    assert_eq!(
+        facts,
+        ToolResultFacts::Write {
+            path: FactPath::new("secret.txt"),
+            outcome: ToolOutcome::Denied,
+            written: None,
+        }
+    );
+}
+
+#[test]
+fn a_gate_with_no_denial_facts_leaves_a_denied_call_pathless() {
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "write".into(),
+                input: "{\"path\":\"secret.txt\"}".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Deny],
+        denial_facts: None,
+    };
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher::default();
+    let mut repository = Repository::default();
+
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("headless turn should complete");
+
+    assert!(
+        !snapshot
+            .events()
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ToolResultFacts { .. })),
+        "a gate reporting no denial facts must not synthesize a facts event"
+    );
+}
+
+#[test]
 fn headless_turn_snapshot_omits_tool_result_facts() {
     let mut provider = Provider {
         iterations: vec![
@@ -186,6 +287,7 @@ fn headless_turn_snapshot_omits_tool_result_facts() {
     };
     let mut gate = PermissionGate {
         decisions: vec![PermissionDecision::Allow],
+        denial_facts: None,
     };
     let mut resolver = PermissionResolver::default();
     let mut dispatcher = ToolDispatcher {
@@ -237,6 +339,7 @@ impl TurnProvider for Provider {
 #[derive(Default)]
 struct PermissionGate {
     decisions: Vec<PermissionDecision>,
+    denial_facts: Option<ToolResultFacts>,
 }
 
 impl HeadlessPermissionGate for PermissionGate {
@@ -246,6 +349,10 @@ impl HeadlessPermissionGate for PermissionGate {
         _cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send {
         ready(Ok(self.decisions.remove(0)))
+    }
+
+    fn denial_facts(&self, _call: &HeadlessToolCall) -> Option<ToolResultFacts> {
+        self.denial_facts.clone()
     }
 }
 
@@ -378,6 +485,7 @@ fn runs_ordered_provider_tool_iterations_and_persists_one_completed_snapshot() {
             PermissionDecision::Deny,
             PermissionDecision::Allow,
         ],
+        denial_facts: None,
     };
     let mut resolver = PermissionResolver {
         decisions: vec![PermissionDecision::Allow],
@@ -487,6 +595,7 @@ fn cancellation_provider_tool_and_store_failures_are_typed_and_never_persist_par
         &mut tool_provider,
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
         },
         &mut PermissionResolver::default(),
         &mut ToolDispatcher {
@@ -615,6 +724,7 @@ fn permission_evaluation_distinguishes_unresolved_asks_without_exposing_tool_inp
         &mut provider,
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Ask],
+            denial_facts: None,
         },
         &mut PermissionResolver {
             decisions: vec![PermissionDecision::Ask],
@@ -659,6 +769,7 @@ fn denied_permissions_emit_sanitized_tool_results_and_continue_without_dispatch(
             &mut provider,
             &mut PermissionGate {
                 decisions: vec![gate_decision],
+                denial_facts: None,
             },
             &mut resolver,
             &mut ToolDispatcher::default(),
@@ -694,6 +805,7 @@ fn permission_evaluation_errors_remain_distinct_from_unresolved_asks() {
         let mut repository = Repository::default();
         let mut gate = PermissionGate {
             decisions: vec![PermissionDecision::Ask],
+            denial_facts: None,
         };
         let mut resolver = PermissionResolver {
             decisions: vec![PermissionDecision::Allow],
@@ -774,6 +886,7 @@ fn max_iterations_stops_before_a_second_provider_request_without_persisting() {
         &mut provider,
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Allow],
+            denial_facts: None,
         },
         &mut PermissionResolver::default(),
         &mut ToolDispatcher {
@@ -919,6 +1032,7 @@ fn cancellation_during_preflight_runs_nothing_and_during_execution_keeps_complet
         &mut provider,
         &mut PermissionGate {
             decisions: vec![PermissionDecision::Allow, PermissionDecision::Allow],
+            denial_facts: None,
         },
         &mut PermissionResolver::default(),
         &mut dispatcher,

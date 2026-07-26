@@ -1290,6 +1290,17 @@ pub trait HeadlessPermissionGate {
         call: &HeadlessToolCall,
         cancellation: &HeadlessTurnCancellation,
     ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send;
+
+    /// Facts for a call this gate denied before it ran.
+    ///
+    /// A denial short-circuits before any tool executes, so this is the only
+    /// place the harness can still report the path a denied write or edit
+    /// targeted. The default reports none: most gates in this codebase are
+    /// test doubles with no route from a raw call to a typed input, and a
+    /// gate that cannot parse `call.input` has nothing honest to report.
+    fn denial_facts(&self, _call: &HeadlessToolCall) -> Option<ToolResultFacts> {
+        None
+    }
 }
 
 pub trait HeadlessPermissionResolver {
@@ -1639,7 +1650,13 @@ async fn run_headless_turn_with_iteration_limit(
                     .map_err(|error| {
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
                     })?,
-                PermissionDecision::Deny => HeadlessToolOutput::failure("permission denied"),
+                PermissionDecision::Deny => {
+                    let output = HeadlessToolOutput::failure("permission denied");
+                    match permission_gate.denial_facts(&call) {
+                        Some(facts) => output.with_facts(facts),
+                        None => output,
+                    }
+                }
                 PermissionDecision::Ask => return Err(permission_required(&mut coordinator)),
             };
 

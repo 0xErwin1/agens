@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
 use agens_core::{
-    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation,
-    HeadlessTurnPortError, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
-    PermissionRule, PermissionSession,
+    FactPath, HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
+    HeadlessTurnCancellation, HeadlessTurnPortError, PermissionDecision, PermissionMode,
+    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, ToolInput, ToolOutcome,
+    ToolResultFacts,
 };
 use agens_store::PermissionGrantStore;
 use agens_tools::{
@@ -259,6 +260,52 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                     }),
             });
         std::future::ready(result)
+    }
+
+    /// Reports the path a denied `write` or `edit` targeted, or that a
+    /// `bash` call was denied. The engine loop short-circuits a denial
+    /// before any tool runs, so this is the only vantage point left from
+    /// which the harness can still surface what a denied call touched.
+    ///
+    /// `call.name` carries its dispatcher prefix (`native::`/`mcp::`); the
+    /// prefix is stripped before parsing so the bare name matches
+    /// `ToolInput::parse`'s vocabulary, mirroring the same strip performed
+    /// when reconstructing a saved session's tool history.
+    fn denial_facts(&self, call: &HeadlessToolCall) -> Option<ToolResultFacts> {
+        let bare = call
+            .name
+            .strip_prefix("native::")
+            .or_else(|| call.name.strip_prefix("mcp::"))
+            .unwrap_or(call.name.as_str());
+
+        match bare {
+            "write" => Some(ToolResultFacts::Write {
+                path: denied_input_path(ToolInput::parse(bare, &call.input)),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            }),
+            "edit" => Some(ToolResultFacts::Edit {
+                path: denied_input_path(ToolInput::parse(bare, &call.input)),
+                outcome: ToolOutcome::Denied,
+                changed: None,
+            }),
+            "bash" => Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Denied,
+                exit_code: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Extracts the path a `write` or `edit` call reported, or an unrepresentable
+/// `FactPath` when the call's input did not parse into that shape at all —
+/// a malformed payload for a known tool must not fabricate a path, but the
+/// denial itself is still reported by its caller.
+fn denied_input_path(parsed: ToolInput) -> FactPath {
+    match parsed {
+        ToolInput::Write { path } | ToolInput::Edit { path } => FactPath::new(&path),
+        _ => FactPath::new(""),
     }
 }
 
@@ -1569,5 +1616,120 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&directory).expect("temporary grant directory should be removed");
+    }
+
+    fn permission_gate_with_no_grants() -> ProductionPermissionGate {
+        ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, vec![]),
+            Arc::new(Mutex::new(Vec::new())),
+            PermissionSession::new(),
+            "project".into(),
+            Arc::new(Mutex::new(ToolDispatcher::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        )
+    }
+
+    #[test]
+    fn a_denied_native_write_reports_the_path_it_targeted() {
+        let gate = permission_gate_with_no_grants();
+        let call = HeadlessToolCall {
+            id: "denied-write".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"secret.txt","content":"x"}"#.into(),
+        };
+
+        assert_eq!(
+            gate.denial_facts(&call),
+            Some(ToolResultFacts::Write {
+                path: FactPath::new("secret.txt"),
+                outcome: ToolOutcome::Denied,
+                written: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_denied_native_edit_reports_the_path_it_targeted() {
+        let gate = permission_gate_with_no_grants();
+        let call = HeadlessToolCall {
+            id: "denied-edit".into(),
+            name: "native::edit".into(),
+            input: r#"{"path":"secret.txt","old":"a","new":"b"}"#.into(),
+        };
+
+        assert_eq!(
+            gate.denial_facts(&call),
+            Some(ToolResultFacts::Edit {
+                path: FactPath::new("secret.txt"),
+                outcome: ToolOutcome::Denied,
+                changed: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_denied_native_bash_carries_no_path() {
+        let gate = permission_gate_with_no_grants();
+        let call = HeadlessToolCall {
+            id: "denied-bash".into(),
+            name: "native::bash".into(),
+            input: r#"{"command":"rm -rf /"}"#.into(),
+        };
+
+        assert_eq!(
+            gate.denial_facts(&call),
+            Some(ToolResultFacts::Bash {
+                outcome: ToolOutcome::Denied,
+                exit_code: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_denied_call_with_an_unrecognized_tool_name_reports_no_facts() {
+        let gate = permission_gate_with_no_grants();
+        let call = HeadlessToolCall {
+            id: "denied-unknown".into(),
+            name: "mcp::files::read".into(),
+            input: r#"{"path":"secret.txt"}"#.into(),
+        };
+
+        assert_eq!(gate.denial_facts(&call), None);
+    }
+
+    /// A malformed payload for a known native tool parses to `ToolInput::Other`,
+    /// per `ParseToolInput`'s `serde_json` failure fallback. This is a decision,
+    /// not a silent hole: the denial still reports that a write was attempted,
+    /// with an unrepresentable path rather than a fabricated one, and the call
+    /// remains visible via its `ToolResult` regardless.
+    #[test]
+    fn a_denied_native_write_with_a_malformed_payload_is_pathless_not_absent() {
+        let gate = permission_gate_with_no_grants();
+        let call = HeadlessToolCall {
+            id: "denied-malformed-write".into(),
+            name: "native::write".into(),
+            input: "{not json".into(),
+        };
+
+        assert_eq!(
+            ToolInput::parse("write", &call.input),
+            ToolInput::Other {
+                name: "write".into(),
+                raw: "{not json".into(),
+            }
+        );
+        match gate.denial_facts(&call) {
+            Some(ToolResultFacts::Write {
+                path,
+                outcome,
+                written,
+            }) => {
+                assert!(!path.is_representable());
+                assert_eq!(outcome, ToolOutcome::Denied);
+                assert_eq!(written, None);
+            }
+            other => panic!("expected pathless write denial facts, got {other:?}"),
+        }
     }
 }
