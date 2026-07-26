@@ -12,11 +12,10 @@ use agens_core::{
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
+mod database;
 mod session_writer;
 pub use session_writer::{SessionCursor, SessionPage, StoredSession};
 
-const PERMISSIONS_DATABASE: &str = "permissions.db";
-const PERMISSIONS_SCHEMA_VERSION: i64 = 1;
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
     ExpectedColumnSignature::new(0, "id", "INTEGER", false, None, 1),
     ExpectedColumnSignature::new(1, "project", "TEXT", true, None, 0),
@@ -131,6 +130,10 @@ impl PermissionGrantStoreError {
             message: message.into(),
         }
     }
+
+    fn from_database(error: database::DatabaseError) -> Self {
+        Self::operation(error.operation(), error.path(), error.detail())
+    }
 }
 
 impl fmt::Display for PermissionGrantStoreError {
@@ -148,18 +151,9 @@ pub struct PermissionGrantStore {
 
 impl PermissionGrantStore {
     pub fn open(data_directory: impl AsRef<Path>) -> Result<Self, PermissionGrantStoreError> {
-        let data_directory = data_directory.as_ref();
-        fs::create_dir_all(data_directory).map_err(|error| {
-            PermissionGrantStoreError::operation("create data directory", data_directory, error)
-        })?;
-        restrict_permissions(data_directory, 0o700)?;
-
-        let database_path = data_directory.join(PERMISSIONS_DATABASE);
-        let connection = Connection::open(&database_path).map_err(|error| {
-            PermissionGrantStoreError::operation("open database", &database_path, error)
-        })?;
-        restrict_permissions(&database_path, 0o600)?;
-        initialize_schema(&connection, &database_path)?;
+        let (database_path, connection) = database::open_unified_database(data_directory.as_ref())
+            .map_err(PermissionGrantStoreError::from_database)?;
+        verify_schema(&connection, &database_path)?;
 
         Ok(Self {
             database_path,
@@ -425,52 +419,6 @@ impl PermissionGrantStore {
             Ok(ProjectPermissionGrant::new(project, decision, tool, target))
         })
         .collect()
-    }
-}
-
-fn initialize_schema(
-    connection: &Connection,
-    database_path: &Path,
-) -> Result<(), PermissionGrantStoreError> {
-    let version = connection
-        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-        .map_err(|error| {
-            PermissionGrantStoreError::operation("read schema version", database_path, error)
-        })?;
-
-    match version {
-        0 => {
-            connection
-                .execute_batch(&format!(
-                    "
-                BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS permission_grants (
-                    id INTEGER PRIMARY KEY,
-                    project TEXT NOT NULL,
-                    decision TEXT NOT NULL,
-                    tool_kind TEXT NOT NULL,
-                    tool_value TEXT,
-                    target_kind TEXT NOT NULL,
-                    target_value TEXT
-                );
-                CREATE INDEX IF NOT EXISTS permission_grants_project
-                    ON permission_grants(project, id);
-                PRAGMA user_version = {PERMISSIONS_SCHEMA_VERSION};
-                COMMIT;
-                "
-                ))
-                .map_err(|error| {
-                    PermissionGrantStoreError::operation("initialize schema", database_path, error)
-                })?;
-
-            verify_schema(connection, database_path)
-        }
-        PERMISSIONS_SCHEMA_VERSION => verify_schema(connection, database_path),
-        unsupported => Err(PermissionGrantStoreError::operation(
-            "check schema version",
-            database_path,
-            format!("unsupported schema version {unsupported}"),
-        )),
     }
 }
 

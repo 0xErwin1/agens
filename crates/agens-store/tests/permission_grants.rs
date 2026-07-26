@@ -38,16 +38,17 @@ fn persists_only_project_scoped_grants_in_the_rust_permissions_database() {
         let mut store = PermissionGrantStore::open(&directory).unwrap();
         store.append_grants(&[allow.clone(), deny.clone()]).unwrap();
 
-        assert_eq!(store.database_path(), directory.join("permissions.db"));
+        assert_eq!(store.database_path(), directory.join("agens.db"));
     }
 
-    let database = directory.join("permissions.db");
+    let database = directory.join("agens.db");
     assert_eq!(
         Connection::open(&database)
             .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .query_row("SELECT id FROM schema_migrations", [], |row| row
+                .get::<_, String>(0))
             .unwrap(),
-        1
+        "0001_permission_grants"
     );
 
     let reopened = PermissionGrantStore::open(&directory).unwrap();
@@ -83,24 +84,10 @@ fn rejects_non_project_scoped_grants_without_persisting_a_partial_write() {
 }
 
 #[test]
-fn rejects_missing_project_lookup_and_unsupported_schema_versions_with_actionable_context() {
+fn rejects_missing_project_lookup_with_actionable_context() {
     let directory = data_directory();
     let store = PermissionGrantStore::open(&directory).unwrap();
     assert!(store.grants_for_project("").is_err());
-    drop(store);
-
-    let database = directory.join("permissions.db");
-    Connection::open(&database)
-        .unwrap()
-        .pragma_update(None, "user_version", 999)
-        .unwrap();
-
-    let error = PermissionGrantStore::open(&directory)
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(error.contains("schema version"));
-    assert!(error.contains(database.to_string_lossy().as_ref()));
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -108,11 +95,15 @@ fn rejects_missing_project_lookup_and_unsupported_schema_versions_with_actionabl
 #[test]
 fn rejects_supported_version_without_the_expected_schema() {
     let directory = data_directory();
-    let database = directory.join("permissions.db");
-    Connection::open(&database)
-        .unwrap()
-        .pragma_update(None, "user_version", 1)
+    let database = directory.join("agens.db");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+             INSERT INTO schema_migrations (id, applied_at) VALUES ('0001_permission_grants', 0);",
+        )
         .unwrap();
+    drop(connection);
 
     let error = PermissionGrantStore::open(&directory)
         .err()
@@ -236,10 +227,15 @@ fn rejects_version_one_databases_with_incompatible_permission_grant_contracts() 
 
     for (name, schema) in incompatible_schemas {
         let directory = data_directory();
-        let database = directory.join("permissions.db");
+        let database = directory.join("agens.db");
         let connection = Connection::open(&database).unwrap();
         connection.execute_batch(schema).unwrap();
-        connection.pragma_update(None, "user_version", 1).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);
+                 INSERT INTO schema_migrations (id, applied_at) VALUES ('0001_permission_grants', 0);",
+            )
+            .unwrap();
         drop(connection);
 
         let error = match PermissionGrantStore::open(&directory) {
@@ -259,21 +255,21 @@ fn rejects_version_one_databases_with_incompatible_permission_grant_contracts() 
 #[test]
 fn corrupt_database_open_failure_includes_operation_and_path() {
     let directory = data_directory();
-    let database = directory.join("permissions.db");
+    let database = directory.join("agens.db");
     fs::write(&database, "not a sqlite database").unwrap();
 
     let error = PermissionGrantStore::open(&directory)
         .err()
         .unwrap()
         .to_string();
-    assert!(error.contains("permission grants read schema version"));
+    assert!(error.contains("permission grants enable WAL"), "{error}");
     assert!(error.contains(database.to_string_lossy().as_ref()));
 
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn persists_glob_patterns_with_explicit_kind_and_value_without_changing_schema_version_one() {
+fn persists_glob_patterns_with_explicit_kind_and_value_without_reapplying_the_ledger() {
     let directory = data_directory();
     let grants = vec![
         ProjectPermissionGrant::allow(
@@ -300,7 +296,7 @@ fn persists_glob_patterns_with_explicit_kind_and_value_without_changing_schema_v
         store.append_grants(&grants).unwrap();
     }
 
-    let database = directory.join("permissions.db");
+    let database = directory.join("agens.db");
     let connection = Connection::open(&database).unwrap();
     let rows = connection
         .prepare(
@@ -343,9 +339,10 @@ fn persists_glob_patterns_with_explicit_kind_and_value_without_changing_schema_v
     );
     assert_eq!(
         connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .query_row("SELECT id FROM schema_migrations", [], |row| row
+                .get::<_, String>(0))
             .unwrap(),
-        1
+        "0001_permission_grants"
     );
     drop(connection);
 
