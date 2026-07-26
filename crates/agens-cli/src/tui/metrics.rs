@@ -87,6 +87,7 @@ impl TuiMetricsPublisher {
             }
             TurnEvent::ProviderPart(_) | TurnEvent::StateChanged(_) => None,
             TurnEvent::ToolResult(_) => None,
+            TurnEvent::ToolResultFacts { .. } => None,
         };
 
         if let Some(event) = metric {
@@ -279,6 +280,25 @@ mod tests {
                 },
             ]
         ));
+    }
+
+    #[test]
+    fn observe_on_tool_result_facts_publishes_nothing() {
+        let (bridge, receiver) = agens_tui::BridgeTx::bounded(4);
+        let cancellation = agens_tui::BridgeCancel::new();
+        let mut publisher = TuiMetricsPublisher::new(bridge, cancellation, "unknown-model");
+
+        publisher.observe(&TurnEvent::ToolResultFacts {
+            tool_call_id: "call-1".into(),
+            facts: agens_core::ToolResultFacts::Bash { exit_code: Some(1) },
+        });
+
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "a facts event must publish nothing to the bridge"
+        );
     }
 
     #[test]

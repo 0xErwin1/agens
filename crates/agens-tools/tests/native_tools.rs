@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agens_core::Error;
+use agens_core::{Error, ToolResultFacts};
 use agens_tools::{
     BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
     NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
@@ -729,6 +729,36 @@ fn catalog_dispatches_the_separate_edit_schema() {
         ToolOutput::failure("tool execution cancelled")
     );
     assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after");
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn native_catalog_preserves_edit_facts() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "before").unwrap();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+
+    let output = catalog
+        .execute(
+            "native::edit",
+            json!({"path": "notes.txt", "old": "before", "new": "after"}),
+            &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        output,
+        ToolOutput::success("--- notes.txt\n+++ notes.txt\n@@ -1,1 +1,1 @@\n-before\n+after\n")
+    );
+    assert_eq!(
+        output.facts(),
+        Some(&ToolResultFacts::Edit {
+            path: "notes.txt".into(),
+            lines_added: 1,
+            lines_removed: 1,
+        })
+    );
 
     fs::remove_dir_all(root).unwrap();
 }

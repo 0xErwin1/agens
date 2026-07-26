@@ -481,6 +481,10 @@ pub enum TurnEvent {
         input: String,
     },
     ToolResult(MessagePart),
+    ToolResultFacts {
+        tool_call_id: String,
+        facts: ToolResultFacts,
+    },
 }
 
 /// Typed decomposition of a tool call's raw argument payload.
@@ -526,6 +530,27 @@ pub enum ToolInput {
     Other {
         name: String,
         raw: String,
+    },
+}
+
+/// Typed values a native tool reports about a call it has just completed.
+///
+/// Each variant carries only data the tool already produced while executing;
+/// nothing here is derived, scored, or interpreted. Absence of facts means the
+/// harness reported none for that call, not that the call was uneventful.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolResultFacts {
+    Write {
+        path: String,
+        bytes_written: usize,
+    },
+    Edit {
+        path: String,
+        lines_added: usize,
+        lines_removed: usize,
+    },
+    Bash {
+        exit_code: Option<i32>,
     },
 }
 
@@ -709,6 +734,21 @@ fn validate_completed_turn_events(events: &[TurnEvent]) -> Result<(), CompletedT
         .ok_or_else(CompletedTurnSnapshotError::invalid)
 }
 
+/// Events the coordinator emits for live observation only. They never enter
+/// persisted history and are never replayed, so the completed-turn validator
+/// must not see them.
+const fn is_live_only_event(event: &TurnEvent) -> bool {
+    matches!(event, TurnEvent::ToolResultFacts { .. })
+}
+
+fn persisted_history(events: &[TurnEvent]) -> Vec<TurnEvent> {
+    events
+        .iter()
+        .filter(|event| !is_live_only_event(event))
+        .cloned()
+        .collect()
+}
+
 fn consume_generated_events(
     coordinator: &mut TurnCoordinator,
     persisted_events: &[TurnEvent],
@@ -846,7 +886,7 @@ impl TurnCoordinator {
         }
 
         let snapshot = CompletedTurnSnapshot {
-            events: self.events.clone(),
+            events: persisted_history(&self.events),
         };
 
         self.completed_turn_persistence_attempted = true;
@@ -910,6 +950,20 @@ impl TurnCoordinator {
         content: String,
         is_error: bool,
     ) -> Result<(), TurnEventError> {
+        self.accept_tool_result_with_facts(tool_call_id, content, is_error, None)
+    }
+
+    /// Records a tool result and, when the harness reported them, the typed
+    /// facts for that call. The facts event is live-only: it is excluded from
+    /// persisted history and must never be regenerated during replay, which is
+    /// why replay uses `accept_tool_result` instead.
+    pub fn accept_tool_result_with_facts(
+        &mut self,
+        tool_call_id: &str,
+        content: String,
+        is_error: bool,
+        facts: Option<ToolResultFacts>,
+    ) -> Result<(), TurnEventError> {
         if self.state != TurnState::Dispatching {
             return Err(TurnEventError::UnexpectedToolResult {
                 tool_call_id: tool_call_id.into(),
@@ -933,6 +987,13 @@ impl TurnCoordinator {
                 content: bound_retained_tool_result(content),
                 is_error,
             }));
+
+        if let Some(facts) = facts {
+            self.events.push(TurnEvent::ToolResultFacts {
+                tool_call_id: tool_call_id.into(),
+                facts,
+            });
+        }
 
         if self.pending_tool_calls.is_empty() {
             self.transition_to(TurnState::Requesting)?;
@@ -999,6 +1060,7 @@ pub struct HeadlessToolCall {
 pub struct HeadlessToolOutput {
     pub content: String,
     pub is_error: bool,
+    pub facts: Option<ToolResultFacts>,
 }
 
 /// Sanitized terminal outcome emitted by the built-in synchronous task tool.
@@ -1040,6 +1102,7 @@ impl HeadlessToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            facts: None,
         }
     }
 
@@ -1047,7 +1110,14 @@ impl HeadlessToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            facts: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_facts(mut self, facts: ToolResultFacts) -> Self {
+        self.facts = Some(facts);
+        self
     }
 }
 
@@ -1381,8 +1451,10 @@ async fn run_headless_turn_with_iteration_limit(
                 .await
                 .map_err(|_| HeadlessTurnError::Store)?;
 
-            return CompletedTurnSnapshot::from_persisted_events(coordinator.events().to_vec())
-                .map_err(|_| HeadlessTurnError::State);
+            return CompletedTurnSnapshot::from_persisted_events(persisted_history(
+                coordinator.events(),
+            ))
+            .map_err(|_| HeadlessTurnError::State);
         }
 
         let mut preflight = Vec::with_capacity(tool_calls.len());
@@ -1431,7 +1503,12 @@ async fn run_headless_turn_with_iteration_limit(
             };
 
             coordinator
-                .accept_tool_result(&call.id, output.content, output.is_error)
+                .accept_tool_result_with_facts(
+                    &call.id,
+                    output.content,
+                    output.is_error,
+                    output.facts,
+                )
                 .map_err(|_| fail_state(&mut coordinator))?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
             if let Err(error) = check_cancelled(&mut coordinator, cancellation) {

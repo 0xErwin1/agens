@@ -89,7 +89,8 @@ pub(crate) fn completed_session_turn_from_events(
             TurnEvent::ToolResult(part) => (Role::Tool, part),
             TurnEvent::StateChanged(_)
             | TurnEvent::Usage(_)
-            | TurnEvent::ToolCallRequested { .. } => continue,
+            | TurnEvent::ToolCallRequested { .. }
+            | TurnEvent::ToolResultFacts { .. } => continue,
         };
         if role != Some(next_role) {
             if let Some(role) = role {
@@ -378,6 +379,52 @@ mod tests {
                         tool_call_id: "call-1".into(),
                         content: "tool output".into(),
                         is_error: false,
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("after tool".into())],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_session_turn_skips_tool_result_facts_without_a_role_message() {
+        let events = [
+            TurnEvent::ProviderPart(MessagePart::Text("before tool".into())),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "exit 1".into(),
+                is_error: true,
+            }),
+            TurnEvent::ToolResultFacts {
+                tool_call_id: "call-1".into(),
+                facts: agens_core::ToolResultFacts::Bash { exit_code: Some(1) },
+            },
+            TurnEvent::ProviderPart(MessagePart::Text("after tool".into())),
+        ];
+
+        let turn = completed_session_turn_from_events("prompt", &events, None)
+            .expect("completed session turn should skip live-only facts events");
+
+        assert_eq!(
+            turn.messages(),
+            &[
+                Message {
+                    role: Role::User,
+                    parts: vec![MessagePart::Text("prompt".into())],
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![MessagePart::Text("before tool".into())],
+                },
+                Message {
+                    role: Role::Tool,
+                    parts: vec![MessagePart::ToolResult {
+                        tool_call_id: "call-1".into(),
+                        content: "exit 1".into(),
+                        is_error: true,
                     }],
                 },
                 Message {

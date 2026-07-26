@@ -1462,11 +1462,17 @@ fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
         TurnEvent::Usage(_) => {
             unreachable!("presentation usage events are excluded from completed history")
         }
+        TurnEvent::ToolResultFacts { .. } => {
+            unreachable!("live-only tool result facts are excluded from completed history")
+        }
     }
 }
 
 fn persistable_turn_event(event: &TurnEvent) -> bool {
-    !matches!(event, TurnEvent::Usage(_))
+    !matches!(
+        event,
+        TurnEvent::Usage(_) | TurnEvent::ToolResultFacts { .. }
+    )
 }
 
 fn decode_turn_event(fields: PersistedTurnEvent) -> Result<TurnEvent, &'static str> {
@@ -1606,6 +1612,48 @@ mod tests {
                 TurnEvent::StateChanged(TurnState::Streaming),
                 TurnEvent::ProviderPart(MessagePart::Text("before usage".into())),
                 TurnEvent::ProviderPart(MessagePart::Text("after usage".into())),
+                TurnEvent::StateChanged(TurnState::Completed),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_tool_result_facts_events_when_converting_completed_history() {
+        let events = [
+            TurnEvent::StateChanged(TurnState::Requesting),
+            TurnEvent::StateChanged(TurnState::Streaming),
+            TurnEvent::ProviderPart(MessagePart::Text("before facts".into())),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "exit 1".into(),
+                is_error: true,
+            }),
+            TurnEvent::ToolResultFacts {
+                tool_call_id: "call-1".into(),
+                facts: agens_core::ToolResultFacts::Bash { exit_code: Some(1) },
+            },
+            TurnEvent::ProviderPart(MessagePart::Text("after facts".into())),
+            TurnEvent::StateChanged(TurnState::Completed),
+        ];
+
+        let persisted_events = events
+            .iter()
+            .filter(|event| persistable_turn_event(event))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            persisted_events,
+            vec![
+                TurnEvent::StateChanged(TurnState::Requesting),
+                TurnEvent::StateChanged(TurnState::Streaming),
+                TurnEvent::ProviderPart(MessagePart::Text("before facts".into())),
+                TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    content: "exit 1".into(),
+                    is_error: true,
+                }),
+                TurnEvent::ProviderPart(MessagePart::Text("after facts".into())),
                 TurnEvent::StateChanged(TurnState::Completed),
             ]
         );

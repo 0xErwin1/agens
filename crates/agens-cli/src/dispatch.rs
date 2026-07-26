@@ -122,22 +122,28 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
                     )
                     .map_err(headless_tool_error)
             })
-            .and_then(|output| {
-                if let Some(terminal) = output.terminal() {
-                    return Err(HeadlessTurnPortError::TaskTerminal(terminal));
-                }
-                let content = if output.is_error {
-                    sanitized_native_tool_failure(&output.content)
-                } else {
-                    output.content
-                };
-                Ok(HeadlessToolOutput {
-                    content,
-                    is_error: output.is_error,
-                })
-            });
+            .and_then(headless_output);
         std::future::ready(output)
     }
+}
+
+fn headless_output(output: ToolOutput) -> Result<HeadlessToolOutput, HeadlessTurnPortError> {
+    if let Some(terminal) = output.terminal() {
+        return Err(HeadlessTurnPortError::TaskTerminal(terminal));
+    }
+
+    let facts = output.facts().cloned();
+    let content = if output.is_error {
+        sanitized_native_tool_failure(&output.content)
+    } else {
+        output.content
+    };
+
+    Ok(HeadlessToolOutput {
+        content,
+        is_error: output.is_error,
+        facts,
+    })
 }
 
 pub(crate) fn sanitized_native_tool_failure(content: &str) -> String {
@@ -387,7 +393,28 @@ mod tests {
     use crate::tui::agents::select_tui_subagent;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
     use crate::tui::session::TuiSessionContext;
+    use agens_core::ToolResultFacts;
     use std::path::Path;
+
+    #[test]
+    fn sanitized_tool_failure_keeps_its_facts() {
+        let output = ToolOutput::failure("bash: exit 127").with_facts(ToolResultFacts::Bash {
+            exit_code: Some(127),
+        });
+
+        let converted = headless_output(output).expect("failing tool output is not terminal");
+
+        assert_eq!(
+            converted.content,
+            sanitized_native_tool_failure("bash: exit 127")
+        );
+        assert_eq!(
+            converted.facts,
+            Some(ToolResultFacts::Bash {
+                exit_code: Some(127)
+            })
+        );
+    }
 
     #[test]
     fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {

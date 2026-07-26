@@ -6,8 +6,9 @@ use agens_core::{
     CompletedTurnRepository, CompletedTurnSnapshot, CompletedTurnStoreError,
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    MessagePart, PermissionDecision, TurnEvent, TurnProgressSink, TurnProvider, TurnState,
-    run_headless_turn, run_headless_turn_with_max_iterations, run_headless_turn_with_progress,
+    MessagePart, PermissionDecision, ToolResultFacts, TurnEvent, TurnProgressSink, TurnProvider,
+    TurnState, run_headless_turn, run_headless_turn_with_max_iterations,
+    run_headless_turn_with_progress,
 };
 
 #[test]
@@ -45,6 +46,103 @@ fn progress_sink_receives_state_and_provider_events_before_completion() {
             TurnEvent::StateChanged(TurnState::Completed),
         ]
     );
+}
+
+#[test]
+fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let progress: TurnProgressSink = {
+        let observed = Arc::clone(&observed);
+        Arc::new(move |event| observed.lock().unwrap().push(event))
+    };
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 2\"}".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Allow],
+    };
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher {
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 2")
+            .with_facts(ToolResultFacts::Bash { exit_code: Some(2) }))],
+        ..ToolDispatcher::default()
+    };
+    let mut repository = Repository::default();
+
+    block_on_ready(run_headless_turn_with_progress(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+        Some(&progress),
+    ))
+    .unwrap();
+
+    let observed = observed.lock().unwrap();
+    let tool_result_index = observed
+        .iter()
+        .position(|event| matches!(event, TurnEvent::ToolResult(_)))
+        .expect("tool result event must reach the progress sink");
+
+    assert_eq!(
+        observed.get(tool_result_index + 1),
+        Some(&TurnEvent::ToolResultFacts {
+            tool_call_id: "call-1".into(),
+            facts: ToolResultFacts::Bash { exit_code: Some(2) },
+        })
+    );
+}
+
+#[test]
+fn headless_turn_snapshot_omits_tool_result_facts() {
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                input: "{\"command\":\"exit 2\"}".into(),
+            }]),
+            Ok(vec![MessagePart::Text("complete".into())]),
+        ],
+    };
+    let mut gate = PermissionGate {
+        decisions: vec![PermissionDecision::Allow],
+    };
+    let mut resolver = PermissionResolver::default();
+    let mut dispatcher = ToolDispatcher {
+        outputs: vec![Ok(HeadlessToolOutput::success("exit 2")
+            .with_facts(ToolResultFacts::Bash { exit_code: Some(2) }))],
+        ..ToolDispatcher::default()
+    };
+    let mut repository = Repository::default();
+
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut resolver,
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("headless turn should complete");
+
+    assert!(
+        !snapshot
+            .events()
+            .iter()
+            .any(|event| matches!(event, TurnEvent::ToolResultFacts { .. })),
+        "completed turn snapshot must omit live-only facts events"
+    );
+    assert_eq!(repository.snapshots, vec![snapshot]);
 }
 
 #[derive(Default)]

@@ -19,6 +19,7 @@ use std::{
 use agens_core::{
     Error, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter, PermissionDecision,
     PermissionPolicy, PermissionRequest, PermissionSession, ProjectPermissionGrant, ToolAccess,
+    ToolResultFacts,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -2930,6 +2931,7 @@ pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
     task_terminal: Option<HeadlessTaskTerminal>,
+    facts: Option<ToolResultFacts>,
 }
 
 impl PartialEq for ToolOutput {
@@ -2946,11 +2948,22 @@ impl ToolOutput {
             content: terminal.message().to_owned(),
             is_error: true,
             task_terminal: Some(terminal),
+            facts: None,
         }
     }
 
     pub fn terminal(&self) -> Option<HeadlessTaskTerminal> {
         self.task_terminal
+    }
+
+    #[must_use]
+    pub fn with_facts(mut self, facts: ToolResultFacts) -> Self {
+        self.facts = Some(facts);
+        self
+    }
+
+    pub fn facts(&self) -> Option<&ToolResultFacts> {
+        self.facts.as_ref()
     }
 }
 
@@ -3394,6 +3407,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             task_terminal: None,
+            facts: None,
         }
     }
 
@@ -3402,6 +3416,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             task_terminal: None,
+            facts: None,
         }
     }
 }
@@ -3758,10 +3773,18 @@ impl NativeTools {
         ));
 
         match result {
-            Ok(()) => Ok(ToolOutput::success(format!(
-                "wrote {}",
-                input.path.display()
-            ))),
+            Ok(()) => {
+                let bytes_written = input.content.len();
+
+                Ok(
+                    ToolOutput::success(format!("wrote {}", input.path.display())).with_facts(
+                        ToolResultFacts::Write {
+                            path: input.path.display().to_string(),
+                            bytes_written,
+                        },
+                    ),
+                )
+            }
             Err(output) => Ok(output),
         }
     }
@@ -4268,7 +4291,11 @@ impl NativeTools {
         let output = wait_for_readers(stdout_reader, stderr_reader)
             .map_err(|_| Error::Tool("bash: output reader failed".into()))?;
 
-        Ok(render_bash_result(&output, &exit_code(status), None))
+        let facts = ToolResultFacts::Bash {
+            exit_code: status.code(),
+        };
+
+        Ok(render_bash_result(&output, &exit_code(status), None).with_facts(facts))
     }
 
     fn resolve_existing(&self, path: &Path) -> Result<PathBuf, ToolOutput> {
@@ -5077,7 +5104,13 @@ fn edit_file_confined(
         original_identity,
         context,
     )?;
-    Ok(ToolOutput::success(diff))
+    Ok(
+        ToolOutput::success(diff.text).with_facts(ToolResultFacts::Edit {
+            path: path.display().to_string(),
+            lines_added: diff.lines_added,
+            lines_removed: diff.lines_removed,
+        }),
+    )
 }
 
 #[cfg(unix)]
@@ -5163,6 +5196,13 @@ fn write_edit_temp(
 }
 
 #[cfg(unix)]
+struct EditDiff {
+    text: String,
+    lines_added: usize,
+    lines_removed: usize,
+}
+
+#[cfg(unix)]
 fn unified_edit_diff(
     path: &Path,
     original: &str,
@@ -5170,7 +5210,7 @@ fn unified_edit_diff(
     old: &str,
     new: &str,
     match_offset: usize,
-) -> String {
+) -> EditDiff {
     const CONTEXT_LINES: usize = 3;
     let old_lines: Vec<_> = original.lines().collect();
     let new_lines: Vec<_> = replacement.lines().collect();
@@ -5206,7 +5246,12 @@ fn unified_edit_diff(
     for line in &new_lines[new_end..new_tail_end] {
         diff.push_str(&format!(" {line}\n"));
     }
-    diff
+
+    EditDiff {
+        text: diff,
+        lines_added: new_end - changed,
+        lines_removed: old_end - changed,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -5219,6 +5264,13 @@ mod native_tool_tests {
     };
 
     static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+    /// `write_edit_temp` names its temporary file from the process-global
+    /// `TEMP_FILE_SEQUENCE`, and some tests predict that name ahead of time.
+    /// Any concurrently running edit that reaches `write_edit_temp` also
+    /// advances the same counter, invalidating that prediction, so tests
+    /// relying on it must not run concurrently with each other.
+    static SEQUENTIAL_EDIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn project_root() -> PathBuf {
         let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
@@ -5233,7 +5285,127 @@ mod native_tool_tests {
     }
 
     #[test]
+    fn write_reports_relative_path_and_byte_count() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+        let body = "café \u{1F600}";
+
+        let output = tools
+            .write_file(WriteFileInput::new("notes.txt", body))
+            .unwrap();
+
+        assert!(!output.is_error);
+        assert_eq!(
+            output.facts(),
+            Some(&ToolResultFacts::Write {
+                path: "notes.txt".into(),
+                bytes_written: body.len(),
+            })
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn edit_reports_line_counts_matching_its_own_diff() {
+        let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
+        let root = project_root();
+        fs::write(root.join("notes.txt"), "one\ntwo\nthree\n").unwrap();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let output = tools
+            .edit_file(EditFileInput::new("notes.txt", "two", "alpha\nbeta\ngamma"))
+            .unwrap();
+
+        assert!(!output.is_error);
+        let diff_added = output
+            .content
+            .lines()
+            .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+            .count();
+        let diff_removed = output
+            .content
+            .lines()
+            .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+            .count();
+        assert_eq!(
+            output.facts(),
+            Some(&ToolResultFacts::Edit {
+                path: "notes.txt".into(),
+                lines_added: 3,
+                lines_removed: 1,
+            })
+        );
+        assert_eq!(diff_added, 3);
+        assert_eq!(diff_removed, 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_reports_its_exit_code() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+
+        for (command, expected) in [("exit 0", 0), ("exit 3", 3)] {
+            let output = tools
+                .bash(BashInput::new(command).with_timeout(Duration::from_secs(5)))
+                .unwrap();
+
+            assert_eq!(
+                output.facts(),
+                Some(&ToolResultFacts::Bash {
+                    exit_code: Some(expected)
+                })
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bash_timeout_reports_no_facts() {
+        let root = project_root();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let output = tools
+            .bash(BashInput::new("sleep 5").with_timeout(Duration::from_millis(50)))
+            .unwrap();
+
+        assert!(output.is_error);
+        assert_eq!(output.facts(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failing_tools_report_no_facts() {
+        let root = project_root();
+        fs::write(root.join("notes.txt"), "old").unwrap();
+        let tools = NativeTools::open(&root).unwrap();
+
+        let rejected_write = tools
+            .write_file(WriteFileInput::new("../outside.txt", "x"))
+            .unwrap();
+        assert!(rejected_write.is_error);
+        assert_eq!(rejected_write.facts(), None);
+
+        let missing_edit = tools
+            .edit_file(EditFileInput::new("notes.txt", "missing", "new"))
+            .unwrap();
+        assert!(missing_edit.is_error);
+        assert_eq!(missing_edit.facts(), None);
+
+        let read = tools.read_file(ReadFileInput::new("notes.txt")).unwrap();
+        assert!(!read.is_error);
+        assert_eq!(read.facts(), None);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn exact_edit_rejects_deterministic_races_and_cleans_up() {
+        let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
         let root = project_root();
         let outside = project_root();
         let target = root.join("notes.txt");
