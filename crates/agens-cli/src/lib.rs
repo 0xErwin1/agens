@@ -48,14 +48,18 @@ use agens_core::{PermissionMode, TurnProgressSink};
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_core::{TurnEvent, TurnState};
 #[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use agens_providers::DiagnosticRef;
+#[cfg(test)]
 use agens_providers::ProviderDiagnosticComponent;
+use agens_providers::ProviderDiagnosticKind;
 #[cfg(test)]
 use agens_providers::chatgpt_login::LoginError;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_providers::chatgpt_login::upsert_provider_entry;
-use agens_providers::{DiagnosticRef, ProviderDiagnosticKind};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -78,10 +82,7 @@ use agens_tools::TaskTerminalState;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
 use agens_tools::ToolDispatcher;
-use agens_tools::{
-    AgentCatalog, AgentModelValidator, CommandCatalog, McpEndpointSummary, McpStatusSnapshot,
-    ReadFileInput, SkillCatalog,
-};
+use agens_tools::{AgentCatalog, AgentModelValidator, CommandCatalog, ReadFileInput, SkillCatalog};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -105,8 +106,8 @@ use agens_tui::TuiSubmitOrigin;
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tui::{BridgeCancel, BridgeTx};
 use agens_tui::{
-    Conversation, DialogEntry, DialogView, Engine as TuiEngine, Tui, TuiPresentation,
-    TuiRouteCancellation, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubmissionOutcome,
+    Conversation, Engine as TuiEngine, Tui, TuiPresentation, TuiRouteCancellation, TuiRuntimeEvent,
+    TuiSubagentErrorKind, TuiSubmissionOutcome,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -168,11 +169,12 @@ use commands::config::run_config;
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use diagnostics::{
-    DIAGNOSTIC_FILE_COUNT_LIMIT, DIAGNOSTIC_REFERENCE_SEQUENCE, SafeDiagnosticStore,
+    DIAGNOSTIC_FILE_COUNT_LIMIT, DIAGNOSTIC_FILE_LIMIT_BYTES, DIAGNOSTIC_REFERENCE_SEQUENCE,
+    SafeDiagnosticStore,
 };
 use diagnostics::{
-    DIAGNOSTIC_FILE_LIMIT_BYTES, next_diagnostic_reference, operation_diagnostics,
-    record_agent_diagnostic, record_parent_terminal, record_subagent_terminal,
+    next_diagnostic_reference, operation_diagnostics, record_agent_diagnostic,
+    record_parent_terminal, record_subagent_terminal,
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -250,6 +252,10 @@ use tools::task::{
     production_tui_task_runtime, production_tui_task_runtime_with_runner,
     production_tui_task_runtime_with_runner_and_parent_config,
 };
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use tui::dialogs::diagnostics_dialog;
 use tui::engine::{ProductionTuiEngine, run_production_tui};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
@@ -573,182 +579,6 @@ fn report_tui_extension_collisions<E: TuiEngine>(
             "Skill /{} is shadowed by a command; command routing wins.",
             skill.name()
         ));
-    }
-}
-
-fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
-    let entries = snapshot
-        .servers()
-        .iter()
-        .map(|server| {
-            let descriptor = server.descriptor();
-            let transport = format!("{:?}", descriptor.transport()).to_lowercase();
-            let state = format!("{:?}", server.state()).to_lowercase();
-            let enabled = if descriptor.enabled() { "enabled" } else { "disabled" };
-            let source = format!("{:?}", descriptor.source()).to_lowercase();
-            let tools = server.tool_names().join(", ");
-            let endpoint = descriptor.endpoint().map_or("not configured", McpEndpointSummary::as_str);
-            let error = server.last_error().map_or_else(
-                || "none".into(),
-                |error| format!("{}: {}", format!("{:?}", error.category()).to_lowercase(), error.message()),
-            );
-            DialogEntry::read_only(
-                format!("{}  {transport}  {enabled}/{state}  {} tools", descriptor.name(), server.tool_count()),
-                format!("{} {transport} {state} {tools}", descriptor.name()),
-                format!(
-                    "Source: {source}\nEndpoint: {endpoint}\nTimeout: {}ms\nTools: {}\nLast error: {error}",
-                    descriptor.timeout().as_millis(),
-                    if tools.is_empty() { "none" } else { &tools },
-                ),
-            )
-        })
-        .collect();
-    DialogView::read_only("MCP servers", None::<&str>, entries, "mcp")
-        .with_empty_message("No MCP servers configured.")
-}
-
-fn diagnostics_dialog(data_directory: &Path) -> DialogView {
-    let directory = data_directory.join("diagnostics");
-    let safe_directory =
-        fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir());
-    let mut files = match safe_directory.then(|| fs::read_dir(&directory)) {
-        Some(Ok(entries)) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let name = entry.file_name().into_string().ok()?;
-                is_diagnostic_file_name(&name).then_some((name, entry.path()))
-            })
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut entries = Vec::new();
-    for (name, path) in files {
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.file_type().is_file() || metadata.len() > DIAGNOSTIC_FILE_LIMIT_BYTES {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let relative_path = format!("diagnostics/{name}");
-        entries.extend(content.lines().filter_map(|line| {
-            let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
-            safe_diagnostic_entry(&value, &relative_path)
-        }));
-    }
-
-    DialogView::read_only(
-        "Runtime diagnostics",
-        Some("Sanitized local events"),
-        entries,
-        "diagnostics",
-    )
-    .with_empty_message("No runtime diagnostics are available.")
-}
-
-fn is_diagnostic_file_name(name: &str) -> bool {
-    let Some(identifier) = name
-        .strip_prefix("agens-")
-        .and_then(|name| name.strip_suffix(".jsonl"))
-    else {
-        return false;
-    };
-    let mut parts = identifier.split('.');
-    let Some(process) = parts.next() else {
-        return false;
-    };
-    if process.is_empty() || !process.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    match (parts.next(), parts.next()) {
-        (None, None) => true,
-        (Some(generation), None) => matches!(generation, "1" | "2" | "3"),
-        _ => false,
-    }
-}
-
-fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Option<DialogEntry> {
-    let object = value.as_object()?;
-    let timestamp = object.get("timestamp_ms")?.as_u64()?;
-    let reference = object.get("reference")?.as_str()?;
-    DiagnosticRef::new(reference.to_owned()).ok()?;
-    let scope =
-        allowlisted_diagnostic_value(object.get("scope")?.as_str()?, &["parent", "subagent"])?;
-    let component = allowlisted_diagnostic_value(
-        object.get("component")?.as_str()?,
-        &["responses", "oauth_refresh", "subagent", "agent"],
-    )?;
-    let event = allowlisted_diagnostic_value(
-        object.get("event")?.as_str()?,
-        &[
-            "attempt",
-            "retry_scheduled",
-            "terminal",
-            "agent_unavailable",
-            "agent_fallback",
-        ],
-    )?;
-    let attempt = object
-        .get("attempt")?
-        .as_u64()
-        .filter(|attempt| *attempt <= 3)?;
-    let max_attempts = object
-        .get("max_attempts")?
-        .as_u64()
-        .filter(|attempts| *attempts <= 3)?;
-    let delay = optional_bounded_u64(object.get("delay_ms"), 5_000)?;
-    let status = optional_bounded_u64(object.get("status"), 599)?;
-    let class = match object.get("class") {
-        Some(serde_json::Value::String(class)) => Some(allowlisted_diagnostic_value(
-            class,
-            &[
-                "authentication",
-                "cancelled",
-                "context",
-                "deadline",
-                "model_unavailable",
-                "network",
-                "provider",
-                "protocol",
-                "rate_limited",
-                "rejected",
-                "runtime",
-                "server",
-                "tool",
-            ],
-        )?),
-        Some(serde_json::Value::Null) | None => None,
-        Some(_) => return None,
-    };
-    let class_label = class.unwrap_or("success");
-    let status_label = status.map_or_else(|| "none".into(), |status| status.to_string());
-    let delay_label = delay.map_or_else(|| "none".into(), |delay| format!("{delay}ms"));
-    let label = format!("[ref: {reference}] {scope} · {component} · {event} · {class_label}");
-    let detail = format!(
-        "Source: {relative_path}\nTimestamp: {timestamp}\nAttempt: {attempt}/{max_attempts}\nHTTP status: {status_label}\nRetry delay: {delay_label}"
-    );
-    Some(DialogEntry::read_only(
-        label.clone(),
-        format!("{reference} {scope} {component} {event} {class_label}"),
-        detail,
-    ))
-}
-
-fn allowlisted_diagnostic_value<'a>(value: &'a str, allowed: &[&str]) -> Option<&'a str> {
-    allowed.contains(&value).then_some(value)
-}
-
-fn optional_bounded_u64(value: Option<&serde_json::Value>, maximum: u64) -> Option<Option<u64>> {
-    match value {
-        Some(serde_json::Value::Number(number)) => {
-            Some(Some(number.as_u64().filter(|value| *value <= maximum)?))
-        }
-        Some(serde_json::Value::Null) | None => Some(None),
-        Some(_) => None,
     }
 }
 

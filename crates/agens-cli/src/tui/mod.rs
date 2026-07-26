@@ -1,3 +1,4 @@
+pub(crate) mod dialogs;
 pub(crate) mod engine;
 pub(crate) mod extensions;
 pub(crate) mod metrics;
