@@ -17,7 +17,7 @@ use std::{
 };
 
 use agens_core::{
-    EditMagnitude, Error, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
+    EditMagnitude, Error, FactPath, HeadlessTaskTerminal, HeadlessTurnCancellationAdapter,
     PermissionDecision, PermissionPolicy, PermissionRequest, PermissionSession,
     ProjectPermissionGrant, ToolAccess, ToolOutcome, ToolResultFacts, WriteMagnitude,
 };
@@ -3780,7 +3780,7 @@ impl NativeTools {
                 Ok(
                     ToolOutput::success(format!("wrote {}", input.path.display())).with_facts(
                         ToolResultFacts::Write {
-                            path: input.path.display().to_string(),
+                            path: FactPath::new(&input.path.display().to_string()),
                             outcome: ToolOutcome::Succeeded,
                             written: Some(WriteMagnitude {
                                 is_new_file,
@@ -5118,7 +5118,7 @@ fn edit_file_confined(
     )?;
     Ok(
         ToolOutput::success(diff.text).with_facts(ToolResultFacts::Edit {
-            path: path.display().to_string(),
+            path: FactPath::new(&path.display().to_string()),
             outcome: ToolOutcome::Succeeded,
             changed: Some(EditMagnitude {
                 lines_added: diff.lines_added,
@@ -5314,7 +5314,7 @@ mod native_tool_tests {
         assert_eq!(
             output.facts(),
             Some(&ToolResultFacts::Write {
-                path: "notes.txt".into(),
+                path: FactPath::new("notes.txt"),
                 outcome: ToolOutcome::Succeeded,
                 written: Some(WriteMagnitude {
                     is_new_file: true,
@@ -5374,7 +5374,7 @@ mod native_tool_tests {
         assert_eq!(
             output.facts(),
             Some(&ToolResultFacts::Edit {
-                path: "notes.txt".into(),
+                path: FactPath::new("notes.txt"),
                 outcome: ToolOutcome::Succeeded,
                 changed: Some(EditMagnitude {
                     lines_added: 3,

@@ -5,10 +5,11 @@ use std::{
 
 use agens_core::{
     AttemptKey, CompletedTurnPersistenceError, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, Error, ErrorCategory, Message, MessagePart, PermissionDecision,
-    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest, PermissionRule,
-    PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolOutcome, ToolResultFacts,
-    TurnCoordinator, TurnEvent, TurnEventError, TurnState, TurnTransitionError, WriteMagnitude,
+    CompletedTurnStoreError, Error, ErrorCategory, FactPath, Message, MessagePart,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRequest,
+    PermissionRule, PermissionSession, ProjectPermissionGrant, Role, ToolAccess, ToolOutcome,
+    ToolResultFacts, TurnCoordinator, TurnEvent, TurnEventError, TurnState, TurnTransitionError,
+    WriteMagnitude,
 };
 
 #[derive(Default)]
@@ -937,7 +938,7 @@ fn accept_tool_result_orders_facts_between_result_and_state_change() {
             "wrote a.txt".into(),
             false,
             Some(ToolResultFacts::Write {
-                path: "a.txt".into(),
+                path: FactPath::new("a.txt"),
                 outcome: ToolOutcome::Succeeded,
                 written: Some(WriteMagnitude {
                     is_new_file: true,
@@ -967,7 +968,7 @@ fn accept_tool_result_orders_facts_between_result_and_state_change() {
             assert_eq!(
                 *facts,
                 ToolResultFacts::Write {
-                    path: "a.txt".into(),
+                    path: FactPath::new("a.txt"),
                     outcome: ToolOutcome::Succeeded,
                     written: Some(WriteMagnitude {
                         is_new_file: true,
@@ -1340,7 +1341,7 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
             "wrote a.txt".into(),
             false,
             Some(ToolResultFacts::Write {
-                path: "a.txt".into(),
+                path: FactPath::new("a.txt"),
                 outcome: ToolOutcome::Succeeded,
                 written: Some(WriteMagnitude {
                     is_new_file: true,
@@ -1381,7 +1382,7 @@ fn two_concurrent_tool_calls_pin_the_full_result_facts_slice() {
             assert_eq!(
                 *facts,
                 ToolResultFacts::Write {
-                    path: "a.txt".into(),
+                    path: FactPath::new("a.txt"),
                     outcome: ToolOutcome::Succeeded,
                     written: Some(WriteMagnitude {
                         is_new_file: true,

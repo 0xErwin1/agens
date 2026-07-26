@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agens_core::{EditMagnitude, Error, ToolOutcome, ToolResultFacts};
+use agens_core::{EditMagnitude, Error, FactPath, ToolOutcome, ToolResultFacts};
 use agens_tools::{
     BashInput, EditFileInput, GlobInput, GrepInput, ListDirectoryInput, NativeToolCatalog,
     NativeToolLimits, NativeTools, ReadFileInput, SearchInput, ToolExecutionContext, ToolOutput,
@@ -777,7 +777,7 @@ fn native_catalog_preserves_edit_facts() {
     assert_eq!(
         output.facts(),
         Some(&ToolResultFacts::Edit {
-            path: "notes.txt".into(),
+            path: FactPath::new("notes.txt"),
             outcome: ToolOutcome::Succeeded,
             changed: Some(EditMagnitude {
                 lines_added: 1,

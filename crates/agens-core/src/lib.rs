@@ -645,12 +645,12 @@ pub struct EditMagnitude {
 #[non_exhaustive]
 pub enum ToolResultFacts {
     Write {
-        path: String,
+        path: FactPath,
         outcome: ToolOutcome,
         written: Option<WriteMagnitude>,
     },
     Edit {
-        path: String,
+        path: FactPath,
         outcome: ToolOutcome,
         changed: Option<EditMagnitude>,
     },
@@ -2427,7 +2427,7 @@ mod tests {
     use super::{
         AttemptKey, CompletedTurnSnapshot, FactPath, MessagePart, PermissionPattern,
         RecoveryOutcome, RetryBoundary, SessionAttemptFailureKind, SessionAttemptStatus,
-        SessionAttemptSummary, TurnCoordinator, TurnEvent,
+        SessionAttemptSummary, ToolOutcome, ToolResultFacts, TurnCoordinator, TurnEvent,
     };
 
     #[test]
@@ -2632,6 +2632,34 @@ mod tests {
 
         assert!(path.is_representable());
         assert_eq!(path.relative(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn a_writes_reported_path_enforces_the_fact_path_contract() {
+        let facts = ToolResultFacts::Write {
+            path: FactPath::new("/etc/passwd"),
+            outcome: ToolOutcome::Failed,
+            written: None,
+        };
+
+        match facts {
+            ToolResultFacts::Write { path, .. } => assert!(!path.is_representable()),
+            other => panic!("expected write facts, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_edits_reported_path_enforces_the_fact_path_contract() {
+        let facts = ToolResultFacts::Edit {
+            path: FactPath::new("notes\n.txt"),
+            outcome: ToolOutcome::Failed,
+            changed: None,
+        };
+
+        match facts {
+            ToolResultFacts::Edit { path, .. } => assert!(!path.is_representable()),
+            other => panic!("expected edit facts, got {other:?}"),
+        }
     }
 
     #[test]
