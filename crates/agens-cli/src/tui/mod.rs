@@ -6,6 +6,7 @@ pub(crate) mod metrics;
 pub(crate) mod provider;
 pub(crate) mod router;
 pub(crate) mod session;
+pub(crate) mod turn;
 
 use crate::CliDependencies;
 use crate::bootstrap::bootstrap;

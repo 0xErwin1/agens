@@ -41,13 +41,13 @@ use crate::tui::session::{
     TuiSessionContext, current_session_timestamp, parse_recovery_action,
     recovery_confirmation_dialog, reset_tui_session, session_dialog_entry,
 };
+use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
 use crate::{
     apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
-    commit_tui_session_resume, current_tui_provider, effective_tui_model, format_model_metadata,
-    load_tui_session_for_resume, persist_pending_agent_correction,
-    prepare_loaded_tui_session_resume, resolve_provider_type, resume_tui_session, rotate_tui_agent,
-    select_tui_effort, select_tui_model, select_tui_subagent, tui_agent_catalog_for_context,
-    tui_model_source, tui_project_identifier, tui_session_presentation, tui_subagent_catalog,
+    commit_tui_session_resume, format_model_metadata, load_tui_session_for_resume,
+    persist_pending_agent_correction, prepare_loaded_tui_session_resume, resolve_provider_type,
+    resume_tui_session, rotate_tui_agent, select_tui_effort, select_tui_model, select_tui_subagent,
+    tui_agent_catalog_for_context, tui_model_source, tui_project_identifier, tui_subagent_catalog,
 };
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";

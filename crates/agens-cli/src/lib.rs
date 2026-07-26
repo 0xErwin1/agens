@@ -27,10 +27,14 @@ use agens_config::{
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
+use agens_core::Role;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
 use agens_core::SessionMetadata;
 use agens_core::{
     AgentDefinition, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
-    RetryBoundary, Role, SessionAttemptStatus,
+    RetryBoundary, SessionAttemptStatus,
 };
 #[cfg(test)]
 use agens_core::{
@@ -100,13 +104,17 @@ use agens_tools::{TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
+use agens_tui::TuiPresentation;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
 use agens_tui::TuiSubmitOrigin;
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use agens_tui::{BridgeCancel, BridgeTx};
 use agens_tui::{
-    Conversation, Engine as TuiEngine, Tui, TuiPresentation, TuiRouteCancellation, TuiRuntimeEvent,
+    Conversation, Engine as TuiEngine, Tui, TuiRouteCancellation, TuiRuntimeEvent,
     TuiSubagentErrorKind, TuiSubmissionOutcome,
 };
 #[cfg(test)]
@@ -185,10 +193,10 @@ use dispatch::{
     poll_permission_port, sanitized_native_tool_failure, selected_tui_task_skips_parent,
 };
 use error::cancellation_result;
-use headless::{
-    HeadlessChatCompletion, HeadlessChatFailure, block_on_headless_turn,
-    run_production_headless_chat,
-};
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls these unqualified. Remove this re-export once the test module moves.
+use headless::{HeadlessChatCompletion, HeadlessChatFailure};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
@@ -196,6 +204,7 @@ use headless::{
     RequestedSubagent, interrupted_turn_note, provider_messages, record_requested_subagent,
     run_production_headless_chat_with_progress,
 };
+use headless::{block_on_headless_turn, run_production_headless_chat};
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls this unqualified. Remove this re-export once the test module moves.
@@ -298,13 +307,18 @@ use tui::session::{
 };
 #[cfg(test)]
 // Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
+// calls this unqualified. Remove this re-export once the test module moves.
+use tui::turn::complete_tui_turn;
+use tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
+use turns::sanitize_subagent_summary;
+#[cfg(test)]
+// Scaffolding for Phase 3: `mod tests` still opens with `use super::*;` and
 // calls these unqualified. Remove this re-export once the test module moves.
 use turns::{
     MAX_PERSISTED_SUBAGENT_RESULT_CHARS, SUBAGENT_RESULT_TRUNCATION_MARKER, completed_session_turn,
     completed_session_turn_from_events, completed_subagent_session_turn,
     persist_completed_subagent_turn,
 };
-use turns::{SUBAGENT_CALL_ID_PREFIX, sanitize_subagent_summary};
 
 pub use bootstrap::{Bootstrap, bootstrap};
 pub use error::{CliError, CommandResult, ExitStatus};
@@ -593,143 +607,6 @@ fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootstrap:
     if let Some(project_root) = bootstrap.project_root() {
         tui.set_project(project_root.display().to_string());
     }
-}
-
-fn complete_tui_turn(
-    session: &mut TuiSessionContext,
-    completion: Result<HeadlessChatCompletion, HeadlessChatFailure>,
-    consumed_reminder: bool,
-) -> Result<String, CliError> {
-    let completion = match completion {
-        Ok(completion) => completion,
-        Err(failure) => {
-            if let Some(partial) = failure.partial {
-                session.identifier = Some(partial.metadata.id);
-                session.metadata = Some(partial.metadata);
-                adopt_turn_history(session, partial.messages);
-            }
-
-            return Err(failure.error);
-        }
-    };
-    session.identifier = Some(completion.metadata.id);
-    session.metadata = Some(completion.metadata);
-    adopt_turn_history(session, completion.messages);
-    if consumed_reminder {
-        session.pending_system_reminder = None;
-    }
-    Ok(completion.text)
-}
-
-/// A background subagent turn can be persisted after the foreground turn reloaded the session, so
-/// adopting the turn's history alone would drop that turn from the in-process request history for
-/// the rest of the process even though the store keeps it.
-fn adopt_turn_history(session: &mut TuiSessionContext, history: Vec<Message>) {
-    let preserved = missing_subagent_turns(&session.messages, &history);
-    session.messages = history;
-    session.messages.extend(preserved);
-}
-
-fn missing_subagent_turns(previous: &[Message], history: &[Message]) -> Vec<Message> {
-    let known = history
-        .iter()
-        .flat_map(|message| message.parts.iter())
-        .filter_map(subagent_call_id)
-        .collect::<BTreeSet<_>>();
-
-    previous
-        .windows(3)
-        .filter(|window| {
-            let [user, assistant, tool] = window else {
-                return false;
-            };
-            let Some(call_id) = assistant.parts.iter().find_map(subagent_call_id) else {
-                return false;
-            };
-
-            user.role == Role::User
-                && !known.contains(call_id)
-                && tool.parts.iter().any(|part| match part {
-                    MessagePart::ToolResult { tool_call_id, .. } => tool_call_id == call_id,
-                    _ => false,
-                })
-        })
-        .flatten()
-        .cloned()
-        .collect()
-}
-
-fn subagent_call_id(part: &MessagePart) -> Option<&str> {
-    match part {
-        MessagePart::ToolCall { id, .. } if id.starts_with(SUBAGENT_CALL_ID_PREFIX) => Some(id),
-        _ => None,
-    }
-}
-
-fn current_tui_provider(bootstrap: &Bootstrap, context: &TuiSessionContext) -> Option<TuiProvider> {
-    if context.chatgpt_unavailable {
-        return None;
-    }
-    if context.resume_error.is_some()
-        && context
-            .metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.provider_id.is_some())
-        && context.provider.is_none()
-    {
-        return None;
-    }
-    context
-        .provider
-        .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
-}
-
-fn effective_tui_model(bootstrap: &Bootstrap, context: &TuiSessionContext) -> String {
-    context
-        .selection
-        .as_ref()
-        .map(TuiModelSelector::model)
-        .or_else(|| {
-            context
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.model_id.as_deref())
-        })
-        .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap))
-        .to_owned()
-}
-
-fn tui_session_presentation(bootstrap: &Bootstrap, session: &TuiSessionContext) -> TuiPresentation {
-    let model = effective_tui_model(bootstrap, session);
-    let provider = session
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.provider_id.as_deref())
-        .or_else(|| current_tui_provider(bootstrap, session).map(TuiProvider::identifier))
-        .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
-    let label = session
-        .identifier
-        .map_or_else(|| "new session".into(), |id| format!("session #{id}"));
-    let effort = session
-        .selection
-        .as_ref()
-        .and_then(|selection| {
-            selection
-                .reasoning_effort()
-                .or_else(|| selection.reasoning_effort_default())
-        })
-        .or_else(|| {
-            TuiModelSelector::for_source(&model, tui_model_source(bootstrap, session))
-                .reasoning_effort_default()
-        });
-    let mut presentation = TuiPresentation::new(provider, &model, label)
-        .with_context_window(model_registry::context_window_for(&model))
-        .with_dangerous_mode(session.dangerous_mode);
-    if let Some(effort) = effort {
-        presentation = presentation.with_effort(effort);
-    }
-    presentation
 }
 
 fn apply_tui_selection(
