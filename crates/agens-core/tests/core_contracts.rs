@@ -1189,14 +1189,50 @@ fn fact_sequence_is_monotonic_and_gap_free_across_three_calls_in_one_turn() {
     assert_eq!(sequences, vec![1, 2, 3]);
 }
 
-#[test]
-fn no_second_acceptance_entry_point_symbol_exists() {
-    let source = include_str!("../src/lib.rs");
+type AcceptToolResultSignature = fn(
+    &mut TurnCoordinator,
+    &str,
+    String,
+    bool,
+    Option<ToolResultFacts>,
+) -> Result<(), TurnEventError>;
 
-    assert!(
-        !source.contains("accept_tool_result_with_facts"),
-        "a second facts-taking acceptance function must not exist; every call site must state \
-         its choice explicitly through the single accept_tool_result entry point"
+#[test]
+fn accept_tool_result_is_the_only_public_function_accepting_tool_result_facts() {
+    // Pins the acceptance function's exact signature at compile time — Rust has no
+    // reflection to prove a second facts-taking function does not exist anywhere in the
+    // crate, so this coercion is a genuine but partial guarantee: it proves this function
+    // exists with this shape, not that no other one does.
+    let _typed_entry_point: AcceptToolResultSignature = TurnCoordinator::accept_tool_result;
+
+    // Scans every public function signature in the source for one that also accepts
+    // `Option<ToolResultFacts>`. Unlike a check for the literal name
+    // `accept_tool_result_with_facts`, this survives a rename of a reintroduced second
+    // entry point to any other name, because it matches on the parameter type rather
+    // than on an identifier.
+    let source = include_str!("../src/lib.rs");
+    let mut facts_accepting_functions = 0;
+    let mut search_from = 0;
+
+    while let Some(offset) = source[search_from..].find("pub fn ") {
+        let start = search_from + offset;
+        let Some(brace_offset) = source[start..].find('{') else {
+            break;
+        };
+        let signature = &source[start..start + brace_offset];
+
+        if signature.contains("Option<ToolResultFacts>") {
+            facts_accepting_functions += 1;
+        }
+
+        search_from = start + brace_offset + 1;
+    }
+
+    assert_eq!(
+        facts_accepting_functions, 1,
+        "exactly one public function may accept Option<ToolResultFacts>; a second \
+         facts-accepting entry point under any name would defeat the single acceptance \
+         function guarantee"
     );
 }
 

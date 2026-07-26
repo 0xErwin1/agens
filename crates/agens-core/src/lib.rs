@@ -542,7 +542,7 @@ pub enum ToolInput {
 /// this key. The total order within a session is `(session_id, attempt_id,
 /// sequence)`. `session_id` and `attempt_id` are `None` for turns that run
 /// outside a session attempt, such as subagent child turns; `dispatch_id` is
-/// reserved for the gRPC facade and is always `None` in this change.
+/// reserved for the gRPC facade and is currently always `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FactIdentity {
@@ -559,8 +559,9 @@ pub struct FactIdentity {
 /// nothing here is derived, scored, or interpreted. Absence of facts means the
 /// harness reported none for that call, not that the call was uneventful.
 ///
-/// Marked `#[non_exhaustive]` because AGN-47 and AGN-58 add further variants
-/// and downstream crates already match on this enum with a wildcard arm.
+/// Marked `#[non_exhaustive]` because further variants are expected as more
+/// tools report facts, and downstream crates already match on this enum with
+/// a wildcard arm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ToolResultFacts {

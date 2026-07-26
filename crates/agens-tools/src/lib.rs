@@ -5286,6 +5286,7 @@ mod native_tool_tests {
 
     #[test]
     fn write_reports_relative_path_and_byte_count() {
+        let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
         let root = project_root();
         let tools = NativeTools::open(&root).unwrap();
         let body = "café \u{1F600}";
