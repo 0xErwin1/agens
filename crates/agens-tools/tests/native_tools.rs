@@ -603,6 +603,25 @@ fn reads_a_project_relative_file() {
 }
 
 #[test]
+fn a_successful_read_reports_its_path() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "project note").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    let output = tools.read_file(ReadFileInput::new("notes.txt")).unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(
+        output.facts(),
+        Some(&ToolResultFacts::Read {
+            path: FactPath::new("notes.txt"),
+            outcome: ToolOutcome::Succeeded,
+        })
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn confined_read_write_creates_parents_and_reads_one_based_ranges() {
     let root = project_root();
     let tools = NativeTools::open(&root).unwrap();
@@ -865,6 +884,74 @@ fn list_and_search_fail_when_configured_work_budgets_are_exhausted() {
     assert_eq!(
         tools.search(SearchInput::new("flat", "needle")).unwrap(),
         ToolOutput::failure("search: entry limit of 3 exceeded")
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_and_grep_report_an_untruncated_match_count() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "needle\nother\nneedle\n").unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    let search_output = tools.search(SearchInput::new(".", "needle")).unwrap();
+    assert!(!search_output.is_error);
+    assert_eq!(
+        search_output.facts(),
+        Some(&ToolResultFacts::Search {
+            outcome: ToolOutcome::Succeeded,
+            match_count: 2,
+            truncated: false,
+        })
+    );
+
+    let grep_output = tools.grep(GrepInput::new("needle")).unwrap();
+    assert!(!grep_output.is_error);
+    assert_eq!(
+        grep_output.facts(),
+        Some(&ToolResultFacts::Search {
+            outcome: ToolOutcome::Succeeded,
+            match_count: 2,
+            truncated: false,
+        })
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_truncated_grep_reports_the_match_count_before_the_truncation_marker() {
+    let root = project_root();
+    fs::write(root.join("notes.txt"), "needle\nneedle\nneedle\n").unwrap();
+    let tools = NativeTools::open_with_limits(
+        &root,
+        NativeToolLimits {
+            max_list_entries: 10,
+            max_search_entries: 10,
+            max_search_results: 2,
+            max_search_depth: 32,
+            operation_timeout: Duration::from_secs(1),
+            bash_timeout: Duration::from_secs(1),
+        },
+    )
+    .unwrap();
+
+    let output = tools.grep(GrepInput::new("needle")).unwrap();
+
+    assert!(!output.is_error);
+    assert!(
+        output
+            .content
+            .contains("[grep output truncated after 2 results]")
+    );
+    assert_eq!(
+        output.facts(),
+        Some(&ToolResultFacts::Search {
+            outcome: ToolOutcome::Succeeded,
+            match_count: 2,
+            truncated: true,
+        })
     );
 
     fs::remove_dir_all(root).unwrap();

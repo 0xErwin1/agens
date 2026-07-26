@@ -3707,7 +3707,13 @@ impl NativeTools {
             "read: secure confined reads are unavailable on this platform",
         ));
 
-        Ok(result.unwrap_or_else(|output| output))
+        match result {
+            Ok(output) => Ok(output.with_facts(ToolResultFacts::Read {
+                path: FactPath::new(&input.path.display().to_string()),
+                outcome: ToolOutcome::Succeeded,
+            })),
+            Err(output) => Ok(output),
+        }
     }
 
     /// Lists bounded, readable project files for the TUI `@file` picker.
@@ -3912,7 +3918,14 @@ impl NativeTools {
             return Ok(output);
         }
 
-        Ok(ToolOutput::success(results.join("")))
+        let match_count = results.len();
+        Ok(
+            ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
+                outcome: ToolOutcome::Succeeded,
+                match_count,
+                truncated: false,
+            }),
+        )
     }
 
     pub fn grep(&self, input: GrepInput) -> Result<ToolOutput, Error> {
@@ -3982,18 +3995,32 @@ impl NativeTools {
                 }
                 if regex.is_match(text) {
                     if results.len() == self.limits.max_search_results {
+                        let match_count = results.len();
                         results.push(format!(
                             "[grep output truncated after {} results]\n",
                             self.limits.max_search_results
                         ));
-                        return Ok(ToolOutput::success(results.join("")));
+                        return Ok(ToolOutput::success(results.join("")).with_facts(
+                            ToolResultFacts::Search {
+                                outcome: ToolOutcome::Succeeded,
+                                match_count,
+                                truncated: true,
+                            },
+                        ));
                     }
                     results.push(format!("{}:{}:{text}\n", relative.display(), line + 1));
                 }
             }
         }
 
-        Ok(ToolOutput::success(results.join("")))
+        let match_count = results.len();
+        Ok(
+            ToolOutput::success(results.join("")).with_facts(ToolResultFacts::Search {
+                outcome: ToolOutcome::Succeeded,
+                match_count,
+                truncated: false,
+            }),
+        )
     }
 
     pub fn glob(&self, input: GlobInput) -> Result<ToolOutput, Error> {
@@ -5456,7 +5483,7 @@ mod native_tool_tests {
     }
 
     #[test]
-    fn failing_writes_and_edits_report_failure_facts_but_reads_do_not() {
+    fn failing_writes_and_edits_report_failure_facts() {
         let root = project_root();
         fs::write(root.join("notes.txt"), "old").unwrap();
         let tools = NativeTools::open(&root).unwrap();
@@ -5562,10 +5589,6 @@ mod native_tool_tests {
             }
             other => panic!("expected edit failure facts, got {other:?}"),
         }
-
-        let read = tools.read_file(ReadFileInput::new("notes.txt")).unwrap();
-        assert!(!read.is_error);
-        assert_eq!(read.facts(), None);
 
         fs::remove_dir_all(root).unwrap();
     }

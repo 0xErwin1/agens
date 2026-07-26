@@ -663,6 +663,24 @@ pub enum ToolResultFacts {
         outcome: ToolOutcome,
         exit_code: Option<i32>,
     },
+    /// A read carries no size or content hash: the harness only needs to
+    /// establish that a path was read, not how much of it was returned.
+    /// Only the success path is reported; a failed or denied read is
+    /// invisible via `ToolResult` and never reaches this variant.
+    Read {
+        path: FactPath,
+        outcome: ToolOutcome,
+    },
+    /// Neither `search` nor `grep` reports which paths matched, only how
+    /// many results were found. `truncated` is `true` exactly when the
+    /// result limit cut the output short; `match_count` is always the
+    /// count before any truncation marker was appended to the rendered
+    /// output, so the two never drift against each other.
+    Search {
+        outcome: ToolOutcome,
+        match_count: usize,
+        truncated: bool,
+    },
 }
 
 const MAX_RETAINED_TOOL_RESULT_BYTES: usize = 64 * 1024;
