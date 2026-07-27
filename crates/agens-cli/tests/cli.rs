@@ -309,7 +309,10 @@ fn global_mcp_command_and_environment_fields_expand_without_expanding_system_pro
         std::fs::read_to_string(launch_record).expect("launch record should be readable"),
         "configured-argument|configured-environment\n"
     );
-    assert_eq!(bootstrap.system_prompt(), Some("literal $(printf ignored)"));
+    assert_eq!(
+        bootstrap.settings().text("agent.system_prompt"),
+        Some("literal $(printf ignored)")
+    );
     transports[0]
         .1
         .close(&agens_tools::McpOperationContext::new(

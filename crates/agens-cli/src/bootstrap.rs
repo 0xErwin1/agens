@@ -33,7 +33,13 @@ pub struct Bootstrap {
     pub(crate) provider_type: Option<String>,
     pub(crate) provider_source: ProviderSource,
     pub(crate) provider_base_url: Option<String>,
-    pub(crate) system_prompt: Option<String>,
+    /// The process's own project-scoped `agent.system_prompt`, captured once at `bootstrap()`
+    /// time. Visible only within `crate::bootstrap`, on purpose: a session-scoped system prompt
+    /// decision must go through [`session_config::SessionConfig::resolve`] instead, which
+    /// re-derives it from a session's OWN recorded root rather than trusting this
+    /// process-lifetime value — this field is model-facing instruction text, so trusting the
+    /// wrong root's value here is a prompt-injection path, not merely a stale setting.
+    pub(in crate::bootstrap) system_prompt: Option<String>,
     pub(crate) max_iterations: Option<usize>,
     pub(crate) parallel_tool_calls: bool,
     pub(crate) collapse_thinking: bool,
@@ -138,7 +144,10 @@ impl Bootstrap {
         self.provider_base_url.as_deref()
     }
 
-    pub fn system_prompt(&self) -> Option<&str> {
+    /// The process's own project-scoped `agent.system_prompt`. Visible only within
+    /// `crate::bootstrap`; see the field's own documentation for why a session-scoped caller must
+    /// go through [`session_config::SessionConfig::resolve`] instead.
+    pub(in crate::bootstrap) fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
     }
 
