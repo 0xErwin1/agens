@@ -999,7 +999,7 @@ fn catalog_exposes_strict_schemas_and_cancellation_suppresses_bash_output() {
     let root = project_root();
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
-    assert_eq!(metadata.len(), 9);
+    assert_eq!(metadata.len(), 10);
     assert!(metadata.iter().all(|tool| {
         tool.qualified_name.starts_with("native::")
             && tool.input_schema["type"] == "object"
@@ -1327,7 +1327,7 @@ fn catalog_dispatches_grep_and_glob_with_their_own_schemas() {
     let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
     let metadata = NativeToolCatalog::metadata();
 
-    assert_eq!(metadata.len(), 9);
+    assert_eq!(metadata.len(), 10);
     let grep = metadata
         .iter()
         .find(|tool| tool.qualified_name == "native::grep")

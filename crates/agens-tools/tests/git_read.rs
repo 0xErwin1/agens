@@ -2,9 +2,14 @@ use std::{
     fs,
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 
-use agens_tools::{GitReadInput, GitReadOperation, NativeTools};
+use agens_core::ToolAccess;
+use agens_tools::{
+    GitReadInput, GitReadOperation, NativeToolCatalog, NativeTools, ToolExecutionContext,
+};
+use serde_json::json;
 
 static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -273,4 +278,39 @@ fn reports_a_failure_when_the_root_is_not_a_repository() {
     let output = run(&root, GitReadInput::new(GitReadOperation::Status));
 
     assert!(output.is_error, "{output:?}");
+}
+
+#[test]
+fn catalog_exposes_git_read_as_a_read_only_tool_with_an_enumerated_operation() {
+    let metadata = NativeToolCatalog::metadata();
+
+    let git_read = metadata
+        .iter()
+        .find(|tool| tool.qualified_name == "native::git_read")
+        .expect("git_read metadata");
+
+    assert_eq!(git_read.access, ToolAccess::ReadOnly);
+    assert_eq!(git_read.input_schema["required"], json!(["operation"]));
+    assert_eq!(
+        git_read.input_schema["properties"]["operation"]["enum"],
+        json!(["status", "diff", "log", "branch_merged", "merge_base"])
+    );
+    assert_eq!(git_read.input_schema["additionalProperties"], json!(false));
+}
+
+#[test]
+fn catalog_dispatches_git_read_and_rejects_an_unknown_operation() {
+    let root = repository();
+    let catalog = NativeToolCatalog::new(NativeTools::open(&root).unwrap());
+    let context = ToolExecutionContext::with_timeout(Duration::from_secs(5));
+
+    let status = catalog
+        .execute("native::git_read", json!({"operation": "status"}), &context)
+        .unwrap();
+    assert!(!status.is_error, "{status:?}");
+
+    let unknown = catalog
+        .execute("native::git_read", json!({"operation": "push"}), &context)
+        .unwrap();
+    assert!(unknown.is_error, "{unknown:?}");
 }

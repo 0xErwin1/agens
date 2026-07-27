@@ -1112,7 +1112,8 @@ mod tests {
         assert_eq!(
             catalog.iter().map(|tool| tool.name()).collect::<Vec<_>>(),
             [
-                "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch"
+                "read", "git_read", "list", "search", "glob", "grep", "write", "edit", "bash",
+                "webfetch"
             ]
         );
         assert!(

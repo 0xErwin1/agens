@@ -4803,6 +4803,12 @@ impl NativeToolCatalog {
                 serde_json::json!({"type":"object","additionalProperties":false,"required":["command"],"properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}}}),
             ),
             native_metadata(
+                "native::git_read",
+                "Inspect git state in the project root without any write surface",
+                ToolAccess::ReadOnly,
+                serde_json::json!({"type":"object","additionalProperties":false,"required":["operation"],"properties":{"operation":{"type":"string","enum":["status","diff","log","branch_merged","merge_base"]},"base":{"type":"string"},"head":{"type":"string"},"staged":{"type":"boolean"},"limit":{"type":"integer","minimum":1}}}),
+            ),
+            native_metadata(
                 "native::webfetch",
                 "Fetch an HTTP or HTTPS URL without credentials",
                 ToolAccess::ReadOnly,
@@ -4869,6 +4875,29 @@ impl NativeToolCatalog {
                 self.tools.grep(input)?
             }
             "native::glob" => self.tools.glob(GlobInput::new(string("pattern")?))?,
+            "native::git_read" => {
+                let Some(operation) = GitReadOperation::parse(string("operation")?) else {
+                    return Ok(ToolOutput::failure("git_read: unknown operation"));
+                };
+                let mut input =
+                    GitReadInput::new(operation).with_execution_context(context.clone());
+                if let Some(base) = arguments.get("base").and_then(Value::as_str) {
+                    input = input.with_base(base);
+                }
+                if let Some(head) = arguments.get("head").and_then(Value::as_str) {
+                    input = input.with_head(head);
+                }
+                if let Some(staged) = arguments.get("staged").and_then(Value::as_bool) {
+                    input = input.with_staged(staged);
+                }
+                if let Some(limit) = arguments.get("limit").and_then(Value::as_u64) {
+                    input = input.with_limit(limit as usize);
+                }
+                if let Ok(remaining) = context.remaining() {
+                    input = input.capped_at(remaining);
+                }
+                self.tools.git_read(input)?
+            }
             "native::webfetch" => {
                 let mut input = WebfetchInput::new(string("url")?);
                 if let Some(timeout) = arguments.get("timeout_ms").and_then(Value::as_u64) {

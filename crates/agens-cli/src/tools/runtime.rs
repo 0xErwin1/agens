@@ -241,8 +241,9 @@ fn production_read_only_tool_runtime(
     Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
 }
 
-const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 9] = [
+const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 10] = [
     "native::read",
+    "native::git_read",
     "native::list",
     "native::search",
     "native::glob",
@@ -450,7 +451,8 @@ mod tests {
         assert_eq!(
             provider_names,
             [
-                "read", "list", "search", "glob", "grep", "write", "edit", "bash", "webfetch",
+                "read", "git_read", "list", "search", "glob", "grep", "write", "edit", "bash",
+                "webfetch",
             ]
         );
 

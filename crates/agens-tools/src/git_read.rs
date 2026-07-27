@@ -107,6 +107,13 @@ impl GitReadInput {
         self
     }
 
+    /// Lowers the timeout to the caller's remaining budget without ever raising
+    /// it above the tool's own bound.
+    pub fn capped_at(mut self, remaining: Duration) -> Self {
+        self.timeout = self.timeout.min(remaining);
+        self
+    }
+
     pub fn with_execution_context(mut self, context: ToolExecutionContext) -> Self {
         self.execution_context = Some(context);
         self
