@@ -1,0 +1,276 @@
+use std::{
+    fs,
+    process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use agens_tools::{GitReadInput, GitReadOperation, NativeTools};
+
+static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
+
+fn project_root() -> std::path::PathBuf {
+    let suffix = NEXT_ROOT.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("agens-git-read-{}-{suffix}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+fn git(root: &std::path::Path, arguments: &[&str]) {
+    let status = Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "agens")
+        .env("GIT_AUTHOR_EMAIL", "agens@example.invalid")
+        .env("GIT_COMMITTER_NAME", "agens")
+        .env("GIT_COMMITTER_EMAIL", "agens@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+}
+
+/// A repository with one commit on `main` containing `tracked.txt`.
+fn repository() -> std::path::PathBuf {
+    let root = project_root();
+    git(&root, &["init", "--initial-branch=main", "--quiet"]);
+    fs::write(root.join("tracked.txt"), "base\n").unwrap();
+    git(&root, &["add", "tracked.txt"]);
+    git(&root, &["commit", "--quiet", "-m", "base commit"]);
+    root
+}
+
+fn run(root: &std::path::Path, input: GitReadInput) -> agens_tools::ToolOutput {
+    NativeTools::open(root).unwrap().git_read(input).unwrap()
+}
+
+fn executable_script(
+    root: &std::path::Path,
+    name: &str,
+    sentinel: &std::path::Path,
+) -> std::path::PathBuf {
+    let script = root.join(name);
+    fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch {}\n", sentinel.display()),
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    script
+}
+
+#[test]
+fn status_reports_untracked_and_modified_entries() {
+    let root = repository();
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+    fs::write(root.join("fresh.txt"), "new\n").unwrap();
+
+    let output = run(&root, GitReadInput::new(GitReadOperation::Status));
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(output.content.contains("tracked.txt"), "{output:?}");
+    assert!(output.content.contains("fresh.txt"), "{output:?}");
+}
+
+#[test]
+fn diff_reports_the_worktree_patch_and_staged_selects_the_index() {
+    let root = repository();
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+
+    let worktree = run(&root, GitReadInput::new(GitReadOperation::Diff));
+    assert!(!worktree.is_error, "{worktree:?}");
+    assert!(worktree.content.contains("-base"), "{worktree:?}");
+    assert!(worktree.content.contains("+changed"), "{worktree:?}");
+
+    let staged = run(
+        &root,
+        GitReadInput::new(GitReadOperation::Diff).with_staged(true),
+    );
+    assert!(!staged.is_error, "{staged:?}");
+    assert!(!staged.content.contains("+changed"), "{staged:?}");
+}
+
+#[test]
+fn log_is_bounded_by_the_requested_limit() {
+    let root = repository();
+    fs::write(root.join("tracked.txt"), "second\n").unwrap();
+    git(&root, &["commit", "--quiet", "-am", "second commit"]);
+
+    let output = run(
+        &root,
+        GitReadInput::new(GitReadOperation::Log).with_limit(1),
+    );
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(output.content.contains("second commit"), "{output:?}");
+    assert!(!output.content.contains("base commit"), "{output:?}");
+}
+
+#[test]
+fn branch_merged_lists_only_branches_already_contained_in_the_base() {
+    let root = repository();
+    git(&root, &["branch", "landed"]);
+    git(&root, &["checkout", "--quiet", "-b", "pending"]);
+    fs::write(root.join("tracked.txt"), "pending\n").unwrap();
+    git(&root, &["commit", "--quiet", "-am", "pending commit"]);
+    git(&root, &["checkout", "--quiet", "main"]);
+
+    let output = run(
+        &root,
+        GitReadInput::new(GitReadOperation::BranchMerged).with_base("main"),
+    );
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(output.content.contains("landed"), "{output:?}");
+    assert!(!output.content.contains("pending"), "{output:?}");
+}
+
+#[test]
+fn merge_base_resolves_the_common_ancestor_of_two_refs() {
+    let root = repository();
+    let ancestor = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let ancestor = String::from_utf8(ancestor.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&root, &["checkout", "--quiet", "-b", "topic"]);
+    fs::write(root.join("tracked.txt"), "topic\n").unwrap();
+    git(&root, &["commit", "--quiet", "-am", "topic commit"]);
+
+    let output = run(
+        &root,
+        GitReadInput::new(GitReadOperation::MergeBase)
+            .with_base("main")
+            .with_head("topic"),
+    );
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(output.content.contains(&ancestor), "{output:?}");
+}
+
+#[test]
+fn rejects_a_revision_that_would_smuggle_a_flag_into_the_argv() {
+    let root = repository();
+    let escape = root.join("written-by-git.txt");
+
+    let output = run(
+        &root,
+        GitReadInput::new(GitReadOperation::Log)
+            .with_base(format!("--output={}", escape.display())),
+    );
+
+    assert!(output.is_error, "{output:?}");
+    assert!(!escape.exists(), "git wrote a file through a smuggled flag");
+}
+
+#[test]
+fn rejects_revisions_carrying_range_or_shell_metacharacters() {
+    let root = repository();
+
+    for revision in [
+        "main..topic",
+        "main;touch owned",
+        "main topic",
+        "HEAD@{0}",
+        "refs/heads/main:refs/heads/other",
+        "",
+    ] {
+        let output = run(
+            &root,
+            GitReadInput::new(GitReadOperation::BranchMerged).with_base(revision),
+        );
+        assert!(output.is_error, "accepted revision {revision:?}");
+    }
+}
+
+#[test]
+fn repository_configuration_cannot_make_a_diff_execute_a_program() {
+    let root = repository();
+    let sentinel = root.join("external-diff-ran.txt");
+    let script = executable_script(&root, "external-diff.sh", &sentinel);
+    git(
+        &root,
+        &["config", "diff.external", script.to_str().unwrap()],
+    );
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+
+    let output = run(&root, GitReadInput::new(GitReadOperation::Diff));
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(
+        !sentinel.exists(),
+        "repository configuration executed a program during a read"
+    );
+}
+
+/// A content change does not make git refresh stat information, so the mutation
+/// that removes `--no-optional-locks` survives it. Touching the file without
+/// changing it does, which is what makes this a real guard.
+#[test]
+fn status_does_not_write_the_repository_index() {
+    let root = repository();
+    let index = root.join(".git").join("index");
+    assert!(!run(&root, GitReadInput::new(GitReadOperation::Status)).is_error);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(root.join("tracked.txt"), "base\n").unwrap();
+    let before = fs::read(&index).unwrap();
+
+    assert!(!run(&root, GitReadInput::new(GitReadOperation::Status)).is_error);
+
+    assert_eq!(before, fs::read(&index).unwrap(), "status wrote the index");
+}
+
+#[test]
+fn repository_configuration_cannot_make_status_execute_a_program() {
+    let root = repository();
+    let sentinel = root.join("fsmonitor-ran.txt");
+    let script = executable_script(&root, "fsmonitor.sh", &sentinel);
+    git(
+        &root,
+        &["config", "core.fsmonitor", script.to_str().unwrap()],
+    );
+
+    let output = run(&root, GitReadInput::new(GitReadOperation::Status));
+
+    assert!(!output.is_error, "{output:?}");
+    assert!(
+        !sentinel.exists(),
+        "repository configuration executed a program during a read"
+    );
+}
+
+#[test]
+fn branch_merged_and_merge_base_require_their_revisions() {
+    let root = repository();
+
+    assert!(run(&root, GitReadInput::new(GitReadOperation::BranchMerged)).is_error);
+    assert!(
+        run(
+            &root,
+            GitReadInput::new(GitReadOperation::MergeBase).with_base("main")
+        )
+        .is_error
+    );
+}
+
+#[test]
+fn reports_a_failure_when_the_root_is_not_a_repository() {
+    let root = project_root();
+
+    let output = run(&root, GitReadInput::new(GitReadOperation::Status));
+
+    assert!(output.is_error, "{output:?}");
+}

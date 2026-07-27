@@ -30,6 +30,7 @@ use serde_json::Value;
 
 mod agents;
 mod capabilities;
+mod git_read;
 mod http_mcp;
 pub mod http_worker;
 pub mod markdown;
@@ -42,6 +43,7 @@ pub use agents::{
     AgentShadow,
 };
 pub use capabilities::{EffectiveCapabilityDescriptor, EffectiveCapabilitySet};
+pub use git_read::{GitReadInput, GitReadOperation};
 pub use http_mcp::{McpHttpTransport, McpSseTransport};
 pub use mcp_status::{
     MAX_MCP_STATUS_TOOL_NAMES, McpEndpointSummary, McpErrorCategory, McpLifecycleState,
