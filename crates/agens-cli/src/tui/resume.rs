@@ -358,47 +358,18 @@ mod tests {
 
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
-    use crate::deps::CliDependencies;
     use crate::permissions::production_tui_permission_bridge;
     use crate::session::attempt::attempt_failure_status;
     use crate::test_support::{
-        persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
-        reset_tui_resume_test_counters, rotation_dispatcher, tui_project, tui_resume_test_counters,
-        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
-        tui_session_messages,
+        bootstrap_from_a_different_working_directory, persist_tui_session,
+        persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,
+        rotation_dispatcher, tui_project, tui_resume_test_counters, tui_session_bootstrap,
+        tui_session_bootstrap_for_provider, tui_session_directory, tui_session_messages,
     };
     use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime;
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
-
-    /// A second bootstrap sharing `origin`'s data directory (and therefore its sessions
-    /// database) but discovering its own project root from a completely different, unrelated
-    /// working directory — simulating a process restart from elsewhere on disk.
-    fn bootstrap_from_a_different_working_directory(
-        origin: &std::path::Path,
-        label: &str,
-    ) -> Bootstrap {
-        let elsewhere = tui_session_directory(label);
-        let config_home = origin.join("config");
-        let data_directory = origin.join("data");
-        crate::bootstrap::bootstrap(&CliDependencies::for_test(
-            elsewhere.join("project"),
-            Some(elsewhere.join("home")),
-            std::collections::BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            std::collections::BTreeMap::from([(
-                config_home.join("config.toml"),
-                format!(
-                    "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n",
-                    data_directory.display()
-                ),
-            )]),
-        ))
-        .unwrap()
-    }
 
     #[test]
     fn resuming_from_a_different_working_directory_confines_to_the_originally_recorded_root() {

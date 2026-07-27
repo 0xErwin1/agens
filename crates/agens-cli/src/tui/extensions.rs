@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use agens_tools::{CommandCatalog, CommandDefinition, SkillCatalog};
@@ -60,6 +61,7 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
 pub(crate) fn start_tui_commands<E: TuiEngine>(
     tui: &mut Tui<E>,
     bootstrap: &Bootstrap,
+    project_root: &Path,
 ) -> Result<Arc<CommandCatalog>, CliError> {
     let global_root = bootstrap
         .paths
@@ -67,12 +69,7 @@ pub(crate) fn start_tui_commands<E: TuiEngine>(
         .parent()
         .ok_or_else(|| CliError::configuration("global command root is unavailable"))?
         .join("commands");
-    let project_root = bootstrap
-        .paths
-        .project_config
-        .parent()
-        .ok_or_else(|| CliError::configuration("project command root is unavailable"))?
-        .join("commands");
+    let project_command_root = project_root.join(".agens/commands");
     let built_ins = RESERVED_TUI_COMMANDS
         .iter()
         .map(|name| {
@@ -80,7 +77,7 @@ pub(crate) fn start_tui_commands<E: TuiEngine>(
                 .expect("reserved TUI command names are valid")
         })
         .collect::<Vec<_>>();
-    let discovery = CommandCatalog::discover(&built_ins, global_root, project_root)
+    let discovery = CommandCatalog::discover(&built_ins, global_root, project_command_root)
         .map_err(CliError::configuration)?;
 
     for diagnostic in discovery.diagnostics() {
@@ -102,8 +99,9 @@ pub(crate) fn start_tui_commands<E: TuiEngine>(
 pub(crate) fn start_tui_skills<E: TuiEngine>(
     tui: &mut Tui<E>,
     bootstrap: &Bootstrap,
+    project_root: &Path,
 ) -> Result<Arc<SkillCatalog>, CliError> {
-    let discovery = discover_skill_catalog(bootstrap)?;
+    let discovery = discover_skill_catalog(bootstrap, project_root)?;
     for diagnostic in discovery.diagnostics() {
         tui.add_diagnostic(format!(
             "Skill diagnostic ({}): {}",
@@ -123,10 +121,11 @@ pub(crate) fn start_tui_skills<E: TuiEngine>(
 
 pub(crate) fn discover_skill_catalog(
     bootstrap: &Bootstrap,
+    project_root: &Path,
 ) -> Result<agens_tools::SkillDiscovery, CliError> {
     SkillCatalog::discover(
         bootstrap.paths.global_config.with_file_name("skills"),
-        bootstrap.paths.project_config.with_file_name("skills"),
+        project_root.join(".agens/skills"),
     )
     .map_err(|_| CliError::configuration("skill catalog is unavailable"))
 }
@@ -254,6 +253,50 @@ mod tests {
     }
 
     #[test]
+    fn startup_commands_and_skills_read_the_given_root_not_the_bootstrap_process_root() {
+        let temporary = tui_session_directory("extensions-root-confinement");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let bootstrap_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+
+        let elsewhere = tui_session_directory("extensions-root-confinement-elsewhere");
+        let elsewhere_root = elsewhere.join("project");
+        std::fs::create_dir_all(elsewhere_root.join(".agens/commands")).unwrap();
+        write_tui_command(
+            &elsewhere_root.join(".agens/commands"),
+            "elsewhere",
+            "elsewhere command",
+            "ELSEWHERE:$ARGUMENTS",
+        );
+        std::fs::create_dir_all(elsewhere_root.join(".agens/skills")).unwrap();
+        write_tui_skill(
+            &elsewhere_root.join(".agens/skills"),
+            "elsewhere-skill",
+            "elsewhere skill",
+            "ELSEWHERE_SKILL_BODY",
+        );
+
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let commands = start_tui_commands(&mut tui, &bootstrap, &elsewhere_root).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap, &elsewhere_root).unwrap();
+
+        assert!(
+            commands.command("elsewhere").is_some(),
+            "the given root's commands must be discovered"
+        );
+        assert!(
+            skills.skill("elsewhere-skill").is_some(),
+            "the given root's skills must be discovered"
+        );
+        assert_ne!(bootstrap_root, elsewhere_root);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+        std::fs::remove_dir_all(elsewhere).unwrap();
+    }
+
+    #[test]
     fn tui_startup_commands_route_real_enter_to_captured_provider_requests() {
         let temporary = tui_session_directory("declarative-commands");
         let config_home = temporary.join("config");
@@ -297,7 +340,8 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
+        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
         assert!(tui.view().dialog.is_some());
         assert!(tui.transcript().is_empty());
         let router = TuiRuntimeRouter::new(
@@ -421,8 +465,9 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
-        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         report_tui_extension_collisions(&mut tui, &commands, &skills);
         assert!(tui.view().dialog.is_some());
         assert!(tui.transcript().is_empty());
@@ -568,8 +613,9 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
-        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         report_tui_extension_collisions(&mut tui, &commands, &skills);
         let router = TuiRuntimeRouter::new(
             bootstrap,
@@ -687,8 +733,9 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let commands = start_tui_commands(&mut tui, &bootstrap).unwrap();
-        let skills = start_tui_skills(&mut tui, &bootstrap).unwrap();
+        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
+        let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),

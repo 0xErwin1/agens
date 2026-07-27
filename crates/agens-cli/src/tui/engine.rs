@@ -72,12 +72,13 @@ pub(crate) fn run_production_tui(
     let mut tui = Tui::new(engine);
     configure_tui_project_identity(&mut tui, bootstrap);
     tui.set_collapse_thinking(bootstrap.collapse_thinking);
-    let skills = start_tui_skills(&mut tui, bootstrap)?;
     if let Some(identifier) = resume {
+        // The catalog this parameter would otherwise select is instead rediscovered below, once
+        // the session's own root is known, so this value is not read for a production resume.
         let mut resumed = resume_tui_session(
             bootstrap,
             identifier,
-            &skills,
+            &SkillCatalog::default(),
             &TuiCredentialResolver::production(),
         )?;
         persist_pending_agent_correction(bootstrap, &mut resumed);
@@ -111,7 +112,14 @@ pub(crate) fn run_production_tui(
         }
     }
 
-    let commands = start_tui_commands(&mut tui, bootstrap)?;
+    let session_root_for_startup = {
+        let context = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        crate::session_root::resolve_tui_session_root(&context, bootstrap)?
+    };
+    let skills = start_tui_skills(&mut tui, bootstrap, &session_root_for_startup)?;
+    let commands = start_tui_commands(&mut tui, bootstrap, &session_root_for_startup)?;
     report_tui_extension_collisions(&mut tui, &commands, &skills);
     let router = TuiRuntimeRouter::new(
         bootstrap.clone(),
@@ -121,7 +129,12 @@ pub(crate) fn run_production_tui(
         Arc::clone(&skills),
     );
     tui.set_palette_entries(router.palette_entries().to_vec());
-    match tui_picker_file_candidates(bootstrap) {
+    let picker_candidates = router
+        .session
+        .lock()
+        .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))
+        .and_then(|context| tui_picker_file_candidates(&context, bootstrap));
+    match picker_candidates {
         Ok(candidates) => tui.set_file_candidates(candidates),
         Err(error) => tui.add_info(format!("File references are unavailable: {error}")),
     }
@@ -351,7 +364,12 @@ pub(crate) fn run_tui_prompt_with(
     skills: Option<Arc<SkillCatalog>>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
-    let prompt = expand_tui_file_reference(bootstrap, prompt)?;
+    let prompt = {
+        let context = session
+            .lock()
+            .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
+        expand_tui_file_reference(&context, bootstrap, prompt)?
+    };
     let request = {
         let mut session = session
             .lock()
@@ -566,8 +584,8 @@ mod tests {
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let original = session.lock().unwrap().clone();
 
-        // Session 1 belongs to a different project than `bootstrap`'s own; per AGN-48 it must
-        // still resume, confined to its OWN recorded root rather than being rejected.
+        // Session 1 belongs to a different project than `bootstrap`'s own; it must still
+        // resume, confined to its OWN recorded root rather than being rejected.
         run_tui_prompt(
             &bootstrap,
             "/resume 1",

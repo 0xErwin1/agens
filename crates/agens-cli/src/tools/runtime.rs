@@ -137,7 +137,9 @@ pub(crate) fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     let skills = match skills {
         Some(skills) => skills,
         None => {
-            discovered_skills = discover_skill_catalog(bootstrap)?.catalog().clone();
+            discovered_skills = discover_skill_catalog(bootstrap, project_root)?
+                .catalog()
+                .clone();
             &discovered_skills
         }
     };
@@ -180,6 +182,7 @@ pub(crate) fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
 
     register_production_task_tool(
         bootstrap,
+        project_root,
         skills,
         &mut dispatcher,
         &mut provider_tools,

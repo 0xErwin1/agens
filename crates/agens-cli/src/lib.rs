@@ -40,7 +40,6 @@ pub use deps::CliDependencies;
 pub use error::{CliError, CommandResult, ExitStatus};
 pub use headless::HeadlessChatRequest;
 pub use model_registry::{TuiModelSelector, TuiModelSource};
-pub use tui::files::tui_file_candidates;
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
 where

@@ -4,6 +4,7 @@
 //! provider currently in effect.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{AgentDefinition, HeadlessTurnError};
@@ -31,13 +32,16 @@ pub(crate) fn rotate_tui_agent(
     session: &Arc<Mutex<TuiSessionContext>>,
     skills: &SkillCatalog,
 ) -> Result<String, CliError> {
-    let validator = {
+    let (validator, project_root) = {
         let context = session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-        TuiAgentModelValidator::for_context(bootstrap, &context)?
+        (
+            TuiAgentModelValidator::for_context(bootstrap, &context)?,
+            crate::session_root::resolve_tui_session_root(&context, bootstrap)?,
+        )
     };
-    let catalog = tui_agent_catalog(bootstrap, &validator)?;
+    let catalog = tui_agent_catalog(bootstrap, &project_root, &validator)?;
     if session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?
@@ -50,12 +54,6 @@ pub(crate) fn rotate_tui_agent(
         .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
         .ok_or_else(|| CliError::usage("/agent requires an available primary agent"))?
         .clone();
-    let project_root = {
-        let context = session
-            .lock()
-            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-        crate::session_root::resolve_tui_session_root(&context, bootstrap)?
-    };
     let (_, dispatcher) = production_tool_runtime(bootstrap, &project_root, Some(skills))?;
     ensure_active_tui_agent_runtime(bootstrap, session, &dispatcher)?;
     let dispatcher = dispatcher
@@ -182,25 +180,34 @@ pub(crate) fn tui_subagent_catalog(
 
 pub(crate) fn tui_agent_catalog(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     validator: &dyn AgentModelValidator,
 ) -> Result<AgentCatalog, CliError> {
-    discover_tui_agent_catalog(bootstrap, Some(validator))
+    discover_tui_agent_catalog(bootstrap, project_root, Some(validator))
 }
 
+/// Resolves the session's own recorded root (falling back to the process's discovered root for a
+/// session that has not been created yet), so a resumed session's agent catalog reflects its own
+/// project-local `agents/` directory rather than the resuming process's.
 pub(crate) fn tui_agent_catalog_for_context(
     bootstrap: &Bootstrap,
     context: &TuiSessionContext,
 ) -> Result<AgentCatalog, CliError> {
     let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
-    tui_agent_catalog(bootstrap, &validator)
+    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    tui_agent_catalog(bootstrap, &project_root, &validator)
 }
 
-pub(crate) fn tui_task_agent_catalog(bootstrap: &Bootstrap) -> Result<AgentCatalog, CliError> {
-    discover_tui_agent_catalog(bootstrap, None)
+pub(crate) fn tui_task_agent_catalog(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<AgentCatalog, CliError> {
+    discover_tui_agent_catalog(bootstrap, project_root, None)
 }
 
 pub(crate) fn discover_tui_agent_catalog(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     validator: Option<&dyn AgentModelValidator>,
 ) -> Result<AgentCatalog, CliError> {
     let primary = AgentDefinition {
@@ -236,7 +243,7 @@ pub(crate) fn discover_tui_agent_catalog(
         skills: Vec::new(),
     };
     let global = bootstrap.paths.global_config.with_file_name("agents");
-    let project = bootstrap.paths.project_config.with_file_name("agents");
+    let project = project_root.join(".agens/agents");
     let built_ins = [primary, explore, general];
     let discovery = match validator {
         Some(validator) => {
@@ -414,8 +421,9 @@ pub(crate) fn reconcile_persisted_active_agent(
 ) -> Result<AgentDefinition, CliError> {
     let name = initial_active_agent_name(context, bootstrap);
     let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
-    let catalog = tui_agent_catalog(bootstrap, &validator)?;
-    let unvalidated_catalog = tui_task_agent_catalog(bootstrap)?;
+    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    let catalog = tui_agent_catalog(bootstrap, &project_root, &validator)?;
+    let unvalidated_catalog = tui_task_agent_catalog(bootstrap, &project_root)?;
     let resolution =
         resolve_persisted_active_agent(&name, &catalog, &unvalidated_catalog, &validator).map_err(
             |error| {
@@ -500,11 +508,59 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        bootstrap_from_configuration, persist_tui_session, rotation_dispatcher, tui_project,
-        tui_session_bootstrap, tui_session_directory,
+        bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
+        persist_tui_session, rotation_dispatcher, tui_project, tui_session_bootstrap,
+        tui_session_directory,
     };
     use crate::tui::provider::TuiCredentialResolver;
     use crate::tui::resume::resume_tui_session;
+
+    #[test]
+    fn a_resumed_cross_directory_session_reads_agents_from_its_own_root_not_the_process_root() {
+        let origin = tui_session_directory("agent-catalog-root-origin");
+        let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
+        let mut store = SessionStore::open(creation_bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&origin), "origin");
+        drop(store);
+        std::fs::create_dir_all(origin.join("project/.agens/agents")).unwrap();
+        std::fs::write(
+            origin.join("project/.agens/agents/origin-only.md"),
+            "---\nname: origin-only\ndescription: origin only\nmode: all\npermissions: []\n---\nOrigin-only work.\n",
+        )
+        .unwrap();
+
+        let resume_bootstrap =
+            bootstrap_from_a_different_working_directory(&origin, "agent-catalog-root-elsewhere");
+        let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        std::fs::create_dir_all(elsewhere_root.join(".agens/agents")).unwrap();
+        std::fs::write(
+            elsewhere_root.join(".agens/agents/elsewhere-only.md"),
+            "---\nname: elsewhere-only\ndescription: elsewhere only\nmode: all\npermissions: []\n---\nElsewhere-only work.\n",
+        )
+        .unwrap();
+
+        let context = resume_tui_session(
+            &resume_bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        )
+        .unwrap();
+
+        let catalog = tui_agent_catalog_for_context(&resume_bootstrap, &context).unwrap();
+        assert!(
+            catalog.agent("origin-only").is_some(),
+            "the resumed session's own root must supply its agent catalog"
+        );
+        assert!(
+            catalog.agent("elsewhere-only").is_none(),
+            "the resuming process's own root must not leak into a resumed session's agent \
+             catalog"
+        );
+
+        std::fs::remove_dir_all(&origin).unwrap();
+        std::fs::remove_dir_all(elsewhere_root.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn explicit_agent_missing_keeps_active_primary_and_persisted_metadata_unchanged() {

@@ -109,6 +109,34 @@ pub(crate) fn bootstrap_from_configuration(
     bootstrap(&dependencies).expect("configuration fixture should be valid")
 }
 
+/// A second bootstrap sharing `origin`'s data directory (and therefore its sessions
+/// database) but discovering its own project root from a completely different, unrelated
+/// working directory — simulating a process restart from elsewhere on disk.
+pub(crate) fn bootstrap_from_a_different_working_directory(
+    origin: &Path,
+    label: &str,
+) -> Bootstrap {
+    let elsewhere = tui_session_directory(label);
+    let config_home = origin.join("config");
+    let data_directory = origin.join("data");
+    bootstrap(&CliDependencies::for_test(
+        elsewhere.join("project"),
+        Some(elsewhere.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::from([(
+            config_home.join("config.toml"),
+            format!(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n",
+                data_directory.display()
+            ),
+        )]),
+    ))
+    .unwrap()
+}
+
 /// A fresh, uniquely named temporary directory with a project marker
 /// (`project/.git`) already created, isolating one test's filesystem state
 /// from every other test running concurrently.

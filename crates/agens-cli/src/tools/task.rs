@@ -32,6 +32,10 @@ pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) task_registry: TaskExecutionRegistry,
     #[allow(dead_code)]
     pub(crate) authorized: AuthorizedNativeTaskRuntime<ProductionPermissionPrompter>,
+    /// The session root this runtime's dispatcher, permission policy, and grant scope were built
+    /// against. The headless turn body reuses this value instead of re-deriving a root, so the
+    /// parent turn and this runtime never disagree about which project's grants apply.
+    pub(crate) project_root: std::path::PathBuf,
 }
 
 pub(crate) struct TaskParentSelection {
@@ -153,11 +157,13 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
             dispatcher: ProductionToolDispatcher::new(dispatcher, pending),
             next_call_id: 0,
         },
+        project_root: project_root.to_path_buf(),
     })
 }
 
 pub(crate) fn register_production_task_tool<R: TaskRunner>(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     skills: &SkillCatalog,
     dispatcher: &mut ToolDispatcher,
     provider_tools: &mut BTreeMap<String, OpenAiFunctionTool>,
@@ -166,7 +172,7 @@ pub(crate) fn register_production_task_tool<R: TaskRunner>(
 ) -> Result<(), CliError> {
     let available_models = task_model_catalog(bootstrap)?;
     let validator = TaskModelValidator::new(&available_models);
-    let agents = tui_task_agent_catalog(bootstrap)?;
+    let agents = tui_task_agent_catalog(bootstrap, project_root)?;
     if !agents
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent)

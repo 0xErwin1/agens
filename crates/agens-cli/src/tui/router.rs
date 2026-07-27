@@ -408,7 +408,11 @@ impl TuiRuntimeRouter {
             ),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
             "select" => {
-                let entries = tui_select_candidates(&bootstrap)?
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                let entries = tui_select_candidates(&context, &bootstrap)?
                     .into_iter()
                     .map(|path| DialogEntry::safe_action(&path, format!("select:{path}")))
                     .collect();
@@ -558,7 +562,11 @@ impl TuiRuntimeRouter {
                     return Ok(TuiSubmissionOutcome::SelectionCancelled);
                 }
                 if let Some(path) = action_id.strip_prefix("select:") {
-                    return selected_tui_file(&bootstrap, path).map(|path| {
+                    let context = self
+                        .session
+                        .lock()
+                        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+                    return selected_tui_file(&context, &bootstrap, path).map(|path| {
                         TuiSubmissionOutcome::SelectionInfo(format!("Selected file: {path}"))
                     });
                 }
