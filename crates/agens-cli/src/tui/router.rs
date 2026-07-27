@@ -2860,6 +2860,7 @@ mod tests {
         );
         assert!(matches!(local_refusal, TuiSubmissionOutcome::Dialog(_)));
         let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let database_path = store.database_path();
         assert_eq!(
             store
                 .load_session_for_resume(locally_active.key().session_id())
@@ -2870,7 +2871,7 @@ mod tests {
             agens_core::SessionAttemptStatus::Running
         );
         drop(store);
-        active_session_attempts().unregister(locally_active.key());
+        active_session_attempts().unregister(&database_path, locally_active.key());
 
         let recovered = router.route_dialog_action(
             &format!(

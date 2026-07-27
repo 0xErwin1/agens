@@ -2,6 +2,7 @@
 //! completion or failure, and recovering an attempt left running by a crashed or killed process.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use agens_core::{
@@ -12,10 +13,24 @@ use agens_store::SessionStore;
 
 use crate::error::CliError;
 
+/// An `AttemptKey` is only a small SQLite autoincrement pair (`session_id`, `attempt_id`) with no
+/// discriminator for which database it came from. Two independent `SessionStore`s — each its own
+/// `agens.db` file — assign the SAME small keys starting from their own 1, so scoping this
+/// registry by `AttemptKey` alone lets one database's `RegisteredAttempt::drop` unregister a
+/// DIFFERENT database's still-active attempt that happens to share the same key. Today one
+/// process opens one data directory, so this never collides in practice; it becomes reachable the
+/// moment one process serves more than one database (for example one daemon process serving
+/// several projects, each with its own data directory).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScopedAttemptKey {
+    database_path: PathBuf,
+    key: AttemptKey,
+}
+
 #[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct AttemptActivityRegistry {
-    active: Mutex<Vec<AttemptKey>>,
+    active: Mutex<Vec<ScopedAttemptKey>>,
 }
 
 static ACTIVE_SESSION_ATTEMPTS: OnceLock<AttemptActivityRegistry> = OnceLock::new();
@@ -37,17 +52,26 @@ impl AttemptActivityRegistry {
             .lock()
             .map_err(|_| BeginSessionAttemptError::Store)?;
         let attempt = store.begin_session_attempt(metadata, prompt)?;
-        active.push(attempt.key());
+        active.push(ScopedAttemptKey {
+            database_path: store.database_path(),
+            key: attempt.key(),
+        });
         Ok(attempt)
     }
 
-    pub(crate) fn contains(&self, key: AttemptKey) -> bool {
-        self.active.lock().is_ok_and(|active| active.contains(&key))
+    pub(crate) fn contains(&self, database_path: &std::path::Path, key: AttemptKey) -> bool {
+        self.active.lock().is_ok_and(|active| {
+            active
+                .iter()
+                .any(|scoped| scoped.database_path == database_path && scoped.key == key)
+        })
     }
 
-    pub(crate) fn unregister(&self, key: AttemptKey) {
+    pub(crate) fn unregister(&self, database_path: &std::path::Path, key: AttemptKey) {
         if let Ok(mut active) = self.active.lock()
-            && let Some(index) = active.iter().position(|active_key| *active_key == key)
+            && let Some(index) = active
+                .iter()
+                .position(|scoped| scoped.database_path == database_path && scoped.key == key)
         {
             active.remove(index);
         }
@@ -59,8 +83,12 @@ impl AttemptActivityRegistry {
         key: AttemptKey,
         finished_at: i64,
     ) -> Result<Option<RecoveryOutcome>, ()> {
+        let database_path = store.database_path();
         let active = self.active.lock().map_err(|_| ())?;
-        if active.contains(&key) {
+        if active
+            .iter()
+            .any(|scoped| scoped.database_path == database_path && scoped.key == key)
+        {
             return Ok(None);
         }
 
@@ -73,12 +101,13 @@ impl AttemptActivityRegistry {
 
 struct RegisteredAttempt<'a> {
     registry: &'a AttemptActivityRegistry,
+    database_path: PathBuf,
     key: AttemptKey,
 }
 
 impl Drop for RegisteredAttempt<'_> {
     fn drop(&mut self) {
-        self.registry.unregister(self.key);
+        self.registry.unregister(&self.database_path, self.key);
     }
 }
 
@@ -237,6 +266,7 @@ pub(crate) fn run_session_attempt_lifecycle_with_terminal_writer(
         .map_err(AttemptLifecycleError::Begin)?;
     let _registered = RegisteredAttempt {
         registry,
+        database_path: store.database_path(),
         key: attempt.key(),
     };
     metadata.id = attempt.key().session_id();
@@ -388,6 +418,64 @@ mod tests {
     use crate::tui::turn::complete_tui_turn;
     use crate::turns::completed_session_turn;
 
+    /// Two independent SQLite databases both autoincrement `(session_id, attempt_id)` from 1, so
+    /// the SAME `AttemptKey` is reachable from two entirely unrelated sessions once more than one
+    /// database is in play in a single process — exactly what a daemon serving multiple projects'
+    /// data directories would do. The registry must not treat these as the same active attempt.
+    #[test]
+    fn the_registry_scopes_active_attempts_by_database_not_just_by_attempt_key() {
+        let directory_x =
+            std::env::temp_dir().join(format!("agens-registry-scope-x-{}", std::process::id()));
+        let directory_y =
+            std::env::temp_dir().join(format!("agens-registry-scope-y-{}", std::process::id()));
+        std::fs::create_dir_all(&directory_x).unwrap();
+        std::fs::create_dir_all(&directory_y).unwrap();
+        let mut store_x = SessionStore::open(&directory_x).unwrap();
+        let mut store_y = SessionStore::open(&directory_y).unwrap();
+        let metadata = SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let registry = AttemptActivityRegistry::default();
+
+        let attempt_x = registry
+            .begin_and_register(&mut store_x, &metadata, "prompt-x".into())
+            .unwrap();
+        let attempt_y = registry
+            .begin_and_register(&mut store_y, &metadata, "prompt-y".into())
+            .unwrap();
+        assert_eq!(
+            attempt_x.key(),
+            attempt_y.key(),
+            "two fresh, unrelated databases must assign the same small AttemptKey, which is the \
+             precondition for the collision this test guards against"
+        );
+
+        registry.unregister(&store_x.database_path(), attempt_x.key());
+
+        assert!(
+            !registry.contains(&store_x.database_path(), attempt_x.key()),
+            "unregistering X's own attempt must deactivate it"
+        );
+        assert!(
+            registry.contains(&store_y.database_path(), attempt_y.key()),
+            "unregistering X's attempt must not deactivate Y's colliding key from a DIFFERENT \
+             database"
+        );
+
+        std::fs::remove_dir_all(&directory_x).unwrap();
+        std::fs::remove_dir_all(&directory_y).unwrap();
+    }
+
     #[test]
     fn turn_attempt_registry_blocks_same_session_begin_and_preserves_primary_errors() {
         let directory =
@@ -431,9 +519,9 @@ mod tests {
             ))
         ));
         assert_eq!(provider_calls.load(std::sync::atomic::Ordering::Relaxed), 0);
-        assert!(registry.contains(attempt.key()));
-        registry.unregister(attempt.key());
-        assert!(!registry.contains(attempt.key()));
+        assert!(registry.contains(&store.database_path(), attempt.key()));
+        registry.unregister(&store.database_path(), attempt.key());
+        assert!(!registry.contains(&store.database_path(), attempt.key()));
 
         let mut unrelated = metadata.clone();
         unrelated.id = 2;
@@ -450,7 +538,7 @@ mod tests {
             primary_error,
             AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Provider))
         );
-        assert!(!registry.contains(attempt.key()));
+        assert!(!registry.contains(&store.database_path(), attempt.key()));
         assert_eq!(
             store
                 .load_session_for_resume(2)
@@ -483,7 +571,7 @@ mod tests {
             AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
         );
         assert_eq!(running.status(), agens_core::SessionAttemptStatus::Running);
-        assert!(!registry.contains(running.key()));
+        assert!(!registry.contains(&store.database_path(), running.key()));
 
         let mut successful = metadata.clone();
         successful.id = 4;
@@ -781,7 +869,7 @@ mod tests {
             agens_core::SessionAttemptStatus::Running
         );
 
-        registry.unregister(active.key());
+        registry.unregister(&store.database_path(), active.key());
         let recovered = recover_session_attempt_lifecycle(
             &registry,
             &mut store,
@@ -815,7 +903,7 @@ mod tests {
             store.recover_running_attempt(active.key(), 4).unwrap(),
             agens_core::RecoveryOutcome::Stale
         );
-        assert!(!registry.contains(active.key()));
+        assert!(!registry.contains(&store.database_path(), active.key()));
         assert!(!format!("{recovered:?}").contains("private retry prompt"));
 
         let terminal_metadata = SessionMetadata { id: 10, ..metadata };
@@ -839,7 +927,7 @@ mod tests {
             AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
         );
         assert_eq!(terminal.status(), agens_core::SessionAttemptStatus::Running);
-        assert!(!registry.contains(terminal.key()));
+        assert!(!registry.contains(&store.database_path(), terminal.key()));
 
         drop(store);
         let mut reopened = SessionStore::open(&directory).unwrap();
@@ -948,7 +1036,7 @@ mod tests {
                 "SENTINEL_PRIVATE_RECOVERY_RETRY".into(),
             )
             .unwrap();
-        registry.unregister(active.key());
+        registry.unregister(&store.database_path(), active.key());
         let recovery = recover_session_attempt_lifecycle(
             &registry,
             &mut store,
