@@ -134,7 +134,14 @@ mod tests {
         let resume_bootstrap =
             bootstrap_from_a_different_working_directory(&origin, "files-confinement-elsewhere");
         let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
-        std::fs::write(elsewhere_root.join("secret.txt"), "elsewhere-secret").unwrap();
+        // Deliberately a DIFFERENT filename than origin's, not just different content: a picker
+        // leak must be provable by listing alone, without relying on the expansion assertion
+        // below to carry the whole test.
+        std::fs::write(
+            elsewhere_root.join("only-in-elsewhere.txt"),
+            "elsewhere-secret",
+        )
+        .unwrap();
 
         let context = resume_tui_session(
             &resume_bootstrap,
