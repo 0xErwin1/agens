@@ -32,6 +32,31 @@ pub struct SessionPage {
     pub next_cursor: Option<SessionCursor>,
 }
 
+const MAX_TRANSCRIPT_PAGE_SIZE: usize = 200;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptPage {
+    pub messages: Vec<Message>,
+    pub next_cursor: Option<TranscriptCursor>,
+}
+
+/// The sequence of the last message already returned; the next page starts
+/// strictly after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranscriptCursor {
+    after_sequence: i64,
+}
+
+impl TranscriptCursor {
+    pub const fn new(after_sequence: i64) -> Self {
+        Self { after_sequence }
+    }
+
+    pub const fn after_sequence(self) -> i64 {
+        self.after_sequence
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionCursor {
     updated_at: i64,
@@ -492,6 +517,179 @@ impl SessionStore {
             sessions,
             next_cursor,
         })
+    }
+
+    /// Reads a page of a session's thread, oldest message first.
+    ///
+    /// Unlike [`SessionStore::load_session_for_resume`], this does not require the
+    /// session to be resumable: the thread is evidence, and a run that failed or
+    /// was exhausted is exactly the one worth reading. It never writes to the
+    /// thread, which the `&self` receiver makes structural.
+    pub fn read_transcript_page(
+        &self,
+        session_id: i64,
+        cursor: Option<TranscriptCursor>,
+        page_size: usize,
+    ) -> Result<TranscriptPage, SessionStoreError> {
+        if page_size == 0 {
+            return Err(SessionStoreError::operation(
+                "validate transcript page size",
+                &self.database_path,
+                "page size must be greater than zero",
+            ));
+        }
+
+        let exists = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                [session_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("check session", &self.database_path, error)
+            })?;
+        if !exists {
+            return Err(SessionStoreError::operation(
+                "read transcript page",
+                &self.database_path,
+                format!("unknown session {session_id}"),
+            ));
+        }
+
+        let page_size = page_size.min(MAX_TRANSCRIPT_PAGE_SIZE);
+        let sequences = self.transcript_sequences(session_id, cursor, page_size)?;
+        let has_more = sequences.len() > page_size;
+        let sequences = &sequences[..sequences.len().min(page_size)];
+
+        let (Some(first), Some(last)) = (sequences.first(), sequences.last()) else {
+            return Ok(TranscriptPage {
+                messages: Vec::new(),
+                next_cursor: None,
+            });
+        };
+
+        Ok(TranscriptPage {
+            messages: self.transcript_messages(session_id, *first, *last)?,
+            next_cursor: has_more.then(|| TranscriptCursor::new(*last)),
+        })
+    }
+
+    /// Selects the message boundaries of the page before any part is read, so a
+    /// message's parts can never be split across two pages.
+    fn transcript_sequences(
+        &self,
+        session_id: i64,
+        cursor: Option<TranscriptCursor>,
+        page_size: usize,
+    ) -> Result<Vec<i64>, SessionStoreError> {
+        let fetch_limit = i64::try_from(page_size.saturating_add(1)).map_err(|error| {
+            SessionStoreError::operation(
+                "validate transcript page size",
+                &self.database_path,
+                error,
+            )
+        })?;
+        let after = cursor.map(TranscriptCursor::after_sequence);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT sequence FROM messages
+                 WHERE session_id = ?1 AND (?2 IS NULL OR sequence > ?2)
+                 ORDER BY sequence LIMIT ?3",
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "prepare transcript sequences",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        statement
+            .query_map(params![session_id, after, fetch_limit], |row| row.get(0))
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "query transcript sequences",
+                    &self.database_path,
+                    error,
+                )
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "read transcript sequences",
+                    &self.database_path,
+                    error,
+                )
+            })
+    }
+
+    fn transcript_messages(
+        &self,
+        session_id: i64,
+        first: i64,
+        last: i64,
+    ) -> Result<Vec<Message>, SessionStoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT messages.sequence, role, kind, text, call_id, name, input_json, content, is_error
+                 FROM messages JOIN message_parts ON messages.session_id = message_parts.session_id
+                     AND messages.sequence = message_parts.message_sequence
+                 WHERE messages.session_id = ?1 AND messages.sequence BETWEEN ?2 AND ?3
+                 ORDER BY messages.sequence, message_parts.sequence",
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("prepare transcript page", &self.database_path, error)
+            })?;
+        let rows = statement
+            .query_map(params![session_id, first, last], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<bool>>(8)?,
+                ))
+            })
+            .map_err(|error| {
+                SessionStoreError::operation("query transcript page", &self.database_path, error)
+            })?;
+
+        let mut messages = Vec::new();
+        let mut sequence = None;
+
+        for row in rows {
+            let (message_sequence, role, kind, text, call_id, name, input, content, is_error) = row
+                .map_err(|error| {
+                    SessionStoreError::operation("read transcript page", &self.database_path, error)
+                })?;
+
+            if sequence != Some(message_sequence) {
+                messages.push(Message {
+                    role: decode_role(&role, &self.database_path)?,
+                    parts: Vec::new(),
+                });
+                sequence = Some(message_sequence);
+            }
+
+            messages
+                .last_mut()
+                .expect("message inserted for part")
+                .parts
+                .push(decode_part(
+                    &kind,
+                    (text, call_id, name, input, content, is_error),
+                    &self.database_path,
+                )?);
+        }
+
+        Ok(messages)
     }
 
     pub fn recover_running_attempt(

@@ -14,7 +14,9 @@ mod database;
 mod fact_store;
 mod session_writer;
 pub use fact_store::{ToolFactStore, ToolFactStoreError};
-pub use session_writer::{SessionCursor, SessionPage, StoredSession};
+pub use session_writer::{
+    SessionCursor, SessionPage, StoredSession, TranscriptCursor, TranscriptPage,
+};
 
 const PERMISSION_GRANTS_COLUMNS: [ExpectedColumnSignature; 7] = [
     ExpectedColumnSignature::new(0, "id", "INTEGER", false, None, 1),
