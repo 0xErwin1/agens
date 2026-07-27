@@ -515,30 +515,105 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    fn ordered_table_columns(connection: &Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+            ))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
     #[test]
     fn migration_0005_is_purely_additive_and_adds_a_nullable_confinement_root_column() {
         let directory = data_directory();
         let (_, connection) = open_unified_database(&directory).unwrap();
 
-        for pre_existing_table in [
-            "sessions",
-            "session_attempts",
-            "permission_grants",
-            "model_preference",
-            "tool_result_facts",
+        // Every table migration 0005 must leave untouched keeps the exact column set (name and
+        // order) it already had after migration 0004 — not merely a non-empty column count, which
+        // would stay green even if a migration dropped or renamed columns.
+        for (unaffected_table, expected_columns) in [
+            (
+                "session_attempts",
+                vec![
+                    "id",
+                    "session_id",
+                    "sequence",
+                    "status",
+                    "failure_kind",
+                    "retry_prompt",
+                    "started_at",
+                    "finished_at",
+                    "completed_turn_sequence",
+                ],
+            ),
+            (
+                "permission_grants",
+                vec![
+                    "id",
+                    "project",
+                    "decision",
+                    "tool_kind",
+                    "tool_value",
+                    "target_kind",
+                    "target_value",
+                ],
+            ),
+            ("model_preference", vec!["id", "model", "reasoning_effort"]),
+            (
+                "tool_result_facts",
+                vec![
+                    "id",
+                    "session_id",
+                    "attempt_id",
+                    "sequence",
+                    "tool_call_id",
+                    "tool",
+                    "outcome",
+                    "path",
+                    "path_status",
+                    "exit_code",
+                    "is_new_file",
+                    "bytes_written",
+                    "lines_written",
+                    "lines_added",
+                    "lines_removed",
+                    "match_count",
+                    "truncated",
+                    "recorded_at",
+                ],
+            ),
         ] {
-            let column_count: i64 = connection
-                .query_row(
-                    &format!("SELECT count(*) FROM pragma_table_info('{pre_existing_table}')"),
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                column_count > 0,
-                "{pre_existing_table} must be unchanged by migration 0005"
+            assert_eq!(
+                ordered_table_columns(&connection, unaffected_table),
+                expected_columns,
+                "{unaffected_table} must be unchanged by migration 0005"
             );
         }
+
+        // `sessions` keeps every pre-existing column, unchanged and in the same order, with
+        // exactly one new column appended.
+        assert_eq!(
+            ordered_table_columns(&connection, "sessions"),
+            vec![
+                "id",
+                "project",
+                "title",
+                "active_agent",
+                "created_at",
+                "updated_at",
+                "completed_turn_count",
+                "resumable",
+                "provider_id",
+                "model_id",
+                "reasoning_effort",
+                "confinement_root",
+            ]
+        );
 
         let (not_null, default_value): (i64, Option<String>) = connection
             .query_row(
