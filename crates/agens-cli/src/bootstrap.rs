@@ -33,13 +33,6 @@ pub struct Bootstrap {
     pub(crate) provider_type: Option<String>,
     pub(crate) provider_source: ProviderSource,
     pub(crate) provider_base_url: Option<String>,
-    /// The process's own project-scoped `agent.system_prompt`, captured once at `bootstrap()`
-    /// time. Visible only within `crate::bootstrap`, on purpose: a session-scoped system prompt
-    /// decision must go through [`session_config::SessionConfig::resolve`] instead, which
-    /// re-derives it from a session's OWN recorded root rather than trusting this
-    /// process-lifetime value — this field is model-facing instruction text, so trusting the
-    /// wrong root's value here is a prompt-injection path, not merely a stale setting.
-    pub(in crate::bootstrap) system_prompt: Option<String>,
     pub(crate) max_iterations: Option<usize>,
     pub(crate) parallel_tool_calls: bool,
     pub(crate) collapse_thinking: bool,
@@ -77,7 +70,6 @@ impl Clone for Bootstrap {
             provider_type: self.provider_type.clone(),
             provider_source: self.provider_source,
             provider_base_url: self.provider_base_url.clone(),
-            system_prompt: self.system_prompt.clone(),
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
             collapse_thinking: self.collapse_thinking,
@@ -154,13 +146,6 @@ impl Bootstrap {
 
     pub fn provider_base_url(&self) -> Option<&str> {
         self.provider_base_url.as_deref()
-    }
-
-    /// The process's own project-scoped `agent.system_prompt`. Visible only within
-    /// `crate::bootstrap`; see the field's own documentation for why a session-scoped caller must
-    /// go through [`session_config::SessionConfig::resolve`] instead.
-    pub(in crate::bootstrap) fn system_prompt(&self) -> Option<&str> {
-        self.system_prompt.as_deref()
     }
 
     pub fn data_directory(&self) -> &Path {
@@ -294,7 +279,6 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         provider_type,
         provider_source,
         provider_base_url: settings.text("provider.base_url").map(ToOwned::to_owned),
-        system_prompt: settings.text("agent.system_prompt").map(ToOwned::to_owned),
         max_iterations: settings
             .integer("agent.max_iterations")
             .and_then(|value| usize::try_from(value).ok())

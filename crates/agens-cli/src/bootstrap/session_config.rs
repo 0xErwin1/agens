@@ -1,30 +1,44 @@
 //! Configuration whose correctness depends on which root a session is confined to TODAY, not on
 //! which root the current process happened to discover at `bootstrap()` time.
 //!
-//! [`Bootstrap`] captures its `permission_rules` and `system_prompt` once, from the PROCESS's own
-//! discovered root, and never revisits them. That is correct for anything that is not a
-//! session-scoped decision, but both feed exactly such a decision — whether a tool call
-//! auto-authorizes or prompts a human, and what instruction text the model is given — so a value
-//! captured once from the process root can silently keep applying after a resume moves the live
-//! session to a different root than the one the process started at, including re-labelling
-//! another root's rules or instruction text with THIS session's project key. `system_prompt` in
-//! particular is model-facing instruction text, so trusting the wrong root's value is a direct
+//! [`Bootstrap`] captures its `permission_rules` once, from the PROCESS's own discovered root,
+//! and never revisits them. That is correct for anything that is not a session-scoped decision,
+//! but permission rules feed exactly such a decision — whether a tool call auto-authorizes or
+//! prompts a human — so a value captured once from the process root can silently keep applying
+//! after a resume moves the live session to a different root than the one the process started
+//! at, including re-labelling another root's rules with THIS session's project key.
+//!
+//! `agent.system_prompt` is the same shape of problem, but this module does not read it off
+//! `Bootstrap` at all: it is re-read directly from a session's OWN project document, and
+//! independently from the global document, never through the process's already-merged,
+//! project-precedence [`agens_config::ResolvedSettings`]. That merge only remembers the FINAL
+//! winning value and which layer won it for THIS process's own root, so there is no way to
+//! recover "what would the global document have said on its own" from it once a project override
+//! elsewhere has already replaced it — reading the two source documents directly is what makes a
+//! session's own project override and a legitimate home-scoped global default both reachable,
+//! independently of whichever root the process itself started at. `agent.system_prompt` is
+//! model-facing instruction text, so trusting the wrong root's value would be a direct
 //! prompt-injection path, not merely a stale setting.
 //!
 //! `SessionConfig` closes that gap by never being cached: [`SessionConfig::resolve`] always
-//! re-reads the given [`SessionRoot`]'s own `.agens/config.toml` from disk, so the rules it
+//! re-reads the given [`SessionRoot`]'s own `.agens/config.toml` from disk, so the values it
 //! returns can never be older than the root they are being evaluated against. The only
 //! constructor takes a `SessionRoot`, not a bare `Path`, which is what removes the compile-time
 //! path for a caller to hand this type a value that never went through the session's own root
 //! resolution — [`Bootstrap::permission_rules`](super::Bootstrap::permission_rules) and
-//! [`Bootstrap::system_prompt`](super::Bootstrap::system_prompt) are themselves visible only
-//! inside `crate::bootstrap` for the same reason `discovered_root` is.
+//! [`Bootstrap::settings`](super::Bootstrap::settings) are themselves visible only inside
+//! `crate::bootstrap` for the same reason `discovered_root` is: `settings()` returns the
+//! process's merged configuration under an untyped, string-keyed accessor
+//! ([`agens_config::ResolvedSettings::text`]) that reaches every project-settable value,
+//! including `agent.system_prompt`, with no name-level signal that a session-scoped decision is
+//! being made from the wrong root.
 //!
-//! What this makes IMPOSSIBLE: reaching the process-captured, potentially wrong-rooted
-//! `permission_rules` or `system_prompt` fields from outside `crate::bootstrap` — those
-//! identifiers are no longer reachable at all outside this module, so a session-scoped caller
-//! cannot regress back to them by deleting a call to `SessionConfig::resolve` and reaching for
-//! the old field instead; the compiler has nothing left to offer it.
+//! What this makes IMPOSSIBLE: reaching `Bootstrap`'s process-captured `permission_rules` field,
+//! or its merged `settings` (and therefore `agent.system_prompt` through it), from outside
+//! `crate::bootstrap` — those identifiers are no longer reachable at all outside this module, so
+//! a session-scoped caller cannot regress back to them by deleting a call to
+//! `SessionConfig::resolve` and reaching for the old field or the generic settings accessor
+//! instead; the compiler has nothing left to offer it.
 //!
 //! What this only makes INCONVENIENT, not impossible: passing the WRONG root into
 //! [`SessionRoot::confined_to`]. That constructor accepts any `PathBuf`, so a caller that already
@@ -35,7 +49,7 @@
 //! change makes — see this module's call sites, which wrap an already-resolved, already-correct
 //! `project_root` rather than deriving one themselves.
 
-use agens_config::{ConfigPermissionRule, ConfigPermissionScope, Origin, extract_permission_rules};
+use agens_config::{ConfigPermissionRule, ConfigPermissionScope, extract_permission_rules};
 
 use crate::bootstrap::Bootstrap;
 use crate::bootstrap::session_root::SessionRoot;
@@ -60,15 +74,19 @@ impl SessionConfig {
     /// the user's home directory, not by project root, so it does not need to move with a
     /// session's confinement root) with PROJECT-scope rules read fresh from `root`'s own
     /// `.agens/config.toml` — never from `bootstrap`'s own process-captured project document.
+    ///
+    /// `system_prompt` is re-read the same way, from BOTH the session root's own project
+    /// document and the global document, each read fresh from disk here rather than taken from
+    /// `bootstrap`'s already-merged settings — see this module's own documentation for why the
+    /// merge cannot be trusted for it.
     pub(crate) fn resolve(root: &SessionRoot, bootstrap: &Bootstrap) -> Result<Self, CliError> {
-        let project_config_path = root.path().join(".agens/config.toml");
-        let project_document = match (bootstrap.config_reader)(&project_config_path)? {
-            Some(contents) => agens_config::parse_toml_document(&contents)
-                .map_err(|_| CliError::configuration("project configuration is invalid"))?,
-            None => toml::Table::new(),
-        };
-        agens_config::validate_toml_document(&project_document)
-            .map_err(|_| CliError::configuration("project configuration is invalid"))?;
+        let project_document = read_toml_document(
+            &root.path().join(".agens/config.toml"),
+            bootstrap,
+            "project",
+        )?;
+        let global_document =
+            read_toml_document(&bootstrap.paths().global_config, bootstrap, "global")?;
 
         let mut permission_rules: Vec<ConfigPermissionRule> = bootstrap
             .permission_rules()
@@ -82,11 +100,8 @@ impl SessionConfig {
                 .map_err(|_| CliError::configuration("permission configuration is invalid"))?,
         );
 
-        let system_prompt = project_system_prompt(&project_document).or_else(|| {
-            (bootstrap.settings().origin("agent.system_prompt") == Origin::Global)
-                .then(|| bootstrap.system_prompt().map(ToOwned::to_owned))
-                .flatten()
-        });
+        let system_prompt = document_text(&project_document, "agent", "system_prompt")
+            .or_else(|| document_text(&global_document, "agent", "system_prompt"));
 
         Ok(Self {
             permission_rules,
@@ -95,14 +110,32 @@ impl SessionConfig {
     }
 }
 
-/// Reads `agent.system_prompt` directly from a single, project-only document — never merged with
-/// global — so a session's own project override is honored without also picking up a value that
-/// only exists because it happened to be present in the SAME document at some OTHER path.
-fn project_system_prompt(project_document: &toml::Table) -> Option<String> {
-    project_document
-        .get("agent")
+/// Reads and validates a single TOML configuration document fresh from disk, through the same
+/// `config_reader` `bootstrap()` itself used, so a session-scoped re-read observes the same
+/// document a fresh `bootstrap()` at that path would.
+fn read_toml_document(
+    path: &std::path::Path,
+    bootstrap: &Bootstrap,
+    scope: &str,
+) -> Result<toml::Table, CliError> {
+    let document = match (bootstrap.config_reader)(path)? {
+        Some(contents) => agens_config::parse_toml_document(&contents)
+            .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?,
+        None => toml::Table::new(),
+    };
+    agens_config::validate_toml_document(&document)
+        .map_err(|_| CliError::configuration(format!("{scope} configuration is invalid")))?;
+    Ok(document)
+}
+
+/// Reads `document.section.key` directly from a single document — never merged with the other
+/// scope — so a scope's own setting is honored without also picking up a value that only exists
+/// because it happened to be present in the SAME document at some OTHER path.
+fn document_text(document: &toml::Table, section: &str, key: &str) -> Option<String> {
+    document
+        .get(section)
         .and_then(toml::Value::as_table)
-        .and_then(|table| table.get("system_prompt"))
+        .and_then(|table| table.get(key))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -182,6 +215,59 @@ mod tests {
             session_config.system_prompt(),
             Some("You are root A's own assistant."),
             "a session's OWN project configuration must still set its system prompt"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+    }
+
+    /// A legitimate home-scoped `agent.system_prompt` must still apply to a session at root A
+    /// even when the PROCESS was bootstrapped at a different root B whose OWN project
+    /// configuration overrides that same key — proving the fallback reads the global document
+    /// directly, rather than trusting the process's merged `Origin`, which would incorrectly
+    /// flip to `Project` and silently drop the global value purely because of root B's
+    /// unrelated override.
+    #[test]
+    fn a_global_system_prompt_still_applies_when_the_process_root_overrides_it_for_itself() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-session-config-global-system-prompt-fallback-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            config_home.join("config.toml"),
+            "[agent]\nsystem_prompt = \"GLOBAL-HOME-SCOPED-PROMPT\"\n".to_owned(),
+        );
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[agent]\nsystem_prompt = \"ROOT-B-OWN-OVERRIDE\"\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let session_root_a = SessionRoot::confined_to(root_a);
+        let session_config = SessionConfig::resolve(&session_root_a, &bootstrap_from_root_b)
+            .expect("session configuration should resolve");
+
+        assert_eq!(
+            session_config.system_prompt(),
+            Some("GLOBAL-HOME-SCOPED-PROMPT"),
+            "a legitimate home-scoped global system prompt must still reach a session at a root \
+             that has no project override of its own, regardless of what an unrelated other \
+             root's own project configuration happens to set"
         );
 
         std::fs::remove_dir_all(&temporary).ok();
