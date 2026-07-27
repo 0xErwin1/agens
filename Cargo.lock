@@ -9,6 +9,7 @@ dependencies = [
  "agens-config",
  "agens-core",
  "agens-providers",
+ "agens-server",
  "agens-store",
  "agens-tools",
  "agens-tui",
@@ -52,6 +53,15 @@ dependencies = [
  "time",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "agens-server"
+version = "0.1.0"
+dependencies = [
+ "agens-core",
+ "libc",
+ "tokio",
 ]
 
 [[package]]

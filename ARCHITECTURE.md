@@ -12,6 +12,7 @@ crates/agens-cli        command parsing and composition root
   -> agens-tools        native tools, permissions, MCP, skills, and subagents
   -> agens-store        SQLite sessions and persisted grants
   -> agens-tui          terminal surface over the shared runtime
+  -> agens-server       the machine's daemon: single-instance runtime and, later, the coordinator
 ```
 
 ## Dependency direction
@@ -20,6 +21,7 @@ crates/agens-cli        command parsing and composition root
 - `agens-config` is a leaf crate for configuration and credential compatibility.
 - Provider, tool, and store crates may depend on `agens-core` and `agens-config` where required.
 - `agens-tui` depends on `agens-core` only and remains a surface adapter.
+- `agens-server` depends on `agens-core` only. It owns the daemon: the single-instance runtime today, and the coordinator, its state machines, the scheduler and the timers as they land. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate.
 - `agens-cli` is the composition root and the sole binary crate.
 
 ## Runtime boundary

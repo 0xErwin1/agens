@@ -6,6 +6,7 @@ members = [
   "crates/agens-tools",
   "crates/agens-store",
   "crates/agens-tui",
+  "crates/agens-server",
   "crates/agens-cli",
 ]
 resolver = "3"

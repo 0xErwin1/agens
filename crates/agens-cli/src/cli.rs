@@ -45,6 +45,8 @@ pub(crate) enum Command {
     Chat(ChatArgs),
     #[command(about = "list provider models")]
     Models,
+    #[command(about = "run the headless daemon for this machine")]
+    Serve,
     #[command(about = "inspect completed turns")]
     Sessions {
         #[command(subcommand)]

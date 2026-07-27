@@ -11,10 +11,12 @@ jq -e '
     "agens-tools": ["agens-config", "agens-core"],
     "agens-store": ["agens-core"],
     "agens-tui": ["agens-core"],
+    "agens-server": ["agens-core"],
     "agens": [
       "agens-config",
       "agens-core",
       "agens-providers",
+      "agens-server",
       "agens-store",
       "agens-tools",
       "agens-tui"
