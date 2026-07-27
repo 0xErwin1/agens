@@ -93,9 +93,10 @@ pub(crate) fn run_production_tui(
             history: std::mem::take(&mut resumed.restored_history),
             draft,
             resume_error,
-            // The real picker candidates are set below, once the session's own root is resolved
-            // and `start_tui_skills`/`start_tui_commands` have run against it.
+            // The real picker candidates and palette are set below, once the session's own root
+            // is resolved and `start_tui_skills`/`start_tui_commands` have run against it.
             file_candidates: Vec::new(),
+            palette_entries: Vec::new(),
         });
         for event in resumed_subagent_cards(&resumed.messages) {
             tui.apply_runtime_event(event);
@@ -533,6 +534,7 @@ mod tests {
             draft: None,
             resume_error: None,
             file_candidates: Vec::new(),
+            palette_entries: Vec::new(),
         });
         let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
         assert!(

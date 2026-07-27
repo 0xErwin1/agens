@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use agens_core::{HeadlessTurnError, Message, MessagePart, RetryBoundary, SessionAttemptStatus};
 use agens_store::{SessionStore, StoredSession};
 use agens_tools::SkillCatalog;
-use agens_tui::{Conversation, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome};
+use agens_tui::{
+    Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
+};
 
 use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
@@ -197,15 +199,16 @@ pub(crate) fn prepare_loaded_tui_session_resume(
 ///
 /// `on_commit` is the caller's hook for refreshing every OTHER piece of session-scoped state that
 /// must follow the session's newly recorded root (command/skill catalogs, the `@` picker
-/// candidate list): this function only owns the session slot itself, so it cannot refresh those
-/// on the caller's behalf. It returns the picker candidates to attach to the outcome.
+/// candidate list, the rendered composer palette): this function only owns the session slot
+/// itself, so it cannot refresh those on the caller's behalf. It returns the picker candidates and
+/// palette entries to attach to the outcome.
 pub(crate) fn commit_tui_session_resume(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<TuiSessionContext>>,
     expected: &TuiSessionContext,
     mut resumed: TuiSessionContext,
     cancellation: &TuiRouteCancellation,
-    on_commit: impl FnOnce(&TuiSessionContext) -> Vec<String>,
+    on_commit: impl FnOnce(&TuiSessionContext) -> (Vec<String>, Vec<PaletteEntry>),
 ) -> Result<TuiSubmissionOutcome, CliError> {
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
@@ -227,7 +230,7 @@ pub(crate) fn commit_tui_session_resume(
         return Ok(TuiSubmissionOutcome::RouteCancelled);
     }
     persist_pending_agent_correction(bootstrap, &mut resumed);
-    let file_candidates = on_commit(&resumed);
+    let (file_candidates, palette_entries) = on_commit(&resumed);
     *current = resumed;
 
     Ok(TuiSubmissionOutcome::SessionResumed {
@@ -237,6 +240,7 @@ pub(crate) fn commit_tui_session_resume(
         draft,
         resume_error,
         file_candidates,
+        palette_entries,
     })
 }
 
@@ -595,7 +599,7 @@ mod tests {
             &expected,
             prepared,
             &TuiRouteCancellation::new(),
-            |_| Vec::new(),
+            |_| (Vec::new(), Vec::new()),
         )
         .unwrap();
         assert!(session.lock().unwrap().resume_draft.is_none());
@@ -742,7 +746,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &cancelled,
-                |_| Vec::new(),
+                |_| (Vec::new(), Vec::new()),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -758,7 +762,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &TuiRouteCancellation::new(),
-                |_| Vec::new(),
+                |_| (Vec::new(), Vec::new()),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -769,7 +773,7 @@ mod tests {
         let accepted = TuiRouteCancellation::new();
         assert!(matches!(
             commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted, |_| {
-                Vec::new()
+                (Vec::new(), Vec::new())
             },)
             .unwrap(),
             TuiSubmissionOutcome::SessionResumed { .. }
@@ -1021,7 +1025,7 @@ mod tests {
             &expected,
             resumed,
             &TuiRouteCancellation::new(),
-            |_| Vec::new(),
+            |_| (Vec::new(), Vec::new()),
         )
         .unwrap();
         assert!(matches!(
@@ -1260,7 +1264,7 @@ mod tests {
                     &original,
                     prepared,
                     &cancellation,
-                    |_| Vec::new(),
+                    |_| (Vec::new(), Vec::new()),
                 )
                 .unwrap();
                 (outcome, tui_resume_test_counters())

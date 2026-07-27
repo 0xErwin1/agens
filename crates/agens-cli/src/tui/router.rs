@@ -766,15 +766,18 @@ impl TuiRuntimeRouter {
     /// Called by [`commit_tui_session_resume`] exactly once a resume has actually won its commit
     /// race (never on a rejected, stale, or cancelled attempt), with the context that is about to
     /// become the live session. Refreshes every session-scoped derived surface — the command and
-    /// skill catalogs plus the `@` picker candidate list — from that context's own root, and
-    /// returns the picker candidates for the `SessionResumed` outcome to apply to the `Tui`.
+    /// skill catalogs, the `@` picker candidate list, and the composer's rendered palette — from
+    /// that context's own root, and returns the picker candidates and palette entries for the
+    /// `SessionResumed` outcome to apply to the `Tui`.
     fn on_session_resume_committed(
         &self,
         bootstrap: &Bootstrap,
         context: &TuiSessionContext,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<PaletteEntry>) {
         self.refresh_session_extensions(bootstrap, context);
-        tui_picker_file_candidates(context, bootstrap).unwrap_or_default()
+        let file_candidates = tui_picker_file_candidates(context, bootstrap).unwrap_or_default();
+        let palette_entries = self.palette_entries().unwrap_or_default();
+        (file_candidates, palette_entries)
     }
 
     #[cfg(test)]
@@ -1268,6 +1271,7 @@ mod tests {
         elsewhere_root: std::path::PathBuf,
         metadata_id: i64,
         router: TuiRuntimeRouter,
+        tui: Tui<ProductionTuiEngine>,
     }
 
     /// Builds a session confined to root A and a router whose STARTUP catalogs were discovered
@@ -1297,6 +1301,11 @@ mod tests {
             start_tui_commands(&mut tui, &resume_bootstrap, &elsewhere_root).unwrap();
         let startup_skills =
             start_tui_skills(&mut tui, &resume_bootstrap, &elsewhere_root).unwrap();
+        tui.set_palette_entries(resolved_tui_palette(
+            &startup_commands,
+            &startup_skills,
+            false,
+        ));
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             resume_bootstrap,
@@ -1311,6 +1320,7 @@ mod tests {
             elsewhere_root,
             metadata_id: metadata.id,
             router,
+            tui,
         }
     }
 
@@ -1429,6 +1439,69 @@ mod tests {
         );
 
         assert_router_confined_to_root_a(&fixture.router);
+    }
+
+    /// The router's own palette cache is refreshed on a post-startup `/resume` (proven above by
+    /// `assert_router_confined_to_root_a`'s `/bskill` check and the file-candidate assertions),
+    /// but `Tui::set_palette_entries` is only ever called once, at startup. A post-startup resume
+    /// must still refresh the composer's OWN copy — the one it actually renders from — or root
+    /// B's skill and command names keep showing up in the composer's autocomplete after the
+    /// session is confined to root A.
+    #[test]
+    fn a_post_startup_resume_refreshes_the_composers_own_palette_not_just_the_routers() {
+        let mut fixture = catalog_confinement_fixture("catalog-confinement-composer-palette");
+
+        let palette_before_resume: Vec<String> = fixture
+            .tui
+            .view()
+            .palette
+            .map(|palette| {
+                palette
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            palette_before_resume.is_empty(),
+            "the palette dialog is not open yet, so the view must not surface any entries"
+        );
+
+        let resume_outcome = fixture
+            .router
+            .route(format!("/resume {}", fixture.metadata_id));
+        assert!(
+            fixture
+                .tui
+                .apply_submission_outcome(resume_outcome)
+                .is_none(),
+            "a session resume does not launch a provider turn"
+        );
+
+        fixture
+            .tui
+            .handle(agens_tui::Event::Key(agens_tui::Key::Char('/')));
+        let rendered_palette_names: Vec<String> = fixture
+            .tui
+            .view()
+            .palette
+            .expect("typing a leading '/' opens the palette")
+            .entries()
+            .iter()
+            .map(|entry| entry.name().to_owned())
+            .collect();
+
+        assert!(
+            !rendered_palette_names.iter().any(|name| name == "bskill"),
+            "the composer's OWN rendered palette must not keep listing root B's skill after the \
+             session is confined to root A: {rendered_palette_names:?}"
+        );
+        assert!(
+            rendered_palette_names.iter().any(|name| name == "askill"),
+            "root A's own skill must be present in the composer's rendered palette after resume: \
+             {rendered_palette_names:?}"
+        );
     }
 
     fn test_chatgpt_credentials(

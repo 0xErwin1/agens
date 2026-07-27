@@ -274,6 +274,11 @@ pub enum TuiSubmissionOutcome {
         /// earlier session) in place, even though they may now name files outside the resumed
         /// session's own confined root.
         file_candidates: Vec<String>,
+        /// The command/skill palette entries for the resumed session's OWN root. Without this,
+        /// the composer's rendered autocomplete would keep listing whatever entries were set at
+        /// TUI startup (or by an earlier session), even after those names are no longer reachable
+        /// once the session is confined to a different root.
+        palette_entries: Vec<PaletteEntry>,
     },
     Dialog(DialogView),
     SafeDialog(DialogView),
@@ -621,6 +626,16 @@ impl PaletteEntry {
 pub struct PaletteView<'a> {
     entries: &'a [PaletteEntry],
     selected: usize,
+}
+
+impl<'a> PaletteView<'a> {
+    pub fn entries(&self) -> &'a [PaletteEntry] {
+        self.entries
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
 }
 
 /// Open `@` reference: character index of the `@` and the current row selection.
@@ -3240,11 +3255,13 @@ where
                 draft,
                 resume_error,
                 file_candidates,
+                palette_entries,
             } => {
                 self.finish_session_load();
                 self.replace_projected_history(history);
                 self.apply_presentation(presentation);
                 self.set_file_candidates(file_candidates);
+                self.set_palette_entries(palette_entries);
                 self.input.clear();
                 self.input_cursor = 0;
                 self.recovered_failed_prompt = false;
@@ -7159,6 +7176,7 @@ mod runtime_tests {
             draft: None,
             resume_error: None,
             file_candidates: Vec::new(),
+            palette_entries: Vec::new(),
         });
         let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut renderer = RatatuiRenderer::new(terminal);

@@ -247,6 +247,7 @@ fn transcript_admission_retention_session_resume_keeps_restored_history_summary_
         draft: None,
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
 
     let view = tui.view();
@@ -334,6 +335,7 @@ fn session_resume_success_replaces_prepared_state_in_one_outcome() {
         draft: None,
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
 
     let resumed = tui.view();
@@ -367,6 +369,7 @@ fn failed_session_resume_restores_exact_draft_with_history_at_composer_bottom() 
         draft: Some("retry exact café 🙂".into()),
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
 
     let resumed = tui.view();
@@ -411,6 +414,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         draft: Some("failed prompt".into()),
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
@@ -425,6 +429,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         draft: Some("older failed prompt".into()),
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
     tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
         message: "Resumed session 3.".into(),
@@ -433,6 +438,7 @@ fn recovered_failed_prompt_escape_discards_and_successful_resume_replaces_atomic
         draft: None,
         resume_error: None,
         file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
     });
 
     assert!(tui.input().is_empty());
