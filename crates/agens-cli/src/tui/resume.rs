@@ -191,12 +191,21 @@ pub(crate) fn prepare_loaded_tui_session_resume(
     Ok(context)
 }
 
+/// Commits a prepared resume into the live session slot under the race guard described on
+/// [`TuiRouteCancellation`], then invokes `on_commit` exactly once, only for a resume that has
+/// actually won that race — never for one rejected as busy, stale, or cancelled.
+///
+/// `on_commit` is the caller's hook for refreshing every OTHER piece of session-scoped state that
+/// must follow the session's newly recorded root (command/skill catalogs, the `@` picker
+/// candidate list): this function only owns the session slot itself, so it cannot refresh those
+/// on the caller's behalf. It returns the picker candidates to attach to the outcome.
 pub(crate) fn commit_tui_session_resume(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<TuiSessionContext>>,
     expected: &TuiSessionContext,
     mut resumed: TuiSessionContext,
     cancellation: &TuiRouteCancellation,
+    on_commit: impl FnOnce(&TuiSessionContext) -> Vec<String>,
 ) -> Result<TuiSubmissionOutcome, CliError> {
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
@@ -218,6 +227,7 @@ pub(crate) fn commit_tui_session_resume(
         return Ok(TuiSubmissionOutcome::RouteCancelled);
     }
     persist_pending_agent_correction(bootstrap, &mut resumed);
+    let file_candidates = on_commit(&resumed);
     *current = resumed;
 
     Ok(TuiSubmissionOutcome::SessionResumed {
@@ -226,6 +236,7 @@ pub(crate) fn commit_tui_session_resume(
         history,
         draft,
         resume_error,
+        file_candidates,
     })
 }
 
@@ -584,6 +595,7 @@ mod tests {
             &expected,
             prepared,
             &TuiRouteCancellation::new(),
+            |_| Vec::new(),
         )
         .unwrap();
         assert!(session.lock().unwrap().resume_draft.is_none());
@@ -730,6 +742,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &cancelled,
+                |_| Vec::new(),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -745,6 +758,7 @@ mod tests {
                 &original,
                 prepared.clone(),
                 &TuiRouteCancellation::new(),
+                |_| Vec::new(),
             )
             .unwrap(),
             TuiSubmissionOutcome::RouteCancelled
@@ -754,8 +768,10 @@ mod tests {
         *session.lock().unwrap() = original.clone();
         let accepted = TuiRouteCancellation::new();
         assert!(matches!(
-            commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted,)
-                .unwrap(),
+            commit_tui_session_resume(&bootstrap, &session, &original, prepared, &accepted, |_| {
+                Vec::new()
+            },)
+            .unwrap(),
             TuiSubmissionOutcome::SessionResumed { .. }
         ));
         assert!(!accepted.cancel());
@@ -1005,6 +1021,7 @@ mod tests {
             &expected,
             resumed,
             &TuiRouteCancellation::new(),
+            |_| Vec::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -1243,6 +1260,7 @@ mod tests {
                     &original,
                     prepared,
                     &cancellation,
+                    |_| Vec::new(),
                 )
                 .unwrap();
                 (outcome, tui_resume_test_counters())

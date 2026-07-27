@@ -35,8 +35,11 @@ use crate::tui::agents::{
     tui_agent_catalog_for_context, tui_subagent_catalog,
 };
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
-use crate::tui::extensions::{RESERVED_TUI_COMMANDS, render_tui_help, resolved_tui_palette};
-use crate::tui::files::{selected_tui_file, tui_select_candidates};
+use crate::tui::extensions::{
+    RESERVED_TUI_COMMANDS, discover_skill_catalog, discover_tui_command_catalog, render_tui_help,
+    resolved_tui_palette,
+};
+use crate::tui::files::{selected_tui_file, tui_picker_file_candidates, tui_select_candidates};
 use crate::tui::models::{
     apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
     format_model_metadata, select_tui_effort, select_tui_model, tui_model_source,
@@ -64,13 +67,20 @@ pub(crate) struct TuiRuntimeRouter {
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
     credentials: TuiCredentialResolver,
-    commands: Arc<CommandCatalog>,
-    pub(crate) skills: Arc<SkillCatalog>,
-    palette: Arc<[PaletteEntry]>,
+    /// Commands, skills, and the derived command palette, bundled behind one lock so a
+    /// post-startup resume can swap all three atomically to the resumed session's own root
+    /// instead of leaving them pinned to whatever root the router was constructed with.
+    extensions: Arc<Mutex<RouterExtensions>>,
     pub(crate) mcp_status: McpStatusHandle,
     _mcp_registry: Arc<Mutex<McpRegistry>>,
     clock: fn() -> i64,
     credential_restorer: Arc<CredentialRestorer>,
+}
+
+struct RouterExtensions {
+    commands: Arc<CommandCatalog>,
+    skills: Arc<SkillCatalog>,
+    palette: Vec<PaletteEntry>,
 }
 
 type CredentialRestorer =
@@ -106,7 +116,7 @@ impl TuiRuntimeRouter {
             tui_subagent_catalog(&bootstrap, &context)
                 .is_ok_and(|mut agents| agents.next().is_some())
         });
-        let palette = resolved_tui_palette(&commands, &skills, has_subagents).into();
+        let palette = resolved_tui_palette(&commands, &skills, has_subagents);
         let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
         let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
             &bootstrap,
@@ -123,9 +133,11 @@ impl TuiRuntimeRouter {
             cancellation,
             auth,
             credentials: TuiCredentialResolver::production(),
-            commands,
-            skills,
-            palette,
+            extensions: Arc::new(Mutex::new(RouterExtensions {
+                commands,
+                skills,
+                palette,
+            })),
             mcp_status,
             _mcp_registry: registry,
             clock: current_session_timestamp,
@@ -403,7 +415,7 @@ impl TuiRuntimeRouter {
             }
             "help" => DialogView::selection(
                 "Commands and skills",
-                Some(render_tui_help(&self.palette)),
+                Some(render_tui_help(&self.palette_entries()?)),
                 Vec::new(),
             ),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
@@ -604,6 +616,7 @@ impl TuiRuntimeRouter {
                         &expected,
                         resumed,
                         cancellation,
+                        |context| self.on_session_resume_committed(&bootstrap, context),
                     );
                 }
                 let message = if let Some(model) = action_id.strip_prefix("model:") {
@@ -615,7 +628,7 @@ impl TuiRuntimeRouter {
                 } else if let Some(effort) = action_id.strip_prefix("effort:") {
                     apply_tui_effort(&bootstrap, effort, &self.session)?
                 } else if let Some(agent) = action_id.strip_prefix("agent:") {
-                    rotate_tui_agent(&bootstrap, agent, &self.session, &self.skills)?
+                    rotate_tui_agent(&bootstrap, agent, &self.session, self.skills()?.as_ref())?
                 } else if let Some(agent) = action_id.strip_prefix("subagent:") {
                     select_tui_subagent(&bootstrap, agent, &self.session)?
                 } else {
@@ -677,9 +690,14 @@ impl TuiRuntimeRouter {
             .ok_or_else(|| CliError::storage("attempt recovery failed"))?;
         drop(store);
 
-        let mut resumed =
-            resume_tui_session(bootstrap, key.session_id(), &self.skills, &self.credentials)?;
+        let mut resumed = resume_tui_session(
+            bootstrap,
+            key.session_id(),
+            self.skills()?.as_ref(),
+            &self.credentials,
+        )?;
         persist_pending_agent_correction(bootstrap, &mut resumed);
+        self.refresh_session_extensions(bootstrap, &resumed);
         let prompt = boundary.prompt().to_owned();
         *self
             .session
@@ -692,8 +710,71 @@ impl TuiRuntimeRouter {
         })
     }
 
-    pub(crate) fn palette_entries(&self) -> &[PaletteEntry] {
-        &self.palette
+    pub(crate) fn skills(&self) -> Result<Arc<SkillCatalog>, CliError> {
+        self.extensions
+            .lock()
+            .map(|extensions| Arc::clone(&extensions.skills))
+            .map_err(|_| CliError::storage("TUI extension catalogs are unavailable"))
+    }
+
+    fn commands(&self) -> Result<Arc<CommandCatalog>, CliError> {
+        self.extensions
+            .lock()
+            .map(|extensions| Arc::clone(&extensions.commands))
+            .map_err(|_| CliError::storage("TUI extension catalogs are unavailable"))
+    }
+
+    pub(crate) fn palette_entries(&self) -> Result<Vec<PaletteEntry>, CliError> {
+        self.extensions
+            .lock()
+            .map(|extensions| extensions.palette.clone())
+            .map_err(|_| CliError::storage("TUI extension catalogs are unavailable"))
+    }
+
+    /// Re-discovers commands, skills, and the derived palette from the session's OWN recorded
+    /// root, after a post-startup resume may have changed that root out from under this router.
+    ///
+    /// Best-effort: on any discovery failure the previously held catalogs are left in place,
+    /// mirroring the same graceful degradation startup already applies (`tui.add_info` there,
+    /// nothing to report to here since a resume commit has no `Tui` handle). This must run for
+    /// every resume that lands in the live session slot, or the catalogs captured once at startup
+    /// keep feeding a DIFFERENT root's skill bodies and command templates into every later turn as
+    /// model-facing instruction text.
+    fn refresh_session_extensions(&self, bootstrap: &Bootstrap, context: &TuiSessionContext) {
+        let Ok(project_root) = crate::session_root::resolve_tui_session_root(context, bootstrap)
+        else {
+            return;
+        };
+        let Ok(commands_discovery) = discover_tui_command_catalog(bootstrap, &project_root) else {
+            return;
+        };
+        let Ok(skills_discovery) = discover_skill_catalog(bootstrap, &project_root) else {
+            return;
+        };
+        let commands = Arc::new(commands_discovery.catalog().clone());
+        let skills = Arc::new(skills_discovery.catalog().clone());
+        let has_subagents = tui_subagent_catalog(bootstrap, context)
+            .is_ok_and(|mut agents| agents.next().is_some());
+        let palette = resolved_tui_palette(&commands, &skills, has_subagents);
+        if let Ok(mut extensions) = self.extensions.lock() {
+            extensions.commands = commands;
+            extensions.skills = skills;
+            extensions.palette = palette;
+        }
+    }
+
+    /// Called by [`commit_tui_session_resume`] exactly once a resume has actually won its commit
+    /// race (never on a rejected, stale, or cancelled attempt), with the context that is about to
+    /// become the live session. Refreshes every session-scoped derived surface — the command and
+    /// skill catalogs plus the `@` picker candidate list — from that context's own root, and
+    /// returns the picker candidates for the `SessionResumed` outcome to apply to the `Tui`.
+    fn on_session_resume_committed(
+        &self,
+        bootstrap: &Bootstrap,
+        context: &TuiSessionContext,
+    ) -> Vec<String> {
+        self.refresh_session_extensions(bootstrap, context);
+        tui_picker_file_candidates(context, bootstrap).unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -763,18 +844,28 @@ impl TuiRuntimeRouter {
                     .trim()
                     .parse::<i64>()
                     .map_err(|_| CliError::usage("/resume requires a numeric session id"))?;
-                let resumed =
-                    resume_tui_session(&bootstrap, identifier, &self.skills, &self.credentials)?;
+                let resumed = resume_tui_session(
+                    &bootstrap,
+                    identifier,
+                    self.skills()?.as_ref(),
+                    &self.credentials,
+                )?;
                 commit_tui_session_resume(
                     &bootstrap,
                     &self.session,
                     &expected,
                     resumed,
                     cancellation,
+                    |context| self.on_session_resume_committed(&bootstrap, context),
                 )?
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
-                message: rotate_tui_agent(&bootstrap, &command[7..], &self.session, &self.skills)?,
+                message: rotate_tui_agent(
+                    &bootstrap,
+                    &command[7..],
+                    &self.session,
+                    self.skills()?.as_ref(),
+                )?,
                 presentation: self.presentation()?,
             },
             "/agent" => self.open_dialog("agent")?,
@@ -797,12 +888,12 @@ impl TuiRuntimeRouter {
             _ if RESERVED_TUI_COMMANDS.contains(&name) => {
                 return Err(CliError::usage(format!("unknown TUI command: {command}")));
             }
-            _ => match self.commands.command(name) {
+            _ => match self.commands()?.command(name) {
                 Some(command) => TuiSubmissionOutcome::ProviderTurn {
                     display: input.clone(),
                     prompt: command.expand(arguments),
                 },
-                None => match self.skills.skill(name) {
+                None => match self.skills()?.skill(name) {
                     Some(skill) => TuiSubmissionOutcome::ProviderTurn {
                         display: input.clone(),
                         prompt: format!(
@@ -1152,14 +1243,193 @@ mod tests {
     use crate::headless::HeadlessChatCompletion;
     use crate::model_registry::TuiModelSource;
     use crate::test_support::{
-        dispatch_tui_dialog_selection, enter_tui_input, open_tui_palette_dialog,
-        persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
-        rotation_dispatcher, run_production_batch, submit_tui_command, tui_project,
-        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
-        tui_session_messages,
+        bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
+        enter_tui_input, open_tui_palette_dialog, persist_tui_session,
+        persist_tui_session_metadata, render_tui_test_backend, rotation_dispatcher,
+        run_production_batch, submit_tui_command, tui_project, tui_session_bootstrap,
+        tui_session_bootstrap_for_provider, tui_session_directory, tui_session_messages,
     };
     use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
+    use crate::tui::extensions::{start_tui_commands, start_tui_skills};
     use crate::tui::resume::ensure_active_tui_agent_runtime;
+
+    fn write_router_test_skill(root: &Path, name: &str, body: &str) {
+        let directory = root.join(".agens/skills").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {name}\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    struct CatalogConfinementFixture {
+        origin: std::path::PathBuf,
+        elsewhere_root: std::path::PathBuf,
+        metadata_id: i64,
+        router: TuiRuntimeRouter,
+    }
+
+    /// Builds a session confined to root A and a router whose STARTUP catalogs were discovered
+    /// from a DIFFERENT root B (matching production, where no `--resume` flag was given), with
+    /// one skill and one distinctly named file unique to each root.
+    fn catalog_confinement_fixture(label: &str) -> CatalogConfinementFixture {
+        let origin = tui_session_directory(&format!("{label}-origin"));
+        let origin_root = origin.join("project");
+        write_router_test_skill(&origin_root, "askill", "INSTRUCTIONS-FROM-ROOT-A");
+        std::fs::write(origin_root.join("only-in-a.txt"), "a").unwrap();
+        let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
+        let mut store = SessionStore::open(creation_bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&origin), "origin");
+        drop(store);
+
+        let resume_bootstrap =
+            bootstrap_from_a_different_working_directory(&origin, &format!("{label}-elsewhere"));
+        let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        write_router_test_skill(&elsewhere_root, "bskill", "INSTRUCTIONS-FROM-ROOT-B");
+        std::fs::write(elsewhere_root.join("only-in-elsewhere.txt"), "b").unwrap();
+
+        let cancellation = Arc::new(Mutex::new(None));
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::clone(&cancellation),
+        });
+        let startup_commands =
+            start_tui_commands(&mut tui, &resume_bootstrap, &elsewhere_root).unwrap();
+        let startup_skills =
+            start_tui_skills(&mut tui, &resume_bootstrap, &elsewhere_root).unwrap();
+        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let router = TuiRuntimeRouter::new(
+            resume_bootstrap,
+            session,
+            cancellation,
+            startup_commands,
+            startup_skills,
+        );
+
+        CatalogConfinementFixture {
+            origin,
+            elsewhere_root,
+            metadata_id: metadata.id,
+            router,
+        }
+    }
+
+    impl Drop for CatalogConfinementFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.origin);
+            let _ = std::fs::remove_dir_all(self.elsewhere_root.parent().unwrap());
+        }
+    }
+
+    fn assert_router_confined_to_root_a(router: &TuiRuntimeRouter) {
+        assert!(
+            matches!(
+                router.route("/bskill args".into()),
+                TuiSubmissionOutcome::LocalActionableError { .. }
+            ),
+            "root B's skill must no longer be reachable once the session is confined to root A"
+        );
+        let TuiSubmissionOutcome::ProviderTurn { prompt, .. } = router.route("/askill args".into())
+        else {
+            panic!("root A's own skill must be reachable after resuming into root A");
+        };
+        assert!(prompt.contains("INSTRUCTIONS-FROM-ROOT-A"), "{prompt:?}");
+    }
+
+    /// Proves C-NEW is closed: a post-startup `/resume <id>` across a differently rooted
+    /// process re-discovers the router's command/skill catalogs from the RESUMED session's own
+    /// root, instead of keeping the catalogs the router was constructed with at startup.
+    ///
+    /// Mirrors the verifier's own probe exactly: a session created under root A is resumed from
+    /// a router whose STARTUP catalogs came from a different root B (matching production, where
+    /// no `--resume` flag was given and the process's own root is B). Before the fix, `/bskill`
+    /// (root B's skill, model-facing instruction text) would remain reachable, and root A's own
+    /// `/askill` would stay unknown, even though the session is now confined to A.
+    #[test]
+    fn a_post_startup_resume_command_refreshes_commands_skills_and_picker_candidates() {
+        let fixture = catalog_confinement_fixture("catalog-confinement-resume-command");
+
+        assert!(
+            matches!(
+                fixture.router.route("/bskill args".into()),
+                TuiSubmissionOutcome::ProviderTurn { .. }
+            ),
+            "root B's skill must be reachable before any resume, matching production startup"
+        );
+
+        let resume_outcome = fixture
+            .router
+            .route(format!("/resume {}", fixture.metadata_id));
+        let TuiSubmissionOutcome::SessionResumed {
+            file_candidates, ..
+        } = resume_outcome
+        else {
+            panic!("expected a successful resume, got {resume_outcome:?}");
+        };
+
+        assert_router_confined_to_root_a(&fixture.router);
+        assert_eq!(
+            file_candidates,
+            vec!["only-in-a.txt".to_owned()],
+            "the picker candidates on the resume outcome must enumerate the resumed \
+             session's own root, not the resuming process's discovered root"
+        );
+    }
+
+    /// Same proof as the `/resume <id>` test above, but through the session-picker dialog action
+    /// (`session:{id}`) instead of the slash command — the second of the three post-startup
+    /// resume entry points named by C-NEW.
+    #[test]
+    fn a_post_startup_session_picker_action_refreshes_commands_skills_and_picker_candidates() {
+        let fixture = catalog_confinement_fixture("catalog-confinement-picker-action");
+
+        let resume_outcome = fixture.router.route_dialog_action(
+            &format!("session:{}", fixture.metadata_id),
+            std::sync::mpsc::channel().0,
+        );
+        let TuiSubmissionOutcome::SessionResumed {
+            file_candidates, ..
+        } = resume_outcome
+        else {
+            panic!("expected a successful resume, got {resume_outcome:?}");
+        };
+
+        assert_router_confined_to_root_a(&fixture.router);
+        assert_eq!(file_candidates, vec!["only-in-a.txt".to_owned()]);
+    }
+
+    /// Same proof again, but through interrupted-attempt recovery (`session:recover:<id>:<n>`)
+    /// — the third of the three post-startup resume entry points named by C-NEW. This path
+    /// returns `ProviderTurn`, not `SessionResumed`, so it has no picker candidates to check.
+    #[test]
+    fn a_post_startup_recovery_action_refreshes_commands_and_skills() {
+        let fixture = catalog_confinement_fixture("catalog-confinement-recovery");
+        let bootstrap = fixture.router.bootstrap().unwrap();
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let stored = store.load_session_for_resume(fixture.metadata_id).unwrap();
+        let attempt = store
+            .begin_session_attempt(&stored.metadata, "recovered prompt".into())
+            .unwrap();
+        drop(store);
+
+        let outcome = fixture.router.route_dialog_action(
+            &format!(
+                "session:recover:{}:{}",
+                attempt.key().session_id(),
+                attempt.key().attempt_id()
+            ),
+            std::sync::mpsc::channel().0,
+        );
+        assert!(
+            matches!(
+                &outcome,
+                TuiSubmissionOutcome::ProviderTurn { prompt, .. } if prompt == "recovered prompt"
+            ),
+            "{outcome:?}"
+        );
+
+        assert_router_confined_to_root_a(&fixture.router);
+    }
 
     fn test_chatgpt_credentials(
         access_token: &str,
@@ -1229,7 +1499,7 @@ mod tests {
             Arc::new(CommandCatalog::default()),
             Arc::new(SkillCatalog::default()),
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let (progress, _) = std::sync::mpsc::channel();
 
         for (prefix, route_id, expected) in [
@@ -1315,7 +1585,7 @@ mod tests {
             Arc::new(SkillCatalog::default()),
             coordinator,
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let (progress, _) = std::sync::mpsc::channel();
 
         for (prefix, down, flow) in [
@@ -1743,6 +2013,7 @@ mod tests {
         assert!(
             router
                 .palette_entries()
+                .unwrap()
                 .iter()
                 .any(|entry| entry.name() == "subagent")
         );
@@ -1805,6 +2076,7 @@ mod tests {
         assert!(
             !unavailable_router
                 .palette_entries()
+                .unwrap()
                 .iter()
                 .any(|entry| entry.name() == "subagent")
         );
@@ -2381,7 +2653,7 @@ mod tests {
             Arc::new(CommandCatalog::default()),
             Arc::new(SkillCatalog::default()),
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let (progress, _) = std::sync::mpsc::channel();
 
         let empty = router.route_request(
@@ -2614,7 +2886,7 @@ mod tests {
             Arc::new(SkillCatalog::default()),
             || 10_000,
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let (progress, _) = std::sync::mpsc::channel();
         let original_context = session.lock().unwrap().clone();
 
@@ -2737,7 +3009,7 @@ mod tests {
             Arc::new(CommandCatalog::default()),
             Arc::new(SkillCatalog::default()),
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let (progress, _) = std::sync::mpsc::channel();
 
         open_tui_palette_dialog(&mut tui, &router, "/re", "sessions", progress.clone());
@@ -2874,7 +3146,7 @@ mod tests {
             &bootstrap,
             &prompt,
             &router.session,
-            Some(Arc::clone(&router.skills)),
+            Some(router.skills().unwrap()),
             |request| {
                 assert_eq!(request.history, restored_messages);
                 let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();

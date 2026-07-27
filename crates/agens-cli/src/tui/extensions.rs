@@ -58,11 +58,14 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("quit", "Exit Agens", "", None),
 ];
 
-pub(crate) fn start_tui_commands<E: TuiEngine>(
-    tui: &mut Tui<E>,
+/// Discovers the command catalog for the given root without surfacing diagnostics to a `Tui`.
+///
+/// Shared by [`start_tui_commands`] (which adds startup diagnostics) and by a session's
+/// post-resume catalog refresh, which has no `Tui` handle to report diagnostics to.
+pub(crate) fn discover_tui_command_catalog(
     bootstrap: &Bootstrap,
     project_root: &Path,
-) -> Result<Arc<CommandCatalog>, CliError> {
+) -> Result<agens_tools::CommandDiscovery, CliError> {
     let global_root = bootstrap
         .paths
         .global_config
@@ -77,8 +80,16 @@ pub(crate) fn start_tui_commands<E: TuiEngine>(
                 .expect("reserved TUI command names are valid")
         })
         .collect::<Vec<_>>();
-    let discovery = CommandCatalog::discover(&built_ins, global_root, project_command_root)
-        .map_err(CliError::configuration)?;
+    CommandCatalog::discover(&built_ins, global_root, project_command_root)
+        .map_err(CliError::configuration)
+}
+
+pub(crate) fn start_tui_commands<E: TuiEngine>(
+    tui: &mut Tui<E>,
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<Arc<CommandCatalog>, CliError> {
+    let discovery = discover_tui_command_catalog(bootstrap, project_root)?;
 
     for diagnostic in discovery.diagnostics() {
         tui.add_diagnostic(format!(
@@ -624,7 +635,7 @@ mod tests {
             commands,
             skills,
         );
-        let entries = router.palette_entries();
+        let entries = router.palette_entries().unwrap();
 
         assert_eq!(
             entries.iter().map(|entry| entry.name()).collect::<Vec<_>>(),
@@ -743,7 +754,7 @@ mod tests {
             commands,
             skills,
         );
-        tui.set_palette_entries(router.palette_entries().to_vec());
+        tui.set_palette_entries(router.palette_entries().unwrap());
         let mut provider_prompts = Vec::new();
 
         for (input, expected) in [

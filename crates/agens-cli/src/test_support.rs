@@ -758,7 +758,7 @@ pub(crate) fn submit_tui_command(
         bootstrap,
         &prompt,
         &router.session,
-        Some(Arc::clone(&router.skills)),
+        Some(router.skills().unwrap()),
         {
             let captured = Arc::clone(captured);
             move |request| {

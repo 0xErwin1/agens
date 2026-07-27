@@ -3638,6 +3638,7 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
                 history: Vec::new(),
                 draft: Some("failed prompt".into()),
                 resume_error: None,
+                file_candidates: Vec::new(),
             });
         }),
         ("danger", |tui| tui.set_dangerous_mode(true)),

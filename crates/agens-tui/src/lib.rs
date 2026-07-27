@@ -269,6 +269,11 @@ pub enum TuiSubmissionOutcome {
         history: Vec<Conversation>,
         draft: Option<String>,
         resume_error: Option<String>,
+        /// The `@` picker candidates for the resumed session's OWN root. Without this, a
+        /// post-startup resume would leave whatever candidates were set at TUI startup (or by an
+        /// earlier session) in place, even though they may now name files outside the resumed
+        /// session's own confined root.
+        file_candidates: Vec<String>,
     },
     Dialog(DialogView),
     SafeDialog(DialogView),
@@ -3234,10 +3239,12 @@ where
                 history,
                 draft,
                 resume_error,
+                file_candidates,
             } => {
                 self.finish_session_load();
                 self.replace_projected_history(history);
                 self.apply_presentation(presentation);
+                self.set_file_candidates(file_candidates);
                 self.input.clear();
                 self.input_cursor = 0;
                 self.recovered_failed_prompt = false;
@@ -7151,6 +7158,7 @@ mod runtime_tests {
             history,
             draft: None,
             resume_error: None,
+            file_candidates: Vec::new(),
         });
         let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let mut renderer = RatatuiRenderer::new(terminal);

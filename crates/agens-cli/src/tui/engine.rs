@@ -93,6 +93,9 @@ pub(crate) fn run_production_tui(
             history: std::mem::take(&mut resumed.restored_history),
             draft,
             resume_error,
+            // The real picker candidates are set below, once the session's own root is resolved
+            // and `start_tui_skills`/`start_tui_commands` have run against it.
+            file_candidates: Vec::new(),
         });
         for event in resumed_subagent_cards(&resumed.messages) {
             tui.apply_runtime_event(event);
@@ -128,7 +131,7 @@ pub(crate) fn run_production_tui(
         commands,
         Arc::clone(&skills),
     );
-    tui.set_palette_entries(router.palette_entries().to_vec());
+    tui.set_palette_entries(router.palette_entries()?);
     let picker_candidates = router
         .session
         .lock()
@@ -202,10 +205,14 @@ pub(crate) fn run_production_tui(
                 Ok(root) => root,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            let skills = match router.skills() {
+                Ok(skills) => skills,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
             let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
                 &session_project_root,
-                &router.skills,
+                &skills,
                 prompt_bridge.clone(),
                 lifecycle_bridge.clone(),
                 task_parent_request_config.clone(),
@@ -244,12 +251,12 @@ pub(crate) fn run_production_tui(
                 &runtime_bootstrap,
                 &prompt,
                 &router.session,
-                Some(Arc::clone(&router.skills)),
+                Some(Arc::clone(&skills)),
                 |request| {
                     let task_runtime = production_tui_task_runtime_with_runner_and_parent_config(
                         &runtime_bootstrap,
                         &session_project_root,
-                        &router.skills,
+                        &skills,
                         prompt_bridge.clone(),
                         ProductionTaskRunner::new(
                             runtime_bootstrap.clone(),
@@ -525,6 +532,7 @@ mod tests {
             history: Vec::new(),
             draft: None,
             resume_error: None,
+            file_candidates: Vec::new(),
         });
         let resumed_session_header = render_tui_test_backend(&tui, 120, 24);
         assert!(
