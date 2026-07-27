@@ -675,7 +675,13 @@ mod tests {
             completed_turn_count: 0,
             resumable: true,
         };
-        let resumed = TuiSessionContext::restored(7, metadata, Vec::new(), Vec::new());
+        let resumed = TuiSessionContext::restored(
+            7,
+            metadata,
+            Vec::new(),
+            Vec::new(),
+            std::path::PathBuf::from("project"),
+        );
 
         assert_eq!(initial_active_agent_name(&resumed, &configured), "planner");
     }

@@ -356,11 +356,12 @@ impl TuiSessionContext {
         metadata: SessionMetadata,
         messages: Vec<Message>,
         active_agent: ActiveAgentRuntime,
+        confinement_root: std::path::PathBuf,
     ) -> Self {
         Self {
             identifier: Some(identifier),
             metadata: Some(metadata),
-            confinement_root: None,
+            confinement_root: Some(confinement_root),
             messages,
             restored_history: Vec::new(),
             active_agent: Some(active_agent),
@@ -378,16 +379,23 @@ impl TuiSessionContext {
         }
     }
 
+    /// Builds a session context for a session that was just resumed from storage.
+    ///
+    /// `confinement_root` is required, not optional: a resumed session's tools must always be
+    /// confined to the root recorded for it, and making the parameter mandatory here rules out a
+    /// caller silently constructing a "resumed" context that falls back to the process's own
+    /// discovered root through [`crate::session_root::resolve_tui_session_root`]'s `None` branch.
     pub(crate) fn restored(
         identifier: i64,
         metadata: SessionMetadata,
         messages: Vec<Message>,
         restored_history: Vec<Conversation>,
+        confinement_root: std::path::PathBuf,
     ) -> Self {
         Self {
             identifier: Some(identifier),
             metadata: Some(metadata),
-            confinement_root: None,
+            confinement_root: Some(confinement_root),
             messages,
             restored_history,
             active_agent: None,
@@ -574,8 +582,13 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let mut context =
-            TuiSessionContext::resumed(1, metadata.clone(), Vec::new(), primary_runtime);
+        let mut context = TuiSessionContext::resumed(
+            1,
+            metadata.clone(),
+            Vec::new(),
+            primary_runtime,
+            std::path::PathBuf::from("project"),
+        );
         let original = context.clone();
         context.running = true;
         let busy_original = context.clone();
@@ -759,6 +772,7 @@ mod tests {
             reopened.metadata,
             reopened.messages,
             context.active_agent.clone().unwrap(),
+            std::path::PathBuf::from("project"),
         );
         no_expansion.metadata = None;
         rotate_active_agent(
@@ -879,24 +893,30 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let request = TuiSessionContext::resumed(7, metadata, messages.clone(), active_agent)
-            .apply_to(HeadlessChatRequest {
-                prompt: "next question".into(),
-                history: Vec::new(),
-                model: None,
-                system_prompt: None,
-                max_iterations: None,
-                mode: PermissionMode::Edit,
-                dangerously_allow_all: false,
-                dangerous_mode: false,
-                request_config: agens_core::RequestConfig::default(),
-                session_reasoning_effort: None,
-                session: None,
-                active_agent: None,
-                effective_capabilities: None,
-                pending_system_reminder: None,
-                skills: None,
-            });
+        let request = TuiSessionContext::resumed(
+            7,
+            metadata,
+            messages.clone(),
+            active_agent,
+            std::path::PathBuf::from("project"),
+        )
+        .apply_to(HeadlessChatRequest {
+            prompt: "next question".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+        });
 
         assert_eq!(request.prompt, "next question");
         assert_eq!(request.history, messages);

@@ -173,8 +173,8 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         session.metadata,
         session.messages,
         restored_history,
+        confinement_root,
     );
-    context.confinement_root = Some(confinement_root);
     context.provider = provider;
     context.selection = selection;
     context.resume_error = resume_error;
