@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agens_config::{
     ConfigPaths, ConfigPermissionRule, McpDefaultSettings, McpTransport, ResolvedSettings,
@@ -15,6 +16,7 @@ use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
 
 use crate::{CliDependencies, CliError, HeadlessChatRequest};
 
+pub(crate) mod session_config;
 pub(crate) mod session_root;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +50,11 @@ pub struct Bootstrap {
     pub(crate) mcp_servers: Vec<agens_config::McpServerConfig>,
     pub(crate) mcp_status: Option<McpStatusHandle>,
     pub(crate) permission_rules: Vec<ConfigPermissionRule>,
+    /// Re-reads a project configuration document from an arbitrary path, the same way
+    /// `bootstrap()` read this process's own project config, so [`session_config::SessionConfig`]
+    /// can re-derive session-scoped configuration from a session's OWN recorded root instead of
+    /// trusting the value this struct captured once from the PROCESS's discovered root.
+    pub(in crate::bootstrap) config_reader: crate::deps::ConfigReader,
 }
 
 impl Clone for Bootstrap {
@@ -81,6 +88,7 @@ impl Clone for Bootstrap {
             mcp_servers: self.mcp_servers.clone(),
             mcp_status: self.mcp_status.clone(),
             permission_rules: self.permission_rules.clone(),
+            config_reader: Arc::clone(&self.config_reader),
         }
     }
 }
@@ -153,7 +161,12 @@ impl Bootstrap {
         self.project_root.as_deref()
     }
 
-    pub(crate) fn permission_rules(&self) -> &[ConfigPermissionRule] {
+    /// The permission rules this PROCESS captured from its own discovered root at `bootstrap()`
+    /// time. Visible only within `crate::bootstrap`, on purpose: a session-scoped permission
+    /// decision must go through [`session_config::SessionConfig::resolve`] instead, which
+    /// re-reads a session's OWN recorded root rather than trusting this process-lifetime value —
+    /// see that type's documentation for why the distinction matters.
+    pub(in crate::bootstrap) fn permission_rules(&self) -> &[ConfigPermissionRule] {
         &self.permission_rules
     }
 
@@ -284,6 +297,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         mcp_servers,
         mcp_status: None,
         permission_rules,
+        config_reader: Arc::clone(&dependencies.read_file),
         paths,
         global_loaded,
         project_loaded,

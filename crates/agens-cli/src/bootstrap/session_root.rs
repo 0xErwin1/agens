@@ -38,6 +38,16 @@ impl SessionRoot {
             .discovered_root()
             .map(|root| Self(root.to_path_buf()))
     }
+
+    /// Wraps a root already resolved for a live session — typically the value a tool runtime or
+    /// headless turn was already built against, itself derived from
+    /// [`resolve_tui_session_root`] earlier in the same call chain — so that anything computing a
+    /// session-scoped decision from it (see
+    /// [`crate::bootstrap::session_config::SessionConfig`]) is forced through this type instead of
+    /// a bare `&Path` that carries no indication of which root's session it belongs to.
+    pub(crate) fn confined_to(root: PathBuf) -> Self {
+        Self(root)
+    }
 }
 
 /// Resolves the root a resumed or in-progress TUI session's tools must be confined to: the

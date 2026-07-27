@@ -108,8 +108,10 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
         task_runner,
     )?;
     let project = project_root.display().to_string();
+    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     let policy = permission_policy(
-        bootstrap.permission_rules(),
+        session_config.permission_rules(),
         &project,
         PermissionMode::Edit,
         &dispatcher,
@@ -290,6 +292,111 @@ mod tests {
     use super::*;
     use crate::permissions::production_tui_permission_bridge;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
+
+    #[test]
+    fn a_task_runtimes_permission_policy_is_scoped_to_its_own_root_not_the_bootstraps_process_root()
+    {
+        use std::collections::BTreeMap;
+        use std::path::Path;
+
+        use agens_core::{PermissionDecision, PermissionRequest, PermissionSession, ToolAccess};
+
+        use crate::CliDependencies;
+        use crate::bootstrap::bootstrap;
+
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-task-runtime-permission-scope-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+
+        // `config_reader` in this fixture answers for ANY path present in this map, mirroring
+        // the production `read_file` capability, which can re-read a different root's document
+        // on demand rather than only the one path `bootstrap()` itself resolved.
+        let mut files = BTreeMap::new();
+        files.insert(
+            config_home.join("config.toml"),
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        );
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[permissions]\nallow = [\"write\"]\n".to_owned(),
+        );
+        files.insert(
+            root_a.join(".agens/config.toml"),
+            "[permissions]\nallow = [\"write\"]\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let evaluate_write_decision = |root: &Path| {
+            std::fs::create_dir_all(root).unwrap();
+            let runtime = production_tui_task_runtime_with_runner_and_parent_config(
+                &bootstrap_from_root_b,
+                root,
+                &SkillCatalog::default(),
+                production_tui_permission_bridge().0,
+                ProductionTaskRunner::new(bootstrap_from_root_b.clone(), root.to_path_buf()),
+                agens_core::RequestConfig::default(),
+                None,
+            )
+            .unwrap();
+            let write_identity = runtime
+                .dispatcher
+                .lock()
+                .unwrap()
+                .canonical_identity("native::write")
+                .unwrap()
+                .as_str()
+                .to_owned();
+            runtime.authorized.gate.policy.evaluate(
+                &PermissionRequest::new(
+                    root.display().to_string(),
+                    write_identity,
+                    "notes.md",
+                    ToolAccess::Write,
+                ),
+                &[],
+                &PermissionSession::new(),
+            )
+        };
+
+        // `bootstrap_from_root_b` discovered its process-scoped configuration from root B, which
+        // grants `write`. Building a runtime for root A — a DIFFERENT recorded root, which also
+        // happens to grant `write` in ITS OWN config — must authorize from root A's own document,
+        // never from the bootstrap's process-captured one.
+        assert_eq!(
+            evaluate_write_decision(&root_a),
+            PermissionDecision::Allow,
+            "a permission rule written for THIS root's own project config must still authorize"
+        );
+
+        // Removing root A's own grant must remove the authorization too, even though the
+        // bootstrap's process-captured rules (from root B) still grant `write` unconditionally.
+        // If the runtime were still reading `bootstrap.permission_rules()`, this would stay
+        // `Allow`.
+        let root_a_without_its_own_grant = temporary.join("root-a-bare/project");
+        assert_eq!(
+            evaluate_write_decision(&root_a_without_its_own_grant),
+            PermissionDecision::Ask,
+            "a permission rule written for a DIFFERENT project root's config must not silently \
+             auto-authorize a tool call in this root's task runtime"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+    }
 
     #[test]
     fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {

@@ -384,6 +384,32 @@ fn headless_turn_project_root(
     }
 }
 
+/// The permission policy a headless turn's tool dispatch must be evaluated against.
+///
+/// `project_root` may differ from `bootstrap`'s own process-discovered root — it is the session's
+/// own recorded root once one exists — so this always re-derives session-scoped configuration
+/// through [`crate::session_config::SessionConfig`] rather than reading `bootstrap`'s
+/// process-captured `permission_rules` directly, which would silently keep applying rules read
+/// from the WRONG root's project configuration.
+fn headless_turn_permission_policy(
+    bootstrap: &Bootstrap,
+    project_root: &std::path::Path,
+    project: &str,
+    mode: PermissionMode,
+    tool_runtime: &crate::permissions::SharedToolDispatcher,
+    effective_capabilities: Option<&EffectiveCapabilitySet>,
+) -> Result<agens_core::PermissionPolicy, CliError> {
+    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    permission_policy(
+        session_config.permission_rules(),
+        project,
+        mode,
+        tool_runtime,
+        effective_capabilities,
+    )
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
@@ -430,8 +456,9 @@ where
         .task_runtime
         .map(|runtime| runtime.task_registry.clone());
     let project = project_root.display().to_string();
-    let policy = permission_policy(
-        context.bootstrap.permission_rules(),
+    let policy = headless_turn_permission_policy(
+        context.bootstrap,
+        project_root,
         &project,
         request.mode,
         &tool_runtime,
@@ -762,6 +789,87 @@ mod tests {
 
         std::fs::remove_dir_all(&origin).unwrap();
         std::fs::remove_dir_all(discovered_process_root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_headless_turns_permission_policy_is_scoped_to_its_own_root_not_the_bootstraps_process_root()
+     {
+        use agens_core::{PermissionDecision, PermissionRequest, PermissionSession, ToolAccess};
+
+        use crate::tools::runtime::production_tool_runtime_for_parent;
+
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-headless-permission-scope-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+        std::fs::create_dir_all(&root_a).unwrap();
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            config_home.join("config.toml"),
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n".to_owned(),
+        );
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[permissions]\nallow = [\"write\"]\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let (_, dispatcher) = production_tool_runtime_for_parent(
+            &bootstrap_from_root_b,
+            &root_a,
+            None,
+            "gpt-4.1".to_owned(),
+            agens_core::RequestConfig::default(),
+            None,
+        )
+        .unwrap();
+        let write_identity = dispatcher
+            .lock()
+            .unwrap()
+            .canonical_identity("native::write")
+            .unwrap()
+            .as_str()
+            .to_owned();
+
+        let project_a = root_a.display().to_string();
+        let policy = headless_turn_permission_policy(
+            &bootstrap_from_root_b,
+            &root_a,
+            &project_a,
+            PermissionMode::Edit,
+            &dispatcher,
+            None,
+        )
+        .unwrap();
+        let decision = policy.evaluate(
+            &PermissionRequest::new(project_a, write_identity, "notes.md", ToolAccess::Write),
+            &[],
+            &PermissionSession::new(),
+        );
+
+        assert_eq!(
+            decision,
+            PermissionDecision::Ask,
+            "a permission rule written for a DIFFERENT project root's config must not silently \
+             auto-authorize a headless turn's tool call in this root"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
     }
 
     #[test]

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agens_config::resolve_paths;
 use agens_core::HeadlessTurnCancellation;
@@ -26,7 +27,10 @@ const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
 type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
 type Environment = Box<dyn Fn() -> BTreeMap<String, String>>;
-type ConfigReader = Box<dyn Fn(&Path) -> Result<Option<String>, CliError>>;
+/// Shared, not owned, because [`Bootstrap`] keeps its own clone of this closure so it can
+/// re-read a session's own project configuration document later — after `bootstrap()` has
+/// already returned — instead of only ever answering for the process's own discovered root.
+pub(crate) type ConfigReader = Arc<dyn Fn(&Path) -> Result<Option<String>, CliError> + Send + Sync>;
 /// Creates a configuration file, failing when one already exists.
 type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
 type HeadlessChat = Box<
@@ -59,7 +63,7 @@ impl CliDependencies {
                     .filter(|(key, _)| !key.is_empty())
                     .collect()
             }),
-            read_file: Box::new(|path| match fs::read_to_string(path) {
+            read_file: Arc::new(|path| match fs::read_to_string(path) {
                 Ok(contents) => Ok(Some(contents)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(_) => Err(CliError::configuration("configuration file is unavailable")),
@@ -95,7 +99,7 @@ impl CliDependencies {
             current_directory: Box::new(move || Ok(current_directory.clone())),
             home_directory: Box::new(move || home_directory.clone()),
             environment: Box::new(move || environment.clone()),
-            read_file: Box::new(move |path| Ok(files.get(path).cloned())),
+            read_file: Arc::new(move |path| Ok(files.get(path).cloned())),
             create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
