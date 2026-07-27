@@ -104,7 +104,19 @@ impl Bootstrap {
         &self.paths
     }
 
-    pub fn settings(&self) -> &ResolvedSettings {
+    /// The process's own merged, project-precedence configuration settings, keyed by dotted
+    /// path (e.g. `"agent.system_prompt"`, `"provider.base_url"`).
+    ///
+    /// Visible only within `crate::bootstrap` — narrower than the historical `pub`, because the
+    /// untyped [`ResolvedSettings::text`] path reaches every project-settable value through one
+    /// generic accessor, including session-scoped ones such as `agent.system_prompt` and
+    /// `provider.base_url`, with no name-level signal that a session-scoped decision is being made
+    /// from the wrong (process) root. A session-scoped caller must go through
+    /// [`session_config::SessionConfig::resolve`] instead, which re-reads the relevant keys fresh
+    /// from a session's OWN recorded root. `commands::config::run_config` is the one legitimate
+    /// process-level reader left (the `config doctor` report, which is about the process's own
+    /// configuration by definition, not a session's).
+    pub(crate) fn settings(&self) -> &ResolvedSettings {
         &self.settings
     }
 
@@ -692,6 +704,26 @@ mod tests {
 
         assert_eq!(request.request_config.reasoning_effort(), None);
         assert_eq!(request.session_reasoning_effort, None);
+    }
+
+    /// `agent.system_prompt` is read straight out of the merged document with no environment
+    /// expansion of any kind — [`expand_document`] only expands `options.data_dir` and
+    /// `provider.base_url` — so a `$(...)` pattern in it stays literal, unlike MCP `command`,
+    /// `args` and `env` fields, which DO run command substitution
+    /// (`global_mcp_command_and_environment_fields_expand` in `tests/cli.rs` covers that
+    /// contrast).
+    #[test]
+    fn system_prompt_is_never_environment_expanded() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-system-prompt-literal",
+            Some("[agent]\nsystem_prompt = \"literal $(printf ignored)\"\n"),
+            None,
+        );
+
+        assert_eq!(
+            bootstrap.settings().text("agent.system_prompt"),
+            Some("literal $(printf ignored)")
+        );
     }
 
     #[test]

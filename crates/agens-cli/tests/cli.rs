@@ -263,7 +263,7 @@ fn disabled_global_mcp_server_is_not_expanded_or_started() {
 }
 
 #[test]
-fn global_mcp_command_and_environment_fields_expand_without_expanding_system_prompt() {
+fn global_mcp_command_and_environment_fields_expand() {
     let temporary = TemporaryDirectory::new("mcp-command-expansion");
     let config_home = temporary.path().join("config");
     let project_root = temporary.path().join("project");
@@ -284,7 +284,7 @@ fn global_mcp_command_and_environment_fields_expand_without_expanding_system_pro
         BTreeMap::from([(
             config_home.join("config.toml"),
             format!(
-                "[agent]\nsystem_prompt = \"literal $(printf ignored)\"\n\n[mcp.files]\ntransport = \"stdio\"\ncommand = \"$(printf /bin/sh)\"\nargs = [\"-c\", {script:?}, \"ignored\", \"$(printf configured-argument)\"]\n[mcp.files.env]\nMCP_SENTINEL = \"$(printf 'configured-environment\\\\n')\"\n"
+                "[mcp.files]\ntransport = \"stdio\"\ncommand = \"$(printf /bin/sh)\"\nargs = [\"-c\", {script:?}, \"ignored\", \"$(printf configured-argument)\"]\n[mcp.files.env]\nMCP_SENTINEL = \"$(printf 'configured-environment\\\\n')\"\n"
             ),
         )]),
     );
@@ -308,10 +308,6 @@ fn global_mcp_command_and_environment_fields_expand_without_expanding_system_pro
     assert_eq!(
         std::fs::read_to_string(launch_record).expect("launch record should be readable"),
         "configured-argument|configured-environment\n"
-    );
-    assert_eq!(
-        bootstrap.settings().text("agent.system_prompt"),
-        Some("literal $(printf ignored)")
     );
     transports[0]
         .1
