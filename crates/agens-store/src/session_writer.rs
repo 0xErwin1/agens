@@ -939,11 +939,12 @@ fn decode_attempt_failure_kind(value: &str) -> rusqlite::Result<SessionAttemptFa
     }
 }
 
-/// Seeds `confinement_root` from `project` at session creation: before AGN-52 introduces
-/// worktree-per-session paths, the two are the same discovered root, so a brand-new row can
-/// carry both without a second confinement-root input threaded through this call. A resumed
-/// session reads this column back explicitly rather than re-deriving it from the process's own
-/// current working directory, which is the whole reason the column exists as its own field.
+/// Seeds `confinement_root` from `project` at session creation: today the two are always the
+/// same discovered root, so a brand-new row can carry both without a second confinement-root
+/// input threaded through this call. A resumed session reads this column back explicitly rather
+/// than re-deriving it from the process's own current working directory, which is the whole
+/// reason the column exists as its own field — the two are expected to diverge once a session's
+/// literal confinement root can differ from its project grouping/display identity.
 fn insert_attempt_session(
     transaction: &Transaction<'_>,
     database_path: &std::path::Path,

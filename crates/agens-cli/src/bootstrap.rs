@@ -144,8 +144,11 @@ impl Bootstrap {
     /// This is deliberately visible only to [`session_root`]: a session's confinement root must
     /// come from that module's `SessionRoot`, not from re-deriving this value at an arbitrary
     /// call site, because after a resume this process's current working directory can
-    /// legitimately differ from the root the session was created under. Reaching this method
-    /// from anywhere else is a compile error by construction, not a convention to remember.
+    /// legitimately differ from the root the session was created under. The compiler forces any
+    /// new call site outside `session_root` to explicitly name and re-export this escape hatch
+    /// before it can be reached — it cannot make that escape hatch unreachable once named, so a
+    /// call site inside `session_root` that itself re-derives the process root instead of using
+    /// the session's recorded one is still a possible, silent mistake, not a compile error.
     pub(in crate::bootstrap) fn discovered_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
     }
