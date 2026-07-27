@@ -8,17 +8,20 @@
 //! after a resume moves the live session to a different root than the one the process started
 //! at, including re-labelling another root's rules with THIS session's project key.
 //!
-//! `agent.system_prompt` is the same shape of problem, but this module does not read it off
-//! `Bootstrap` at all: it is re-read directly from a session's OWN project document, and
-//! independently from the global document, never through the process's already-merged,
-//! project-precedence [`agens_config::ResolvedSettings`]. That merge only remembers the FINAL
-//! winning value and which layer won it for THIS process's own root, so there is no way to
-//! recover "what would the global document have said on its own" from it once a project override
-//! elsewhere has already replaced it — reading the two source documents directly is what makes a
-//! session's own project override and a legitimate home-scoped global default both reachable,
-//! independently of whichever root the process itself started at. `agent.system_prompt` is
-//! model-facing instruction text, so trusting the wrong root's value would be a direct
-//! prompt-injection path, not merely a stale setting.
+//! `agent.system_prompt` and `provider.base_url` are the same shape of problem, but this module
+//! does not read either of them off `Bootstrap` at all: both are re-read directly from a
+//! session's OWN project document, and independently from the global document, never through the
+//! process's already-merged, project-precedence [`agens_config::ResolvedSettings`]. That merge
+//! only remembers the FINAL winning value and which layer won it for THIS process's own root, so
+//! there is no way to recover "what would the global document have said on its own" from it once
+//! a project override elsewhere has already replaced it — reading the two source documents
+//! directly is what makes a session's own project override and a legitimate home-scoped global
+//! default both reachable, independently of whichever root the process itself started at.
+//! `agent.system_prompt` in particular is model-facing instruction text, so trusting the wrong
+//! root's value would be a direct prompt-injection path, not merely a stale setting;
+//! `provider.base_url` selects the endpoint a session's entire conversation is sent to, so
+//! trusting the wrong root's value would silently redirect that traffic to an endpoint the
+//! operator only ever configured for a different project.
 //!
 //! `SessionConfig` closes that gap by never being cached: [`SessionConfig::resolve`] always
 //! re-reads the given [`SessionRoot`]'s own `.agens/config.toml` from disk, so the values it
@@ -30,15 +33,15 @@
 //! `crate::bootstrap` for the same reason `discovered_root` is: `settings()` returns the
 //! process's merged configuration under an untyped, string-keyed accessor
 //! ([`agens_config::ResolvedSettings::text`]) that reaches every project-settable value,
-//! including `agent.system_prompt`, with no name-level signal that a session-scoped decision is
-//! being made from the wrong root.
+//! including these two, with no name-level signal that a session-scoped decision is being made
+//! from the wrong root.
 //!
 //! What this makes IMPOSSIBLE: reaching `Bootstrap`'s process-captured `permission_rules` field,
-//! or its merged `settings` (and therefore `agent.system_prompt` through it), from outside
-//! `crate::bootstrap` — those identifiers are no longer reachable at all outside this module, so
-//! a session-scoped caller cannot regress back to them by deleting a call to
-//! `SessionConfig::resolve` and reaching for the old field or the generic settings accessor
-//! instead; the compiler has nothing left to offer it.
+//! or its merged `settings` (and therefore `agent.system_prompt` / `provider.base_url` through
+//! it), from outside `crate::bootstrap` — those identifiers are no longer reachable at all
+//! outside this module, so a session-scoped caller cannot regress back to them by deleting a
+//! call to `SessionConfig::resolve` and reaching for the old field or the generic settings
+//! accessor instead; the compiler has nothing left to offer it.
 //!
 //! What this only makes INCONVENIENT, not impossible: passing the WRONG root into
 //! [`SessionRoot::confined_to`]. That constructor accepts any `PathBuf`, so a caller that already
@@ -59,6 +62,7 @@ use crate::error::CliError;
 pub(crate) struct SessionConfig {
     permission_rules: Vec<ConfigPermissionRule>,
     system_prompt: Option<String>,
+    provider_base_url: Option<String>,
 }
 
 impl SessionConfig {
@@ -70,15 +74,19 @@ impl SessionConfig {
         self.system_prompt.as_deref()
     }
 
+    pub(crate) fn provider_base_url(&self) -> Option<&str> {
+        self.provider_base_url.as_deref()
+    }
+
     /// Combines the process's GLOBAL-scope permission rules (global configuration is keyed by
     /// the user's home directory, not by project root, so it does not need to move with a
     /// session's confinement root) with PROJECT-scope rules read fresh from `root`'s own
     /// `.agens/config.toml` — never from `bootstrap`'s own process-captured project document.
     ///
-    /// `system_prompt` is re-read the same way, from BOTH the session root's own project
-    /// document and the global document, each read fresh from disk here rather than taken from
-    /// `bootstrap`'s already-merged settings — see this module's own documentation for why the
-    /// merge cannot be trusted for it.
+    /// `system_prompt` and `provider_base_url` are re-read the same way, from BOTH the session
+    /// root's own project document and the global document, each read fresh from disk here
+    /// rather than taken from `bootstrap`'s already-merged settings — see this module's own
+    /// documentation for why the merge cannot be trusted for either value.
     pub(crate) fn resolve(root: &SessionRoot, bootstrap: &Bootstrap) -> Result<Self, CliError> {
         let project_document = read_toml_document(
             &root.path().join(".agens/config.toml"),
@@ -103,9 +111,13 @@ impl SessionConfig {
         let system_prompt = document_text(&project_document, "agent", "system_prompt")
             .or_else(|| document_text(&global_document, "agent", "system_prompt"));
 
+        let provider_base_url = document_text(&project_document, "provider", "base_url")
+            .or_else(|| document_text(&global_document, "provider", "base_url"));
+
         Ok(Self {
             permission_rules,
             system_prompt,
+            provider_base_url,
         })
     }
 }
@@ -268,6 +280,75 @@ mod tests {
             "a legitimate home-scoped global system prompt must still reach a session at a root \
              that has no project override of its own, regardless of what an unrelated other \
              root's own project configuration happens to set"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+    }
+
+    /// The same confinement shape as `system_prompt`, but for `provider.base_url`: a session
+    /// confined to root A must not send its conversation to the endpoint root B's project
+    /// configuration names, and root A's own endpoint override must still apply.
+    #[test]
+    fn provider_base_url_is_re_derived_from_the_sessions_own_root_not_the_bootstraps_process_root()
+    {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-session-config-provider-base-url-scope-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-b.invalid/exfiltrate\"\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files.clone(),
+        ))
+        .unwrap();
+
+        let session_root_a = SessionRoot::confined_to(root_a.clone());
+        let session_config = SessionConfig::resolve(&session_root_a, &bootstrap_from_root_b)
+            .expect("session configuration should resolve");
+
+        assert_eq!(
+            session_config.provider_base_url(),
+            None,
+            "a provider endpoint configured for a DIFFERENT project root must not silently \
+             govern a session confined to this root"
+        );
+
+        files.insert(
+            root_a.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-a.invalid/own-endpoint\"\n".to_owned(),
+        );
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            temporary.join("root-b/project"),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+        let session_config = SessionConfig::resolve(&session_root_a, &bootstrap_from_root_b)
+            .expect("session configuration should resolve");
+
+        assert_eq!(
+            session_config.provider_base_url(),
+            Some("https://root-a.invalid/own-endpoint"),
+            "a session's OWN project configuration must still set its provider endpoint"
         );
 
         std::fs::remove_dir_all(&temporary).ok();

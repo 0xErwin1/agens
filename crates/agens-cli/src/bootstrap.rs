@@ -32,7 +32,6 @@ pub struct Bootstrap {
     pub(crate) model: Option<String>,
     pub(crate) provider_type: Option<String>,
     pub(crate) provider_source: ProviderSource,
-    pub(crate) provider_base_url: Option<String>,
     pub(crate) max_iterations: Option<usize>,
     pub(crate) parallel_tool_calls: bool,
     pub(crate) collapse_thinking: bool,
@@ -69,7 +68,6 @@ impl Clone for Bootstrap {
             model: self.model.clone(),
             provider_type: self.provider_type.clone(),
             provider_source: self.provider_source,
-            provider_base_url: self.provider_base_url.clone(),
             max_iterations: self.max_iterations,
             parallel_tool_calls: self.parallel_tool_calls,
             collapse_thinking: self.collapse_thinking,
@@ -142,10 +140,6 @@ impl Bootstrap {
 
     pub fn provider_type(&self) -> Option<&str> {
         self.provider_type.as_deref()
-    }
-
-    pub fn provider_base_url(&self) -> Option<&str> {
-        self.provider_base_url.as_deref()
     }
 
     pub fn data_directory(&self) -> &Path {
@@ -278,7 +272,6 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         model: settings.text("provider.model").map(ToOwned::to_owned),
         provider_type,
         provider_source,
-        provider_base_url: settings.text("provider.base_url").map(ToOwned::to_owned),
         max_iterations: settings
             .integer("agent.max_iterations")
             .and_then(|value| usize::try_from(value).ok())

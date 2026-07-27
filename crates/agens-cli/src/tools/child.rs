@@ -174,10 +174,12 @@ pub(crate) fn run_production_task(
                 .openai_api_key
                 .clone()
                 .ok_or(ChildRunError::Runtime)?;
+            let base_url = task_provider_base_url(bootstrap, project_root)
+                .map_err(|_| ChildRunError::Runtime)?;
             let provider =
                 OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                     api_key,
-                    bootstrap.provider_base_url(),
+                    base_url.as_deref(),
                     request.model().to_owned(),
                     messages,
                     provider_tools,
@@ -204,9 +206,11 @@ pub(crate) fn run_production_task(
             )
         }
         Some("openai-chatgpt") => {
+            let base_url = task_provider_base_url(bootstrap, project_root)
+                .map_err(|_| ChildRunError::Runtime)?;
             let provider = ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                 &bootstrap.paths.credentials,
-                bootstrap.provider_base_url(),
+                base_url.as_deref(),
                 None,
                 request.model().to_owned(),
                 task_system_prompt(&request),
@@ -245,6 +249,19 @@ fn task_system_prompt(request: &TaskTurnRequest) -> String {
         .fold(request.system_prompt().to_owned(), |prompt, skill| {
             format!("{prompt}\n\n## {}\n{}", skill.name(), skill.instructions())
         })
+}
+
+/// The provider endpoint a subagent's turn must send its conversation to, re-derived from the
+/// subagent's own recorded root rather than `bootstrap`'s process-captured `provider.base_url` —
+/// a wrong root's project configuration here would silently redirect this subagent's traffic to
+/// an endpoint the operator only ever configured for a different project.
+fn task_provider_base_url(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+) -> Result<Option<String>, crate::error::CliError> {
+    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    Ok(session_config.provider_base_url().map(ToOwned::to_owned))
 }
 
 pub(crate) struct TaskMailboxProvider<P> {
@@ -430,6 +447,79 @@ mod tests {
         ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
             Ok(vec![MessagePart::Text("ok".into())])
         }
+    }
+
+    /// A subagent turn confined to root A must not send its conversation to root B's configured
+    /// `provider.base_url` — the same confinement shape headless turns get, but for the child
+    /// (subagent) provider construction path, which reads its endpoint through
+    /// [`task_provider_base_url`] rather than `headless_turn_provider_base_url`.
+    #[test]
+    fn a_task_runtimes_provider_base_url_is_scoped_to_its_own_root_not_the_bootstraps_process_root()
+    {
+        use std::collections::BTreeMap;
+
+        use crate::CliDependencies;
+        use crate::bootstrap::bootstrap;
+
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-task-runtime-provider-base-url-scope-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-b.invalid/exfiltrate\"\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files.clone(),
+        ))
+        .unwrap();
+
+        let base_url = task_provider_base_url(&bootstrap_from_root_b, &root_a).unwrap();
+
+        assert_eq!(
+            base_url, None,
+            "a provider endpoint configured for a DIFFERENT project root must not silently \
+             govern a subagent turn confined to this root"
+        );
+
+        files.insert(
+            root_a.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-a.invalid/own-endpoint\"\n".to_owned(),
+        );
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            temporary.join("root-b/project"),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let base_url = task_provider_base_url(&bootstrap_from_root_b, &root_a).unwrap();
+
+        assert_eq!(
+            base_url.as_deref(),
+            Some("https://root-a.invalid/own-endpoint"),
+            "a session's OWN project configuration must still set its subagent turn's provider \
+             endpoint"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
     }
 
     #[test]

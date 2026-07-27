@@ -255,6 +255,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
             let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
                 CliError::authentication("OpenAI API authentication is unavailable")
             })?;
+            let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
             run_production_headless_chat_with_provider(
                 request,
                 HeadlessProviderContext {
@@ -269,7 +270,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
                         api_key,
-                        bootstrap.provider_base_url(),
+                        base_url.as_deref(),
                         model,
                         messages,
                         tools,
@@ -297,6 +298,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
                 None => headless_turn_system_prompt(bootstrap, &agent_catalog_root)?
                     .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned()),
             };
+            let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
             run_production_headless_chat_with_provider(
                 request,
                 HeadlessProviderContext {
@@ -311,7 +313,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
                         &credentials_path,
-                        bootstrap.provider_base_url(),
+                        base_url.as_deref(),
                         None,
                         model,
                         instructions,
@@ -423,6 +425,22 @@ fn headless_turn_system_prompt(
     let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
     let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.system_prompt().map(ToOwned::to_owned))
+}
+
+/// The provider endpoint a headless turn must send its conversation to, re-derived from the
+/// session's own recorded root rather than `bootstrap`'s process-captured `provider.base_url`.
+///
+/// `project_root` carries the same "may differ from `bootstrap`'s own process root" caveat as
+/// [`headless_turn_permission_policy`] and [`headless_turn_system_prompt`]: a wrong root's
+/// project configuration here would silently redirect this session's traffic to an endpoint the
+/// operator only ever configured for a different project.
+fn headless_turn_provider_base_url(
+    bootstrap: &Bootstrap,
+    project_root: &std::path::Path,
+) -> Result<Option<String>, CliError> {
+    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    Ok(session_config.provider_base_url().map(ToOwned::to_owned))
 }
 
 fn run_production_headless_chat_with_provider<P>(
@@ -950,6 +968,75 @@ mod tests {
             Some("You are root A's own assistant."),
             "a session's OWN project configuration must still set its headless turn's system \
              prompt"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+    }
+
+    /// The same confinement shape as the system prompt above, but for the provider endpoint: a
+    /// headless turn confined to root A must not send its conversation to root B's configured
+    /// `provider.base_url`. This exercises the shared helper used by BOTH `openai-api` and
+    /// `openai-chatgpt` provider construction sites.
+    #[test]
+    fn a_headless_turns_provider_base_url_is_scoped_to_its_own_root_not_the_bootstraps_process_root()
+     {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-headless-provider-base-url-scope-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let root_b = temporary.join("root-b/project");
+        let root_a = temporary.join("root-a/project");
+        std::fs::create_dir_all(&root_a).unwrap();
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            root_b.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-b.invalid/exfiltrate\"\n".to_owned(),
+        );
+
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            root_b,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files.clone(),
+        ))
+        .unwrap();
+
+        let base_url = headless_turn_provider_base_url(&bootstrap_from_root_b, &root_a).unwrap();
+
+        assert_eq!(
+            base_url, None,
+            "a provider endpoint configured for a DIFFERENT project root must not silently \
+             govern a headless turn confined to this root"
+        );
+
+        files.insert(
+            root_a.join(".agens/config.toml"),
+            "[provider]\nbase_url = \"https://root-a.invalid/own-endpoint\"\n".to_owned(),
+        );
+        let bootstrap_from_root_b = bootstrap(&CliDependencies::for_test(
+            temporary.join("root-b/project"),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let base_url = headless_turn_provider_base_url(&bootstrap_from_root_b, &root_a).unwrap();
+
+        assert_eq!(
+            base_url.as_deref(),
+            Some("https://root-a.invalid/own-endpoint"),
+            "a session's OWN project configuration must still set its headless turn's provider \
+             endpoint"
         );
 
         std::fs::remove_dir_all(&temporary).ok();
