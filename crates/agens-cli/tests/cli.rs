@@ -3927,6 +3927,91 @@ fn production_binary_records_a_completed_native_call_in_the_evidence_ledger() {
     server.join();
 }
 
+/// A hardcoded, defaulted, or zeroed identity would leave `production_binary_records_a_completed_native_call_in_the_evidence_ledger`
+/// green, because a fresh database allocates `session_id = attempt_id = 1` for
+/// its one call. This test runs two independent sessions against the SAME
+/// data directory and asserts the ledger carries the two DIFFERENT identities
+/// SQLite actually allocated, in allocation order, so it fails under any of
+/// those mutations.
+#[test]
+fn production_binary_records_each_sessions_own_identity_in_the_evidence_ledger() {
+    let temporary = TemporaryDirectory::new("production-evidence-ledger-identity");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::bash".to_owned()],
+            response: native_tool_call_response(
+                "call_probe_one",
+                "native::bash",
+                r#"{"command":"exit 0"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["\"call_id\":\"call_probe_one\"".to_owned()],
+            response: text_response("first session recorded"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["native::bash".to_owned()],
+            response: native_tool_call_response(
+                "call_probe_two",
+                "native::bash",
+                r#"{"command":"exit 0"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["\"call_id\":\"call_probe_two\"".to_owned()],
+            response: text_response("second session recorded"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"test-model\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"bash(*)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("config should be written");
+
+    for prompt in ["run the first probe", "run the second probe"] {
+        let output = isolated_agens_command(&temporary)
+            .args(["chat", prompt])
+            .current_dir(&project_root)
+            .env("AGENS_CONFIG_HOME", &config_home)
+            .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
+            .output()
+            .expect("production binary should execute");
+
+        assert!(output.status.success());
+    }
+
+    let connection = rusqlite::Connection::open(data_directory.join("agens.db"))
+        .expect("unified database should open");
+    let mut statement = connection
+        .prepare("SELECT session_id, attempt_id, tool_call_id FROM tool_result_facts ORDER BY id")
+        .expect("query should prepare");
+    let rows: Vec<(i64, i64, String)> = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query should run")
+        .collect::<Result<_, _>>()
+        .expect("rows should be readable");
+
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1, "call_probe_one".to_owned()),
+            (2, 2, "call_probe_two".to_owned()),
+        ]
+    );
+
+    server.join();
+}
+
 #[test]
 fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_or_persistence() {
     for (name, mode, timeout_ms) in [
