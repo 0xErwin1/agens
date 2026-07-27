@@ -578,7 +578,7 @@ impl FactPath {
     pub const MAX_BYTES: usize = 1024;
 
     pub fn new(path: &str) -> Self {
-        let is_representable = !path.is_empty()
+        let is_well_formed = !path.is_empty()
             && path.len() <= Self::MAX_BYTES
             && !path.chars().any(|character| character.is_control())
             && !Path::new(path).is_absolute()
@@ -587,7 +587,33 @@ impl FactPath {
                 .any(|component| matches!(component, Component::ParentDir));
 
         Self {
-            value: is_representable.then(|| path.to_owned()),
+            value: is_well_formed.then(|| Self::normalize(path)),
+        }
+    }
+
+    /// Collapses every spelling `Component`s treats as equivalent to a single
+    /// canonical form, so two reports of the same file never compare unequal.
+    /// `Component::CurDir` (a leading, embedded, or trailing `.`) is dropped
+    /// entirely, and repeated or trailing separators are collapsed by
+    /// rejoining the remaining `Normal` components with `/`. A path made up
+    /// entirely of `Component::CurDir` (`.`, `./`, `././`, ...) names the
+    /// session root itself rather than any file; it is kept verbatim rather
+    /// than collapsed to an empty string, since an empty path is a distinct,
+    /// already-rejected case.
+    fn normalize(path: &str) -> String {
+        let joined = Path::new(path)
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_string_lossy()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if joined.is_empty() {
+            path.to_owned()
+        } else {
+            joined
         }
     }
 
@@ -2659,6 +2685,44 @@ mod tests {
 
         assert!(!path.is_representable());
         assert_eq!(path.relative(), None);
+    }
+
+    #[test]
+    fn fact_path_normalizes_a_leading_current_dir_component() {
+        assert_eq!(FactPath::new("./notes.txt"), FactPath::new("notes.txt"));
+    }
+
+    #[test]
+    fn fact_path_normalizes_repeated_leading_current_dir_components() {
+        assert_eq!(FactPath::new("././notes.txt"), FactPath::new("notes.txt"));
+    }
+
+    #[test]
+    fn fact_path_normalizes_an_embedded_current_dir_component() {
+        assert_eq!(FactPath::new("src/./lib.rs"), FactPath::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn fact_path_normalizes_repeated_separators() {
+        assert_eq!(FactPath::new("src//lib.rs"), FactPath::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn fact_path_normalizes_a_trailing_separator() {
+        assert_eq!(FactPath::new("src/lib.rs/"), FactPath::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn fact_path_normalizes_a_trailing_current_dir_component() {
+        assert_eq!(FactPath::new("src/lib.rs/."), FactPath::new("src/lib.rs"));
+    }
+
+    #[test]
+    fn fact_path_keeps_a_bare_current_dir_verbatim() {
+        let path = FactPath::new(".");
+
+        assert!(path.is_representable());
+        assert_eq!(path.relative(), Some("."));
     }
 
     #[test]
