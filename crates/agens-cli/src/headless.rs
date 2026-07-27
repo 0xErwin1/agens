@@ -230,7 +230,8 @@ pub(crate) fn run_production_headless_chat_with_progress(
         .map(TuiProvider::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
     let validator = TuiAgentModelValidator::for_source(source)?;
-    let has_task = tui_agent_catalog(bootstrap, &validator)?
+    let agent_catalog_root = headless_turn_project_root(bootstrap, task_runtime)?;
+    let has_task = tui_agent_catalog(bootstrap, &agent_catalog_root, &validator)?
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent);
     if has_task {
@@ -359,6 +360,30 @@ fn provider_construction_error(error: agens_core::Error, authentication: &str) -
     }
 }
 
+/// The session root a headless turn's tool dispatch, permission policy, and grant scope must all
+/// agree on.
+///
+/// This function is not exclusive to the headless one-shot `agens chat` command: it is also the
+/// TUI's per-turn body (`run_production_headless_chat_with_progress` is called from every TUI
+/// turn), so it runs against a resumed session on every turn a resumed session takes. When
+/// `task_runtime` is `Some` — always true on that TUI path — the runtime's own recorded root must
+/// be reused here, or the permission policy and grant scope computed downstream would apply to
+/// the resuming process's root instead of the session's, silently disagreeing with the tool
+/// dispatcher `task_runtime` was already built against. Only a genuinely new session (no
+/// `task_runtime` yet, including headless one-shot chat, which has no `--resume` flag) falls back
+/// to discovering the process's own root.
+fn headless_turn_project_root(
+    bootstrap: &Bootstrap,
+    task_runtime: Option<&ProductionTuiTaskRuntime>,
+) -> Result<std::path::PathBuf, CliError> {
+    match task_runtime {
+        Some(task_runtime) => Ok(task_runtime.project_root.clone()),
+        None => crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+            .ok_or_else(|| CliError::configuration("native tools require a project root"))
+            .map(crate::session_root::SessionRoot::into_path_buf),
+    }
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
@@ -385,13 +410,7 @@ where
     let session_effort = request
         .session_reasoning_effort
         .or_else(|| request.request_config.reasoning_effort());
-    // Headless one-shot chat has no `--resume` path (only the TUI does), so the current
-    // invocation's own discovered root is always the correct one here: there is never a
-    // pre-existing session whose recorded root this could silently diverge from.
-    let project_root =
-        crate::session_root::SessionRoot::discover_for_new_session(context.bootstrap)
-            .ok_or_else(|| CliError::configuration("native tools require a project root"))?
-            .into_path_buf();
+    let project_root = headless_turn_project_root(context.bootstrap, context.task_runtime)?;
     let project_root = project_root.as_path();
     let (provider_tools, tool_runtime) = match context.task_runtime {
         Some(task_runtime) => (
@@ -668,6 +687,82 @@ mod tests {
     use super::*;
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
+
+    #[test]
+    fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_process_root() {
+        use agens_store::SessionStore;
+        use agens_tools::SkillCatalog;
+
+        use crate::permissions::production_tui_permission_bridge;
+        use crate::test_support::{
+            bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
+            tui_session_bootstrap, tui_session_directory,
+        };
+        use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
+        use crate::tools::task::production_tui_task_runtime;
+
+        let origin = tui_session_directory("headless-root-origin");
+        let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
+        let mut store = SessionStore::open(creation_bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&origin), "origin");
+        drop(store);
+
+        let resume_bootstrap =
+            bootstrap_from_a_different_working_directory(&origin, "headless-root-elsewhere");
+        let discovered_process_root =
+            crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        assert_ne!(discovered_process_root, origin.join("project"));
+
+        let resumed = crate::tui::resume::resume_tui_session(
+            &resume_bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &crate::tui::provider::TuiCredentialResolver::production(),
+        )
+        .unwrap();
+        let session = Arc::new(Mutex::new(resumed));
+        let resolved_root = crate::session_root::resolve_tui_session_root(
+            &session.lock().unwrap(),
+            &resume_bootstrap,
+        )
+        .unwrap();
+        assert_eq!(resolved_root, origin.join("project"));
+
+        let runtime = production_tui_task_runtime(
+            &resume_bootstrap,
+            &resolved_root,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            TuiTaskLifecycleBridge::new(
+                agens_tui::BridgeTx::bounded(8).0,
+                TuiTaskControls::default(),
+            ),
+            agens_core::RequestConfig::default(),
+            "headless-root-check".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            headless_turn_project_root(&resume_bootstrap, Some(&runtime)).unwrap(),
+            resolved_root,
+            "a live task runtime must pin the headless turn to the session's own recorded root"
+        );
+        assert_ne!(
+            headless_turn_project_root(&resume_bootstrap, Some(&runtime)).unwrap(),
+            discovered_process_root,
+            "the headless turn must not silently fall back to the resuming process's own root \
+             once a session-scoped task runtime exists"
+        );
+        assert_eq!(
+            headless_turn_project_root(&resume_bootstrap, None).unwrap(),
+            discovered_process_root,
+            "a brand-new session with no task runtime yet must still discover the process's own \
+             root"
+        );
+
+        std::fs::remove_dir_all(&origin).unwrap();
+        std::fs::remove_dir_all(discovered_process_root.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn primary_task_instruction_requires_explicit_delegation_and_is_idempotent() {
