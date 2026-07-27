@@ -5484,6 +5484,8 @@ mod native_tool_tests {
 
     #[test]
     fn failing_writes_and_edits_report_failure_facts() {
+        let _sequential_edit_guard = SEQUENTIAL_EDIT_TEST_LOCK.lock().unwrap();
+
         let root = project_root();
         fs::write(root.join("notes.txt"), "old").unwrap();
         let tools = NativeTools::open(&root).unwrap();
