@@ -981,6 +981,18 @@ fn normalized_session_schema_v5_with_required_terminal_retry_prompts() -> String
     )
 }
 
+/// The cumulative expected `sessions` shape after migration `0005`: `ALTER TABLE ADD COLUMN`
+/// inserts a new column immediately before the table's trailing `CHECK` constraint rather than
+/// appending it after, so the new column must be spliced into that exact position to match what
+/// SQLite actually rewrites the stored `CREATE TABLE` text to.
+fn normalized_session_schema_v6() -> String {
+    normalized_session_schema_v5().replacen(
+        "CHECK(resumable = (completed_turn_count > 0))",
+        "confinement_root TEXT,\n        CHECK(resumable = (completed_turn_count > 0))",
+        1,
+    )
+}
+
 fn validate_legacy_archive(
     connection: &Connection,
     database_path: &Path,
@@ -1091,7 +1103,7 @@ fn validate_v5_schema(
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v5())
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v6())
 }
 
 fn validate_normalized_session_schema(

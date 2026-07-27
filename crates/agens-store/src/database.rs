@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 4] = [
+const MIGRATIONS: [Migration; 5] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -68,6 +68,10 @@ const MIGRATIONS: [Migration; 4] = [
     Migration {
         id: "0004_tool_result_facts",
         ddl: tool_result_facts_ddl,
+    },
+    Migration {
+        id: "0005_session_confinement_root",
+        ddl: session_confinement_root_ddl,
     },
 ];
 
@@ -330,6 +334,13 @@ fn tool_result_facts_ddl() -> String {
     .to_owned()
 }
 
+/// The literal filesystem root a session's tools are confined to, distinct from `project`: the
+/// grouping/display/permission-grant key produced by the lossy `Path::display()`. NULL on every
+/// pre-existing row, which the read path falls back to `project` for.
+fn session_confinement_root_ddl() -> String {
+    "ALTER TABLE sessions ADD COLUMN confinement_root TEXT;".to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -500,6 +511,45 @@ mod tests {
                 "recorded_at",
             ]
         );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_0005_is_purely_additive_and_adds_a_nullable_confinement_root_column() {
+        let directory = data_directory();
+        let (_, connection) = open_unified_database(&directory).unwrap();
+
+        for pre_existing_table in [
+            "sessions",
+            "session_attempts",
+            "permission_grants",
+            "model_preference",
+            "tool_result_facts",
+        ] {
+            let column_count: i64 = connection
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{pre_existing_table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                column_count > 0,
+                "{pre_existing_table} must be unchanged by migration 0005"
+            );
+        }
+
+        let (not_null, default_value): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('sessions')
+                 WHERE name = 'confinement_root'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_null, 0, "confinement_root must be nullable");
+        assert_eq!(default_value, None);
 
         fs::remove_dir_all(directory).unwrap();
     }

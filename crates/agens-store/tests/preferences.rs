@@ -49,7 +49,8 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0001_permission_grants",
             "0002_model_preference",
             "0003_sessions_v5",
-            "0004_tool_result_facts"
+            "0004_tool_result_facts",
+            "0005_session_confinement_root"
         ]
     );
     drop(connection);

@@ -4,6 +4,8 @@ use agens_core::{
     RetryBoundary, Role, SessionAttemptFailureKind, SessionAttemptStatus, SessionAttemptSummary,
     SessionMetadata,
 };
+use std::path::PathBuf;
+
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::{SessionStore, SessionStoreError};
@@ -578,6 +580,26 @@ impl SessionStore {
             .transpose()
     }
 
+    /// The literal filesystem root a session's tools must be confined to.
+    ///
+    /// Falls back to the session's `project` column when `confinement_root` was never recorded
+    /// (every row created before migration `0005`), so a pre-existing session still resumes to
+    /// the root it was always confined to rather than failing to resolve one at all.
+    pub fn confinement_root(&self, session_id: i64) -> Result<PathBuf, SessionStoreError> {
+        let (confinement_root, project): (Option<String>, String) = self
+            .connection
+            .query_row(
+                "SELECT confinement_root, project FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| {
+                SessionStoreError::operation("load confinement root", &self.database_path, error)
+            })?;
+
+        Ok(PathBuf::from(confinement_root.unwrap_or(project)))
+    }
+
     pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {
         let metadata = self
             .connection
@@ -917,6 +939,11 @@ fn decode_attempt_failure_kind(value: &str) -> rusqlite::Result<SessionAttemptFa
     }
 }
 
+/// Seeds `confinement_root` from `project` at session creation: before AGN-52 introduces
+/// worktree-per-session paths, the two are the same discovered root, so a brand-new row can
+/// carry both without a second confinement-root input threaded through this call. A resumed
+/// session reads this column back explicitly rather than re-deriving it from the process's own
+/// current working directory, which is the whole reason the column exists as its own field.
 fn insert_attempt_session(
     transaction: &Transaction<'_>,
     database_path: &std::path::Path,
@@ -926,8 +953,8 @@ fn insert_attempt_session(
         transaction
             .execute(
                 "INSERT INTO sessions (project, title, active_agent, provider_id, model_id,
-                                        reasoning_effort, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                        reasoning_effort, created_at, updated_at, confinement_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?1)",
                 params![
                     metadata.project,
                     metadata.title,
@@ -947,8 +974,8 @@ fn insert_attempt_session(
 
     transaction
         .execute(
-            "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id, reasoning_effort, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO sessions (id, project, title, active_agent, provider_id, model_id, reasoning_effort, created_at, updated_at, confinement_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?2) ON CONFLICT(id) DO NOTHING",
             params![metadata.id, metadata.project, metadata.title, metadata.active_agent, metadata.provider_id, metadata.model_id, metadata.reasoning_effort.map(ReasoningEffort::as_str), metadata.created_at, metadata.updated_at],
         )
         .map_err(|error| SessionStoreError::operation("create session", database_path, error))?;
