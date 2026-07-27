@@ -11,6 +11,11 @@ use crate::tui::provider::TuiProvider;
 pub(crate) struct TuiSessionContext {
     pub(crate) identifier: Option<i64>,
     pub(crate) metadata: Option<SessionMetadata>,
+    /// The confinement root recorded on a resumed session, read back from its own persisted
+    /// `confinement_root` rather than re-derived from the current process's working directory.
+    /// `None` for a session that has not been created yet; see
+    /// [`crate::session_root::resolve_tui_session_root`] for the fallback that applies then.
+    pub(crate) confinement_root: Option<std::path::PathBuf>,
     pub(crate) messages: Vec<Message>,
     pub(crate) restored_history: Vec<Conversation>,
     pub(crate) active_agent: Option<ActiveAgentRuntime>,
@@ -355,6 +360,7 @@ impl TuiSessionContext {
         Self {
             identifier: Some(identifier),
             metadata: Some(metadata),
+            confinement_root: None,
             messages,
             restored_history: Vec::new(),
             active_agent: Some(active_agent),
@@ -381,6 +387,7 @@ impl TuiSessionContext {
         Self {
             identifier: Some(identifier),
             metadata: Some(metadata),
+            confinement_root: None,
             messages,
             restored_history,
             active_agent: None,

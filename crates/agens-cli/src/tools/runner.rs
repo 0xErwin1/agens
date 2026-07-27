@@ -652,11 +652,12 @@ mod tests {
                 .with_session_writer(bootstrap.clone(), Arc::clone(&session));
             let mut runtime = production_tui_task_runtime_with_runner(
                 &bootstrap,
+                &crate::session_root::discovered_root_for_tests(&bootstrap),
                 &SkillCatalog::default(),
                 production_tui_permission_bridge().0,
                 ProductionTaskRunner::with_probe(
                     bootstrap.clone(),
-                    bootstrap.project_root().unwrap().to_path_buf(),
+                    crate::session_root::discovered_root_for_tests(&bootstrap),
                     Arc::new(Mutex::new(Vec::new())),
                 )
                 .with_lifecycle_bridge(lifecycle_bridge),
@@ -742,11 +743,12 @@ mod tests {
         });
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
+            &crate::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
             bridge,
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
-                bootstrap.project_root().unwrap().to_path_buf(),
+                crate::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::clone(&probe),
             ),
         )
@@ -831,11 +833,12 @@ mod tests {
             .with_session_writer(bootstrap.clone(), Arc::clone(&session));
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
+            &crate::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
             production_tui_permission_bridge().0,
             ProductionTaskRunner::with_progress_probe(
                 bootstrap.clone(),
-                bootstrap.project_root().unwrap().to_path_buf(),
+                crate::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::clone(&probe),
                 vec![
                     TurnEvent::ProviderPart(MessagePart::Reasoning("inspect".into())),
@@ -1102,11 +1105,12 @@ mod tests {
             let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default());
             let mut runtime = production_tui_task_runtime_with_runner(
                 &bootstrap,
+                &crate::session_root::discovered_root_for_tests(&bootstrap),
                 &SkillCatalog::default(),
                 production_tui_permission_bridge().0,
                 ProductionTaskRunner::with_failure_probe(
                     bootstrap.clone(),
-                    bootstrap.project_root().unwrap().to_path_buf(),
+                    crate::session_root::discovered_root_for_tests(&bootstrap),
                     source,
                     "provider-token=super-secret-error-detail",
                 )

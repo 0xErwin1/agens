@@ -50,10 +50,13 @@ pub(crate) fn rotate_tui_agent(
         .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
         .ok_or_else(|| CliError::usage("/agent requires an available primary agent"))?
         .clone();
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let (_, dispatcher) = production_tool_runtime(bootstrap, project_root, Some(skills))?;
+    let project_root = {
+        let context = session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        crate::session_root::resolve_tui_session_root(&context, bootstrap)?
+    };
+    let (_, dispatcher) = production_tool_runtime(bootstrap, &project_root, Some(skills))?;
     ensure_active_tui_agent_runtime(bootstrap, session, &dispatcher)?;
     let dispatcher = dispatcher
         .lock()

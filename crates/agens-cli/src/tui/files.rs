@@ -20,13 +20,18 @@ pub(crate) fn tui_picker_file_candidates(bootstrap: &Bootstrap) -> Result<Vec<St
 
 /// Bounded, ignore-aware project files read through the confined native tools,
 /// so no candidate can ever name a path outside the project root.
+///
+/// Deliberately reads the process's own discovered root rather than a resumed session's
+/// recorded one: the `@` picker and file-reference expansion are not yet threaded through a
+/// live session context, so this remains a named, acknowledged gap for a resumed session whose
+/// root diverges from the current working directory, rather than a silently missed conversion.
 pub(crate) fn tui_file_candidates_with_limit(
     bootstrap: &Bootstrap,
     limit: usize,
 ) -> Result<Vec<String>, CliError> {
-    let project_root = bootstrap
-        .project_root()
+    let project_root = crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    let project_root = project_root.path();
     open_native_tools(project_root, bootstrap.tool_limits())?
         .tui_file_candidates(limit)
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
@@ -54,14 +59,16 @@ pub(crate) fn tui_select_candidates(bootstrap: &Bootstrap) -> Result<Vec<String>
         .collect())
 }
 
+/// Deliberately reads the process's own discovered root; see
+/// [`tui_file_candidates_with_limit`] for why this is an acknowledged gap rather than a missed
+/// conversion.
 pub(crate) fn expand_tui_file_reference(
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<String, CliError> {
-    let project_root = bootstrap
-        .project_root()
+    let project_root = crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
         .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
-    let tools = open_native_tools(project_root, bootstrap.tool_limits())?;
+    let tools = open_native_tools(project_root.path(), bootstrap.tool_limits())?;
     let mut expanded = String::with_capacity(prompt.len());
 
     for segment in prompt.split_inclusive(char::is_whitespace) {

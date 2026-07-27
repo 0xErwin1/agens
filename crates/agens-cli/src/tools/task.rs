@@ -3,6 +3,7 @@
 //! `task`/`task_control`/`task_message` tools with the parent dispatcher.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{PermissionMode, PermissionSession};
@@ -41,17 +42,16 @@ pub(crate) struct TaskParentSelection {
 
 pub(crate) fn production_tui_task_runtime(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
     lifecycle_bridge: TuiTaskLifecycleBridge,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: String,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
+        project_root,
         skills,
         permission_bridge,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf())
@@ -64,12 +64,14 @@ pub(crate) fn production_tui_task_runtime(
 #[cfg(test)]
 pub(crate) fn production_tui_task_runtime_with_runner(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
     task_runner: ProductionTaskRunner,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
+        project_root,
         skills,
         permission_bridge,
         task_runner,
@@ -80,6 +82,7 @@ pub(crate) fn production_tui_task_runtime_with_runner(
 
 pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
     bootstrap: &Bootstrap,
+    project_root: &Path,
     skills: &SkillCatalog,
     permission_bridge: TuiPermissionBridge,
     task_runner: ProductionTaskRunner,
@@ -87,9 +90,6 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
     model_resolution_reference: Option<String>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let task_registry = task_runner.execution_registry().unwrap_or_default();
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     let parent_model = bootstrap
         .model()
         .unwrap_or_else(|| default_model(bootstrap))
@@ -297,13 +297,15 @@ mod tests {
         );
         bootstrap.model = Some("gpt-5.6-sol".into());
         let probe = Arc::new(Mutex::new(Vec::new()));
+        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
         let runtime = production_tui_task_runtime_with_runner_and_parent_config(
             &bootstrap,
+            &project_root,
             &SkillCatalog::default(),
             production_tui_permission_bridge().0,
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
-                bootstrap.project_root().unwrap().to_path_buf(),
+                project_root.clone(),
                 Arc::clone(&probe),
             ),
             agens_core::RequestConfig::with_reasoning_effort("high").unwrap(),

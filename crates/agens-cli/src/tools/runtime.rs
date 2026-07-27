@@ -561,7 +561,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
             &bootstrap,
-            bootstrap.project_root().unwrap(),
+            &crate::session_root::discovered_root_for_tests(&bootstrap),
             Some(&SkillCatalog::default()),
             RecordingTaskRunner(Arc::clone(&calls)),
         )
@@ -630,7 +630,7 @@ mod tests {
                 tui_session_bootstrap_for_provider(&provider_temporary, &[], provider, "gpt-4.1");
             let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
                 &bootstrap,
-                bootstrap.project_root().unwrap(),
+                &crate::session_root::discovered_root_for_tests(&bootstrap),
                 Some(&SkillCatalog::default()),
                 RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
             )
@@ -680,7 +680,7 @@ mod tests {
         );
         let (provider_tools, dispatcher) = production_tool_runtime_with_task_runner(
             &bootstrap,
-            bootstrap.project_root().unwrap(),
+            &crate::session_root::discovered_root_for_tests(&bootstrap),
             Some(&SkillCatalog::default()),
             RecordingTaskRunner(Arc::new(Mutex::new(Vec::new()))),
         )

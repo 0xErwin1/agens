@@ -179,8 +179,19 @@ pub(crate) fn run_production_tui(
             let lifecycle_bridge =
                 TuiTaskLifecycleBridge::new(task_events, submit_task_controls.clone())
                     .with_session_writer(runtime_bootstrap.clone(), Arc::clone(&router.session));
+            let session_project_root = match router
+                .session
+                .lock()
+                .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))
+                .and_then(|context| {
+                    crate::session_root::resolve_tui_session_root(&context, &runtime_bootstrap)
+                }) {
+                Ok(root) => root,
+                Err(error) => return tui_provider_outcome(Err(error)),
+            };
             let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
+                &session_project_root,
                 &router.skills,
                 prompt_bridge.clone(),
                 lifecycle_bridge.clone(),
@@ -222,16 +233,14 @@ pub(crate) fn run_production_tui(
                 &router.session,
                 Some(Arc::clone(&router.skills)),
                 |request| {
-                    let project_root = runtime_bootstrap.project_root().ok_or_else(|| {
-                        CliError::configuration("native tools require a project root")
-                    })?;
                     let task_runtime = production_tui_task_runtime_with_runner_and_parent_config(
                         &runtime_bootstrap,
+                        &session_project_root,
                         &router.skills,
                         prompt_bridge.clone(),
                         ProductionTaskRunner::new(
                             runtime_bootstrap.clone(),
-                            project_root.to_path_buf(),
+                            session_project_root.clone(),
                         )
                         .with_lifecycle_bridge(lifecycle_bridge.clone())
                         .with_dangerous_mode(request.dangerous_mode),
@@ -419,12 +428,15 @@ pub(crate) fn report_tui_extension_collisions<E: TuiEngine>(
     }
 }
 
+/// Labels the TUI header with the process's own current project, before any session has been
+/// created or resumed. Purely a display convenience, not a confinement decision, so it is one of
+/// the few sites allowed to read the process-wide discovered root directly.
 pub(crate) fn configure_tui_project_identity(
     tui: &mut Tui<ProductionTuiEngine>,
     bootstrap: &Bootstrap,
 ) {
-    if let Some(project_root) = bootstrap.project_root() {
-        tui.set_project(project_root.display().to_string());
+    if let Some(root) = crate::session_root::SessionRoot::discover_for_new_session(bootstrap) {
+        tui.set_project(root.path().display().to_string());
     }
 }
 
@@ -542,42 +554,54 @@ mod tests {
     }
 
     #[test]
-    fn tui_session_resume_fails_closed_for_cross_project_missing_and_legacy_records() {
+    fn tui_session_resume_confines_a_cross_project_session_and_fails_closed_for_missing_and_legacy_records()
+     {
         let temporary = tui_session_directory("fail-closed");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
-        persist_tui_session(
-            &mut store,
-            &temporary.join("other").display().to_string(),
-            "other",
-        );
+        let other_project = temporary.join("other").display().to_string();
+        persist_tui_session(&mut store, &other_project, "other");
         let saved_sessions = store.list_sessions().unwrap();
         drop(store);
         let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
         let original = session.lock().unwrap().clone();
 
-        for command in ["/resume 1", "/resume 2"] {
-            assert_eq!(
-                run_tui_prompt(
-                    &bootstrap,
-                    command,
-                    &HeadlessTurnCancellation::new(),
-                    &session,
-                    None,
-                )
-                .unwrap_err()
-                .to_string(),
-                "store: saved session is unavailable"
-            );
-            assert_eq!(*session.lock().unwrap(), original);
-            assert_eq!(
-                SessionStore::open(bootstrap.data_directory())
-                    .unwrap()
-                    .list_sessions()
-                    .unwrap(),
-                saved_sessions
-            );
-        }
+        // Session 1 belongs to a different project than `bootstrap`'s own; per AGN-48 it must
+        // still resume, confined to its OWN recorded root rather than being rejected.
+        run_tui_prompt(
+            &bootstrap,
+            "/resume 1",
+            &HeadlessTurnCancellation::new(),
+            &session,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            session.lock().unwrap().metadata.as_ref().unwrap().project,
+            other_project
+        );
+        *session.lock().unwrap() = original.clone();
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/resume 2",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap_err()
+            .to_string(),
+            "store: saved session is unavailable"
+        );
+        assert_eq!(*session.lock().unwrap(), original);
+        assert_eq!(
+            SessionStore::open(bootstrap.data_directory())
+                .unwrap()
+                .list_sessions()
+                .unwrap(),
+            saved_sessions
+        );
 
         let legacy_temporary = tui_session_directory("legacy-fail-closed");
         let legacy_bootstrap = tui_session_bootstrap(&legacy_temporary, &[]);

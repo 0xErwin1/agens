@@ -53,6 +53,7 @@ pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliErro
 pub(crate) struct LoadedTuiSessionResume {
     pub(crate) session: StoredSession,
     pub(crate) retry_boundary: Option<RetryBoundary>,
+    pub(crate) confinement_root: std::path::PathBuf,
 }
 
 impl std::ops::Deref for LoadedTuiSessionResume {
@@ -105,9 +106,13 @@ pub(crate) fn load_tui_session_for_resume(
     {
         return Err(CliError::storage("saved session is unavailable"));
     }
+    let confinement_root = store
+        .confinement_root(identifier)
+        .map_err(|_| CliError::storage("saved session is unavailable"))?;
     Ok(LoadedTuiSessionResume {
         session,
         retry_boundary,
+        confinement_root,
     })
 }
 
@@ -120,10 +125,8 @@ pub(crate) fn prepare_loaded_tui_session_resume(
     let LoadedTuiSessionResume {
         session,
         retry_boundary,
+        confinement_root,
     } = loaded;
-    if session.metadata.project != tui_project_identifier(bootstrap)? {
-        return Err(CliError::storage("saved session is unavailable"));
-    }
     #[cfg(test)]
     crate::test_support::note_tui_resume_projection();
     let restored_history =
@@ -171,6 +174,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         session.messages,
         restored_history,
     );
+    context.confinement_root = Some(confinement_root);
     context.provider = provider;
     context.selection = selection;
     context.resume_error = resume_error;
@@ -302,10 +306,12 @@ pub(crate) fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEven
     restored
 }
 
+/// Identifies the process's own current project, used to filter the session picker to sessions
+/// belonging to it. This is a listing/grouping concern distinct from a session's own confinement
+/// root, so it is one of the few sites allowed to read the process-wide discovered root.
 pub(crate) fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
-    bootstrap
-        .project_root()
-        .map(|project| project.display().to_string())
+    crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+        .map(|root| root.path().display().to_string())
         .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
 }
 
@@ -314,9 +320,6 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     session: &Arc<Mutex<TuiSessionContext>>,
     dispatcher: &SharedToolDispatcher,
 ) -> Result<(), CliError> {
-    let project_root = bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
@@ -326,6 +329,7 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     if context.active_agent.is_some() {
         return Ok(());
     }
+    let project_root = crate::session_root::resolve_tui_session_root(&context, bootstrap)?;
     let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
     let validator = TuiAgentModelValidator::for_context(bootstrap, &context)?;
     let inherited_model = effective_tui_model(bootstrap, &context);
@@ -345,15 +349,17 @@ pub(crate) fn ensure_active_tui_agent_runtime(
 #[cfg(test)]
 mod tests {
     use agens_core::{
-        PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-        PermissionSession, Role, SessionMetadata,
+        HeadlessTurnCancellation, PermissionDecision, PermissionMode, PermissionPattern,
+        PermissionPolicy, PermissionRule, PermissionSession, Role, SessionMetadata,
     };
-    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome};
+    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
     use agens_tui::{Event, Key, Tui, TuiPermissionBridge};
     use rusqlite::Connection;
 
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
+    use crate::deps::CliDependencies;
+    use crate::permissions::production_tui_permission_bridge;
     use crate::session::attempt::attempt_failure_status;
     use crate::test_support::{
         persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
@@ -365,6 +371,127 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime;
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
+
+    /// A second bootstrap sharing `origin`'s data directory (and therefore its sessions
+    /// database) but discovering its own project root from a completely different, unrelated
+    /// working directory — simulating a process restart from elsewhere on disk.
+    fn bootstrap_from_a_different_working_directory(
+        origin: &std::path::Path,
+        label: &str,
+    ) -> Bootstrap {
+        let elsewhere = tui_session_directory(label);
+        let config_home = origin.join("config");
+        let data_directory = origin.join("data");
+        crate::bootstrap::bootstrap(&CliDependencies::for_test(
+            elsewhere.join("project"),
+            Some(elsewhere.join("home")),
+            std::collections::BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            std::collections::BTreeMap::from([(
+                config_home.join("config.toml"),
+                format!(
+                    "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n",
+                    data_directory.display()
+                ),
+            )]),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn resuming_from_a_different_working_directory_confines_to_the_originally_recorded_root() {
+        let origin = tui_session_directory("confinement-origin");
+        let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
+        let mut store = SessionStore::open(creation_bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&origin), "origin");
+        drop(store);
+
+        let resume_bootstrap =
+            bootstrap_from_a_different_working_directory(&origin, "confinement-elsewhere");
+        assert_ne!(
+            resume_bootstrap.paths().project_config,
+            creation_bootstrap.paths().project_config
+        );
+
+        let resumed = resume_tui_session(
+            &resume_bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &TuiCredentialResolver::production(),
+        );
+        assert!(
+            resumed.is_ok(),
+            "resuming from a different working directory must confine to the session's own \
+             recorded root instead of being rejected: {resumed:?}"
+        );
+        let session = Arc::new(Mutex::new(resumed.unwrap()));
+        let resolved_root = crate::session_root::resolve_tui_session_root(
+            &session.lock().unwrap(),
+            &resume_bootstrap,
+        )
+        .unwrap();
+        assert_eq!(resolved_root, origin.join("project"));
+        let runtime = production_tui_task_runtime(
+            &resume_bootstrap,
+            &resolved_root,
+            &SkillCatalog::default(),
+            production_tui_permission_bridge().0,
+            TuiTaskLifecycleBridge::new(
+                agens_tui::BridgeTx::bounded(8).0,
+                TuiTaskControls::default(),
+            ),
+            agens_core::RequestConfig::default(),
+            "confinement-check".to_owned(),
+        )
+        .unwrap();
+        ensure_active_tui_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
+
+        let policy = PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Exact("native::read".into()),
+                PermissionPattern::Any,
+            )],
+        );
+        let outcome = runtime
+            .dispatcher
+            .lock()
+            .unwrap()
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    tui_project(&origin),
+                    "read",
+                    serde_json::json!({"path": "marker.txt"}),
+                ),
+            )
+            .unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = outcome else {
+            panic!("read should authorize under an allow rule");
+        };
+        std::fs::write(origin.join("project").join("marker.txt"), "origin-only").unwrap();
+        let context = ToolExecutionContext::from_headless_adapter(
+            HeadlessTurnCancellation::new().adapter_view(),
+        );
+        let output = runtime
+            .dispatcher
+            .lock()
+            .unwrap()
+            .execute(handle, &context)
+            .unwrap();
+        assert!(
+            !output.is_error,
+            "the confined read must find the file under the ORIGINAL root: {output:?}"
+        );
+        assert!(output.content.contains("origin-only"));
+
+        std::fs::remove_dir_all(&origin).unwrap();
+    }
 
     #[test]
     fn tui_session_list_filters_current_project_and_resume_preserves_typed_history() {
@@ -702,8 +829,12 @@ mod tests {
         let session = Arc::new(Mutex::new(resumed));
         let (permission_bridge, _) = TuiPermissionBridge::channel();
         let (events, _) = agens_tui::BridgeTx::bounded(8);
+        let project_root =
+            crate::session_root::resolve_tui_session_root(&session.lock().unwrap(), &bootstrap)
+                .unwrap();
         let runtime = production_tui_task_runtime(
             &bootstrap,
+            &project_root,
             &skills,
             permission_bridge,
             TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),

@@ -385,10 +385,14 @@ where
     let session_effort = request
         .session_reasoning_effort
         .or_else(|| request.request_config.reasoning_effort());
-    let project_root = context
-        .bootstrap
-        .project_root()
-        .ok_or_else(|| CliError::configuration("native tools require a project root"))?;
+    // Headless one-shot chat has no `--resume` path (only the TUI does), so the current
+    // invocation's own discovered root is always the correct one here: there is never a
+    // pre-existing session whose recorded root this could silently diverge from.
+    let project_root =
+        crate::session_root::SessionRoot::discover_for_new_session(context.bootstrap)
+            .ok_or_else(|| CliError::configuration("native tools require a project root"))?
+            .into_path_buf();
+    let project_root = project_root.as_path();
     let (provider_tools, tool_runtime) = match context.task_runtime {
         Some(task_runtime) => (
             task_runtime.provider_tools.clone(),

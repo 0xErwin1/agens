@@ -575,9 +575,6 @@ impl TuiRuntimeRouter {
                         .parse()
                         .map_err(|_| CliError::usage("session action is invalid"))?;
                     let stored = load_tui_session_for_resume(&bootstrap, identifier)?;
-                    if stored.metadata.project != tui_project_identifier(&bootstrap)? {
-                        return Err(CliError::storage("saved session is unavailable"));
-                    }
                     if let Some(attempt) = stored.latest_attempt.as_ref().filter(|attempt| {
                         attempt.status() == agens_core::SessionAttemptStatus::Running
                     }) {
@@ -646,9 +643,6 @@ impl TuiRuntimeRouter {
         let stored = store
             .load_session_for_resume(key.session_id())
             .map_err(|_| CliError::storage("saved session is unavailable"))?;
-        if stored.metadata.project != tui_project_identifier(bootstrap)? {
-            return Err(CliError::storage("saved session is unavailable"));
-        }
         let Some(attempt) = stored.latest_attempt.as_ref().filter(|attempt| {
             attempt.key() == key && attempt.status() == agens_core::SessionAttemptStatus::Running
         }) else {

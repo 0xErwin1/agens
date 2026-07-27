@@ -457,7 +457,7 @@ mod tests {
 
         let (tools, dispatcher) = production_tool_runtime(
             &bootstrap,
-            bootstrap.project_root().unwrap(),
+            &crate::session_root::discovered_root_for_tests(&bootstrap),
             Some(skills.as_ref()),
         )
         .unwrap();

@@ -15,6 +15,8 @@ use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
 
 use crate::{CliDependencies, CliError, HeadlessChatRequest};
 
+pub(crate) mod session_root;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderSource {
     Auto,
@@ -136,7 +138,15 @@ impl Bootstrap {
         &self.data_directory
     }
 
-    pub(crate) fn project_root(&self) -> Option<&Path> {
+    /// The process's own discovered project root, from walking up from the current working
+    /// directory to find `.git`.
+    ///
+    /// This is deliberately visible only to [`session_root`]: a session's confinement root must
+    /// come from that module's `SessionRoot`, not from re-deriving this value at an arbitrary
+    /// call site, because after a resume this process's current working directory can
+    /// legitimately differ from the root the session was created under. Reaching this method
+    /// from anywhere else is a compile error by construction, not a convention to remember.
+    pub(in crate::bootstrap) fn discovered_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
     }
 

@@ -15,6 +15,11 @@ use crate::tui::provider::TuiProvider;
 use crate::tui::session::{CompletedSubagentTurn, TuiSessionContext};
 use crate::{Bootstrap, CliError};
 
+/// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
+/// session (its `project` was already recorded), or freshly seeded from the process's own
+/// discovered root when no session exists yet — the only point where that discovery is a valid
+/// confinement source, since no session has a recorded root to read back before its own first
+/// persisted attempt.
 pub(crate) fn next_session_metadata(
     bootstrap: &Bootstrap,
     title: &str,
@@ -41,9 +46,8 @@ pub(crate) fn next_session_metadata(
 
     Ok(SessionMetadata {
         id: 0,
-        project: bootstrap
-            .project_root()
-            .map(|path| path.display().to_string())
+        project: crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+            .map(|root| root.path().display().to_string())
             .unwrap_or_else(|| "default".to_owned()),
         title: title.to_owned(),
         active_agent: active_agent.unwrap_or("primary").to_owned(),

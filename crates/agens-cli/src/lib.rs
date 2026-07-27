@@ -34,6 +34,7 @@ use headless::block_on_headless_turn;
 use tui::models::tui_model_source;
 use tui::run_tui;
 
+pub(crate) use bootstrap::session_root;
 pub use bootstrap::{Bootstrap, bootstrap};
 pub use deps::CliDependencies;
 pub use error::{CliError, CommandResult, ExitStatus};
