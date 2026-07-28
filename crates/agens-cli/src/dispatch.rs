@@ -98,8 +98,6 @@ mod tests {
     use super::*;
     use crate::CliError;
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
-    use crate::session::agents::ensure_active_agent_runtime;
-    use crate::session::agents::select_subagent;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
         run_production_batch_with_policy, tui_session_bootstrap, tui_session_directory,
@@ -107,6 +105,8 @@ mod tests {
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls};
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tools::task::production_tui_task_runtime_with_runner;
+    use agens_agents::ensure_active_agent_runtime;
+    use agens_agents::select_subagent;
     use agens_core::HeadlessPermissionGate;
     use agens_dispatch::{
         AuthorizedNativeTaskRuntime, ProductionToolDispatcher, origin_launches_selected_subagent,

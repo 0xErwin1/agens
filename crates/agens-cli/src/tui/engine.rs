@@ -25,8 +25,6 @@ use crate::headless::{
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
-use crate::session::agents::ensure_active_agent_runtime;
-use crate::session::agents::persist_pending_agent_correction;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
@@ -39,6 +37,8 @@ use crate::tui::models::seed_remembered_tui_selection;
 use crate::tui::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
+use agens_agents::ensure_active_agent_runtime;
+use agens_agents::persist_pending_agent_correction;
 use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};

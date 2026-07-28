@@ -6,6 +6,7 @@ version = 4
 name = "agens"
 version = "0.1.0"
 dependencies = [
+ "agens-agents",
  "agens-bootstrap",
  "agens-bus",
  "agens-config",
@@ -30,6 +31,22 @@ dependencies = [
  "sha2",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "agens-agents"
+version = "0.1.0"
+dependencies = [
+ "agens-bootstrap",
+ "agens-core",
+ "agens-diagnostics",
+ "agens-error",
+ "agens-models",
+ "agens-permissions",
+ "agens-providers",
+ "agens-session",
+ "agens-store",
+ "agens-tools",
 ]
 
 [[package]]

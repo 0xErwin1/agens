@@ -26,10 +26,7 @@ use agens_tui::{
 
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::mcp::load_configured_mcp_registry;
-use crate::session::agents::{
-    agent_catalog_for_context, persist_pending_agent_correction, rotate_agent, select_subagent,
-    subagent_catalog,
-};
+use crate::session::agents::rotate_agent;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
     RESERVED_TUI_COMMANDS, discover_tui_command_catalog, render_tui_help, resolved_tui_palette,
@@ -47,6 +44,9 @@ use crate::tui::session::{
     parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
 use crate::tui::turn::tui_session_presentation;
+use agens_agents::{
+    agent_catalog_for_context, persist_pending_agent_correction, select_subagent, subagent_catalog,
+};
 use agens_bootstrap::discover_skill_catalog;
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
@@ -1251,7 +1251,6 @@ mod tests {
 
     use super::*;
     use crate::headless::HeadlessChatCompletion;
-    use crate::session::agents::ensure_active_agent_runtime;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1261,6 +1260,7 @@ mod tests {
     };
     use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
     use crate::tui::extensions::{start_tui_commands, start_tui_skills};
+    use agens_agents::ensure_active_agent_runtime;
     use agens_models::ModelSource;
 
     fn write_router_test_skill(root: &Path, name: &str, body: &str) {

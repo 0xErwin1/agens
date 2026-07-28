@@ -13,9 +13,9 @@ use agens_tui::{
     Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 
-use crate::session::agents::{persist_pending_agent_correction, reconcile_persisted_active_agent};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::tui_session_presentation;
+use agens_agents::{persist_pending_agent_correction, reconcile_persisted_active_agent};
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
@@ -352,7 +352,6 @@ mod tests {
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
-    use crate::session::agents::ensure_active_agent_runtime;
     use crate::test_counters::{reset_tui_resume_test_counters, tui_resume_test_counters};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
@@ -364,6 +363,7 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime;
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
+    use agens_agents::ensure_active_agent_runtime;
     use agens_session::attempt::attempt_failure_status;
 
     #[test]

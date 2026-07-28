@@ -1,37 +1,30 @@
-//! Agent catalogs, rotation and model compatibility.
+//! Agent rotation.
 //!
-//! No user interface: which agents a session may use, which models each one can
-//! run, and how rotation resolves. It sat under `tui/` with a `Tui` prefix and
-//! never referenced the terminal crate at all.
-//!
-//! Resolving the active primary agent, selecting a subagent, discovering the
-//! built-in plus configured agent catalog, validating a candidate model against
-//! the provider currently in effect, and building the runtime a session needs
-//! before it can accept a native tool call.
+//! Everything else about agents lives in `agens-agents`. Rotation stays here
+//! because it builds a tool runtime to hand the new agent, and that runtime is
+//! assembled from the modules below this one.
 
-use std::collections::BTreeSet;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use agens_core::{AgentDefinition, HeadlessTurnError};
-use agens_providers::ProviderDiagnosticKind;
+use agens_core::HeadlessTurnError;
 use agens_store::SessionStore;
-use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
+#[cfg(test)]
+use agens_tools::AgentModelValidator;
+use agens_tools::SkillCatalog;
 
 use crate::tools::runtime::production_tool_runtime;
+use agens_agents::{
+    AgentModelCompatibility, agent_catalog, agent_rotation_error, ensure_active_agent_runtime,
+};
+#[cfg(test)]
+use agens_agents::{agent_catalog_for_context, initial_active_agent_name, task_agent_catalog};
 use agens_bootstrap::Bootstrap;
-use agens_diagnostics::record_agent_diagnostic;
 use agens_error::CliError;
-use agens_models::default_model;
+#[cfg(test)]
 use agens_models::{ModelSelection, ModelSource};
-use agens_permissions::SharedToolDispatcher;
-use agens_session::context::ActiveAgentRuntime;
 use agens_session::context::SessionContext;
-use agens_session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
+use agens_session::context::rotate_active_agent;
 use agens_session::model::effective_model;
-use agens_session::model::model_source;
-use agens_session::provider::ProviderKind;
-
 pub(crate) fn rotate_agent(
     bootstrap: &Bootstrap,
     name: &str,
@@ -137,179 +130,6 @@ pub(crate) fn list_agents(
     ))
 }
 
-pub(crate) fn select_subagent(
-    bootstrap: &Bootstrap,
-    name: &str,
-    session: &Arc<Mutex<SessionContext>>,
-) -> Result<String, CliError> {
-    let snapshot = session
-        .lock()
-        .map_err(|_| CliError::storage("TUI session is unavailable"))?
-        .clone();
-    let agents = subagent_catalog(bootstrap, &snapshot)?.collect::<Vec<_>>();
-    if agents.is_empty() {
-        return Err(CliError::usage("No eligible subagents are available."));
-    }
-    let agent = agents
-        .into_iter()
-        .find(|agent| agent.name == name.trim())
-        .ok_or_else(|| CliError::usage("/subagent requires an available subagent"))?;
-    let mut context = session
-        .lock()
-        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    if context.running {
-        return Err(CliError::runtime(HeadlessTurnError::State));
-    }
-    context.selected_subagent = Some(agent.name.clone());
-    Ok(format!("Subagent: {}.", agent.name))
-}
-
-pub(crate) fn subagent_catalog(
-    bootstrap: &Bootstrap,
-    context: &SessionContext,
-) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
-    if bootstrap
-        .provider_type()
-        .and_then(ProviderKind::parse)
-        .is_none()
-    {
-        return Ok(Vec::new().into_iter());
-    }
-
-    let agents = agent_catalog_for_context(bootstrap, context)?
-        .subagents()
-        .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
-        .cloned()
-        .collect::<Vec<_>>();
-    Ok(agents.into_iter())
-}
-
-pub(crate) fn agent_catalog(
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-    validator: &dyn AgentModelValidator,
-) -> Result<AgentCatalog, CliError> {
-    discover_agent_catalog(bootstrap, project_root, Some(validator))
-}
-
-/// Resolves the session's own recorded root (falling back to the process's discovered root for a
-/// session that has not been created yet), so a resumed session's agent catalog reflects its own
-/// project-local `agents/` directory rather than the resuming process's.
-pub(crate) fn agent_catalog_for_context(
-    bootstrap: &Bootstrap,
-    context: &SessionContext,
-) -> Result<AgentCatalog, CliError> {
-    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
-    agent_catalog(bootstrap, &project_root, &validator)
-}
-
-pub(crate) fn task_agent_catalog(
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-) -> Result<AgentCatalog, CliError> {
-    discover_agent_catalog(bootstrap, project_root, None)
-}
-
-pub(crate) fn discover_agent_catalog(
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-    validator: Option<&dyn AgentModelValidator>,
-) -> Result<AgentCatalog, CliError> {
-    let session_root =
-        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let system_prompt =
-        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?
-            .system_prompt()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
-    let primary = AgentDefinition {
-        name: "primary".into(),
-        description: "Default interactive agent".into(),
-        mode: agens_core::AgentMode::Primary,
-        model: None,
-        system_prompt,
-        permission_rules: Vec::new(),
-        skills: Vec::new(),
-    };
-    let explore = AgentDefinition {
-        name: "explore".into(),
-        description: "Explore the codebase without modifying files".into(),
-        mode: agens_core::AgentMode::Subagent,
-        model: None,
-        system_prompt: "You are the read-only exploration subagent. Inspect the codebase without modifying files and return concise, grounded findings."
-            .into(),
-        permission_rules: Vec::new(),
-        skills: Vec::new(),
-    };
-    let general = AgentDefinition {
-        name: "general".into(),
-        description: "Handle a general delegated coding task".into(),
-        mode: agens_core::AgentMode::Subagent,
-        model: None,
-        system_prompt: "You are the general-purpose subagent. Complete the delegated task with the available native tools and return a concise result."
-            .into(),
-        permission_rules: Vec::new(),
-        skills: Vec::new(),
-    };
-    let global = bootstrap.paths.global_config.with_file_name("agents");
-    let project = project_root.join(".agens/agents");
-    let built_ins = [primary, explore, general];
-    let discovery = match validator {
-        Some(validator) => {
-            AgentCatalog::discover_with_model_validator(&built_ins, &global, &project, validator)
-        }
-        None => AgentCatalog::discover(&built_ins, &global, &project),
-    };
-    discovery
-        .map(|discovery| discovery.catalog().clone())
-        .map_err(|_| CliError::configuration("agent catalog is unavailable"))
-}
-
-pub(crate) fn agent_rotation_error(error: AgentRotationError) -> CliError {
-    match error {
-        AgentRotationError::Busy => CliError::runtime(HeadlessTurnError::State),
-        AgentRotationError::ModelUnavailable => {
-            CliError::configuration("agent model is unavailable")
-        }
-        AgentRotationError::Persistence => CliError::storage("active agent could not be saved"),
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct AgentModelCompatibility {
-    available: Arc<BTreeSet<String>>,
-}
-
-impl AgentModelCompatibility {
-    pub(crate) fn for_source(source: ModelSource) -> Result<Self, CliError> {
-        let available = ModelSelection::for_source("gpt-4.1", source)
-            .model_values()
-            .map_err(CliError::unavailable)?
-            .into_iter()
-            .collect();
-        Ok(Self {
-            available: Arc::new(available),
-        })
-    }
-
-    pub(crate) fn for_context(
-        bootstrap: &Bootstrap,
-        context: &SessionContext,
-    ) -> Result<Self, CliError> {
-        Self::for_source(model_source(bootstrap, context))
-    }
-}
-
-impl AgentModelValidator for AgentModelCompatibility {
-    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        self.available
-            .contains(model)
-            .then_some(())
-            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
-    }
-}
-
 #[cfg(test)]
 pub(crate) struct BundledModelValidator;
 
@@ -326,215 +146,6 @@ impl AgentModelValidator for BundledModelValidator {
             .then_some(())
             .ok_or(agens_tools::AgentModelValidationError::Unavailable)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PersistedAgentResolution {
-    agent: AgentDefinition,
-    fallback_from: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PersistedAgentResolutionError {
-    Model,
-    Agent,
-    Primary,
-}
-
-pub(crate) fn resolve_persisted_active_agent(
-    name: &str,
-    catalog: &AgentCatalog,
-    unvalidated_catalog: &AgentCatalog,
-    validator: &dyn AgentModelValidator,
-) -> Result<PersistedAgentResolution, PersistedAgentResolutionError> {
-    let unvalidated = unvalidated_catalog.agent(name);
-    if unvalidated
-        .and_then(|agent| agent.model.as_deref())
-        .is_some_and(|model| validator.validate_model(model).is_err())
-    {
-        return Err(PersistedAgentResolutionError::Model);
-    }
-    if let Some(agent) = catalog
-        .agent(name)
-        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
-    {
-        return Ok(PersistedAgentResolution {
-            agent: agent.clone(),
-            fallback_from: None,
-        });
-    }
-    if name == "primary" {
-        return Err(PersistedAgentResolutionError::Primary);
-    }
-    if unvalidated.is_some() {
-        return Err(PersistedAgentResolutionError::Agent);
-    }
-
-    let unvalidated_primary = unvalidated_catalog
-        .agent("primary")
-        .ok_or(PersistedAgentResolutionError::Primary)?;
-    if unvalidated_primary.mode == agens_core::AgentMode::Subagent {
-        return Err(PersistedAgentResolutionError::Primary);
-    }
-    if unvalidated_primary
-        .model
-        .as_deref()
-        .is_some_and(|model| validator.validate_model(model).is_err())
-    {
-        return Err(PersistedAgentResolutionError::Model);
-    }
-    let primary = catalog
-        .agent("primary")
-        .filter(|agent| agent.mode != agens_core::AgentMode::Subagent)
-        .ok_or(PersistedAgentResolutionError::Primary)?;
-    Ok(PersistedAgentResolution {
-        agent: primary.clone(),
-        fallback_from: Some(name.to_owned()),
-    })
-}
-
-pub(crate) fn persisted_agent_resolution_error(error: PersistedAgentResolutionError) -> CliError {
-    match error {
-        PersistedAgentResolutionError::Model => {
-            CliError::configuration("agent model is unavailable")
-        }
-        PersistedAgentResolutionError::Agent => {
-            CliError::configuration("active agent is unavailable")
-        }
-        PersistedAgentResolutionError::Primary => {
-            CliError::configuration("primary agent is unavailable")
-        }
-    }
-}
-
-/// A resumed session keeps the agent it was persisted with; a fresh one starts
-/// from the configured default. An unresolvable name is not fatal here: it
-/// falls through the same recovery path a stale persisted agent takes.
-pub(crate) fn initial_active_agent_name(context: &SessionContext, bootstrap: &Bootstrap) -> String {
-    context
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.active_agent.clone())
-        .or_else(|| bootstrap.default_agent().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "primary".into())
-}
-
-pub(crate) fn reconcile_persisted_active_agent(
-    bootstrap: &Bootstrap,
-    context: &mut SessionContext,
-) -> Result<AgentDefinition, CliError> {
-    let name = initial_active_agent_name(context, bootstrap);
-    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
-    let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
-    let unvalidated_catalog = task_agent_catalog(bootstrap, &project_root)?;
-    let resolution =
-        resolve_persisted_active_agent(&name, &catalog, &unvalidated_catalog, &validator).map_err(
-            |error| {
-                record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentUnavailable);
-                persisted_agent_resolution_error(error)
-            },
-        )?;
-
-    let Some(stale_name) = resolution.fallback_from.as_deref() else {
-        return Ok(resolution.agent);
-    };
-    if let Some(metadata) = context.metadata.as_mut() {
-        metadata.active_agent = "primary".into();
-        context.agent_correction_pending = true;
-    }
-    context.resume_notice = Some(format!(
-        "Agent '{stale_name}' is unavailable; resumed with primary."
-    ));
-    record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentFallback);
-
-    Ok(resolution.agent)
-}
-
-pub(crate) fn persist_pending_agent_correction(
-    bootstrap: &Bootstrap,
-    context: &mut SessionContext,
-) {
-    if !context.agent_correction_pending {
-        return;
-    }
-    context.agent_correction_pending = false;
-
-    let Some(metadata) = context.metadata.as_mut() else {
-        return;
-    };
-    let mut corrected = metadata.clone();
-    corrected.updated_at = current_session_timestamp();
-    if SessionStore::open(bootstrap.data_directory())
-        .and_then(|mut store| store.update_session(&corrected))
-        .is_ok()
-    {
-        *metadata = corrected;
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TaskModelValidator {
-    available: Arc<BTreeSet<String>>,
-}
-
-impl TaskModelValidator {
-    pub(crate) fn new(models: &[String]) -> Self {
-        Self {
-            available: Arc::new(models.iter().cloned().collect()),
-        }
-    }
-}
-
-impl AgentModelValidator for TaskModelValidator {
-    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        self.available
-            .contains(model)
-            .then_some(())
-            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
-    }
-}
-
-pub(crate) fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
-    let source = bootstrap
-        .provider_type()
-        .and_then(ProviderKind::parse)
-        .map(ProviderKind::source)
-        .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    ModelSelection::for_source(default_model(bootstrap.provider_type()), source)
-        .model_values()
-        .map_err(CliError::unavailable)
-}
-
-pub(crate) fn ensure_active_agent_runtime(
-    bootstrap: &Bootstrap,
-    session: &Arc<Mutex<SessionContext>>,
-    dispatcher: &SharedToolDispatcher,
-) -> Result<(), CliError> {
-    let dispatcher = dispatcher
-        .lock()
-        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
-    let mut context = session
-        .lock()
-        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    if context.active_agent.is_some() {
-        return Ok(());
-    }
-    let project_root = agens_session::root::resolve_tui_session_root(&context, bootstrap)?;
-    let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
-    let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
-    let inherited_model = effective_model(bootstrap, &context);
-    let active_agent = ActiveAgentRuntime::build(
-        &agent,
-        Some(&inherited_model),
-        &project_root.display().to_string(),
-        &dispatcher,
-        &validator,
-    )
-    .map_err(agent_rotation_error)?;
-    persist_pending_agent_correction(bootstrap, &mut context);
-    context.active_agent = Some(active_agent);
-    Ok(())
 }
 
 #[cfg(test)]

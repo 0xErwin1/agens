@@ -19,6 +19,7 @@ path = "../agens-tools/src/bin/fake-mcp-child.rs"
 
 [dependencies]
 agens-config = { path = "../agens-config" }
+agens-agents = { path = "../agens-agents" }
 agens-diagnostics = { path = "../agens-diagnostics" }
 agens-dispatch = { path = "../agens-dispatch" }
 agens-core = { path = "../agens-core" }

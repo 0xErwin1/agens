@@ -352,11 +352,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::session::agents::task_model_catalog;
     use crate::test_support::{
         bootstrap_from_configuration, tui_session_bootstrap, tui_session_bootstrap_for_provider,
         tui_session_directory,
     };
+    use agens_agents::task_model_catalog;
 
     #[test]
     fn configured_tool_limits_reach_the_native_tool_runtime() {
