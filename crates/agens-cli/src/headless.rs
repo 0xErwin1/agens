@@ -22,8 +22,6 @@ use agens_tui::TuiPermissionBridge;
 use crate::dispatch::ProductionToolDispatcher;
 use crate::error::{CliError, ExitStatus};
 use crate::permissions::prompt::{ProductionPermissionPrompter, TtyPermissionPrompter};
-#[allow(unused_imports)]
-use crate::permissions::{};
 use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     permission_policy,

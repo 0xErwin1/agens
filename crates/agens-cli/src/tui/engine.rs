@@ -4,13 +4,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use agens_core::SubmitOrigin;
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, PermissionMode, TurnProgressSink};
 use agens_tools::{
     CommandCatalog, SkillCatalog, TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget,
 };
 use agens_tui::{
     BridgeCancel, Engine as TuiEngine, Tui, TuiProviderOutcome, TuiSubmissionOutcome,
-    TuiSubmitOrigin, run_with_default_progress_submit_with_permissions_and_task_controls,
+    run_with_default_progress_submit_with_permissions_and_task_controls,
 };
 
 use crate::Bootstrap;
@@ -238,7 +239,7 @@ pub(crate) fn run_production_tui(
                         &mut task_runtime,
                         &router.session,
                         &prompt,
-                        matches!(origin, TuiSubmitOrigin::Background),
+                        matches!(origin, SubmitOrigin::Background),
                         &turn_cancellation,
                     ),
                     &lifecycle_bridge,

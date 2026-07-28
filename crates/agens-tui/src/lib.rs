@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::SubmitOrigin;
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::{
@@ -355,17 +356,6 @@ pub enum TuiProviderOutcome {
     Failed { message: String, action: String },
     Cancelled { message: String, action: String },
     Backgrounded,
-}
-
-/// Who asked for a turn the composition layer is about to run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TuiSubmitOrigin {
-    /// A prompt the user submitted for the main agent.
-    User,
-    /// A prompt the user submitted for the armed subagent to run in the background.
-    Background,
-    /// A turn the runtime scheduled after a background subagent finished.
-    SubagentCompletion,
 }
 
 /// A visible conversation entry in chronological order.
@@ -6117,7 +6107,7 @@ pub fn run_with_default_progress_submit(
     + 'static,
     submit: impl Fn(
         String,
-        TuiSubmitOrigin,
+        SubmitOrigin,
         mpsc::Sender<TurnEvent>,
         BridgeTx<TuiRuntimeEvent>,
     ) -> TuiProviderOutcome
@@ -6153,7 +6143,7 @@ where
         + 'static,
     F: Fn(
             String,
-            TuiSubmitOrigin,
+            SubmitOrigin,
             mpsc::Sender<TurnEvent>,
             BridgeTx<TuiRuntimeEvent>,
         ) -> TuiProviderOutcome
@@ -6194,7 +6184,7 @@ where
         + 'static,
     F: Fn(
             String,
-            TuiSubmitOrigin,
+            SubmitOrigin,
             mpsc::Sender<TurnEvent>,
             BridgeTx<TuiRuntimeEvent>,
         ) -> TuiProviderOutcome
@@ -6268,7 +6258,7 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, TuiSubmitOrigin::User, sender, metrics);
+                    let outcome = submit(prompt, SubmitOrigin::User, sender, metrics);
                     let _ = completion_sender.send(outcome);
                 });
             })
@@ -6317,7 +6307,7 @@ where
             let metrics = metrics_sender.clone();
             let completion_sender = completion_sender.clone();
             thread::spawn(move || {
-                let outcome = submit(prompt, TuiSubmitOrigin::SubagentCompletion, sender, metrics);
+                let outcome = submit(prompt, SubmitOrigin::SubagentCompletion, sender, metrics);
                 let _ = completion_sender.send(outcome);
             });
             dirty = true;
@@ -6370,7 +6360,7 @@ where
                 let metrics = metrics_sender.clone();
                 let completion_sender = completion_sender.clone();
                 thread::spawn(move || {
-                    let outcome = submit(prompt, TuiSubmitOrigin::Background, sender, metrics);
+                    let outcome = submit(prompt, SubmitOrigin::Background, sender, metrics);
                     let _ = completion_sender.send(outcome);
                 });
             }

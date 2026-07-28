@@ -417,6 +417,19 @@ pub enum SessionMetadataError {
     InvalidResumability,
 }
 
+/// Who asked for a turn. A domain fact, not a surface one: a background
+/// subagent turn and a user prompt differ in what the runtime may do with them,
+/// whether or not a terminal is attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubmitOrigin {
+    /// A prompt the user submitted for the main agent.
+    User,
+    /// A prompt the user submitted for the armed subagent to run in the background.
+    Background,
+    /// A turn the runtime scheduled after a background subagent finished.
+    SubagentCompletion,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TurnState {
     Idle,

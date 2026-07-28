@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use agens_core::SubmitOrigin;
 use agens_core::{
     HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
     HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
@@ -14,7 +15,6 @@ use agens_core::{
 use agens_tools::{
     DispatchTool, McpRegistry, NativeToolCatalog, TaskLaunchMode, ToolExecutionContext, ToolOutput,
 };
-use agens_tui::TuiSubmitOrigin;
 
 use crate::error::{CliError, ExitStatus};
 use crate::permissions::{
@@ -310,10 +310,10 @@ pub(crate) fn launch_selected_tui_task(
 
 /// A subagent armed for the user's next prompt must survive a turn the user never submitted, so a
 /// runtime-scheduled turn leaves the arming in place and runs the main agent instead.
-pub(crate) fn origin_launches_selected_subagent(origin: TuiSubmitOrigin) -> bool {
+pub(crate) fn origin_launches_selected_subagent(origin: SubmitOrigin) -> bool {
     match origin {
-        TuiSubmitOrigin::User | TuiSubmitOrigin::Background => true,
-        TuiSubmitOrigin::SubagentCompletion => false,
+        SubmitOrigin::User | SubmitOrigin::Background => true,
+        SubmitOrigin::SubagentCompletion => false,
     }
 }
 
@@ -622,12 +622,10 @@ mod tests {
             Ok("Subagent: reviewer.".to_owned())
         );
 
-        assert!(origin_launches_selected_subagent(TuiSubmitOrigin::User));
-        assert!(origin_launches_selected_subagent(
-            TuiSubmitOrigin::Background
-        ));
+        assert!(origin_launches_selected_subagent(SubmitOrigin::User));
+        assert!(origin_launches_selected_subagent(SubmitOrigin::Background));
         assert!(!origin_launches_selected_subagent(
-            TuiSubmitOrigin::SubagentCompletion
+            SubmitOrigin::SubagentCompletion
         ));
         assert_eq!(
             session.lock().unwrap().selected_subagent.as_deref(),
