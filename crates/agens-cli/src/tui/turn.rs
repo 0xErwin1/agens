@@ -3,16 +3,15 @@
 //! were persisted out of band, and deriving the provider/model/effort
 //! presentation shown for a session.
 
+use agens_session::model::{current_provider, effective_model, model_source};
 use std::collections::BTreeSet;
 
 use agens_core::{Message, MessagePart, Role};
 
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
-use crate::tui_model_source;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
-use agens_models::default_model;
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
 use agens_session::turns::SUBAGENT_CALL_ID_PREFIX;
@@ -89,53 +88,16 @@ pub(crate) fn subagent_call_id(part: &MessagePart) -> Option<&str> {
     }
 }
 
-pub(crate) fn current_tui_provider(
-    bootstrap: &Bootstrap,
-    context: &SessionContext,
-) -> Option<ProviderKind> {
-    if context.chatgpt_unavailable {
-        return None;
-    }
-    if context.resume_error.is_some()
-        && context
-            .metadata
-            .as_ref()
-            .is_some_and(|metadata| metadata.provider_id.is_some())
-        && context.provider.is_none()
-    {
-        return None;
-    }
-    context
-        .provider
-        .or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse))
-}
-
-pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &SessionContext) -> String {
-    context
-        .selection
-        .as_ref()
-        .map(ModelSelection::model)
-        .or_else(|| {
-            context
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.model_id.as_deref())
-        })
-        .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
-        .to_owned()
-}
-
 pub(crate) fn tui_session_presentation(
     bootstrap: &Bootstrap,
     session: &SessionContext,
 ) -> TuiPresentation {
-    let model = effective_tui_model(bootstrap, session);
+    let model = effective_model(bootstrap, session);
     let provider = session
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.provider_id.as_deref())
-        .or_else(|| current_tui_provider(bootstrap, session).map(ProviderKind::identifier))
+        .or_else(|| current_provider(bootstrap, session).map(ProviderKind::identifier))
         .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
     let label = session
         .identifier
@@ -149,7 +111,7 @@ pub(crate) fn tui_session_presentation(
                 .or_else(|| selection.reasoning_effort_default())
         })
         .or_else(|| {
-            ModelSelection::for_source(&model, tui_model_source(bootstrap, session))
+            ModelSelection::for_source(&model, model_source(bootstrap, session))
                 .reasoning_effort_default()
         });
     let mut presentation = TuiPresentation::new(provider, &model, label)

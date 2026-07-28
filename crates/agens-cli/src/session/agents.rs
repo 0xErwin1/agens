@@ -20,15 +20,15 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::diagnostics::record_agent_diagnostic;
 use crate::tools::runtime::production_tool_runtime;
-use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
-use crate::tui::turn::effective_tui_model;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};
 use agens_session::context::SessionContext;
 use agens_session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
+use agens_session::model::effective_model;
+use agens_session::model::model_source;
 use agens_session::provider::ProviderKind;
 
 pub(crate) fn rotate_agent(
@@ -70,7 +70,7 @@ pub(crate) fn rotate_agent(
     if context.running {
         return Err(CliError::runtime(HeadlessTurnError::State));
     }
-    let inherited_model = effective_tui_model(bootstrap, &context);
+    let inherited_model = effective_model(bootstrap, &context);
     let mut store = context
         .metadata
         .is_some()
@@ -296,7 +296,7 @@ impl AgentModelCompatibility {
         bootstrap: &Bootstrap,
         context: &SessionContext,
     ) -> Result<Self, CliError> {
-        Self::for_source(tui_model_source(bootstrap, context))
+        Self::for_source(model_source(bootstrap, context))
     }
 }
 

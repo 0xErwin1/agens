@@ -3,16 +3,17 @@
 //! seeding a fresh session from the last remembered selection, and rendering
 //! model metadata for `/model` and `/effort` command responses.
 
+use agens_session::model::model_source;
 use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
-use crate::tui::turn::current_tui_provider;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
+use agens_models::ModelSelection;
 use agens_models::default_model;
-use agens_models::{ModelSelection, ModelSource};
 use agens_session::context::SessionContext;
+use agens_session::model::current_provider;
 use agens_session::provider::ProviderKind;
 
 pub(crate) fn apply_tui_selection(
@@ -66,7 +67,7 @@ pub(crate) fn seed_remembered_tui_selection(
         Ok(None) => return None,
         Err(_) => return Some("Remembered model selection could not be read.".to_owned()),
     };
-    let source = tui_model_source(bootstrap, context);
+    let source = model_source(bootstrap, context);
     let default = default_model(bootstrap.provider_type());
     let mut selector = ModelSelection::for_source(default, source);
     if selector.apply_model(preference.model()).is_err() {
@@ -88,12 +89,6 @@ pub(crate) fn seed_remembered_tui_selection(
     });
     context.selection = Some(selector);
     notice
-}
-
-pub(crate) fn tui_model_source(bootstrap: &Bootstrap, context: &SessionContext) -> ModelSource {
-    current_tui_provider(bootstrap, context)
-        .unwrap_or(ProviderKind::OpenAiApi)
-        .source()
 }
 
 pub(crate) fn format_model_metadata(model: &agens_models::ModelMetadata) -> String {
@@ -131,7 +126,7 @@ pub(crate) fn select_tui_model(
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        let selector = ModelSelection::for_source("gpt-4.1", tui_model_source(bootstrap, &context));
+        let selector = ModelSelection::for_source("gpt-4.1", model_source(bootstrap, &context));
         let values = selector
             .model_values()
             .map_err(CliError::unavailable)?
@@ -156,15 +151,16 @@ pub(crate) fn apply_tui_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-    let mut selector = context.selection.clone().unwrap_or_else(|| {
-        ModelSelection::for_source(model, tui_model_source(bootstrap, &context))
-    });
+    let mut selector = context
+        .selection
+        .clone()
+        .unwrap_or_else(|| ModelSelection::for_source(model, model_source(bootstrap, &context)));
     let previous_effort = selector.reasoning_effort();
     selector
         .apply_model(model)
         .map_err(CliError::configuration)?;
     let reset_effort = previous_effort.filter(|_| selector.reasoning_effort().is_none());
-    let provider = current_tui_provider(bootstrap, &context)
+    let provider = current_provider(bootstrap, &context)
         .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
     apply_tui_selection(bootstrap, &mut context, provider, selector)?;
     Ok(reset_effort.map_or_else(
@@ -185,14 +181,15 @@ pub(crate) fn apply_tui_unverified_model(
     let mut context = session
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-    let mut selector = context.selection.clone().unwrap_or_else(|| {
-        ModelSelection::for_source(model, tui_model_source(bootstrap, &context))
-    });
+    let mut selector = context
+        .selection
+        .clone()
+        .unwrap_or_else(|| ModelSelection::for_source(model, model_source(bootstrap, &context)));
     let reset_effort = selector.reasoning_effort().is_some();
     selector
         .apply_unverified_model(model)
         .map_err(CliError::configuration)?;
-    let provider = current_tui_provider(bootstrap, &context)
+    let provider = current_provider(bootstrap, &context)
         .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
     apply_tui_selection(bootstrap, &mut context, provider, selector)?;
 
@@ -239,11 +236,11 @@ pub(crate) fn apply_tui_effort(
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
         .unwrap_or_else(|| default_model(bootstrap.provider_type()));
-    let mut selector = ModelSelection::for_source(model, tui_model_source(bootstrap, &context));
+    let mut selector = ModelSelection::for_source(model, model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
-    let provider = current_tui_provider(bootstrap, &context)
+    let provider = current_provider(bootstrap, &context)
         .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
     apply_tui_selection(bootstrap, &mut context, provider, selector)?;
     let effort = if effort == "default" {
@@ -285,7 +282,7 @@ mod tests {
         );
 
         assert_eq!(
-            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            agens_session::model::effective_model(&bootstrap, &context),
             "gpt-5.5"
         );
         let request = crate::headless::apply_session_to_request(
@@ -318,7 +315,7 @@ mod tests {
         );
         assert!(context.selection.is_none());
         assert_eq!(
-            crate::tui::turn::effective_tui_model(&configured, &context),
+            agens_session::model::effective_model(&configured, &context),
             "gpt-4.1"
         );
 
@@ -331,7 +328,7 @@ mod tests {
         assert_eq!(seed_remembered_tui_selection(&flagged, &mut context), None);
         assert!(context.selection.is_none());
         assert_eq!(
-            crate::tui::turn::effective_tui_model(&flagged, &context),
+            agens_session::model::effective_model(&flagged, &context),
             "o3"
         );
 
@@ -354,7 +351,7 @@ mod tests {
         );
         assert!(context.selection.is_none());
         assert_eq!(
-            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            agens_session::model::effective_model(&bootstrap, &context),
             "gpt-4.1"
         );
 
@@ -413,7 +410,7 @@ mod tests {
             None
         );
         assert_eq!(
-            crate::tui::turn::effective_tui_model(&bootstrap, &context),
+            agens_session::model::effective_model(&bootstrap, &context),
             "gpt-5.5"
         );
         assert_eq!(

@@ -7,6 +7,7 @@
 
 pub mod attempt;
 pub mod context;
+pub mod model;
 pub mod provider;
 pub mod root;
 pub mod turns;

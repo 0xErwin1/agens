@@ -37,7 +37,6 @@ use diagnostics::{
     record_subagent_terminal,
 };
 use headless::block_on_headless_turn;
-use tui::models::tui_model_source;
 use tui::run_tui;
 
 pub use agens_bootstrap::Bootstrap;

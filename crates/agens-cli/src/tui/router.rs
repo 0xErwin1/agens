@@ -9,6 +9,7 @@
 //! hold", item 3). Do not distribute its methods across files or additional
 //! `impl` blocks.
 
+use agens_session::model::{current_provider, effective_model, model_source};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -36,7 +37,7 @@ use crate::tui::extensions::{
 use crate::tui::files::{selected_tui_file, tui_picker_file_candidates, tui_select_candidates};
 use crate::tui::models::{
     apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
-    format_model_metadata, select_tui_effort, select_tui_model, tui_model_source,
+    format_model_metadata, select_tui_effort, select_tui_model,
 };
 use crate::tui::resume::{
     ResumedTuiSession, commit_tui_session_resume, load_tui_session_for_resume,
@@ -45,7 +46,7 @@ use crate::tui::resume::{
 use crate::tui::session::{
     parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
-use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
+use crate::tui::turn::tui_session_presentation;
 use agens_bootstrap::discover_skill_catalog;
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
@@ -284,7 +285,7 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let current = current_tui_provider(&bootstrap, &context);
+                let current = current_provider(&bootstrap, &context);
                 let entries = ProviderKind::ALL
                     .into_iter()
                     .filter_map(|provider| {
@@ -335,7 +336,7 @@ impl TuiRuntimeRouter {
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(bootstrap.provider_type()))
                     .to_owned();
-                let source = tui_model_source(&bootstrap, &context);
+                let source = model_source(&bootstrap, &context);
                 drop(context);
                 let selector = ModelSelection::for_source(current.clone(), source);
                 let values = selector.models().map_err(CliError::unavailable)?;
@@ -383,7 +384,7 @@ impl TuiRuntimeRouter {
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(bootstrap.provider_type()));
                 let selector = context.selection.clone().unwrap_or_else(|| {
-                    ModelSelection::for_source(model, tui_model_source(&bootstrap, &context))
+                    ModelSelection::for_source(model, model_source(&bootstrap, &context))
                 });
                 let current = selector.reasoning_effort().unwrap_or("default");
                 let values = selector.reasoning_effort_values();
@@ -966,7 +967,7 @@ impl TuiRuntimeRouter {
                 "ChatGPT credentials are unavailable; run /connect",
             ));
         }
-        let provider = current_tui_provider(&bootstrap, &context)
+        let provider = current_provider(&bootstrap, &context)
             .ok_or_else(|| CliError::configuration("TUI provider is unavailable"))?;
         if let Some(selection) = &context.selection {
             bootstrap.model = Some(selection.model().to_owned());
@@ -1156,7 +1157,7 @@ impl TuiRuntimeRouter {
             return Err(CliError::authentication(message));
         }
 
-        let current_model = effective_tui_model(bootstrap, &context);
+        let current_model = effective_model(bootstrap, &context);
         let previous_effort = context
             .selection
             .as_ref()

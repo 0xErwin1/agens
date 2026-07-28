@@ -4,6 +4,7 @@
 //! completed-subagent cards shown for its history. Also ensures a session
 //! has an active agent runtime before it can accept native tool calls.
 
+use agens_session::model::effective_model;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +20,7 @@ use crate::session::agents::{
     reconcile_persisted_active_agent,
 };
 use crate::tui::session::resume_retry_notice;
-use crate::tui::turn::{effective_tui_model, tui_session_presentation};
+use crate::tui::turn::tui_session_presentation;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
@@ -360,7 +361,7 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     let project_root = agens_session::root::resolve_tui_session_root(&context, bootstrap)?;
     let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
     let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
-    let inherited_model = effective_tui_model(bootstrap, &context);
+    let inherited_model = effective_model(bootstrap, &context);
     let active_agent = ActiveAgentRuntime::build(
         &agent,
         Some(&inherited_model),
