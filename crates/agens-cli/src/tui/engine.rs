@@ -15,7 +15,6 @@ use agens_tui::{
 };
 
 use crate::Bootstrap;
-use crate::diagnostics::next_diagnostic_reference;
 use crate::dispatch::{launch_selected_tui_task, selected_tui_task_skips_parent};
 use crate::headless::seed_configured_reasoning_effort;
 use crate::headless::{
@@ -40,6 +39,7 @@ use crate::tui::models::seed_remembered_tui_selection;
 use crate::tui::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
+use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::{ResumeDraft, SessionContext};

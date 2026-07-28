@@ -18,9 +18,9 @@ use agens_providers::ProviderDiagnosticKind;
 use agens_store::SessionStore;
 use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
-use crate::diagnostics::record_agent_diagnostic;
 use crate::tools::runtime::production_tool_runtime;
 use agens_bootstrap::Bootstrap;
+use agens_diagnostics::record_agent_diagnostic;
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};

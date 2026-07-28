@@ -5,7 +5,7 @@ use agens_providers::DiagnosticRef;
 use agens_tools::{McpEndpointSummary, McpStatusSnapshot};
 use agens_tui::{DialogEntry, DialogView};
 
-use crate::diagnostics::DIAGNOSTIC_FILE_LIMIT_BYTES;
+use agens_diagnostics::DIAGNOSTIC_FILE_LIMIT_BYTES;
 
 pub(crate) fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
     let entries = snapshot
@@ -195,6 +195,7 @@ mod tests {
     };
     use agens_tui::Tui;
 
+    use super::*;
     use crate::test_support::{
         render_tui_test_backend, tui_session_bootstrap, tui_session_directory,
     };
@@ -299,5 +300,45 @@ mod tests {
         assert!(session.lock().unwrap().messages.is_empty());
         assert!(tui.transcript().is_empty());
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_dialog_projects_only_safe_fields_and_relative_paths() {
+        use std::os::unix::fs::symlink;
+
+        let data_directory = std::env::temp_dir().join(format!(
+            "agens-diagnostics-dialog-{}-{}",
+            std::process::id(),
+            agens_diagnostics::DIAGNOSTIC_REFERENCE_SEQUENCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let diagnostics_directory = data_directory.join("diagnostics");
+        std::fs::create_dir_all(&diagnostics_directory)
+            .expect("diagnostics directory should be created");
+        std::fs::write(
+            diagnostics_directory.join("agens-42.jsonl"),
+            concat!(
+                "{\"timestamp_ms\":1,\"reference\":\"abc12345\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"terminal\",\"attempt\":3,",
+                "\"max_attempts\":3,\"delay_ms\":null,\"status\":429,",
+                "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n"
+            ),
+        )
+        .expect("diagnostic fixture should be written");
+        let outside = data_directory.join("outside.txt");
+        std::fs::write(&outside, "SENTINEL_OUTSIDE").expect("outside fixture should be written");
+        symlink(&outside, diagnostics_directory.join("agens-99.jsonl"))
+            .expect("diagnostic symlink should be created");
+
+        let rendered = format!("{:?}", diagnostics_dialog(&data_directory));
+
+        assert!(rendered.contains("abc12345"));
+        assert!(rendered.contains("diagnostics/agens-42.jsonl"));
+        assert!(!rendered.contains(&data_directory.display().to_string()));
+        assert!(!rendered.contains("SENTINEL_SECRET"));
+        assert!(!rendered.contains("SENTINEL_OUTSIDE"));
+
+        std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
     }
 }

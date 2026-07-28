@@ -13,7 +13,7 @@ mod chatgpt_auth;
 mod cli;
 mod commands;
 mod deps;
-mod diagnostics;
+
 mod dispatch;
 mod headless;
 mod mcp;
@@ -32,11 +32,11 @@ mod tui;
 mod turns_tests;
 
 use agens_bootstrap::effective_max_iterations;
-use agens_error::cancellation_result;
-use diagnostics::{
+use agens_diagnostics::{
     next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
     record_subagent_terminal,
 };
+use agens_error::cancellation_result;
 use headless::block_on_headless_turn;
 use tui::run_tui;
 

@@ -20,10 +20,10 @@ use agens_tools::{
     TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget, TaskRunnerError, TaskTurnRequest,
 };
 
-use crate::diagnostics::diagnostic_store;
 use crate::tools::runtime::production_child_tool_runtime;
 use crate::{Bootstrap, SubagentErrorKind, block_on_headless_turn};
 use agens_core::DiscardCompletedTurnRepository;
+use agens_diagnostics::diagnostic_store;
 use agens_dispatch::ProductionToolDispatcher;
 use agens_permissions::{ProductionPermissionGate, SharedToolDispatcher};
 

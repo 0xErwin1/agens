@@ -18,8 +18,8 @@ use agens_tools::{
 };
 
 use crate::Bootstrap;
-use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
+use agens_diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use agens_permissions::ParseToolInput;
 use agens_permissions::sanitize_metric;
 use agens_session::context::SessionContext;

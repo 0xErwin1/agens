@@ -17,6 +17,7 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-tools        native tools, MCP, skills, and subagents
   -> agens-permissions  whether a tool call is allowed
   -> agens-dispatch     binding a tool call to the thing that runs it
+  -> agens-diagnostics  the sanitized, capacity-bounded record of what went wrong
   -> agens-session      what a session is: identity, context, provider, attempts
   -> agens-server       the machine's daemon and its sync/async boundary
   -> agens-tui          terminal rendering surface
@@ -39,6 +40,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-store` | SQLite: the unified database, migrations, sessions, attempts, grants, the evidence ledger, and paginated transcript reads. | Interpreting what it stores. |
 | `agens-tools` | Native tools and their confinement, permission capabilities, MCP transports, skills, and subagent plumbing. | Deciding whether a call is allowed for a given session. |
 | `agens-permissions` | Deciding whether a tool call is allowed: rules, grants, session authorization, and which tools a delegated subagent may reach. | Asking a person. That is a surface, and it reaches policy through the `PermissionPrompter` port. |
+| `agens-diagnostics` | The local failure record: a rotating, size-capped JSONL log written with a closed set of fields, and the reference-scoped handles a provider writes through. | Showing any of it. A surface reads the files and decides what a person sees. |
 | `agens-dispatch` | The dispatch table: the adapters that bind a native or MCP tool to its executor, the dispatcher that runs only what permissions already authorized, the redaction a failure passes through before a model sees it, and the authorized subagent-task launch. | Who asked. The same table serves a headless run, a terminal session and a daemon worker. |
 | `agens-session` | What a session is: its context, the provider and credentials it speaks through, its attempt lifecycle, and how a completed turn is recorded. | Rendering any of it, or composing text for a person. |
 | `agens-server` | The machine's daemon: its single-instance guard, its runtime, and the one named crossing into synchronous code. Grows to hold the coordinator. | A project. One daemon serves many. |

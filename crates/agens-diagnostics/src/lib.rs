@@ -14,15 +14,16 @@ use agens_providers::{
     ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
 };
 
-use crate::{Bootstrap, CliError};
+use agens_bootstrap::Bootstrap;
+use agens_error::CliError;
 
-pub(crate) const DIAGNOSTIC_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
-pub(crate) const DIAGNOSTIC_FILE_COUNT_LIMIT: usize = 4;
-pub(crate) static DIAGNOSTIC_REFERENCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub const DIAGNOSTIC_FILE_LIMIT_BYTES: u64 = 1024 * 1024;
+pub const DIAGNOSTIC_FILE_COUNT_LIMIT: usize = 4;
+pub static DIAGNOSTIC_REFERENCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone)]
-pub(crate) struct SafeDiagnosticStore {
+pub struct SafeDiagnosticStore {
     directory: PathBuf,
     enabled: bool,
 }
@@ -30,14 +31,14 @@ pub(crate) struct SafeDiagnosticStore {
 impl SafeDiagnosticStore {
     /// Capture is what `options.debug` switches: disabled, nothing about a
     /// failure is written to disk.
-    pub(crate) fn with_capture(data_directory: PathBuf, enabled: bool) -> Self {
+    pub fn with_capture(data_directory: PathBuf, enabled: bool) -> Self {
         Self {
             directory: data_directory.join("diagnostics"),
             enabled,
         }
     }
 
-    pub(crate) fn record(&self, event: &ProviderDiagnosticEvent) {
+    pub fn record(&self, event: &ProviderDiagnosticEvent) {
         if !self.enabled {
             return;
         }
@@ -147,12 +148,12 @@ fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<
     Ok(line)
 }
 
-pub(crate) struct OperationDiagnostics {
-    pub(crate) reference: String,
-    pub(crate) provider: ProviderDiagnostics,
+pub struct OperationDiagnostics {
+    pub reference: String,
+    pub provider: ProviderDiagnostics,
 }
 
-pub(crate) fn operation_diagnostics(
+pub fn operation_diagnostics(
     bootstrap: &Bootstrap,
     scope: ProviderDiagnosticScope,
     reference: Option<&str>,
@@ -168,11 +169,11 @@ pub(crate) fn operation_diagnostics(
     }
 }
 
-pub(crate) fn diagnostic_store(bootstrap: &Bootstrap) -> SafeDiagnosticStore {
+pub fn diagnostic_store(bootstrap: &Bootstrap) -> SafeDiagnosticStore {
     SafeDiagnosticStore::with_capture(bootstrap.data_directory().to_path_buf(), bootstrap.debug())
 }
 
-pub(crate) fn next_diagnostic_reference() -> String {
+pub fn next_diagnostic_reference() -> String {
     let sequence = DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -185,7 +186,7 @@ pub(crate) fn next_diagnostic_reference() -> String {
     format!("{:08x}", mixed as u32)
 }
 
-pub(crate) fn record_subagent_terminal(
+pub fn record_subagent_terminal(
     bootstrap: &Bootstrap,
     reference: &str,
     class: ProviderDiagnosticClass,
@@ -206,7 +207,7 @@ pub(crate) fn record_subagent_terminal(
     });
 }
 
-pub(crate) fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
+pub fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, error: &CliError) {
     if error.message == agens_core::HeadlessTaskTerminal::ModelUnavailable.message() {
         return;
     }
@@ -234,7 +235,7 @@ pub(crate) fn record_parent_terminal(bootstrap: &Bootstrap, reference: &str, err
     });
 }
 
-pub(crate) fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
+pub fn record_agent_diagnostic(bootstrap: &Bootstrap, event: ProviderDiagnosticKind) {
     let Ok(reference) = DiagnosticRef::new(next_diagnostic_reference()) else {
         return;
     };
@@ -384,48 +385,6 @@ mod tests {
                     .len()
                     <= DIAGNOSTIC_FILE_LIMIT_BYTES)
         );
-
-        std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn diagnostics_dialog_projects_only_safe_fields_and_relative_paths() {
-        use std::os::unix::fs::symlink;
-
-        let data_directory = std::env::temp_dir().join(format!(
-            "agens-diagnostics-dialog-{}-{}",
-            std::process::id(),
-            DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let diagnostics_directory = data_directory.join("diagnostics");
-        std::fs::create_dir_all(&diagnostics_directory)
-            .expect("diagnostics directory should be created");
-        std::fs::write(
-            diagnostics_directory.join("agens-42.jsonl"),
-            concat!(
-                "{\"timestamp_ms\":1,\"reference\":\"abc12345\",\"scope\":\"parent\",",
-                "\"component\":\"responses\",\"event\":\"terminal\",\"attempt\":3,",
-                "\"max_attempts\":3,\"delay_ms\":null,\"status\":429,",
-                "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n"
-            ),
-        )
-        .expect("diagnostic fixture should be written");
-        let outside = data_directory.join("outside.txt");
-        std::fs::write(&outside, "SENTINEL_OUTSIDE").expect("outside fixture should be written");
-        symlink(&outside, diagnostics_directory.join("agens-99.jsonl"))
-            .expect("diagnostic symlink should be created");
-
-        let rendered = format!(
-            "{:?}",
-            crate::tui::dialogs::diagnostics_dialog(&data_directory)
-        );
-
-        assert!(rendered.contains("abc12345"));
-        assert!(rendered.contains("diagnostics/agens-42.jsonl"));
-        assert!(!rendered.contains(&data_directory.display().to_string()));
-        assert!(!rendered.contains("SENTINEL_SECRET"));
-        assert!(!rendered.contains("SENTINEL_OUTSIDE"));
 
         std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
     }
