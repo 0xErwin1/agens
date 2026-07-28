@@ -6,15 +6,16 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use agens_bus::{BridgeCancel, BridgeTx};
 #[cfg(test)]
 use agens_core::HeadlessTurnError;
 use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
+use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 use agens_tools::{
     TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
     TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
 };
-use agens_tui::{BridgeCancel, BridgeTx, TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 
 use crate::Bootstrap;
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
@@ -109,8 +110,8 @@ impl TuiTaskLifecycleBridge {
             *current = Some(lifecycle.clone());
         }
         let presentation = match lifecycle.mode() {
-            TaskLaunchMode::Foreground => agens_tui::TuiExecutionState::ForegroundRunning,
-            TaskLaunchMode::Background => agens_tui::TuiExecutionState::BackgroundRunning,
+            TaskLaunchMode::Foreground => agens_core::TuiExecutionState::ForegroundRunning,
+            TaskLaunchMode::Background => agens_core::TuiExecutionState::BackgroundRunning,
         };
         let agent = request.agent_name().to_owned();
         if let Ok(mut turns) = self.completed_turns.lock() {
@@ -885,7 +886,7 @@ mod tests {
                     1,
                     "reviewer",
                     "review task",
-                    agens_tui::TuiExecutionState::ForegroundRunning,
+                    agens_core::TuiExecutionState::ForegroundRunning,
                 )),
                 TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
                 TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(1, "partial")),
@@ -1137,7 +1138,7 @@ mod tests {
                     1,
                     "reviewer",
                     "review task",
-                    agens_tui::TuiExecutionState::ForegroundRunning,
+                    agens_core::TuiExecutionState::ForegroundRunning,
                 )),
             ];
             if let Some(kind) = expected_kind {

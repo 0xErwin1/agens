@@ -34,6 +34,7 @@ jq -e '
     "agens-server": ["agens-core"],
     "agens": [
       "agens-bootstrap",
+      "agens-bus",
       "agens-config",
       "agens-core",
       "agens-error",

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use crate::bridge::SubagentErrorPresentation;
-use crate::{TuiExecutionState, TuiSubagentEvent, bridge::TuiSubagentUpdate};
-use agens_core::{Message, MessagePart, Role, SubagentStatus, ToolInput};
+use agens_core::{DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput};
+use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 
 /// A source event accepted by the conversation projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,30 +29,6 @@ pub enum ConversationEvent {
         message: String,
         action: String,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DiffLine {
-    pub number: u32,
-    pub kind: DiffLineKind,
-    pub text: String,
-}
-
-impl DiffLine {
-    pub fn new(number: u32, kind: DiffLineKind, text: impl Into<String>) -> Self {
-        Self {
-            number,
-            kind,
-            text: text.into(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiffLineKind {
-    Added,
-    Removed,
-    Context,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

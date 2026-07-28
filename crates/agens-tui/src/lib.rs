@@ -8,14 +8,15 @@ mod terminal;
 mod widgets;
 
 pub use agens_bus::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
-pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
-pub use bridge::{
-    ToolResultState, TuiExecution, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
-    TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, TuiSubagentEvent,
+pub use agens_core::{
+    DiffLine, DiffLineKind, ToolResultState, TuiExecution, TuiExecutionEvent, TuiExecutionState,
+    TuiRuntimeEvent, TuiSubagentEvent,
 };
+pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
+pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 pub use conversation::{
-    ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
-    SubagentCard, ToolBatch, ToolCall, ToolResult,
+    ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
+    ToolCall, ToolResult,
 };
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
@@ -3663,12 +3664,15 @@ where
         {
             execution.last_activity = self.now;
             if execution.terminal_at.is_some()
-                && matches!(&event.update, bridge::TuiSubagentUpdate::Terminal { .. })
+                && matches!(
+                    &event.update,
+                    agens_core::TuiSubagentUpdate::Terminal { .. }
+                )
             {
                 execution.terminal_at = Some(self.now);
             }
         }
-        if let bridge::TuiSubagentUpdate::Started { agent, .. } = &event.update {
+        if let agens_core::TuiSubagentUpdate::Started { agent, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript")
@@ -3681,14 +3685,17 @@ where
             .conversation
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply_child_event(event.clone());
-        if let bridge::TuiSubagentUpdate::ToolResult { call_id, .. } = &event.update {
+        if let agens_core::TuiSubagentUpdate::ToolResult { call_id, .. } = &event.update {
             self.transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript")
                 .tool_display_modes
                 .insert(call_id.clone(), widgets::DisplayMode::Collapsed);
         }
-        if matches!(&event.update, bridge::TuiSubagentUpdate::Terminal { .. }) {
+        if matches!(
+            &event.update,
+            agens_core::TuiSubagentUpdate::Terminal { .. }
+        ) {
             let record = self
                 .transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
@@ -3736,7 +3743,7 @@ where
         if matches!(
             event,
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent {
-                update: bridge::TuiSubagentUpdate::Terminal { .. },
+                update: agens_core::TuiSubagentUpdate::Terminal { .. },
                 ..
             })
         ) {
@@ -4056,7 +4063,7 @@ where
             return false;
         };
         match &event.update {
-            bridge::TuiSubagentUpdate::Started {
+            agens_core::TuiSubagentUpdate::Started {
                 agent,
                 presentation,
                 ..
@@ -4073,15 +4080,15 @@ where
                         )
                     )
             }
-            bridge::TuiSubagentUpdate::Reasoning(_)
-            | bridge::TuiSubagentUpdate::Text(_)
-            | bridge::TuiSubagentUpdate::ToolCall { .. }
-            | bridge::TuiSubagentUpdate::ToolResult { .. }
-            | bridge::TuiSubagentUpdate::Error { .. } => matches!(
+            agens_core::TuiSubagentUpdate::Reasoning(_)
+            | agens_core::TuiSubagentUpdate::Text(_)
+            | agens_core::TuiSubagentUpdate::ToolCall { .. }
+            | agens_core::TuiSubagentUpdate::ToolResult { .. }
+            | agens_core::TuiSubagentUpdate::Error { .. } => matches!(
                 execution.state,
                 TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
             ),
-            bridge::TuiSubagentUpdate::Terminal { status, .. } => {
+            agens_core::TuiSubagentUpdate::Terminal { status, .. } => {
                 status_matches_execution(*status, execution.state)
                     && self.conversation.as_ref().is_some_and(|conversation| {
                         conversation

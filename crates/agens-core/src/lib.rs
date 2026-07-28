@@ -2809,3 +2809,301 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Runtime observation
+//
+// What the runtime reports about its own execution: turns, tool calls, diffs,
+// task and subagent lifecycle. Facts a surface renders and a daemon records, so
+// they are owned by neither. The `Tui` prefix on some names is historical and is
+// renamed separately.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffLine {
+    pub number: u32,
+    pub kind: DiffLineKind,
+    pub text: String,
+}
+
+impl DiffLine {
+    pub fn new(number: u32, kind: DiffLineKind, text: impl Into<String>) -> Self {
+        Self {
+            number,
+            kind,
+            text: text.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffLineKind {
+    Added,
+    Removed,
+    Context,
+}
+
+/// Typed observational data emitted by the CLI runtime for later TUI rendering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiRuntimeEvent {
+    TurnStarted,
+    TurnEnded {
+        status: TurnState,
+        duration: Option<Duration>,
+    },
+    Usage(Usage),
+    ToolStarted {
+        call_id: String,
+        name: String,
+        input: String,
+        parsed: ToolInput,
+    },
+    ToolEnded {
+        call_id: String,
+        duration: Option<Duration>,
+        result: ToolResultState,
+    },
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
+    TaskExecution {
+        agent: String,
+        event: TuiExecutionEvent,
+    },
+    SubagentExecution(TuiSubagentEvent),
+    RestoredCompletedSubagent {
+        id: u64,
+        agent: String,
+        task_summary: String,
+        final_result: String,
+        tool_uses: usize,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiSubagentEvent {
+    pub id: u64,
+    pub update: TuiSubagentUpdate,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TuiSubagentUpdate {
+    Started {
+        agent: String,
+        task_summary: String,
+        presentation: TuiExecutionState,
+    },
+    Reasoning(String),
+    Text(String),
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: String,
+        parsed: ToolInput,
+    },
+    ToolResult {
+        call_id: String,
+        output: String,
+        is_error: bool,
+    },
+    Error {
+        kind: SubagentErrorKind,
+        reference: Option<String>,
+    },
+    Terminal {
+        status: SubagentStatus,
+        final_result: String,
+    },
+}
+
+impl TuiSubagentEvent {
+    pub fn started(
+        id: u64,
+        agent: impl AsRef<str>,
+        task_summary: impl AsRef<str>,
+        presentation: TuiExecutionState,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Started {
+                agent: sanitize_projection(agent.as_ref()),
+                task_summary: sanitize_projection(task_summary.as_ref()),
+                presentation,
+            },
+        }
+    }
+    /// Records a child tool call with an unknown/default `parsed` payload.
+    ///
+    /// Prefer [`Self::tool_call_with_parsed`] when an accurate typed input is
+    /// available at the call site; this constructor exists for callers that
+    /// only need the raw name/input (e.g. most tests).
+    pub fn tool_call(
+        id: u64,
+        call_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+        input: impl AsRef<str>,
+    ) -> Self {
+        let name = name.as_ref();
+        let input = input.as_ref();
+        Self::tool_call_with_parsed(
+            id,
+            call_id,
+            name,
+            input,
+            ToolInput::Other {
+                name: name.to_owned(),
+                raw: input.to_owned(),
+            },
+        )
+    }
+
+    /// Records a child tool call with a caller-supplied typed `parsed` input.
+    pub fn tool_call_with_parsed(
+        id: u64,
+        call_id: impl AsRef<str>,
+        name: impl AsRef<str>,
+        input: impl AsRef<str>,
+        parsed: ToolInput,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::ToolCall {
+                call_id: sanitize_projection(call_id.as_ref()),
+                name: sanitize_projection(name.as_ref()),
+                input: sanitize_projection(input.as_ref()),
+                parsed,
+            },
+        }
+    }
+
+    pub fn reasoning(id: u64, delta: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Reasoning(sanitize_projection(delta.as_ref())),
+        }
+    }
+
+    pub fn text(id: u64, delta: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Text(sanitize_projection(delta.as_ref())),
+        }
+    }
+    pub fn tool_result(
+        id: u64,
+        call_id: impl AsRef<str>,
+        output: impl AsRef<str>,
+        is_error: bool,
+    ) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::ToolResult {
+                call_id: sanitize_projection(call_id.as_ref()),
+                output: sanitize_projection(output.as_ref()),
+                is_error,
+            },
+        }
+    }
+
+    pub fn error(id: u64, kind: SubagentErrorKind) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Error {
+                kind,
+                reference: None,
+            },
+        }
+    }
+
+    pub fn error_with_reference(
+        id: u64,
+        kind: SubagentErrorKind,
+        reference: impl AsRef<str>,
+    ) -> Self {
+        let reference = reference.as_ref();
+        let reference = (reference.len() == 8
+            && reference
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then(|| reference.to_owned());
+        Self {
+            id,
+            update: TuiSubagentUpdate::Error { kind, reference },
+        }
+    }
+
+    pub fn terminal(id: u64, status: SubagentStatus, final_result: impl AsRef<str>) -> Self {
+        Self {
+            id,
+            update: TuiSubagentUpdate::Terminal {
+                status,
+                final_result: sanitize_projection(final_result.as_ref()),
+            },
+        }
+    }
+}
+
+fn sanitize_projection(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "prompt:",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        "[redacted]".into()
+    } else {
+        value.chars().take(256).collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiExecutionEvent {
+    ForegroundStarted { id: u64 },
+    BackgroundStarted { id: u64 },
+    Backgrounded { id: u64 },
+    Completed { id: u64 },
+    Failed { id: u64 },
+    Cancelled { id: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiExecutionState {
+    ForegroundRunning,
+    BackgroundRunning,
+    CompletedRecent,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TuiExecution {
+    pub id: u64,
+    pub agent: String,
+    pub state: TuiExecutionState,
+    pub started_at: Duration,
+    pub last_activity: Duration,
+    pub terminal_at: Option<Duration>,
+}
+
+impl TuiExecution {
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub const fn state(&self) -> TuiExecutionState {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolResultState {
+    Success,
+    Failure,
+}

@@ -21,6 +21,7 @@ path = "../agens-tools/src/bin/fake-mcp-child.rs"
 agens-config = { path = "../agens-config" }
 agens-core = { path = "../agens-core" }
 agens-bootstrap = { path = "../agens-bootstrap" }
+agens-bus = { path = "../agens-bus" }
 agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
 agens-permissions = { path = "../agens-permissions" }

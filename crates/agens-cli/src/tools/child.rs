@@ -418,8 +418,8 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
 
 #[cfg(test)]
 mod tests {
+    use agens_bus::BridgeTx;
     use agens_tools::TaskLaunchMode;
-    use agens_tui::BridgeTx;
 
     use super::*;
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
