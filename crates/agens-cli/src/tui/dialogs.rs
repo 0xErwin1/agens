@@ -195,12 +195,12 @@ mod tests {
     };
     use agens_tui::Tui;
 
+    use crate::session::context::SessionContext;
     use crate::test_support::{
         render_tui_test_backend, tui_session_bootstrap, tui_session_directory,
     };
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::router::TuiRuntimeRouter;
-    use crate::tui::session::TuiSessionContext;
 
     #[test]
     fn tui_mcp_overlay_is_local_safe_refreshable_and_includes_disabled_servers() {
@@ -237,7 +237,7 @@ mod tests {
                 timeout_ms: 500,
             },
         ];
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),

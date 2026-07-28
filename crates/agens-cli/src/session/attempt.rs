@@ -412,9 +412,9 @@ mod tests {
         HeadlessChatFailure, RequestedSubagent, interrupted_turn_note, provider_messages,
         record_requested_subagent,
     };
+    use crate::session::context::SessionContext;
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tui::router::tui_provider_outcome;
-    use crate::tui::session::TuiSessionContext;
     use crate::tui::turn::complete_tui_turn;
     use crate::turns::completed_session_turn;
 
@@ -675,7 +675,7 @@ mod tests {
         let partial = partial.expect("an interrupted attempt carries its persisted turn");
         assert!(!format!("{partial:?}").contains("launch the explorer subagent"));
 
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
         assert!(
             complete_tui_turn(
                 &mut context,

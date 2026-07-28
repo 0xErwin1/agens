@@ -1,63 +1,10 @@
 use agens_core::{AgentDefinition, AttemptKey, Message, SessionAttemptStatus, SessionMetadata};
 use agens_store::{SessionStore, StoredSession};
-use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
+use agens_tools::{AgentModelValidator, ToolDispatcher};
 use agens_tui::{Conversation, DialogEntry, DialogView};
 
 use crate::headless::HeadlessChatRequest;
-use crate::model_registry::TuiModelSelector;
-use crate::tui::provider::TuiProvider;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TuiSessionContext {
-    pub(crate) identifier: Option<i64>,
-    pub(crate) metadata: Option<SessionMetadata>,
-    /// The confinement root recorded on a resumed session, read back from its own persisted
-    /// `confinement_root` rather than re-derived from the current process's working directory.
-    /// `None` for a session that has not been created yet; see
-    /// [`crate::session_root::resolve_tui_session_root`] for the fallback that applies then.
-    pub(crate) confinement_root: Option<std::path::PathBuf>,
-    pub(crate) messages: Vec<Message>,
-    pub(crate) restored_history: Vec<Conversation>,
-    pub(crate) active_agent: Option<ActiveAgentRuntime>,
-    pub(crate) pending_system_reminder: Option<String>,
-    pub(crate) selection: Option<TuiModelSelector>,
-    pub(crate) provider: Option<TuiProvider>,
-    pub(crate) chatgpt_unavailable: bool,
-    pub(crate) resume_error: Option<String>,
-    pub(crate) resume_notice: Option<String>,
-    pub(crate) agent_correction_pending: bool,
-    pub(crate) resume_draft: Option<ResumeDraft>,
-    pub(crate) selected_subagent: Option<String>,
-    pub(crate) dangerous_mode: bool,
-    pub(crate) running: bool,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ResumeDraft(String);
-
-impl ResumeDraft {
-    pub(crate) fn new(prompt: String) -> Self {
-        Self(prompt)
-    }
-
-    pub(crate) fn into_inner(self) -> String {
-        self.0
-    }
-}
-
-impl std::ops::Deref for ResumeDraft {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for ResumeDraft {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ResumeDraft([REDACTED])")
-    }
-}
+use crate::session::context::{ActiveAgentRuntime, SessionContext};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedSubagentTurn {
@@ -74,50 +21,14 @@ pub(crate) enum TuiSessionMutationError {
 }
 
 pub(crate) fn reset_tui_session(
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
 ) -> Result<(), TuiSessionMutationError> {
     if context.running {
         return Err(TuiSessionMutationError::Busy);
     }
 
-    *context = TuiSessionContext::fresh();
+    *context = SessionContext::fresh();
     Ok(())
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ActiveAgentRuntime {
-    pub(crate) name: String,
-    pub(crate) model: Option<String>,
-    pub(crate) system_prompt: String,
-    pub(crate) capabilities: EffectiveCapabilitySet,
-}
-impl ActiveAgentRuntime {
-    pub(crate) fn build(
-        agent: &AgentDefinition,
-        inherited_model: Option<&str>,
-        project: &str,
-        dispatcher: &ToolDispatcher,
-        validator: &dyn AgentModelValidator,
-    ) -> Result<Self, AgentRotationError> {
-        if agent
-            .model
-            .as_deref()
-            .is_some_and(|model| validator.validate_model(model).is_err())
-        {
-            return Err(AgentRotationError::ModelUnavailable);
-        }
-        let model = agent
-            .model
-            .as_deref()
-            .or(inherited_model)
-            .map(str::to_owned);
-        Ok(Self {
-            name: agent.name.clone(),
-            model,
-            system_prompt: agent.system_prompt.clone(),
-            capabilities: EffectiveCapabilitySet::from_agent(agent, project, dispatcher),
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,7 +38,7 @@ pub(crate) enum AgentRotationError {
     Persistence,
 }
 pub(crate) fn rotate_active_agent(
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
     candidate: &AgentDefinition,
     inherited_model: Option<&str>,
     project: &str,
@@ -345,7 +256,7 @@ pub(crate) fn session_relative_age(updated_at: i64, now: i64) -> String {
     }
 }
 
-impl TuiSessionContext {
+impl SessionContext {
     pub(crate) fn fresh() -> Self {
         Self::default()
     }
@@ -506,9 +417,9 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let session = TuiSessionContext {
+        let session = SessionContext {
             active_agent: Some(active),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         };
 
         registry
@@ -582,7 +493,7 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let mut context = TuiSessionContext::resumed(
+        let mut context = SessionContext::resumed(
             1,
             metadata.clone(),
             Vec::new(),
@@ -767,7 +678,7 @@ mod tests {
         );
         assert!(context.pending_system_reminder.is_none());
 
-        let mut no_expansion = TuiSessionContext::resumed(
+        let mut no_expansion = SessionContext::resumed(
             1,
             reopened.metadata,
             reopened.messages,
@@ -792,7 +703,7 @@ mod tests {
 
     #[test]
     fn tui_session_reset_refuses_running_mutation_without_state_change() {
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
         context.identifier = Some(7);
         context.running = true;
         let original = context.clone();
@@ -806,7 +717,7 @@ mod tests {
 
     #[test]
     fn tui_session_reset_clears_resumed_state_when_idle() {
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
         context.identifier = Some(7);
         context.metadata = Some(SessionMetadata {
             id: 7,
@@ -829,7 +740,7 @@ mod tests {
 
         reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
 
-        assert_eq!(context, TuiSessionContext::fresh());
+        assert_eq!(context, SessionContext::fresh());
     }
 
     #[test]
@@ -893,7 +804,7 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let request = TuiSessionContext::resumed(
+        let request = SessionContext::resumed(
             7,
             metadata,
             messages.clone(),
@@ -926,7 +837,7 @@ mod tests {
 
     #[test]
     fn fresh_tui_session_does_not_reuse_prior_context() {
-        let request = TuiSessionContext::fresh().apply_to(HeadlessChatRequest {
+        let request = SessionContext::fresh().apply_to(HeadlessChatRequest {
             prompt: "new question".into(),
             history: Vec::new(),
             model: None,

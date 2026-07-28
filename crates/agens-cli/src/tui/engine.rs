@@ -25,6 +25,7 @@ use crate::headless::{
     run_production_headless_chat_with_progress,
 };
 use crate::permissions::prompt::production_tui_permission_bridge;
+use crate::session::context::{ResumeDraft, SessionContext};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
@@ -40,7 +41,6 @@ use crate::tui::resume::{
     ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
 };
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
-use crate::tui::session::{ResumeDraft, TuiSessionContext};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
 
 pub(crate) struct ProductionTuiEngine {
@@ -62,7 +62,7 @@ pub(crate) fn run_production_tui(
     resume: Option<i64>,
 ) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
-    let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
     let task_controls = TuiTaskControls(TaskExecutionRegistry::with_limits(task_execution_limits(
         bootstrap.subagent_limits(),
     )));
@@ -320,7 +320,7 @@ pub(crate) fn run_tui_prompt(
     bootstrap: &Bootstrap,
     prompt: &str,
     cancellation: &HeadlessTurnCancellation,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     progress: Option<&TurnProgressSink>,
 ) -> Result<String, CliError> {
     match prompt.trim() {
@@ -368,7 +368,7 @@ pub(crate) fn run_tui_prompt(
 pub(crate) fn run_tui_prompt_with(
     bootstrap: &Bootstrap,
     prompt: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     skills: Option<Arc<SkillCatalog>>,
     run: impl FnOnce(HeadlessChatRequest) -> Result<HeadlessChatCompletion, HeadlessChatFailure>,
 ) -> Result<String, CliError> {
@@ -428,7 +428,7 @@ pub(crate) fn run_tui_prompt_with(
 /// `agent.system_prompt` — see [`crate::session_config::SessionConfig`] for why the process root
 /// is the wrong source once a session can be resumed into a different root.
 fn tui_turn_system_prompt(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Option<String>, CliError> {
     let root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
@@ -495,12 +495,12 @@ mod tests {
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
     use crate::model_registry::TuiModelSelector;
+    use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
         tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
     };
     use crate::tui::agents::BundledModelValidator;
-    use crate::tui::session::ActiveAgentRuntime;
 
     #[test]
     fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()
@@ -611,9 +611,9 @@ mod tests {
         ))
         .unwrap();
 
-        let context = TuiSessionContext {
+        let context = SessionContext {
             confinement_root: Some(root_a.clone()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         };
 
         let prompt = tui_turn_system_prompt(&context, &bootstrap_from_root_b).unwrap();
@@ -675,7 +675,7 @@ mod tests {
         persist_tui_session(&mut store, &other_project, "other");
         let saved_sessions = store.list_sessions().unwrap();
         drop(store);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let original = session.lock().unwrap().clone();
 
         // Session 1 belongs to a different project than `bootstrap`'s own; it must still
@@ -735,7 +735,7 @@ mod tests {
             )
             .unwrap();
         drop(legacy_store);
-        let legacy_session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let legacy_session = Arc::new(Mutex::new(SessionContext::fresh()));
         let legacy_original = legacy_session.lock().unwrap().clone();
         assert_eq!(
             run_tui_prompt(
@@ -765,11 +765,11 @@ mod tests {
                 "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             identifier: Some(7),
             selected_subagent: Some("reviewer".into()),
             running: true,
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let original = session.lock().unwrap().clone();
 
@@ -802,7 +802,7 @@ mod tests {
                 "---\nname: all\ndescription: all\nmode: all\npermissions: []\n---\nAll work.\n",
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
 
         assert_eq!(
             run_tui_prompt(
@@ -838,7 +838,7 @@ mod tests {
                 "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         ensure_active_tui_agent_runtime(
             &bootstrap,
             &session,
@@ -887,7 +887,7 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             identifier: Some(7),
             metadata: Some(SessionMetadata {
                 id: 7,
@@ -907,7 +907,7 @@ mod tests {
             pending_system_reminder: Some("previous reminder".into()),
             selection: Some(TuiModelSelector::new("gpt-4.1")),
             selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
 
         assert_eq!(
@@ -921,7 +921,7 @@ mod tests {
             .unwrap(),
             "Started a new session."
         );
-        assert_eq!(*session.lock().unwrap(), TuiSessionContext::fresh());
+        assert_eq!(*session.lock().unwrap(), SessionContext::fresh());
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -940,13 +940,13 @@ mod tests {
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
         let saved_sessions = store.list_sessions().unwrap();
         drop(store);
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             identifier: Some(metadata.id),
             metadata: Some(metadata),
             messages: tui_session_messages(),
             selected_subagent: Some("reviewer".into()),
             running: true,
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let original = session.lock().unwrap().clone();
 
@@ -1095,7 +1095,7 @@ mod tests {
             )]),
         );
         let bootstrap = bootstrap(&dependencies).expect("production bootstrap should be valid");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = HeadlessTurnCancellation::new();
 
         let previous_model = if provider_type == "openai-chatgpt" {

@@ -12,15 +12,15 @@ use crate::error::CliError;
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::model_registry;
 use crate::model_registry::TuiModelSelector;
+use crate::session::context::SessionContext;
 use crate::tools::task::default_model;
 use crate::tui::provider::TuiProvider;
-use crate::tui::session::TuiSessionContext;
 use crate::tui_model_source;
 use crate::turns::SUBAGENT_CALL_ID_PREFIX;
 use agens_tui::TuiPresentation;
 
 pub(crate) fn complete_tui_turn(
-    session: &mut TuiSessionContext,
+    session: &mut SessionContext,
     completion: Result<HeadlessChatCompletion, HeadlessChatFailure>,
     consumed_reminder: bool,
 ) -> Result<String, CliError> {
@@ -48,7 +48,7 @@ pub(crate) fn complete_tui_turn(
 /// A background subagent turn can be persisted after the foreground turn reloaded the session, so
 /// adopting the turn's history alone would drop that turn from the in-process request history for
 /// the rest of the process even though the store keeps it.
-pub(crate) fn adopt_turn_history(session: &mut TuiSessionContext, history: Vec<Message>) {
+pub(crate) fn adopt_turn_history(session: &mut SessionContext, history: Vec<Message>) {
     let preserved = missing_subagent_turns(&session.messages, &history);
     session.messages = history;
     session.messages.extend(preserved);
@@ -92,7 +92,7 @@ pub(crate) fn subagent_call_id(part: &MessagePart) -> Option<&str> {
 
 pub(crate) fn current_tui_provider(
     bootstrap: &Bootstrap,
-    context: &TuiSessionContext,
+    context: &SessionContext,
 ) -> Option<TuiProvider> {
     if context.chatgpt_unavailable {
         return None;
@@ -111,7 +111,7 @@ pub(crate) fn current_tui_provider(
         .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
 }
 
-pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &TuiSessionContext) -> String {
+pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &SessionContext) -> String {
     context
         .selection
         .as_ref()
@@ -129,7 +129,7 @@ pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &TuiSessionCon
 
 pub(crate) fn tui_session_presentation(
     bootstrap: &Bootstrap,
-    session: &TuiSessionContext,
+    session: &SessionContext,
 ) -> TuiPresentation {
     let model = effective_tui_model(bootstrap, session);
     let provider = session
@@ -190,7 +190,7 @@ mod tests {
             completed_turn_count: 2,
             resumable: true,
         };
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
         context.pending_system_reminder = Some("reminder".into());
 
         assert_eq!(
@@ -253,10 +253,10 @@ mod tests {
                 parts: vec![MessagePart::Text("summary".into())],
             },
         ];
-        let mut session = TuiSessionContext {
+        let mut session = SessionContext {
             identifier: Some(7),
             messages: subagent_turn.clone(),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         };
         let completion = HeadlessChatCompletion {
             text: "summary".into(),
@@ -296,7 +296,7 @@ mod tests {
         });
         known_tui.apply_presentation(tui_session_presentation(
             &known_bootstrap,
-            &TuiSessionContext::fresh(),
+            &SessionContext::fresh(),
         ));
         configure_tui_project_identity(&mut known_tui, &known_bootstrap);
         let known = render_tui_test_backend(&known_tui, 140, 14);
@@ -315,7 +315,7 @@ mod tests {
         });
         unknown_tui.apply_presentation(tui_session_presentation(
             &unknown_bootstrap,
-            &TuiSessionContext::fresh(),
+            &SessionContext::fresh(),
         ));
         let unknown = render_tui_test_backend(&unknown_tui, 140, 14);
 

@@ -29,6 +29,7 @@ use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::TuiModelSelector;
 use crate::session::attempt::active_session_attempts;
+use crate::session::context::SessionContext;
 use crate::tools::task::default_model;
 use crate::tui::agents::{
     persist_pending_agent_correction, rotate_tui_agent, select_tui_subagent,
@@ -53,8 +54,8 @@ use crate::tui::resume::{
     resume_tui_session, tui_project_identifier,
 };
 use crate::tui::session::{
-    TuiSessionContext, current_session_timestamp, parse_recovery_action,
-    recovery_confirmation_dialog, reset_tui_session, session_dialog_entry,
+    current_session_timestamp, parse_recovery_action, recovery_confirmation_dialog,
+    reset_tui_session, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
 
@@ -63,7 +64,7 @@ pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condit
 #[derive(Clone)]
 pub(crate) struct TuiRuntimeRouter {
     bootstrap: Arc<Mutex<Bootstrap>>,
-    pub(crate) session: Arc<Mutex<TuiSessionContext>>,
+    pub(crate) session: Arc<Mutex<SessionContext>>,
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
     credentials: TuiCredentialResolver,
@@ -89,7 +90,7 @@ type CredentialRestorer =
 impl TuiRuntimeRouter {
     pub(crate) fn new(
         bootstrap: Bootstrap,
-        session: Arc<Mutex<TuiSessionContext>>,
+        session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
         skills: Arc<SkillCatalog>,
@@ -106,7 +107,7 @@ impl TuiRuntimeRouter {
 
     pub(crate) fn with_auth_coordinator(
         mut bootstrap: Bootstrap,
-        session: Arc<Mutex<TuiSessionContext>>,
+        session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
         skills: Arc<SkillCatalog>,
@@ -160,7 +161,7 @@ impl TuiRuntimeRouter {
     #[cfg(test)]
     pub(crate) fn with_credential_resolver(
         bootstrap: Bootstrap,
-        session: Arc<Mutex<TuiSessionContext>>,
+        session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
         skills: Arc<SkillCatalog>,
@@ -174,7 +175,7 @@ impl TuiRuntimeRouter {
     #[cfg(test)]
     pub(crate) fn with_clock(
         bootstrap: Bootstrap,
-        session: Arc<Mutex<TuiSessionContext>>,
+        session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
         skills: Arc<SkillCatalog>,
@@ -740,7 +741,7 @@ impl TuiRuntimeRouter {
     /// every resume that lands in the live session slot, or the catalogs captured once at startup
     /// keep feeding a DIFFERENT root's skill bodies and command templates into every later turn as
     /// model-facing instruction text.
-    fn refresh_session_extensions(&self, bootstrap: &Bootstrap, context: &TuiSessionContext) {
+    fn refresh_session_extensions(&self, bootstrap: &Bootstrap, context: &SessionContext) {
         let Ok(project_root) = crate::session_root::resolve_tui_session_root(context, bootstrap)
         else {
             return;
@@ -772,7 +773,7 @@ impl TuiRuntimeRouter {
     fn on_session_resume_committed(
         &self,
         bootstrap: &Bootstrap,
-        context: &TuiSessionContext,
+        context: &SessionContext,
     ) -> (Vec<String>, Vec<PaletteEntry>) {
         self.refresh_session_extensions(bootstrap, context);
         let file_candidates = tui_picker_file_candidates(context, bootstrap).unwrap_or_default();
@@ -1306,7 +1307,7 @@ mod tests {
             &startup_skills,
             false,
         ));
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             resume_bootstrap,
             session,
@@ -1521,7 +1522,7 @@ mod tests {
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "current");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),
@@ -1560,7 +1561,7 @@ mod tests {
     fn tui_model_effort_and_help_palette_routes_open_local_overlays_and_dispatch_once() {
         let temporary = tui_session_directory("local-overlays");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -1645,7 +1646,7 @@ mod tests {
                 Ok(test_chatgpt_credentials("new-access"))
             }
         });
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -1708,7 +1709,7 @@ mod tests {
                 Ok(test_chatgpt_credentials("new-access"))
             }
         });
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::with_auth_coordinator(
             bootstrap,
             Arc::clone(&session),
@@ -1759,9 +1760,9 @@ mod tests {
         bootstrap.provider_source = ProviderSource::Auto;
         bootstrap.provider_type = Some("openai-api".into());
         bootstrap.openai_api_key = Some("preserved".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             running: true,
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let original_runtime = session.lock().unwrap().clone();
         let router = TuiRuntimeRouter::with_auth_coordinator(
@@ -1814,9 +1815,9 @@ mod tests {
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.provider_source = ProviderSource::ExplicitChatGpt;
         bootstrap.provider_type = Some("openai-chatgpt".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             provider: Some(TuiProvider::OpenAiChatGpt),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         ensure_active_tui_agent_runtime(
             &bootstrap,
@@ -1868,9 +1869,9 @@ mod tests {
         bootstrap.provider_source = ProviderSource::Auto;
         bootstrap.provider_type = Some("openai-api".into());
         bootstrap.openai_api_key = Some("preserved".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             running: true,
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let router = TuiRuntimeRouter::with_auth_coordinator(
             bootstrap,
@@ -1904,9 +1905,9 @@ mod tests {
         std::fs::create_dir_all(&config_home).unwrap();
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.paths.credentials = config_home.clone();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             provider: Some(TuiProvider::OpenAiApi),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let original_runtime = session.lock().unwrap().clone();
         let router = TuiRuntimeRouter::with_auth_coordinator(
@@ -1952,9 +1953,9 @@ mod tests {
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.provider_source = ProviderSource::Auto;
         bootstrap.provider_type = Some("openai-chatgpt".into());
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             provider: Some(TuiProvider::OpenAiChatGpt),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let router = TuiRuntimeRouter::new(
             bootstrap,
@@ -1979,7 +1980,7 @@ mod tests {
     fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
         let temporary = tui_session_directory("dangerous-mode");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             bootstrap.clone(),
             Arc::clone(&session),
@@ -2071,7 +2072,7 @@ mod tests {
                 ),
             ],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),
@@ -2137,7 +2138,7 @@ mod tests {
             "unavailable-provider",
             "gpt-4.1",
         );
-        let unavailable_session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let unavailable_session = Arc::new(Mutex::new(SessionContext::fresh()));
         let unavailable_router = TuiRuntimeRouter::new(
             unavailable_bootstrap.clone(),
             Arc::clone(&unavailable_session),
@@ -2214,9 +2215,9 @@ mod tests {
     fn plural_subagents_command_opens_the_transcript_picker_without_changing_next_type() {
         let temporary = tui_session_directory("plural-subagents");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("explore".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let router = TuiRuntimeRouter::new(
             bootstrap,
@@ -2252,7 +2253,7 @@ mod tests {
             let temporary = tui_session_directory(&format!("model-source-{provider}"));
             let bootstrap =
                 tui_session_bootstrap_for_provider(&temporary, &[], provider, "gpt-5.5");
-            let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+            let session = Arc::new(Mutex::new(SessionContext::fresh()));
             let cancellation = Arc::new(Mutex::new(None));
             let mut tui = Tui::new(ProductionTuiEngine {
                 cancellation: Arc::clone(&cancellation),
@@ -2417,7 +2418,7 @@ mod tests {
             r#"{"openai-chatgpt":{"access_token":"secret-access","refresh_token":"secret-refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::with_credential_resolver(
             bootstrap,
             Arc::clone(&session),
@@ -2466,7 +2467,7 @@ mod tests {
             r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::with_credential_resolver(
             bootstrap,
             Arc::clone(&session),
@@ -2517,7 +2518,7 @@ mod tests {
             let environment = Arc::clone(&environment);
             move || environment.lock().unwrap().clone()
         });
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::with_credential_resolver(
             bootstrap,
             Arc::clone(&session),
@@ -2580,7 +2581,7 @@ mod tests {
         let temporary = tui_session_directory("unverified-model");
         let bootstrap =
             tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -2650,7 +2651,7 @@ mod tests {
         let temporary = tui_session_directory("effort-capabilities");
         let bootstrap =
             tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -2714,7 +2715,7 @@ mod tests {
                 ),
             ],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -2780,7 +2781,7 @@ mod tests {
     fn dialog_recovery_is_confirmed_private_local_safe_and_retryable() {
         let temporary = tui_session_directory("recovery-dialog");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let router = TuiRuntimeRouter::new(
             bootstrap.clone(),
@@ -2942,9 +2943,9 @@ mod tests {
         store.update_session_selection(&current).unwrap();
         drop(store);
 
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             identifier: Some(current.id),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
@@ -3071,7 +3072,7 @@ mod tests {
         let restored_messages = store.load_session_for_resume(restored.id).unwrap().messages;
         drop(store);
 
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -3322,7 +3323,7 @@ mod tests {
         std::fs::write(project.join("large.txt"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
         std::fs::write(&outside, "outside").unwrap();
         symlink(&outside, project.join("escape.txt")).unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let router = TuiRuntimeRouter::new(
             bootstrap,
             Arc::clone(&session),

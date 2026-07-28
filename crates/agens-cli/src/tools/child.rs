@@ -422,10 +422,11 @@ mod tests {
     use super::*;
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
     use crate::permissions::prompt::production_tui_permission_bridge;
+    use crate::session::context::SessionContext;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime_with_runner;
-    use crate::tui::session::{TuiSessionContext, current_session_timestamp};
+    use crate::tui::session::current_session_timestamp;
 
     struct RecordingMailboxProvider {
         queued: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -586,9 +587,9 @@ mod tests {
         );
         let (events, _receiver) = BridgeTx::bounded(16);
         let controls = TuiTaskControls::default();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
             .with_session_writer(bootstrap.clone(), Arc::clone(&session));

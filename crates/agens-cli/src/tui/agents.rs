@@ -16,20 +16,19 @@ use crate::bootstrap::Bootstrap;
 use crate::diagnostics::record_agent_diagnostic;
 use crate::error::CliError;
 use crate::model_registry::{TuiModelSelector, TuiModelSource};
+use crate::session::context::SessionContext;
 use crate::tools::runtime::production_tool_runtime;
 use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::provider::TuiProvider;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
-use crate::tui::session::{
-    AgentRotationError, TuiSessionContext, current_session_timestamp, rotate_active_agent,
-};
+use crate::tui::session::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use crate::tui::turn::effective_tui_model;
 
 pub(crate) fn rotate_tui_agent(
     bootstrap: &Bootstrap,
     name: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     skills: &SkillCatalog,
 ) -> Result<String, CliError> {
     let (validator, project_root) = {
@@ -88,7 +87,7 @@ pub(crate) fn rotate_tui_agent(
 #[cfg(test)]
 pub(crate) fn list_tui_agents(
     bootstrap: &Bootstrap,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     mode: agens_core::AgentMode,
 ) -> Result<String, CliError> {
     let context = session
@@ -134,7 +133,7 @@ pub(crate) fn list_tui_agents(
 pub(crate) fn select_tui_subagent(
     bootstrap: &Bootstrap,
     name: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let snapshot = session
         .lock()
@@ -160,7 +159,7 @@ pub(crate) fn select_tui_subagent(
 
 pub(crate) fn tui_subagent_catalog(
     bootstrap: &Bootstrap,
-    context: &TuiSessionContext,
+    context: &SessionContext,
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
     if bootstrap
         .provider_type()
@@ -191,7 +190,7 @@ pub(crate) fn tui_agent_catalog(
 /// project-local `agents/` directory rather than the resuming process's.
 pub(crate) fn tui_agent_catalog_for_context(
     bootstrap: &Bootstrap,
-    context: &TuiSessionContext,
+    context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
     let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
     let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
@@ -287,7 +286,7 @@ impl TuiAgentModelValidator {
 
     pub(crate) fn for_context(
         bootstrap: &Bootstrap,
-        context: &TuiSessionContext,
+        context: &SessionContext,
     ) -> Result<Self, CliError> {
         Self::for_source(tui_model_source(bootstrap, context))
     }
@@ -405,10 +404,7 @@ pub(crate) fn persisted_agent_resolution_error(error: PersistedAgentResolutionEr
 /// A resumed session keeps the agent it was persisted with; a fresh one starts
 /// from the configured default. An unresolvable name is not fatal here: it
 /// falls through the same recovery path a stale persisted agent takes.
-pub(crate) fn initial_active_agent_name(
-    context: &TuiSessionContext,
-    bootstrap: &Bootstrap,
-) -> String {
+pub(crate) fn initial_active_agent_name(context: &SessionContext, bootstrap: &Bootstrap) -> String {
     context
         .metadata
         .as_ref()
@@ -419,7 +415,7 @@ pub(crate) fn initial_active_agent_name(
 
 pub(crate) fn reconcile_persisted_active_agent(
     bootstrap: &Bootstrap,
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
 ) -> Result<AgentDefinition, CliError> {
     let name = initial_active_agent_name(context, bootstrap);
     let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
@@ -451,7 +447,7 @@ pub(crate) fn reconcile_persisted_active_agent(
 
 pub(crate) fn persist_pending_agent_correction(
     bootstrap: &Bootstrap,
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
 ) {
     if !context.agent_correction_pending {
         return;
@@ -693,7 +689,7 @@ mod tests {
                 ),
             ],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
 
         assert_eq!(
             list_tui_agents(&bootstrap, &session, AgentMode::Primary).unwrap(),
@@ -723,7 +719,7 @@ mod tests {
             None,
         );
         let unconfigured = bootstrap_from_configuration("config-no-default-agent", None, None);
-        let fresh = TuiSessionContext::fresh();
+        let fresh = SessionContext::fresh();
 
         assert_eq!(initial_active_agent_name(&fresh, &configured), "reviewer");
         assert_eq!(initial_active_agent_name(&fresh, &unconfigured), "primary");
@@ -749,7 +745,7 @@ mod tests {
             completed_turn_count: 0,
             resumable: true,
         };
-        let resumed = TuiSessionContext::restored(
+        let resumed = SessionContext::restored(
             7,
             metadata,
             Vec::new(),

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
-use crate::tui::session::TuiSessionContext;
+use crate::session::context::SessionContext;
 
 /// The literal filesystem root a session's native tools must be confined to.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +54,7 @@ impl SessionRoot {
 /// value recorded on the session when it was loaded, or the process's own discovered root for a
 /// session that has not been created yet.
 pub(crate) fn resolve_tui_session_root(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<PathBuf, CliError> {
     context

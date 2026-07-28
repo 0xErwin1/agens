@@ -2,8 +2,8 @@ use agens_tools::ReadFileInput;
 
 use crate::bootstrap::Bootstrap;
 use crate::error::{CliError, ExitStatus};
+use crate::session::context::SessionContext;
 use crate::tools::runtime::open_native_tools;
-use crate::tui::session::TuiSessionContext;
 
 const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// Hard cap on `@` picker entries: enumeration is one bounded walk of the
@@ -12,14 +12,14 @@ const TUI_SELECT_FILE_LIMIT: usize = 100;
 const TUI_PICKER_FILE_LIMIT: usize = 2_000;
 
 pub(crate) fn tui_file_candidates(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
     tui_file_candidates_with_limit(context, bootstrap, TUI_SELECT_FILE_LIMIT)
 }
 
 pub(crate) fn tui_picker_file_candidates(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
     tui_file_candidates_with_limit(context, bootstrap, TUI_PICKER_FILE_LIMIT)
@@ -34,7 +34,7 @@ pub(crate) fn tui_picker_file_candidates(
 /// resumed session confined to a different root than the resuming process's working directory
 /// would leak that other root's file listing.
 pub(crate) fn tui_file_candidates_with_limit(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
     limit: usize,
 ) -> Result<Vec<String>, CliError> {
@@ -45,7 +45,7 @@ pub(crate) fn tui_file_candidates_with_limit(
 }
 
 pub(crate) fn selected_tui_file(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
     selection: &str,
 ) -> Result<String, CliError> {
@@ -60,7 +60,7 @@ pub(crate) fn selected_tui_file(
 }
 
 pub(crate) fn tui_select_candidates(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
     Ok(tui_file_candidates(context, bootstrap)?
@@ -74,7 +74,7 @@ pub(crate) fn tui_select_candidates(
 /// documentation for why the session's own recorded root must be used instead of re-deriving the
 /// process's discovered root.
 pub(crate) fn expand_tui_file_reference(
-    context: &TuiSessionContext,
+    context: &SessionContext,
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<String, CliError> {
@@ -172,7 +172,7 @@ mod tests {
     fn tui_file_candidates_and_expansion_use_confined_reads() {
         let temporary = tui_session_directory("files");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let context = TuiSessionContext::fresh();
+        let context = SessionContext::fresh();
         let project = temporary.join("project");
         std::fs::write(project.join("zeta.txt"), "zeta").unwrap();
         std::fs::write(project.join("alpha.txt"), "alpha").unwrap();
@@ -207,7 +207,7 @@ mod tests {
     fn the_file_picker_inserts_a_relative_path_the_confined_expansion_resolves() {
         let temporary = tui_session_directory("picker");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let context = TuiSessionContext::fresh();
+        let context = SessionContext::fresh();
         let project = temporary.join("project");
         std::fs::create_dir_all(project.join("nested/deep")).unwrap();
         std::fs::write(project.join("nested/deep/alpha.txt"), "alpha").unwrap();
@@ -247,7 +247,7 @@ mod tests {
     fn picker_candidates_stay_capped_and_confined_to_the_project_root() {
         let temporary = tui_session_directory("picker-cap");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let context = TuiSessionContext::fresh();
+        let context = SessionContext::fresh();
         let project = temporary.join("project");
         std::fs::write(temporary.join("outside.txt"), "outside").unwrap();
         #[cfg(unix)]

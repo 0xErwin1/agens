@@ -21,9 +21,9 @@ use crate::permissions::{
     AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, SharedToolDispatcher,
 };
+use crate::session::context::SessionContext;
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
-use crate::tui::session::TuiSessionContext;
 
 pub(crate) struct RegisteredNativeTool {
     pub(crate) name: String,
@@ -268,7 +268,7 @@ impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
 
 pub(crate) fn launch_selected_tui_task(
     runtime: &mut ProductionTuiTaskRuntime,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     description: &str,
     background: bool,
     cancellation: &HeadlessTurnCancellation,
@@ -383,6 +383,7 @@ mod tests {
         PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
         ProductionPromptAuthorization, prompt::production_tui_permission_bridge,
     };
+    use crate::session::context::SessionContext;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
         run_production_batch_with_policy, tui_session_bootstrap, tui_session_directory,
@@ -392,7 +393,6 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime_with_runner;
     use crate::tui::agents::select_tui_subagent;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
-    use crate::tui::session::TuiSessionContext;
     use agens_core::{ToolOutcome, ToolResultFacts};
     use std::path::Path;
 
@@ -616,7 +616,7 @@ mod tests {
                 "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         assert_eq!(
             select_tui_subagent(&bootstrap, "reviewer", &session),
             Ok("Subagent: reviewer.".to_owned())
@@ -672,9 +672,9 @@ mod tests {
                 PermissionPattern::Any,
             )],
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
         let cancellation = HeadlessTurnCancellation::new();
@@ -788,9 +788,9 @@ mod tests {
         .unwrap();
         let cancellation = HeadlessTurnCancellation::new();
         let selected = || {
-            Arc::new(Mutex::new(TuiSessionContext {
+            Arc::new(Mutex::new(SessionContext {
                 selected_subagent: Some("reviewer".into()),
-                ..TuiSessionContext::fresh()
+                ..SessionContext::fresh()
             }))
         };
 
@@ -854,9 +854,9 @@ mod tests {
         )
         .unwrap();
         let selected = || {
-            Arc::new(Mutex::new(TuiSessionContext {
+            Arc::new(Mutex::new(SessionContext {
                 selected_subagent: Some("reviewer".into()),
-                ..TuiSessionContext::fresh()
+                ..SessionContext::fresh()
             }))
         };
         let cancellation = HeadlessTurnCancellation::new();
@@ -886,9 +886,9 @@ mod tests {
                 PermissionPattern::Any,
             )],
         );
-        let unavailable = Arc::new(Mutex::new(TuiSessionContext {
+        let unavailable = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("missing".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         assert_eq!(
             launch_selected_tui_task(

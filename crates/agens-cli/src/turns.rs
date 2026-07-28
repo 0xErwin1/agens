@@ -10,9 +10,10 @@ use agens_core::{
 };
 use agens_store::SessionStore;
 
+use crate::session::context::SessionContext;
 use crate::tools::task::default_model;
 use crate::tui::provider::TuiProvider;
-use crate::tui::session::{CompletedSubagentTurn, TuiSessionContext};
+use crate::tui::session::CompletedSubagentTurn;
 use crate::{Bootstrap, CliError};
 
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
@@ -238,7 +239,7 @@ fn contains_credential_marker(value: &str) -> bool {
 
 pub(crate) fn persist_completed_subagent_turn(
     bootstrap: &Bootstrap,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     turn: CompletedSubagentTurn,
 ) -> Result<(), CliError> {
     let mut context = session
@@ -543,7 +544,7 @@ mod tests {
     fn p1c1_persisted_subagent_call_ids_stay_unique_when_execution_ids_restart() {
         let temporary = tui_session_directory("subagent-call-id-uniqueness");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let turn = |final_result: &str| CompletedSubagentTurn {
             id: 1,
             agent: "reviewer".into(),

@@ -237,13 +237,13 @@ mod tests {
     use agens_tui::{TuiProviderOutcome, TuiSubmissionOutcome};
 
     use super::*;
+    use crate::session::context::SessionContext;
     use crate::test_support::{
         enter_tui_input, submit_tui_command, tui_session_bootstrap, tui_session_directory,
     };
     use crate::tools::runtime::production_tool_runtime;
     use crate::tui::engine::{ProductionTuiEngine, report_tui_extension_collisions};
     use crate::tui::router::TuiRuntimeRouter;
-    use crate::tui::session::TuiSessionContext;
 
     fn write_tui_command(root: &Path, name: &str, description: &str, template: &str) {
         std::fs::write(
@@ -346,7 +346,7 @@ mod tests {
         .unwrap();
 
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -471,7 +471,7 @@ mod tests {
         .unwrap();
 
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -619,7 +619,7 @@ mod tests {
         .unwrap();
 
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
@@ -739,7 +739,7 @@ mod tests {
         write_tui_skill(&project_skills, "inspect", "inspect code", "INSPECT_BODY");
 
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let cancellation = Arc::new(Mutex::new(None));
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),

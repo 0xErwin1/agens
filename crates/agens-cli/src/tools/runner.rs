@@ -21,9 +21,10 @@ use agens_tui::{
 use crate::Bootstrap;
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use crate::permissions::ParseToolInput;
+use crate::session::context::SessionContext;
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
 use crate::tui::metrics::sanitize_tui_metric;
-use crate::tui::session::{CompletedSubagentTurn, TuiSessionContext, current_session_timestamp};
+use crate::tui::session::{CompletedSubagentTurn, current_session_timestamp};
 use crate::turns::persist_completed_subagent_turn;
 
 #[cfg(test)]
@@ -78,7 +79,7 @@ impl TuiTaskLifecycleBridge {
     pub(crate) fn with_session_writer(
         mut self,
         bootstrap: Bootstrap,
-        session: Arc<Mutex<TuiSessionContext>>,
+        session: Arc<Mutex<SessionContext>>,
     ) -> Self {
         let events = self.events.clone();
         self.persist_completed = Some(Arc::new(move |turn: CompletedSubagentTurn| {
@@ -644,9 +645,9 @@ mod tests {
             );
             let (events, _receiver) = BridgeTx::bounded(8);
             let controls = TuiTaskControls::default();
-            let session = Arc::new(Mutex::new(TuiSessionContext {
+            let session = Arc::new(Mutex::new(SessionContext {
                 selected_subagent: Some("reviewer".into()),
-                ..TuiSessionContext::fresh()
+                ..SessionContext::fresh()
             }));
             let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone())
                 .with_session_writer(bootstrap.clone(), Arc::clone(&session));
@@ -753,9 +754,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let cancellation = HeadlessTurnCancellation::new();
         let policy = PermissionPolicy::new(
@@ -825,9 +826,9 @@ mod tests {
         let probe = Arc::new(Mutex::new(Vec::new()));
         let (events, receiver) = BridgeTx::bounded(16);
         let controls = TuiTaskControls::default();
-        let session = Arc::new(Mutex::new(TuiSessionContext {
+        let session = Arc::new(Mutex::new(SessionContext {
             selected_subagent: Some("reviewer".into()),
-            ..TuiSessionContext::fresh()
+            ..SessionContext::fresh()
         }));
         let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls)
             .with_session_writer(bootstrap.clone(), Arc::clone(&session));
@@ -954,7 +955,7 @@ mod tests {
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
         std::fs::create_dir_all(bootstrap.data_directory().join("agens.db")).unwrap();
         let (events, receiver) = BridgeTx::bounded(4);
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let bridge = TuiTaskLifecycleBridge::new(events, TuiTaskControls::default())
             .with_session_writer(bootstrap.clone(), Arc::clone(&session));
         let persist = bridge
@@ -1125,9 +1126,9 @@ mod tests {
                     PermissionPattern::Any,
                 )],
             );
-            let session = Arc::new(Mutex::new(TuiSessionContext {
+            let session = Arc::new(Mutex::new(SessionContext {
                 selected_subagent: Some("reviewer".into()),
-                ..TuiSessionContext::fresh()
+                ..SessionContext::fresh()
             }));
 
             assert_eq!(

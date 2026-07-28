@@ -1,5 +1,5 @@
 //! Resuming a persisted TUI session: loading it from the sessions store,
-//! projecting it into a fresh [`TuiSessionContext`], committing it into the
+//! projecting it into a fresh [`SessionContext`], committing it into the
 //! live session slot under a race guard, and reconstructing the restored
 //! completed-subagent cards shown for its history. Also ensures a session
 //! has an active agent runtime before it can accept native tool calls.
@@ -18,14 +18,13 @@ use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
 use crate::model_registry::TuiModelSelector;
 use crate::permissions::{ParseToolInput, SharedToolDispatcher};
+use crate::session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
 use crate::tui::agents::{
     TuiAgentModelValidator, agent_rotation_error, persist_pending_agent_correction,
     reconcile_persisted_active_agent,
 };
 use crate::tui::provider::{TuiCredentialResolver, TuiProvider};
-use crate::tui::session::{
-    ActiveAgentRuntime, ResumeDraft, TuiSessionContext, resume_retry_notice,
-};
+use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
 
@@ -71,7 +70,7 @@ pub(crate) fn resume_tui_session(
     identifier: i64,
     _skills: &SkillCatalog,
     credentials: &TuiCredentialResolver,
-) -> Result<TuiSessionContext, CliError> {
+) -> Result<SessionContext, CliError> {
     let session = load_tui_session_for_resume(bootstrap, identifier)?;
     prepare_loaded_tui_session_resume(bootstrap, identifier, session, credentials)
 }
@@ -123,7 +122,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
     identifier: i64,
     loaded: LoadedTuiSessionResume,
     credentials: &TuiCredentialResolver,
-) -> Result<TuiSessionContext, CliError> {
+) -> Result<SessionContext, CliError> {
     let LoadedTuiSessionResume {
         session,
         retry_boundary,
@@ -170,7 +169,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
             })
         })
         .map(|_| "connect or choose provider".to_owned());
-    let mut context = TuiSessionContext::restored(
+    let mut context = SessionContext::restored(
         identifier,
         session.metadata,
         session.messages,
@@ -204,11 +203,11 @@ pub(crate) fn prepare_loaded_tui_session_resume(
 /// palette entries to attach to the outcome.
 pub(crate) fn commit_tui_session_resume(
     bootstrap: &Bootstrap,
-    session: &Arc<Mutex<TuiSessionContext>>,
-    expected: &TuiSessionContext,
-    mut resumed: TuiSessionContext,
+    session: &Arc<Mutex<SessionContext>>,
+    expected: &SessionContext,
+    mut resumed: SessionContext,
     cancellation: &TuiRouteCancellation,
-    on_commit: impl FnOnce(&TuiSessionContext) -> (Vec<String>, Vec<PaletteEntry>),
+    on_commit: impl FnOnce(&SessionContext) -> (Vec<String>, Vec<PaletteEntry>),
 ) -> Result<TuiSubmissionOutcome, CliError> {
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
@@ -332,7 +331,7 @@ pub(crate) fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, Cl
 
 pub(crate) fn ensure_active_tui_agent_runtime(
     bootstrap: &Bootstrap,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
     dispatcher: &SharedToolDispatcher,
 ) -> Result<(), CliError> {
     let dispatcher = dispatcher
@@ -591,7 +590,7 @@ mod tests {
             prepared.note(),
             "Recovered failed prompt · Enter retry · Esc discard"
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let expected = session.lock().unwrap().clone();
         let outcome = commit_tui_session_resume(
             &bootstrap,
@@ -734,7 +733,7 @@ mod tests {
             prepared.resume_draft.as_deref(),
             Some("atomic preserved draft")
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let original = session.lock().unwrap().clone();
 
         let cancelled = TuiRouteCancellation::new();
@@ -934,7 +933,7 @@ mod tests {
         let temporary = tui_session_directory("active-agent-model-switch");
         let bootstrap =
             tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
         ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
         assert_eq!(
@@ -1017,7 +1016,7 @@ mod tests {
                 .active_agent,
             "retired"
         );
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let expected = session.lock().unwrap().clone();
         let outcome = commit_tui_session_resume(
             &bootstrap,
@@ -1237,7 +1236,7 @@ mod tests {
                 .join("retired.md"),
         )
         .unwrap();
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let original = session.lock().unwrap().clone();
         let cancellation = TuiRouteCancellation::new();
         let (started_sender, started_receiver) = std::sync::mpsc::channel();

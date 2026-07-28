@@ -11,14 +11,14 @@ use crate::bootstrap::Bootstrap;
 use crate::error::{CliError, ExitStatus};
 use crate::model_registry;
 use crate::model_registry::{TuiModelSelector, TuiModelSource};
+use crate::session::context::SessionContext;
 use crate::tools::task::default_model;
 use crate::tui::provider::TuiProvider;
-use crate::tui::session::TuiSessionContext;
 use crate::tui::turn::current_tui_provider;
 
 pub(crate) fn apply_tui_selection(
     bootstrap: &Bootstrap,
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
     provider: TuiProvider,
     selector: TuiModelSelector,
 ) -> Result<(), CliError> {
@@ -54,7 +54,7 @@ pub(crate) fn apply_tui_selection(
 /// from the preference being ignored.
 pub(crate) fn seed_remembered_tui_selection(
     bootstrap: &Bootstrap,
-    context: &mut TuiSessionContext,
+    context: &mut SessionContext,
 ) -> Option<String> {
     if bootstrap.model().is_some() {
         return None;
@@ -91,10 +91,7 @@ pub(crate) fn seed_remembered_tui_selection(
     notice
 }
 
-pub(crate) fn tui_model_source(
-    bootstrap: &Bootstrap,
-    context: &TuiSessionContext,
-) -> TuiModelSource {
+pub(crate) fn tui_model_source(bootstrap: &Bootstrap, context: &SessionContext) -> TuiModelSource {
     current_tui_provider(bootstrap, context)
         .unwrap_or(TuiProvider::OpenAiApi)
         .source()
@@ -128,7 +125,7 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
 pub(crate) fn select_tui_model(
     bootstrap: &Bootstrap,
     command: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let model = command.strip_prefix("/model").unwrap_or_default().trim();
     if model.is_empty() {
@@ -156,7 +153,7 @@ pub(crate) fn select_tui_model(
 pub(crate) fn apply_tui_model(
     bootstrap: &Bootstrap,
     model: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let mut context = session
         .lock()
@@ -185,7 +182,7 @@ pub(crate) fn apply_tui_model(
 pub(crate) fn apply_tui_unverified_model(
     bootstrap: &Bootstrap,
     model: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let mut context = session
         .lock()
@@ -211,7 +208,7 @@ pub(crate) fn apply_tui_unverified_model(
 pub(crate) fn select_tui_effort(
     bootstrap: &Bootstrap,
     command: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let effort = command.strip_prefix("/effort").unwrap_or_default().trim();
     let context = session
@@ -233,7 +230,7 @@ pub(crate) fn select_tui_effort(
 pub(crate) fn apply_tui_effort(
     bootstrap: &Bootstrap,
     effort: &str,
-    session: &Arc<Mutex<TuiSessionContext>>,
+    session: &Arc<Mutex<SessionContext>>,
 ) -> Result<String, CliError> {
     let mut context = session
         .lock()
@@ -282,7 +279,7 @@ mod tests {
             "gpt-5.5",
             Some(agens_core::ReasoningEffort::High),
         );
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
 
         assert_eq!(
             seed_remembered_tui_selection(&bootstrap, &mut context),
@@ -312,7 +309,7 @@ mod tests {
             "gpt-5.5",
             Some(agens_core::ReasoningEffort::High),
         );
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
 
         assert_eq!(
             seed_remembered_tui_selection(&configured, &mut context),
@@ -328,7 +325,7 @@ mod tests {
         // remembered pick through the same branch.
         let mut flagged = configured.clone();
         flagged.model = Some("o3".into());
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
 
         assert_eq!(seed_remembered_tui_selection(&flagged, &mut context), None);
         assert!(context.selection.is_none());
@@ -346,7 +343,7 @@ mod tests {
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.model = None;
         remember(&bootstrap, "gpt-5.4", None);
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
 
         assert_eq!(
             seed_remembered_tui_selection(&bootstrap, &mut context),
@@ -373,7 +370,7 @@ mod tests {
             "gpt-4.1",
             Some(agens_core::ReasoningEffort::High),
         );
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
 
         assert_eq!(
             seed_remembered_tui_selection(&bootstrap, &mut context),
@@ -393,7 +390,7 @@ mod tests {
         let temporary = tui_session_directory("remembered-selection-write");
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.model = None;
-        let session = Arc::new(Mutex::new(TuiSessionContext::fresh()));
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
 
         apply_tui_model(&bootstrap, "gpt-5.5", &session).unwrap();
         apply_tui_effort(&bootstrap, "high", &session).unwrap();
@@ -409,7 +406,7 @@ mod tests {
             Some(agens_core::ReasoningEffort::High)
         );
 
-        let mut context = TuiSessionContext::fresh();
+        let mut context = SessionContext::fresh();
         assert_eq!(
             seed_remembered_tui_selection(&bootstrap, &mut context),
             None
