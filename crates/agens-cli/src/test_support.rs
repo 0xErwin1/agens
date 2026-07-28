@@ -43,6 +43,27 @@ thread_local! {
     static PRODUCTION_PROVIDER_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Waits for a condition rather than for a fixed number of polls.
+///
+/// A count-based wait is a bet on how fast the machine is. Under a loaded gate
+/// it loses, and the test then fails for a reason that has nothing to do with
+/// what it asserts, which trains people to rerun the gate instead of reading it.
+pub(crate) fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 pub(crate) fn note_tui_resume_load() {
     TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
 }

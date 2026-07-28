@@ -680,17 +680,12 @@ mod tests {
                     &worker_cancellation,
                 )
             });
-            let lifecycle = (0..100)
-                .find_map(|_| {
-                    let lifecycle = controls
+            let lifecycle =
+                crate::test_support::wait_for("the running task to be observed", || {
+                    controls
                         .0
-                        .lifecycle(agens_tools::TaskExecutionId::from_value(1));
-                    if lifecycle.is_none() {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    lifecycle
-                })
-                .expect("running task should be observed");
+                        .lifecycle(agens_tools::TaskExecutionId::from_value(1))
+                });
 
             assert!(session.lock().unwrap().identifier.is_none());
             assert!(lifecycle.transition_to_background());
@@ -918,15 +913,10 @@ mod tests {
             ]
         );
         assert_eq!(probe.lock().unwrap().len(), 1);
-        let session_id = (0..100)
-            .find_map(|_| {
-                let identifier = session.lock().unwrap().identifier;
-                if identifier.is_none() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                identifier
-            })
-            .expect("completed terminal should persist exactly one durable turn");
+        let session_id = crate::test_support::wait_for(
+            "the completed terminal to persist exactly one durable turn",
+            || session.lock().unwrap().identifier,
+        );
         let stored = SessionStore::open(bootstrap.data_directory())
             .unwrap()
             .load_session_for_resume(session_id)

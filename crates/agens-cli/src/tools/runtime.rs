@@ -621,11 +621,27 @@ mod tests {
             dispatcher.execute(handle, &context).unwrap();
         }
         drop(dispatcher);
+
+        // A background dispatch reaches the runner on its own thread while the
+        // foreground one reaches it inline, so which lands first is not a
+        // guarantee this design makes. Wait for both, then compare without
+        // ordering.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while calls.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both task dispatches should reach the runner, saw {:?}",
+                *calls.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut observed = calls.lock().unwrap().clone();
+        observed.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(
-            *calls.lock().unwrap(),
+            observed,
             vec![
-                ("reviewer".to_owned(), TaskLaunchMode::Background),
                 ("alpha".to_owned(), TaskLaunchMode::Foreground),
+                ("reviewer".to_owned(), TaskLaunchMode::Background),
             ]
         );
 

@@ -622,15 +622,10 @@ mod tests {
             launch_selected_tui_task(&mut runtime, &session, "review task", true, &cancellation),
             Ok(TuiSelectedTaskLaunch::Dispatched)
         );
-        (0..100)
-            .find_map(|_| {
-                let identifier = session.lock().unwrap().identifier;
-                if identifier.is_none() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                identifier
-            })
-            .expect("a completed background subagent persists one durable turn");
+        crate::test_support::wait_for(
+            "a completed background subagent to persist one durable turn",
+            || session.lock().unwrap().identifier,
+        );
 
         let queued = Arc::new(Mutex::new(Vec::new()));
         let mut provider = TaskMailboxProvider::new(
@@ -640,16 +635,36 @@ mod tests {
             Some(controls.0.clone()),
             TaskMessageTarget::Main,
         );
+        // The notice is posted after the turn is persisted, so the identifier the
+        // launch waits on is set strictly earlier. Drain until the notice lands
+        // rather than assuming one drain is enough.
+        crate::test_support::wait_for("the completed subagent's mailbox notice", || {
+            block_on_headless_turn(provider.next_parts(&[], &cancellation))
+                .unwrap()
+                .unwrap();
+            queued
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|batch| !batch.is_empty())
+                .then_some(())
+        });
+        // Draining again must add nothing: the notice is delivered once, which is
+        // the property the old single-drain assertion was standing in for.
         block_on_headless_turn(provider.next_parts(&[], &cancellation))
             .unwrap()
             .unwrap();
 
         let queued = queued.lock().unwrap();
-        assert_eq!(queued.len(), 1);
-        assert_eq!(queued[0].len(), 1);
-        assert_eq!(queued[0][0].role, Role::User);
-        let [MessagePart::Text(notice)] = queued[0][0].parts.as_slice() else {
-            panic!("a mailbox notice is text: {:?}", queued[0][0].parts)
+        let delivered = queued
+            .iter()
+            .filter(|batch| !batch.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(delivered.len(), 1, "{queued:?}");
+        assert_eq!(delivered[0].len(), 1);
+        assert_eq!(delivered[0][0].role, Role::User);
+        let [MessagePart::Text(notice)] = delivered[0][0].parts.as_slice() else {
+            panic!("a mailbox notice is text: {:?}", delivered[0][0].parts)
         };
         let (label, detail) = notice
             .split_once('\n')
