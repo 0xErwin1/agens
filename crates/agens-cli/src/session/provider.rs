@@ -18,7 +18,7 @@ use std::sync::Arc;
 use agens_providers::chatgpt_login::{remove_provider_entry, upsert_provider_entry};
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
-use crate::bootstrap::openai_api_key;
+use agens_bootstrap::openai_api_key;
 use agens_error::CliError;
 use agens_models::ModelSource;
 

@@ -4,9 +4,10 @@
 use agens_core::{HeadlessTurnCancellation, PermissionMode};
 
 use crate::CliDependencies;
-use crate::bootstrap::{bootstrap, seed_configured_reasoning_effort};
 use crate::cli;
+use crate::deps::bootstrap;
 use crate::headless::HeadlessChatRequest;
+use crate::headless::seed_configured_reasoning_effort;
 use agens_error::{CliError, cancellation_result};
 
 pub(crate) fn run_chat(

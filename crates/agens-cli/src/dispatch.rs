@@ -651,12 +651,12 @@ mod tests {
         let lifecycle_bridge = TuiTaskLifecycleBridge::new(events, controls.clone());
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
-            &crate::session_root::discovered_root_for_tests(&bootstrap),
+            &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
             production_tui_permission_bridge().0,
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
-                crate::session_root::discovered_root_for_tests(&bootstrap),
+                agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::clone(&probe),
             )
             .with_lifecycle_bridge(lifecycle_bridge.clone()),
@@ -774,12 +774,12 @@ mod tests {
         let (bridge, requests) = production_tui_permission_bridge();
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
-            &crate::session_root::discovered_root_for_tests(&bootstrap),
+            &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
             bridge.clone(),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
-                crate::session_root::discovered_root_for_tests(&bootstrap),
+                agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::clone(&probe),
             ),
         )
@@ -841,12 +841,12 @@ mod tests {
         let (bridge, requests) = production_tui_permission_bridge();
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
-            &crate::session_root::discovered_root_for_tests(&bootstrap),
+            &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
             bridge.clone(),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
-                crate::session_root::discovered_root_for_tests(&bootstrap),
+                agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::clone(&probe),
             ),
         )

@@ -7,6 +7,7 @@ jq -e '
   {
     "agens-core": [],
     "agens-error": ["agens-core"],
+    "agens-bootstrap": ["agens-config", "agens-core", "agens-error", "agens-tools"],
     "agens-models": ["agens-core"],
     "agens-config": [],
     "agens-providers": ["agens-config", "agens-core"],
@@ -15,6 +16,7 @@ jq -e '
     "agens-tui": ["agens-core"],
     "agens-server": ["agens-core"],
     "agens": [
+      "agens-bootstrap",
       "agens-config",
       "agens-core",
       "agens-error",

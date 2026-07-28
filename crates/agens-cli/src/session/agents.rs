@@ -18,7 +18,6 @@ use agens_providers::ProviderDiagnosticKind;
 use agens_store::SessionStore;
 use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
-use crate::bootstrap::Bootstrap;
 use crate::diagnostics::record_agent_diagnostic;
 use crate::session::context::SessionContext;
 use crate::session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
@@ -28,6 +27,7 @@ use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::turn::effective_tui_model;
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::{ModelSelection, ModelSource};
 
@@ -43,7 +43,7 @@ pub(crate) fn rotate_agent(
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
         (
             AgentModelCompatibility::for_context(bootstrap, &context)?,
-            crate::session_root::resolve_tui_session_root(&context, bootstrap)?,
+            crate::session::root::resolve_tui_session_root(&context, bootstrap)?,
         )
     };
     let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
@@ -199,7 +199,7 @@ pub(crate) fn agent_catalog_for_context(
     context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
     let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
     agent_catalog(bootstrap, &project_root, &validator)
 }
 
@@ -215,11 +215,13 @@ pub(crate) fn discover_agent_catalog(
     project_root: &Path,
     validator: Option<&dyn AgentModelValidator>,
 ) -> Result<AgentCatalog, CliError> {
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let system_prompt = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?
-        .system_prompt()
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let system_prompt =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?
+            .system_prompt()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
     let primary = AgentDefinition {
         name: "primary".into(),
         description: "Default interactive agent".into(),
@@ -422,7 +424,7 @@ pub(crate) fn reconcile_persisted_active_agent(
 ) -> Result<AgentDefinition, CliError> {
     let name = initial_active_agent_name(context, bootstrap);
     let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
     let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
     let unvalidated_catalog = task_agent_catalog(bootstrap, &project_root)?;
     let resolution =
@@ -532,7 +534,8 @@ mod tests {
 
         let resume_bootstrap =
             bootstrap_from_a_different_working_directory(&origin, "agent-catalog-root-elsewhere");
-        let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        let elsewhere_root =
+            agens_bootstrap::session_root::discovered_root_for_tests(&resume_bootstrap);
         std::fs::create_dir_all(elsewhere_root.join(".agens/agents")).unwrap();
         std::fs::write(
             elsewhere_root.join(".agens/agents/elsewhere-only.md"),
@@ -570,7 +573,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         use crate::CliDependencies;
-        use crate::bootstrap::bootstrap;
+        use crate::deps::bootstrap;
 
         let temporary = std::env::temp_dir().join(format!(
             "agens-primary-agent-system-prompt-scope-{}",

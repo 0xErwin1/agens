@@ -14,7 +14,6 @@ use agens_tui::{
     Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 
-use crate::bootstrap::Bootstrap;
 use crate::permissions::{ParseToolInput, SharedToolDispatcher};
 use crate::session::agents::{
     AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
@@ -25,6 +24,7 @@ use crate::session::provider::{CredentialResolver, ProviderKind};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
 
@@ -338,7 +338,7 @@ pub(crate) fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEven
 /// belonging to it. This is a listing/grouping concern distinct from a session's own confinement
 /// root, so it is one of the few sites allowed to read the process-wide discovered root.
 pub(crate) fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
-    crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+    agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
         .map(|root| root.path().display().to_string())
         .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
 }
@@ -357,7 +357,7 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     if context.active_agent.is_some() {
         return Ok(());
     }
-    let project_root = crate::session_root::resolve_tui_session_root(&context, bootstrap)?;
+    let project_root = crate::session::root::resolve_tui_session_root(&context, bootstrap)?;
     let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
     let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
     let inherited_model = effective_tui_model(bootstrap, &context);
@@ -426,7 +426,7 @@ mod tests {
              recorded root instead of being rejected: {resumed:?}"
         );
         let session = Arc::new(Mutex::new(resumed.unwrap().context));
-        let resolved_root = crate::session_root::resolve_tui_session_root(
+        let resolved_root = crate::session::root::resolve_tui_session_root(
             &session.lock().unwrap(),
             &resume_bootstrap,
         )
@@ -835,7 +835,7 @@ mod tests {
         let (permission_bridge, _) = TuiPermissionBridge::channel();
         let (events, _) = agens_tui::BridgeTx::bounded(8);
         let project_root =
-            crate::session_root::resolve_tui_session_root(&session.lock().unwrap(), &bootstrap)
+            crate::session::root::resolve_tui_session_root(&session.lock().unwrap(), &bootstrap)
                 .unwrap();
         let runtime = production_tui_task_runtime(
             &bootstrap,

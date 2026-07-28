@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
-use crate::bootstrap::Bootstrap;
 use crate::session::context::SessionContext;
 use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::tui::turn::current_tui_provider;
+use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 use agens_models::{ModelSelection, ModelSource};
 

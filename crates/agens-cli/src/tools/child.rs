@@ -259,8 +259,10 @@ fn task_provider_base_url(
     bootstrap: &Bootstrap,
     project_root: &Path,
 ) -> Result<Option<String>, agens_error::CliError> {
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.provider_base_url().map(ToOwned::to_owned))
 }
 
@@ -460,7 +462,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         use crate::CliDependencies;
-        use crate::bootstrap::bootstrap;
+        use crate::deps::bootstrap;
 
         let temporary = std::env::temp_dir().join(format!(
             "agens-task-runtime-provider-base-url-scope-{}",
@@ -595,12 +597,12 @@ mod tests {
             .with_session_writer(bootstrap.clone(), Arc::clone(&session));
         let mut runtime = production_tui_task_runtime_with_runner(
             &bootstrap,
-            &crate::session_root::discovered_root_for_tests(&bootstrap),
+            &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &agens_tools::SkillCatalog::default(),
             production_tui_permission_bridge().0,
             ProductionTaskRunner::with_progress_probe(
                 bootstrap.clone(),
-                crate::session_root::discovered_root_for_tests(&bootstrap),
+                agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 Arc::new(Mutex::new(Vec::new())),
                 Vec::new(),
             )

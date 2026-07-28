@@ -47,7 +47,7 @@ pub(crate) fn next_session_metadata(
 
     Ok(SessionMetadata {
         id: 0,
-        project: crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+        project: agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
             .map(|root| root.path().display().to_string())
             .unwrap_or_else(|| "default".to_owned()),
         title: title.to_owned(),

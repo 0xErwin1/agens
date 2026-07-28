@@ -5,7 +5,8 @@ use clap::Parser as _;
 use agens_core::HeadlessTurnCancellation;
 use agens_core::SubagentErrorKind;
 
-mod bootstrap;
+#[cfg(test)]
+mod bootstrap_tests;
 mod chatgpt_auth;
 mod cli;
 mod commands;
@@ -22,8 +23,8 @@ mod tools;
 mod tui;
 mod turns;
 
+use agens_bootstrap::effective_max_iterations;
 use agens_error::cancellation_result;
-use bootstrap::effective_max_iterations;
 use diagnostics::{
     next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
     record_subagent_terminal,
@@ -32,12 +33,11 @@ use headless::block_on_headless_turn;
 use tui::models::tui_model_source;
 use tui::run_tui;
 
+pub use agens_bootstrap::Bootstrap;
 pub use agens_error::{CliError, CommandResult, ExitStatus};
 pub use agens_models::{ModelSelection, ModelSource};
-pub(crate) use bootstrap::session_config;
-pub(crate) use bootstrap::session_root;
-pub use bootstrap::{Bootstrap, bootstrap};
 pub use deps::CliDependencies;
+pub use deps::bootstrap;
 pub use headless::HeadlessChatRequest;
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult

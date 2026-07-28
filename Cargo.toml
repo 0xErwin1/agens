@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/agens-core",
+  "crates/agens-bootstrap",
   "crates/agens-error",
   "crates/agens-models",
   "crates/agens-config",

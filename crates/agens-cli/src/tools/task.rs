@@ -109,8 +109,10 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
         task_runner,
     )?;
     let project = project_root.display().to_string();
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     let policy = permission_policy(
         session_config.permission_rules(),
         &project,
@@ -303,7 +305,7 @@ mod tests {
         use agens_core::{PermissionDecision, PermissionRequest, PermissionSession, ToolAccess};
 
         use crate::CliDependencies;
-        use crate::bootstrap::bootstrap;
+        use crate::deps::bootstrap;
 
         let temporary = std::env::temp_dir().join(format!(
             "agens-task-runtime-permission-scope-{}",
@@ -411,7 +413,7 @@ mod tests {
         );
         bootstrap.model = Some("gpt-5.6-sol".into());
         let probe = Arc::new(Mutex::new(Vec::new()));
-        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
         let runtime = production_tui_task_runtime_with_runner_and_parent_config(
             &bootstrap,
             &project_root,

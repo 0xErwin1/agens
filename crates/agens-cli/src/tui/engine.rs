@@ -15,11 +15,11 @@ use agens_tui::{
 };
 
 use crate::Bootstrap;
-use crate::bootstrap::seed_configured_reasoning_effort;
 use crate::diagnostics::next_diagnostic_reference;
 use crate::dispatch::{
     launch_selected_tui_task, origin_launches_selected_subagent, selected_tui_task_skips_parent,
 };
+use crate::headless::seed_configured_reasoning_effort;
 use crate::headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
     run_production_headless_chat_with_progress,
@@ -127,7 +127,7 @@ pub(crate) fn run_production_tui(
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        crate::session_root::resolve_tui_session_root(&context, bootstrap)?
+        crate::session::root::resolve_tui_session_root(&context, bootstrap)?
     };
     let skills = start_tui_skills(&mut tui, bootstrap, &session_root_for_startup)?;
     let commands = start_tui_commands(&mut tui, bootstrap, &session_root_for_startup)?;
@@ -208,7 +208,7 @@ pub(crate) fn run_production_tui(
                 .lock()
                 .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))
                 .and_then(|context| {
-                    crate::session_root::resolve_tui_session_root(&context, &runtime_bootstrap)
+                    crate::session::root::resolve_tui_session_root(&context, &runtime_bootstrap)
                 }) {
                 Ok(root) => root,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -432,15 +432,16 @@ pub(crate) fn run_tui_prompt_with(
 
 /// The configured system prompt fallback a TUI turn must fall back to, re-derived from the
 /// session's own recorded confinement root rather than `bootstrap`'s process-captured
-/// `agent.system_prompt` — see [`crate::session_config::SessionConfig`] for why the process root
+/// `agent.system_prompt` — see [`agens_bootstrap::session_config::SessionConfig`] for why the process root
 /// is the wrong source once a session can be resumed into a different root.
 fn tui_turn_system_prompt(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Option<String>, CliError> {
-    let root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
-    let session_root = crate::session_root::SessionRoot::confined_to(root);
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let session_root = agens_bootstrap::session_root::SessionRoot::confined_to(root);
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.system_prompt().map(ToOwned::to_owned))
 }
 
@@ -482,7 +483,9 @@ pub(crate) fn configure_tui_project_identity(
     tui: &mut Tui<ProductionTuiEngine>,
     bootstrap: &Bootstrap,
 ) {
-    if let Some(root) = crate::session_root::SessionRoot::discover_for_new_session(bootstrap) {
+    if let Some(root) =
+        agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
+    {
         tui.set_project(root.path().display().to_string());
     }
 }
@@ -500,7 +503,7 @@ mod tests {
 
     use super::*;
     use crate::CliDependencies;
-    use crate::bootstrap::bootstrap;
+    use crate::deps::bootstrap;
     use crate::session::agents::BundledModelValidator;
     use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{

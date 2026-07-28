@@ -3,8 +3,8 @@
 use agens_store::SessionStore;
 
 use crate::CliDependencies;
-use crate::bootstrap::bootstrap;
 use crate::cli;
+use crate::deps::bootstrap;
 use agens_error::CliError;
 
 pub(crate) fn run_sessions(

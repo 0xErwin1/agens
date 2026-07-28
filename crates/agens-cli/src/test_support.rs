@@ -24,7 +24,7 @@ use agens_tui::{
 };
 
 use crate::CliDependencies;
-use crate::bootstrap::{Bootstrap, bootstrap};
+use crate::deps::bootstrap;
 use crate::dispatch::ProductionToolDispatcher;
 use crate::headless::HeadlessChatCompletion;
 use crate::permissions::{
@@ -34,6 +34,7 @@ use crate::permissions::{
 use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
 thread_local! {

@@ -380,9 +380,9 @@ fn headless_turn_project_root(
 ) -> Result<std::path::PathBuf, CliError> {
     match task_runtime {
         Some(task_runtime) => Ok(task_runtime.project_root.clone()),
-        None => crate::session_root::SessionRoot::discover_for_new_session(bootstrap)
+        None => agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
             .ok_or_else(|| CliError::configuration("native tools require a project root"))
-            .map(crate::session_root::SessionRoot::into_path_buf),
+            .map(agens_bootstrap::session_root::SessionRoot::into_path_buf),
     }
 }
 
@@ -390,7 +390,7 @@ fn headless_turn_project_root(
 ///
 /// `project_root` may differ from `bootstrap`'s own process-discovered root — it is the session's
 /// own recorded root once one exists — so this always re-derives session-scoped configuration
-/// through [`crate::session_config::SessionConfig`] rather than reading `bootstrap`'s
+/// through [`agens_bootstrap::session_config::SessionConfig`] rather than reading `bootstrap`'s
 /// process-captured `permission_rules` directly, which would silently keep applying rules read
 /// from the WRONG root's project configuration.
 fn headless_turn_permission_policy(
@@ -401,8 +401,10 @@ fn headless_turn_permission_policy(
     tool_runtime: &crate::permissions::SharedToolDispatcher,
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<agens_core::PermissionPolicy, CliError> {
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     permission_policy(
         session_config.permission_rules(),
         project,
@@ -422,8 +424,10 @@ fn headless_turn_system_prompt(
     bootstrap: &Bootstrap,
     project_root: &std::path::Path,
 ) -> Result<Option<String>, CliError> {
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.system_prompt().map(ToOwned::to_owned))
 }
 
@@ -438,8 +442,10 @@ fn headless_turn_provider_base_url(
     bootstrap: &Bootstrap,
     project_root: &std::path::Path,
 ) -> Result<Option<String>, CliError> {
-    let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
-    let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.provider_base_url().map(ToOwned::to_owned))
 }
 
@@ -715,6 +721,27 @@ impl CompletedTurnRepository for DiscardCompletedTurnRepository {
     }
 }
 
+/// Applies the configured reasoning effort to a request that carries none.
+/// An explicit model selection or `/effort` choice already populated the
+/// request config, and must not be overwritten by the configured default.
+pub(crate) fn seed_configured_reasoning_effort(
+    request: &mut HeadlessChatRequest,
+    bootstrap: &Bootstrap,
+) {
+    if request.request_config.reasoning_effort().is_some() {
+        return;
+    }
+    let Some(effort) = bootstrap.reasoning_effort() else {
+        return;
+    };
+    let Ok(config) = agens_core::RequestConfig::with_reasoning_effort(effort) else {
+        return;
+    };
+
+    request.session_reasoning_effort = config.reasoning_effort();
+    request.request_config = config;
+}
+
 pub(crate) fn block_on_headless_turn<T>(
     future: impl std::future::Future<Output = T>,
 ) -> Result<T, CliError> {
@@ -743,7 +770,7 @@ mod tests {
 
     use super::*;
     use crate::CliDependencies;
-    use crate::bootstrap::bootstrap;
+    use crate::deps::bootstrap;
 
     #[test]
     fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_process_root() {
@@ -767,7 +794,7 @@ mod tests {
         let resume_bootstrap =
             bootstrap_from_a_different_working_directory(&origin, "headless-root-elsewhere");
         let discovered_process_root =
-            crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+            agens_bootstrap::session_root::discovered_root_for_tests(&resume_bootstrap);
         assert_ne!(discovered_process_root, origin.join("project"));
 
         let resumed = crate::tui::resume::resume_tui_session(
@@ -779,7 +806,7 @@ mod tests {
         .unwrap()
         .context;
         let session = Arc::new(Mutex::new(resumed));
-        let resolved_root = crate::session_root::resolve_tui_session_root(
+        let resolved_root = crate::session::root::resolve_tui_session_root(
             &session.lock().unwrap(),
             &resume_bootstrap,
         )

@@ -10,7 +10,7 @@ pub(crate) mod session;
 pub(crate) mod turn;
 
 use crate::CliDependencies;
-use crate::bootstrap::bootstrap;
+use crate::deps::bootstrap;
 use agens_error::CliError;
 
 pub(crate) fn run_tui(

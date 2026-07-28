@@ -7,7 +7,7 @@ use agens_core::HeadlessTurnCancellation;
 use agens_server::ServerError;
 
 use crate::CliDependencies;
-use crate::bootstrap::bootstrap;
+use crate::deps::bootstrap;
 use agens_error::CliError;
 
 pub(crate) fn run_serve(

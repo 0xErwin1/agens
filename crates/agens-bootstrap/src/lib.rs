@@ -1,5 +1,13 @@
-//! Resolves the effective runtime configuration (`Bootstrap`) from the
-//! project/global TOML documents, environment, and stored credentials.
+//! Resolving a run's configuration: paths, credentials, settings, MCP servers.
+//!
+//! It reads the host through [`HostEnvironment`] rather than through any
+//! command surface, so the daemon and the CLI resolve the same way.
+
+mod host;
+pub mod session_config;
+pub mod session_root;
+
+pub use host::{ConfigReader, HostEnvironment};
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -14,45 +22,42 @@ use agens_config::{
 };
 use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
 
-use crate::{CliDependencies, CliError, HeadlessChatRequest};
-
-pub(crate) mod session_config;
-pub(crate) mod session_root;
+use agens_error::CliError;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProviderSource {
+pub enum ProviderSource {
     Auto,
     ExplicitChatGpt,
     ExplicitOther,
 }
 pub struct Bootstrap {
-    pub(crate) paths: ConfigPaths,
-    pub(crate) global_loaded: bool,
-    pub(crate) project_loaded: bool,
-    pub(crate) model: Option<String>,
-    pub(crate) provider_type: Option<String>,
-    pub(crate) provider_source: ProviderSource,
-    pub(crate) max_iterations: Option<usize>,
-    pub(crate) parallel_tool_calls: bool,
-    pub(crate) collapse_thinking: bool,
-    pub(crate) debug: bool,
-    pub(crate) default_agent: Option<String>,
-    pub(crate) reasoning_effort: Option<String>,
-    pub(crate) tool_limits: ToolLimitSettings,
-    pub(crate) subagent_limits: SubagentSettings,
-    pub(crate) mcp_defaults: McpDefaultSettings,
-    pub(crate) settings: ResolvedSettings,
-    pub(crate) openai_api_key: Option<String>,
-    pub(crate) data_directory: PathBuf,
-    pub(crate) project_root: Option<PathBuf>,
-    pub(crate) mcp_servers: Vec<agens_config::McpServerConfig>,
-    pub(crate) mcp_status: Option<McpStatusHandle>,
-    pub(crate) permission_rules: Vec<ConfigPermissionRule>,
+    pub paths: ConfigPaths,
+    pub global_loaded: bool,
+    pub project_loaded: bool,
+    pub model: Option<String>,
+    pub provider_type: Option<String>,
+    pub provider_source: ProviderSource,
+    pub max_iterations: Option<usize>,
+    pub parallel_tool_calls: bool,
+    pub collapse_thinking: bool,
+    pub debug: bool,
+    pub default_agent: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub tool_limits: ToolLimitSettings,
+    pub subagent_limits: SubagentSettings,
+    pub mcp_defaults: McpDefaultSettings,
+    pub settings: ResolvedSettings,
+    pub openai_api_key: Option<String>,
+    pub data_directory: PathBuf,
+    pub project_root: Option<PathBuf>,
+    pub mcp_servers: Vec<agens_config::McpServerConfig>,
+    pub mcp_status: Option<McpStatusHandle>,
+    pub permission_rules: Vec<ConfigPermissionRule>,
     /// Re-reads a project configuration document from an arbitrary path, the same way
     /// `bootstrap()` read this process's own project config, so [`session_config::SessionConfig`]
     /// can re-derive session-scoped configuration from a session's OWN recorded root instead of
     /// trusting the value this struct captured once from the PROCESS's discovered root.
-    pub(in crate::bootstrap) config_reader: crate::deps::ConfigReader,
+    pub(crate) config_reader: crate::host::ConfigReader,
 }
 
 impl Clone for Bootstrap {
@@ -106,7 +111,7 @@ impl Bootstrap {
     /// from a session's OWN recorded root. `commands::config::run_config` is the one legitimate
     /// process-level reader left (the `config doctor` report, which is about the process's own
     /// configuration by definition, not a session's).
-    pub(crate) fn settings(&self) -> &ResolvedSettings {
+    pub fn settings(&self) -> &ResolvedSettings {
         &self.settings
     }
 
@@ -157,7 +162,7 @@ impl Bootstrap {
     /// before it can be reached — it cannot make that escape hatch unreachable once named, so a
     /// call site inside `session_root` that itself re-derives the process root instead of using
     /// the session's recorded one is still a possible, silent mistake, not a compile error.
-    pub(in crate::bootstrap) fn discovered_root(&self) -> Option<&Path> {
+    pub(crate) fn discovered_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
     }
 
@@ -166,7 +171,7 @@ impl Bootstrap {
     /// decision must go through [`session_config::SessionConfig::resolve`] instead, which
     /// re-reads a session's OWN recorded root rather than trusting this process-lifetime value —
     /// see that type's documentation for why the distinction matters.
-    pub(in crate::bootstrap) fn permission_rules(&self) -> &[ConfigPermissionRule] {
+    pub(crate) fn permission_rules(&self) -> &[ConfigPermissionRule] {
         &self.permission_rules
     }
 
@@ -204,45 +209,21 @@ impl Bootstrap {
     }
 }
 
-/// Applies the configured reasoning effort to a request that carries none.
-/// An explicit model selection or `/effort` choice already populated the
-/// request config, and must not be overwritten by the configured default.
-pub(crate) fn seed_configured_reasoning_effort(
-    request: &mut HeadlessChatRequest,
-    bootstrap: &Bootstrap,
-) {
-    if request.request_config.reasoning_effort().is_some() {
-        return;
-    }
-    let Some(effort) = bootstrap.reasoning_effort() else {
-        return;
-    };
-    let Ok(config) = agens_core::RequestConfig::with_reasoning_effort(effort) else {
-        return;
-    };
-
-    request.session_reasoning_effort = config.reasoning_effort();
-    request.request_config = config;
-}
-
 /// Applies the configuration precedence contract for a turn's iteration cap:
 /// a command-line value always wins over the configured one.
-pub(crate) fn effective_max_iterations(
-    flag: Option<usize>,
-    configured: Option<usize>,
-) -> Option<usize> {
+pub fn effective_max_iterations(flag: Option<usize>, configured: Option<usize>) -> Option<usize> {
     flag.or(configured)
 }
 
-pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
-    let current_directory = (dependencies.current_directory)()?;
-    let home_directory = (dependencies.home_directory)();
-    let environment = (dependencies.environment)();
+pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
+    let current_directory = (host.current_directory)()?;
+    let home_directory = (host.home_directory)();
+    let environment = (host.environment)();
     let project_root = discover_project_root(&current_directory);
     let config_root = project_root.as_deref().unwrap_or(&current_directory);
     let paths = resolve_paths(config_root, home_directory.as_deref(), &environment);
-    let (global, global_loaded) = load_toml(&paths.global_config, "global", dependencies)?;
-    let (project, project_loaded) = load_toml(&paths.project_config, "project", dependencies)?;
+    let (global, global_loaded) = load_toml(&paths.global_config, "global", host)?;
+    let (project, project_loaded) = load_toml(&paths.project_config, "project", host)?;
     if project.contains_key("mcp") {
         return Err(CliError::configuration(
             "project configuration cannot define MCP servers",
@@ -259,7 +240,7 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
 
     let mcp_servers = mcp_servers(&document)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
-    let credentials = (dependencies.read_file)(&paths.credentials)?;
+    let credentials = (host.read_file)(&paths.credentials)?;
     let configured_provider = settings.text("provider.type").map(ToOwned::to_owned);
     let provider_source = match configured_provider.as_deref() {
         None => ProviderSource::Auto,
@@ -295,14 +276,14 @@ pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> 
         mcp_servers,
         mcp_status: None,
         permission_rules,
-        config_reader: Arc::clone(&dependencies.read_file),
+        config_reader: Arc::clone(&host.read_file),
         paths,
         global_loaded,
         project_loaded,
     })
 }
 
-pub(crate) fn discover_project_root(current_directory: &Path) -> Option<PathBuf> {
+pub fn discover_project_root(current_directory: &Path) -> Option<PathBuf> {
     let mut current = fs::canonicalize(current_directory).ok()?;
 
     loop {
@@ -340,9 +321,9 @@ fn data_directory(
 fn load_toml(
     path: &Path,
     scope: &str,
-    dependencies: &CliDependencies,
+    host: &HostEnvironment,
 ) -> Result<(toml::Table, bool), CliError> {
-    let Some(contents) = (dependencies.read_file)(path)? else {
+    let Some(contents) = (host.read_file)(path)? else {
         return Ok((toml::Table::new(), false));
     };
 
@@ -405,7 +386,7 @@ fn expand_global_mcp(
     Ok(document)
 }
 
-pub(crate) fn resolve_provider_type(
+pub fn resolve_provider_type(
     configured: Option<String>,
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
@@ -445,7 +426,7 @@ pub(crate) fn resolve_provider_type(
     None
 }
 
-pub(crate) fn openai_api_key(
+pub fn openai_api_key(
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
 ) -> Option<String> {
@@ -523,191 +504,4 @@ fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {
     }
 
     value.as_str().map(ToOwned::to_owned)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::commands::chat::{chat_args_with_prompt, chat_request};
-    use crate::test_support::bootstrap_from_configuration;
-
-    #[test]
-    fn bootstrap_retains_the_ui_collapse_thinking_setting() {
-        let temporary =
-            std::env::temp_dir().join(format!("agens-collapse-thinking-{}", std::process::id()));
-        let config_home = temporary.join("config");
-        let dependencies = CliDependencies::for_test(
-            temporary.join("project"),
-            Some(temporary.join("home")),
-            BTreeMap::from([(
-                "AGENS_CONFIG_HOME".to_owned(),
-                config_home.display().to_string(),
-            )]),
-            BTreeMap::from([(
-                config_home.join("config.toml"),
-                "[ui]\ncollapse_thinking = true\n".to_owned(),
-            )]),
-        );
-
-        let bootstrap = bootstrap(&dependencies).expect("UI configuration should be valid");
-
-        assert!(bootstrap.collapse_thinking);
-    }
-
-    #[test]
-    fn bootstrap_defaults_reproduce_the_limits_the_runtime_hardcoded() {
-        let bootstrap = bootstrap_from_configuration("config-defaults", None, None);
-
-        let tools = bootstrap.tool_limits();
-        assert_eq!(tools.max_list_entries, 1_000);
-        assert_eq!(tools.max_search_entries, 10_000);
-        assert_eq!(tools.max_search_results, 100);
-        assert_eq!(tools.max_search_depth, 32);
-        assert_eq!(tools.operation_timeout_ms, 5_000);
-        assert_eq!(tools.bash_timeout_ms, 120_000);
-
-        let subagents = bootstrap.subagent_limits();
-        assert_eq!(subagents.max_iterations, 16);
-        assert_eq!(subagents.max_concurrency, 4);
-        assert_eq!(subagents.max_output_chars, 65_536);
-
-        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 10_000);
-        assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
-        assert!(bootstrap.debug());
-        assert_eq!(bootstrap.default_agent(), None);
-        assert_eq!(bootstrap.reasoning_effort(), None);
-    }
-
-    #[test]
-    fn project_configuration_overrides_global_settings_and_records_the_origin() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-precedence",
-            Some("[tools]\nmax_search_depth = 8\nmax_search_results = 25\n"),
-            Some("[tools]\nmax_search_depth = 4\n"),
-        );
-
-        assert_eq!(bootstrap.tool_limits().max_search_depth, 4);
-        assert_eq!(bootstrap.tool_limits().max_search_results, 25);
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_search_depth"),
-            agens_config::Origin::Project
-        );
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_search_results"),
-            agens_config::Origin::Global
-        );
-        assert_eq!(
-            bootstrap.settings().origin("tools.max_list_entries"),
-            agens_config::Origin::Default
-        );
-    }
-
-    #[test]
-    fn configured_behavioral_settings_reach_bootstrap() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-behavior",
-            Some(
-                "[options]\ndebug = true\n\n[agent]\ndefault_agent = \"reviewer\"\nreasoning_effort = \"high\"\n\n[subagents]\nmax_concurrency = 2\n",
-            ),
-            None,
-        );
-
-        assert!(bootstrap.debug());
-        assert_eq!(bootstrap.default_agent(), Some("reviewer"));
-        assert_eq!(bootstrap.reasoning_effort(), Some("high"));
-        assert_eq!(bootstrap.subagent_limits().max_concurrency, 2);
-    }
-
-    #[test]
-    fn diagnostics_are_captured_unless_debug_is_disabled() {
-        let enabled = bootstrap_from_configuration("config-debug-default", None, None);
-        let disabled = bootstrap_from_configuration(
-            "config-debug-off",
-            Some("[options]\ndebug = false\n"),
-            None,
-        );
-
-        assert!(enabled.debug());
-        assert!(!disabled.debug());
-    }
-
-    #[test]
-    fn the_configured_reasoning_effort_seeds_a_request_that_carries_none() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-effort",
-            Some("[agent]\nreasoning_effort = \"high\"\n"),
-            None,
-        );
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(
-            request.request_config.reasoning_effort(),
-            Some(agens_core::ReasoningEffort::High)
-        );
-        assert_eq!(
-            request.session_reasoning_effort,
-            Some(agens_core::ReasoningEffort::High)
-        );
-    }
-
-    #[test]
-    fn an_explicit_effort_survives_the_configured_default() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-effort-explicit",
-            Some("[agent]\nreasoning_effort = \"high\"\n"),
-            None,
-        );
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-        request.request_config = agens_core::RequestConfig::with_reasoning_effort("low").unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(
-            request.request_config.reasoning_effort(),
-            Some(agens_core::ReasoningEffort::Low)
-        );
-    }
-
-    #[test]
-    fn an_absent_configured_effort_leaves_the_request_untouched() {
-        let bootstrap = bootstrap_from_configuration("config-effort-absent", None, None);
-        let mut request = chat_request(chat_args_with_prompt("work")).unwrap();
-
-        seed_configured_reasoning_effort(&mut request, &bootstrap);
-
-        assert_eq!(request.request_config.reasoning_effort(), None);
-        assert_eq!(request.session_reasoning_effort, None);
-    }
-
-    /// `agent.system_prompt` is read straight out of the merged document with no environment
-    /// expansion of any kind — [`expand_document`] only expands `options.data_dir` and
-    /// `provider.base_url` — so a `$(...)` pattern in it stays literal, unlike MCP `command`,
-    /// `args` and `env` fields, which DO run command substitution
-    /// (`global_mcp_command_and_environment_fields_expand` in `tests/cli.rs` covers that
-    /// contrast).
-    #[test]
-    fn system_prompt_is_never_environment_expanded() {
-        let bootstrap = bootstrap_from_configuration(
-            "config-system-prompt-literal",
-            Some("[agent]\nsystem_prompt = \"literal $(printf ignored)\"\n"),
-            None,
-        );
-
-        assert_eq!(
-            bootstrap.settings().text("agent.system_prompt"),
-            Some("literal $(printf ignored)")
-        );
-    }
-
-    #[test]
-    fn a_command_line_iteration_cap_overrides_the_configured_one() {
-        assert_eq!(effective_max_iterations(Some(9), Some(5)), Some(9));
-        assert_eq!(effective_max_iterations(None, Some(5)), Some(5));
-        assert_eq!(effective_max_iterations(Some(9), None), Some(9));
-        assert_eq!(effective_max_iterations(None, None), None);
-    }
 }

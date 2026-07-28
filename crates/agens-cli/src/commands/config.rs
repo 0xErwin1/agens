@@ -9,8 +9,9 @@ use std::path::Path;
 use agens_config::{ConfiguredValue, Origin, ResolvedSettings, resolve_paths, starter_document};
 
 use crate::CliDependencies;
-use crate::bootstrap::{bootstrap, discover_project_root};
 use crate::cli;
+use crate::deps::bootstrap;
+use agens_bootstrap::discover_project_root;
 use agens_error::CliError;
 
 pub(crate) fn run_config(
@@ -39,9 +40,9 @@ pub(crate) fn run_config(
 /// existing file: the command creates configuration, it never rewrites what
 /// a user already wrote.
 fn run_config_init(dependencies: &CliDependencies, global: bool) -> Result<String, CliError> {
-    let current_directory = (dependencies.current_directory)()?;
-    let home_directory = (dependencies.home_directory)();
-    let environment = (dependencies.environment)();
+    let current_directory = (dependencies.host.current_directory)()?;
+    let home_directory = (dependencies.host.home_directory)();
+    let environment = (dependencies.host.environment)();
     let project_root = discover_project_root(&current_directory).unwrap_or(current_directory);
     let paths = resolve_paths(&project_root, home_directory.as_deref(), &environment);
     let target = if global {
@@ -50,7 +51,7 @@ fn run_config_init(dependencies: &CliDependencies, global: bool) -> Result<Strin
         &paths.project_config
     };
 
-    if (dependencies.read_file)(target)?.is_some() {
+    if (dependencies.host.read_file)(target)?.is_some() {
         return Err(CliError::configuration(format!(
             "configuration already exists at {}",
             target.display()

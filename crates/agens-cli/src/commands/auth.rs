@@ -12,9 +12,9 @@ use agens_providers::chatgpt_login::{
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
 use crate::CliDependencies;
-use crate::bootstrap::bootstrap;
 use crate::chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::cli;
+use crate::deps::bootstrap;
 use agens_error::CliError;
 
 pub(crate) fn run_auth(

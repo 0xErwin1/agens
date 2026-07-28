@@ -15,22 +15,18 @@ use std::sync::Arc;
 use agens_config::resolve_paths;
 use agens_core::HeadlessTurnCancellation;
 
-use crate::bootstrap::Bootstrap;
 use crate::commands::auth::run_production_auth_login;
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
 use crate::headless::{HeadlessChatRequest, run_production_headless_chat};
 use crate::tui::engine::run_production_tui;
+use agens_bootstrap::{Bootstrap, HostEnvironment};
 use agens_error::CliError;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
-type CurrentDirectory = Box<dyn Fn() -> Result<PathBuf, CliError>>;
-type HomeDirectory = Box<dyn Fn() -> Option<PathBuf>>;
-type Environment = Box<dyn Fn() -> BTreeMap<String, String>>;
 /// Shared, not owned, because [`Bootstrap`] keeps its own clone of this closure so it can
 /// re-read a session's own project configuration document later — after `bootstrap()` has
 /// already returned — instead of only ever answering for the process's own discovered root.
-pub(crate) type ConfigReader = Arc<dyn Fn(&Path) -> Result<Option<String>, CliError> + Send + Sync>;
 /// Creates a configuration file, failing when one already exists.
 type ConfigCreator = Box<dyn Fn(&Path, &str) -> Result<(), CliError>>;
 type HeadlessChat = Box<
@@ -40,10 +36,7 @@ type TuiLauncher = Box<dyn Fn(&Bootstrap, Option<i64>) -> Result<String, CliErro
 type AuthLogin = Box<dyn Fn(&Path, bool, &HeadlessTurnCancellation) -> Result<String, CliError>>;
 
 pub struct CliDependencies {
-    pub(crate) current_directory: CurrentDirectory,
-    pub(crate) home_directory: HomeDirectory,
-    pub(crate) environment: Environment,
-    pub(crate) read_file: ConfigReader,
+    pub(crate) host: HostEnvironment,
     pub(crate) create_file: ConfigCreator,
     pub(crate) headless_chat: HeadlessChat,
     pub(crate) tui_launcher: TuiLauncher,
@@ -53,21 +46,23 @@ pub struct CliDependencies {
 impl CliDependencies {
     pub fn production() -> Self {
         Self {
-            current_directory: Box::new(|| {
-                std::env::current_dir()
-                    .map_err(|_| CliError::configuration("working directory is unavailable"))
-            }),
-            home_directory: Box::new(|| std::env::var_os("HOME").map(PathBuf::from)),
-            environment: Box::new(|| {
-                std::env::vars()
-                    .filter(|(key, _)| !key.is_empty())
-                    .collect()
-            }),
-            read_file: Arc::new(|path| match fs::read_to_string(path) {
-                Ok(contents) => Ok(Some(contents)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(_) => Err(CliError::configuration("configuration file is unavailable")),
-            }),
+            host: HostEnvironment {
+                current_directory: Box::new(|| {
+                    std::env::current_dir()
+                        .map_err(|_| CliError::configuration("working directory is unavailable"))
+                }),
+                home_directory: Box::new(|| std::env::var_os("HOME").map(PathBuf::from)),
+                environment: Box::new(|| {
+                    std::env::vars()
+                        .filter(|(key, _)| !key.is_empty())
+                        .collect()
+                }),
+                read_file: Arc::new(|path| match fs::read_to_string(path) {
+                    Ok(contents) => Ok(Some(contents)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(_) => Err(CliError::configuration("configuration file is unavailable")),
+                }),
+            },
             create_file: Box::new(|path, contents| {
                 let home_directory = std::env::var_os("HOME").map(PathBuf::from);
                 let environment: BTreeMap<String, String> = std::env::vars()
@@ -96,10 +91,7 @@ impl CliDependencies {
         files: BTreeMap<PathBuf, String>,
     ) -> Self {
         Self {
-            current_directory: Box::new(move || Ok(current_directory.clone())),
-            home_directory: Box::new(move || home_directory.clone()),
-            environment: Box::new(move || environment.clone()),
-            read_file: Arc::new(move |path| Ok(files.get(path).cloned())),
+            host: HostEnvironment::fixed(current_directory, home_directory, environment, files),
             create_file: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             headless_chat: Box::new(|_, _, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
             tui_launcher: Box::new(|_, _| Err(CliError::unavailable(UNAVAILABLE_MESSAGE))),
@@ -143,4 +135,9 @@ impl CliDependencies {
         self.auth_login = Box::new(login);
         self
     }
+}
+
+/// The CLI's only job here: hand the resolver the host it should read.
+pub fn bootstrap(dependencies: &CliDependencies) -> Result<Bootstrap, CliError> {
+    agens_bootstrap::resolve(&dependencies.host)
 }

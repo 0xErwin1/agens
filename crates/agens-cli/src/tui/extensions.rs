@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agens_tools::{CommandCatalog, CommandDefinition, SkillCatalog};
 use agens_tui::{Engine as TuiEngine, PaletteEntry, PaletteEntryKind, Tui};
 
-use crate::bootstrap::Bootstrap;
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
 pub(crate) const RESERVED_TUI_COMMANDS: &[&str] = &[
@@ -267,7 +267,7 @@ mod tests {
     fn startup_commands_and_skills_read_the_given_root_not_the_bootstrap_process_root() {
         let temporary = tui_session_directory("extensions-root-confinement");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
-        let bootstrap_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let bootstrap_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
 
         let elsewhere = tui_session_directory("extensions-root-confinement-elsewhere");
         let elsewhere_root = elsewhere.join("project");
@@ -351,7 +351,7 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
         let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
         assert!(tui.view().dialog.is_some());
         assert!(tui.transcript().is_empty());
@@ -476,7 +476,7 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
         let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
         let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         report_tui_extension_collisions(&mut tui, &commands, &skills);
@@ -513,7 +513,7 @@ mod tests {
 
         let (tools, dispatcher) = production_tool_runtime(
             &bootstrap,
-            &crate::session_root::discovered_root_for_tests(&bootstrap),
+            &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             Some(skills.as_ref()),
         )
         .unwrap();
@@ -624,7 +624,7 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
         let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
         let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         report_tui_extension_collisions(&mut tui, &commands, &skills);
@@ -744,7 +744,7 @@ mod tests {
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::clone(&cancellation),
         });
-        let project_root = crate::session_root::discovered_root_for_tests(&bootstrap);
+        let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
         let commands = start_tui_commands(&mut tui, &bootstrap, &project_root).unwrap();
         let skills = start_tui_skills(&mut tui, &bootstrap, &project_root).unwrap();
         let router = TuiRuntimeRouter::new(

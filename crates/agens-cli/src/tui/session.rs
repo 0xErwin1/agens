@@ -205,7 +205,7 @@ impl SessionContext {
     /// `confinement_root` is required, not optional: a resumed session's tools must always be
     /// confined to the root recorded for it, and making the parameter mandatory here rules out a
     /// caller silently constructing a "resumed" context that falls back to the process's own
-    /// discovered root through [`crate::session_root::resolve_tui_session_root`]'s `None` branch.
+    /// discovered root through [`crate::session::root::resolve_tui_session_root`]'s `None` branch.
     pub(crate) fn restored(
         identifier: i64,
         metadata: SessionMetadata,

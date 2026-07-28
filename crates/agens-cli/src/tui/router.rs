@@ -23,7 +23,6 @@ use agens_tui::{
     TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
 };
 
-use crate::bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::mcp::load_configured_mcp_registry;
 use crate::session::agents::{
@@ -56,6 +55,7 @@ use crate::tui::session::{
     parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
+use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
 use agens_models::ModelSelection;
 
@@ -747,7 +747,7 @@ impl TuiRuntimeRouter {
     /// keep feeding a DIFFERENT root's skill bodies and command templates into every later turn as
     /// model-facing instruction text.
     fn refresh_session_extensions(&self, bootstrap: &Bootstrap, context: &SessionContext) {
-        let Ok(project_root) = crate::session_root::resolve_tui_session_root(context, bootstrap)
+        let Ok(project_root) = crate::session::root::resolve_tui_session_root(context, bootstrap)
         else {
             return;
         };
@@ -1295,7 +1295,8 @@ mod tests {
 
         let resume_bootstrap =
             bootstrap_from_a_different_working_directory(&origin, &format!("{label}-elsewhere"));
-        let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        let elsewhere_root =
+            agens_bootstrap::session_root::discovered_root_for_tests(&resume_bootstrap);
         write_router_test_skill(&elsewhere_root, "bskill", "INSTRUCTIONS-FROM-ROOT-B");
         std::fs::write(elsewhere_root.join("only-in-elsewhere.txt"), "b").unwrap();
 

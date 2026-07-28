@@ -1,8 +1,8 @@
 use agens_tools::ReadFileInput;
 
-use crate::bootstrap::Bootstrap;
 use crate::session::context::SessionContext;
 use crate::tools::runtime::open_native_tools;
+use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 
 const TUI_SELECT_FILE_LIMIT: usize = 100;
@@ -28,7 +28,7 @@ pub(crate) fn tui_picker_file_candidates(
 /// Bounded, ignore-aware project files read through the confined native tools,
 /// so no candidate can ever name a path outside the project root.
 ///
-/// Resolves the root through [`crate::session_root::resolve_tui_session_root`]: a resumed
+/// Resolves the root through [`crate::session::root::resolve_tui_session_root`]: a resumed
 /// session's own recorded root, or the process's own discovered root for a session that has not
 /// been created yet. This must never re-derive the process's discovered root directly, or a
 /// resumed session confined to a different root than the resuming process's working directory
@@ -38,7 +38,7 @@ pub(crate) fn tui_file_candidates_with_limit(
     bootstrap: &Bootstrap,
     limit: usize,
 ) -> Result<Vec<String>, CliError> {
-    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
     open_native_tools(&project_root, bootstrap.tool_limits())?
         .tui_file_candidates(limit)
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
@@ -78,7 +78,7 @@ pub(crate) fn expand_tui_file_reference(
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<String, CliError> {
-    let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
     let tools = open_native_tools(&project_root, bootstrap.tool_limits())?;
     let mut expanded = String::with_capacity(prompt.len());
 
@@ -133,7 +133,8 @@ mod tests {
 
         let resume_bootstrap =
             bootstrap_from_a_different_working_directory(&origin, "files-confinement-elsewhere");
-        let elsewhere_root = crate::session_root::discovered_root_for_tests(&resume_bootstrap);
+        let elsewhere_root =
+            agens_bootstrap::session_root::discovered_root_for_tests(&resume_bootstrap);
         // Deliberately a DIFFERENT filename than origin's, not just different content: a picker
         // leak must be provable by listing alone, without relying on the expansion assertion
         // below to carry the whole test.

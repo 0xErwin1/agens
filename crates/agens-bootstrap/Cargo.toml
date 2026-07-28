@@ -1,0 +1,17 @@
+[package]
+name = "agens-bootstrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
+agens-error = { path = "../agens-error" }
+agens-tools = { path = "../agens-tools" }
+toml = "0.8"
+serde_json = "1"

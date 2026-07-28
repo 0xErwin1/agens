@@ -7,13 +7,13 @@ use std::collections::BTreeSet;
 
 use agens_core::{Message, MessagePart, Role};
 
-use crate::bootstrap::Bootstrap;
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::session::context::SessionContext;
 use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::tui_model_source;
 use crate::turns::SUBAGENT_CALL_ID_PREFIX;
+use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
 use agens_tui::TuiPresentation;
