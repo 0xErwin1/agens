@@ -311,8 +311,8 @@ mod tests {
     use super::*;
     use crate::headless::provider_messages;
     use crate::permissions::permission_policy;
+    use crate::session::agents::BundledModelValidator;
     use crate::test_support::{rotation_agent, rotation_dispatcher};
-    use crate::tui::agents::BundledModelValidator;
     use crate::turns::completed_session_turn;
 
     #[test]

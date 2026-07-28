@@ -25,6 +25,7 @@ use crate::headless::{
     run_production_headless_chat_with_progress,
 };
 use crate::permissions::prompt::production_tui_permission_bridge;
+use crate::session::agents::persist_pending_agent_correction;
 use crate::session::context::{ResumeDraft, SessionContext};
 use crate::session::provider::CredentialResolver;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
@@ -32,7 +33,6 @@ use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
     production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
 };
-use crate::tui::agents::persist_pending_agent_correction;
 use crate::tui::extensions::{start_tui_commands, start_tui_skills};
 use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -498,12 +498,12 @@ mod tests {
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
     use crate::model_registry::ModelSelection;
+    use crate::session::agents::BundledModelValidator;
     use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
         tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
     };
-    use crate::tui::agents::BundledModelValidator;
 
     #[test]
     fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()

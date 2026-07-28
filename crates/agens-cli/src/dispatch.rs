@@ -383,6 +383,7 @@ mod tests {
         PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
         ProductionPromptAuthorization, prompt::production_tui_permission_bridge,
     };
+    use crate::session::agents::select_subagent;
     use crate::session::context::SessionContext;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
@@ -391,7 +392,6 @@ mod tests {
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls};
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tools::task::production_tui_task_runtime_with_runner;
-    use crate::tui::agents::select_tui_subagent;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
     use agens_core::{ToolOutcome, ToolResultFacts};
     use std::path::Path;
@@ -618,7 +618,7 @@ mod tests {
         );
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
         assert_eq!(
-            select_tui_subagent(&bootstrap, "reviewer", &session),
+            select_subagent(&bootstrap, "reviewer", &session),
             Ok("Subagent: reviewer.".to_owned())
         );
 

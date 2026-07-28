@@ -22,9 +22,9 @@ use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     SharedToolDispatcher, permission_policy,
 };
+use crate::session::agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
-use crate::tui::agents::{TaskModelValidator, task_model_catalog, tui_task_agent_catalog};
 use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
 
 pub(crate) struct ProductionTuiTaskRuntime {
@@ -175,7 +175,7 @@ pub(crate) fn register_production_task_tool<R: TaskRunner>(
 ) -> Result<(), CliError> {
     let available_models = task_model_catalog(bootstrap)?;
     let validator = TaskModelValidator::new(&available_models);
-    let agents = tui_task_agent_catalog(bootstrap, project_root)?;
+    let agents = task_agent_catalog(bootstrap, project_root)?;
     if !agents
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent)

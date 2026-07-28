@@ -18,12 +18,12 @@ use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
 use crate::model_registry::ModelSelection;
 use crate::permissions::{ParseToolInput, SharedToolDispatcher};
-use crate::session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
-use crate::session::provider::{CredentialResolver, ProviderKind};
-use crate::tui::agents::{
-    TuiAgentModelValidator, agent_rotation_error, persist_pending_agent_correction,
+use crate::session::agents::{
+    AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
     reconcile_persisted_active_agent,
 };
+use crate::session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
+use crate::session::provider::{CredentialResolver, ProviderKind};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
@@ -359,7 +359,7 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     }
     let project_root = crate::session_root::resolve_tui_session_root(&context, bootstrap)?;
     let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
-    let validator = TuiAgentModelValidator::for_context(bootstrap, &context)?;
+    let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
     let inherited_model = effective_tui_model(bootstrap, &context);
     let active_agent = ActiveAgentRuntime::build(
         &agent,

@@ -1,3 +1,9 @@
+//! Agent catalogs, rotation and model compatibility.
+//!
+//! No user interface: which agents a session may use, which models each one can
+//! run, and how rotation resolves. It sat under `tui/` with a `Tui` prefix and
+//! never referenced the terminal crate at all.
+
 //! Agent rotation and catalog discovery for the TUI: resolving the active
 //! primary agent, selecting a subagent, discovering the built-in plus
 //! configured agent catalog, and validating a candidate model against the
@@ -25,7 +31,7 @@ use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::turn::effective_tui_model;
 
-pub(crate) fn rotate_tui_agent(
+pub(crate) fn rotate_agent(
     bootstrap: &Bootstrap,
     name: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -36,11 +42,11 @@ pub(crate) fn rotate_tui_agent(
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
         (
-            TuiAgentModelValidator::for_context(bootstrap, &context)?,
+            AgentModelCompatibility::for_context(bootstrap, &context)?,
             crate::session_root::resolve_tui_session_root(&context, bootstrap)?,
         )
     };
-    let catalog = tui_agent_catalog(bootstrap, &project_root, &validator)?;
+    let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
     if session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?
@@ -85,7 +91,7 @@ pub(crate) fn rotate_tui_agent(
 }
 
 #[cfg(test)]
-pub(crate) fn list_tui_agents(
+pub(crate) fn list_agents(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<SessionContext>>,
     mode: agens_core::AgentMode,
@@ -93,7 +99,7 @@ pub(crate) fn list_tui_agents(
     let context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    let catalog = tui_agent_catalog_for_context(bootstrap, &context)?;
+    let catalog = agent_catalog_for_context(bootstrap, &context)?;
     let current = match mode {
         agens_core::AgentMode::Primary => context
             .active_agent
@@ -130,7 +136,7 @@ pub(crate) fn list_tui_agents(
     ))
 }
 
-pub(crate) fn select_tui_subagent(
+pub(crate) fn select_subagent(
     bootstrap: &Bootstrap,
     name: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -139,7 +145,7 @@ pub(crate) fn select_tui_subagent(
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?
         .clone();
-    let agents = tui_subagent_catalog(bootstrap, &snapshot)?.collect::<Vec<_>>();
+    let agents = subagent_catalog(bootstrap, &snapshot)?.collect::<Vec<_>>();
     if agents.is_empty() {
         return Err(CliError::usage("No eligible subagents are available."));
     }
@@ -157,7 +163,7 @@ pub(crate) fn select_tui_subagent(
     Ok(format!("Subagent: {}.", agent.name))
 }
 
-pub(crate) fn tui_subagent_catalog(
+pub(crate) fn subagent_catalog(
     bootstrap: &Bootstrap,
     context: &SessionContext,
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
@@ -169,7 +175,7 @@ pub(crate) fn tui_subagent_catalog(
         return Ok(Vec::new().into_iter());
     }
 
-    let agents = tui_agent_catalog_for_context(bootstrap, context)?
+    let agents = agent_catalog_for_context(bootstrap, context)?
         .subagents()
         .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
         .cloned()
@@ -177,34 +183,34 @@ pub(crate) fn tui_subagent_catalog(
     Ok(agents.into_iter())
 }
 
-pub(crate) fn tui_agent_catalog(
+pub(crate) fn agent_catalog(
     bootstrap: &Bootstrap,
     project_root: &Path,
     validator: &dyn AgentModelValidator,
 ) -> Result<AgentCatalog, CliError> {
-    discover_tui_agent_catalog(bootstrap, project_root, Some(validator))
+    discover_agent_catalog(bootstrap, project_root, Some(validator))
 }
 
 /// Resolves the session's own recorded root (falling back to the process's discovered root for a
 /// session that has not been created yet), so a resumed session's agent catalog reflects its own
 /// project-local `agents/` directory rather than the resuming process's.
-pub(crate) fn tui_agent_catalog_for_context(
+pub(crate) fn agent_catalog_for_context(
     bootstrap: &Bootstrap,
     context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
-    let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
+    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
-    tui_agent_catalog(bootstrap, &project_root, &validator)
+    agent_catalog(bootstrap, &project_root, &validator)
 }
 
-pub(crate) fn tui_task_agent_catalog(
+pub(crate) fn task_agent_catalog(
     bootstrap: &Bootstrap,
     project_root: &Path,
 ) -> Result<AgentCatalog, CliError> {
-    discover_tui_agent_catalog(bootstrap, project_root, None)
+    discover_agent_catalog(bootstrap, project_root, None)
 }
 
-pub(crate) fn discover_tui_agent_catalog(
+pub(crate) fn discover_agent_catalog(
     bootstrap: &Bootstrap,
     project_root: &Path,
     validator: Option<&dyn AgentModelValidator>,
@@ -268,11 +274,11 @@ pub(crate) fn agent_rotation_error(error: AgentRotationError) -> CliError {
 }
 
 #[derive(Clone)]
-pub(crate) struct TuiAgentModelValidator {
+pub(crate) struct AgentModelCompatibility {
     available: Arc<BTreeSet<String>>,
 }
 
-impl TuiAgentModelValidator {
+impl AgentModelCompatibility {
     pub(crate) fn for_source(source: ModelSource) -> Result<Self, CliError> {
         let available = ModelSelection::for_source("gpt-4.1", source)
             .model_values()
@@ -292,7 +298,7 @@ impl TuiAgentModelValidator {
     }
 }
 
-impl AgentModelValidator for TuiAgentModelValidator {
+impl AgentModelValidator for AgentModelCompatibility {
     fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
         self.available
             .contains(model)
@@ -415,10 +421,10 @@ pub(crate) fn reconcile_persisted_active_agent(
     context: &mut SessionContext,
 ) -> Result<AgentDefinition, CliError> {
     let name = initial_active_agent_name(context, bootstrap);
-    let validator = TuiAgentModelValidator::for_context(bootstrap, context)?;
+    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let project_root = crate::session_root::resolve_tui_session_root(context, bootstrap)?;
-    let catalog = tui_agent_catalog(bootstrap, &project_root, &validator)?;
-    let unvalidated_catalog = tui_task_agent_catalog(bootstrap, &project_root)?;
+    let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
+    let unvalidated_catalog = task_agent_catalog(bootstrap, &project_root)?;
     let resolution =
         resolve_persisted_active_agent(&name, &catalog, &unvalidated_catalog, &validator).map_err(
             |error| {
@@ -543,7 +549,7 @@ mod tests {
         .unwrap()
         .context;
 
-        let catalog = tui_agent_catalog_for_context(&resume_bootstrap, &context).unwrap();
+        let catalog = agent_catalog_for_context(&resume_bootstrap, &context).unwrap();
         assert!(
             catalog.agent("origin-only").is_some(),
             "the resumed session's own root must supply its agent catalog"
@@ -593,7 +599,7 @@ mod tests {
         ))
         .unwrap();
 
-        let catalog = tui_task_agent_catalog(&bootstrap_from_root_b, &root_a).unwrap();
+        let catalog = task_agent_catalog(&bootstrap_from_root_b, &root_a).unwrap();
         let primary = catalog.agent("primary").unwrap();
 
         assert_eq!(
@@ -617,7 +623,7 @@ mod tests {
         ))
         .unwrap();
 
-        let catalog = tui_task_agent_catalog(&bootstrap_from_root_b, &root_a).unwrap();
+        let catalog = task_agent_catalog(&bootstrap_from_root_b, &root_a).unwrap();
         let primary = catalog.agent("primary").unwrap();
 
         assert_eq!(
@@ -654,8 +660,8 @@ mod tests {
         .unwrap();
         let before = session.lock().unwrap().clone();
 
-        let error = rotate_tui_agent(&bootstrap, "missing", &session, &SkillCatalog::default())
-            .unwrap_err();
+        let error =
+            rotate_agent(&bootstrap, "missing", &session, &SkillCatalog::default()).unwrap_err();
 
         assert_eq!(error.category, "usage");
         assert_eq!(*session.lock().unwrap(), before);
@@ -691,18 +697,18 @@ mod tests {
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
 
         assert_eq!(
-            list_tui_agents(&bootstrap, &session, AgentMode::Primary).unwrap(),
+            list_agents(&bootstrap, &session, AgentMode::Primary).unwrap(),
             "Active agent: none. Available: primary, all."
         );
         assert_eq!(
-            list_tui_agents(&bootstrap, &session, AgentMode::Subagent).unwrap(),
+            list_agents(&bootstrap, &session, AgentMode::Subagent).unwrap(),
             "Subagent: none. Available: explore, general, reviewer."
         );
 
         let no_agents_temporary = tui_session_directory("no-agent-selectors");
         let no_subagents = tui_session_bootstrap(&no_agents_temporary, &[]);
         assert_eq!(
-            list_tui_agents(&no_subagents, &session, AgentMode::Subagent).unwrap(),
+            list_agents(&no_subagents, &session, AgentMode::Subagent).unwrap(),
             "Subagent: none. Available: explore, general."
         );
 

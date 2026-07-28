@@ -28,6 +28,10 @@ use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGpt
 use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::ModelSelection;
+use crate::session::agents::{
+    agent_catalog_for_context, persist_pending_agent_correction, rotate_agent, select_subagent,
+    subagent_catalog,
+};
 use crate::session::attempt::active_session_attempts;
 use crate::session::context::SessionContext;
 use crate::session::context::{current_session_timestamp, reset_session};
@@ -36,10 +40,6 @@ use crate::session::provider::{
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
 use crate::tools::task::default_model;
-use crate::tui::agents::{
-    persist_pending_agent_correction, rotate_tui_agent, select_tui_subagent,
-    tui_agent_catalog_for_context, tui_subagent_catalog,
-};
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
     RESERVED_TUI_COMMANDS, discover_skill_catalog, discover_tui_command_catalog, render_tui_help,
@@ -114,8 +114,7 @@ impl TuiRuntimeRouter {
         auth: ChatGptAuthCoordinator,
     ) -> Self {
         let has_subagents = session.lock().is_ok_and(|context| {
-            tui_subagent_catalog(&bootstrap, &context)
-                .is_ok_and(|mut agents| agents.next().is_some())
+            subagent_catalog(&bootstrap, &context).is_ok_and(|mut agents| agents.next().is_some())
         });
         let palette = resolved_tui_palette(&commands, &skills, has_subagents);
         let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
@@ -447,7 +446,7 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let catalog = tui_agent_catalog_for_context(&bootstrap, &context)?;
+                let catalog = agent_catalog_for_context(&bootstrap, &context)?;
                 let current = context
                     .active_agent
                     .as_ref()
@@ -477,7 +476,7 @@ impl TuiRuntimeRouter {
                     .session
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-                let entries = tui_subagent_catalog(&bootstrap, &context)?
+                let entries = subagent_catalog(&bootstrap, &context)?
                     .map(|agent| {
                         DialogEntry::action(&agent.name, format!("subagent:{}", agent.name))
                     })
@@ -629,9 +628,9 @@ impl TuiRuntimeRouter {
                 } else if let Some(effort) = action_id.strip_prefix("effort:") {
                     apply_tui_effort(&bootstrap, effort, &self.session)?
                 } else if let Some(agent) = action_id.strip_prefix("agent:") {
-                    rotate_tui_agent(&bootstrap, agent, &self.session, self.skills()?.as_ref())?
+                    rotate_agent(&bootstrap, agent, &self.session, self.skills()?.as_ref())?
                 } else if let Some(agent) = action_id.strip_prefix("subagent:") {
-                    select_tui_subagent(&bootstrap, agent, &self.session)?
+                    select_subagent(&bootstrap, agent, &self.session)?
                 } else {
                     return Err(CliError::usage("TUI dialog action is unavailable"));
                 };
@@ -760,8 +759,8 @@ impl TuiRuntimeRouter {
         };
         let commands = Arc::new(commands_discovery.catalog().clone());
         let skills = Arc::new(skills_discovery.catalog().clone());
-        let has_subagents = tui_subagent_catalog(bootstrap, context)
-            .is_ok_and(|mut agents| agents.next().is_some());
+        let has_subagents =
+            subagent_catalog(bootstrap, context).is_ok_and(|mut agents| agents.next().is_some());
         let palette = resolved_tui_palette(&commands, &skills, has_subagents);
         if let Ok(mut extensions) = self.extensions.lock() {
             extensions.commands = commands;
@@ -870,7 +869,7 @@ impl TuiRuntimeRouter {
                 )?
             }
             command if command.starts_with("/agent ") => TuiSubmissionOutcome::ContextChanged {
-                message: rotate_tui_agent(
+                message: rotate_agent(
                     &bootstrap,
                     &command[7..],
                     &self.session,
@@ -880,7 +879,7 @@ impl TuiRuntimeRouter {
             },
             "/agent" => self.open_dialog("agent")?,
             command if command.starts_with("/subagent ") => TuiSubmissionOutcome::ContextChanged {
-                message: select_tui_subagent(&bootstrap, &command[10..], &self.session)?,
+                message: select_subagent(&bootstrap, &command[10..], &self.session)?,
                 presentation: self.presentation()?,
             },
             "/subagent" => self.open_dialog("subagent")?,

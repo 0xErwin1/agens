@@ -1,4 +1,3 @@
-pub(crate) mod agents;
 pub(crate) mod dialogs;
 pub(crate) mod engine;
 pub(crate) mod extensions;

@@ -28,6 +28,7 @@ use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     permission_policy,
 };
+use crate::session::agents::{AgentModelCompatibility, agent_catalog};
 use crate::session::attempt::{
     AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
@@ -36,7 +37,6 @@ use crate::session::provider::ProviderKind;
 use crate::tools::child::TaskMailboxProvider;
 use crate::tools::runtime::production_tool_runtime_for_parent;
 use crate::tools::task::ProductionTuiTaskRuntime;
-use crate::tui::agents::{TuiAgentModelValidator, tui_agent_catalog};
 use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
@@ -232,9 +232,9 @@ pub(crate) fn run_production_headless_chat_with_progress(
         .and_then(ProviderKind::parse)
         .map(ProviderKind::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    let validator = TuiAgentModelValidator::for_source(source)?;
+    let validator = AgentModelCompatibility::for_source(source)?;
     let agent_catalog_root = headless_turn_project_root(bootstrap, task_runtime)?;
-    let has_task = tui_agent_catalog(bootstrap, &agent_catalog_root, &validator)?
+    let has_task = agent_catalog(bootstrap, &agent_catalog_root, &validator)?
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent);
     if has_task {
