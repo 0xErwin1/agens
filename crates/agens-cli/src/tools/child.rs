@@ -423,7 +423,7 @@ mod tests {
 
     use super::*;
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
-    use crate::permission_prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime_with_runner;
@@ -599,7 +599,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &agens_tools::SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             ProductionTaskRunner::with_progress_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

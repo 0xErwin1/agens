@@ -379,7 +379,7 @@ mod tests {
 
     use super::*;
     use crate::CliError;
-    use crate::permission_prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::session::agents::select_subagent;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
@@ -654,7 +654,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -777,7 +777,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            bridge.clone(),
+            Box::new(TuiPermissionPrompter(bridge.clone())),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -844,7 +844,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            bridge.clone(),
+            Box::new(TuiPermissionPrompter(bridge.clone())),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

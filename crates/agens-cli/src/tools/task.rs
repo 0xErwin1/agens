@@ -13,16 +13,15 @@ use agens_tools::{
     SkillCatalog, TaskControlTool, TaskExecutionRegistry, TaskMessageSource, TaskMessageTool,
     TaskModelResolutionError, TaskRunner, TaskTool, ToolDispatcher,
 };
-use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
-use crate::permission_prompt::TuiPermissionPrompter;
 use crate::session::agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
 use agens_error::CliError;
 use agens_models::default_model;
+use agens_permissions::PermissionPrompter;
 use agens_permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     SharedToolDispatcher, permission_policy,
@@ -33,7 +32,7 @@ pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) dispatcher: SharedToolDispatcher,
     pub(crate) task_registry: TaskExecutionRegistry,
     #[allow(dead_code)]
-    pub(crate) authorized: AuthorizedNativeTaskRuntime<TuiPermissionPrompter>,
+    pub(crate) authorized: AuthorizedNativeTaskRuntime<Box<dyn PermissionPrompter>>,
     /// The session root this runtime's dispatcher, permission policy, and grant scope were built
     /// against. The headless turn body reuses this value instead of re-deriving a root, so the
     /// parent turn and this runtime never disagree about which project's grants apply.
@@ -50,7 +49,7 @@ pub(crate) fn production_tui_task_runtime(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: &SkillCatalog,
-    permission_bridge: TuiPermissionBridge,
+    prompter: Box<dyn PermissionPrompter>,
     lifecycle_bridge: TuiTaskLifecycleBridge,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: String,
@@ -59,7 +58,7 @@ pub(crate) fn production_tui_task_runtime(
         bootstrap,
         project_root,
         skills,
-        permission_bridge,
+        prompter,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf())
             .with_lifecycle_bridge(lifecycle_bridge),
         parent_request_config,
@@ -72,14 +71,14 @@ pub(crate) fn production_tui_task_runtime_with_runner(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: &SkillCatalog,
-    permission_bridge: TuiPermissionBridge,
+    prompter: Box<dyn PermissionPrompter>,
     task_runner: ProductionTaskRunner,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
         project_root,
         skills,
-        permission_bridge,
+        prompter,
         task_runner,
         agens_core::RequestConfig::default(),
         None,
@@ -90,7 +89,7 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: &SkillCatalog,
-    permission_bridge: TuiPermissionBridge,
+    prompter: Box<dyn PermissionPrompter>,
     task_runner: ProductionTaskRunner,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
@@ -140,7 +139,7 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
         Arc::clone(&prompts),
     );
     let resolver = ProductionPermissionResolver::new(
-        TuiPermissionPrompter(permission_bridge),
+        prompter,
         grant_store,
         grants,
         prompts,
@@ -287,7 +286,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::permission_prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
 
     #[test]
@@ -343,7 +342,7 @@ mod tests {
                 &bootstrap_from_root_b,
                 root,
                 &SkillCatalog::default(),
-                production_tui_permission_bridge().0,
+                Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
                 ProductionTaskRunner::new(bootstrap_from_root_b.clone(), root.to_path_buf()),
                 agens_core::RequestConfig::default(),
                 None,
@@ -412,7 +411,7 @@ mod tests {
             &bootstrap,
             &project_root,
             &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 project_root.clone(),

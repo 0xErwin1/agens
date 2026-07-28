@@ -823,7 +823,7 @@ mod tests {
         use agens_store::SessionStore;
         use agens_tools::SkillCatalog;
 
-        use crate::permission_prompt::production_tui_permission_bridge;
+        use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
         use crate::test_support::{
             bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
             tui_session_bootstrap, tui_session_directory,
@@ -863,7 +863,7 @@ mod tests {
             &resume_bootstrap,
             &resolved_root,
             &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             TuiTaskLifecycleBridge::new(
                 agens_tui::BridgeTx::bounded(8).0,
                 TuiTaskControls::default(),

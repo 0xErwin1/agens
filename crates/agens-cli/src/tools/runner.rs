@@ -603,7 +603,7 @@ mod tests {
     use super::*;
     use crate::CliError;
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
-    use crate::permission_prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::task::production_tui_task_runtime_with_runner;
 
@@ -651,7 +651,7 @@ mod tests {
                 &bootstrap,
                 &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 &SkillCatalog::default(),
-                production_tui_permission_bridge().0,
+                Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
                 ProductionTaskRunner::with_probe(
                     bootstrap.clone(),
                     agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -737,7 +737,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            bridge,
+            Box::new(TuiPermissionPrompter(bridge)),
             ProductionTaskRunner::with_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -827,7 +827,7 @@ mod tests {
             &bootstrap,
             &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
             &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             ProductionTaskRunner::with_progress_probe(
                 bootstrap.clone(),
                 agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
@@ -1094,7 +1094,7 @@ mod tests {
                 &bootstrap,
                 &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
                 &SkillCatalog::default(),
-                production_tui_permission_bridge().0,
+                Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
                 ProductionTaskRunner::with_failure_probe(
                     bootstrap.clone(),
                     agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),

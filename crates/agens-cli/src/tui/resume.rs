@@ -386,7 +386,7 @@ mod tests {
 
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
-    use crate::permission_prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,
@@ -436,7 +436,7 @@ mod tests {
             &resume_bootstrap,
             &resolved_root,
             &SkillCatalog::default(),
-            production_tui_permission_bridge().0,
+            Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
             TuiTaskLifecycleBridge::new(
                 agens_tui::BridgeTx::bounded(8).0,
                 TuiTaskControls::default(),
@@ -841,7 +841,7 @@ mod tests {
             &bootstrap,
             &project_root,
             &skills,
-            permission_bridge,
+            Box::new(TuiPermissionPrompter(permission_bridge)),
             TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),

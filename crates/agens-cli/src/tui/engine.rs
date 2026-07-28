@@ -221,7 +221,7 @@ pub(crate) fn run_production_tui(
                 &runtime_bootstrap,
                 &session_project_root,
                 &skills,
-                prompt_bridge.clone(),
+                Box::new(TuiPermissionPrompter(prompt_bridge.clone())),
                 lifecycle_bridge.clone(),
                 task_parent_request_config.clone(),
                 task_diagnostic_reference.clone(),
@@ -265,7 +265,7 @@ pub(crate) fn run_production_tui(
                         &runtime_bootstrap,
                         &session_project_root,
                         &skills,
-                        prompt_bridge.clone(),
+                        Box::new(TuiPermissionPrompter(prompt_bridge.clone())),
                         ProductionTaskRunner::new(
                             runtime_bootstrap.clone(),
                             session_project_root.clone(),
