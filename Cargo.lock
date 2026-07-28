@@ -9,6 +9,7 @@ dependencies = [
  "agens-agents",
  "agens-bootstrap",
  "agens-bus",
+ "agens-callcount",
  "agens-config",
  "agens-core",
  "agens-diagnostics",
@@ -64,6 +65,10 @@ dependencies = [
 
 [[package]]
 name = "agens-bus"
+version = "0.1.0"
+
+[[package]]
+name = "agens-callcount"
 version = "0.1.0"
 
 [[package]]

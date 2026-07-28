@@ -25,6 +25,7 @@ agens-dispatch = { path = "../agens-dispatch" }
 agens-core = { path = "../agens-core" }
 agens-bootstrap = { path = "../agens-bootstrap" }
 agens-bus = { path = "../agens-bus" }
+agens-callcount = { path = "../agens-callcount" }
 agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
 agens-permissions = { path = "../agens-permissions" }

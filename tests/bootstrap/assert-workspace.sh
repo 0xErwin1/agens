@@ -9,6 +9,7 @@ jq -e '
     "agens-bus": [],
     "agens-error": ["agens-core"],
     "agens-bootstrap": ["agens-config", "agens-core", "agens-error", "agens-tools"],
+    "agens-callcount": [],
     "agens-models": ["agens-core"],
     "agens-agents": [
       "agens-bootstrap",
@@ -60,6 +61,7 @@ jq -e '
       "agens-agents",
       "agens-bootstrap",
       "agens-bus",
+      "agens-callcount",
       "agens-config",
       "agens-core",
       "agens-diagnostics",

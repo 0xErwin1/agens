@@ -1,7 +1,6 @@
 //! Fixture helpers shared by more than one module's test suite, so a consumer
-//! reaches a named function instead of duplicating setup. The call counters
-//! production code increments live in `test_counters`, which depends on
-//! nothing; see the note there.
+//! reaches a named function instead of duplicating setup. The surface-free ones
+//! come from `agens-fixtures`; what stays here is what drives a terminal.
 #![cfg(test)]
 
 use std::collections::BTreeMap;

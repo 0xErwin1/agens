@@ -224,7 +224,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
     #[cfg(test)]
-    crate::test_counters::note_production_provider_runtime();
+    agens_callcount::note_provider_runtime_build();
 
     let source = bootstrap
         .provider_type()

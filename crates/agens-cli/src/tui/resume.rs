@@ -85,7 +85,7 @@ pub(crate) fn load_tui_session_for_resume(
     identifier: i64,
 ) -> Result<LoadedTuiSessionResume, CliError> {
     #[cfg(test)]
-    crate::test_counters::note_tui_resume_load();
+    agens_callcount::note_session_resume_load();
 
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -134,7 +134,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         confinement_root,
     } = loaded;
     #[cfg(test)]
-    crate::test_counters::note_tui_resume_projection();
+    agens_callcount::note_session_resume_projection();
     let restored_history =
         Conversation::from_messages_with_parser(&session.messages, |name, input| {
             let bare = name
@@ -352,7 +352,6 @@ mod tests {
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
-    use crate::test_counters::{reset_tui_resume_test_counters, tui_resume_test_counters};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, rotation_dispatcher, tui_project,
@@ -364,6 +363,7 @@ mod tests {
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
     use agens_agents::ensure_active_agent_runtime;
+    use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
     use agens_session::attempt::attempt_failure_status;
 
     #[test]
@@ -473,7 +473,7 @@ mod tests {
 
         assert_eq!(list_tui_sessions(&bootstrap).unwrap(), "1\t1 event(s)");
 
-        reset_tui_resume_test_counters();
+        reset_call_counts();
         let resumed = resume_tui_session(
             &bootstrap,
             current.id,
@@ -486,7 +486,7 @@ mod tests {
         assert_eq!(resumed.context.messages, tui_session_messages());
         assert!(resumed.context.active_agent.is_none());
         assert_eq!(resumed.history.len(), 1);
-        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+        assert_eq!(call_counts(), Counts(1, 1, 0, 0));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -552,7 +552,7 @@ mod tests {
         let attempt_count = session_attempt_count(&store);
         drop(store);
 
-        reset_tui_resume_test_counters();
+        reset_call_counts();
         let loaded = load_tui_session_for_resume(&bootstrap, attempt.key().session_id()).unwrap();
         assert_eq!(
             loaded.retry_boundary.as_ref().map(RetryBoundary::prompt),
@@ -599,7 +599,7 @@ mod tests {
         );
         assert!(history.is_empty());
         assert_eq!(draft.as_deref(), Some(retry_prompt));
-        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+        assert_eq!(call_counts(), Counts(1, 1, 0, 0));
 
         let reopened = SessionStore::open(bootstrap.data_directory()).unwrap();
         let unchanged_attempt_count = session_attempt_count(&reopened);
@@ -788,7 +788,7 @@ mod tests {
         let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "lazy");
         drop(store);
         let skills = SkillCatalog::default();
-        reset_tui_resume_test_counters();
+        reset_call_counts();
         let resumed = resume_tui_session(
             &bootstrap,
             metadata.id,
@@ -797,7 +797,7 @@ mod tests {
         )
         .unwrap()
         .context;
-        assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
+        assert_eq!(call_counts(), Counts(1, 1, 0, 0));
         let session = Arc::new(Mutex::new(resumed));
         let (permission_bridge, _) = TuiPermissionBridge::channel();
         let (events, _) = agens_tui::BridgeTx::bounded(8);
@@ -815,7 +815,7 @@ mod tests {
         )
         .unwrap();
         ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
-        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+        assert_eq!(call_counts(), Counts(1, 1, 1, 0));
         assert_eq!(
             session
                 .lock()
@@ -850,7 +850,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(outcome, ToolEvaluationOutcome::Denied));
-        assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
+        assert_eq!(call_counts(), Counts(1, 1, 1, 0));
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -1239,7 +1239,7 @@ mod tests {
             let original = original.clone();
             let cancellation = cancellation.clone();
             move || {
-                reset_tui_resume_test_counters();
+                reset_call_counts();
                 started_sender.send(()).unwrap();
                 release_receiver.recv().unwrap();
                 let prepared = resume_tui_session(
@@ -1258,7 +1258,7 @@ mod tests {
                     |_| (Vec::new(), Vec::new()),
                 )
                 .unwrap();
-                (outcome, tui_resume_test_counters())
+                (outcome, call_counts())
             }
         });
         started_receiver.recv().unwrap();
@@ -1282,7 +1282,7 @@ mod tests {
         release_sender.send(()).unwrap();
         let (outcome, counters) = worker.join().unwrap();
         assert_eq!(outcome, TuiSubmissionOutcome::RouteCancelled);
-        assert_eq!(counters, (1, 1, 0, 0));
+        assert_eq!(counters, Counts(1, 1, 0, 0));
         assert_eq!(*session.lock().unwrap(), original);
         assert_eq!(
             SessionStore::open(bootstrap.data_directory())
