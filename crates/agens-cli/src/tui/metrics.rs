@@ -1,3 +1,4 @@
+use agens_permissions::sanitize_metric;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -5,7 +6,7 @@ use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 use agens_error::CliError;
-use agens_permissions::{ParseToolInput, contains_sensitive_marker};
+use agens_permissions::ParseToolInput;
 
 pub(crate) struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
@@ -62,7 +63,7 @@ impl TuiMetricsPublisher {
                 Some(TuiRuntimeEvent::ToolStarted {
                     call_id: id.clone(),
                     name: name.clone(),
-                    input: sanitize_tui_metric(input),
+                    input: sanitize_metric(input),
                     parsed: agens_core::ToolInput::parse(name, input),
                 })
             }
@@ -102,7 +103,7 @@ impl TuiMetricsPublisher {
                 .as_ref()
                 .is_some_and(|(name, _)| name.ends_with("::edit"))
         {
-            let lines = parse_edit_diff(&sanitize_tui_metric(content));
+            let lines = parse_edit_diff(&sanitize_metric(content));
             if !lines.is_empty() {
                 let _ = self.bridge.publish(
                     TuiRuntimeEvent::Diff {
@@ -137,14 +138,6 @@ pub(crate) fn finish_tui_metrics<T>(
 ) {
     if let Ok(mut metrics) = metrics.lock() {
         metrics.finish(result.as_ref().map(|_| ()));
-    }
-}
-
-pub(crate) fn sanitize_tui_metric(value: &str) -> String {
-    if contains_sensitive_marker(value) {
-        "[redacted]".to_owned()
-    } else {
-        value.to_owned()
     }
 }
 

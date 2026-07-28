@@ -597,6 +597,16 @@ pub fn sanitize_permission_target(tool: &str, target: &str) -> String {
     target.to_owned()
 }
 
+/// Redacts a value recorded for display when it looks like a secret. Lives with
+/// the marker it asks about rather than with whichever surface shows the metric.
+pub fn sanitize_metric(value: &str) -> String {
+    if contains_sensitive_marker(value) {
+        "[redacted]".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 pub fn contains_sensitive_marker(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     ["api_key", "authorization", "password", "secret", "token"]

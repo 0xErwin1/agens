@@ -505,3 +505,16 @@ fn string_value(document: &toml::Table, path: &[&str]) -> Option<String> {
 
     value.as_str().map(ToOwned::to_owned)
 }
+
+/// Where a run's skills come from: the global catalog beside the global config,
+/// and the project's own. Path resolution, which is this crate's job.
+pub fn discover_skill_catalog(
+    bootstrap: &Bootstrap,
+    project_root: &std::path::Path,
+) -> Result<agens_tools::SkillDiscovery, CliError> {
+    agens_tools::SkillCatalog::discover(
+        bootstrap.paths.global_config.with_file_name("skills"),
+        project_root.join(".agens/skills"),
+    )
+    .map_err(|_| CliError::configuration("skill catalog is unavailable"))
+}

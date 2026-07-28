@@ -31,8 +31,7 @@ use crate::session::agents::{
 };
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
-    RESERVED_TUI_COMMANDS, discover_skill_catalog, discover_tui_command_catalog, render_tui_help,
-    resolved_tui_palette,
+    RESERVED_TUI_COMMANDS, discover_tui_command_catalog, render_tui_help, resolved_tui_palette,
 };
 use crate::tui::files::{selected_tui_file, tui_picker_file_candidates, tui_select_candidates};
 use crate::tui::models::{
@@ -47,6 +46,7 @@ use crate::tui::session::{
     parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
+use agens_bootstrap::discover_skill_catalog;
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
 use agens_models::ModelSelection;

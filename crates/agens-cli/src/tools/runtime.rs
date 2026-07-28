@@ -21,7 +21,7 @@ use crate::mcp::{
 };
 use crate::tools::runner::ProductionTaskRunner;
 use crate::tools::task::{TaskParentSelection, register_production_task_tool};
-use crate::tui::extensions::discover_skill_catalog;
+use agens_bootstrap::discover_skill_catalog;
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_permissions::SharedToolDispatcher;

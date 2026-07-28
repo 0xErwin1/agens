@@ -1,3 +1,4 @@
+use agens_bootstrap::discover_skill_catalog;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -128,17 +129,6 @@ pub(crate) fn start_tui_skills<E: TuiEngine>(
     }
 
     Ok(Arc::new(discovery.catalog().clone()))
-}
-
-pub(crate) fn discover_skill_catalog(
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-) -> Result<agens_tools::SkillDiscovery, CliError> {
-    SkillCatalog::discover(
-        bootstrap.paths.global_config.with_file_name("skills"),
-        project_root.join(".agens/skills"),
-    )
-    .map_err(|_| CliError::configuration("skill catalog is unavailable"))
 }
 
 pub(crate) fn resolved_tui_palette(

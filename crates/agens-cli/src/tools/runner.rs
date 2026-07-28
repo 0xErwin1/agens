@@ -19,8 +19,8 @@ use agens_tui::{BridgeCancel, BridgeTx, TuiExecutionEvent, TuiRuntimeEvent, TuiS
 use crate::Bootstrap;
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
-use crate::tui::metrics::sanitize_tui_metric;
 use agens_permissions::ParseToolInput;
+use agens_permissions::sanitize_metric;
 use agens_session::context::SessionContext;
 use agens_session::context::{CompletedSubagentTurn, current_session_timestamp};
 use agens_session::turns::persist_completed_subagent_turn;
@@ -237,7 +237,7 @@ impl TuiTaskLifecycleBridge {
             } => {
                 // Parse the sanitized input so a redacted secret never
                 // survives inside `parsed`'s `Other { raw, .. }` fallback.
-                let sanitized_input = sanitize_tui_metric(&input);
+                let sanitized_input = sanitize_metric(&input);
                 let parsed = agens_core::ToolInput::parse(&name, &sanitized_input);
                 TuiSubagentEvent::tool_call_with_parsed(id, call_id, name, input, parsed)
             }
