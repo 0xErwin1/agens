@@ -22,9 +22,9 @@ use agens_tools::{
 
 use crate::diagnostics::diagnostic_store;
 use crate::dispatch::ProductionToolDispatcher;
-use crate::headless::DiscardCompletedTurnRepository;
 use crate::tools::runtime::production_child_tool_runtime;
 use crate::{Bootstrap, SubagentErrorKind, block_on_headless_turn};
+use agens_core::DiscardCompletedTurnRepository;
 use agens_permissions::{ProductionPermissionGate, SharedToolDispatcher};
 
 #[derive(Clone, Copy)]

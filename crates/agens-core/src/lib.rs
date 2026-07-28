@@ -2810,6 +2810,20 @@ mod tests {
     }
 }
 
+/// A [`CompletedTurnRepository`] that keeps nothing. For callers that run a turn
+/// without owning its history — a subagent inside a parent turn, a probe — where
+/// the alternative is threading an `Option` through every layer.
+pub struct DiscardCompletedTurnRepository;
+
+impl CompletedTurnRepository for DiscardCompletedTurnRepository {
+    fn persist_completed_turn(
+        &mut self,
+        _: CompletedTurnSnapshot,
+    ) -> impl std::future::Future<Output = Result<(), CompletedTurnStoreError>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime observation
 //

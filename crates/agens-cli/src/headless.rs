@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    BeginSessionAttemptError, CompletedTurnRepository, CompletedTurnSnapshot,
-    CompletedTurnStoreError, FactIdentity, HeadlessTurnCancellation, HeadlessTurnError, Message,
+    BeginSessionAttemptError, FactIdentity, HeadlessTurnCancellation, HeadlessTurnError, Message,
     MessagePart, PermissionMode, PermissionSession, Role, SessionMetadata, ToolResultFacts,
     TurnEvent, TurnProgressSink, run_headless_turn_with_max_iterations_and_progress,
 };
@@ -519,7 +518,7 @@ where
     };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut repository = DiscardCompletedTurnRepository;
+    let mut repository = agens_core::DiscardCompletedTurnRepository;
     let mut gate = ProductionPermissionGate::new(
         policy.clone(),
         Arc::clone(&grants),
@@ -711,17 +710,6 @@ pub(crate) fn provider_messages(
         parts: vec![MessagePart::Text(request.prompt.clone())],
     });
     messages
-}
-
-pub(crate) struct DiscardCompletedTurnRepository;
-
-impl CompletedTurnRepository for DiscardCompletedTurnRepository {
-    fn persist_completed_turn(
-        &mut self,
-        _: CompletedTurnSnapshot,
-    ) -> impl std::future::Future<Output = Result<(), CompletedTurnStoreError>> + Send {
-        std::future::ready(Ok(()))
-    }
 }
 
 /// Applies the configured reasoning effort to a request that carries none.
