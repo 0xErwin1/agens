@@ -1,100 +1,11 @@
-use agens_core::{AgentDefinition, AttemptKey, Message, SessionAttemptStatus, SessionMetadata};
-use agens_store::{SessionStore, StoredSession};
-use agens_tools::{AgentModelValidator, ToolDispatcher};
+use agens_core::{AttemptKey, Message, SessionAttemptStatus, SessionMetadata};
+use agens_store::StoredSession;
 use agens_tui::{DialogEntry, DialogView};
 
 use crate::headless::HeadlessChatRequest;
-use crate::session::context::{ActiveAgentRuntime, SessionContext};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CompletedSubagentTurn {
-    pub(crate) id: u64,
-    pub(crate) agent: String,
-    pub(crate) task: String,
-    pub(crate) final_result: String,
-    pub(crate) tool_uses: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TuiSessionMutationError {
-    Busy,
-}
-
-pub(crate) fn reset_tui_session(
-    context: &mut SessionContext,
-) -> Result<(), TuiSessionMutationError> {
-    if context.running {
-        return Err(TuiSessionMutationError::Busy);
-    }
-
-    *context = SessionContext::fresh();
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AgentRotationError {
-    Busy,
-    ModelUnavailable,
-    Persistence,
-}
-pub(crate) fn rotate_active_agent(
-    context: &mut SessionContext,
-    candidate: &AgentDefinition,
-    inherited_model: Option<&str>,
-    project: &str,
-    dispatcher: &ToolDispatcher,
-    validator: &dyn AgentModelValidator,
-    store: Option<&mut SessionStore>,
-) -> Result<(), AgentRotationError> {
-    if context.running {
-        return Err(AgentRotationError::Busy);
-    }
-    let next =
-        ActiveAgentRuntime::build(candidate, inherited_model, project, dispatcher, validator)?;
-    let reminder = context.active_agent.as_ref().and_then(|current| {
-        next.capabilities
-            .is_expansion_from(&current.capabilities)
-            .then(|| {
-                format!(
-                    "Agent capabilities expanded: {} -> {}.",
-                    current.name, next.name
-                )
-            })
-    });
-
-    let metadata = match (&context.metadata, store) {
-        (Some(metadata), Some(store)) => {
-            let mut metadata = metadata.clone();
-            metadata.active_agent = next.name.clone();
-            metadata.updated_at = session_timestamp().ok_or(AgentRotationError::Persistence)?;
-            store
-                .update_session(&metadata)
-                .map_err(|_| AgentRotationError::Persistence)?;
-            Some(metadata)
-        }
-        (Some(_), None) => return Err(AgentRotationError::Persistence),
-        (None, _) => None,
-    };
-
-    context.active_agent = Some(next);
-    context.metadata = metadata;
-    if reminder.is_some() {
-        context.pending_system_reminder = reminder;
-    }
-
-    Ok(())
-}
-
-fn session_timestamp() -> Option<i64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-}
-
-pub(crate) fn current_session_timestamp() -> i64 {
-    session_timestamp().unwrap_or_default()
-}
+#[cfg(test)]
+use crate::session::context::ActiveAgentRuntime;
+use crate::session::context::SessionContext;
 
 pub(crate) fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
     let mut parts = action_id.split(':');
@@ -382,6 +293,10 @@ impl SessionContext {
 
 #[cfg(test)]
 mod tests {
+    use crate::session::context::{
+        AgentRotationError, SessionMutationError, reset_session, rotate_active_agent,
+    };
+    use agens_store::SessionStore;
     use std::sync::{Arc, Mutex};
 
     use agens_core::{
@@ -705,10 +620,7 @@ mod tests {
         context.running = true;
         let original = context.clone();
 
-        assert_eq!(
-            reset_tui_session(&mut context),
-            Err(TuiSessionMutationError::Busy)
-        );
+        assert_eq!(reset_session(&mut context), Err(SessionMutationError::Busy));
         assert_eq!(context, original);
     }
 
@@ -735,7 +647,7 @@ mod tests {
         }];
         context.selected_subagent = Some("reviewer".into());
 
-        reset_tui_session(&mut context).expect("idle reset should synchronize the backend state");
+        reset_session(&mut context).expect("idle reset should synchronize the backend state");
 
         assert_eq!(context, SessionContext::fresh());
     }

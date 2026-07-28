@@ -281,7 +281,7 @@ pub(crate) fn run_session_attempt_lifecycle_with_terminal_writer(
                     status: attempt_failure_status(&error),
                     metadata: &metadata,
                     prompt: &prompt,
-                    finished_at: crate::tui::session::current_session_timestamp(),
+                    finished_at: crate::session::context::current_session_timestamp(),
                 },
             )
             .ok()
@@ -299,7 +299,7 @@ pub(crate) fn run_session_attempt_lifecycle_with_terminal_writer(
             attempt.key(),
             &metadata,
             &turn,
-            crate::tui::session::current_session_timestamp(),
+            crate::session::context::current_session_timestamp(),
         )
         .map_err(|error| {
             CliError::storage(format!("completed session could not be saved: {error}"))

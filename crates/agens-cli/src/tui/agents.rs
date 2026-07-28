@@ -17,12 +17,12 @@ use crate::diagnostics::record_agent_diagnostic;
 use crate::error::CliError;
 use crate::model_registry::{ModelSelection, ModelSource};
 use crate::session::context::SessionContext;
+use crate::session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use crate::session::provider::ProviderKind;
 use crate::tools::runtime::production_tool_runtime;
 use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
-use crate::tui::session::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use crate::tui::turn::effective_tui_model;
 
 pub(crate) fn rotate_tui_agent(

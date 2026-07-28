@@ -6,11 +6,11 @@
 //! they do this module is not yet listed in the surface-boundary check.
 
 use agens_core::{AgentDefinition, Message, SessionMetadata};
+use agens_store::SessionStore;
 use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
 
 use crate::model_registry::ModelSelection;
 use crate::session::provider::ProviderKind;
-use crate::tui::session::AgentRotationError;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionContext {
@@ -97,4 +97,91 @@ impl ActiveAgentRuntime {
             capabilities: EffectiveCapabilitySet::from_agent(agent, project, dispatcher),
         })
     }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedSubagentTurn {
+    pub(crate) id: u64,
+    pub(crate) agent: String,
+    pub(crate) task: String,
+    pub(crate) final_result: String,
+    pub(crate) tool_uses: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionMutationError {
+    Busy,
+}
+
+pub(crate) fn reset_session(context: &mut SessionContext) -> Result<(), SessionMutationError> {
+    if context.running {
+        return Err(SessionMutationError::Busy);
+    }
+
+    *context = SessionContext::fresh();
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentRotationError {
+    Busy,
+    ModelUnavailable,
+    Persistence,
+}
+pub(crate) fn rotate_active_agent(
+    context: &mut SessionContext,
+    candidate: &AgentDefinition,
+    inherited_model: Option<&str>,
+    project: &str,
+    dispatcher: &ToolDispatcher,
+    validator: &dyn AgentModelValidator,
+    store: Option<&mut SessionStore>,
+) -> Result<(), AgentRotationError> {
+    if context.running {
+        return Err(AgentRotationError::Busy);
+    }
+    let next =
+        ActiveAgentRuntime::build(candidate, inherited_model, project, dispatcher, validator)?;
+    let reminder = context.active_agent.as_ref().and_then(|current| {
+        next.capabilities
+            .is_expansion_from(&current.capabilities)
+            .then(|| {
+                format!(
+                    "Agent capabilities expanded: {} -> {}.",
+                    current.name, next.name
+                )
+            })
+    });
+
+    let metadata = match (&context.metadata, store) {
+        (Some(metadata), Some(store)) => {
+            let mut metadata = metadata.clone();
+            metadata.active_agent = next.name.clone();
+            metadata.updated_at = session_timestamp().ok_or(AgentRotationError::Persistence)?;
+            store
+                .update_session(&metadata)
+                .map_err(|_| AgentRotationError::Persistence)?;
+            Some(metadata)
+        }
+        (Some(_), None) => return Err(AgentRotationError::Persistence),
+        (None, _) => None,
+    };
+
+    context.active_agent = Some(next);
+    context.metadata = metadata;
+    if reminder.is_some() {
+        context.pending_system_reminder = reminder;
+    }
+
+    Ok(())
+}
+
+fn session_timestamp() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+}
+
+pub(crate) fn current_session_timestamp() -> i64 {
+    session_timestamp().unwrap_or_default()
 }

@@ -423,10 +423,10 @@ mod tests {
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
     use crate::permissions::prompt::production_tui_permission_bridge;
     use crate::session::context::SessionContext;
+    use crate::session::context::current_session_timestamp;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime_with_runner;
-    use crate::tui::session::current_session_timestamp;
 
     struct RecordingMailboxProvider {
         queued: Arc<Mutex<Vec<Vec<Message>>>>,

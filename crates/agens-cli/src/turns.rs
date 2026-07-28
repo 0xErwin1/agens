@@ -10,10 +10,10 @@ use agens_core::{
 };
 use agens_store::SessionStore;
 
+use crate::session::context::CompletedSubagentTurn;
 use crate::session::context::SessionContext;
 use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
-use crate::tui::session::CompletedSubagentTurn;
 use crate::{Bootstrap, CliError};
 
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing

@@ -30,6 +30,7 @@ use crate::mcp::load_configured_mcp_registry;
 use crate::model_registry::ModelSelection;
 use crate::session::attempt::active_session_attempts;
 use crate::session::context::SessionContext;
+use crate::session::context::{current_session_timestamp, reset_session};
 use crate::session::provider::{
     ChatGptCredentialSnapshot, CredentialResolver, CredentialStatus, ProviderKind,
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
@@ -54,8 +55,7 @@ use crate::tui::resume::{
     prepare_loaded_tui_session_resume, resume_tui_session, tui_project_identifier,
 };
 use crate::tui::session::{
-    current_session_timestamp, parse_recovery_action, recovery_confirmation_dialog,
-    reset_tui_session, session_dialog_entry,
+    parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
 
@@ -833,7 +833,7 @@ impl TuiRuntimeRouter {
                 let mut session = self.session.lock().map_err(|_| {
                     CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
                 })?;
-                reset_tui_session(&mut session)
+                reset_session(&mut session)
                     .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
                 drop(session);
                 TuiSubmissionOutcome::ResetSucceeded {
