@@ -11,10 +11,10 @@ use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::model_registry;
-use crate::model_registry::TuiModelSelector;
+use crate::model_registry::ModelSelection;
 use crate::session::context::SessionContext;
+use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
-use crate::tui::provider::TuiProvider;
 use crate::tui_model_source;
 use crate::turns::SUBAGENT_CALL_ID_PREFIX;
 use agens_tui::TuiPresentation;
@@ -93,7 +93,7 @@ pub(crate) fn subagent_call_id(part: &MessagePart) -> Option<&str> {
 pub(crate) fn current_tui_provider(
     bootstrap: &Bootstrap,
     context: &SessionContext,
-) -> Option<TuiProvider> {
+) -> Option<ProviderKind> {
     if context.chatgpt_unavailable {
         return None;
     }
@@ -108,14 +108,14 @@ pub(crate) fn current_tui_provider(
     }
     context
         .provider
-        .or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse))
+        .or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse))
 }
 
 pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &SessionContext) -> String {
     context
         .selection
         .as_ref()
-        .map(TuiModelSelector::model)
+        .map(ModelSelection::model)
         .or_else(|| {
             context
                 .metadata
@@ -136,7 +136,7 @@ pub(crate) fn tui_session_presentation(
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.provider_id.as_deref())
-        .or_else(|| current_tui_provider(bootstrap, session).map(TuiProvider::identifier))
+        .or_else(|| current_tui_provider(bootstrap, session).map(ProviderKind::identifier))
         .unwrap_or_else(|| bootstrap.provider_type().unwrap_or("provider"));
     let label = session
         .identifier
@@ -150,7 +150,7 @@ pub(crate) fn tui_session_presentation(
                 .or_else(|| selection.reasoning_effort_default())
         })
         .or_else(|| {
-            TuiModelSelector::for_source(&model, tui_model_source(bootstrap, session))
+            ModelSelection::for_source(&model, tui_model_source(bootstrap, session))
                 .reasoning_effort_default()
         });
     let mut presentation = TuiPresentation::new(provider, &model, label)

@@ -8,8 +8,8 @@
 use agens_core::{AgentDefinition, Message, SessionMetadata};
 use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
 
-use crate::model_registry::TuiModelSelector;
-use crate::tui::provider::TuiProvider;
+use crate::model_registry::ModelSelection;
+use crate::session::provider::ProviderKind;
 use crate::tui::session::AgentRotationError;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -24,8 +24,8 @@ pub(crate) struct SessionContext {
     pub(crate) messages: Vec<Message>,
     pub(crate) active_agent: Option<ActiveAgentRuntime>,
     pub(crate) pending_system_reminder: Option<String>,
-    pub(crate) selection: Option<TuiModelSelector>,
-    pub(crate) provider: Option<TuiProvider>,
+    pub(crate) selection: Option<ModelSelection>,
+    pub(crate) provider: Option<ProviderKind>,
     pub(crate) chatgpt_unavailable: bool,
     pub(crate) resume_error: Option<String>,
     pub(crate) resume_notice: Option<String>,

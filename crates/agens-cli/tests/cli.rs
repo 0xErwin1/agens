@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use agens::{
-    CliDependencies, ExitStatus, TuiModelSelector, TuiModelSource, bootstrap, execute, execute_os,
+    CliDependencies, ExitStatus, ModelSelection, ModelSource, bootstrap, execute, execute_os,
     execute_with_cancellation,
 };
 use agens_core::{
@@ -1175,7 +1175,7 @@ fn tui_resume_shapes_reach_the_injected_tui_launcher() {
 
 #[test]
 fn tui_model_selector_applies_verified_api_catalog_and_preserves_state_on_refusal() {
-    let mut selector = TuiModelSelector::new("gpt-4.1");
+    let mut selector = ModelSelection::new("gpt-4.1");
 
     assert_eq!(
         selector
@@ -1212,9 +1212,8 @@ fn tui_model_selector_applies_verified_api_catalog_and_preserves_state_on_refusa
 
 #[test]
 fn tui_model_selector_exposes_only_models_compatible_with_the_effective_source() {
-    let mut api = TuiModelSelector::for_source("gpt-5.5", TuiModelSource::OpenAiApi);
-    let mut subscription =
-        TuiModelSelector::for_source("gpt-5.5", TuiModelSource::ChatGptSubscription);
+    let mut api = ModelSelection::for_source("gpt-5.5", ModelSource::OpenAiApi);
+    let mut subscription = ModelSelection::for_source("gpt-5.5", ModelSource::ChatGptSubscription);
 
     assert!(
         api.model_values()
@@ -1248,7 +1247,7 @@ fn tui_model_selector_exposes_only_models_compatible_with_the_effective_source()
 
 #[test]
 fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_without_mutation() {
-    let mut selector = TuiModelSelector::for_source("gpt-5.5", TuiModelSource::OpenAiApi);
+    let mut selector = ModelSelection::for_source("gpt-5.5", ModelSource::OpenAiApi);
 
     assert_eq!(
         selector.reasoning_effort_values(),
@@ -1271,8 +1270,7 @@ fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_withou
     );
     assert_eq!(selector.reasoning_effort(), Some("xhigh"));
 
-    let mut subscription =
-        TuiModelSelector::for_source("gpt-5.5", TuiModelSource::ChatGptSubscription);
+    let mut subscription = ModelSelection::for_source("gpt-5.5", ModelSource::ChatGptSubscription);
     assert_eq!(
         subscription.reasoning_effort_values(),
         [
@@ -1288,14 +1286,11 @@ fn tui_model_selector_applies_typed_effort_and_refuses_unsupported_values_withou
         Some(ReasoningEffort::Low)
     );
 
-    let non_reasoning = TuiModelSelector::new("gpt-4.1");
+    let non_reasoning = ModelSelection::new("gpt-4.1");
     assert_eq!(non_reasoning.reasoning_effort_values(), ["default"]);
 
-    for source in [
-        TuiModelSource::OpenAiApi,
-        TuiModelSource::ChatGptSubscription,
-    ] {
-        let mut gpt_5_6 = TuiModelSelector::for_source("gpt-5.6", source);
+    for source in [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription] {
+        let mut gpt_5_6 = ModelSelection::for_source("gpt-5.6", source);
         assert_eq!(gpt_5_6.reasoning_effort_default(), Some("medium"));
         assert_eq!(
             gpt_5_6.reasoning_effort_values(),

@@ -13,6 +13,7 @@ set -euo pipefail
 
 declare -a LOGIC_MODULES=(
   "crates/agens-cli/src/permissions.rs"
+  "crates/agens-cli/src/session/provider.rs"
 )
 
 # Names that only exist because a human is watching.

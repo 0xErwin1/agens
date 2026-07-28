@@ -114,12 +114,12 @@ mod tests {
     use agens_tui::Tui;
 
     use super::*;
+    use crate::session::provider::CredentialResolver;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
         tui_session_bootstrap, tui_session_directory,
     };
     use crate::tui::engine::ProductionTuiEngine;
-    use crate::tui::provider::TuiCredentialResolver;
     use crate::tui::resume::resume_tui_session;
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
             &resume_bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap()
         .context;

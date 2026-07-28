@@ -26,6 +26,7 @@ use crate::headless::{
 };
 use crate::permissions::prompt::production_tui_permission_bridge;
 use crate::session::context::{ResumeDraft, SessionContext};
+use crate::session::provider::CredentialResolver;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
@@ -36,7 +37,6 @@ use crate::tui::extensions::{start_tui_commands, start_tui_skills};
 use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::models::seed_remembered_tui_selection;
-use crate::tui::provider::TuiCredentialResolver;
 use crate::tui::resume::{
     ResumedTuiSession, ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
 };
@@ -82,7 +82,7 @@ pub(crate) fn run_production_tui(
             bootstrap,
             identifier,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )?;
         persist_pending_agent_correction(bootstrap, &mut resumed);
         let presentation = tui_session_presentation(bootstrap, &resumed);
@@ -497,7 +497,7 @@ mod tests {
     use super::*;
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
-    use crate::model_registry::TuiModelSelector;
+    use crate::model_registry::ModelSelection;
     use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
@@ -908,7 +908,7 @@ mod tests {
             messages: tui_session_messages(),
             active_agent: Some(active_agent),
             pending_system_reminder: Some("previous reminder".into()),
-            selection: Some(TuiModelSelector::new("gpt-4.1")),
+            selection: Some(ModelSelection::new("gpt-4.1")),
             selected_subagent: Some("reviewer".into()),
             ..SessionContext::fresh()
         }));
@@ -1206,7 +1206,7 @@ mod tests {
             &bootstrap,
             persisted.metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::with_environment(BTreeMap::from([(
+            &CredentialResolver::with_environment(BTreeMap::from([(
                 "OPENAI_API_KEY".into(),
                 "test-key".into(),
             )])),

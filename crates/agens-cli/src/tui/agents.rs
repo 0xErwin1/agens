@@ -15,12 +15,12 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 use crate::bootstrap::Bootstrap;
 use crate::diagnostics::record_agent_diagnostic;
 use crate::error::CliError;
-use crate::model_registry::{TuiModelSelector, TuiModelSource};
+use crate::model_registry::{ModelSelection, ModelSource};
 use crate::session::context::SessionContext;
+use crate::session::provider::ProviderKind;
 use crate::tools::runtime::production_tool_runtime;
 use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
-use crate::tui::provider::TuiProvider;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::session::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use crate::tui::turn::effective_tui_model;
@@ -163,7 +163,7 @@ pub(crate) fn tui_subagent_catalog(
 ) -> Result<impl Iterator<Item = AgentDefinition>, CliError> {
     if bootstrap
         .provider_type()
-        .and_then(TuiProvider::parse)
+        .and_then(ProviderKind::parse)
         .is_none()
     {
         return Ok(Vec::new().into_iter());
@@ -273,8 +273,8 @@ pub(crate) struct TuiAgentModelValidator {
 }
 
 impl TuiAgentModelValidator {
-    pub(crate) fn for_source(source: TuiModelSource) -> Result<Self, CliError> {
-        let available = TuiModelSelector::for_source("gpt-4.1", source)
+    pub(crate) fn for_source(source: ModelSource) -> Result<Self, CliError> {
+        let available = ModelSelection::for_source("gpt-4.1", source)
             .model_values()
             .map_err(CliError::unavailable)?
             .into_iter()
@@ -307,18 +307,15 @@ pub(crate) struct BundledModelValidator;
 #[cfg(test)]
 impl AgentModelValidator for BundledModelValidator {
     fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        [
-            TuiModelSource::OpenAiApi,
-            TuiModelSource::ChatGptSubscription,
-        ]
-        .into_iter()
-        .any(|source| {
-            TuiModelSelector::for_source(model, source)
-                .model_values()
-                .is_ok_and(|models| models.iter().any(|candidate| candidate == model))
-        })
-        .then_some(())
-        .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+        [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription]
+            .into_iter()
+            .any(|source| {
+                ModelSelection::for_source(model, source)
+                    .model_values()
+                    .is_ok_and(|models| models.iter().any(|candidate| candidate == model))
+            })
+            .then_some(())
+            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
     }
 }
 
@@ -492,10 +489,10 @@ impl AgentModelValidator for TaskModelValidator {
 pub(crate) fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError> {
     let source = bootstrap
         .provider_type()
-        .and_then(TuiProvider::parse)
-        .map(TuiProvider::source)
+        .and_then(ProviderKind::parse)
+        .map(ProviderKind::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    TuiModelSelector::for_source(default_model(bootstrap), source)
+    ModelSelection::for_source(default_model(bootstrap), source)
         .model_values()
         .map_err(CliError::unavailable)
 }
@@ -505,12 +502,12 @@ mod tests {
     use agens_core::{AgentMode, SessionMetadata};
 
     use super::*;
+    use crate::session::provider::CredentialResolver;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
         persist_tui_session, rotation_dispatcher, tui_project, tui_session_bootstrap,
         tui_session_directory,
     };
-    use crate::tui::provider::TuiCredentialResolver;
     use crate::tui::resume::resume_tui_session;
 
     #[test]
@@ -541,7 +538,7 @@ mod tests {
             &resume_bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap()
         .context;
@@ -644,7 +641,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap()
         .context;

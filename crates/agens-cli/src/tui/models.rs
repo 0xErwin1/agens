@@ -10,17 +10,17 @@ use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 use crate::bootstrap::Bootstrap;
 use crate::error::{CliError, ExitStatus};
 use crate::model_registry;
-use crate::model_registry::{TuiModelSelector, TuiModelSource};
+use crate::model_registry::{ModelSelection, ModelSource};
 use crate::session::context::SessionContext;
+use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
-use crate::tui::provider::TuiProvider;
 use crate::tui::turn::current_tui_provider;
 
 pub(crate) fn apply_tui_selection(
     bootstrap: &Bootstrap,
     context: &mut SessionContext,
-    provider: TuiProvider,
-    selector: TuiModelSelector,
+    provider: ProviderKind,
+    selector: ModelSelection,
 ) -> Result<(), CliError> {
     if let Some(mut metadata) = context.metadata.clone() {
         metadata.provider_id = Some(provider.identifier().into());
@@ -69,7 +69,7 @@ pub(crate) fn seed_remembered_tui_selection(
     };
     let source = tui_model_source(bootstrap, context);
     let default = default_model(bootstrap);
-    let mut selector = TuiModelSelector::for_source(default, source);
+    let mut selector = ModelSelection::for_source(default, source);
     if selector.apply_model(preference.model()).is_err() {
         return Some(format!(
             "Remembered model {} is unavailable for {}; using {default}.",
@@ -91,9 +91,9 @@ pub(crate) fn seed_remembered_tui_selection(
     notice
 }
 
-pub(crate) fn tui_model_source(bootstrap: &Bootstrap, context: &SessionContext) -> TuiModelSource {
+pub(crate) fn tui_model_source(bootstrap: &Bootstrap, context: &SessionContext) -> ModelSource {
     current_tui_provider(bootstrap, context)
-        .unwrap_or(TuiProvider::OpenAiApi)
+        .unwrap_or(ProviderKind::OpenAiApi)
         .source()
 }
 
@@ -132,8 +132,7 @@ pub(crate) fn select_tui_model(
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        let selector =
-            TuiModelSelector::for_source("gpt-4.1", tui_model_source(bootstrap, &context));
+        let selector = ModelSelection::for_source("gpt-4.1", tui_model_source(bootstrap, &context));
         let values = selector
             .model_values()
             .map_err(CliError::unavailable)?
@@ -159,7 +158,7 @@ pub(crate) fn apply_tui_model(
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     let mut selector = context.selection.clone().unwrap_or_else(|| {
-        TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context))
+        ModelSelection::for_source(model, tui_model_source(bootstrap, &context))
     });
     let previous_effort = selector.reasoning_effort();
     selector
@@ -188,7 +187,7 @@ pub(crate) fn apply_tui_unverified_model(
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     let mut selector = context.selection.clone().unwrap_or_else(|| {
-        TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context))
+        ModelSelection::for_source(model, tui_model_source(bootstrap, &context))
     });
     let reset_effort = selector.reasoning_effort().is_some();
     selector
@@ -241,7 +240,7 @@ pub(crate) fn apply_tui_effort(
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
         .unwrap_or_else(|| default_model(bootstrap));
-    let mut selector = TuiModelSelector::for_source(model, tui_model_source(bootstrap, &context));
+    let mut selector = ModelSelection::for_source(model, tui_model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)
         .map_err(CliError::configuration)?;
@@ -419,7 +418,7 @@ mod tests {
             context
                 .selection
                 .as_ref()
-                .and_then(TuiModelSelector::reasoning_effort),
+                .and_then(ModelSelection::reasoning_effort),
             Some("high")
         );
 

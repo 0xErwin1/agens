@@ -27,9 +27,13 @@ use crate::bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
-use crate::model_registry::TuiModelSelector;
+use crate::model_registry::ModelSelection;
 use crate::session::attempt::active_session_attempts;
 use crate::session::context::SessionContext;
+use crate::session::provider::{
+    ChatGptCredentialSnapshot, CredentialResolver, CredentialStatus, ProviderKind,
+    restore_chatgpt_credentials, snapshot_chatgpt_credentials,
+};
 use crate::tools::task::default_model;
 use crate::tui::agents::{
     persist_pending_agent_correction, rotate_tui_agent, select_tui_subagent,
@@ -44,10 +48,6 @@ use crate::tui::files::{selected_tui_file, tui_picker_file_candidates, tui_selec
 use crate::tui::models::{
     apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
     format_model_metadata, select_tui_effort, select_tui_model, tui_model_source,
-};
-use crate::tui::provider::{
-    ChatGptCredentialSnapshot, TuiCredentialResolver, TuiProvider, TuiProviderStatus,
-    restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
 use crate::tui::resume::{
     ResumedTuiSession, commit_tui_session_resume, load_tui_session_for_resume,
@@ -67,7 +67,7 @@ pub(crate) struct TuiRuntimeRouter {
     pub(crate) session: Arc<Mutex<SessionContext>>,
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
-    credentials: TuiCredentialResolver,
+    credentials: CredentialResolver,
     /// Commands, skills, and the derived command palette, bundled behind one lock so a
     /// post-startup resume can swap all three atomically to the resumed session's own root
     /// instead of leaving them pinned to whatever root the router was constructed with.
@@ -133,7 +133,7 @@ impl TuiRuntimeRouter {
             session,
             cancellation,
             auth,
-            credentials: TuiCredentialResolver::production(),
+            credentials: CredentialResolver::production(),
             extensions: Arc::new(Mutex::new(RouterExtensions {
                 commands,
                 skills,
@@ -165,7 +165,7 @@ impl TuiRuntimeRouter {
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
         commands: Arc<CommandCatalog>,
         skills: Arc<SkillCatalog>,
-        credentials: TuiCredentialResolver,
+        credentials: CredentialResolver,
     ) -> Self {
         let mut router = Self::new(bootstrap, session, cancellation, commands, skills);
         router.credentials = credentials;
@@ -286,7 +286,7 @@ impl TuiRuntimeRouter {
                     .lock()
                     .map_err(|_| CliError::storage("TUI session is unavailable"))?;
                 let current = current_tui_provider(&bootstrap, &context);
-                let entries = TuiProvider::ALL
+                let entries = ProviderKind::ALL
                     .into_iter()
                     .filter_map(|provider| {
                         let status = self
@@ -312,7 +312,7 @@ impl TuiRuntimeRouter {
                         let status = self
                             .credentials
                             .status(&bootstrap.paths.credentials, provider);
-                        let remediation = matches!(status, TuiProviderStatus::ConnectRequired)
+                        let remediation = matches!(status, CredentialStatus::ConnectRequired)
                             .then_some(" · run /connect")
                             .unwrap_or_default();
                         format!(
@@ -332,13 +332,13 @@ impl TuiRuntimeRouter {
                 let current = context
                     .selection
                     .as_ref()
-                    .map(TuiModelSelector::model)
+                    .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(&bootstrap))
                     .to_owned();
                 let source = tui_model_source(&bootstrap, &context);
                 drop(context);
-                let selector = TuiModelSelector::for_source(current.clone(), source);
+                let selector = ModelSelection::for_source(current.clone(), source);
                 let values = selector.models().map_err(CliError::unavailable)?;
                 let selected = values
                     .iter()
@@ -380,11 +380,11 @@ impl TuiRuntimeRouter {
                 let model = context
                     .selection
                     .as_ref()
-                    .map(TuiModelSelector::model)
+                    .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| default_model(&bootstrap));
                 let selector = context.selection.clone().unwrap_or_else(|| {
-                    TuiModelSelector::for_source(model, tui_model_source(&bootstrap, &context))
+                    ModelSelection::for_source(model, tui_model_source(&bootstrap, &context))
                 });
                 let current = selector.reasoning_effort().unwrap_or("default");
                 let values = selector.reasoning_effort_values();
@@ -976,14 +976,14 @@ impl TuiRuntimeRouter {
 
         bootstrap.provider_type = Some(provider.identifier().into());
         bootstrap.openai_api_key = match provider {
-            TuiProvider::OpenAiApi => Some(
+            ProviderKind::OpenAiApi => Some(
                 self.credentials
                     .api_key(&bootstrap.paths.credentials)
                     .ok_or_else(|| {
                         CliError::authentication("OpenAI API authentication is unavailable")
                     })?,
             ),
-            TuiProvider::OpenAiChatGpt => {
+            ProviderKind::OpenAiChatGpt => {
                 if !self
                     .credentials
                     .status(&bootstrap.paths.credentials, provider)
@@ -1136,7 +1136,7 @@ impl TuiRuntimeRouter {
     }
 
     fn apply_provider(&self, bootstrap: &Bootstrap, provider: &str) -> Result<String, CliError> {
-        let provider = TuiProvider::parse(provider)
+        let provider = ProviderKind::parse(provider)
             .ok_or_else(|| CliError::usage("provider is not implemented"))?;
         let mut context = self
             .session
@@ -1149,7 +1149,7 @@ impl TuiRuntimeRouter {
             .credentials
             .status(&bootstrap.paths.credentials, provider);
         if !status.available() {
-            let message = if provider == TuiProvider::OpenAiChatGpt {
+            let message = if provider == ProviderKind::OpenAiChatGpt {
                 "ChatGPT subscription requires connection; run /connect"
             } else {
                 "OpenAI API credentials are unavailable"
@@ -1161,8 +1161,8 @@ impl TuiRuntimeRouter {
         let previous_effort = context
             .selection
             .as_ref()
-            .and_then(TuiModelSelector::reasoning_effort);
-        let mut next = TuiModelSelector::for_source(&current_model, provider.source());
+            .and_then(ModelSelection::reasoning_effort);
+        let mut next = ModelSelection::for_source(&current_model, provider.source());
         let compatible = next
             .model_values()
             .map_err(CliError::unavailable)?
@@ -1182,7 +1182,7 @@ impl TuiRuntimeRouter {
         } else {
             let previous = current_model.clone();
             let default = ["gpt-4.1", "gpt-5.5"][provider as usize];
-            next = TuiModelSelector::for_source(default, provider.source());
+            next = ModelSelection::for_source(default, provider.source());
             format!(
                 "Provider: {label}. Model reset to {default} and reasoning effort reset to Default because {previous} is unavailable."
             )
@@ -1251,7 +1251,7 @@ mod tests {
 
     use super::*;
     use crate::headless::HeadlessChatCompletion;
-    use crate::model_registry::TuiModelSource;
+    use crate::model_registry::ModelSource;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1733,7 +1733,7 @@ mod tests {
         assert_eq!(progress_rx.try_iter().count(), 1);
         assert_eq!(*flows.lock().unwrap(), vec![ChatGptAuthFlow::Device]);
         let context = session.lock().unwrap();
-        assert_eq!(context.provider, Some(TuiProvider::OpenAiChatGpt));
+        assert_eq!(context.provider, Some(ProviderKind::OpenAiChatGpt));
         assert!(context.messages.is_empty());
         drop(context);
         let configured = router.bootstrap().unwrap();
@@ -1744,7 +1744,7 @@ mod tests {
         assert!(router.disconnect().is_ok());
         assert_eq!(
             session.lock().unwrap().provider,
-            Some(TuiProvider::OpenAiApi)
+            Some(ProviderKind::OpenAiApi)
         );
         let stored = std::fs::read_to_string(&credentials_path).unwrap();
         assert!(stored.contains("preserved"));
@@ -1822,7 +1822,7 @@ mod tests {
         bootstrap.provider_source = ProviderSource::ExplicitChatGpt;
         bootstrap.provider_type = Some("openai-chatgpt".into());
         let session = Arc::new(Mutex::new(SessionContext {
-            provider: Some(TuiProvider::OpenAiChatGpt),
+            provider: Some(ProviderKind::OpenAiChatGpt),
             ..SessionContext::fresh()
         }));
         ensure_active_tui_agent_runtime(
@@ -1912,7 +1912,7 @@ mod tests {
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.paths.credentials = config_home.clone();
         let session = Arc::new(Mutex::new(SessionContext {
-            provider: Some(TuiProvider::OpenAiApi),
+            provider: Some(ProviderKind::OpenAiApi),
             ..SessionContext::fresh()
         }));
         let original_runtime = session.lock().unwrap().clone();
@@ -1960,7 +1960,7 @@ mod tests {
         bootstrap.provider_source = ProviderSource::Auto;
         bootstrap.provider_type = Some("openai-chatgpt".into());
         let session = Arc::new(Mutex::new(SessionContext {
-            provider: Some(TuiProvider::OpenAiChatGpt),
+            provider: Some(ProviderKind::OpenAiChatGpt),
             ..SessionContext::fresh()
         }));
         let router = TuiRuntimeRouter::new(
@@ -2290,11 +2290,11 @@ mod tests {
             assert!(text.contains("reasoning"), "{provider}: {text:?}");
 
             let source = if provider == "openai-chatgpt" {
-                TuiModelSource::ChatGptSubscription
+                ModelSource::ChatGptSubscription
             } else {
-                TuiModelSource::OpenAiApi
+                ModelSource::OpenAiApi
             };
-            let models = TuiModelSelector::for_source("gpt-5.5", source)
+            let models = ModelSelection::for_source("gpt-5.5", source)
                 .models()
                 .unwrap();
             let family = models
@@ -2431,7 +2431,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(CommandCatalog::default()),
             Arc::new(SkillCatalog::default()),
-            TuiCredentialResolver::with_environment(BTreeMap::new()),
+            CredentialResolver::with_environment(BTreeMap::new()),
         );
         let mut tui = Tui::new(ProductionTuiEngine {
             cancellation: Arc::new(Mutex::new(None)),
@@ -2480,7 +2480,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             Arc::new(CommandCatalog::default()),
             Arc::new(SkillCatalog::default()),
-            TuiCredentialResolver::with_environment(BTreeMap::from([(
+            CredentialResolver::with_environment(BTreeMap::from([(
                 "OPENAI_API_KEY".into(),
                 "api-secret".into(),
             )])),
@@ -2520,7 +2520,7 @@ mod tests {
         let configured_provider = bootstrap.provider_type.clone();
         let credentials = bootstrap.paths.credentials.clone();
         let environment = Arc::new(Mutex::new(BTreeMap::new()));
-        let resolver = TuiCredentialResolver::with_environment_resolver({
+        let resolver = CredentialResolver::with_environment_resolver({
             let environment = Arc::clone(&environment);
             move || environment.lock().unwrap().clone()
         });
@@ -2556,7 +2556,7 @@ mod tests {
         std::fs::remove_file(&credentials).unwrap();
         assert!(router.turn_bootstrap().is_err());
 
-        session.lock().unwrap().provider = Some(TuiProvider::OpenAiChatGpt);
+        session.lock().unwrap().provider = Some(ProviderKind::OpenAiChatGpt);
         std::fs::write(
             &credentials,
             r#"{"openai-chatgpt":{"access_token":"chat-access","refresh_token":"chat-refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
@@ -3495,7 +3495,7 @@ mod tests {
         metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
         store.update_session_selection(&metadata).unwrap();
         drop(store);
-        let resolver = TuiCredentialResolver::with_environment(BTreeMap::from([(
+        let resolver = CredentialResolver::with_environment(BTreeMap::from([(
             "OPENAI_API_KEY".into(),
             "fresh-secret".into(),
         )]));
@@ -3569,7 +3569,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::with_environment(BTreeMap::new()),
+            &CredentialResolver::with_environment(BTreeMap::new()),
         )
         .unwrap()
         .context;

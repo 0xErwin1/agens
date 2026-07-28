@@ -32,11 +32,11 @@ use crate::session::attempt::{
     AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
 };
+use crate::session::provider::ProviderKind;
 use crate::tools::child::TaskMailboxProvider;
 use crate::tools::runtime::production_tool_runtime_for_parent;
 use crate::tools::task::ProductionTuiTaskRuntime;
 use crate::tui::agents::{TuiAgentModelValidator, tui_agent_catalog};
-use crate::tui::provider::TuiProvider;
 use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
@@ -229,8 +229,8 @@ pub(crate) fn run_production_headless_chat_with_progress(
 
     let source = bootstrap
         .provider_type()
-        .and_then(TuiProvider::parse)
-        .map(TuiProvider::source)
+        .and_then(ProviderKind::parse)
+        .map(ProviderKind::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
     let validator = TuiAgentModelValidator::for_source(source)?;
     let agent_catalog_root = headless_turn_project_root(bootstrap, task_runtime)?;
@@ -780,7 +780,7 @@ mod tests {
             &resume_bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &crate::tui::provider::TuiCredentialResolver::production(),
+            &crate::session::provider::CredentialResolver::production(),
         )
         .unwrap()
         .context;
@@ -1322,7 +1322,7 @@ mod tests {
             &bootstrap,
             1,
             &SkillCatalog::default(),
-            &crate::tui::provider::TuiCredentialResolver::production(),
+            &crate::session::provider::CredentialResolver::production(),
         )
         .expect("normalized session should resume")
         .context

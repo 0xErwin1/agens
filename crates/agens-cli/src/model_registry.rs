@@ -38,12 +38,12 @@ pub(crate) fn bundled_openai_models() -> Result<Vec<ModelMetadata>, ModelRegistr
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TuiModelSource {
+pub enum ModelSource {
     OpenAiApi,
     ChatGptSubscription,
 }
 
-impl TuiModelSource {
+impl ModelSource {
     pub const fn label(self) -> &'static str {
         match self {
             Self::OpenAiApi => "OpenAI API",
@@ -54,20 +54,20 @@ impl TuiModelSource {
 
 /// Validates and retains the bounded selections exposed by the terminal UI adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TuiModelSelector {
+pub struct ModelSelection {
     model: String,
-    source: TuiModelSource,
+    source: ModelSource,
     metadata_known: bool,
     reasoning_effort: Option<ReasoningEffort>,
     request_config: RequestConfig,
 }
 
-impl TuiModelSelector {
+impl ModelSelection {
     pub fn new(model: impl Into<String>) -> Self {
-        Self::for_source(model, TuiModelSource::OpenAiApi)
+        Self::for_source(model, ModelSource::OpenAiApi)
     }
 
-    pub fn for_source(model: impl Into<String>, source: TuiModelSource) -> Self {
+    pub fn for_source(model: impl Into<String>, source: ModelSource) -> Self {
         Self {
             model: model.into(),
             source,
@@ -134,17 +134,17 @@ impl TuiModelSelector {
 
         match (self.source, self.model.as_str()) {
             (
-                TuiModelSource::ChatGptSubscription,
+                ModelSource::ChatGptSubscription,
                 "gpt-5.3-codex-spark" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5",
             ) => {
                 vec![
                     "default", "none", "minimal", "low", "medium", "high", "xhigh",
                 ]
             }
-            (TuiModelSource::OpenAiApi, "gpt-5.5") => {
+            (ModelSource::OpenAiApi, "gpt-5.5") => {
                 vec!["default", "none", "low", "medium", "high", "xhigh"]
             }
-            (TuiModelSource::OpenAiApi, "o3" | "o4-mini") => {
+            (ModelSource::OpenAiApi, "o3" | "o4-mini") => {
                 vec!["default", "none", "minimal", "low", "medium", "high"]
             }
             _ => vec!["default"],
@@ -179,7 +179,7 @@ impl TuiModelSelector {
 
         let selected = RequestConfig::with_reasoning_effort(effort)
             .map_err(|_| "reasoning effort is unsupported".to_owned())?;
-        let payload = if self.source == TuiModelSource::ChatGptSubscription && effort == "minimal" {
+        let payload = if self.source == ModelSource::ChatGptSubscription && effort == "minimal" {
             "low"
         } else {
             effort
@@ -204,10 +204,7 @@ fn valid_model_id(model: &str) -> bool {
 /// Returns `None` when the model is unknown or has no recorded window.
 /// Never invents a default size.
 pub(crate) fn context_window_for(model_id: &str) -> Option<u64> {
-    for source in [
-        TuiModelSource::OpenAiApi,
-        TuiModelSource::ChatGptSubscription,
-    ] {
+    for source in [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription] {
         if let Ok(models) = source_models(source)
             && let Some(model) = models.iter().find(|model| model.id == model_id)
         {
@@ -218,9 +215,9 @@ pub(crate) fn context_window_for(model_id: &str) -> Option<u64> {
     None
 }
 
-fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
+fn source_models(source: ModelSource) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
     let mut models = match source {
-        TuiModelSource::OpenAiApi => {
+        ModelSource::OpenAiApi => {
             let mut models = bundled_openai_models()?;
             for model in &mut models {
                 let (output, reasoning) = bundled_capabilities(&model.id);
@@ -230,7 +227,7 @@ fn source_models(source: TuiModelSource) -> Result<Vec<ModelMetadata>, ModelRegi
             models.push(pinned_model("gpt-5.5", "GPT-5.5", 272_000, 128_000, true));
             models
         }
-        TuiModelSource::ChatGptSubscription => vec![
+        ModelSource::ChatGptSubscription => vec![
             pinned_model(
                 "gpt-5.3-codex-spark",
                 "GPT-5.3 Codex Spark",

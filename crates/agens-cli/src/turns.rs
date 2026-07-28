@@ -11,8 +11,8 @@ use agens_core::{
 use agens_store::SessionStore;
 
 use crate::session::context::SessionContext;
+use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
-use crate::tui::provider::TuiProvider;
 use crate::tui::session::CompletedSubagentTurn;
 use crate::{Bootstrap, CliError};
 
@@ -246,8 +246,8 @@ pub(crate) fn persist_completed_subagent_turn(
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
     let provider = context.provider.map(|provider| match provider {
-        TuiProvider::OpenAiApi => "openai-api".to_owned(),
-        TuiProvider::OpenAiChatGpt => "openai-chatgpt".to_owned(),
+        ProviderKind::OpenAiApi => "openai-api".to_owned(),
+        ProviderKind::OpenAiChatGpt => "openai-chatgpt".to_owned(),
     });
     let model = context
         .selection

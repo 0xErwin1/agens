@@ -1,6 +1,12 @@
+//! Provider identity and credential state.
+//!
+//! None of this is a user interface: it is which provider a session speaks to
+//! and whether its credentials are usable. It lived under `tui/` and carried a
+//! `Tui` prefix, which is why the engine appeared to depend on the terminal.
+
 //! Provider identity and ChatGPT credential-file bookkeeping for the TUI:
-//! [`TuiProvider`] enumerates the supported API/subscription providers,
-//! [`TuiCredentialResolver`] resolves each provider's [`TuiProviderStatus`]
+//! [`ProviderKind`] enumerates the supported API/subscription providers,
+//! [`CredentialResolver`] resolves each provider's [`CredentialStatus`]
 //! against the on-disk credentials file, and the snapshot/restore pair
 //! backs ChatGPT login rollback on failure.
 
@@ -14,16 +20,16 @@ use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
 use crate::bootstrap::openai_api_key;
 use crate::error::CliError;
-use crate::model_registry::TuiModelSource;
+use crate::model_registry::ModelSource;
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TuiProvider {
+pub(crate) enum ProviderKind {
     OpenAiApi,
     OpenAiChatGpt,
 }
 
-impl TuiProvider {
+impl ProviderKind {
     pub(crate) const ALL: [Self; 2] = [Self::OpenAiChatGpt, Self::OpenAiApi];
 
     pub(crate) const fn identifier(self) -> &'static str {
@@ -34,11 +40,8 @@ impl TuiProvider {
         ["OpenAI API", "ChatGPT subscription"][self as usize]
     }
 
-    pub(crate) const fn source(self) -> TuiModelSource {
-        [
-            TuiModelSource::OpenAiApi,
-            TuiModelSource::ChatGptSubscription,
-        ][self as usize]
+    pub(crate) const fn source(self) -> ModelSource {
+        [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription][self as usize]
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
@@ -50,14 +53,14 @@ impl TuiProvider {
 
 #[repr(usize)]
 #[derive(Clone, Copy)]
-pub(crate) enum TuiProviderStatus {
+pub(crate) enum CredentialStatus {
     Ready,
     RefreshRequired,
     ConnectRequired,
     CredentialRequired,
 }
 
-impl TuiProviderStatus {
+impl CredentialStatus {
     pub(crate) const fn label(self) -> &'static str {
         [
             "ready",
@@ -73,11 +76,11 @@ impl TuiProviderStatus {
 }
 
 #[derive(Clone)]
-pub(crate) struct TuiCredentialResolver {
+pub(crate) struct CredentialResolver {
     pub(crate) environment: Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>,
 }
 
-impl TuiCredentialResolver {
+impl CredentialResolver {
     pub(crate) fn production() -> Self {
         Self {
             environment: Arc::new(|| std::env::vars().collect()),
@@ -103,20 +106,20 @@ impl TuiCredentialResolver {
         openai_api_key(credentials.as_deref(), &(self.environment)())
     }
 
-    pub(crate) fn status(&self, path: &Path, provider: TuiProvider) -> TuiProviderStatus {
+    pub(crate) fn status(&self, path: &Path, provider: ProviderKind) -> CredentialStatus {
         match provider {
-            TuiProvider::OpenAiChatGpt => {
+            ProviderKind::OpenAiChatGpt => {
                 match load_chatgpt_auth_state(path, std::time::SystemTime::now()) {
-                    Ok(ChatGptAuthState::Ready) => TuiProviderStatus::Ready,
-                    Ok(ChatGptAuthState::RefreshRequired) => TuiProviderStatus::RefreshRequired,
-                    Err(_) => TuiProviderStatus::ConnectRequired,
+                    Ok(ChatGptAuthState::Ready) => CredentialStatus::Ready,
+                    Ok(ChatGptAuthState::RefreshRequired) => CredentialStatus::RefreshRequired,
+                    Err(_) => CredentialStatus::ConnectRequired,
                 }
             }
-            TuiProvider::OpenAiApi => {
+            ProviderKind::OpenAiApi => {
                 if self.api_key(path).is_some() {
-                    TuiProviderStatus::Ready
+                    CredentialStatus::Ready
                 } else {
-                    TuiProviderStatus::CredentialRequired
+                    CredentialStatus::CredentialRequired
                 }
             }
         }
@@ -174,10 +177,10 @@ mod tests {
             r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
         )
         .unwrap();
-        let resolver = TuiCredentialResolver::with_environment(BTreeMap::new());
+        let resolver = CredentialResolver::with_environment(BTreeMap::new());
 
         let statuses =
-            TuiProvider::ALL.map(|provider| resolver.status(&credentials, provider).label());
+            ProviderKind::ALL.map(|provider| resolver.status(&credentials, provider).label());
         assert_eq!(statuses, ["ready", "credential required"]);
         std::fs::remove_dir_all(temporary).unwrap();
     }

@@ -16,14 +16,14 @@ use agens_tui::{
 
 use crate::bootstrap::Bootstrap;
 use crate::error::CliError;
-use crate::model_registry::TuiModelSelector;
+use crate::model_registry::ModelSelection;
 use crate::permissions::{ParseToolInput, SharedToolDispatcher};
 use crate::session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
+use crate::session::provider::{CredentialResolver, ProviderKind};
 use crate::tui::agents::{
     TuiAgentModelValidator, agent_rotation_error, persist_pending_agent_correction,
     reconcile_persisted_active_agent,
 };
-use crate::tui::provider::{TuiCredentialResolver, TuiProvider};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
@@ -78,7 +78,7 @@ pub(crate) fn resume_tui_session(
     bootstrap: &Bootstrap,
     identifier: i64,
     _skills: &SkillCatalog,
-    credentials: &TuiCredentialResolver,
+    credentials: &CredentialResolver,
 ) -> Result<ResumedTuiSession, CliError> {
     let session = load_tui_session_for_resume(bootstrap, identifier)?;
     prepare_loaded_tui_session_resume(bootstrap, identifier, session, credentials)
@@ -130,7 +130,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
     loaded: LoadedTuiSessionResume,
-    credentials: &TuiCredentialResolver,
+    credentials: &CredentialResolver,
 ) -> Result<ResumedTuiSession, CliError> {
     let LoadedTuiSessionResume {
         session,
@@ -149,12 +149,12 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         })
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
     let saved_provider = session.metadata.provider_id.as_deref();
-    let provider = saved_provider.and_then(TuiProvider::parse);
+    let provider = saved_provider.and_then(ProviderKind::parse);
     let selection_provider =
-        provider.or_else(|| bootstrap.provider_type().and_then(TuiProvider::parse));
+        provider.or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse));
     let selection = match (session.metadata.model_id.as_deref(), selection_provider) {
         (Some(model), Some(provider)) => {
-            let mut selector = TuiModelSelector::for_source(model, provider.source());
+            let mut selector = ModelSelection::for_source(model, provider.source());
             if selector.apply_model(model).is_err() {
                 selector
                     .apply_unverified_model(model)
@@ -418,7 +418,7 @@ mod tests {
             &resume_bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         );
         assert!(
             resumed.is_ok(),
@@ -511,7 +511,7 @@ mod tests {
             &bootstrap,
             current.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap();
         assert_eq!(resumed.context.identifier, Some(current.id));
@@ -595,7 +595,7 @@ mod tests {
             &bootstrap,
             attempt.key().session_id(),
             loaded,
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap();
         assert_eq!(prepared.context.resume_draft.as_deref(), Some(retry_prompt));
@@ -670,7 +670,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             loaded,
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap();
         assert_eq!(prepared.context.messages, tui_session_messages());
@@ -706,7 +706,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             loaded,
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap();
         assert!(prepared.context.resume_draft.is_none());
@@ -736,7 +736,7 @@ mod tests {
             .finish_session_attempt(attempt.key(), SessionAttemptStatus::Failed, 30)
             .unwrap();
         drop(store);
-        let credentials = TuiCredentialResolver::production();
+        let credentials = CredentialResolver::production();
         let prepared = resume_tui_session(
             &bootstrap,
             metadata.id,
@@ -826,7 +826,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             &skills,
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap()
         .context;
@@ -915,7 +915,7 @@ mod tests {
                     &bootstrap,
                     metadata.id,
                     &SkillCatalog::default(),
-                    &TuiCredentialResolver::production(),
+                    &CredentialResolver::production(),
                 )
                 .unwrap()
                 .context;
@@ -1013,7 +1013,7 @@ mod tests {
             &bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &TuiCredentialResolver::production(),
+            &CredentialResolver::production(),
         )
         .unwrap();
 
@@ -1129,7 +1129,7 @@ mod tests {
                 &bootstrap,
                 metadata.id,
                 &SkillCatalog::default(),
-                &TuiCredentialResolver::production(),
+                &CredentialResolver::production(),
             )
             .unwrap_err();
             assert_eq!(error.message, expected, "{case}");
@@ -1202,7 +1202,7 @@ mod tests {
                 &bootstrap,
                 metadata.id,
                 &SkillCatalog::default(),
-                &TuiCredentialResolver::production(),
+                &CredentialResolver::production(),
             )
             .unwrap()
             .context;
@@ -1274,7 +1274,7 @@ mod tests {
                     &bootstrap,
                     metadata.id,
                     &SkillCatalog::default(),
-                    &TuiCredentialResolver::production(),
+                    &CredentialResolver::production(),
                 )
                 .unwrap();
                 let outcome = commit_tui_session_resume(
