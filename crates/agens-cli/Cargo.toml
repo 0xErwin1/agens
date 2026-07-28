@@ -43,5 +43,6 @@ libc = "0.2"
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 
 [dev-dependencies]
+agens-fixtures = { path = "../agens-fixtures" }
 ratatui = "0.30.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }

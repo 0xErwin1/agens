@@ -5,7 +5,7 @@
 #![cfg(test)]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
@@ -22,8 +22,6 @@ use agens_tui::{
     TuiRuntimeEvent,
 };
 
-use crate::CliDependencies;
-use crate::deps::bootstrap;
 use crate::headless::HeadlessChatCompletion;
 use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -36,143 +34,12 @@ use agens_permissions::{
     ProductionPermissionResolver, ProductionPromptAuthorization,
 };
 
-/// Waits for a condition rather than for a fixed number of polls.
-///
-/// A count-based wait is a bet on how fast the machine is. Under a loaded gate
-/// it loses, and the test then fails for a reason that has nothing to do with
-/// what it asserts, which trains people to rerun the gate instead of reading it.
-pub(crate) fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-
-    loop {
-        if let Some(value) = probe() {
-            return value;
-        }
-
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(2));
-    }
-}
-
-/// Bootstraps a `Bootstrap` fixture from optional global/project TOML
-/// fragments, isolated under a unique temporary directory named after
-/// `label`. Shared by `bootstrap.rs`'s own tests and by test clusters in
-/// other modules that need a configured `Bootstrap` without repeating its
-/// setup.
-pub(crate) fn bootstrap_from_configuration(
-    label: &str,
-    global: Option<&str>,
-    project: Option<&str>,
-) -> Bootstrap {
-    let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
-    let config_home = temporary.join("config");
-    let project_root = temporary.join("project");
-    let mut files = BTreeMap::new();
-    if let Some(global) = global {
-        files.insert(config_home.join("config.toml"), global.to_owned());
-    }
-    if let Some(project) = project {
-        files.insert(project_root.join(".agens/config.toml"), project.to_owned());
-    }
-
-    let dependencies = CliDependencies::for_test(
-        project_root,
-        Some(temporary.join("home")),
-        BTreeMap::from([(
-            "AGENS_CONFIG_HOME".to_owned(),
-            config_home.display().to_string(),
-        )]),
-        files,
-    );
-
-    bootstrap(&dependencies).expect("configuration fixture should be valid")
-}
-
-/// A second bootstrap sharing `origin`'s data directory (and therefore its sessions
-/// database) but discovering its own project root from a completely different, unrelated
-/// working directory — simulating a process restart from elsewhere on disk.
-pub(crate) fn bootstrap_from_a_different_working_directory(
-    origin: &Path,
-    label: &str,
-) -> Bootstrap {
-    let elsewhere = tui_session_directory(label);
-    let config_home = origin.join("config");
-    let data_directory = origin.join("data");
-    bootstrap(&CliDependencies::for_test(
-        elsewhere.join("project"),
-        Some(elsewhere.join("home")),
-        BTreeMap::from([(
-            "AGENS_CONFIG_HOME".to_owned(),
-            config_home.display().to_string(),
-        )]),
-        BTreeMap::from([(
-            config_home.join("config.toml"),
-            format!(
-                "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n",
-                data_directory.display()
-            ),
-        )]),
-    ))
-    .unwrap()
-}
-
-/// A fresh, uniquely named temporary directory with a project marker
-/// (`project/.git`) already created, isolating one test's filesystem state
-/// from every other test running concurrently.
-pub(crate) fn tui_session_directory(label: &str) -> PathBuf {
-    let temporary = std::env::temp_dir().join(format!(
-        "agens-tui-session-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(temporary.join("project/.git")).unwrap();
-    temporary
-}
-
-/// A `Bootstrap` fixture wired for the OpenAI API provider, with the given
-/// agent definitions written under the fixture's config directory.
-pub(crate) fn tui_session_bootstrap(temporary: &Path, agents: &[(&str, &str)]) -> Bootstrap {
-    tui_session_bootstrap_for_provider(temporary, agents, "openai-api", "gpt-4.1")
-}
-
-/// A `Bootstrap` fixture wired for the given provider and model, with the
-/// given agent definitions written under the fixture's config directory.
-pub(crate) fn tui_session_bootstrap_for_provider(
-    temporary: &Path,
-    agents: &[(&str, &str)],
-    provider: &str,
-    model: &str,
-) -> Bootstrap {
-    let config_home = temporary.join("config");
-    let data_directory = temporary.join("data");
-    let agents_directory = config_home.join("agents");
-    std::fs::create_dir_all(&agents_directory).unwrap();
-    for (name, contents) in agents {
-        std::fs::write(agents_directory.join(format!("{name}.md")), contents).unwrap();
-    }
-    bootstrap(&CliDependencies::for_test(
-        temporary.join("project"),
-        Some(temporary.join("home")),
-        BTreeMap::from([(
-            "AGENS_CONFIG_HOME".to_owned(),
-            config_home.display().to_string(),
-        )]),
-        BTreeMap::from([(
-            config_home.join("config.toml"),
-            format!(
-                "[provider]\ntype = \"{provider}\"\nmodel = \"{model}\"\n\n[options]\ndata_dir = \"{}\"\n",
-                data_directory.display()
-            ),
-        )]),
-    ))
-    .unwrap()
-}
+pub(crate) use agens_fixtures::{
+    bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
+    session_bootstrap as tui_session_bootstrap,
+    session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
+    session_directory as tui_session_directory, wait_for,
+};
 
 /// A native tool that records every path it acts on into a shared log and can
 /// be told, per call, to inject a permission-evaluator failure or a

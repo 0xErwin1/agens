@@ -14,6 +14,7 @@ dependencies = [
  "agens-diagnostics",
  "agens-dispatch",
  "agens-error",
+ "agens-fixtures",
  "agens-models",
  "agens-permissions",
  "agens-providers",
@@ -106,6 +107,14 @@ name = "agens-error"
 version = "0.1.0"
 dependencies = [
  "agens-core",
+]
+
+[[package]]
+name = "agens-fixtures"
+version = "0.1.0"
+dependencies = [
+ "agens-bootstrap",
+ "agens-error",
 ]
 
 [[package]]

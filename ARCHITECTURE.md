@@ -47,6 +47,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-session` | What a session is: its context, the provider and credentials it speaks through, its attempt lifecycle, and how a completed turn is recorded. | Rendering any of it, or composing text for a person. |
 | `agens-server` | The machine's daemon: its single-instance guard, its runtime, and the one named crossing into synchronous code. Grows to hold the coordinator. | A project. One daemon serves many. |
 | `agens-tui` | Terminal rendering: widgets, layout, the conversation projection, and the bridges a surface needs. | Any decision the runtime would still have to make with no terminal attached. |
+| `agens-fixtures` | Test fixtures more than one crate needs: an isolated project directory, a `Bootstrap` resolved from a fixed host, a deadline-based wait. A dev-dependency. | Anything a surface would render. Keeping it surface-free is what lets a logic crate use it without pulling a terminal into its test build. |
 | `agens-cli` | Argument parsing, the command table, and wiring production implementations together. | Logic. If deleting the CLI would delete a capability, that capability is in the wrong crate. |
 
 ## Dependency direction

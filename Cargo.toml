@@ -9,6 +9,7 @@ members = [
   "crates/agens-session",
   "crates/agens-agents",
   "crates/agens-diagnostics",
+  "crates/agens-fixtures",
   "crates/agens-dispatch",
   "crates/agens-config",
   "crates/agens-providers",

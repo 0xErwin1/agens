@@ -22,6 +22,7 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
+    "agens-fixtures": ["agens-bootstrap", "agens-error"],
     "agens-diagnostics": [
       "agens-bootstrap",
       "agens-core",
@@ -64,6 +65,7 @@ jq -e '
       "agens-diagnostics",
       "agens-dispatch",
       "agens-error",
+      "agens-fixtures",
       "agens-models",
       "agens-permissions",
       "agens-providers",
