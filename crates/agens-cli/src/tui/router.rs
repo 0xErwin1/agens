@@ -25,9 +25,7 @@ use agens_tui::{
 
 use crate::bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
-use crate::error::{CliError, ExitStatus};
 use crate::mcp::load_configured_mcp_registry;
-use crate::model_registry::ModelSelection;
 use crate::session::agents::{
     agent_catalog_for_context, persist_pending_agent_correction, rotate_agent, select_subagent,
     subagent_catalog,
@@ -58,6 +56,8 @@ use crate::tui::session::{
     parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
 };
 use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_presentation};
+use agens_error::{CliError, ExitStatus};
+use agens_models::ModelSelection;
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
@@ -1250,7 +1250,6 @@ mod tests {
 
     use super::*;
     use crate::headless::HeadlessChatCompletion;
-    use crate::model_registry::ModelSource;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1261,6 +1260,7 @@ mod tests {
     use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
     use crate::tui::extensions::{start_tui_commands, start_tui_skills};
     use crate::tui::resume::ensure_active_tui_agent_runtime;
+    use agens_models::ModelSource;
 
     fn write_router_test_skill(root: &Path, name: &str, body: &str) {
         let directory = root.join(".agens/skills").join(name);

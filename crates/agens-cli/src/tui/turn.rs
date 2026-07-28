@@ -8,15 +8,14 @@ use std::collections::BTreeSet;
 use agens_core::{Message, MessagePart, Role};
 
 use crate::bootstrap::Bootstrap;
-use crate::error::CliError;
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
-use crate::model_registry;
-use crate::model_registry::ModelSelection;
 use crate::session::context::SessionContext;
 use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::tui_model_source;
 use crate::turns::SUBAGENT_CALL_ID_PREFIX;
+use agens_error::CliError;
+use agens_models::ModelSelection;
 use agens_tui::TuiPresentation;
 
 pub(crate) fn complete_tui_turn(
@@ -154,7 +153,7 @@ pub(crate) fn tui_session_presentation(
                 .reasoning_effort_default()
         });
     let mut presentation = TuiPresentation::new(provider, &model, label)
-        .with_context_window(model_registry::context_window_for(&model))
+        .with_context_window(agens_models::context_window_for(&model))
         .with_dangerous_mode(session.dangerous_mode);
     if let Some(effort) = effort {
         presentation = presentation.with_effort(effort);

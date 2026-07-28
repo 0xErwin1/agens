@@ -16,7 +16,6 @@ use agens_tools::{
 use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
-use crate::error::CliError;
 use crate::permissions::prompt::TuiPermissionPrompter;
 use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
@@ -26,6 +25,7 @@ use crate::session::agents::{TaskModelValidator, task_agent_catalog, task_model_
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
+use agens_error::CliError;
 
 pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) provider_tools: Vec<OpenAiFunctionTool>,

@@ -9,8 +9,8 @@ use agens_core::HeadlessTurnCancellation;
 
 use crate::CliDependencies;
 use crate::cli;
-use crate::error::CliError;
 use crate::tui::run_tui;
+use agens_error::CliError;
 use auth::run_auth;
 use chat::run_chat;
 use config::run_config;

@@ -1,3 +1,9 @@
+//! The runtime's error and exit-status contract.
+//!
+//! Shared by every layer that can fail, which is why it is not owned by any one
+//! of them. `CliError` keeps its name for now; the rename to something that does
+//! not claim a surface is a separate, mechanical change.
+
 //! Exit-status and error types shared by every CLI command body, plus the
 //! `CliError` constructors that translate domain failures into them.
 
@@ -38,13 +44,13 @@ pub struct CommandResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliError {
     status: ExitStatus,
-    pub(crate) category: &'static str,
-    pub(crate) message: String,
+    pub category: &'static str,
+    pub message: String,
     preformatted: bool,
 }
 
 impl CliError {
-    pub(crate) fn usage(message: impl Into<String>) -> Self {
+    pub fn usage(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Usage, "usage", message)
     }
 
@@ -52,7 +58,7 @@ impl CliError {
     /// and usage block). `error_result` emits `message` verbatim instead of
     /// wrapping it in the `error: {category}: {message}` envelope, which
     /// would otherwise double the `error: ` prefix.
-    pub(crate) fn preformatted_usage(message: impl Into<String>) -> Self {
+    pub fn preformatted_usage(message: impl Into<String>) -> Self {
         Self {
             status: ExitStatus::Usage,
             category: "usage",
@@ -61,23 +67,23 @@ impl CliError {
         }
     }
 
-    pub(crate) fn configuration(message: impl Into<String>) -> Self {
+    pub fn configuration(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Configuration, "config", message)
     }
 
-    pub(crate) fn authentication(message: impl Into<String>) -> Self {
+    pub fn authentication(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Authentication, "auth", message)
     }
 
-    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+    pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Unavailable, "unavailable", message)
     }
 
-    pub(crate) fn storage(message: impl Into<String>) -> Self {
+    pub fn storage(message: impl Into<String>) -> Self {
         Self::new(ExitStatus::Failure, "store", message)
     }
 
-    pub(crate) fn runtime(error: HeadlessTurnError) -> Self {
+    pub fn runtime(error: HeadlessTurnError) -> Self {
         let (status, category, message) = match error {
             HeadlessTurnError::Cancelled => (
                 ExitStatus::Failure,
@@ -159,11 +165,7 @@ impl CliError {
         Self::new(status, category, message)
     }
 
-    pub(crate) fn new(
-        status: ExitStatus,
-        category: &'static str,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn new(status: ExitStatus, category: &'static str, message: impl Into<String>) -> Self {
         Self {
             status,
             category,
@@ -172,18 +174,18 @@ impl CliError {
         }
     }
 
-    pub(crate) fn with_diagnostic_reference(mut self, reference: &str) -> Self {
+    pub fn with_diagnostic_reference(mut self, reference: &str) -> Self {
         self.message.push_str(" [ref: ");
         self.message.push_str(reference);
         self.message.push(']');
         self
     }
 
-    pub(crate) const fn status(&self) -> ExitStatus {
+    pub const fn status(&self) -> ExitStatus {
         self.status
     }
 
-    pub(crate) const fn is_preformatted(&self) -> bool {
+    pub const fn is_preformatted(&self) -> bool {
         self.preformatted
     }
 }
@@ -200,7 +202,7 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-pub(crate) fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), CliError> {
+pub fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<(), CliError> {
     if cancellation.is_cancelled() {
         return Err(CliError::runtime(HeadlessTurnError::Cancelled));
     }

@@ -56,7 +56,7 @@ use agens_config::{ConfigPermissionRule, ConfigPermissionScope, extract_permissi
 
 use crate::bootstrap::Bootstrap;
 use crate::bootstrap::session_root::SessionRoot;
-use crate::error::CliError;
+use agens_error::CliError;
 
 /// Session-scoped configuration, re-derived fresh every time it is asked for.
 pub(crate) struct SessionConfig {

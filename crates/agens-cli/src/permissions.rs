@@ -21,8 +21,8 @@ use agens_tools::{
     ToolDispatcher, ToolEvaluationOutcome,
 };
 
-use crate::error::CliError;
 use crate::tools::runtime::is_dangerous_child_native_tool;
+use agens_error::CliError;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum NativePermissionTarget {

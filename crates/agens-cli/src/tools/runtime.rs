@@ -15,7 +15,6 @@ use agens_tools::{
 
 use crate::Bootstrap;
 use crate::dispatch::RegisteredNativeTool;
-use crate::error::CliError;
 use crate::mcp::{
     ProductionMcpRuntime, load_configured_mcp_registry, mcp_model_tool_name,
     native_model_tool_name, remote_function_tool,
@@ -24,6 +23,7 @@ use crate::permissions::SharedToolDispatcher;
 use crate::tools::runner::ProductionTaskRunner;
 use crate::tools::task::{TaskParentSelection, default_model, register_production_task_tool};
 use crate::tui::extensions::discover_skill_catalog;
+use agens_error::CliError;
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
 pub(crate) fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {

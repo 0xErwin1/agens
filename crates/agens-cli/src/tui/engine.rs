@@ -20,7 +20,6 @@ use crate::diagnostics::next_diagnostic_reference;
 use crate::dispatch::{
     launch_selected_tui_task, origin_launches_selected_subagent, selected_tui_task_skips_parent,
 };
-use crate::error::{CliError, ExitStatus};
 use crate::headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
     run_production_headless_chat_with_progress,
@@ -46,6 +45,7 @@ use crate::tui::resume::{
 };
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
+use agens_error::{CliError, ExitStatus};
 
 pub(crate) struct ProductionTuiEngine {
     pub(crate) cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -501,13 +501,13 @@ mod tests {
     use super::*;
     use crate::CliDependencies;
     use crate::bootstrap::bootstrap;
-    use crate::model_registry::ModelSelection;
     use crate::session::agents::BundledModelValidator;
     use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
         tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
     };
+    use agens_models::ModelSelection;
 
     #[test]
     fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()

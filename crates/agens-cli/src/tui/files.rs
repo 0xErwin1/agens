@@ -1,9 +1,9 @@
 use agens_tools::ReadFileInput;
 
 use crate::bootstrap::Bootstrap;
-use crate::error::{CliError, ExitStatus};
 use crate::session::context::SessionContext;
 use crate::tools::runtime::open_native_tools;
+use agens_error::{CliError, ExitStatus};
 
 const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// Hard cap on `@` picker entries: enumeration is one bounded walk of the

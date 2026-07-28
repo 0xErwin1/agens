@@ -14,8 +14,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::bootstrap::Bootstrap;
-use crate::error::CliError;
 use crate::session::context::SessionContext;
+use agens_error::CliError;
 
 /// The literal filesystem root a session's native tools must be confined to.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -12,10 +12,8 @@ mod commands;
 mod deps;
 mod diagnostics;
 mod dispatch;
-mod error;
 mod headless;
 mod mcp;
-mod model_registry;
 mod permissions;
 mod session;
 #[cfg(test)]
@@ -24,23 +22,23 @@ mod tools;
 mod tui;
 mod turns;
 
+use agens_error::cancellation_result;
 use bootstrap::effective_max_iterations;
 use diagnostics::{
     next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
     record_subagent_terminal,
 };
-use error::cancellation_result;
 use headless::block_on_headless_turn;
 use tui::models::tui_model_source;
 use tui::run_tui;
 
+pub use agens_error::{CliError, CommandResult, ExitStatus};
+pub use agens_models::{ModelSelection, ModelSource};
 pub(crate) use bootstrap::session_config;
 pub(crate) use bootstrap::session_root;
 pub use bootstrap::{Bootstrap, bootstrap};
 pub use deps::CliDependencies;
-pub use error::{CliError, CommandResult, ExitStatus};
 pub use headless::HeadlessChatRequest;
-pub use model_registry::{ModelSelection, ModelSource};
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
 where

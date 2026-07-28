@@ -11,7 +11,7 @@ use agens_config::{ConfiguredValue, Origin, ResolvedSettings, resolve_paths, sta
 use crate::CliDependencies;
 use crate::bootstrap::{bootstrap, discover_project_root};
 use crate::cli;
-use crate::error::CliError;
+use agens_error::CliError;
 
 pub(crate) fn run_config(
     action: cli::ConfigAction,

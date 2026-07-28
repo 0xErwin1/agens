@@ -258,7 +258,7 @@ fn task_system_prompt(request: &TaskTurnRequest) -> String {
 fn task_provider_base_url(
     bootstrap: &Bootstrap,
     project_root: &Path,
-) -> Result<Option<String>, crate::error::CliError> {
+) -> Result<Option<String>, agens_error::CliError> {
     let session_root = crate::session_root::SessionRoot::confined_to(project_root.to_path_buf());
     let session_config = crate::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.provider_base_url().map(ToOwned::to_owned))

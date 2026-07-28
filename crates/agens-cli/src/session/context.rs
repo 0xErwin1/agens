@@ -9,8 +9,8 @@ use agens_core::{AgentDefinition, Message, SessionMetadata};
 use agens_store::SessionStore;
 use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
 
-use crate::model_registry::ModelSelection;
 use crate::session::provider::ProviderKind;
+use agens_models::ModelSelection;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionContext {

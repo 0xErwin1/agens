@@ -15,7 +15,7 @@ use crate::CliDependencies;
 use crate::bootstrap::bootstrap;
 use crate::chatgpt_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use crate::cli;
-use crate::error::CliError;
+use agens_error::CliError;
 
 pub(crate) fn run_auth(
     action: cli::AuthAction,

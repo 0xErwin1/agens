@@ -8,6 +8,8 @@ version = "0.1.0"
 dependencies = [
  "agens-config",
  "agens-core",
+ "agens-error",
+ "agens-models",
  "agens-providers",
  "agens-server",
  "agens-store",
@@ -36,6 +38,23 @@ name = "agens-core"
 version = "0.1.0"
 dependencies = [
  "globset",
+]
+
+[[package]]
+name = "agens-error"
+version = "0.1.0"
+dependencies = [
+ "agens-core",
+]
+
+[[package]]
+name = "agens-models"
+version = "0.1.0"
+dependencies = [
+ "agens-core",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -11,7 +11,7 @@ pub(crate) mod turn;
 
 use crate::CliDependencies;
 use crate::bootstrap::bootstrap;
-use crate::error::CliError;
+use agens_error::CliError;
 
 pub(crate) fn run_tui(
     dependencies: &CliDependencies,

@@ -8,13 +8,12 @@ use std::sync::{Arc, Mutex};
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
 use crate::bootstrap::Bootstrap;
-use crate::error::{CliError, ExitStatus};
-use crate::model_registry;
-use crate::model_registry::{ModelSelection, ModelSource};
 use crate::session::context::SessionContext;
 use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::tui::turn::current_tui_provider;
+use agens_error::{CliError, ExitStatus};
+use agens_models::{ModelSelection, ModelSource};
 
 pub(crate) fn apply_tui_selection(
     bootstrap: &Bootstrap,
@@ -97,7 +96,7 @@ pub(crate) fn tui_model_source(bootstrap: &Bootstrap, context: &SessionContext) 
         .source()
 }
 
-pub(crate) fn format_model_metadata(model: &model_registry::ModelMetadata) -> String {
+pub(crate) fn format_model_metadata(model: &agens_models::ModelMetadata) -> String {
     let context = model
         .context
         .map(format_token_count)

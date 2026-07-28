@@ -19,8 +19,8 @@ use agens_providers::chatgpt_login::{remove_provider_entry, upsert_provider_entr
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
 use crate::bootstrap::openai_api_key;
-use crate::error::CliError;
-use crate::model_registry::ModelSource;
+use agens_error::CliError;
+use agens_models::ModelSource;
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

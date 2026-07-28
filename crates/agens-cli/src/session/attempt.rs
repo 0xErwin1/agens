@@ -11,7 +11,7 @@ use agens_core::{
 };
 use agens_store::SessionStore;
 
-use crate::error::CliError;
+use agens_error::CliError;
 
 /// An `AttemptKey` is only a small SQLite autoincrement pair (`session_id`, `attempt_id`) with no
 /// discriminator for which database it came from. Two independent `SessionStore`s — each its own

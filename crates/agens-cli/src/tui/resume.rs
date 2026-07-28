@@ -15,8 +15,6 @@ use agens_tui::{
 };
 
 use crate::bootstrap::Bootstrap;
-use crate::error::CliError;
-use crate::model_registry::ModelSelection;
 use crate::permissions::{ParseToolInput, SharedToolDispatcher};
 use crate::session::agents::{
     AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
@@ -27,6 +25,8 @@ use crate::session::provider::{CredentialResolver, ProviderKind};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
+use agens_error::CliError;
+use agens_models::ModelSelection;
 
 #[cfg(test)]
 pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {

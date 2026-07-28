@@ -19,7 +19,6 @@ use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
 
 use crate::dispatch::ProductionToolDispatcher;
-use crate::error::{CliError, ExitStatus};
 use crate::permissions::prompt::TtyPermissionPrompter;
 use crate::permissions::{
     PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
@@ -39,6 +38,7 @@ use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
     record_parent_terminal,
 };
+use agens_error::{CliError, ExitStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {

@@ -26,7 +26,6 @@ use agens_tui::{
 use crate::CliDependencies;
 use crate::bootstrap::{Bootstrap, bootstrap};
 use crate::dispatch::ProductionToolDispatcher;
-use crate::error::CliError;
 use crate::headless::HeadlessChatCompletion;
 use crate::permissions::{
     NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
@@ -35,6 +34,7 @@ use crate::permissions::{
 use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
+use agens_error::CliError;
 
 thread_local! {
     static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

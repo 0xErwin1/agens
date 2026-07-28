@@ -7,6 +7,8 @@ Agens is a Rust coding-agent CLI. The Rust workspace is the only buildable, test
 ```text
 crates/agens-cli        command parsing and composition root
   -> agens-core         messages, turns, cancellation, and domain errors
+  -> agens-error        the shared error and exit-status contract
+  -> agens-models       the bundled model catalog and selection
   -> agens-config       TOML configuration and credential-path compatibility
   -> agens-providers    OpenAI and ChatGPT authentication and streaming adapters
   -> agens-tools        native tools, permissions, MCP, skills, and subagents

@@ -12,24 +12,24 @@ const GPT_5_6_MODELS: [(&str, &str); 4] = [
 ];
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ModelMetadata {
-    pub(crate) id: String,
-    pub(crate) name: Option<String>,
-    pub(crate) context: Option<u64>,
-    pub(crate) output: Option<u64>,
-    pub(crate) reasoning: Option<bool>,
-    pub(crate) input_price: Option<f64>,
-    pub(crate) output_price: Option<f64>,
+pub struct ModelMetadata {
+    pub id: String,
+    pub name: Option<String>,
+    pub context: Option<u64>,
+    pub output: Option<u64>,
+    pub reasoning: Option<bool>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
 }
 
 #[derive(Debug)]
-pub(crate) enum ModelRegistryError {
+pub enum ModelRegistryError {
     Checksum,
     Schema,
 }
 
 /// The bundled snapshot's source and revision are recorded in its JSON metadata.
-pub(crate) fn bundled_openai_models() -> Result<Vec<ModelMetadata>, ModelRegistryError> {
+pub fn bundled_openai_models() -> Result<Vec<ModelMetadata>, ModelRegistryError> {
     if bundled_snapshot_checksum() != SNAPSHOT_CHECKSUM.trim() {
         return Err(ModelRegistryError::Checksum);
     }
@@ -86,7 +86,7 @@ impl ModelSelection {
         self.source.label()
     }
 
-    pub(crate) fn models(&self) -> Result<Vec<ModelMetadata>, String> {
+    pub fn models(&self) -> Result<Vec<ModelMetadata>, String> {
         source_models(self.source).map_err(|_| "model registry is unavailable".to_owned())
     }
 
@@ -203,7 +203,7 @@ fn valid_model_id(model: &str) -> bool {
 ///
 /// Returns `None` when the model is unknown or has no recorded window.
 /// Never invents a default size.
-pub(crate) fn context_window_for(model_id: &str) -> Option<u64> {
+pub fn context_window_for(model_id: &str) -> Option<u64> {
     for source in [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription] {
         if let Ok(models) = source_models(source)
             && let Some(model) = models.iter().find(|model| model.id == model_id)
@@ -279,11 +279,11 @@ fn pinned_model(id: &str, name: &str, context: u64, output: u64, reasoning: bool
     }
 }
 
-pub(crate) fn bundled_snapshot_checksum() -> String {
+pub fn bundled_snapshot_checksum() -> String {
     format!("{:x}", Sha256::digest(SNAPSHOT))
 }
 
-pub(crate) fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
+pub fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelRegistryError> {
     let snapshot =
         serde_json::from_slice::<Snapshot>(snapshot).map_err(|_| ModelRegistryError::Schema)?;
     if snapshot.source.trim().is_empty() || snapshot.revision.trim().is_empty() {
@@ -316,7 +316,7 @@ pub(crate) fn parse_models(snapshot: &[u8]) -> Result<Vec<ModelMetadata>, ModelR
     Ok(models)
 }
 
-pub(crate) fn format_models(models: &[ModelMetadata]) -> String {
+pub fn format_models(models: &[ModelMetadata]) -> String {
     if models.is_empty() {
         return "No supported models.\n".to_owned();
     }
@@ -365,12 +365,6 @@ struct SnapshotModel {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    use agens_core::HeadlessTurnCancellation;
-
-    use crate::{CliDependencies, ExitStatus, execute_strings};
 
     #[test]
     fn parses_tolerant_snapshot_filters_and_sorts_models() {
@@ -385,7 +379,7 @@ mod tests {
                 ]
             }"#;
 
-        let models = crate::model_registry::parse_models(snapshot).expect("snapshot parses");
+        let models = crate::parse_models(snapshot).expect("snapshot parses");
 
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "a-model");
@@ -398,11 +392,10 @@ mod tests {
 
     #[test]
     fn validates_bundled_snapshot_checksum_and_schema() {
-        let models =
-            crate::model_registry::bundled_openai_models().expect("bundled snapshot is valid");
+        let models = crate::bundled_openai_models().expect("bundled snapshot is valid");
 
         assert_eq!(
-            crate::model_registry::bundled_snapshot_checksum(),
+            crate::bundled_snapshot_checksum(),
             "75086c4979636664367c3031c023b20479fb66296b197fe612b2b624696b5984"
         );
         assert_eq!(
@@ -417,17 +410,15 @@ mod tests {
 
     #[test]
     fn rejects_snapshot_schema_without_a_model_collection() {
-        let result = crate::model_registry::parse_models(
-            br#"{"source":"https://models.dev","revision":"test"}"#,
-        );
+        let result = crate::parse_models(br#"{"source":"https://models.dev","revision":"test"}"#);
 
         assert!(result.is_err());
     }
 
     #[test]
     fn formats_four_columns_and_an_explicit_empty_result() {
-        let output = crate::model_registry::format_models(&[
-            crate::model_registry::ModelMetadata {
+        let output = crate::format_models(&[
+            crate::ModelMetadata {
                 id: "missing".to_owned(),
                 name: None,
                 context: None,
@@ -436,7 +427,7 @@ mod tests {
                 input_price: None,
                 output_price: Some(0.6),
             },
-            crate::model_registry::ModelMetadata {
+            crate::ModelMetadata {
                 id: "known".to_owned(),
                 name: Some("Known".to_owned()),
                 context: Some(128000),
@@ -451,45 +442,13 @@ mod tests {
             output,
             "ID\tNAME\tCONTEXT\tPRICE\nmissing\t-\t-\t-/$0.60\nknown\tKnown\t128000\t$2.50/$10.00\n"
         );
-        assert_eq!(
-            crate::model_registry::format_models(&[]),
-            "No supported models.\n"
-        );
+        assert_eq!(crate::format_models(&[]), "No supported models.\n");
     }
 
     #[test]
     fn context_window_for_returns_registry_value_or_none() {
-        assert_eq!(
-            crate::model_registry::context_window_for("gpt-4.1"),
-            Some(1_047_576)
-        );
-        assert_eq!(
-            crate::model_registry::context_window_for("gpt-5.5"),
-            Some(272_000)
-        );
-        assert_eq!(
-            crate::model_registry::context_window_for("not-a-real-model-xyz"),
-            None
-        );
-    }
-
-    #[test]
-    fn models_command_uses_the_bundled_registry() {
-        let result = execute_strings(
-            vec!["models".to_owned()],
-            &CliDependencies::for_test(
-                PathBuf::from("/workspace"),
-                None,
-                BTreeMap::new(),
-                BTreeMap::new(),
-            ),
-            &HeadlessTurnCancellation::new(),
-        );
-
-        assert_eq!(result.status, ExitStatus::Success);
-        assert_eq!(
-            result.stdout,
-            "ID\tNAME\tCONTEXT\tPRICE\ngpt-4.1\tGPT-4.1\t1047576\t$2.00/$8.00\ngpt-4.1-mini\tGPT-4.1 mini\t1047576\t$0.40/$1.60\ngpt-4.1-nano\tGPT-4.1 nano\t1047576\t$0.10/$0.40\ngpt-4o\tGPT-4o\t128000\t$2.50/$10.00\ngpt-4o-mini\tGPT-4o mini\t128000\t$0.15/$0.60\no3\to3\t200000\t$2.00/$8.00\no4-mini\to4-mini\t200000\t$1.10/$4.40\n"
-        );
+        assert_eq!(crate::context_window_for("gpt-4.1"), Some(1_047_576));
+        assert_eq!(crate::context_window_for("gpt-5.5"), Some(272_000));
+        assert_eq!(crate::context_window_for("not-a-real-model-xyz"), None);
     }
 }

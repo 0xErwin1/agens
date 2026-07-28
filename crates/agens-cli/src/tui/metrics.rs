@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex};
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
-use crate::error::CliError;
-use crate::model_registry;
 use crate::permissions::{ParseToolInput, contains_sensitive_marker};
+use agens_error::CliError;
 
 pub(crate) struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
@@ -54,7 +53,7 @@ impl TuiMetricsPublisher {
             TurnEvent::Usage(usage) => {
                 let mut usage = usage.clone();
                 if usage.context_window.is_none() {
-                    usage.context_window = model_registry::context_window_for(&self.model_id);
+                    usage.context_window = agens_models::context_window_for(&self.model_id);
                 }
                 Some(TuiRuntimeEvent::Usage(usage))
             }

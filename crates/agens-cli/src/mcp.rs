@@ -16,8 +16,8 @@ use agens_tools::{
 
 use crate::Bootstrap;
 use crate::dispatch::RegisteredMcpTool;
-use crate::error::CliError;
 use crate::permissions::SharedToolDispatcher;
+use agens_error::CliError;
 
 pub(crate) struct ProductionMcpRuntime {
     pub(crate) registry: Arc<Mutex<McpRegistry>>,

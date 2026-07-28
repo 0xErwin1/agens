@@ -16,7 +16,6 @@ use agens_tools::{
     DispatchTool, McpRegistry, NativeToolCatalog, TaskLaunchMode, ToolExecutionContext, ToolOutput,
 };
 
-use crate::error::{CliError, ExitStatus};
 use crate::permissions::{
     AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, SharedToolDispatcher,
@@ -24,6 +23,7 @@ use crate::permissions::{
 use crate::session::context::SessionContext;
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
+use agens_error::{CliError, ExitStatus};
 
 pub(crate) struct RegisteredNativeTool {
     pub(crate) name: String,

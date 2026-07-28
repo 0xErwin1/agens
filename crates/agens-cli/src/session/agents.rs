@@ -20,8 +20,6 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::bootstrap::Bootstrap;
 use crate::diagnostics::record_agent_diagnostic;
-use crate::error::CliError;
-use crate::model_registry::{ModelSelection, ModelSource};
 use crate::session::context::SessionContext;
 use crate::session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use crate::session::provider::ProviderKind;
@@ -30,6 +28,8 @@ use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::turn::effective_tui_model;
+use agens_error::CliError;
+use agens_models::{ModelSelection, ModelSource};
 
 pub(crate) fn rotate_agent(
     bootstrap: &Bootstrap,

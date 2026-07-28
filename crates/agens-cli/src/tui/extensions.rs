@@ -5,7 +5,7 @@ use agens_tools::{CommandCatalog, CommandDefinition, SkillCatalog};
 use agens_tui::{Engine as TuiEngine, PaletteEntry, PaletteEntryKind, Tui};
 
 use crate::bootstrap::Bootstrap;
-use crate::error::CliError;
+use agens_error::CliError;
 
 pub(crate) const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
