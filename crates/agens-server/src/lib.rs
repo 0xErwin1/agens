@@ -5,12 +5,14 @@
 //! CLI on purpose — the daemon owns the coordinator, its state machines, the
 //! scheduler and the timers, and none of that belongs to a command surface.
 
+mod blocking;
 mod instance;
 
 use std::os::unix::net::UnixListener;
 
 use agens_core::HeadlessTurnCancellation;
 
+pub use blocking::{BlockingBoundary, BlockingError};
 pub use instance::{ServeInstance, ServeInstanceError};
 
 #[derive(Debug)]
