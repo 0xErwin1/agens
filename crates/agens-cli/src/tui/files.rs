@@ -149,7 +149,8 @@ mod tests {
             &SkillCatalog::default(),
             &TuiCredentialResolver::production(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
 
         assert_eq!(
             tui_file_candidates_with_limit(&context, &resume_bootstrap, 50).unwrap(),

@@ -7,7 +7,6 @@
 
 use agens_core::{AgentDefinition, Message, SessionMetadata};
 use agens_tools::{AgentModelValidator, EffectiveCapabilitySet, ToolDispatcher};
-use agens_tui::Conversation;
 
 use crate::model_registry::TuiModelSelector;
 use crate::tui::provider::TuiProvider;
@@ -23,7 +22,6 @@ pub(crate) struct SessionContext {
     /// [`crate::session_root::resolve_tui_session_root`] for the fallback that applies then.
     pub(crate) confinement_root: Option<std::path::PathBuf>,
     pub(crate) messages: Vec<Message>,
-    pub(crate) restored_history: Vec<Conversation>,
     pub(crate) active_agent: Option<ActiveAgentRuntime>,
     pub(crate) pending_system_reminder: Option<String>,
     pub(crate) selection: Option<TuiModelSelector>,

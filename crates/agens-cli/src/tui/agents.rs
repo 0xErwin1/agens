@@ -543,7 +543,8 @@ mod tests {
             &SkillCatalog::default(),
             &TuiCredentialResolver::production(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
 
         let catalog = tui_agent_catalog_for_context(&resume_bootstrap, &context).unwrap();
         assert!(
@@ -645,7 +646,8 @@ mod tests {
             &SkillCatalog::default(),
             &TuiCredentialResolver::production(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         let session = Arc::new(Mutex::new(resumed));
         ensure_active_tui_agent_runtime(
             &bootstrap,
@@ -745,13 +747,8 @@ mod tests {
             completed_turn_count: 0,
             resumable: true,
         };
-        let resumed = SessionContext::restored(
-            7,
-            metadata,
-            Vec::new(),
-            Vec::new(),
-            std::path::PathBuf::from("project"),
-        );
+        let resumed =
+            SessionContext::restored(7, metadata, Vec::new(), std::path::PathBuf::from("project"));
 
         assert_eq!(initial_active_agent_name(&resumed, &configured), "planner");
     }

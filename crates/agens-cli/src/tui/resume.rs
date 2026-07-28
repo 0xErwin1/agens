@@ -65,12 +65,21 @@ impl std::ops::Deref for LoadedTuiSessionResume {
     }
 }
 
+/// A resumed session plus the conversation history the surface renders for it.
+/// The history is a handoff, not session state: it is derived from the session's
+/// own messages and consumed once, so it stays out of [`SessionContext`].
+#[derive(Clone, Debug)]
+pub(crate) struct ResumedTuiSession {
+    pub(crate) context: SessionContext,
+    pub(crate) history: Vec<Conversation>,
+}
+
 pub(crate) fn resume_tui_session(
     bootstrap: &Bootstrap,
     identifier: i64,
     _skills: &SkillCatalog,
     credentials: &TuiCredentialResolver,
-) -> Result<SessionContext, CliError> {
+) -> Result<ResumedTuiSession, CliError> {
     let session = load_tui_session_for_resume(bootstrap, identifier)?;
     prepare_loaded_tui_session_resume(bootstrap, identifier, session, credentials)
 }
@@ -122,7 +131,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
     identifier: i64,
     loaded: LoadedTuiSessionResume,
     credentials: &TuiCredentialResolver,
-) -> Result<SessionContext, CliError> {
+) -> Result<ResumedTuiSession, CliError> {
     let LoadedTuiSessionResume {
         session,
         retry_boundary,
@@ -173,7 +182,6 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         identifier,
         session.metadata,
         session.messages,
-        restored_history,
         confinement_root,
     );
     context.provider = provider;
@@ -189,7 +197,10 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         context.resume_draft = Some(ResumeDraft::new(boundary.prompt().to_owned()));
     }
     reconcile_persisted_active_agent(bootstrap, &mut context)?;
-    Ok(context)
+    Ok(ResumedTuiSession {
+        context,
+        history: restored_history,
+    })
 }
 
 /// Commits a prepared resume into the live session slot under the race guard described on
@@ -205,13 +216,16 @@ pub(crate) fn commit_tui_session_resume(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<SessionContext>>,
     expected: &SessionContext,
-    mut resumed: SessionContext,
+    resumed: ResumedTuiSession,
     cancellation: &TuiRouteCancellation,
     on_commit: impl FnOnce(&SessionContext) -> (Vec<String>, Vec<PaletteEntry>),
 ) -> Result<TuiSubmissionOutcome, CliError> {
+    let ResumedTuiSession {
+        context: mut resumed,
+        history,
+    } = resumed;
     let presentation = tui_session_presentation(bootstrap, &resumed);
     let message = resumed.note();
-    let history = std::mem::take(&mut resumed.restored_history);
     let draft = resumed.resume_draft.take().map(ResumeDraft::into_inner);
     let resume_error = resumed.resume_error.clone();
     resumed.resume_notice = None;
@@ -411,7 +425,7 @@ mod tests {
             "resuming from a different working directory must confine to the session's own \
              recorded root instead of being rejected: {resumed:?}"
         );
-        let session = Arc::new(Mutex::new(resumed.unwrap()));
+        let session = Arc::new(Mutex::new(resumed.unwrap().context));
         let resolved_root = crate::session_root::resolve_tui_session_root(
             &session.lock().unwrap(),
             &resume_bootstrap,
@@ -500,11 +514,11 @@ mod tests {
             &TuiCredentialResolver::production(),
         )
         .unwrap();
-        assert_eq!(resumed.identifier, Some(current.id));
-        assert_eq!(resumed.metadata, Some(current));
-        assert_eq!(resumed.messages, tui_session_messages());
-        assert!(resumed.active_agent.is_none());
-        assert_eq!(resumed.restored_history.len(), 1);
+        assert_eq!(resumed.context.identifier, Some(current.id));
+        assert_eq!(resumed.context.metadata, Some(current));
+        assert_eq!(resumed.context.messages, tui_session_messages());
+        assert!(resumed.context.active_agent.is_none());
+        assert_eq!(resumed.history.len(), 1);
         assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
 
         std::fs::remove_dir_all(temporary).unwrap();
@@ -584,10 +598,10 @@ mod tests {
             &TuiCredentialResolver::production(),
         )
         .unwrap();
-        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert_eq!(prepared.context.resume_draft.as_deref(), Some(retry_prompt));
         assert!(!format!("{prepared:?}").contains(retry_prompt));
         assert_eq!(
-            prepared.note(),
+            prepared.context.note(),
             "Recovered failed prompt · Enter retry · Esc discard"
         );
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
@@ -659,15 +673,16 @@ mod tests {
             &TuiCredentialResolver::production(),
         )
         .unwrap();
-        assert_eq!(prepared.messages, tui_session_messages());
-        assert_eq!(prepared.restored_history.len(), 1);
-        assert_eq!(prepared.resume_draft.as_deref(), Some(retry_prompt));
+        assert_eq!(prepared.context.messages, tui_session_messages());
+        assert_eq!(prepared.history.len(), 1);
+        assert_eq!(prepared.context.resume_draft.as_deref(), Some(retry_prompt));
         assert_eq!(
-            prepared.note(),
+            prepared.context.note(),
             "Recovered failed prompt · Enter retry · Esc discard"
         );
         assert!(
             prepared
+                .context
                 .messages
                 .iter()
                 .all(|message| message.role != Role::User
@@ -694,8 +709,8 @@ mod tests {
             &TuiCredentialResolver::production(),
         )
         .unwrap();
-        assert!(prepared.resume_draft.is_none());
-        assert!(prepared.note().starts_with("Resumed session"));
+        assert!(prepared.context.resume_draft.is_none());
+        assert!(prepared.context.note().starts_with("Resumed session"));
         assert_eq!(
             resume_retry_notice(SessionAttemptStatus::Cancelled),
             Some("Recovered failed prompt · Enter retry · Esc discard")
@@ -730,7 +745,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            prepared.resume_draft.as_deref(),
+            prepared.context.resume_draft.as_deref(),
             Some("atomic preserved draft")
         );
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
@@ -781,7 +796,6 @@ mod tests {
         let committed = session.lock().unwrap();
         assert_eq!(committed.identifier, Some(metadata.id));
         assert_eq!(committed.messages, tui_session_messages());
-        assert!(committed.restored_history.is_empty());
         drop(committed);
 
         let mut invalid = load_tui_session_for_resume(&bootstrap, metadata.id).unwrap();
@@ -814,7 +828,8 @@ mod tests {
             &skills,
             &TuiCredentialResolver::production(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         assert_eq!(tui_resume_test_counters(), (1, 1, 0, 0));
         let session = Arc::new(Mutex::new(resumed));
         let (permission_bridge, _) = TuiPermissionBridge::channel();
@@ -902,7 +917,8 @@ mod tests {
                     &SkillCatalog::default(),
                     &TuiCredentialResolver::production(),
                 )
-                .unwrap();
+                .unwrap()
+                .context;
                 assert!(resumed.active_agent.is_none());
                 let session = Arc::new(Mutex::new(resumed));
                 let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
@@ -1002,11 +1018,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            resumed.note(),
+            resumed.context.note(),
             "Agent 'retired' is unavailable; resumed with primary."
         );
-        assert_eq!(resumed.metadata.as_ref().unwrap().active_agent, "primary");
-        assert!(resumed.active_agent.is_none());
+        assert_eq!(
+            resumed.context.metadata.as_ref().unwrap().active_agent,
+            "primary"
+        );
+        assert!(resumed.context.active_agent.is_none());
         assert_eq!(
             SessionStore::open(bootstrap.data_directory())
                 .unwrap()
@@ -1185,7 +1204,8 @@ mod tests {
                 &SkillCatalog::default(),
                 &TuiCredentialResolver::production(),
             )
-            .unwrap();
+            .unwrap()
+            .context;
             let session = Arc::new(Mutex::new(resumed));
 
             ensure_active_tui_agent_runtime(

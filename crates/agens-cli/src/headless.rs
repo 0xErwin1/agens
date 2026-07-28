@@ -782,7 +782,8 @@ mod tests {
             &SkillCatalog::default(),
             &crate::tui::provider::TuiCredentialResolver::production(),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         let session = Arc::new(Mutex::new(resumed));
         let resolved_root = crate::session_root::resolve_tui_session_root(
             &session.lock().unwrap(),
@@ -1324,6 +1325,7 @@ mod tests {
             &crate::tui::provider::TuiCredentialResolver::production(),
         )
         .expect("normalized session should resume")
+        .context
         .apply_to(HeadlessChatRequest {
             prompt: "second input".into(),
             history: Vec::new(),

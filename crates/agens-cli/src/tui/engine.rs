@@ -38,7 +38,7 @@ use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::models::seed_remembered_tui_selection;
 use crate::tui::provider::TuiCredentialResolver;
 use crate::tui::resume::{
-    ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
+    ResumedTuiSession, ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
 };
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
@@ -75,7 +75,10 @@ pub(crate) fn run_production_tui(
     if let Some(identifier) = resume {
         // The catalog this parameter would otherwise select is instead rediscovered below, once
         // the session's own root is known, so this value is not read for a production resume.
-        let mut resumed = resume_tui_session(
+        let ResumedTuiSession {
+            context: mut resumed,
+            history,
+        } = resume_tui_session(
             bootstrap,
             identifier,
             &SkillCatalog::default(),
@@ -90,7 +93,7 @@ pub(crate) fn run_production_tui(
         tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
             message,
             presentation,
-            history: std::mem::take(&mut resumed.restored_history),
+            history,
             draft,
             resume_error,
             // The real picker candidates and palette are set below, once the session's own root
@@ -1208,7 +1211,8 @@ mod tests {
                 "test-key".into(),
             )])),
         )
-        .expect("persisted selection should reopen");
+        .expect("persisted selection should reopen")
+        .context;
         let reopened_selection = reopened.selection.unwrap();
         assert_eq!(reopened_selection.model(), selected_model);
         assert!(reopened_selection.metadata_known());

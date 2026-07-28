@@ -50,8 +50,8 @@ use crate::tui::provider::{
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
 use crate::tui::resume::{
-    commit_tui_session_resume, load_tui_session_for_resume, prepare_loaded_tui_session_resume,
-    resume_tui_session, tui_project_identifier,
+    ResumedTuiSession, commit_tui_session_resume, load_tui_session_for_resume,
+    prepare_loaded_tui_session_resume, resume_tui_session, tui_project_identifier,
 };
 use crate::tui::session::{
     current_session_timestamp, parse_recovery_action, recovery_confirmation_dialog,
@@ -691,7 +691,13 @@ impl TuiRuntimeRouter {
             .ok_or_else(|| CliError::storage("attempt recovery failed"))?;
         drop(store);
 
-        let mut resumed = resume_tui_session(
+        // Recovery replaces the live session without re-rendering its history, so the
+        // handoff is dropped here. It used to be parked in the session context on this
+        // path and never read back.
+        let ResumedTuiSession {
+            context: mut resumed,
+            history: _,
+        } = resume_tui_session(
             bootstrap,
             key.session_id(),
             self.skills()?.as_ref(),
@@ -3495,7 +3501,8 @@ mod tests {
         )]));
         let resumed =
             resume_tui_session(&bootstrap, metadata.id, &SkillCatalog::default(), &resolver)
-                .unwrap();
+                .unwrap()
+                .context;
         assert_eq!(resumed.selection.as_ref().unwrap().model(), "gpt-5.5");
         assert_eq!(
             resumed.selection.as_ref().unwrap().reasoning_effort(),
@@ -3564,7 +3571,8 @@ mod tests {
             &SkillCatalog::default(),
             &TuiCredentialResolver::with_environment(BTreeMap::new()),
         )
-        .unwrap();
+        .unwrap()
+        .context;
         assert_eq!(unavailable.messages, before.messages);
         assert_eq!(
             unavailable.resume_error.as_deref(),

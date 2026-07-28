@@ -1,7 +1,7 @@
 use agens_core::{AgentDefinition, AttemptKey, Message, SessionAttemptStatus, SessionMetadata};
 use agens_store::{SessionStore, StoredSession};
 use agens_tools::{AgentModelValidator, ToolDispatcher};
-use agens_tui::{Conversation, DialogEntry, DialogView};
+use agens_tui::{DialogEntry, DialogView};
 
 use crate::headless::HeadlessChatRequest;
 use crate::session::context::{ActiveAgentRuntime, SessionContext};
@@ -274,7 +274,6 @@ impl SessionContext {
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
             messages,
-            restored_history: Vec::new(),
             active_agent: Some(active_agent),
             pending_system_reminder: None,
             selection: None,
@@ -300,7 +299,6 @@ impl SessionContext {
         identifier: i64,
         metadata: SessionMetadata,
         messages: Vec<Message>,
-        restored_history: Vec<Conversation>,
         confinement_root: std::path::PathBuf,
     ) -> Self {
         Self {
@@ -308,7 +306,6 @@ impl SessionContext {
             metadata: Some(metadata),
             confinement_root: Some(confinement_root),
             messages,
-            restored_history,
             active_agent: None,
             pending_system_reminder: None,
             selection: None,
