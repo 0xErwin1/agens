@@ -10,11 +10,11 @@ use agens_core::{
 };
 use agens_store::SessionStore;
 
-use crate::session::context::CompletedSubagentTurn;
-use crate::session::context::SessionContext;
-use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::{Bootstrap, CliError};
+use agens_session::context::CompletedSubagentTurn;
+use agens_session::context::SessionContext;
+use agens_session::provider::ProviderKind;
 
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
 /// session (its `project` was already recorded), or freshly seeded from the process's own

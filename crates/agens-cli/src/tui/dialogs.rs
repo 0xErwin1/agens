@@ -195,12 +195,12 @@ mod tests {
     };
     use agens_tui::Tui;
 
-    use crate::session::context::SessionContext;
     use crate::test_support::{
         render_tui_test_backend, tui_session_bootstrap, tui_session_directory,
     };
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::router::TuiRuntimeRouter;
+    use agens_session::context::SessionContext;
 
     #[test]
     fn tui_mcp_overlay_is_local_safe_refreshable_and_includes_disabled_servers() {

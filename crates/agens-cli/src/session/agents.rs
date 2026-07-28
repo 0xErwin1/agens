@@ -19,9 +19,6 @@ use agens_store::SessionStore;
 use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::diagnostics::record_agent_diagnostic;
-use crate::session::context::SessionContext;
-use crate::session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
-use crate::session::provider::ProviderKind;
 use crate::tools::runtime::production_tool_runtime;
 use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
@@ -30,6 +27,9 @@ use crate::tui::turn::effective_tui_model;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::{ModelSelection, ModelSource};
+use agens_session::context::SessionContext;
+use agens_session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
+use agens_session::provider::ProviderKind;
 
 pub(crate) fn rotate_agent(
     bootstrap: &Bootstrap,
@@ -43,7 +43,7 @@ pub(crate) fn rotate_agent(
             .map_err(|_| CliError::storage("TUI session is unavailable"))?;
         (
             AgentModelCompatibility::for_context(bootstrap, &context)?,
-            crate::session::root::resolve_tui_session_root(&context, bootstrap)?,
+            agens_session::root::resolve_tui_session_root(&context, bootstrap)?,
         )
     };
     let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
@@ -199,7 +199,7 @@ pub(crate) fn agent_catalog_for_context(
     context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
     let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     agent_catalog(bootstrap, &project_root, &validator)
 }
 
@@ -424,7 +424,7 @@ pub(crate) fn reconcile_persisted_active_agent(
 ) -> Result<AgentDefinition, CliError> {
     let name = initial_active_agent_name(context, bootstrap);
     let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
-    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     let catalog = agent_catalog(bootstrap, &project_root, &validator)?;
     let unvalidated_catalog = task_agent_catalog(bootstrap, &project_root)?;
     let resolution =
@@ -510,13 +510,13 @@ mod tests {
     use agens_core::{AgentMode, SessionMetadata};
 
     use super::*;
-    use crate::session::provider::CredentialResolver;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
         persist_tui_session, rotation_dispatcher, tui_project, tui_session_bootstrap,
         tui_session_directory,
     };
     use crate::tui::resume::resume_tui_session;
+    use agens_session::provider::CredentialResolver;
 
     #[test]
     fn a_resumed_cross_directory_session_reads_agents_from_its_own_root_not_the_process_root() {

@@ -29,13 +29,6 @@ use crate::session::agents::{
     agent_catalog_for_context, persist_pending_agent_correction, rotate_agent, select_subagent,
     subagent_catalog,
 };
-use crate::session::attempt::active_session_attempts;
-use crate::session::context::SessionContext;
-use crate::session::context::{current_session_timestamp, reset_session};
-use crate::session::provider::{
-    ChatGptCredentialSnapshot, CredentialResolver, CredentialStatus, ProviderKind,
-    restore_chatgpt_credentials, snapshot_chatgpt_credentials,
-};
 use crate::tools::task::default_model;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
@@ -58,6 +51,13 @@ use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_pr
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
 use agens_models::ModelSelection;
+use agens_session::attempt::active_session_attempts;
+use agens_session::context::SessionContext;
+use agens_session::context::{current_session_timestamp, reset_session};
+use agens_session::provider::{
+    ChatGptCredentialSnapshot, CredentialResolver, CredentialStatus, ProviderKind,
+    restore_chatgpt_credentials, snapshot_chatgpt_credentials,
+};
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
@@ -747,7 +747,7 @@ impl TuiRuntimeRouter {
     /// keep feeding a DIFFERENT root's skill bodies and command templates into every later turn as
     /// model-facing instruction text.
     fn refresh_session_extensions(&self, bootstrap: &Bootstrap, context: &SessionContext) {
-        let Ok(project_root) = crate::session::root::resolve_tui_session_root(context, bootstrap)
+        let Ok(project_root) = agens_session::root::resolve_tui_session_root(context, bootstrap)
         else {
             return;
         };

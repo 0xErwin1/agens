@@ -6,6 +6,8 @@ use agens_core::HeadlessTurnCancellation;
 use agens_core::SubagentErrorKind;
 
 #[cfg(test)]
+mod attempt_tests;
+#[cfg(test)]
 mod bootstrap_tests;
 mod chatgpt_auth;
 mod cli;
@@ -16,6 +18,8 @@ mod dispatch;
 mod headless;
 mod mcp;
 mod permissions;
+#[cfg(test)]
+mod provider_tests;
 mod session;
 #[cfg(test)]
 mod test_support;

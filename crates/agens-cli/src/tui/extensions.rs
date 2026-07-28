@@ -237,13 +237,13 @@ mod tests {
     use agens_tui::{TuiProviderOutcome, TuiSubmissionOutcome};
 
     use super::*;
-    use crate::session::context::SessionContext;
     use crate::test_support::{
         enter_tui_input, submit_tui_command, tui_session_bootstrap, tui_session_directory,
     };
     use crate::tools::runtime::production_tool_runtime;
     use crate::tui::engine::{ProductionTuiEngine, report_tui_extension_collisions};
     use crate::tui::router::TuiRuntimeRouter;
+    use agens_session::context::SessionContext;
 
     fn write_tui_command(root: &Path, name: &str, description: &str, template: &str) {
         std::fs::write(

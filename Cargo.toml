@@ -4,6 +4,7 @@ members = [
   "crates/agens-bootstrap",
   "crates/agens-error",
   "crates/agens-models",
+  "crates/agens-session",
   "crates/agens-config",
   "crates/agens-providers",
   "crates/agens-tools",

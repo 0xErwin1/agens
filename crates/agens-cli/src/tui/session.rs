@@ -1,11 +1,9 @@
-use agens_core::{AttemptKey, Message, SessionAttemptStatus, SessionMetadata};
+use agens_core::{AttemptKey, SessionAttemptStatus, SessionMetadata};
 use agens_store::StoredSession;
 use agens_tui::{DialogEntry, DialogView};
 
-use crate::headless::HeadlessChatRequest;
 #[cfg(test)]
-use crate::session::context::ActiveAgentRuntime;
-use crate::session::context::SessionContext;
+use agens_session::context::ActiveAgentRuntime;
 
 pub(crate) fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
     let mut parts = action_id.split(':');
@@ -167,133 +165,13 @@ pub(crate) fn session_relative_age(updated_at: i64, now: i64) -> String {
     }
 }
 
-impl SessionContext {
-    pub(crate) fn fresh() -> Self {
-        Self::default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn resumed(
-        identifier: i64,
-        metadata: SessionMetadata,
-        messages: Vec<Message>,
-        active_agent: ActiveAgentRuntime,
-        confinement_root: std::path::PathBuf,
-    ) -> Self {
-        Self {
-            identifier: Some(identifier),
-            metadata: Some(metadata),
-            confinement_root: Some(confinement_root),
-            messages,
-            active_agent: Some(active_agent),
-            pending_system_reminder: None,
-            selection: None,
-            provider: None,
-            chatgpt_unavailable: false,
-            resume_error: None,
-            resume_notice: None,
-            agent_correction_pending: false,
-            resume_draft: None,
-            selected_subagent: None,
-            dangerous_mode: false,
-            running: false,
-        }
-    }
-
-    /// Builds a session context for a session that was just resumed from storage.
-    ///
-    /// `confinement_root` is required, not optional: a resumed session's tools must always be
-    /// confined to the root recorded for it, and making the parameter mandatory here rules out a
-    /// caller silently constructing a "resumed" context that falls back to the process's own
-    /// discovered root through [`crate::session::root::resolve_tui_session_root`]'s `None` branch.
-    pub(crate) fn restored(
-        identifier: i64,
-        metadata: SessionMetadata,
-        messages: Vec<Message>,
-        confinement_root: std::path::PathBuf,
-    ) -> Self {
-        Self {
-            identifier: Some(identifier),
-            metadata: Some(metadata),
-            confinement_root: Some(confinement_root),
-            messages,
-            active_agent: None,
-            pending_system_reminder: None,
-            selection: None,
-            provider: None,
-            chatgpt_unavailable: false,
-            resume_error: None,
-            resume_notice: None,
-            agent_correction_pending: false,
-            resume_draft: None,
-            selected_subagent: None,
-            dangerous_mode: false,
-            running: false,
-        }
-    }
-
-    pub(crate) fn note(&self) -> String {
-        if let Some(notice) = &self.resume_notice {
-            return notice.clone();
-        }
-        if let Some(error) = &self.resume_error {
-            return error.clone();
-        }
-        let identifier = self
-            .identifier
-            .expect("resumed TUI session context always has an identifier");
-        let metadata = self
-            .metadata
-            .as_ref()
-            .expect("resumed TUI session context always has metadata");
-        format!(
-            "Resumed session {identifier}: agent={} turns={}",
-            metadata.active_agent, metadata.completed_turn_count
-        )
-    }
-
-    pub(crate) fn apply_to(&self, mut request: HeadlessChatRequest) -> HeadlessChatRequest {
-        request.dangerous_mode = self.dangerous_mode;
-        if self.identifier.is_some() {
-            request.history = self.messages.clone();
-            request.session = self.metadata.clone();
-        }
-
-        let selected_model = self.selection.as_ref().map(|selection| {
-            request.model = Some(selection.model().to_owned());
-            request.request_config = selection.request_config().clone();
-            request.session_reasoning_effort = selection.reasoning_effort_value();
-            selection.model()
-        });
-        if let Some(agent) = &self.active_agent {
-            let overrides_selection = selected_model.is_some_and(|selected| {
-                agent
-                    .model
-                    .as_deref()
-                    .is_some_and(|model| model != selected)
-            });
-            if request.model.is_none() || overrides_selection {
-                request.model = agent.model.clone();
-            }
-            if overrides_selection {
-                request.request_config = Default::default();
-                request.session_reasoning_effort = None;
-            }
-            request
-                .system_prompt
-                .get_or_insert_with(|| agent.system_prompt.clone());
-            request.active_agent = Some(agent.name.clone());
-            request.effective_capabilities = Some(agent.capabilities.clone());
-        }
-        request.pending_system_reminder = self.pending_system_reminder.clone();
-
-        request
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::session::context::{
+    use agens_core::Message;
+    use agens_session::context::SessionContext;
+
+    use crate::headless::HeadlessChatRequest;
+    use agens_session::context::{
         AgentRotationError, SessionMutationError, reset_session, rotate_active_agent,
     };
     use agens_store::SessionStore;
@@ -472,23 +350,26 @@ mod tests {
             Some("Agent capabilities expanded: primary -> reviewer.")
         );
 
-        let request = context.apply_to(HeadlessChatRequest {
-            prompt: "next".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
+        let request = crate::headless::apply_session_to_request(
+            &context,
+            HeadlessChatRequest {
+                prompt: "next".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: None,
+            },
+        );
         assert_eq!(request.active_agent.as_deref(), Some("reviewer"));
         assert_eq!(request.model.as_deref(), Some("gpt-4o"));
         assert_eq!(request.system_prompt.as_deref(), Some("You are reviewer."));
@@ -713,30 +594,33 @@ mod tests {
             &BundledModelValidator,
         )
         .unwrap();
-        let request = SessionContext::resumed(
+        let context = SessionContext::resumed(
             7,
             metadata,
             messages.clone(),
             active_agent,
             std::path::PathBuf::from("project"),
-        )
-        .apply_to(HeadlessChatRequest {
-            prompt: "next question".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
+        );
+        let request = crate::headless::apply_session_to_request(
+            &context,
+            HeadlessChatRequest {
+                prompt: "next question".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: None,
+            },
+        );
 
         assert_eq!(request.prompt, "next question");
         assert_eq!(request.history, messages);
@@ -746,23 +630,26 @@ mod tests {
 
     #[test]
     fn fresh_tui_session_does_not_reuse_prior_context() {
-        let request = SessionContext::fresh().apply_to(HeadlessChatRequest {
-            prompt: "new question".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
+        let request = crate::headless::apply_session_to_request(
+            &SessionContext::fresh(),
+            HeadlessChatRequest {
+                prompt: "new question".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: None,
+            },
+        );
 
         assert_eq!(request.system_prompt, None);
     }

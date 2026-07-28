@@ -5,18 +5,39 @@ Agens is a Rust coding-agent CLI. The Rust workspace is the only buildable, test
 ## Workspace map
 
 ```text
-crates/agens-cli        command parsing and composition root
-  -> agens-core         messages, turns, cancellation, and domain errors
+crates/agens-cli        argument parsing and composition; calls into the crates below
+  -> agens-core         messages, turns, cancellation, and domain contracts
   -> agens-error        the shared error and exit-status contract
-  -> agens-bootstrap    resolving a run's configuration from a host environment
-  -> agens-models       the bundled model catalog and selection
   -> agens-config       TOML configuration and credential-path compatibility
+  -> agens-models       the bundled model catalog and selection
+  -> agens-bootstrap    resolving a run's configuration from a host environment
   -> agens-providers    OpenAI and ChatGPT authentication and streaming adapters
+  -> agens-store        SQLite sessions, grants, and the evidence ledger
   -> agens-tools        native tools, permissions, MCP, skills, and subagents
-  -> agens-store        SQLite sessions and persisted grants
-  -> agens-tui          terminal surface over the shared runtime
-  -> agens-server       the machine's daemon: single-instance runtime and, later, the coordinator
+  -> agens-session      what a session is: identity, context, provider, attempts
+  -> agens-server       the machine's daemon and its sync/async boundary
+  -> agens-tui          terminal rendering surface
 ```
+
+## What each crate is
+
+Read this before adding a module: the question "where does this go" is answered
+by which of these sentences it fits, not by which directory is convenient.
+
+| Crate | Owns | Does not own |
+|---|---|---|
+| `agens-core` | The domain vocabulary every other crate speaks: messages, turns and their state machine, cancellation, session metadata, tool-result facts, the subagent outcome taxonomy. | Anything that performs I/O, and any dependency on another workspace crate. |
+| `agens-error` | The error and exit-status contract shared by every layer that can fail. | Deciding how an error is displayed. |
+| `agens-config` | Reading hand-authored TOML and resolving credential paths. | Deciding what the resolved values mean for a run. |
+| `agens-models` | The bundled model catalog, its checksum, and a validated model selection. | Talking to a provider. |
+| `agens-bootstrap` | Turning a host environment into a resolved `Bootstrap`: paths, settings, credentials, MCP servers, and the session-scoped re-resolution that keeps a resumed session on its own root. | Knowing which command is running or how it reports. |
+| `agens-providers` | Provider adapters: authentication, streaming, and their error taxonomy. | Choosing a provider or a model for a session. |
+| `agens-store` | SQLite: the unified database, migrations, sessions, attempts, grants, the evidence ledger, and paginated transcript reads. | Interpreting what it stores. |
+| `agens-tools` | Native tools and their confinement, permission capabilities, MCP transports, skills, and subagent plumbing. | Deciding whether a call is allowed for a given session. |
+| `agens-session` | What a session is: its context, the provider and credentials it speaks through, and its attempt lifecycle. | Rendering any of it, or composing text for a person. |
+| `agens-server` | The machine's daemon: its single-instance guard, its runtime, and the one named crossing into synchronous code. Grows to hold the coordinator. | A project. One daemon serves many. |
+| `agens-tui` | Terminal rendering: widgets, layout, the conversation projection, and the bridges a surface needs. | Any decision the runtime would still have to make with no terminal attached. |
+| `agens-cli` | Argument parsing, the command table, and wiring production implementations together. | Logic. If deleting the CLI would delete a capability, that capability is in the wrong crate. |
 
 ## Dependency direction
 

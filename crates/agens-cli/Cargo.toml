@@ -25,6 +25,7 @@ agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
 agens-providers = { path = "../agens-providers" }
 agens-server = { path = "../agens-server" }
+agens-session = { path = "../agens-session" }
 agens-store = { path = "../agens-store" }
 agens-tools = { path = "../agens-tools" }
 agens-tui = { path = "../agens-tui" }

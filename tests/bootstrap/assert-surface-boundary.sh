@@ -11,10 +11,12 @@
 # decision to re-couple, and should be argued for rather than done quietly.
 set -euo pipefail
 
+# `session/provider.rs` and `session/context.rs` left this list by moving to
+# `agens-session`, which does not depend on `agens-tui`. That is the intended
+# exit: once a module is in a crate of its own, the crate graph enforces the
+# boundary and this file no longer has to.
 declare -a LOGIC_MODULES=(
   "crates/agens-cli/src/permissions.rs"
-  "crates/agens-cli/src/session/provider.rs"
-  "crates/agens-cli/src/session/context.rs"
   "crates/agens-cli/src/turns.rs"
 )
 

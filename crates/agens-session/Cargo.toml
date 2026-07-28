@@ -1,0 +1,19 @@
+[package]
+name = "agens-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agens-bootstrap = { path = "../agens-bootstrap" }
+agens-core = { path = "../agens-core" }
+agens-error = { path = "../agens-error" }
+agens-models = { path = "../agens-models" }
+agens-providers = { path = "../agens-providers" }
+agens-store = { path = "../agens-store" }
+agens-tools = { path = "../agens-tools" }
+serde_json = "1"

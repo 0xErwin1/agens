@@ -29,8 +29,6 @@ use crate::permissions::prompt::TtyPermissionPrompter;
 use crate::permissions::prompt::TuiPermissionPrompter;
 use crate::permissions::prompt::production_tui_permission_bridge;
 use crate::session::agents::persist_pending_agent_correction;
-use crate::session::context::{ResumeDraft, SessionContext};
-use crate::session::provider::CredentialResolver;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{
@@ -46,6 +44,8 @@ use crate::tui::resume::{
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
 use agens_error::{CliError, ExitStatus};
+use agens_session::context::{ResumeDraft, SessionContext};
+use agens_session::provider::CredentialResolver;
 
 pub(crate) struct ProductionTuiEngine {
     pub(crate) cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -127,7 +127,7 @@ pub(crate) fn run_production_tui(
         let context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        crate::session::root::resolve_tui_session_root(&context, bootstrap)?
+        agens_session::root::resolve_tui_session_root(&context, bootstrap)?
     };
     let skills = start_tui_skills(&mut tui, bootstrap, &session_root_for_startup)?;
     let commands = start_tui_commands(&mut tui, bootstrap, &session_root_for_startup)?;
@@ -208,7 +208,7 @@ pub(crate) fn run_production_tui(
                 .lock()
                 .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))
                 .and_then(|context| {
-                    crate::session::root::resolve_tui_session_root(&context, &runtime_bootstrap)
+                    agens_session::root::resolve_tui_session_root(&context, &runtime_bootstrap)
                 }) {
                 Ok(root) => root,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -393,23 +393,26 @@ pub(crate) fn run_tui_prompt_with(
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
         session.running = true;
-        let mut request = session.apply_to(HeadlessChatRequest {
-            prompt,
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: skills.clone(),
-        });
+        let mut request = crate::headless::apply_session_to_request(
+            &session,
+            HeadlessChatRequest {
+                prompt,
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: skills.clone(),
+            },
+        );
         if let Some(skills) = skills {
             let base = match request.system_prompt.take() {
                 Some(explicit) => explicit,
@@ -438,7 +441,7 @@ fn tui_turn_system_prompt(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Option<String>, CliError> {
-    let root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     let session_root = agens_bootstrap::session_root::SessionRoot::confined_to(root);
     let session_config =
         agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
@@ -505,12 +508,12 @@ mod tests {
     use crate::CliDependencies;
     use crate::deps::bootstrap;
     use crate::session::agents::BundledModelValidator;
-    use crate::session::context::ActiveAgentRuntime;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
         tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
     };
     use agens_models::ModelSelection;
+    use agens_session::context::ActiveAgentRuntime;
 
     #[test]
     fn production_tui_project_identity_uses_the_canonical_current_project_for_new_and_resumed_sessions()

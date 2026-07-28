@@ -8,12 +8,12 @@ use std::path::PathBuf;
 use agens_bootstrap::{Bootstrap, session_root::SessionRoot};
 use agens_error::CliError;
 
-use crate::session::context::SessionContext;
+use crate::context::SessionContext;
 
 /// Resolves the root a resumed or in-progress TUI session's tools must be confined to: the
 /// value recorded on the session when it was loaded, or the process's own discovered root for a
 /// session that has not been created yet.
-pub(crate) fn resolve_tui_session_root(
+pub fn resolve_tui_session_root(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<PathBuf, CliError> {

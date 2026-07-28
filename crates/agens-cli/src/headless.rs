@@ -25,11 +25,6 @@ use crate::permissions::{
     ProductionPromptAuthorization, permission_policy,
 };
 use crate::session::agents::{AgentModelCompatibility, agent_catalog};
-use crate::session::attempt::{
-    AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
-    run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
-};
-use crate::session::provider::ProviderKind;
 use crate::tools::child::TaskMailboxProvider;
 use crate::tools::runtime::production_tool_runtime_for_parent;
 use crate::tools::task::ProductionTuiTaskRuntime;
@@ -39,6 +34,12 @@ use crate::{
     record_parent_terminal,
 };
 use agens_error::{CliError, ExitStatus};
+use agens_session::attempt::{
+    AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
+    run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
+};
+use agens_session::context::SessionContext;
+use agens_session::provider::ProviderKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
@@ -724,6 +725,49 @@ impl CompletedTurnRepository for DiscardCompletedTurnRepository {
 /// Applies the configured reasoning effort to a request that carries none.
 /// An explicit model selection or `/effort` choice already populated the
 /// request config, and must not be overwritten by the configured default.
+/// Fills a request from a session. A free function rather than a method because
+/// the request is the CLI's type and the session is not.
+pub(crate) fn apply_session_to_request(
+    context: &SessionContext,
+    mut request: HeadlessChatRequest,
+) -> HeadlessChatRequest {
+    request.dangerous_mode = context.dangerous_mode;
+    if context.identifier.is_some() {
+        request.history = context.messages.clone();
+        request.session = context.metadata.clone();
+    }
+
+    let selected_model = context.selection.as_ref().map(|selection| {
+        request.model = Some(selection.model().to_owned());
+        request.request_config = selection.request_config().clone();
+        request.session_reasoning_effort = selection.reasoning_effort_value();
+        selection.model()
+    });
+    if let Some(agent) = &context.active_agent {
+        let overrides_selection = selected_model.is_some_and(|selected| {
+            agent
+                .model
+                .as_deref()
+                .is_some_and(|model| model != selected)
+        });
+        if request.model.is_none() || overrides_selection {
+            request.model = agent.model.clone();
+        }
+        if overrides_selection {
+            request.request_config = Default::default();
+            request.session_reasoning_effort = None;
+        }
+        request
+            .system_prompt
+            .get_or_insert_with(|| agent.system_prompt.clone());
+        request.active_agent = Some(agent.name.clone());
+        request.effective_capabilities = Some(agent.capabilities.clone());
+    }
+    request.pending_system_reminder = context.pending_system_reminder.clone();
+
+    request
+}
+
 pub(crate) fn seed_configured_reasoning_effort(
     request: &mut HeadlessChatRequest,
     bootstrap: &Bootstrap,
@@ -801,12 +845,12 @@ mod tests {
             &resume_bootstrap,
             metadata.id,
             &SkillCatalog::default(),
-            &crate::session::provider::CredentialResolver::production(),
+            &agens_session::provider::CredentialResolver::production(),
         )
         .unwrap()
         .context;
         let session = Arc::new(Mutex::new(resumed));
-        let resolved_root = crate::session::root::resolve_tui_session_root(
+        let resolved_root = agens_session::root::resolve_tui_session_root(
             &session.lock().unwrap(),
             &resume_bootstrap,
         )
@@ -1339,31 +1383,34 @@ mod tests {
             .persist_completed_session_turn(&metadata, &initial_turn)
             .expect("normalized session should persist");
 
-        let mut request = crate::tui::resume::resume_tui_session(
+        let resumed = crate::tui::resume::resume_tui_session(
             &bootstrap,
             1,
             &SkillCatalog::default(),
-            &crate::session::provider::CredentialResolver::production(),
+            &agens_session::provider::CredentialResolver::production(),
         )
         .expect("normalized session should resume")
-        .context
-        .apply_to(HeadlessChatRequest {
-            prompt: "second input".into(),
-            history: Vec::new(),
-            model: None,
-            system_prompt: None,
-            max_iterations: None,
-            mode: PermissionMode::Edit,
-            dangerously_allow_all: false,
-            dangerous_mode: false,
-            request_config: agens_core::RequestConfig::default(),
-            session_reasoning_effort: None,
-            session: None,
-            active_agent: None,
-            effective_capabilities: None,
-            pending_system_reminder: None,
-            skills: None,
-        });
+        .context;
+        let mut request = apply_session_to_request(
+            &resumed,
+            HeadlessChatRequest {
+                prompt: "second input".into(),
+                history: Vec::new(),
+                model: None,
+                system_prompt: None,
+                max_iterations: None,
+                mode: PermissionMode::Edit,
+                dangerously_allow_all: false,
+                dangerous_mode: false,
+                request_config: agens_core::RequestConfig::default(),
+                session_reasoning_effort: None,
+                session: None,
+                active_agent: None,
+                effective_capabilities: None,
+                pending_system_reminder: None,
+                skills: None,
+            },
+        );
         request.pending_system_reminder =
             Some("Agent capabilities expanded: primary -> reviewer.".into());
         let completion = run_production_headless_chat_with_progress(

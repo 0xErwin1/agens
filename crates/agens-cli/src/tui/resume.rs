@@ -19,14 +19,14 @@ use crate::session::agents::{
     AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
     reconcile_persisted_active_agent,
 };
-use crate::session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
-use crate::session::provider::{CredentialResolver, ProviderKind};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
 use crate::turns::sanitize_subagent_summary;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
+use agens_session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
+use agens_session::provider::{CredentialResolver, ProviderKind};
 
 #[cfg(test)]
 pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
@@ -357,7 +357,7 @@ pub(crate) fn ensure_active_tui_agent_runtime(
     if context.active_agent.is_some() {
         return Ok(());
     }
-    let project_root = crate::session::root::resolve_tui_session_root(&context, bootstrap)?;
+    let project_root = agens_session::root::resolve_tui_session_root(&context, bootstrap)?;
     let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
     let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
     let inherited_model = effective_tui_model(bootstrap, &context);
@@ -387,7 +387,6 @@ mod tests {
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::permissions::prompt::production_tui_permission_bridge;
-    use crate::session::attempt::attempt_failure_status;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,
@@ -398,6 +397,7 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime;
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
+    use agens_session::attempt::attempt_failure_status;
 
     #[test]
     fn resuming_from_a_different_working_directory_confines_to_the_originally_recorded_root() {
@@ -426,7 +426,7 @@ mod tests {
              recorded root instead of being rejected: {resumed:?}"
         );
         let session = Arc::new(Mutex::new(resumed.unwrap().context));
-        let resolved_root = crate::session::root::resolve_tui_session_root(
+        let resolved_root = agens_session::root::resolve_tui_session_root(
             &session.lock().unwrap(),
             &resume_bootstrap,
         )
@@ -835,7 +835,7 @@ mod tests {
         let (permission_bridge, _) = TuiPermissionBridge::channel();
         let (events, _) = agens_tui::BridgeTx::bounded(8);
         let project_root =
-            crate::session::root::resolve_tui_session_root(&session.lock().unwrap(), &bootstrap)
+            agens_session::root::resolve_tui_session_root(&session.lock().unwrap(), &bootstrap)
                 .unwrap();
         let runtime = production_tui_task_runtime(
             &bootstrap,
@@ -929,8 +929,10 @@ mod tests {
                 let active = context.active_agent.as_ref().unwrap();
                 assert_eq!(active.name, "primary", "{provider} {model}");
                 assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
-                let request = context
-                    .apply_to(chat_request(chat_args_with_prompt("first submission")).unwrap());
+                let request = crate::headless::apply_session_to_request(
+                    &context,
+                    chat_request(chat_args_with_prompt("first submission")).unwrap(),
+                );
                 assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
                 assert_eq!(
                     request.request_config.reasoning_effort(),
@@ -1222,7 +1224,10 @@ mod tests {
                 Some(model),
                 "{provider} {model}"
             );
-            let request = context.apply_to(chat_request(chat_args_with_prompt("review")).unwrap());
+            let request = crate::headless::apply_session_to_request(
+                &context,
+                chat_request(chat_args_with_prompt("review")).unwrap(),
+            );
             assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
             assert_eq!(
                 request.request_config.reasoning_effort(),

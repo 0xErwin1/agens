@@ -19,11 +19,11 @@ use agens_tui::{BridgeCancel, BridgeTx, TuiExecutionEvent, TuiRuntimeEvent, TuiS
 use crate::Bootstrap;
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use crate::permissions::ParseToolInput;
-use crate::session::context::SessionContext;
-use crate::session::context::{CompletedSubagentTurn, current_session_timestamp};
 use crate::tools::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
 use crate::tui::metrics::sanitize_tui_metric;
 use crate::turns::persist_completed_subagent_turn;
+use agens_session::context::SessionContext;
+use agens_session::context::{CompletedSubagentTurn, current_session_timestamp};
 
 #[cfg(test)]
 type ProductionTaskProbe = Arc<

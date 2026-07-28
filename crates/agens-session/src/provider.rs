@@ -24,27 +24,27 @@ use agens_models::ModelSource;
 
 #[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderKind {
+pub enum ProviderKind {
     OpenAiApi,
     OpenAiChatGpt,
 }
 
 impl ProviderKind {
-    pub(crate) const ALL: [Self; 2] = [Self::OpenAiChatGpt, Self::OpenAiApi];
+    pub const ALL: [Self; 2] = [Self::OpenAiChatGpt, Self::OpenAiApi];
 
-    pub(crate) const fn identifier(self) -> &'static str {
+    pub const fn identifier(self) -> &'static str {
         ["openai-api", "openai-chatgpt"][self as usize]
     }
 
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         ["OpenAI API", "ChatGPT subscription"][self as usize]
     }
 
-    pub(crate) const fn source(self) -> ModelSource {
+    pub const fn source(self) -> ModelSource {
         [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription][self as usize]
     }
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    pub fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|provider| provider.identifier() == value)
@@ -53,7 +53,7 @@ impl ProviderKind {
 
 #[repr(usize)]
 #[derive(Clone, Copy)]
-pub(crate) enum CredentialStatus {
+pub enum CredentialStatus {
     Ready,
     RefreshRequired,
     ConnectRequired,
@@ -61,7 +61,7 @@ pub(crate) enum CredentialStatus {
 }
 
 impl CredentialStatus {
-    pub(crate) const fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         [
             "ready",
             "refresh required",
@@ -70,30 +70,31 @@ impl CredentialStatus {
         ][self as usize]
     }
 
-    pub(crate) const fn available(self) -> bool {
+    pub const fn available(self) -> bool {
         matches!(self, Self::Ready | Self::RefreshRequired)
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct CredentialResolver {
-    pub(crate) environment: Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>,
+pub struct CredentialResolver {
+    pub environment: Arc<dyn Fn() -> BTreeMap<String, String> + Send + Sync>,
 }
 
 impl CredentialResolver {
-    pub(crate) fn production() -> Self {
+    pub fn production() -> Self {
         Self {
             environment: Arc::new(|| std::env::vars().collect()),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_environment(environment: BTreeMap<String, String>) -> Self {
+    /// A resolver whose environment is fixed. Not test-gated: the tests that use
+    /// it live in another crate now, and a constructor that only exists under
+    /// `cfg(test)` cannot cross a crate boundary.
+    pub fn with_environment(environment: BTreeMap<String, String>) -> Self {
         Self::with_environment_resolver(move || environment.clone())
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_environment_resolver(
+    pub fn with_environment_resolver(
         resolve: impl Fn() -> BTreeMap<String, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -101,12 +102,12 @@ impl CredentialResolver {
         }
     }
 
-    pub(crate) fn api_key(&self, path: &Path) -> Option<String> {
+    pub fn api_key(&self, path: &Path) -> Option<String> {
         let credentials = fs::read_to_string(path).ok();
         openai_api_key(credentials.as_deref(), &(self.environment)())
     }
 
-    pub(crate) fn status(&self, path: &Path, provider: ProviderKind) -> CredentialStatus {
+    pub fn status(&self, path: &Path, provider: ProviderKind) -> CredentialStatus {
         match provider {
             ProviderKind::OpenAiChatGpt => {
                 match load_chatgpt_auth_state(path, std::time::SystemTime::now()) {
@@ -126,14 +127,12 @@ impl CredentialResolver {
     }
 }
 
-pub(crate) enum ChatGptCredentialSnapshot {
+pub enum ChatGptCredentialSnapshot {
     Absent,
     Present(serde_json::Value),
 }
 
-pub(crate) fn snapshot_chatgpt_credentials(
-    path: &Path,
-) -> Result<ChatGptCredentialSnapshot, CliError> {
+pub fn snapshot_chatgpt_credentials(path: &Path) -> Result<ChatGptCredentialSnapshot, CliError> {
     match fs::read_to_string(path) {
         Ok(credentials) => serde_json::from_str::<serde_json::Value>(&credentials)
             .ok()
@@ -148,7 +147,7 @@ pub(crate) fn snapshot_chatgpt_credentials(
     }
 }
 
-pub(crate) fn restore_chatgpt_credentials(
+pub fn restore_chatgpt_credentials(
     path: &Path,
     snapshot: ChatGptCredentialSnapshot,
 ) -> Result<(), CliError> {
@@ -161,27 +160,4 @@ pub(crate) fn restore_chatgpt_credentials(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::tui_session_directory;
-
-    #[test]
-    fn tui_provider_availability_uses_complete_current_credentials_without_exposing_them() {
-        let temporary = tui_session_directory("provider-status");
-        let credentials = temporary.join("auth.json");
-        std::fs::write(
-            &credentials,
-            r#"{"openai-chatgpt":{"access_token":"access","refresh_token":"refresh","account_id":"account","expires_at":"2099-01-01T00:00:00Z"}}"#,
-        )
-        .unwrap();
-        let resolver = CredentialResolver::with_environment(BTreeMap::new());
-
-        let statuses =
-            ProviderKind::ALL.map(|provider| resolver.status(&credentials, provider).label());
-        assert_eq!(statuses, ["ready", "credential required"]);
-        std::fs::remove_dir_all(temporary).unwrap();
-    }
 }

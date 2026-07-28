@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
-use crate::session::context::SessionContext;
-use crate::session::provider::ProviderKind;
 use crate::tools::task::default_model;
 use crate::tui::turn::current_tui_provider;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 use agens_models::{ModelSelection, ModelSource};
+use agens_session::context::SessionContext;
+use agens_session::provider::ProviderKind;
 
 pub(crate) fn apply_tui_selection(
     bootstrap: &Bootstrap,
@@ -288,7 +288,10 @@ mod tests {
             crate::tui::turn::effective_tui_model(&bootstrap, &context),
             "gpt-5.5"
         );
-        let request = context.apply_to(chat_request(chat_args_with_prompt("work")).unwrap());
+        let request = crate::headless::apply_session_to_request(
+            &context,
+            chat_request(chat_args_with_prompt("work")).unwrap(),
+        );
         assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(
             request.session_reasoning_effort,

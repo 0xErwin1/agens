@@ -20,10 +20,10 @@ use crate::permissions::{
     AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, SharedToolDispatcher,
 };
-use crate::session::context::SessionContext;
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
 use agens_error::{CliError, ExitStatus};
+use agens_session::context::SessionContext;
 
 pub(crate) struct RegisteredNativeTool {
     pub(crate) name: String,
@@ -384,7 +384,6 @@ mod tests {
         ProductionPromptAuthorization, prompt::production_tui_permission_bridge,
     };
     use crate::session::agents::select_subagent;
-    use crate::session::context::SessionContext;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
         run_production_batch_with_policy, tui_session_bootstrap, tui_session_directory,
@@ -394,6 +393,7 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime_with_runner;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
     use agens_core::{ToolOutcome, ToolResultFacts};
+    use agens_session::context::SessionContext;
     use std::path::Path;
 
     #[test]

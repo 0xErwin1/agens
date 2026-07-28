@@ -1,9 +1,9 @@
 use agens_tools::ReadFileInput;
 
-use crate::session::context::SessionContext;
 use crate::tools::runtime::open_native_tools;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
+use agens_session::context::SessionContext;
 
 const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// Hard cap on `@` picker entries: enumeration is one bounded walk of the
@@ -28,7 +28,7 @@ pub(crate) fn tui_picker_file_candidates(
 /// Bounded, ignore-aware project files read through the confined native tools,
 /// so no candidate can ever name a path outside the project root.
 ///
-/// Resolves the root through [`crate::session::root::resolve_tui_session_root`]: a resumed
+/// Resolves the root through [`agens_session::root::resolve_tui_session_root`]: a resumed
 /// session's own recorded root, or the process's own discovered root for a session that has not
 /// been created yet. This must never re-derive the process's discovered root directly, or a
 /// resumed session confined to a different root than the resuming process's working directory
@@ -38,7 +38,7 @@ pub(crate) fn tui_file_candidates_with_limit(
     bootstrap: &Bootstrap,
     limit: usize,
 ) -> Result<Vec<String>, CliError> {
-    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     open_native_tools(&project_root, bootstrap.tool_limits())?
         .tui_file_candidates(limit)
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
@@ -78,7 +78,7 @@ pub(crate) fn expand_tui_file_reference(
     bootstrap: &Bootstrap,
     prompt: &str,
 ) -> Result<String, CliError> {
-    let project_root = crate::session::root::resolve_tui_session_root(context, bootstrap)?;
+    let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
     let tools = open_native_tools(&project_root, bootstrap.tool_limits())?;
     let mut expanded = String::with_capacity(prompt.len());
 
@@ -114,13 +114,13 @@ mod tests {
     use agens_tui::Tui;
 
     use super::*;
-    use crate::session::provider::CredentialResolver;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
         tui_session_bootstrap, tui_session_directory,
     };
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::resume::resume_tui_session;
+    use agens_session::provider::CredentialResolver;
 
     #[test]
     fn a_resumed_session_confines_the_picker_and_at_file_expansion_to_its_own_recorded_root() {
