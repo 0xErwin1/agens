@@ -21,9 +21,12 @@ use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::ProductionToolDispatcher;
 use crate::error::{CliError, ExitStatus};
+use crate::permissions::prompt::{ProductionPermissionPrompter, TtyPermissionPrompter};
+#[allow(unused_imports)]
+use crate::permissions::{};
 use crate::permissions::{
-    ProductionPermissionGate, ProductionPermissionPrompter, ProductionPermissionResolver,
-    ProductionPromptAuthorization, TtyPermissionPrompter, permission_policy,
+    ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
+    permission_policy,
 };
 use crate::session::attempt::{
     AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
@@ -753,7 +756,7 @@ mod tests {
         use agens_store::SessionStore;
         use agens_tools::SkillCatalog;
 
-        use crate::permissions::production_tui_permission_bridge;
+        use crate::permissions::prompt::production_tui_permission_bridge;
         use crate::test_support::{
             bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
             tui_session_bootstrap, tui_session_directory,

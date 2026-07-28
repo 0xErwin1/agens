@@ -53,9 +53,10 @@ Do not weaken assertions, lint levels, or error handling to manufacture a green 
 
 ## Architecture boundaries
 
-- `agens-cli` is the composition root and sole binary crate.
+- `agens-cli` is the composition root and sole binary crate. It holds composition, not logic.
 - `agens-core` owns domain contracts and must not depend on adapters.
 - `agens-tui` is a terminal surface over the shared runtime, not a second runtime.
+- **User interfaces stay out of logic.** Logic must not depend on a surface crate, and must not be written against surface types either — no rendering types, prompt replies, or submit-origin enums in engine signatures. When logic needs something from a surface, it declares a trait it owns and the surface implements it. See `ARCHITECTURE.md`, *Surfaces and logic*; the crate graph in `tests/bootstrap/assert-workspace.sh` enforces the crate-level half and cannot see the rest.
 - Providers, tools, stores, and configuration remain adapters around core contracts.
 - Hand-authored TOML configuration remains separate from SQLite runtime state.
 - Preserve the dependency graph documented in `ARCHITECTURE.md` and enforced by `tests/bootstrap/assert-workspace.sh`.

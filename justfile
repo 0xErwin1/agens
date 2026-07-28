@@ -21,6 +21,7 @@ deny:
 
 contracts:
     tests/bootstrap/assert-workspace.sh
+    tests/bootstrap/assert-surface-boundary.sh
     tests/bootstrap/docs-contract.sh
     tests/bootstrap/target-budget.sh
     tests/bootstrap/verify-contracts.sh

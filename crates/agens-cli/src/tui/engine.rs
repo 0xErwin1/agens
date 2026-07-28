@@ -24,7 +24,7 @@ use crate::headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
     run_production_headless_chat_with_progress,
 };
-use crate::permissions::production_tui_permission_bridge;
+use crate::permissions::prompt::production_tui_permission_bridge;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
 use crate::tools::task::{

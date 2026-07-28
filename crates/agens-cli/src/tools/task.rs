@@ -17,9 +17,10 @@ use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use crate::error::CliError;
+use crate::permissions::prompt::ProductionPermissionPrompter;
 use crate::permissions::{
-    ProductionPermissionGate, ProductionPermissionPrompter, ProductionPermissionResolver,
-    ProductionPromptAuthorization, SharedToolDispatcher, permission_policy,
+    ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
+    SharedToolDispatcher, permission_policy,
 };
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
@@ -290,7 +291,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::permissions::production_tui_permission_bridge;
+    use crate::permissions::prompt::production_tui_permission_bridge;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
 
     #[test]

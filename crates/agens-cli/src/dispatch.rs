@@ -381,7 +381,7 @@ mod tests {
     use crate::CliError;
     use crate::permissions::{
         PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
-        ProductionPromptAuthorization, production_tui_permission_bridge,
+        ProductionPromptAuthorization, prompt::production_tui_permission_bridge,
     };
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,

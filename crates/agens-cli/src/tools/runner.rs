@@ -606,7 +606,7 @@ mod tests {
     use super::*;
     use crate::CliError;
     use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
-    use crate::permissions::production_tui_permission_bridge;
+    use crate::permissions::prompt::production_tui_permission_bridge;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::task::production_tui_task_runtime_with_runner;
 

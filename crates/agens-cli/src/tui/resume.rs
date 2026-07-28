@@ -373,7 +373,7 @@ mod tests {
 
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
-    use crate::permissions::production_tui_permission_bridge;
+    use crate::permissions::prompt::production_tui_permission_bridge;
     use crate::session::attempt::attempt_failure_status;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
