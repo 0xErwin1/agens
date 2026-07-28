@@ -25,6 +25,9 @@ use crate::headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
     run_production_headless_chat_with_progress,
 };
+#[cfg(test)]
+use crate::permissions::prompt::TtyPermissionPrompter;
+use crate::permissions::prompt::TuiPermissionPrompter;
 use crate::permissions::prompt::production_tui_permission_bridge;
 use crate::session::agents::persist_pending_agent_correction;
 use crate::session::context::{ResumeDraft, SessionContext};
@@ -277,7 +280,7 @@ pub(crate) fn run_production_tui(
                         &runtime_bootstrap,
                         &turn_cancellation,
                         Some(&sink),
-                        Some(prompt_bridge.clone()),
+                        Box::new(TuiPermissionPrompter(prompt_bridge.clone())),
                         Some(&task_runtime),
                         Some(&task_diagnostic_reference),
                     )
@@ -361,7 +364,7 @@ pub(crate) fn run_tui_prompt(
                 bootstrap,
                 cancellation,
                 progress,
-                None,
+                Box::new(TtyPermissionPrompter),
                 None,
                 None,
             )

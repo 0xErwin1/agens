@@ -40,25 +40,23 @@ impl PermissionPrompter for TtyPermissionPrompter {
     }
 }
 
-pub(crate) enum ProductionPermissionPrompter {
-    Tty(TtyPermissionPrompter),
-    Tui(TuiPermissionBridge),
-}
+/// The terminal UI's implementation of the permission port. Each surface owns
+/// its own, so the engine never chooses between them.
+pub(crate) struct TuiPermissionPrompter(pub(crate) TuiPermissionBridge);
 
 pub(crate) fn production_tui_permission_bridge()
 -> (TuiPermissionBridge, Receiver<TuiPermissionRequest>) {
     TuiPermissionBridge::channel()
 }
 
-impl PermissionPrompter for ProductionPermissionPrompter {
+impl PermissionPrompter for TuiPermissionPrompter {
     fn prompt(
         &mut self,
         context: &PermissionPromptContext,
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
-        match self {
-            Self::Tty(prompt) => prompt.prompt(context, cancellation),
-            Self::Tui(bridge) => match bridge.wait_for_reply(
+        {
+            match self.0.wait_for_reply(
                 context.qualified_tool_name.clone(),
                 render_permission_prompt(context),
                 cancellation,
@@ -69,7 +67,7 @@ impl PermissionPrompter for ProductionPermissionPrompter {
                 TuiPermissionReply::DenyAlways => Ok(PermissionPromptAnswer::DenyAlways),
                 TuiPermissionReply::Cancelled => Err(HeadlessTurnPortError::Cancelled),
                 TuiPermissionReply::DeadlineExpired => Err(HeadlessTurnPortError::TimedOut),
-            },
+            }
         }
     }
 }
@@ -215,7 +213,7 @@ mod tests {
                 (request, replied)
             });
             let mut resolver = ProductionPermissionResolver::new(
-                ProductionPermissionPrompter::Tui(bridge),
+                TuiPermissionPrompter(bridge),
                 store,
                 Arc::clone(&grants),
                 Arc::clone(&prompts),

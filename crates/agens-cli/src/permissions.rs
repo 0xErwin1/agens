@@ -326,6 +326,17 @@ pub(crate) trait PermissionPrompter: Send {
     ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError>;
 }
 
+/// Lets the engine hold the port without naming any implementation of it.
+impl PermissionPrompter for Box<dyn PermissionPrompter> {
+    fn prompt(
+        &mut self,
+        context: &PermissionPromptContext,
+        cancellation: &HeadlessTurnCancellation,
+    ) -> Result<PermissionPromptAnswer, HeadlessTurnPortError> {
+        self.as_mut().prompt(context, cancellation)
+    }
+}
+
 pub(crate) struct ProductionPermissionResolver<P> {
     prompt: P,
     grant_store: PermissionGrantStore,

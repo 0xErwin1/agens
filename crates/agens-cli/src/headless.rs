@@ -17,14 +17,13 @@ use agens_providers::{
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
-use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::ProductionToolDispatcher;
 use crate::error::{CliError, ExitStatus};
-use crate::permissions::prompt::{ProductionPermissionPrompter, TtyPermissionPrompter};
+use crate::permissions::prompt::TtyPermissionPrompter;
 use crate::permissions::{
-    ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
-    permission_policy,
+    PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
+    ProductionPromptAuthorization, permission_policy,
 };
 use crate::session::agents::{AgentModelCompatibility, agent_catalog};
 use crate::session::attempt::{
@@ -159,7 +158,7 @@ pub(crate) fn run_production_headless_chat(
         bootstrap,
         cancellation,
         None,
-        None,
+        Box::new(TtyPermissionPrompter),
         None,
         None,
     )
@@ -207,7 +206,7 @@ struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
     cancellation: &'a HeadlessTurnCancellation,
     progress: Option<&'a TurnProgressSink>,
-    permission_bridge: Option<TuiPermissionBridge>,
+    prompter: Box<dyn PermissionPrompter>,
     task_runtime: Option<&'a ProductionTuiTaskRuntime>,
     diagnostic_reference: &'a str,
     include_system_prompt: bool,
@@ -218,7 +217,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
     bootstrap: &Bootstrap,
     cancellation: &HeadlessTurnCancellation,
     progress: Option<&TurnProgressSink>,
-    permission_bridge: Option<TuiPermissionBridge>,
+    prompter: Box<dyn PermissionPrompter>,
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
@@ -263,7 +262,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
                     bootstrap,
                     cancellation,
                     progress,
-                    permission_bridge,
+                    prompter,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
@@ -306,7 +305,7 @@ pub(crate) fn run_production_headless_chat_with_progress(
                     bootstrap,
                     cancellation,
                     progress,
-                    permission_bridge,
+                    prompter,
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: false,
@@ -522,10 +521,7 @@ where
         Arc::clone(&prompts),
     );
     let mut resolver = ProductionPermissionResolver::new(
-        context.permission_bridge.map_or(
-            ProductionPermissionPrompter::Tty(TtyPermissionPrompter),
-            ProductionPermissionPrompter::Tui,
-        ),
+        context.prompter,
         grant_store,
         grants,
         prompts,
@@ -1348,7 +1344,7 @@ mod tests {
             &bootstrap,
             &HeadlessTurnCancellation::new(),
             None,
-            None,
+            Box::new(TtyPermissionPrompter),
             None,
             None,
         )

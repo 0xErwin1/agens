@@ -17,7 +17,7 @@ use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use crate::error::CliError;
-use crate::permissions::prompt::ProductionPermissionPrompter;
+use crate::permissions::prompt::TuiPermissionPrompter;
 use crate::permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
     SharedToolDispatcher, permission_policy,
@@ -32,7 +32,7 @@ pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) dispatcher: SharedToolDispatcher,
     pub(crate) task_registry: TaskExecutionRegistry,
     #[allow(dead_code)]
-    pub(crate) authorized: AuthorizedNativeTaskRuntime<ProductionPermissionPrompter>,
+    pub(crate) authorized: AuthorizedNativeTaskRuntime<TuiPermissionPrompter>,
     /// The session root this runtime's dispatcher, permission policy, and grant scope were built
     /// against. The headless turn body reuses this value instead of re-deriving a root, so the
     /// parent turn and this runtime never disagree about which project's grants apply.
@@ -137,7 +137,7 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
         Arc::clone(&prompts),
     );
     let resolver = ProductionPermissionResolver::new(
-        ProductionPermissionPrompter::Tui(permission_bridge),
+        TuiPermissionPrompter(permission_bridge),
         grant_store,
         grants,
         prompts,
