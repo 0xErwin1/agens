@@ -3,11 +3,11 @@
 //! No user interface: which agents a session may use, which models each one can
 //! run, and how rotation resolves. It sat under `tui/` with a `Tui` prefix and
 //! never referenced the terminal crate at all.
-
-//! Agent rotation and catalog discovery for the TUI: resolving the active
-//! primary agent, selecting a subagent, discovering the built-in plus
-//! configured agent catalog, and validating a candidate model against the
-//! provider currently in effect.
+//!
+//! Resolving the active primary agent, selecting a subagent, discovering the
+//! built-in plus configured agent catalog, validating a candidate model against
+//! the provider currently in effect, and building the runtime a session needs
+//! before it can accept a native tool call.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -20,11 +20,12 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::diagnostics::record_agent_diagnostic;
 use crate::tools::runtime::production_tool_runtime;
-use crate::tui::resume::ensure_active_tui_agent_runtime;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};
+use agens_permissions::SharedToolDispatcher;
+use agens_session::context::ActiveAgentRuntime;
 use agens_session::context::SessionContext;
 use agens_session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
 use agens_session::model::effective_model;
@@ -60,7 +61,7 @@ pub(crate) fn rotate_agent(
         .ok_or_else(|| CliError::usage("/agent requires an available primary agent"))?
         .clone();
     let (_, dispatcher) = production_tool_runtime(bootstrap, &project_root, Some(skills))?;
-    ensure_active_tui_agent_runtime(bootstrap, session, &dispatcher)?;
+    ensure_active_agent_runtime(bootstrap, session, &dispatcher)?;
     let dispatcher = dispatcher
         .lock()
         .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
@@ -505,6 +506,37 @@ pub(crate) fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, C
         .map_err(CliError::unavailable)
 }
 
+pub(crate) fn ensure_active_agent_runtime(
+    bootstrap: &Bootstrap,
+    session: &Arc<Mutex<SessionContext>>,
+    dispatcher: &SharedToolDispatcher,
+) -> Result<(), CliError> {
+    let dispatcher = dispatcher
+        .lock()
+        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
+    let mut context = session
+        .lock()
+        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+    if context.active_agent.is_some() {
+        return Ok(());
+    }
+    let project_root = agens_session::root::resolve_tui_session_root(&context, bootstrap)?;
+    let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
+    let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
+    let inherited_model = effective_model(bootstrap, &context);
+    let active_agent = ActiveAgentRuntime::build(
+        &agent,
+        Some(&inherited_model),
+        &project_root.display().to_string(),
+        &dispatcher,
+        &validator,
+    )
+    .map_err(agent_rotation_error)?;
+    persist_pending_agent_correction(bootstrap, &mut context);
+    context.active_agent = Some(active_agent);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use agens_core::{AgentMode, SessionMetadata};
@@ -655,7 +687,7 @@ mod tests {
         .unwrap()
         .context;
         let session = Arc::new(Mutex::new(resumed));
-        ensure_active_tui_agent_runtime(
+        ensure_active_agent_runtime(
             &bootstrap,
             &session,
             &Arc::new(Mutex::new(rotation_dispatcher())),

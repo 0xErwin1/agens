@@ -28,6 +28,7 @@ use crate::headless::{
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
+use crate::session::agents::ensure_active_agent_runtime;
 use crate::session::agents::persist_pending_agent_correction;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
@@ -38,9 +39,7 @@ use crate::tui::extensions::{start_tui_commands, start_tui_skills};
 use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::models::seed_remembered_tui_selection;
-use crate::tui::resume::{
-    ResumedTuiSession, ensure_active_tui_agent_runtime, resume_tui_session, resumed_subagent_cards,
-};
+use crate::tui::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::tui::turn::{complete_tui_turn, tui_session_presentation};
 use agens_error::{CliError, ExitStatus};
@@ -229,7 +228,7 @@ pub(crate) fn run_production_tui(
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
-            if let Err(error) = ensure_active_tui_agent_runtime(
+            if let Err(error) = ensure_active_agent_runtime(
                 &runtime_bootstrap,
                 &router.session,
                 &task_runtime.dispatcher,
@@ -852,7 +851,7 @@ mod tests {
             )],
         );
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
-        ensure_active_tui_agent_runtime(
+        ensure_active_agent_runtime(
             &bootstrap,
             &session,
             &Arc::new(Mutex::new(rotation_dispatcher())),

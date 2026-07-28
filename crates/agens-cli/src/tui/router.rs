@@ -1251,6 +1251,7 @@ mod tests {
 
     use super::*;
     use crate::headless::HeadlessChatCompletion;
+    use crate::session::agents::ensure_active_agent_runtime;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1260,7 +1261,6 @@ mod tests {
     };
     use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
     use crate::tui::extensions::{start_tui_commands, start_tui_skills};
-    use crate::tui::resume::ensure_active_tui_agent_runtime;
     use agens_models::ModelSource;
 
     fn write_router_test_skill(root: &Path, name: &str, body: &str) {
@@ -1826,7 +1826,7 @@ mod tests {
             provider: Some(ProviderKind::OpenAiChatGpt),
             ..SessionContext::fresh()
         }));
-        ensure_active_tui_agent_runtime(
+        ensure_active_agent_runtime(
             &bootstrap,
             &session,
             &Arc::new(Mutex::new(rotation_dispatcher())),

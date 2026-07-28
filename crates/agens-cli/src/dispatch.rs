@@ -380,6 +380,7 @@ mod tests {
     use super::*;
     use crate::CliError;
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
+    use crate::session::agents::ensure_active_agent_runtime;
     use crate::session::agents::select_subagent;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
@@ -388,7 +389,6 @@ mod tests {
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls};
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tools::task::production_tui_task_runtime_with_runner;
-    use crate::tui::resume::ensure_active_tui_agent_runtime;
     use agens_core::{ToolOutcome, ToolResultFacts};
     use agens_permissions::{
         PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
@@ -675,7 +675,7 @@ mod tests {
             selected_subagent: Some("reviewer".into()),
             ..SessionContext::fresh()
         }));
-        ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
+        ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
         let cancellation = HeadlessTurnCancellation::new();
         let parent_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let next_event = |timeout| receiver.recv_timeout(timeout).unwrap().into_parts().1;

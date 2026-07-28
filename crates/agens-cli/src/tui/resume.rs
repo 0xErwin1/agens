@@ -1,10 +1,8 @@
 //! Resuming a persisted TUI session: loading it from the sessions store,
 //! projecting it into a fresh [`SessionContext`], committing it into the
 //! live session slot under a race guard, and reconstructing the restored
-//! completed-subagent cards shown for its history. Also ensures a session
-//! has an active agent runtime before it can accept native tool calls.
+//! completed-subagent cards shown for its history.
 
-use agens_session::model::effective_model;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -15,17 +13,14 @@ use agens_tui::{
     Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 
-use crate::session::agents::{
-    AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
-    reconcile_persisted_active_agent,
-};
+use crate::session::agents::{persist_pending_agent_correction, reconcile_persisted_active_agent};
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::tui_session_presentation;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
-use agens_permissions::{ParseToolInput, SharedToolDispatcher};
-use agens_session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
+use agens_permissions::ParseToolInput;
+use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::{CredentialResolver, ProviderKind};
 use agens_session::turns::sanitize_subagent_summary;
 
@@ -344,37 +339,6 @@ pub(crate) fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, Cl
         .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
 }
 
-pub(crate) fn ensure_active_tui_agent_runtime(
-    bootstrap: &Bootstrap,
-    session: &Arc<Mutex<SessionContext>>,
-    dispatcher: &SharedToolDispatcher,
-) -> Result<(), CliError> {
-    let dispatcher = dispatcher
-        .lock()
-        .map_err(|_| CliError::configuration("tool catalog is unavailable"))?;
-    let mut context = session
-        .lock()
-        .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    if context.active_agent.is_some() {
-        return Ok(());
-    }
-    let project_root = agens_session::root::resolve_tui_session_root(&context, bootstrap)?;
-    let agent = reconcile_persisted_active_agent(bootstrap, &mut context)?;
-    let validator = AgentModelCompatibility::for_context(bootstrap, &context)?;
-    let inherited_model = effective_model(bootstrap, &context);
-    let active_agent = ActiveAgentRuntime::build(
-        &agent,
-        Some(&inherited_model),
-        &project_root.display().to_string(),
-        &dispatcher,
-        &validator,
-    )
-    .map_err(agent_rotation_error)?;
-    persist_pending_agent_correction(bootstrap, &mut context);
-    context.active_agent = Some(active_agent);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use agens_core::{
@@ -388,6 +352,7 @@ mod tests {
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
+    use crate::session::agents::ensure_active_agent_runtime;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,
@@ -446,7 +411,7 @@ mod tests {
             "confinement-check".to_owned(),
         )
         .unwrap();
-        ensure_active_tui_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
+        ensure_active_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
 
         let policy = PermissionPolicy::new(
             PermissionMode::Edit,
@@ -848,7 +813,7 @@ mod tests {
             "abc12345".to_owned(),
         )
         .unwrap();
-        ensure_active_tui_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
+        ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();
         assert_eq!(tui_resume_test_counters(), (1, 1, 1, 0));
         assert_eq!(
             session
@@ -924,7 +889,7 @@ mod tests {
                 let session = Arc::new(Mutex::new(resumed));
                 let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
 
-                ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+                ensure_active_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
 
                 let context = session.lock().unwrap();
                 let active = context.active_agent.as_ref().unwrap();
@@ -954,7 +919,7 @@ mod tests {
             tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
         let session = Arc::new(Mutex::new(SessionContext::fresh()));
         let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
-        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+        ensure_active_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
         assert_eq!(
             session
                 .lock()
@@ -967,7 +932,7 @@ mod tests {
 
         apply_tui_model(&bootstrap, "gpt-5.6-sol", &session).unwrap();
         assert!(session.lock().unwrap().active_agent.is_none());
-        ensure_active_tui_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
+        ensure_active_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
 
         let context = session.lock().unwrap();
         assert_eq!(
@@ -1054,7 +1019,7 @@ mod tests {
             TuiSubmissionOutcome::SessionResumed { message, .. }
                 if message == "Agent 'retired' is unavailable; resumed with primary."
         ));
-        ensure_active_tui_agent_runtime(
+        ensure_active_agent_runtime(
             &bootstrap,
             &session,
             &Arc::new(Mutex::new(rotation_dispatcher())),
@@ -1211,7 +1176,7 @@ mod tests {
             .context;
             let session = Arc::new(Mutex::new(resumed));
 
-            ensure_active_tui_agent_runtime(
+            ensure_active_agent_runtime(
                 &bootstrap,
                 &session,
                 &Arc::new(Mutex::new(rotation_dispatcher())),
