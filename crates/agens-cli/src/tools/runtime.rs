@@ -19,11 +19,12 @@ use crate::mcp::{
     ProductionMcpRuntime, load_configured_mcp_registry, mcp_model_tool_name,
     native_model_tool_name, remote_function_tool,
 };
-use crate::permissions::SharedToolDispatcher;
 use crate::tools::runner::ProductionTaskRunner;
-use crate::tools::task::{TaskParentSelection, default_model, register_production_task_tool};
+use crate::tools::task::{TaskParentSelection, register_production_task_tool};
 use crate::tui::extensions::discover_skill_catalog;
 use agens_error::CliError;
+use agens_models::default_model;
+use agens_permissions::SharedToolDispatcher;
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
 pub(crate) fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {
@@ -98,7 +99,7 @@ pub(crate) fn production_tool_runtime_with_task_runner<R: TaskRunner>(
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     let parent_model = bootstrap
         .model()
-        .unwrap_or_else(|| default_model(bootstrap))
+        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
         .to_owned();
     production_tool_runtime_with_parent_task_runner(
         bootstrap,
@@ -241,19 +242,6 @@ fn production_read_only_tool_runtime(
     Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
 }
 
-const DANGEROUS_CHILD_NATIVE_TOOLS: [&str; 10] = [
-    "native::read",
-    "native::git_read",
-    "native::list",
-    "native::search",
-    "native::glob",
-    "native::grep",
-    "native::write",
-    "native::edit",
-    "native::bash",
-    "native::webfetch",
-];
-
 pub(crate) fn production_dangerous_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
@@ -263,10 +251,11 @@ pub(crate) fn production_dangerous_child_tool_runtime(
         tool_limits,
     )?)));
     let metadata = NativeToolCatalog::metadata();
-    let mut provider_tools = Vec::with_capacity(DANGEROUS_CHILD_NATIVE_TOOLS.len());
+    let mut provider_tools =
+        Vec::with_capacity(agens_permissions::DANGEROUS_CHILD_NATIVE_TOOLS.len());
     let mut dispatcher = ToolDispatcher::new();
 
-    for name in DANGEROUS_CHILD_NATIVE_TOOLS {
+    for name in agens_permissions::DANGEROUS_CHILD_NATIVE_TOOLS {
         let metadata = metadata
             .iter()
             .find(|metadata| metadata.qualified_name == name)
@@ -346,12 +335,6 @@ pub(crate) fn production_child_tool_runtime(
     drop(dispatcher_guard);
 
     Ok((provider_tools, dispatcher))
-}
-
-pub(crate) fn is_dangerous_child_native_tool(name: &str) -> bool {
-    DANGEROUS_CHILD_NATIVE_TOOLS.iter().any(|registered| {
-        name == *registered || name == registered.strip_prefix("native::").unwrap_or_default()
-    })
 }
 
 #[cfg(test)]

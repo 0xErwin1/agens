@@ -23,6 +23,7 @@ agens-core = { path = "../agens-core" }
 agens-bootstrap = { path = "../agens-bootstrap" }
 agens-error = { path = "../agens-error" }
 agens-models = { path = "../agens-models" }
+agens-permissions = { path = "../agens-permissions" }
 agens-providers = { path = "../agens-providers" }
 agens-server = { path = "../agens-server" }
 agens-session = { path = "../agens-session" }

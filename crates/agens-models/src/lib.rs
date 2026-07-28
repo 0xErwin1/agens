@@ -363,6 +363,16 @@ struct SnapshotModel {
     supported: Option<bool>,
 }
 
+/// The model a run falls back to when nothing selected one. Takes the provider
+/// identifier rather than a resolved configuration: the choice depends on which
+/// provider is in play and on nothing else.
+pub fn default_model(provider_type: Option<&str>) -> &'static str {
+    match provider_type {
+        Some("openai-chatgpt") => "gpt-5.5",
+        _ => "gpt-4.1",
+    }
+}
+
 #[cfg(test)]
 mod tests {
 

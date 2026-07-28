@@ -29,8 +29,8 @@ mod tests {
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tui::router::tui_provider_outcome;
     use crate::tui::turn::complete_tui_turn;
-    use crate::turns::completed_session_turn;
     use agens_session::context::SessionContext;
+    use agens_session::turns::completed_session_turn;
 
     /// Two independent SQLite databases both autoincrement `(session_id, attempt_id)` from 1, so
     /// the SAME `AttemptKey` is reachable from two entirely unrelated sessions once more than one

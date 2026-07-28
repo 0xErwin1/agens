@@ -1,7 +1,7 @@
 //! Where a permission question reaches a person.
 //!
 //! Prompting is a surface: it renders for a human and waits on one. It lives
-//! apart from the policy in `super` so that policy never names a surface type,
+//! in a different crate from the policy so that policy never names a surface type,
 //! and only reaches a person through the `PermissionPrompter` port it owns.
 
 use std::io::{IsTerminal, Write};
@@ -10,7 +10,7 @@ use std::sync::mpsc::Receiver;
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnPortError};
 use agens_tui::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 
-use super::{
+use agens_permissions::{
     PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter, sanitize_permission_target,
 };
 
@@ -94,14 +94,20 @@ pub(crate) fn render_permission_prompt(context: &PermissionPromptContext) -> Str
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+
+    use agens_core::{
+        HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall,
+        HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnPortError, PermissionDecision,
+        PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
+    };
+    use agens_permissions::*;
+
     use super::*;
     use crate::dispatch::ProductionToolDispatcher;
-    use crate::permissions::*;
-    use agens_core::{
-        HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, PermissionDecision,
-    };
     use agens_store::PermissionGrantStore;
-    use agens_tools::{DispatchTool, ToolExecutionContext, ToolOutput};
+    use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
 
     #[test]
     fn production_prompt_decisions_authorize_only_allowed_calls() {

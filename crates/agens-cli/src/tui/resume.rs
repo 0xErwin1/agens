@@ -14,19 +14,19 @@ use agens_tui::{
     Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 
-use crate::permissions::{ParseToolInput, SharedToolDispatcher};
 use crate::session::agents::{
     AgentModelCompatibility, agent_rotation_error, persist_pending_agent_correction,
     reconcile_persisted_active_agent,
 };
 use crate::tui::session::resume_retry_notice;
 use crate::tui::turn::{effective_tui_model, tui_session_presentation};
-use crate::turns::sanitize_subagent_summary;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
+use agens_permissions::{ParseToolInput, SharedToolDispatcher};
 use agens_session::context::{ActiveAgentRuntime, ResumeDraft, SessionContext};
 use agens_session::provider::{CredentialResolver, ProviderKind};
+use agens_session::turns::sanitize_subagent_summary;
 
 #[cfg(test)]
 pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
@@ -386,7 +386,7 @@ mod tests {
 
     use super::*;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
-    use crate::permissions::prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::production_tui_permission_bridge;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,

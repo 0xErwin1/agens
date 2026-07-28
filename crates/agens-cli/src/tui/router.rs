@@ -29,7 +29,6 @@ use crate::session::agents::{
     agent_catalog_for_context, persist_pending_agent_correction, rotate_agent, select_subagent,
     subagent_catalog,
 };
-use crate::tools::task::default_model;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
     RESERVED_TUI_COMMANDS, discover_skill_catalog, discover_tui_command_catalog, render_tui_help,
@@ -51,6 +50,7 @@ use crate::tui::turn::{current_tui_provider, effective_tui_model, tui_session_pr
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
 use agens_models::ModelSelection;
+use agens_models::default_model;
 use agens_session::attempt::active_session_attempts;
 use agens_session::context::SessionContext;
 use agens_session::context::{current_session_timestamp, reset_session};
@@ -333,7 +333,7 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| default_model(&bootstrap))
+                    .unwrap_or_else(|| default_model(bootstrap.provider_type()))
                     .to_owned();
                 let source = tui_model_source(&bootstrap, &context);
                 drop(context);
@@ -381,7 +381,7 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| default_model(&bootstrap));
+                    .unwrap_or_else(|| default_model(bootstrap.provider_type()));
                 let selector = context.selection.clone().unwrap_or_else(|| {
                     ModelSelection::for_source(model, tui_model_source(&bootstrap, &context))
                 });

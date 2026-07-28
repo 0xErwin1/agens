@@ -8,14 +8,14 @@ use std::collections::BTreeSet;
 use agens_core::{Message, MessagePart, Role};
 
 use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
-use crate::tools::task::default_model;
 use crate::tui_model_source;
-use crate::turns::SUBAGENT_CALL_ID_PREFIX;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
+use agens_models::default_model;
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
+use agens_session::turns::SUBAGENT_CALL_ID_PREFIX;
 use agens_tui::TuiPresentation;
 
 pub(crate) fn complete_tui_turn(
@@ -122,7 +122,7 @@ pub(crate) fn effective_tui_model(bootstrap: &Bootstrap, context: &SessionContex
                 .and_then(|metadata| metadata.model_id.as_deref())
         })
         .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap))
+        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
         .to_owned()
 }
 

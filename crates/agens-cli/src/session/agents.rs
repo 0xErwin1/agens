@@ -20,12 +20,12 @@ use agens_tools::{AgentCatalog, AgentModelValidator, SkillCatalog};
 
 use crate::diagnostics::record_agent_diagnostic;
 use crate::tools::runtime::production_tool_runtime;
-use crate::tools::task::default_model;
 use crate::tui::models::tui_model_source;
 use crate::tui::resume::ensure_active_tui_agent_runtime;
 use crate::tui::turn::effective_tui_model;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
+use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};
 use agens_session::context::SessionContext;
 use agens_session::context::{AgentRotationError, current_session_timestamp, rotate_active_agent};
@@ -500,7 +500,7 @@ pub(crate) fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, C
         .and_then(ProviderKind::parse)
         .map(ProviderKind::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    ModelSelection::for_source(default_model(bootstrap), source)
+    ModelSelection::for_source(default_model(bootstrap.provider_type()), source)
         .model_values()
         .map_err(CliError::unavailable)
 }

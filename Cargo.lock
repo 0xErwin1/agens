@@ -11,6 +11,7 @@ dependencies = [
  "agens-core",
  "agens-error",
  "agens-models",
+ "agens-permissions",
  "agens-providers",
  "agens-server",
  "agens-session",
@@ -69,6 +70,18 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "agens-permissions"
+version = "0.1.0"
+dependencies = [
+ "agens-config",
+ "agens-core",
+ "agens-error",
+ "agens-store",
+ "agens-tools",
+ "serde_json",
 ]
 
 [[package]]

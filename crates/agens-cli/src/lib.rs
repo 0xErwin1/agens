@@ -17,7 +17,9 @@ mod diagnostics;
 mod dispatch;
 mod headless;
 mod mcp;
-mod permissions;
+mod permission_prompt;
+#[cfg(test)]
+mod permission_tests;
 #[cfg(test)]
 mod provider_tests;
 mod session;
@@ -25,7 +27,8 @@ mod session;
 mod test_support;
 mod tools;
 mod tui;
-mod turns;
+#[cfg(test)]
+mod turns_tests;
 
 use agens_bootstrap::effective_max_iterations;
 use agens_error::cancellation_result;

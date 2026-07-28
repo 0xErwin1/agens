@@ -16,13 +16,13 @@ use agens_tools::{
     DispatchTool, McpRegistry, NativeToolCatalog, TaskLaunchMode, ToolExecutionContext, ToolOutput,
 };
 
-use crate::permissions::{
-    AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
-    ProductionPermissionResolver, SharedToolDispatcher,
-};
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
 use agens_error::{CliError, ExitStatus};
+use agens_permissions::{
+    AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
+    ProductionPermissionResolver, SharedToolDispatcher,
+};
 use agens_session::context::SessionContext;
 
 pub(crate) struct RegisteredNativeTool {
@@ -379,10 +379,7 @@ mod tests {
 
     use super::*;
     use crate::CliError;
-    use crate::permissions::{
-        PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
-        ProductionPromptAuthorization, prompt::production_tui_permission_bridge,
-    };
+    use crate::permission_prompt::production_tui_permission_bridge;
     use crate::session::agents::select_subagent;
     use crate::test_support::{
         BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
@@ -393,6 +390,10 @@ mod tests {
     use crate::tools::task::production_tui_task_runtime_with_runner;
     use crate::tui::resume::ensure_active_tui_agent_runtime;
     use agens_core::{ToolOutcome, ToolResultFacts};
+    use agens_permissions::{
+        PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
+        ProductionPromptAuthorization,
+    };
     use agens_session::context::SessionContext;
     use std::path::Path;
 

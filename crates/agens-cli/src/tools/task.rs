@@ -16,16 +16,17 @@ use agens_tools::{
 use agens_tui::TuiPermissionBridge;
 
 use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
-use crate::permissions::prompt::TuiPermissionPrompter;
-use crate::permissions::{
-    ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
-    SharedToolDispatcher, permission_policy,
-};
+use crate::permission_prompt::TuiPermissionPrompter;
 use crate::session::agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
 use agens_error::CliError;
+use agens_models::default_model;
+use agens_permissions::{
+    ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
+    SharedToolDispatcher, permission_policy,
+};
 
 pub(crate) struct ProductionTuiTaskRuntime {
     pub(crate) provider_tools: Vec<OpenAiFunctionTool>,
@@ -97,7 +98,7 @@ pub(crate) fn production_tui_task_runtime_with_runner_and_parent_config(
     let task_registry = task_runner.execution_registry().unwrap_or_default();
     let parent_model = bootstrap
         .model()
-        .unwrap_or_else(|| default_model(bootstrap))
+        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
         .to_owned();
     let (provider_tools, dispatcher) = production_tool_runtime_with_parent_task_runner(
         bootstrap,
@@ -273,13 +274,6 @@ fn register_task_coordination_tools(
         .map_err(|_| CliError::configuration("tool catalog is invalid"))
 }
 
-pub(crate) fn default_model(bootstrap: &Bootstrap) -> &'static str {
-    match bootstrap.provider_type() {
-        Some("openai-chatgpt") => "gpt-5.5",
-        _ => "gpt-4.1",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -293,7 +287,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::permissions::prompt::production_tui_permission_bridge;
+    use crate::permission_prompt::production_tui_permission_bridge;
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
 
     #[test]

@@ -188,10 +188,10 @@ mod tests {
 
     use super::*;
     use crate::headless::provider_messages;
-    use crate::permissions::permission_policy;
     use crate::session::agents::BundledModelValidator;
     use crate::test_support::{rotation_agent, rotation_dispatcher};
-    use crate::turns::completed_session_turn;
+    use agens_permissions::permission_policy;
+    use agens_session::turns::completed_session_turn;
 
     #[test]
     fn subagent_message_and_cancellation_leave_the_primary_agent_unchanged() {

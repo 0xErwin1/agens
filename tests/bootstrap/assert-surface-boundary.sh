@@ -11,13 +11,15 @@
 # decision to re-couple, and should be argued for rather than done quietly.
 set -euo pipefail
 
-# `session/provider.rs` and `session/context.rs` left this list by moving to
-# `agens-session`, which does not depend on `agens-tui`. That is the intended
+# Entries leave this list by moving into a crate that does not depend on
+# `agens-tui` — `agens-session`, `agens-permissions` — which is the intended
 # exit: once a module is in a crate of its own, the crate graph enforces the
-# boundary and this file no longer has to.
+# boundary and this file no longer has to. What remains is what still shares a
+# crate with the surfaces.
 declare -a LOGIC_MODULES=(
-  "crates/agens-cli/src/permissions.rs"
-  "crates/agens-cli/src/turns.rs"
+  # Empty is the goal state, not a dead check: every module that was listed here
+  # has moved into a crate that cannot depend on a surface. Add the next module
+  # that gets decoupled but has not moved yet, and remove it once it does.
 )
 
 # Names that only exist because a human is watching.

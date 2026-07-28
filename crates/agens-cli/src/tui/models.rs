@@ -7,10 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 
-use crate::tools::task::default_model;
 use crate::tui::turn::current_tui_provider;
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
+use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
@@ -67,7 +67,7 @@ pub(crate) fn seed_remembered_tui_selection(
         Err(_) => return Some("Remembered model selection could not be read.".to_owned()),
     };
     let source = tui_model_source(bootstrap, context);
-    let default = default_model(bootstrap);
+    let default = default_model(bootstrap.provider_type());
     let mut selector = ModelSelection::for_source(default, source);
     if selector.apply_model(preference.model()).is_err() {
         return Some(format!(
@@ -141,7 +141,7 @@ pub(crate) fn select_tui_model(
             .as_ref()
             .map(|selection| selection.model())
             .or_else(|| bootstrap.model())
-            .unwrap_or_else(|| default_model(bootstrap));
+            .unwrap_or_else(|| default_model(bootstrap.provider_type()));
         return Ok(format!("Model: {current}. Available: {values}."));
     }
 
@@ -238,7 +238,7 @@ pub(crate) fn apply_tui_effort(
         .as_ref()
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap));
+        .unwrap_or_else(|| default_model(bootstrap.provider_type()));
     let mut selector = ModelSelection::for_source(model, tui_model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)

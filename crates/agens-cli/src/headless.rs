@@ -19,27 +19,29 @@ use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
 
 use crate::dispatch::ProductionToolDispatcher;
-use crate::permissions::prompt::TtyPermissionPrompter;
-use crate::permissions::{
-    PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
-    ProductionPromptAuthorization, permission_policy,
-};
+use crate::permission_prompt::TtyPermissionPrompter;
 use crate::session::agents::{AgentModelCompatibility, agent_catalog};
 use crate::tools::child::TaskMailboxProvider;
 use crate::tools::runtime::production_tool_runtime_for_parent;
 use crate::tools::task::ProductionTuiTaskRuntime;
-use crate::turns::{completed_session_turn, next_session_metadata, sanitize_subagent_summary};
 use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
     record_parent_terminal,
 };
 use agens_error::{CliError, ExitStatus};
+use agens_permissions::{
+    PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,
+    ProductionPromptAuthorization, permission_policy,
+};
 use agens_session::attempt::{
     AttemptLifecycleError, PartialTurnRecord, active_session_attempts,
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
 };
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
+use agens_session::turns::{
+    completed_session_turn, next_session_metadata, sanitize_subagent_summary,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
@@ -399,7 +401,7 @@ fn headless_turn_permission_policy(
     project_root: &std::path::Path,
     project: &str,
     mode: PermissionMode,
-    tool_runtime: &crate::permissions::SharedToolDispatcher,
+    tool_runtime: &agens_permissions::SharedToolDispatcher,
     effective_capabilities: Option<&EffectiveCapabilitySet>,
 ) -> Result<agens_core::PermissionPolicy, CliError> {
     let session_root =
@@ -821,7 +823,7 @@ mod tests {
         use agens_store::SessionStore;
         use agens_tools::SkillCatalog;
 
-        use crate::permissions::prompt::production_tui_permission_bridge;
+        use crate::permission_prompt::production_tui_permission_bridge;
         use crate::test_support::{
             bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
             tui_session_bootstrap, tui_session_directory,

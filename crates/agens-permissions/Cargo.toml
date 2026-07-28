@@ -1,0 +1,17 @@
+[package]
+name = "agens-permissions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
+agens-error = { path = "../agens-error" }
+agens-store = { path = "../agens-store" }
+agens-tools = { path = "../agens-tools" }
+serde_json = "1"

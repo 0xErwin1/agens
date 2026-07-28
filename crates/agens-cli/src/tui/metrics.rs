@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use agens_core::{MessagePart, TurnEvent, TurnState};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
-use crate::permissions::{ParseToolInput, contains_sensitive_marker};
 use agens_error::CliError;
+use agens_permissions::{ParseToolInput, contains_sensitive_marker};
 
 pub(crate) struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
@@ -190,8 +190,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::permissions::PermissionPromptAnswer;
     use crate::test_support::{batch_call, run_production_batch};
+    use agens_permissions::PermissionPromptAnswer;
 
     #[test]
     fn tui_metrics_publish_one_terminal_after_the_production_turn_outcome() {

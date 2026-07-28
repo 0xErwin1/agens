@@ -13,7 +13,8 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-bootstrap    resolving a run's configuration from a host environment
   -> agens-providers    OpenAI and ChatGPT authentication and streaming adapters
   -> agens-store        SQLite sessions, grants, and the evidence ledger
-  -> agens-tools        native tools, permissions, MCP, skills, and subagents
+  -> agens-tools        native tools, MCP, skills, and subagents
+  -> agens-permissions  whether a tool call is allowed
   -> agens-session      what a session is: identity, context, provider, attempts
   -> agens-server       the machine's daemon and its sync/async boundary
   -> agens-tui          terminal rendering surface
@@ -34,7 +35,8 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-providers` | Provider adapters: authentication, streaming, and their error taxonomy. | Choosing a provider or a model for a session. |
 | `agens-store` | SQLite: the unified database, migrations, sessions, attempts, grants, the evidence ledger, and paginated transcript reads. | Interpreting what it stores. |
 | `agens-tools` | Native tools and their confinement, permission capabilities, MCP transports, skills, and subagent plumbing. | Deciding whether a call is allowed for a given session. |
-| `agens-session` | What a session is: its context, the provider and credentials it speaks through, and its attempt lifecycle. | Rendering any of it, or composing text for a person. |
+| `agens-permissions` | Deciding whether a tool call is allowed: rules, grants, session authorization, and which tools a delegated subagent may reach. | Asking a person. That is a surface, and it reaches policy through the `PermissionPrompter` port. |
+| `agens-session` | What a session is: its context, the provider and credentials it speaks through, its attempt lifecycle, and how a completed turn is recorded. | Rendering any of it, or composing text for a person. |
 | `agens-server` | The machine's daemon: its single-instance guard, its runtime, and the one named crossing into synchronous code. Grows to hold the coordinator. | A project. One daemon serves many. |
 | `agens-tui` | Terminal rendering: widgets, layout, the conversation projection, and the bridges a surface needs. | Any decision the runtime would still have to make with no terminal attached. |
 | `agens-cli` | Argument parsing, the command table, and wiring production implementations together. | Logic. If deleting the CLI would delete a capability, that capability is in the wrong crate. |

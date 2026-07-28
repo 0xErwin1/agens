@@ -25,9 +25,9 @@ use crate::headless::{
     run_production_headless_chat_with_progress,
 };
 #[cfg(test)]
-use crate::permissions::prompt::TtyPermissionPrompter;
-use crate::permissions::prompt::TuiPermissionPrompter;
-use crate::permissions::prompt::production_tui_permission_bridge;
+use crate::permission_prompt::TtyPermissionPrompter;
+use crate::permission_prompt::TuiPermissionPrompter;
+use crate::permission_prompt::production_tui_permission_bridge;
 use crate::session::agents::persist_pending_agent_correction;
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use crate::tools::runtime::task_execution_limits;
