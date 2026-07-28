@@ -24,6 +24,7 @@ mod permission_tests;
 mod provider_tests;
 mod session;
 #[cfg(test)]
+mod test_counters;
 mod test_support;
 mod tools;
 mod tui;

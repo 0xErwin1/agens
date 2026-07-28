@@ -1,8 +1,7 @@
-//! Shared call counters used by the production TUI-resume and tool/provider
-//! runtime tests, plus fixture helpers shared by more than one module's test
-//! suite. Kept in one place so every consumer reaches a named function
-//! instead of duplicating fixture setup or reaching across a module boundary
-//! into a `thread_local!`.
+//! Fixture helpers shared by more than one module's test suite, so a consumer
+//! reaches a named function instead of duplicating setup. The call counters
+//! production code increments live in `test_counters`, which depends on
+//! nothing; see the note there.
 #![cfg(test)]
 
 use std::collections::BTreeMap;
@@ -37,13 +36,6 @@ use agens_permissions::{
     ProductionPermissionResolver, ProductionPromptAuthorization,
 };
 
-thread_local! {
-    static TUI_RESUME_LOAD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static TUI_RESUME_PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PRODUCTION_TOOL_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PRODUCTION_PROVIDER_RUNTIME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// Waits for a condition rather than for a fixed number of polls.
 ///
 /// A count-based wait is a bet on how fast the machine is. Under a loaded gate
@@ -63,38 +55,6 @@ pub(crate) fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T
         );
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-}
-
-pub(crate) fn note_tui_resume_load() {
-    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(calls.get() + 1));
-}
-
-pub(crate) fn note_tui_resume_projection() {
-    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
-}
-
-pub(crate) fn note_production_tool_runtime() {
-    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
-}
-
-pub(crate) fn note_production_provider_runtime() {
-    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(calls.get() + 1));
-}
-
-pub(crate) fn reset_tui_resume_test_counters() {
-    TUI_RESUME_LOAD_CALLS.with(|calls| calls.set(0));
-    TUI_RESUME_PROJECTION_CALLS.with(|calls| calls.set(0));
-    PRODUCTION_TOOL_RUNTIME_CALLS.with(|calls| calls.set(0));
-    PRODUCTION_PROVIDER_RUNTIME_CALLS.with(|calls| calls.set(0));
-}
-
-pub(crate) fn tui_resume_test_counters() -> (usize, usize, usize, usize) {
-    (
-        TUI_RESUME_LOAD_CALLS.with(std::cell::Cell::get),
-        TUI_RESUME_PROJECTION_CALLS.with(std::cell::Cell::get),
-        PRODUCTION_TOOL_RUNTIME_CALLS.with(std::cell::Cell::get),
-        PRODUCTION_PROVIDER_RUNTIME_CALLS.with(std::cell::Cell::get),
-    )
 }
 
 /// Bootstraps a `Bootstrap` fixture from optional global/project TOML

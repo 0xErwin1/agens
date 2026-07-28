@@ -122,7 +122,7 @@ pub(crate) fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
     #[cfg(test)]
-    crate::test_support::note_production_tool_runtime();
+    crate::test_counters::note_production_tool_runtime();
 
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
         project_root,

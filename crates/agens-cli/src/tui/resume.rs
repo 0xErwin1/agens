@@ -85,7 +85,7 @@ pub(crate) fn load_tui_session_for_resume(
     identifier: i64,
 ) -> Result<LoadedTuiSessionResume, CliError> {
     #[cfg(test)]
-    crate::test_support::note_tui_resume_load();
+    crate::test_counters::note_tui_resume_load();
 
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -134,7 +134,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         confinement_root,
     } = loaded;
     #[cfg(test)]
-    crate::test_support::note_tui_resume_projection();
+    crate::test_counters::note_tui_resume_projection();
     let restored_history =
         Conversation::from_messages_with_parser(&session.messages, |name, input| {
             let bare = name
@@ -353,11 +353,12 @@ mod tests {
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::session::agents::ensure_active_agent_runtime;
+    use crate::test_counters::{reset_tui_resume_test_counters, tui_resume_test_counters};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
-        persist_tui_session_metadata, render_tui_test_backend, reset_tui_resume_test_counters,
-        rotation_dispatcher, tui_project, tui_resume_test_counters, tui_session_bootstrap,
-        tui_session_bootstrap_for_provider, tui_session_directory, tui_session_messages,
+        persist_tui_session_metadata, render_tui_test_backend, rotation_dispatcher, tui_project,
+        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
+        tui_session_messages,
     };
     use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime;
