@@ -1,3 +1,4 @@
+use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
 use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
@@ -5,8 +6,7 @@ use agens_tui::{
     Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
     SessionDialogRequest, ToolResultState, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPresentation, TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
-    TuiSubmissionOutcome,
+    TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
 };
 use ratatui::{
     Terminal,
@@ -3046,7 +3046,7 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
     });
     apply_subagent(
         &mut tui,
-        TuiSubagentEvent::terminal(10, TuiSubagentStatus::Success, "terminal result"),
+        TuiSubagentEvent::terminal(10, SubagentStatus::Success, "terminal result"),
     );
 
     renderer.render(tui.view()).unwrap();
@@ -3246,13 +3246,13 @@ fn subagent_terminal_status_and_elapsed_are_frozen_and_low_dimensions_are_safe()
             9,
             "explore",
             TuiExecutionEvent::Completed { id: 9 },
-            TuiSubagentStatus::Success,
+            SubagentStatus::Success,
         ),
         (
             10,
             "reviewer",
             TuiExecutionEvent::Failed { id: 10 },
-            TuiSubagentStatus::Failure,
+            SubagentStatus::Failure,
         ),
     ] {
         tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
@@ -3555,7 +3555,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
         TuiSubagentEvent::text(7, "child-text-sentinel"),
         TuiSubagentEvent::tool_call(7, "child-call", "native::read", "child-input-sentinel"),
         TuiSubagentEvent::tool_result(7, "child-call", "child-result-sentinel", false),
-        TuiSubagentEvent::error(7, TuiSubagentErrorKind::Tool),
+        TuiSubagentEvent::error(7, SubagentErrorKind::Tool),
     ] {
         apply_subagent(&mut tui, event);
     }
@@ -3565,7 +3565,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     });
     apply_subagent(
         &mut tui,
-        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Failure, "child-final-sentinel"),
+        TuiSubagentEvent::terminal(7, SubagentStatus::Failure, "child-final-sentinel"),
     );
 
     renderer.render(tui.view()).unwrap();
@@ -4079,7 +4079,7 @@ fn active_transcript_render_keeps_terminal_child_renderable_after_expiry_and_swi
     });
     apply_subagent(
         &mut tui,
-        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Success, "expired-final-sentinel"),
+        TuiSubagentEvent::terminal(7, SubagentStatus::Success, "expired-final-sentinel"),
     );
 
     tui.select_transcript(TranscriptId::Subagent(7));

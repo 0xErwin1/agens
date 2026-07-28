@@ -25,7 +25,7 @@ use crate::dispatch::ProductionToolDispatcher;
 use crate::headless::DiscardCompletedTurnRepository;
 use crate::permissions::{ProductionPermissionGate, SharedToolDispatcher};
 use crate::tools::runtime::production_child_tool_runtime;
-use crate::{Bootstrap, TuiSubagentErrorKind, block_on_headless_turn};
+use crate::{Bootstrap, SubagentErrorKind, block_on_headless_turn};
 
 #[derive(Clone, Copy)]
 pub(crate) enum ChildRunError {
@@ -62,19 +62,19 @@ impl ChildRunError {
         }
     }
 
-    pub(crate) const fn tui_kind(self) -> Option<TuiSubagentErrorKind> {
+    pub(crate) const fn tui_kind(self) -> Option<SubagentErrorKind> {
         match self {
             Self::Cancelled | Self::TimedOut => None,
-            Self::Authentication => Some(TuiSubagentErrorKind::Authentication),
-            Self::Context => Some(TuiSubagentErrorKind::Context),
-            Self::Network => Some(TuiSubagentErrorKind::Network),
-            Self::Provider => Some(TuiSubagentErrorKind::Provider),
-            Self::Protocol => Some(TuiSubagentErrorKind::Protocol),
-            Self::RateLimited => Some(TuiSubagentErrorKind::RateLimited),
-            Self::Rejected => Some(TuiSubagentErrorKind::Rejected),
-            Self::Server => Some(TuiSubagentErrorKind::Server),
-            Self::Tool => Some(TuiSubagentErrorKind::Tool),
-            Self::IterationLimit | Self::Runtime => Some(TuiSubagentErrorKind::Runtime),
+            Self::Authentication => Some(SubagentErrorKind::Authentication),
+            Self::Context => Some(SubagentErrorKind::Context),
+            Self::Network => Some(SubagentErrorKind::Network),
+            Self::Provider => Some(SubagentErrorKind::Provider),
+            Self::Protocol => Some(SubagentErrorKind::Protocol),
+            Self::RateLimited => Some(SubagentErrorKind::RateLimited),
+            Self::Rejected => Some(SubagentErrorKind::Rejected),
+            Self::Server => Some(SubagentErrorKind::Server),
+            Self::Tool => Some(SubagentErrorKind::Tool),
+            Self::IterationLimit | Self::Runtime => Some(SubagentErrorKind::Runtime),
         }
     }
 

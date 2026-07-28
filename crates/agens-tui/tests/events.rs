@@ -1,6 +1,7 @@
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
 };
+use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, DisplayMode,
@@ -8,8 +9,7 @@ use agens_tui::{
     Renderer, Runtime, SessionDialogCursor, SessionDialogRequest, SessionDialogScope,
     TranscriptEntry, TranscriptFocus, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
     TuiPermissionBridge, TuiPermissionReply, TuiPresentation, TuiProviderOutcome, TuiRouteProgress,
-    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus,
-    TuiSubmissionOutcome,
+    TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
 };
 use ratatui::{Terminal, backend::TestBackend};
 use std::{
@@ -71,7 +71,7 @@ fn transcript_admission_retention_keeps_terminal_records_after_cards_expire() {
             event: TuiExecutionEvent::Completed { id },
         });
         tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, format!("final-{id}")),
+            TuiSubagentEvent::terminal(id, SubagentStatus::Success, format!("final-{id}")),
         ));
     }
 
@@ -127,7 +127,7 @@ fn transcript_admission_retention_ignores_out_of_order_and_post_terminal_updates
         13,
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
             7,
-            TuiSubagentStatus::Success,
+            SubagentStatus::Success,
             "final",
         )),
     );
@@ -183,7 +183,7 @@ fn transcript_admission_retention_protects_active_child_and_falls_back_after_evi
             event: TuiExecutionEvent::Completed { id },
         });
         tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, format!("final-{id}")),
+            TuiSubagentEvent::terminal(id, SubagentStatus::Success, format!("final-{id}")),
         ));
 
         if id == 1 {
@@ -612,7 +612,7 @@ fn transcript_navigation_restores_focus_and_routes_live_child_composer_to_mailbo
         event: TuiExecutionEvent::Completed { id: 7 },
     });
     tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
-        TuiSubagentEvent::terminal(7, TuiSubagentStatus::Success, "done"),
+        TuiSubagentEvent::terminal(7, SubagentStatus::Success, "done"),
     ));
     tui.tick(Duration::from_secs(60));
     assert!(tui.executions().iter().all(|execution| execution.id() != 7));
@@ -942,7 +942,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         )),
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error_with_reference(
             7,
-            TuiSubagentErrorKind::Tool,
+            SubagentErrorKind::Tool,
             "abc12345",
         )),
         TuiRuntimeEvent::TaskExecution {
@@ -951,7 +951,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         },
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
             7,
-            TuiSubagentStatus::Failure,
+            SubagentStatus::Failure,
             "child-final",
         )),
     ];
@@ -973,7 +973,7 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
         100,
         TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
             7,
-            TuiSubagentStatus::Failure,
+            SubagentStatus::Failure,
             "duplicate-final",
         )),
     );
@@ -1943,17 +1943,17 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
         (
             1,
             TuiExecutionEvent::Completed { id: 1 },
-            TuiSubagentStatus::Success,
+            SubagentStatus::Success,
         ),
         (
             2,
             TuiExecutionEvent::Failed { id: 2 },
-            TuiSubagentStatus::Failure,
+            SubagentStatus::Failure,
         ),
         (
             3,
             TuiExecutionEvent::Cancelled { id: 3 },
-            TuiSubagentStatus::Cancelled,
+            SubagentStatus::Cancelled,
         ),
     ];
 
@@ -1994,7 +1994,7 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
             TuiSubagentEvent::terminal(id, status, format!("final-{long}")),
         ));
         tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
-            TuiSubagentEvent::terminal(id, TuiSubagentStatus::Success, "late terminal"),
+            TuiSubagentEvent::terminal(id, SubagentStatus::Success, "late terminal"),
         ));
         tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
             TuiSubagentEvent::tool_call(id, "late-call", "native::bash", "late input"),
@@ -2043,7 +2043,7 @@ fn p1a2_events_admit_one_bounded_terminal_per_c1_execution_and_ignore_late_mutat
         event: TuiExecutionEvent::Completed { id: 4 },
     });
     redacted.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(
-        TuiSubagentEvent::terminal(4, TuiSubagentStatus::Success, "secret=final-secret"),
+        TuiSubagentEvent::terminal(4, SubagentStatus::Success, "secret=final-secret"),
     ));
 
     let card = &redacted.view().conversation.unwrap().subagent_cards[0];

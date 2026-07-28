@@ -417,6 +417,30 @@ pub enum SessionMetadataError {
     InvalidResumability,
 }
 
+/// Why a subagent turn failed. A classification the runtime makes and any
+/// surface merely renders, so it lives here rather than in a terminal crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentErrorKind {
+    Authentication,
+    Context,
+    Network,
+    Provider,
+    Protocol,
+    RateLimited,
+    Rejected,
+    Server,
+    Tool,
+    Runtime,
+}
+
+/// How a subagent turn ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubagentStatus {
+    Success,
+    Failure,
+    Cancelled,
+}
+
 /// Who asked for a turn. A domain fact, not a surface one: a background
 /// subagent turn and a user prompt differ in what the runtime may do with them,
 /// whether or not a terminal is attached.

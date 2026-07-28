@@ -2,8 +2,9 @@
 
 use std::time::Duration;
 
-use crate::{TuiExecutionState, TuiSubagentEvent, TuiSubagentStatus, bridge::TuiSubagentUpdate};
-use agens_core::{Message, MessagePart, Role, ToolInput};
+use crate::bridge::SubagentErrorPresentation;
+use crate::{TuiExecutionState, TuiSubagentEvent, bridge::TuiSubagentUpdate};
+use agens_core::{Message, MessagePart, Role, SubagentStatus, ToolInput};
 
 /// A source event accepted by the conversation projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +99,7 @@ pub struct SubagentCard {
     pub tool_calls: Vec<ToolCall>,
     pub tool_uses: usize,
     pub activities: Vec<String>,
-    pub status: Option<TuiSubagentStatus>,
+    pub status: Option<SubagentStatus>,
     pub final_result: Option<String>,
     pub started_at: Option<Duration>,
     pub terminal_at: Option<Duration>,
@@ -505,7 +506,7 @@ impl Conversation {
             tool_calls: Vec::new(),
             tool_uses,
             activities: Vec::new(),
-            status: Some(TuiSubagentStatus::Success),
+            status: Some(SubagentStatus::Success),
             final_result: Some(final_result),
             started_at: None,
             terminal_at: None,

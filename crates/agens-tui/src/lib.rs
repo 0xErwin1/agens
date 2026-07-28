@@ -11,7 +11,7 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
     BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
     TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, TuiSubagentErrorKind, TuiSubagentEvent, TuiSubagentStatus, UiEnvelope,
+    TuiRuntimeEvent, TuiSubagentEvent, UiEnvelope,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
@@ -36,6 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agens_core::SubagentStatus;
 use agens_core::SubmitOrigin;
 use agens_core::{MessagePart, TurnEvent, TurnState, Usage};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -2633,9 +2634,9 @@ fn is_task_tool_name(name: &str) -> bool {
 
 fn subagent_picker_detail(card: &SubagentCard) -> String {
     let status = match card.status {
-        Some(TuiSubagentStatus::Success) => "Success",
-        Some(TuiSubagentStatus::Failure) => "Failure",
-        Some(TuiSubagentStatus::Cancelled) => "Cancelled",
+        Some(SubagentStatus::Success) => "Success",
+        Some(SubagentStatus::Failure) => "Failure",
+        Some(SubagentStatus::Cancelled) => "Cancelled",
         None if card.has_activity => "Running",
         None => "Initializing",
     };
@@ -5584,14 +5585,12 @@ fn auto_turn_notice(finished: usize) -> String {
     )
 }
 
-fn status_matches_execution(status: TuiSubagentStatus, state: TuiExecutionState) -> bool {
+fn status_matches_execution(status: SubagentStatus, state: TuiExecutionState) -> bool {
     matches!(
         (status, state),
-        (
-            TuiSubagentStatus::Success,
-            TuiExecutionState::CompletedRecent
-        ) | (TuiSubagentStatus::Failure, TuiExecutionState::Failed)
-            | (TuiSubagentStatus::Cancelled, TuiExecutionState::Cancelled)
+        (SubagentStatus::Success, TuiExecutionState::CompletedRecent)
+            | (SubagentStatus::Failure, TuiExecutionState::Failed)
+            | (SubagentStatus::Cancelled, TuiExecutionState::Cancelled)
     )
 }
 

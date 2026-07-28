@@ -751,9 +751,9 @@ fn subagent_card_block(
     ));
 
     let status = match card.status {
-        Some(crate::TuiSubagentStatus::Success) => "Success",
-        Some(crate::TuiSubagentStatus::Failure) => "Failure",
-        Some(crate::TuiSubagentStatus::Cancelled) => "Cancelled",
+        Some(agens_core::SubagentStatus::Success) => "Success",
+        Some(agens_core::SubagentStatus::Failure) => "Failure",
+        Some(agens_core::SubagentStatus::Cancelled) => "Cancelled",
         None if card.has_activity => "Running",
         None => "Initializing",
     };
@@ -807,11 +807,11 @@ fn subagent_card_block(
     }
 }
 
-fn subagent_status_color(status: Option<crate::TuiSubagentStatus>) -> Color {
+fn subagent_status_color(status: Option<agens_core::SubagentStatus>) -> Color {
     match status {
-        Some(crate::TuiSubagentStatus::Success) => RolePalette::success(),
-        Some(crate::TuiSubagentStatus::Failure) => RolePalette::error(),
-        Some(crate::TuiSubagentStatus::Cancelled) => RolePalette::warning(),
+        Some(agens_core::SubagentStatus::Success) => RolePalette::success(),
+        Some(agens_core::SubagentStatus::Failure) => RolePalette::error(),
+        Some(agens_core::SubagentStatus::Cancelled) => RolePalette::warning(),
         None => RolePalette::accent_active(),
     }
 }

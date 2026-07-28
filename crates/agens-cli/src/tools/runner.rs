@@ -9,14 +9,12 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use agens_core::HeadlessTurnError;
 use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnProgressSink};
+use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_tools::{
     TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
     TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
 };
-use agens_tui::{
-    BridgeCancel, BridgeTx, TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentErrorKind,
-    TuiSubagentEvent, TuiSubagentStatus,
-};
+use agens_tui::{BridgeCancel, BridgeTx, TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
 
 use crate::Bootstrap;
 use crate::diagnostics::{next_diagnostic_reference, record_subagent_terminal};
@@ -88,7 +86,7 @@ impl TuiTaskLifecycleBridge {
                 let _ = events.publish(
                     TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
                         id,
-                        TuiSubagentErrorKind::Runtime,
+                        SubagentErrorKind::Runtime,
                     )),
                     &BridgeCancel::new(),
                     None,
@@ -177,13 +175,11 @@ impl TuiTaskLifecycleBridge {
                     ) {
                         let (status, fallback) = match event {
                             TuiExecutionEvent::Completed { .. } => {
-                                (TuiSubagentStatus::Success, "completed")
+                                (SubagentStatus::Success, "completed")
                             }
-                            TuiExecutionEvent::Failed { .. } => {
-                                (TuiSubagentStatus::Failure, "failed")
-                            }
+                            TuiExecutionEvent::Failed { .. } => (SubagentStatus::Failure, "failed"),
                             TuiExecutionEvent::Cancelled { .. } => {
-                                (TuiSubagentStatus::Cancelled, "cancelled")
+                                (SubagentStatus::Cancelled, "cancelled")
                             }
                             _ => unreachable!("terminal event was matched above"),
                         };
@@ -307,7 +303,7 @@ fn notify_main_of_terminal_subagent(
         let _ = events.publish(
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
                 id,
-                TuiSubagentErrorKind::Runtime,
+                SubagentErrorKind::Runtime,
             )),
             &BridgeCancel::new(),
             None,
@@ -916,7 +912,7 @@ mod tests {
                 },
                 TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::terminal(
                     1,
-                    TuiSubagentStatus::Success,
+                    SubagentStatus::Success,
                     "probe",
                 )),
             ]
@@ -979,7 +975,7 @@ mod tests {
                 .1,
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::error(
                 7,
-                TuiSubagentErrorKind::Runtime,
+                SubagentErrorKind::Runtime,
             ))
         );
         assert!(session.lock().unwrap().identifier.is_none());
@@ -1000,81 +996,81 @@ mod tests {
             (
                 ChildRunError::Authentication,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Authentication),
+                Some(SubagentErrorKind::Authentication),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Context,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Context),
+                Some(SubagentErrorKind::Context),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Network,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Network),
+                Some(SubagentErrorKind::Network),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Provider,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Provider),
+                Some(SubagentErrorKind::Provider),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Protocol,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Protocol),
+                Some(SubagentErrorKind::Protocol),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::RateLimited,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::RateLimited),
+                Some(SubagentErrorKind::RateLimited),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Rejected,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Rejected),
+                Some(SubagentErrorKind::Rejected),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Server,
                 TaskRunnerError::ProviderFailure,
-                Some(TuiSubagentErrorKind::Server),
+                Some(SubagentErrorKind::Server),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Tool,
                 TaskRunnerError::ChildFailure,
-                Some(TuiSubagentErrorKind::Tool),
+                Some(SubagentErrorKind::Tool),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
                 ChildRunError::Runtime,
                 TaskRunnerError::ChildFailure,
-                Some(TuiSubagentErrorKind::Runtime),
+                Some(SubagentErrorKind::Runtime),
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
             (
@@ -1082,7 +1078,7 @@ mod tests {
                 TaskRunnerError::Cancelled,
                 None,
                 TuiExecutionEvent::Cancelled { id: 1 },
-                TuiSubagentStatus::Cancelled,
+                SubagentStatus::Cancelled,
                 "cancelled",
             ),
             (
@@ -1090,7 +1086,7 @@ mod tests {
                 TaskRunnerError::TimedOut,
                 None,
                 TuiExecutionEvent::Failed { id: 1 },
-                TuiSubagentStatus::Failure,
+                SubagentStatus::Failure,
                 "failed",
             ),
         ] {

@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use clap::Parser as _;
 
 use agens_core::HeadlessTurnCancellation;
-use agens_tui::TuiSubagentErrorKind;
+use agens_core::SubagentErrorKind;
 
 mod bootstrap;
 mod chatgpt_auth;

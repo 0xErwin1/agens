@@ -1,3 +1,4 @@
+use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -239,31 +240,24 @@ pub(crate) enum TuiSubagentUpdate {
         is_error: bool,
     },
     Error {
-        kind: TuiSubagentErrorKind,
+        kind: SubagentErrorKind,
         reference: Option<String>,
     },
     Terminal {
-        status: TuiSubagentStatus,
+        status: SubagentStatus,
         final_result: String,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TuiSubagentErrorKind {
-    Authentication,
-    Context,
-    Network,
-    Provider,
-    Protocol,
-    RateLimited,
-    Rejected,
-    Server,
-    Tool,
-    Runtime,
+/// Rendering for the shared taxonomy. The classification is a domain fact and
+/// lives in `agens-core`; only these strings belong to a surface.
+pub(crate) trait SubagentErrorPresentation {
+    fn message(self) -> &'static str;
+    fn action(self) -> &'static str;
 }
 
-impl TuiSubagentErrorKind {
-    pub(crate) const fn message(self) -> &'static str {
+impl SubagentErrorPresentation for SubagentErrorKind {
+    fn message(self) -> &'static str {
         match self {
             Self::Authentication => "Subagent authentication failed.",
             Self::Context => "Subagent request exceeds the model context window.",
@@ -278,7 +272,7 @@ impl TuiSubagentErrorKind {
         }
     }
 
-    pub(crate) const fn action(self) -> &'static str {
+    fn action(self) -> &'static str {
         match self {
             Self::Authentication => "Check provider credentials, then retry.",
             Self::Context => "Reduce the task context, then retry.",
@@ -292,13 +286,6 @@ impl TuiSubagentErrorKind {
             Self::Runtime => "Retry the subagent request or inspect diagnostics.",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TuiSubagentStatus {
-    Success,
-    Failure,
-    Cancelled,
 }
 
 impl TuiSubagentEvent {
@@ -390,7 +377,7 @@ impl TuiSubagentEvent {
         }
     }
 
-    pub fn error(id: u64, kind: TuiSubagentErrorKind) -> Self {
+    pub fn error(id: u64, kind: SubagentErrorKind) -> Self {
         Self {
             id,
             update: TuiSubagentUpdate::Error {
@@ -402,7 +389,7 @@ impl TuiSubagentEvent {
 
     pub fn error_with_reference(
         id: u64,
-        kind: TuiSubagentErrorKind,
+        kind: SubagentErrorKind,
         reference: impl AsRef<str>,
     ) -> Self {
         let reference = reference.as_ref();
@@ -417,7 +404,7 @@ impl TuiSubagentEvent {
         }
     }
 
-    pub fn terminal(id: u64, status: TuiSubagentStatus, final_result: impl AsRef<str>) -> Self {
+    pub fn terminal(id: u64, status: SubagentStatus, final_result: impl AsRef<str>) -> Self {
         Self {
             id,
             update: TuiSubagentUpdate::Terminal {
