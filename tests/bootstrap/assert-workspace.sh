@@ -6,6 +6,7 @@ metadata="$(cargo metadata --format-version 1 --no-deps)"
 jq -e '
   {
     "agens-core": [],
+    "agens-bus": [],
     "agens-error": ["agens-core"],
     "agens-bootstrap": ["agens-config", "agens-core", "agens-error", "agens-tools"],
     "agens-models": ["agens-core"],
@@ -29,7 +30,7 @@ jq -e '
     "agens-providers": ["agens-config", "agens-core"],
     "agens-tools": ["agens-config", "agens-core"],
     "agens-store": ["agens-core"],
-    "agens-tui": ["agens-core"],
+    "agens-tui": ["agens-bus", "agens-core"],
     "agens-server": ["agens-core"],
     "agens": [
       "agens-bootstrap",

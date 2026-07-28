@@ -7,6 +7,7 @@ Agens is a Rust coding-agent CLI. The Rust workspace is the only buildable, test
 ```text
 crates/agens-cli        argument parsing and composition; calls into the crates below
   -> agens-core         messages, turns, cancellation, and domain contracts
+  -> agens-bus          a bounded, ordered, cancellable publish channel
   -> agens-error        the shared error and exit-status contract
   -> agens-config       TOML configuration and credential-path compatibility
   -> agens-models       the bundled model catalog and selection
@@ -28,6 +29,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | Crate | Owns | Does not own |
 |---|---|---|
 | `agens-core` | The domain vocabulary every other crate speaks: messages, turns and their state machine, cancellation, session metadata, tool-result facts, the subagent outcome taxonomy. | Anything that performs I/O, and any dependency on another workspace crate. |
+| `agens-bus` | A bounded, ordered, cancellable publish channel, generic over what travels on it. Communication belongs to no layer: the runtime publishes, and a terminal, a daemon or a test consumes. | Knowing what an event means, or who is at either end. |
 | `agens-error` | The error and exit-status contract shared by every layer that can fail. | Deciding how an error is displayed. |
 | `agens-config` | Reading hand-authored TOML and resolving credential paths. | Deciding what the resolved values mean for a run. |
 | `agens-models` | The bundled model catalog, its checksum, and a validated model selection. | Talking to a provider. |

@@ -42,6 +42,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agens-bus"
+version = "0.1.0"
+
+[[package]]
 name = "agens-config"
 version = "0.1.0"
 dependencies = [
@@ -154,6 +158,7 @@ dependencies = [
 name = "agens-tui"
 version = "0.1.0"
 dependencies = [
+ "agens-bus",
  "agens-core",
  "arborium",
  "arborium-highlight",

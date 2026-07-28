@@ -9,6 +9,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+agens-bus = { path = "../agens-bus" }
 agens-core = { path = "../agens-core" }
 arborium = { version = "2.18.1", default-features = false, features = [
   "lang-bash",

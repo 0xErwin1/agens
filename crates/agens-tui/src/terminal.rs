@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::bridge::{BridgeCancel, BridgeTx};
+use agens_bus::{BridgeCancel, BridgeTx};
 pub fn teardown<T>(
     bridge: &BridgeTx<T>,
     cancellation: &BridgeCancel,

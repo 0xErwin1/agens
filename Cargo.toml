@@ -2,6 +2,7 @@
 members = [
   "crates/agens-core",
   "crates/agens-bootstrap",
+  "crates/agens-bus",
   "crates/agens-error",
   "crates/agens-models",
   "crates/agens-permissions",

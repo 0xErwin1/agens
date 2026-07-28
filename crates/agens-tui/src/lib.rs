@@ -7,11 +7,11 @@ mod render;
 mod terminal;
 mod widgets;
 
+pub use agens_bus::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{
-    BridgeCancel, BridgeTx, PublishOutcome, ToolResultState, TuiExecution, TuiExecutionEvent,
-    TuiExecutionState, TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest,
-    TuiRuntimeEvent, TuiSubagentEvent, UiEnvelope,
+    ToolResultState, TuiExecution, TuiExecutionEvent, TuiExecutionState, TuiPermissionBridge,
+    TuiPermissionReply, TuiPermissionRequest, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, DiffLine, DiffLineKind,
