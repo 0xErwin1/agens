@@ -14,11 +14,11 @@ use agens_tools::{
     TaskModelResolutionError, TaskRunner, TaskTool, ToolDispatcher,
 };
 
-use crate::dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use crate::session::agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use crate::tools::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::tools::runtime::production_tool_runtime_with_parent_task_runner;
 use crate::{Bootstrap, next_diagnostic_reference, record_subagent_terminal};
+use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_permissions::PermissionPrompter;

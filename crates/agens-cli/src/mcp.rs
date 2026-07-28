@@ -15,7 +15,7 @@ use agens_tools::{
 };
 
 use crate::Bootstrap;
-use crate::dispatch::RegisteredMcpTool;
+use agens_dispatch::RegisteredMcpTool;
 use agens_error::CliError;
 use agens_permissions::SharedToolDispatcher;
 

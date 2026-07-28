@@ -24,12 +24,12 @@ use agens_tui::{
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;
-use crate::dispatch::ProductionToolDispatcher;
 use crate::headless::HeadlessChatCompletion;
 use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use agens_bootstrap::Bootstrap;
+use agens_dispatch::ProductionToolDispatcher;
 use agens_error::CliError;
 use agens_permissions::{
     NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,

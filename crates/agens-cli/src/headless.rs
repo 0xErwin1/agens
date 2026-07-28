@@ -17,7 +17,6 @@ use agens_providers::{
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
 
-use crate::dispatch::ProductionToolDispatcher;
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::session::agents::{AgentModelCompatibility, agent_catalog};
 use crate::tools::child::TaskMailboxProvider;
@@ -27,6 +26,7 @@ use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
     record_parent_terminal,
 };
+use agens_dispatch::ProductionToolDispatcher;
 use agens_error::{CliError, ExitStatus};
 use agens_permissions::{
     PermissionPrompter, ProductionPermissionGate, ProductionPermissionResolver,

@@ -21,10 +21,10 @@ use agens_tools::{
 };
 
 use crate::diagnostics::diagnostic_store;
-use crate::dispatch::ProductionToolDispatcher;
 use crate::tools::runtime::production_child_tool_runtime;
 use crate::{Bootstrap, SubagentErrorKind, block_on_headless_turn};
 use agens_core::DiscardCompletedTurnRepository;
+use agens_dispatch::ProductionToolDispatcher;
 use agens_permissions::{ProductionPermissionGate, SharedToolDispatcher};
 
 #[derive(Clone, Copy)]
@@ -422,11 +422,12 @@ mod tests {
     use agens_tools::TaskLaunchMode;
 
     use super::*;
-    use crate::dispatch::{TuiSelectedTaskLaunch, launch_selected_tui_task};
+    use crate::dispatch::launch_selected_tui_task;
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
     use crate::tools::task::production_tui_task_runtime_with_runner;
+    use agens_dispatch::TuiSelectedTaskLaunch;
     use agens_session::context::SessionContext;
     use agens_session::context::current_session_timestamp;
 

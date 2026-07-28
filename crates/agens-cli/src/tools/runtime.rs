@@ -14,7 +14,6 @@ use agens_tools::{
 };
 
 use crate::Bootstrap;
-use crate::dispatch::RegisteredNativeTool;
 use crate::mcp::{
     ProductionMcpRuntime, load_configured_mcp_registry, mcp_model_tool_name,
     native_model_tool_name, remote_function_tool,
@@ -22,6 +21,7 @@ use crate::mcp::{
 use crate::tools::runner::ProductionTaskRunner;
 use crate::tools::task::{TaskParentSelection, register_production_task_tool};
 use agens_bootstrap::discover_skill_catalog;
+use agens_dispatch::RegisteredNativeTool;
 use agens_error::CliError;
 use agens_models::default_model;
 use agens_permissions::SharedToolDispatcher;

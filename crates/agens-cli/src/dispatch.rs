@@ -1,270 +1,18 @@
-//! Native-tool dispatch-table wiring: the registered-tool adapters that bridge native and
-//! MCP tools into the shared dispatcher, the production `HeadlessToolDispatcher`, and the
-//! authorized subagent-task launch path that ties the permission gate, resolver, and
-//! dispatcher together for a single TUI-selected task.
+//! What is left of dispatch once the table itself moved out: the two functions
+//! that launch the subagent a surface armed for the next prompt. They stay here
+//! because they reach into the task runtime and the lifecycle bridge, which the
+//! dispatch table deliberately does not know about.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use agens_core::SubmitOrigin;
-use agens_core::{
-    HeadlessPermissionGate, HeadlessPermissionResolver, HeadlessToolCall, HeadlessToolDispatcher,
-    HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError,
-    PermissionDecision,
-};
-use agens_tools::{
-    DispatchTool, McpRegistry, NativeToolCatalog, TaskLaunchMode, ToolExecutionContext, ToolOutput,
-};
+use agens_core::{HeadlessTurnCancellation, HeadlessTurnError, HeadlessTurnPortError};
+use agens_dispatch::{TaskLaunchOutcome, TaskLaunchRequest, TuiSelectedTaskLaunch};
+use agens_tools::TaskLaunchMode;
 
 use crate::tools::runner::TuiTaskLifecycleBridge;
 use crate::tools::task::ProductionTuiTaskRuntime;
 use agens_error::{CliError, ExitStatus};
-use agens_permissions::{
-    AllowedNativeCall, NativePermissionTarget, PermissionPrompter, ProductionPermissionGate,
-    ProductionPermissionResolver, SharedToolDispatcher,
-};
 use agens_session::context::SessionContext;
-
-pub(crate) struct RegisteredNativeTool {
-    pub(crate) name: String,
-    pub(crate) catalog: Arc<Mutex<NativeToolCatalog>>,
-}
-
-impl DispatchTool for RegisteredNativeTool {
-    fn permission_target(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<String, agens_core::Error> {
-        NativePermissionTarget::parse(&self.name, arguments)
-            .map(NativePermissionTarget::into_value)
-            .map_err(|error| agens_core::Error::Tool(error.to_string()))
-    }
-
-    fn execute(
-        &mut self,
-        context: &ToolExecutionContext,
-        arguments: serde_json::Value,
-    ) -> Result<ToolOutput, agens_core::Error> {
-        self.catalog
-            .lock()
-            .map_err(|_| agens_core::Error::Tool("native tool catalog is unavailable".into()))?
-            .execute(&self.name, arguments, context)
-    }
-}
-
-pub(crate) struct RegisteredMcpTool {
-    pub(crate) name: String,
-    pub(crate) registry: Arc<Mutex<McpRegistry>>,
-}
-
-impl DispatchTool for RegisteredMcpTool {
-    fn permission_target(&self, _: &serde_json::Value) -> Result<String, agens_core::Error> {
-        Ok(self.name.clone())
-    }
-
-    fn execute(
-        &mut self,
-        context: &ToolExecutionContext,
-        arguments: serde_json::Value,
-    ) -> Result<ToolOutput, agens_core::Error> {
-        self.registry
-            .lock()
-            .map_err(|_| agens_core::Error::Tool("MCP tool registry is unavailable".into()))?
-            .call_tool(&self.name, arguments, context)
-    }
-}
-
-pub(crate) struct ProductionToolDispatcher {
-    dispatcher: SharedToolDispatcher,
-    allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
-}
-
-impl ProductionToolDispatcher {
-    pub(crate) fn new(
-        dispatcher: SharedToolDispatcher,
-        allowed: Arc<Mutex<BTreeMap<String, AllowedNativeCall>>>,
-    ) -> Self {
-        Self {
-            dispatcher,
-            allowed,
-        }
-    }
-}
-
-impl HeadlessToolDispatcher for ProductionToolDispatcher {
-    fn dispatch(
-        &mut self,
-        call: HeadlessToolCall,
-        cancellation: &HeadlessTurnCancellation,
-    ) -> impl std::future::Future<Output = Result<HeadlessToolOutput, HeadlessTurnPortError>> + Send
-    {
-        let allowed = self
-            .allowed
-            .lock()
-            .map_err(|_| HeadlessTurnPortError::Tool)
-            .and_then(|mut allowed| {
-                let allowed_call = allowed.get(&call.id).ok_or(HeadlessTurnPortError::Tool)?;
-
-                if allowed_call.name != call.name || allowed_call.input != call.input {
-                    return Err(HeadlessTurnPortError::Tool);
-                }
-
-                allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool)
-            });
-        let output = allowed
-            .and_then(|allowed| {
-                self.dispatcher
-                    .lock()
-                    .map_err(|_| HeadlessTurnPortError::Tool)?
-                    .execute(
-                        allowed.handle,
-                        &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
-                    )
-                    .map_err(headless_tool_error)
-            })
-            .and_then(headless_output);
-        std::future::ready(output)
-    }
-}
-
-fn headless_output(output: ToolOutput) -> Result<HeadlessToolOutput, HeadlessTurnPortError> {
-    if let Some(terminal) = output.terminal() {
-        return Err(HeadlessTurnPortError::TaskTerminal(terminal));
-    }
-
-    let facts = output.facts().cloned();
-    let content = if output.is_error {
-        sanitized_native_tool_failure(&output.content)
-    } else {
-        output.content
-    };
-
-    Ok(HeadlessToolOutput {
-        content,
-        is_error: output.is_error,
-        facts,
-    })
-}
-
-pub(crate) fn sanitized_native_tool_failure(content: &str) -> String {
-    let Some((tool, reason)) = content.split_once(": ") else {
-        return "tool execution failed".to_owned();
-    };
-    if !matches!(
-        tool,
-        "read"
-            | "list"
-            | "search"
-            | "glob"
-            | "grep"
-            | "write"
-            | "edit"
-            | "bash"
-            | "webfetch"
-            | "file picker"
-    ) {
-        return "tool execution failed".to_owned();
-    }
-
-    let safe_reason = matches!(
-        reason,
-        "operation timed out" | "cancelled" | "invalid regex" | "invalid glob pattern"
-    ) || [
-        ("entry limit of ", " exceeded"),
-        ("result limit of ", " exceeded"),
-        ("traversal depth limit of ", " exceeded"),
-    ]
-    .into_iter()
-    .any(|(prefix, suffix)| {
-        reason
-            .strip_prefix(prefix)
-            .and_then(|value| value.strip_suffix(suffix))
-            .is_some_and(|value| {
-                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-            })
-    });
-    if safe_reason {
-        format!("{tool}: {reason}")
-    } else if reason.contains("outside project root")
-        || reason.contains("traversal is not allowed")
-        || reason.contains("must be a non-empty relative path")
-    {
-        format!("{tool}: path validation failed")
-    } else {
-        "tool execution failed".to_owned()
-    }
-}
-
-pub(crate) struct TaskLaunchRequest<'a> {
-    pub(crate) agent: &'a str,
-    pub(crate) description: &'a str,
-    pub(crate) background: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TuiSelectedTaskLaunch {
-    NotSelected,
-    Dispatched,
-    Rejected(TaskLaunchOutcome),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TaskLaunchOutcome {
-    Dispatched(HeadlessToolOutput),
-    RejectedEmptyInput,
-    RejectedCancelled,
-    Denied,
-}
-
-pub(crate) struct AuthorizedNativeTaskRuntime<P> {
-    pub(crate) gate: ProductionPermissionGate,
-    pub(crate) resolver: ProductionPermissionResolver<P>,
-    pub(crate) dispatcher: ProductionToolDispatcher,
-    pub(crate) next_call_id: u64,
-}
-
-impl<P: PermissionPrompter> AuthorizedNativeTaskRuntime<P> {
-    pub(crate) fn launch(
-        &mut self,
-        request: TaskLaunchRequest<'_>,
-        cancellation: &HeadlessTurnCancellation,
-    ) -> Result<TaskLaunchOutcome, HeadlessTurnPortError> {
-        if request.agent.trim().is_empty() || request.description.trim().is_empty() {
-            return Ok(TaskLaunchOutcome::RejectedEmptyInput);
-        }
-        if cancellation.is_cancelled() {
-            return Ok(TaskLaunchOutcome::RejectedCancelled);
-        }
-        if cancellation.is_expired() {
-            return Err(HeadlessTurnPortError::TimedOut);
-        }
-
-        self.next_call_id += 1;
-        let call = HeadlessToolCall {
-            id: format!("tui-task-{}", self.next_call_id),
-            name: "native::task".into(),
-            input: serde_json::json!({
-                "agent": request.agent,
-                "description": request.description,
-                "background": request.background,
-            })
-            .to_string(),
-        };
-        let decision = poll_permission_port(self.gate.evaluate(&call, cancellation))?;
-        let decision = if decision == PermissionDecision::Ask {
-            poll_permission_port(self.resolver.resolve(&call, cancellation))?
-        } else {
-            decision
-        };
-
-        if decision == PermissionDecision::Deny {
-            return Ok(TaskLaunchOutcome::Denied);
-        }
-
-        poll_permission_port(self.dispatcher.dispatch(call, cancellation))
-            .map(TaskLaunchOutcome::Dispatched)
-    }
-}
 
 pub(crate) fn launch_selected_tui_task(
     runtime: &mut ProductionTuiTaskRuntime,
@@ -308,15 +56,6 @@ pub(crate) fn launch_selected_tui_task(
     }
 }
 
-/// A subagent armed for the user's next prompt must survive a turn the user never submitted, so a
-/// runtime-scheduled turn leaves the arming in place and runs the main agent instead.
-pub(crate) fn origin_launches_selected_subagent(origin: SubmitOrigin) -> bool {
-    match origin {
-        SubmitOrigin::User | SubmitOrigin::Background => true,
-        SubmitOrigin::SubagentCompletion => false,
-    }
-}
-
 pub(crate) fn selected_tui_task_skips_parent(
     launch: Result<TuiSelectedTaskLaunch, CliError>,
     lifecycle: &TuiTaskLifecycleBridge,
@@ -339,39 +78,18 @@ fn selected_task_launch_error(outcome: TaskLaunchOutcome) -> CliError {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn poll_permission_port<T>(
-    future: impl std::future::Future<Output = Result<T, HeadlessTurnPortError>>,
-) -> Result<T, HeadlessTurnPortError> {
-    let mut future = std::pin::pin!(future);
-    let context = &mut std::task::Context::from_waker(std::task::Waker::noop());
-
-    match future.as_mut().poll(context) {
-        std::task::Poll::Ready(result) => result,
-        std::task::Poll::Pending => Err(HeadlessTurnPortError::Permission),
-    }
-}
-
-fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
-    match error {
-        agens_core::Error::Cancelled => HeadlessTurnPortError::Cancelled,
-        agens_core::Error::Tool(message) if message == "mcp operation timed out" => {
-            HeadlessTurnPortError::TimedOut
-        }
-        agens_core::Error::Tool(_) | agens_core::Error::Extension(_) => HeadlessTurnPortError::Tool,
-        _ => HeadlessTurnPortError::Tool,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use agens_config::ToolLimitSettings;
     use agens_core::{
-        MessagePart, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
-        PermissionSession, ToolAccess, TurnEvent,
+        HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, MessagePart,
+        PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+        PermissionSession, SubmitOrigin, ToolAccess, TurnEvent,
     };
     use agens_store::PermissionGrantStore;
-    use agens_tools::{SkillCatalog, ToolDispatcher};
+    use agens_tools::{
+        DispatchTool, SkillCatalog, ToolDispatcher, ToolExecutionContext, ToolOutput,
+    };
     use agens_tui::{
         BridgeTx, TuiExecutionEvent, TuiPermissionReply, TuiProviderOutcome, TuiRuntimeEvent,
         TuiSubagentEvent,
@@ -389,35 +107,18 @@ mod tests {
     use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls};
     use crate::tools::runtime::production_dangerous_child_tool_runtime;
     use crate::tools::task::production_tui_task_runtime_with_runner;
-    use agens_core::{ToolOutcome, ToolResultFacts};
+    use agens_core::HeadlessPermissionGate;
+    use agens_dispatch::{
+        AuthorizedNativeTaskRuntime, ProductionToolDispatcher, origin_launches_selected_subagent,
+        poll_permission_port, sanitized_native_tool_failure,
+    };
     use agens_permissions::{
-        PermissionPromptAnswer, ProductionPermissionGate, ProductionPermissionResolver,
-        ProductionPromptAuthorization,
+        PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
+        ProductionPermissionResolver, ProductionPromptAuthorization, SharedToolDispatcher,
     };
     use agens_session::context::SessionContext;
+    use std::collections::BTreeMap;
     use std::path::Path;
-
-    #[test]
-    fn sanitized_tool_failure_keeps_its_facts() {
-        let output = ToolOutput::failure("bash: exit 127").with_facts(ToolResultFacts::Bash {
-            outcome: ToolOutcome::Failed,
-            exit_code: Some(127),
-        });
-
-        let converted = headless_output(output).expect("failing tool output is not terminal");
-
-        assert_eq!(
-            converted.content,
-            sanitized_native_tool_failure("bash: exit 127")
-        );
-        assert_eq!(
-            converted.facts,
-            Some(ToolResultFacts::Bash {
-                outcome: ToolOutcome::Failed,
-                exit_code: Some(127)
-            })
-        );
-    }
 
     #[test]
     fn u15_authorization_model_and_tui_launch_share_one_native_task_path() {

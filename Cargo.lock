@@ -10,6 +10,7 @@ dependencies = [
  "agens-bus",
  "agens-config",
  "agens-core",
+ "agens-dispatch",
  "agens-error",
  "agens-models",
  "agens-permissions",
@@ -58,6 +59,16 @@ name = "agens-core"
 version = "0.1.0"
 dependencies = [
  "globset",
+]
+
+[[package]]
+name = "agens-dispatch"
+version = "0.1.0"
+dependencies = [
+ "agens-core",
+ "agens-permissions",
+ "agens-tools",
+ "serde_json",
 ]
 
 [[package]]

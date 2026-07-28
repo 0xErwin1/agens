@@ -105,7 +105,7 @@ mod tests {
     use agens_permissions::*;
 
     use super::*;
-    use crate::dispatch::ProductionToolDispatcher;
+    use agens_dispatch::ProductionToolDispatcher;
     use agens_store::PermissionGrantStore;
     use agens_tools::{DispatchTool, ToolDispatcher, ToolExecutionContext, ToolOutput};
 
