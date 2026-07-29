@@ -8,6 +8,7 @@ Agens is a Rust coding-agent CLI with a terminal interface, one-shot chat, guard
 - One-shot agent turns through `agens chat <prompt>`.
 - OpenAI Responses API access with `provider.type = "openai-api"` and `OPENAI_API_KEY` or an existing `auth.json` entry.
 - ChatGPT subscription Responses access with OAuth login through `agens auth login`.
+- Moonshot AI (Kimi) chat-completions access with `provider.type = "moonshotai"` and `MOONSHOT_API_KEY` or an `auth.json` entry, written by `agens auth login api-key moonshotai`.
 - A cancellation-aware provider/tool loop with a 120-second top-level deadline.
 - Project-confined native tools: `read`, `write`, `list`, `search`, and bounded `bash`.
 - Permission evaluation before tool execution, including global/project TOML rules, temporary unsafe bypass, and persisted project grants. Unresolved approval requests fail closed.
@@ -33,16 +34,20 @@ For ChatGPT subscription authentication:
 ./target/debug/agens auth status
 ```
 
-For OpenAI API authentication, set the key and select the provider in configuration:
+For API-key authentication, set the key and select the provider in configuration:
 
 ```sh
-export OPENAI_API_KEY="..."
+export OPENAI_API_KEY="..."      # provider.type = "openai-api"
+export MOONSHOT_API_KEY="..."    # provider.type = "moonshotai"
 ```
 
 ```toml
 [provider]
 type = "openai-api"
 ```
+
+An unrecognized `provider.type` is rejected at startup rather than falling back to a
+default, so a typo cannot send a run to a provider you did not name.
 
 Run the TUI or a one-shot prompt:
 
@@ -117,7 +122,11 @@ Inspect resolved paths and validation status with:
 
 ## Persistence and security
 
-Credentials live in `auth.json` under the selected config home. `OPENAI_API_KEY` takes precedence for the OpenAI API provider. ChatGPT OAuth writes only its own provider entry and preserves other entries.
+Credentials live in `auth.json` under the selected config home, keyed by provider. Each
+provider reads its own environment variable — `OPENAI_API_KEY` or `MOONSHOT_API_KEY` — which
+takes precedence over the stored entry. A key configured for one provider never authenticates
+a run against another. ChatGPT OAuth writes only its own provider entry and preserves the
+others.
 
 Mutable runtime state lives under `[options].data_dir` or `${XDG_DATA_HOME:-~/.local/share}/agens` in a single `agens.db` SQLite file:
 
@@ -171,7 +180,6 @@ nix develop --no-pure-eval -c just verify
 ## Known limitations
 
 - `agens models` is reserved in the command surface but currently reports that the capability is unavailable.
-- CLI-managed OpenAI API-key login is not implemented; use `OPENAI_API_KEY` or an existing `openai-api` entry in `auth.json`.
 - The production tool catalog currently wires native tools and configured MCP tools. Skill discovery and sub-agent contracts exist in `agens-tools` but are not exposed as production tools yet.
 - TUI model and reasoning-effort palettes are not implemented; use configuration or `agens chat --model` for model selection.
 - Packaging, release automation, and editor protocol integrations are not provided.
