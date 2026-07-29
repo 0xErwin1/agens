@@ -271,7 +271,8 @@ pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<
                             session_project_root.clone(),
                         )
                         .with_lifecycle_bridge(lifecycle_bridge.clone())
-                        .with_dangerous_mode(request.dangerous_mode),
+                        .with_dangerous_mode(request.dangerous_mode)
+                        .with_bypass(request.dangerously_allow_all),
                         task_parent_request_config.clone(),
                         Some(task_diagnostic_reference.clone()),
                     )?;
@@ -459,7 +460,11 @@ pub fn seed_bypass_permissions_from_configuration(
 /// against. Best-effort, like [`agens_agents::persist_pending_agent_correction`]'s own write:
 /// a session toggled and then abandoned before its first completed turn has no row to write to
 /// yet, and that is an accepted, documented edge rather than a failure to surface.
-fn write_through_bypass_permission_prompts(bootstrap: &Bootstrap, identifier: i64, enabled: bool) {
+pub(crate) fn write_through_bypass_permission_prompts(
+    bootstrap: &Bootstrap,
+    identifier: i64,
+    enabled: bool,
+) {
     let _ = SessionStore::open(bootstrap.data_directory())
         .and_then(|mut store| store.set_bypass_permission_prompts(identifier, enabled));
 }

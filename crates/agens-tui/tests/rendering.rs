@@ -3627,7 +3627,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
 fn conversation_owns_the_first_row_under_every_notice_condition() {
     type ArmNotice = fn(&mut Tui<FakeEngine>);
 
-    let notices: [(&str, ArmNotice); 4] = [
+    let notices: [(&str, ArmNotice); 5] = [
         ("Press Ctrl+C again to exit", |tui| {
             tui.handle(Event::Key(Key::CtrlC));
         }),
@@ -3643,6 +3643,7 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
             });
         }),
         ("danger", |tui| tui.set_dangerous_mode(true)),
+        ("BYPASS", |tui| tui.set_bypass(true)),
         ("status-sentinel", |tui| tui.add_info("status-sentinel")),
     ];
 

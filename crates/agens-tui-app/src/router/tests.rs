@@ -845,6 +845,93 @@ fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
 }
 
 #[test]
+fn bypass_command_and_keybinding_toggle_both_ways_and_report_state() {
+    let temporary = tui_session_directory("bypass-toggle");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+    tui.set_presentation("openai-api", "gpt-4.1", "new session");
+
+    assert!(!session.lock().unwrap().bypass_permissions);
+
+    let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::CtrlShiftP)) else {
+        panic!("Ctrl+Shift+P should route through the bypass-mode router path");
+    };
+    assert_eq!(route_id, "bypass");
+    let outcome = router.route_request(
+        TuiRouteRequest::OpenDialog(route_id),
+        std::sync::mpsc::channel().0,
+    );
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!("Ctrl+Shift+P must report the resulting bypass state");
+    };
+    assert_eq!(message, "Permission bypass: on.");
+    assert!(tui.apply_submission_outcome(outcome).is_none());
+    assert!(session.lock().unwrap().bypass_permissions);
+
+    let outcome = router.route("/bypass".into());
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!("/bypass must report the resulting bypass state");
+    };
+    assert_eq!(message, "Permission bypass: off.");
+    assert!(!session.lock().unwrap().bypass_permissions);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn bypass_toggle_writes_through_once_a_session_row_exists_and_never_mutates_config_files() {
+    let temporary = tui_session_directory("bypass-write-through");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let global_config = bootstrap.paths.global_config.clone();
+    let global_before = std::fs::read(&global_config).unwrap_or_default();
+
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-session");
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    session.lock().unwrap().identifier = Some(metadata.id);
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    assert!(matches!(
+        router.route("/bypass".into()),
+        TuiSubmissionOutcome::ContextChanged { .. }
+    ));
+    assert!(session.lock().unwrap().bypass_permissions);
+
+    let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    assert_eq!(
+        store.bypass_permission_prompts(metadata.id).unwrap(),
+        Some(true)
+    );
+    drop(store);
+
+    assert_eq!(
+        std::fs::read(&global_config).unwrap_or_default(),
+        global_before,
+        "toggling bypass must never write configuration to disk"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
 fn u15_c1a_subagent_overlay_and_alias_expose_only_eligible_agents() {
     let temporary = tui_session_directory("u15-c1a-subagents");
     let bootstrap = tui_session_bootstrap(

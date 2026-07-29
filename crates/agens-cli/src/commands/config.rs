@@ -23,13 +23,14 @@ pub(crate) fn run_config(
         cli::ConfigAction::Doctor => {
             let bootstrap = bootstrap(dependencies)?;
             Ok(format!(
-                "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n\n{}",
+                "Agens config doctor\nGlobal:  {} ({})\nProject: {} ({})\nModel:   {}\nStatus:  valid\n\n{}{}",
                 bootstrap.paths.global_config.display(),
                 source_status(bootstrap.global_loaded),
                 bootstrap.paths.project_config.display(),
                 source_status(bootstrap.project_loaded),
                 bootstrap.model.as_deref().unwrap_or("-"),
-                effective_settings_report(bootstrap.settings())
+                effective_settings_report(bootstrap.settings()),
+                ignored_project_scope_warnings(bootstrap.settings())
             ))
         }
     }
@@ -147,6 +148,33 @@ fn effective_settings_report(settings: &ResolvedSettings) -> String {
     }
 
     report
+}
+
+/// Settings the runtime reads from the global document alone, ignoring any project declaration.
+///
+/// `agent.bypass_permission_prompts` is global-only on purpose: a project-scoped permission bypass
+/// would let a checked-out repository disable its own permission prompts.
+const GLOBAL_ONLY_SETTINGS: &[&str] = &["agent.bypass_permission_prompts"];
+
+/// Flags settings a project declared that the runtime will ignore.
+///
+/// The settings report above renders the MERGED view, where project precedence wins, so without
+/// this a project-declared global-only setting reads as effective when it has no effect at all.
+fn ignored_project_scope_warnings(settings: &ResolvedSettings) -> String {
+    let mut warnings = String::new();
+
+    for (path, setting) in settings.iter() {
+        if !matches!(setting.origin, Origin::Project) || !GLOBAL_ONLY_SETTINGS.contains(&path) {
+            continue;
+        }
+
+        warnings.push_str(&format!(
+            "\nWarning: {path} is declared by this project, but it is read from the global \
+             configuration only. The project value is ignored.\n"
+        ));
+    }
+
+    warnings
 }
 
 fn source_status(loaded: bool) -> &'static str {
@@ -373,5 +401,65 @@ mod tests {
         assert!(report.contains("tools.max_search_results         25            project\n"));
         assert!(report.contains("tools.max_list_entries           1000          default\n"));
         assert!(report.contains("agent.default_agent              -             default\n"));
+    }
+
+    /// `doctor` reports the merged, project-precedence value, but the runtime reads the permission
+    /// bypass from the global document alone. Without the warning the report would present a
+    /// project-declared bypass as effective when it is inert.
+    #[test]
+    fn config_doctor_warns_that_a_project_declared_permission_bypass_is_ignored() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-doctor-project-bypass-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([(
+                project_root.join(".agens/config.toml"),
+                "[agent]\nbypass_permission_prompts = true\n".to_owned(),
+            )]),
+        );
+
+        let report =
+            run_config(cli::ConfigAction::Doctor, &dependencies).expect("doctor should run");
+
+        assert!(
+            report.contains("agent.bypass_permission_prompts"),
+            "{report}"
+        );
+        assert!(report.contains("Warning:"), "{report}");
+        assert!(report.contains("global"), "{report}");
+    }
+
+    #[test]
+    fn config_doctor_stays_silent_when_the_permission_bypass_is_global_only() {
+        let temporary =
+            std::env::temp_dir().join(format!("agens-doctor-global-bypass-{}", std::process::id()));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+        let dependencies = CliDependencies::for_test(
+            project_root,
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            BTreeMap::from([(
+                config_home.join("config.toml"),
+                "[agent]\nbypass_permission_prompts = true\n".to_owned(),
+            )]),
+        );
+
+        let report =
+            run_config(cli::ConfigAction::Doctor, &dependencies).expect("doctor should run");
+
+        assert!(!report.contains("Warning:"), "{report}");
     }
 }

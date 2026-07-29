@@ -17,6 +17,7 @@ pub(crate) struct FooterContext<'a> {
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
     pub dangerous: bool,
+    pub bypass: bool,
 }
 
 /// Narrowest border line worth splicing metadata into.
@@ -92,6 +93,9 @@ impl FooterSegments {
         }
         if ctx.dangerous {
             status = format!("danger {status}");
+        }
+        if ctx.bypass {
+            status = format!("BYPASS {status}");
         }
 
         Self {
@@ -301,6 +305,7 @@ mod tests {
                     context_window: Some(200_000),
                 }),
                 dangerous: false,
+                bypass: false,
             },
         );
         assert!(line.contains("gpt-5.6-sol"));
@@ -337,6 +342,7 @@ mod tests {
                 context_window: Some(200_000),
             }),
             dangerous: false,
+            bypass: false,
         }
     }
 
@@ -361,6 +367,25 @@ mod tests {
         assert_eq!(at(19), " gpt-5.6-sol");
         assert_eq!(at(12), " gpt-5.6-sol");
         assert_eq!(at(11), " gpt-5.6-s…");
+    }
+
+    #[test]
+    fn bypass_segment_is_shown_hidden_and_coexists_with_dangerous_mode() {
+        let mut ctx = sample();
+        ctx.bypass = true;
+        let line = MetricFooter::text(100, ctx);
+        assert!(line.contains("BYPASS"), "{line:?}");
+
+        let ctx = sample();
+        let line = MetricFooter::text(100, ctx);
+        assert!(!line.contains("BYPASS"), "{line:?}");
+
+        let mut ctx = sample();
+        ctx.bypass = true;
+        ctx.dangerous = true;
+        let line = MetricFooter::text(100, ctx);
+        assert!(line.contains("BYPASS"), "{line:?}");
+        assert!(line.contains("danger"), "{line:?}");
     }
 
     #[test]

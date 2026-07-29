@@ -10,6 +10,7 @@ use agens_error::CliError;
 
 pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
+    "bypass",
     "connect",
     "disconnect",
     "diagnostics",

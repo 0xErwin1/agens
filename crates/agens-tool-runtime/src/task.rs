@@ -94,6 +94,7 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
+    let bypass = task_runner.bypass();
     let task_registry = task_runner.execution_registry().unwrap_or_default();
     let parent_model = match bootstrap.model() {
         Some(model) => model.to_owned(),
@@ -130,7 +131,11 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
         .grants_for_project(&project)
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
     let grants = Arc::new(Mutex::new(grants));
-    let session = PermissionSession::new();
+    let session = if bypass {
+        PermissionSession::with_temporary_bypass()
+    } else {
+        PermissionSession::new()
+    };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let gate = ProductionPermissionGate::new(
@@ -149,7 +154,11 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
         prompts,
         ProductionPromptAuthorization {
             policy,
-            session: PermissionSession::new(),
+            session: if bypass {
+                PermissionSession::with_temporary_bypass()
+            } else {
+                PermissionSession::new()
+            },
             project,
             dispatcher: Arc::clone(&dispatcher),
             allowed: Arc::clone(&pending),

@@ -116,7 +116,8 @@ pub fn tui_session_presentation(
         });
     let mut presentation = TuiPresentation::new(provider, &model, label)
         .with_context_window(agens_models::context_window_for(&model))
-        .with_dangerous_mode(session.dangerous_mode);
+        .with_dangerous_mode(session.dangerous_mode)
+        .with_bypass(session.bypass_permissions);
     if let Some(effort) = effort {
         presentation = presentation.with_effort(effort);
     }
@@ -291,5 +292,21 @@ mod tests {
 
         std::fs::remove_dir_all(known_root).unwrap();
         std::fs::remove_dir_all(unknown_root).unwrap();
+    }
+
+    #[test]
+    fn tui_presentation_carries_the_session_bypass_state_into_the_footer() {
+        let root = tui_session_directory("presentation-bypass");
+        let bootstrap = tui_session_bootstrap_for_provider(&root, &[], "openai-api", "gpt-5.6-sol");
+        let mut tui = Tui::new(ProductionTuiEngine {
+            cancellation: Arc::new(Mutex::new(None)),
+        });
+        let mut session = SessionContext::fresh();
+        session.bypass_permissions = true;
+        tui.apply_presentation(tui_session_presentation(&bootstrap, &session));
+        let rendered = render_tui_test_backend(&tui, 140, 14);
+        assert!(rendered.contains("BYPASS"), "{rendered:?}");
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

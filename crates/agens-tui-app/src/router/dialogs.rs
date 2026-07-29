@@ -51,6 +51,7 @@ impl TuiRuntimeRouter {
         let bootstrap = self.bootstrap()?;
         let dialog = match route_id {
             "dangerous" => return self.toggle_dangerous_mode(),
+            "bypass" => return self.toggle_bypass_permissions(),
             "connect" => DialogView::selection(
                 "Connect to ChatGPT",
                 Some("Choose an authentication flow"),
