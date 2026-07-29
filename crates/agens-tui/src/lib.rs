@@ -680,6 +680,7 @@ pub struct DialogEntry {
     search_text: Option<String>,
     selected_detail: Option<String>,
     action: Option<DialogEntryAction>,
+    id: Option<String>,
 }
 
 impl DialogEntry {
@@ -720,6 +721,7 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
     }
 
@@ -733,6 +735,7 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
     }
 
@@ -752,7 +755,14 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
+    }
+
+    /// Attaches the row identity substituted into selected-key action templates.
+    pub fn with_id(mut self, id: impl AsRef<str>) -> Self {
+        self.id = Some(bounded_dialog_text(id.as_ref(), 128));
+        self
     }
 
     pub fn cancel(label: impl AsRef<str>) -> Self {
@@ -762,6 +772,7 @@ impl DialogEntry {
             search_text: None,
             selected_detail: None,
             action: Some(DialogEntryAction::Cancel),
+            id: None,
         }
     }
 
@@ -772,6 +783,7 @@ impl DialogEntry {
             search_text: None,
             selected_detail: None,
             action: None,
+            id: None,
         }
     }
 
@@ -786,6 +798,7 @@ impl DialogEntry {
             search_text: Some(bounded_dialog_text(search_text.as_ref(), 512)),
             selected_detail: Some(bounded_dialog_multiline(selected_detail.as_ref(), 2_048)),
             action: Some(DialogEntryAction::ToggleDetails),
+            id: None,
         }
     }
 }
@@ -893,6 +906,7 @@ pub struct DialogView {
     empty_message: Option<String>,
     cancellation_action: Option<String>,
     shortcut_actions: Vec<(char, String)>,
+    selected_key_actions: Vec<(Key, String)>,
     overlay_kind: widgets::OverlayKind,
 }
 
@@ -921,6 +935,7 @@ impl DialogView {
             empty_message: None,
             cancellation_action: None,
             shortcut_actions: Vec::new(),
+            selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -953,6 +968,15 @@ impl DialogView {
     pub fn with_shortcut_action(mut self, key: char, action_id: impl AsRef<str>) -> Self {
         self.shortcut_actions
             .push((key, bounded_dialog_text(action_id.as_ref(), 128)));
+        self
+    }
+
+    /// Registers a template dispatched for the selected row when `key` is pressed.
+    /// The literal `{selected}` is replaced with the selected entry's `with_id`
+    /// identity; without an identity the key keeps its default behavior.
+    pub fn with_selected_key_action(mut self, key: Key, template: impl AsRef<str>) -> Self {
+        self.selected_key_actions
+            .push((key, bounded_dialog_text(template.as_ref(), 128)));
         self
     }
 
@@ -1050,6 +1074,7 @@ impl DialogView {
             empty_message: None,
             cancellation_action: None,
             shortcut_actions: Vec::new(),
+            selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -4920,6 +4945,26 @@ where
         Some(matched)
     }
 
+    fn selected_key_dialog_action(&mut self, key: Key) -> Option<Action> {
+        let template = self
+            .dialog
+            .as_ref()?
+            .selected_key_actions
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, template)| template.clone())?;
+        let id = self.dialog.as_ref().and_then(|dialog| {
+            dialog_matches(dialog)
+                .into_iter()
+                .find(|(index, _)| *index == dialog.selected)
+                .and_then(|(_, entry)| entry.id.clone())
+        })?;
+        self.dialog = None;
+        Some(Action::DialogAction(
+            template.replace("{selected}", id.as_str()),
+        ))
+    }
+
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
         match key {
             Key::CtrlO => {
@@ -4985,6 +5030,14 @@ where
                 Action::Render
             }
             Key::Backspace => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.query.is_empty())
+                    && let Some(action) = self.selected_key_dialog_action(Key::Backspace)
+                {
+                    return action;
+                }
                 if let Some(request) = self.session_dialog_request() {
                     let mut request = request.clone();
                     request.query.pop();
@@ -5020,6 +5073,9 @@ where
                 self.reset_dialog_selection();
                 Action::Render
             }
+            key @ (Key::Left | Key::Right | Key::Tab) => self
+                .selected_key_dialog_action(key)
+                .unwrap_or(Action::Render),
             Key::Up | Key::Down | Key::ScrollUp | Key::ScrollDown => {
                 self.move_dialog_selection(key, 1, true);
                 Action::Render
@@ -7765,6 +7821,56 @@ mod runtime_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rows, ["AAA AAA", "AAAAA AA", "AAAAAA"]);
+    }
+
+    #[test]
+    fn selected_key_actions_dispatch_the_selected_entry_identity() {
+        let mut tui = Tui::new(NoopEngine);
+        let dialog = || {
+            DialogView::selection(
+                "Profiles",
+                Some("help"),
+                vec![
+                    DialogEntry::action("worker", "profiles:edit:worker").with_id("worker"),
+                    DialogEntry::action("scout", "profiles:edit:scout").with_id("scout"),
+                ],
+            )
+            .with_selected_key_action(Key::Right, "profiles:cycle:{selected}:next")
+            .with_selected_key_action(Key::Backspace, "profiles:reset:{selected}")
+        };
+
+        tui.show_selection_dialog(dialog());
+        assert_eq!(
+            tui.handle(Event::Key(Key::Right)),
+            Action::DialogAction("profiles:cycle:worker:next".into())
+        );
+        assert!(tui.view().dialog.is_none());
+
+        tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Backspace)),
+            Action::DialogAction("profiles:reset:scout".into())
+        );
+        assert!(tui.view().dialog.is_none());
+
+        // A non-empty query keeps Backspace as query editing.
+        tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Char('x')));
+        assert_eq!(tui.handle(Event::Key(Key::Backspace)), Action::Render);
+        assert!(tui.view().dialog.is_some());
+
+        // Rows without an identity keep the key's default behavior.
+        tui.show_selection_dialog(
+            DialogView::selection(
+                "Profiles",
+                Some("help"),
+                vec![DialogEntry::action("worker", "profiles:edit:worker")],
+            )
+            .with_selected_key_action(Key::Right, "profiles:cycle:{selected}:next"),
+        );
+        assert_eq!(tui.handle(Event::Key(Key::Right)), Action::Render);
+        assert!(tui.view().dialog.is_some());
     }
 
     #[test]
