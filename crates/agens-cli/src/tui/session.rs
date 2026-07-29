@@ -187,8 +187,8 @@ mod tests {
     };
 
     use super::*;
-    use crate::session::agents::BundledModelValidator;
     use crate::test_support::{rotation_agent, rotation_dispatcher};
+    use agens_fixtures::BundledModelValidator;
     use agens_headless::provider_messages;
     use agens_permissions::permission_policy;
     use agens_session::turns::completed_session_turn;

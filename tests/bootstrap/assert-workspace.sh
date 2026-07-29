@@ -13,10 +13,23 @@ jq -e '
   {
     "agens-core": [],
     "agens-bus": [],
-    "agens-error": ["agens-core"],
-    "agens-bootstrap": ["agens-config", "agens-core", "agens-error", "agens-tools"],
+    "agens-error": [
+      "agens-core"
+    ],
+    "agens-bootstrap": [
+      "agens-config",
+      "agens-core",
+      "agens-error",
+      "agens-tools"
+    ],
+    "agens-auth": [
+      "agens-error",
+      "agens-providers"
+    ],
     "agens-callcount": [],
-    "agens-models": ["agens-core"],
+    "agens-models": [
+      "agens-core"
+    ],
     "agens-agents": [
       "agens-bootstrap",
       "agens-core",
@@ -29,7 +42,12 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
-    "agens-fixtures": ["agens-bootstrap", "agens-error"],
+    "agens-fixtures": [
+      "agens-bootstrap",
+      "agens-error",
+      "agens-models",
+      "agens-tools"
+    ],
     "agens-diagnostics": [
       "agens-bootstrap",
       "agens-core",
@@ -58,9 +76,17 @@ jq -e '
       "agens-tools"
     ],
     "agens-config": [],
-    "agens-providers": ["agens-config", "agens-core"],
-    "agens-tools": ["agens-config", "agens-core"],
-    "agens-store": ["agens-core"],
+    "agens-providers": [
+      "agens-config",
+      "agens-core"
+    ],
+    "agens-tools": [
+      "agens-config",
+      "agens-core"
+    ],
+    "agens-store": [
+      "agens-core"
+    ],
     "agens-headless": [
       "agens-agents",
       "agens-bootstrap",
@@ -95,10 +121,16 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
-    "agens-tui": ["agens-bus", "agens-core"],
-    "agens-server": ["agens-core"],
+    "agens-tui": [
+      "agens-bus",
+      "agens-core"
+    ],
+    "agens-server": [
+      "agens-core"
+    ],
     "agens": [
       "agens-agents",
+      "agens-auth",
       "agens-bootstrap",
       "agens-bus",
       "agens-callcount",

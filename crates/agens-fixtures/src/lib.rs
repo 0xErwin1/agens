@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use agens_bootstrap::{Bootstrap, HostEnvironment};
+use agens_models::{ModelSelection, ModelSource};
+use agens_tools::AgentModelValidator;
 
 /// Waits for a condition rather than for a fixed number of polls.
 ///
@@ -159,4 +161,24 @@ pub fn session_bootstrap_for_provider(
         )]),
     )
     .expect("session bootstrap fixture should be valid")
+}
+
+/// Accepts any model the bundled catalog knows, under either provider.
+///
+/// Tests that care about agent selection rather than about model availability
+/// use this so a catalog change does not reach them.
+pub struct BundledModelValidator;
+
+impl AgentModelValidator for BundledModelValidator {
+    fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
+        [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription]
+            .into_iter()
+            .any(|source| {
+                ModelSelection::for_source(model, source)
+                    .model_values()
+                    .is_ok_and(|models| models.iter().any(|candidate| candidate == model))
+            })
+            .then_some(())
+            .ok_or(agens_tools::AgentModelValidationError::Unavailable)
+    }
 }

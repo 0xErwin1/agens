@@ -24,8 +24,6 @@ use agens_tui::{
     TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
 };
 
-use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
-use crate::session::agents::rotate_agent;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
     RESERVED_TUI_COMMANDS, discover_tui_command_catalog, render_tui_help, resolved_tui_palette,
@@ -46,6 +44,7 @@ use crate::tui::turn::tui_session_presentation;
 use agens_agents::{
     agent_catalog_for_context, persist_pending_agent_correction, select_subagent, subagent_catalog,
 };
+use agens_auth::{ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
 use agens_bootstrap::discover_skill_catalog;
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::{CliError, ExitStatus};
@@ -59,6 +58,7 @@ use agens_session::provider::{
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
 use agens_tool_runtime::mcp::load_configured_mcp_registry;
+use agens_tool_runtime::rotation::rotate_agent;
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
@@ -1195,7 +1195,7 @@ impl TuiRuntimeRouter {
 }
 
 pub(crate) enum AuthRouteError {
-    Auth(chatgpt_auth::ChatGptAuthError),
+    Auth(agens_auth::ChatGptAuthError),
     Runtime(CliError),
 }
 

@@ -508,11 +508,11 @@ mod tests {
     use super::*;
     use crate::CliDependencies;
     use crate::deps::bootstrap;
-    use crate::session::agents::BundledModelValidator;
     use crate::test_support::{
         persist_tui_session, render_tui_test_backend, rotation_agent, rotation_dispatcher,
         tui_project, tui_session_bootstrap, tui_session_directory, tui_session_messages,
     };
+    use agens_fixtures::BundledModelValidator;
     use agens_models::ModelSelection;
     use agens_session::context::ActiveAgentRuntime;
 

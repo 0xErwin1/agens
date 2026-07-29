@@ -13,6 +13,7 @@ members = [
   "crates/agens-fixtures",
   "crates/agens-dispatch",
   "crates/agens-config",
+  "crates/agens-auth",
   "crates/agens-providers",
   "crates/agens-tools",
   "crates/agens-headless",

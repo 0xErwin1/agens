@@ -8,7 +8,6 @@ use agens_core::HeadlessTurnCancellation;
 mod attempt_tests;
 #[cfg(test)]
 mod bootstrap_tests;
-mod chatgpt_auth;
 mod cli;
 mod commands;
 mod deps;
@@ -22,7 +21,7 @@ mod permission_prompt;
 mod permission_tests;
 #[cfg(test)]
 mod provider_tests;
-mod session;
+mod rotation_tests;
 #[cfg(test)]
 mod task_runner_tests;
 mod task_tool_tests;

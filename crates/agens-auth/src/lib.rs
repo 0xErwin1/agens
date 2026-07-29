@@ -1,3 +1,9 @@
+//! Signing in to a ChatGPT subscription.
+//!
+//! Two flows reach the same credentials: a browser round trip and a device
+//! code. Both report progress through a callback, so a terminal, a headless run
+//! or a test observes the same sequence without this crate knowing which.
+
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -9,12 +15,12 @@ use agens_providers::chatgpt_login::{
     upsert_chatgpt_credentials,
 };
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ChatGptAuthFlow {
+pub enum ChatGptAuthFlow {
     Browser,
     Device,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ChatGptAuthProgress {
+pub enum ChatGptAuthProgress {
     BrowserUrl(String),
     DeviceCode {
         verification_url: String,
@@ -22,17 +28,17 @@ pub(crate) enum ChatGptAuthProgress {
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ChatGptAuthError {
+pub struct ChatGptAuthError {
     message: &'static str,
     action: &'static str,
 }
 
 impl ChatGptAuthError {
-    pub(crate) fn message(&self) -> &'static str {
+    pub fn message(&self) -> &'static str {
         self.message
     }
 
-    pub(crate) fn action(&self) -> &'static str {
+    pub fn action(&self) -> &'static str {
         self.action
     }
 
@@ -68,12 +74,12 @@ type Authenticator = dyn Fn(ChatGptAuthFlow, LoginCancellation, ProgressSink) ->
     + Sync;
 
 #[derive(Clone)]
-pub(crate) struct ChatGptAuthCoordinator {
+pub struct ChatGptAuthCoordinator {
     authenticate: Arc<Authenticator>,
 }
 
 impl ChatGptAuthCoordinator {
-    pub(crate) fn production() -> Self {
+    pub fn production() -> Self {
         Self::with_authenticator(|flow, cancellation, publish| match flow {
             ChatGptAuthFlow::Browser => {
                 let progress = Arc::clone(&publish);
@@ -107,7 +113,7 @@ impl ChatGptAuthCoordinator {
         })
     }
 
-    pub(crate) fn with_authenticator(
+    pub fn with_authenticator(
         authenticate: impl Fn(
             ChatGptAuthFlow,
             LoginCancellation,
@@ -122,7 +128,7 @@ impl ChatGptAuthCoordinator {
         }
     }
 
-    pub(crate) fn login(
+    pub fn login(
         &self,
         path: &Path,
         flow: ChatGptAuthFlow,
@@ -141,7 +147,7 @@ impl ChatGptAuthCoordinator {
         upsert_chatgpt_credentials(path, &credentials).map_err(|_| ChatGptAuthError::persistence())
     }
 
-    pub(crate) fn disconnect(&self, path: &Path) -> Result<bool, ChatGptAuthError> {
+    pub fn disconnect(&self, path: &Path) -> Result<bool, ChatGptAuthError> {
         remove_provider_entry(path, "openai-chatgpt").map_err(|_| ChatGptAuthError::persistence())
     }
 }

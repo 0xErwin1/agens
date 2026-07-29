@@ -9,6 +9,7 @@
 
 pub mod child;
 pub mod mcp;
+pub mod rotation;
 pub mod runner;
 pub mod runtime;
 pub mod task;

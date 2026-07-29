@@ -7,6 +7,7 @@ name = "agens"
 version = "0.1.0"
 dependencies = [
  "agens-agents",
+ "agens-auth",
  "agens-bootstrap",
  "agens-bus",
  "agens-callcount",
@@ -51,6 +52,15 @@ dependencies = [
  "agens-session",
  "agens-store",
  "agens-tools",
+]
+
+[[package]]
+name = "agens-auth"
+version = "0.1.0"
+dependencies = [
+ "agens-error",
+ "agens-providers",
+ "serde_json",
 ]
 
 [[package]]
@@ -122,6 +132,8 @@ version = "0.1.0"
 dependencies = [
  "agens-bootstrap",
  "agens-error",
+ "agens-models",
+ "agens-tools",
 ]
 
 [[package]]

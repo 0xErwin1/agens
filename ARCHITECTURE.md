@@ -14,6 +14,7 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-models       the bundled model catalog and selection
   -> agens-bootstrap    resolving a run's configuration from a host environment
   -> agens-providers    OpenAI and ChatGPT authentication and streaming adapters
+  -> agens-auth         signing in to a ChatGPT subscription
   -> agens-store        SQLite sessions, grants, and the evidence ledger
   -> agens-tools        native tools, MCP, skills, and subagents
   -> agens-tool-runtime assembling and running the tools a turn can call
@@ -42,6 +43,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-models` | The bundled model catalog, its checksum, and a validated model selection. | Talking to a provider. |
 | `agens-bootstrap` | Turning a host environment into a resolved `Bootstrap`: paths, settings, credentials, MCP servers, and the session-scoped re-resolution that keeps a resumed session on its own root. | Knowing which command is running or how it reports. |
 | `agens-providers` | Provider adapters: authentication, streaming, and their error taxonomy. | Choosing a provider or a model for a session. |
+| `agens-auth` | The two ChatGPT sign-in flows, browser and device code, and the credentials they produce. Both report progress through a callback. | Showing progress. It never learns which surface is watching. |
 | `agens-store` | SQLite: the unified database, migrations, sessions, attempts, grants, the evidence ledger, and paginated transcript reads. | Interpreting what it stores. |
 | `agens-tools` | Native tools and their confinement, permission capabilities, MCP transports, skills, and subagent plumbing. | Deciding whether a call is allowed for a given session. |
 | `agens-tool-runtime` | Assembly and execution: building the native catalog and the MCP registry for a project root, registering the `task` tool, running a delegated task in a confined child process, and launching a subagent a caller armed for the next prompt. | Who asked. A headless run, a terminal session and a daemon worker assemble the same runtime. |
