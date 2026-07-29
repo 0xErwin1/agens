@@ -56,9 +56,16 @@ pub fn subagent_catalog(
         return Ok(Vec::new().into_iter());
     }
 
+    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let agents = agent_catalog_for_context(bootstrap, context)?
         .subagents()
         .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
+        .filter(|agent| {
+            agent
+                .model
+                .as_deref()
+                .is_none_or(|model| validator.is_available(model))
+        })
         .cloned()
         .collect::<Vec<_>>();
     Ok(agents.into_iter())

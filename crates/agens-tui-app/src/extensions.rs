@@ -24,6 +24,7 @@ pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "select",
     "sessions",
     "subagent",
+    "subagent-profiles",
     "subagents",
 ];
 
@@ -56,6 +57,12 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("help", "Show commands and skills", "", Some("help")),
     ("mcp", "Show configured MCP servers", "", Some("mcp")),
     ("select", "Select a project file", "", Some("select")),
+    (
+        "subagent-profiles",
+        "Edit subagent model profiles",
+        "",
+        Some("subagent-profiles"),
+    ),
     ("quit", "Exit Agens", "", None),
 ];
 
@@ -643,6 +650,7 @@ mod tests {
                 "help",
                 "mcp",
                 "select",
+                "subagent-profiles",
                 "quit",
                 "subagent",
                 "subagents",

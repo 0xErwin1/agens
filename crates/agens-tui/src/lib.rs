@@ -147,6 +147,8 @@ pub enum Key {
     CtrlShiftN,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
+    /// Opens the subagent model profile editor.
+    CtrlShiftP,
     /// Toggles the visible dangerous-mode session state through the composition layer.
     CtrlShiftD,
     /// Starts or moves the selected subagent into background execution.
@@ -890,6 +892,7 @@ pub struct DialogView {
     details_open: bool,
     empty_message: Option<String>,
     cancellation_action: Option<String>,
+    shortcut_actions: Vec<(char, String)>,
     overlay_kind: widgets::OverlayKind,
 }
 
@@ -917,6 +920,7 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            shortcut_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -943,6 +947,12 @@ impl DialogView {
 
     pub fn with_cancellation_action(mut self, action_id: impl AsRef<str>) -> Self {
         self.cancellation_action = Some(bounded_dialog_text(action_id.as_ref(), 128));
+        self
+    }
+
+    pub fn with_shortcut_action(mut self, key: char, action_id: impl AsRef<str>) -> Self {
+        self.shortcut_actions
+            .push((key, bounded_dialog_text(action_id.as_ref(), 128)));
         self
     }
 
@@ -1039,6 +1049,7 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            shortcut_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -4493,6 +4504,11 @@ where
             return Action::OpenDialog("subagent".into());
         }
 
+        if key == Key::CtrlShiftP {
+            self.palette_open = false;
+            return Action::OpenDialog("subagent-profiles".into());
+        }
+
         if key == Key::CtrlShiftD {
             self.palette_open = false;
             return Action::OpenDialog("dangerous".into());
@@ -4926,6 +4942,16 @@ where
                 self.toggle_session_dialog_scope()
             }
             Key::Char(character) => {
+                if let Some(action_id) = self.dialog.as_ref().and_then(|dialog| {
+                    dialog
+                        .shortcut_actions
+                        .iter()
+                        .find(|(key, _)| *key == character)
+                        .map(|(_, action)| action.clone())
+                }) {
+                    self.dialog = None;
+                    return Action::DialogAction(action_id);
+                }
                 if let Some(action) = self.try_confirm_shortcut(character) {
                     return action;
                 }
@@ -6635,6 +6661,12 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::CtrlShiftA
         }
         (KeyCode::Char('A'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftA,
+        (KeyCode::Char('p'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftP
+        }
+        (KeyCode::Char('P'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftP,
         (KeyCode::Char('d'), modifiers)
             if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
         {

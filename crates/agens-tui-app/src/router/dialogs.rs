@@ -15,16 +15,20 @@ use crate::files::{selected_tui_file, tui_select_candidates};
 use crate::models::{
     apply_tui_effort, apply_tui_model, apply_tui_unverified_model, format_model_metadata,
 };
+use crate::profiles::ProfileEditorRow;
 use crate::resume::{
     ResumedTuiSession, commit_tui_session_resume, load_tui_session_for_resume,
     prepare_loaded_tui_session_resume, resume_tui_session, tui_project_identifier,
 };
 use crate::session::{parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry};
 use agens_agents::{
-    agent_catalog_for_context, persist_pending_agent_correction, select_subagent, subagent_catalog,
+    AgentProfileResolver, ProfileOrigin, agent_catalog_for_context,
+    persist_pending_agent_correction, select_subagent, subagent_catalog,
 };
 use agens_auth::ChatGptAuthFlow;
 use agens_bootstrap::Bootstrap;
+use agens_bootstrap::session_config::SessionConfig;
+use agens_bootstrap::session_root::SessionRoot;
 use agens_error::CliError;
 use agens_models::ModelSelection;
 use agens_session::attempt::active_session_attempts;
@@ -44,6 +48,15 @@ fn providers_with_active_first(active: ProviderKind) -> Vec<ProviderKind> {
             .filter(|provider| *provider != active),
     );
     providers
+}
+
+fn profile_origin_label(origin: ProfileOrigin) -> &'static str {
+    match origin {
+        ProfileOrigin::ProjectProfile => "profile:project",
+        ProfileOrigin::GlobalProfile => "profile:global",
+        ProfileOrigin::Frontmatter => "frontmatter",
+        ProfileOrigin::SessionInherited => "session-inherited",
+    }
 }
 
 impl TuiRuntimeRouter {
@@ -274,6 +287,94 @@ impl TuiRuntimeRouter {
                     .collect();
                 DialogView::selection("Choose agent", Some("Eligible primary agents"), entries)
             }
+            "subagent-profiles" => {
+                let context = self
+                    .session
+                    .lock()
+                    .map_err(|_| CliError::storage("TUI session is unavailable"))?
+                    .clone();
+                let root = agens_session::root::resolve_tui_session_root(&context, &bootstrap)?;
+                let session_config =
+                    SessionConfig::resolve(&SessionRoot::confined_to(root), &bootstrap)?;
+                let presentation = self.presentation()?;
+                let session_effort = self.task_parent_request_config()?.reasoning_effort();
+                let compatibility =
+                    agens_agents::AgentModelCompatibility::for_context(&bootstrap, &context)?;
+                let rows = subagent_catalog(&bootstrap, &context)?
+                    .map(|agent| {
+                        let resolved = AgentProfileResolver::new(session_config.agent_profiles())
+                            .resolve(
+                                &agent.name,
+                                agent.model.as_deref(),
+                                agent.reasoning_effort,
+                                presentation.model(),
+                                session_effort,
+                            );
+                        ProfileEditorRow::new(
+                            &agent.name,
+                            resolved.model.value,
+                            resolved.model.origin,
+                            resolved.effort.value.map(|value| value.as_str()),
+                            resolved.effort.origin,
+                            !compatibility.is_available(
+                                &agent
+                                    .model
+                                    .unwrap_or_else(|| presentation.model().to_owned()),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut editor_state = self
+                    .profile_editor
+                    .lock()
+                    .map_err(|_| CliError::storage("profile editor is unavailable"))?;
+                if editor_state.is_none() {
+                    *editor_state = Some(crate::profiles::ProfileEditor::new(rows));
+                }
+                let entries = editor_state
+                    .as_ref()
+                    .expect("profile editor was initialized")
+                    .rows()
+                    .iter()
+                    .map(|row| {
+                        let unavailable = if row.unavailable {
+                            " (unavailable)"
+                        } else {
+                            ""
+                        };
+                        let effort = row.effort.value.as_deref().unwrap_or("default");
+                        DialogEntry::action(
+                            format!(
+                                "{} · {} [{}] · {} [{}]{}",
+                                row.name,
+                                row.model.value,
+                                profile_origin_label(row.model.origin),
+                                effort,
+                                profile_origin_label(row.effort.origin),
+                                unavailable
+                            ),
+                            format!("subagent-profiles:edit:{}", row.name),
+                        )
+                    })
+                    .collect();
+                drop(editor_state);
+                DialogView::selection(
+                    "Subagent profiles",
+                    Some("Enter/m model · e effort · M/E/r reset · g global · p project · s save · Esc/q cancel"),
+                    entries,
+                )
+                .with_empty_message("No subagents are available.")
+                .with_cancellation_action("subagent-profiles:cancel")
+                .with_shortcut_action('g', "subagent-profiles:scope:global")
+                .with_shortcut_action('p', "subagent-profiles:scope:project")
+                .with_shortcut_action('s', "subagent-profiles:save")
+                .with_shortcut_action('q', "subagent-profiles:cancel")
+                .with_shortcut_action('m', "subagent-profiles:model:selected")
+                .with_shortcut_action('e', "subagent-profiles:effort:selected")
+                .with_shortcut_action('M', "subagent-profiles:reset-model:selected")
+                .with_shortcut_action('E', "subagent-profiles:reset-effort:selected")
+                .with_shortcut_action('r', "subagent-profiles:reset-model:selected")
+            }
             "subagent" => {
                 let context = self
                     .session
@@ -394,6 +495,9 @@ impl TuiRuntimeRouter {
                 if let Some(key) = parse_recovery_action(action_id) {
                     return self.recover_tui_session_attempt(&bootstrap, key);
                 }
+                if let Some(action) = action_id.strip_prefix("subagent-profiles:") {
+                    return self.apply_profile_editor_action(action);
+                }
                 if let Some(identifier) = action_id.strip_prefix("session:") {
                     let expected = self
                         .session
@@ -466,6 +570,159 @@ impl TuiRuntimeRouter {
                 action: TUI_ERROR_ACTION.into(),
             },
         }
+    }
+
+    fn apply_profile_editor_action(&self, action: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        use crate::profiles::ProfileScope;
+
+        if action == "cancel" {
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .take();
+            return Ok(TuiSubmissionOutcome::LocalInfo(
+                "Subagent profile edits discarded.".into(),
+            ));
+        }
+        if let Some(scope) = action.strip_prefix("scope:") {
+            let scope = match scope {
+                "global" => ProfileScope::Global,
+                "project" => ProfileScope::Project,
+                _ => return Err(CliError::usage("profile scope is unavailable")),
+            };
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .as_mut()
+                .ok_or_else(|| CliError::usage("profile editor is unavailable"))?
+                .set_scope(scope);
+            return self.open_dialog("subagent-profiles");
+        }
+        if action == "save" {
+            let store = self
+                .profile_store
+                .as_ref()
+                .ok_or_else(|| CliError::unavailable("profile storage is unavailable"))?;
+            let patches = {
+                let editor = self
+                    .profile_editor
+                    .lock()
+                    .map_err(|_| CliError::storage("profile editor is unavailable"))?;
+                let editor = editor
+                    .as_ref()
+                    .ok_or_else(|| CliError::usage("profile editor is unavailable"))?;
+                [ProfileScope::Global, ProfileScope::Project]
+                    .into_iter()
+                    .flat_map(|scope| {
+                        editor
+                            .patches_for(scope)
+                            .map(move |(agent, patch)| (scope, agent.to_owned(), patch.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (scope, agent, patch) in patches {
+                store
+                    .save(scope, &agent, &patch)
+                    .map_err(CliError::storage)?;
+            }
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .take();
+            return Ok(TuiSubmissionOutcome::LocalInfo(
+                "Subagent profiles saved.".into(),
+            ));
+        }
+        if let Some(name) = action.strip_prefix("edit:") {
+            return self.profile_model_dialog(name);
+        }
+        if let Some(name) = action.strip_prefix("model:") {
+            return self.profile_model_dialog(name);
+        }
+        if let Some(name) = action.strip_prefix("effort:") {
+            let entries = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(|effort| {
+                    DialogEntry::action(
+                        effort,
+                        format!("subagent-profiles:set-effort:{name}:{effort}"),
+                    )
+                })
+                .collect();
+            return Ok(TuiSubmissionOutcome::Dialog(DialogView::selection(
+                "Choose effort",
+                Some("Profile effort"),
+                entries,
+            )));
+        }
+        if let Some(rest) = action.strip_prefix("set-model:") {
+            let (name, model) = rest
+                .split_once(':')
+                .ok_or_else(|| CliError::usage("profile model action is invalid"))?;
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .as_mut()
+                .ok_or_else(|| CliError::usage("profile editor is unavailable"))?
+                .set_model(name, model);
+            return self.open_dialog("subagent-profiles");
+        }
+        if let Some(rest) = action.strip_prefix("set-effort:") {
+            let (name, effort) = rest
+                .split_once(':')
+                .ok_or_else(|| CliError::usage("profile effort action is invalid"))?;
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .as_mut()
+                .ok_or_else(|| CliError::usage("profile editor is unavailable"))?
+                .set_effort(name, effort);
+            return self.open_dialog("subagent-profiles");
+        }
+        if let Some(name) = action.strip_prefix("reset-model:") {
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .as_mut()
+                .ok_or_else(|| CliError::usage("profile editor is unavailable"))?
+                .reset_model(name);
+            return self.open_dialog("subagent-profiles");
+        }
+        if let Some(name) = action.strip_prefix("reset-effort:") {
+            self.profile_editor
+                .lock()
+                .map_err(|_| CliError::storage("profile editor is unavailable"))?
+                .as_mut()
+                .ok_or_else(|| CliError::usage("profile editor is unavailable"))?
+                .reset_effort(name);
+            return self.open_dialog("subagent-profiles");
+        }
+        Err(CliError::usage("profile editor action is unavailable"))
+    }
+
+    fn profile_model_dialog(&self, name: &str) -> Result<TuiSubmissionOutcome, CliError> {
+        let bootstrap = self.bootstrap()?;
+        let context = self
+            .session
+            .lock()
+            .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+        let active = resolved_provider(&bootstrap, &context);
+        drop(context);
+        let mut entries = Vec::new();
+        for provider in providers_with_active_first(active) {
+            let selector = ModelSelection::for_source(provider.default_model(), provider.source());
+            for model in selector.models().map_err(CliError::unavailable)? {
+                entries.push(DialogEntry::action(
+                    format!("{} · {}", model.id, provider.label()),
+                    format!("subagent-profiles:set-model:{name}:{}", model.id),
+                ));
+            }
+        }
+        Ok(TuiSubmissionOutcome::Dialog(DialogView::selection(
+            "Choose profile model",
+            Some("Active provider catalog"),
+            entries,
+        )))
     }
 
     pub(super) fn recover_tui_session_attempt(

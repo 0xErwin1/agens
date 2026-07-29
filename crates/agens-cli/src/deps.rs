@@ -18,10 +18,10 @@ use agens_core::HeadlessTurnCancellation;
 use crate::commands::auth::run_production_auth_login;
 use crate::commands::config::{create_configuration_file, create_global_configuration_file};
 use crate::headless::run_production_headless_chat;
+use crate::tui::run_production_tui;
 use agens_bootstrap::{Bootstrap, HostEnvironment};
 use agens_error::CliError;
 use agens_headless::HeadlessChatRequest;
-use agens_tui_app::engine::run_production_tui;
 
 const UNAVAILABLE_MESSAGE: &str = "this command is not implemented yet";
 
