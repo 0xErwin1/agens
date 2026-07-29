@@ -1275,6 +1275,89 @@ fn tui_provider_switch_reconciles_compatible_incompatible_and_busy_state_atomica
 }
 
 #[test]
+fn tui_provider_switch_to_moonshot_resets_to_kimi_k3_without_panicking() {
+    let temporary = tui_session_directory("provider-moonshot-switch");
+    let bootstrap = tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::with_credential_resolver(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        CredentialResolver::with_environment(BTreeMap::from([(
+            "MOONSHOT_API_KEY".into(),
+            "moonshot-secret".into(),
+        )])),
+    );
+
+    let reset = router.route("/provider moonshotai".into());
+    assert!(
+        matches!(reset, TuiSubmissionOutcome::ContextChanged { ref message, .. } if message.contains("Model reset to kimi-k3")),
+        "{reset:?}"
+    );
+    let idle = session.lock().unwrap().clone();
+    assert_eq!(idle.selection.as_ref().unwrap().model(), "kimi-k3");
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_provider_overlay_lists_moonshot_when_credentials_are_ready() {
+    let temporary = tui_session_directory("provider-overlay-moonshot");
+    let bootstrap = tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::with_credential_resolver(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        CredentialResolver::with_environment(BTreeMap::from([(
+            "MOONSHOT_API_KEY".into(),
+            "moonshot-secret".into(),
+        )])),
+    );
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+    let (progress, _) = std::sync::mpsc::channel();
+    tui.apply_submission_outcome(
+        router.route_request(TuiRouteRequest::OpenDialog("provider".into()), progress),
+    );
+    let overlay = render_tui_test_backend(&tui, 80, 24);
+    assert!(overlay.contains("Moonshot AI"), "{overlay:?}");
+    assert!(!overlay.contains("moonshot-secret"), "{overlay:?}");
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_turn_bootstrap_resolves_moonshot_api_key_from_environment() {
+    let temporary = tui_session_directory("turn-bootstrap-moonshot");
+    let bootstrap = tui_session_bootstrap_for_provider(&temporary, &[], "openai-api", "gpt-5.5");
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    session.lock().unwrap().provider = Some(ProviderKind::Moonshot);
+    let router = TuiRuntimeRouter::with_credential_resolver(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        CredentialResolver::with_environment(BTreeMap::from([(
+            "MOONSHOT_API_KEY".into(),
+            "moonshot-secret".into(),
+        )])),
+    );
+
+    let resolved = router.turn_bootstrap().unwrap();
+    assert_eq!(resolved.provider_type.as_deref(), Some("moonshotai"));
+    assert_eq!(resolved.openai_api_key.as_deref(), Some("moonshot-secret"));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
 fn tui_turn_bootstrap_resolves_changed_and_removed_credentials_without_stale_reuse() {
     let temporary = tui_session_directory("fresh-turn-credentials");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);

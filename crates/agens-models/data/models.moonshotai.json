@@ -1,0 +1,10 @@
+{
+  "source": "https://api.moonshot.ai/v1/models",
+  "revision": "2026-07-29",
+  "models": [
+    { "id": "kimi-k3", "context_length": 1048576, "reasoning_efforts": { "support": true, "valid_efforts": ["low", "high", "max"], "default_effort": "max" } },
+    { "id": "kimi-k2.6", "context_length": 262144 },
+    { "id": "kimi-k2.7-code", "context_length": 262144 },
+    { "id": "kimi-k2.7-code-highspeed", "context_length": 262144 }
+  ]
+}

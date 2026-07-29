@@ -227,6 +227,13 @@ impl TuiRuntimeRouter {
                 }
                 None
             }
+            ProviderKind::Moonshot => Some(
+                self.credentials
+                    .moonshot_api_key(&bootstrap.paths.credentials)
+                    .ok_or_else(|| {
+                        CliError::authentication("Moonshot API authentication is unavailable")
+                    })?,
+            ),
         };
         Ok(bootstrap)
     }

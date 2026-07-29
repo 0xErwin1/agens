@@ -21,7 +21,10 @@ mod tests {
 
         let statuses =
             ProviderKind::ALL.map(|provider| resolver.status(&credentials, provider).label());
-        assert_eq!(statuses, ["ready", "credential required"]);
+        assert_eq!(
+            statuses,
+            ["ready", "credential required", "credential required"]
+        );
         std::fs::remove_dir_all(temporary).unwrap();
     }
 }

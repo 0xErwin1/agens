@@ -388,4 +388,30 @@ mod tests {
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
+
+    #[test]
+    fn applying_a_moonshot_model_selects_kimi_k3_and_remembers_it() {
+        let temporary = tui_session_directory("moonshot-model-selection");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        let session = Arc::new(Mutex::new(SessionContext::fresh()));
+        session.lock().unwrap().provider = Some(agens_session::provider::ProviderKind::Moonshot);
+
+        apply_tui_model(&bootstrap, "kimi-k3", &session).unwrap();
+
+        let context = session.lock().unwrap();
+        let selection = context.selection.as_ref().unwrap();
+        assert_eq!(selection.model(), "kimi-k3");
+        assert_eq!(selection.source_label(), "Moonshot AI");
+        drop(context);
+
+        let remembered = PreferenceStore::open(bootstrap.data_directory())
+            .unwrap()
+            .remembered_model()
+            .unwrap()
+            .unwrap();
+        assert_eq!(remembered.model(), "kimi-k3");
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
 }

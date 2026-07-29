@@ -22,26 +22,38 @@ use agens_bootstrap::openai_api_key;
 use agens_error::CliError;
 use agens_models::ModelSource;
 
-#[repr(usize)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
     OpenAiApi,
     OpenAiChatGpt,
+    Moonshot,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 2] = [Self::OpenAiChatGpt, Self::OpenAiApi];
+    pub const ALL: [Self; 3] = [Self::OpenAiChatGpt, Self::OpenAiApi, Self::Moonshot];
 
     pub const fn identifier(self) -> &'static str {
-        ["openai-api", "openai-chatgpt"][self as usize]
+        match self {
+            Self::OpenAiApi => "openai-api",
+            Self::OpenAiChatGpt => "openai-chatgpt",
+            Self::Moonshot => "moonshotai",
+        }
     }
 
     pub const fn label(self) -> &'static str {
-        ["OpenAI API", "ChatGPT subscription"][self as usize]
+        match self {
+            Self::OpenAiApi => "OpenAI API",
+            Self::OpenAiChatGpt => "ChatGPT subscription",
+            Self::Moonshot => "Moonshot AI",
+        }
     }
 
     pub const fn source(self) -> ModelSource {
-        [ModelSource::OpenAiApi, ModelSource::ChatGptSubscription][self as usize]
+        match self {
+            Self::OpenAiApi => ModelSource::OpenAiApi,
+            Self::OpenAiChatGpt => ModelSource::ChatGptSubscription,
+            Self::Moonshot => ModelSource::MoonshotApi,
+        }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
@@ -107,6 +119,11 @@ impl CredentialResolver {
         openai_api_key(credentials.as_deref(), &(self.environment)())
     }
 
+    pub fn moonshot_api_key(&self, path: &Path) -> Option<String> {
+        let credentials = fs::read_to_string(path).ok();
+        moonshot_api_key(credentials.as_deref(), &(self.environment)())
+    }
+
     pub fn status(&self, path: &Path, provider: ProviderKind) -> CredentialStatus {
         match provider {
             ProviderKind::OpenAiChatGpt => {
@@ -123,8 +140,40 @@ impl CredentialResolver {
                     CredentialStatus::CredentialRequired
                 }
             }
+            ProviderKind::Moonshot => {
+                if self.moonshot_api_key(path).is_some() {
+                    CredentialStatus::Ready
+                } else {
+                    CredentialStatus::CredentialRequired
+                }
+            }
         }
     }
+}
+
+/// Resolves the Moonshot API key with the same env-over-stored precedence as
+/// [`openai_api_key`]: the `MOONSHOT_API_KEY` environment variable wins over a
+/// stored `moonshotai.api_key` credential entry.
+fn moonshot_api_key(
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    environment
+        .get("MOONSHOT_API_KEY")
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .or_else(|| {
+            credentials
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+                .and_then(|credentials| {
+                    credentials
+                        .get("moonshotai")?
+                        .get("api_key")?
+                        .as_str()
+                        .filter(|key| !key.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+        })
 }
 
 pub enum ChatGptCredentialSnapshot {
@@ -160,4 +209,50 @@ pub fn restore_chatgpt_credentials(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_three_provider_kinds_map_correctly() {
+        assert_eq!(ProviderKind::ALL.len(), 3);
+        assert!(ProviderKind::ALL.contains(&ProviderKind::Moonshot));
+
+        assert_eq!(ProviderKind::Moonshot.identifier(), "moonshotai");
+        assert_eq!(ProviderKind::Moonshot.label(), "Moonshot AI");
+        assert_eq!(ProviderKind::Moonshot.source(), ModelSource::MoonshotApi);
+        assert_eq!(
+            ProviderKind::parse("moonshotai"),
+            Some(ProviderKind::Moonshot)
+        );
+    }
+
+    #[test]
+    fn credential_status_reports_a_moonshot_row() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-provider-status-moonshot-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&temporary).expect("fixture directory should be created");
+        let credentials_path = temporary.join("credentials.json");
+
+        let missing = CredentialResolver::with_environment(BTreeMap::new());
+        assert!(matches!(
+            missing.status(&credentials_path, ProviderKind::Moonshot),
+            CredentialStatus::CredentialRequired
+        ));
+
+        let present = CredentialResolver::with_environment(BTreeMap::from([(
+            "MOONSHOT_API_KEY".to_owned(),
+            "sk-test-moonshot".to_owned(),
+        )]));
+        assert!(matches!(
+            present.status(&credentials_path, ProviderKind::Moonshot),
+            CredentialStatus::Ready
+        ));
+
+        std::fs::remove_dir_all(&temporary).ok();
+    }
 }

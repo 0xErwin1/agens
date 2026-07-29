@@ -246,10 +246,7 @@ pub fn persist_completed_subagent_turn(
     let mut context = session
         .lock()
         .map_err(|_| CliError::storage("TUI session is unavailable"))?;
-    let provider = context.provider.map(|provider| match provider {
-        ProviderKind::OpenAiApi => "openai-api".to_owned(),
-        ProviderKind::OpenAiChatGpt => "openai-chatgpt".to_owned(),
-    });
+    let provider = context.provider.map(persisted_provider_identifier);
     let model = context
         .selection
         .as_ref()
@@ -292,11 +289,31 @@ pub fn persist_completed_subagent_turn(
     Ok(())
 }
 
+fn persisted_provider_identifier(provider: ProviderKind) -> String {
+    provider.identifier().to_owned()
+}
+
 fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessagePart>) {
     if !parts.is_empty() {
         messages.push(Message {
             role,
             parts: std::mem::take(parts),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn moonshot_persisted_identifier_round_trips() {
+        let persisted = persisted_provider_identifier(ProviderKind::Moonshot);
+
+        assert_eq!(persisted, "moonshotai");
+        assert_eq!(
+            ProviderKind::parse(&persisted),
+            Some(ProviderKind::Moonshot)
+        );
     }
 }
