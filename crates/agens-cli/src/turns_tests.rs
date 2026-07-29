@@ -7,9 +7,9 @@ mod tests {
 
     use agens_core::{Message, MessagePart, Role, TurnEvent, TurnState, Usage};
 
-    use crate::test_support::{tui_session_bootstrap, tui_session_directory};
     use agens_session::context::{CompletedSubagentTurn, SessionContext};
     use agens_session::turns::*;
+    use agens_tui_app::test_support::{tui_session_bootstrap, tui_session_directory};
 
     #[test]
     fn completed_session_turn_ignores_usage_without_changing_output_history_order() {

@@ -5,8 +5,8 @@
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::test_support::tui_session_directory;
     use agens_session::provider::*;
+    use agens_tui_app::test_support::tui_session_directory;
 
     #[test]
     fn tui_provider_availability_uses_complete_current_credentials_without_exposing_them() {

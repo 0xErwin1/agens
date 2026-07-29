@@ -18,11 +18,11 @@ use agens_tools::{SkillCatalog, TaskLaunchMode};
 
 use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
 
-use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap, session_directory as tui_session_directory,
 };
 use agens_tool_runtime::task::*;
+use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 
 #[test]
 fn a_task_runtimes_permission_policy_is_scoped_to_its_own_root_not_the_bootstraps_process_root() {

@@ -5,7 +5,7 @@ use agens_tui::{DialogEntry, DialogView};
 #[cfg(test)]
 use agens_session::context::ActiveAgentRuntime;
 
-pub(crate) fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
+pub fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
     let mut parts = action_id.split(':');
     let (Some("session"), Some("recover"), Some(session_id), Some(attempt_id), None) = (
         parts.next(),
@@ -20,7 +20,7 @@ pub(crate) fn parse_recovery_action(action_id: &str) -> Option<AttemptKey> {
     AttemptKey::new(session_id.parse().ok()?, attempt_id.parse().ok()?).ok()
 }
 
-pub(crate) fn session_dialog_entry(
+pub fn session_dialog_entry(
     session: &StoredSession,
     current_session: Option<i64>,
     all_projects: bool,
@@ -94,7 +94,7 @@ fn session_attempt_status_label(status: agens_core::SessionAttemptStatus) -> &'s
     }
 }
 
-pub(crate) fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'static str> {
+pub fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'static str> {
     match status {
         SessionAttemptStatus::Cancelled
         | SessionAttemptStatus::Interrupted
@@ -106,7 +106,7 @@ pub(crate) fn resume_retry_notice(status: SessionAttemptStatus) -> Option<&'stat
     }
 }
 
-pub(crate) fn recovery_confirmation_dialog(
+pub fn recovery_confirmation_dialog(
     metadata: &SessionMetadata,
     attempt: &agens_core::SessionAttemptSummary,
     refusal: Option<&str>,
@@ -154,7 +154,7 @@ fn compact_session_root(root: &str) -> String {
     )
 }
 
-pub(crate) fn session_relative_age(updated_at: i64, now: i64) -> String {
+pub fn session_relative_age(updated_at: i64, now: i64) -> String {
     let age = now.saturating_sub(updated_at);
     match age {
         ..=0 => "now".into(),

@@ -19,11 +19,11 @@ mod tests {
         ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     };
 
-    use crate::test_support::{
+    use agens_permissions::*;
+    use agens_tui_app::test_support::{
         ProductionBatchInput, batch_call, native_batch_call, run_production_batch,
         run_production_batch_with_policy,
     };
-    use agens_permissions::*;
 
     #[test]
     fn native_permission_target_projects_each_registered_tool_to_its_canonical_field() {

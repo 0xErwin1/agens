@@ -23,13 +23,13 @@ use agens_tool_runtime::{
 };
 use agens_tools::{TaskExecutionRegistry, TaskLaunchMode, TaskMessageSource, TaskMessageTarget};
 
-use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap, session_directory as tui_session_directory,
 };
 use agens_session::context::current_session_timestamp;
 use agens_tool_runtime::child::*;
 use agens_tool_runtime::task::production_tui_task_runtime_with_runner;
+use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 
 struct RecordingMailboxProvider {
     queued: Arc<Mutex<Vec<Vec<Message>>>>,
@@ -219,7 +219,7 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
         launch_selected_tui_task(&mut runtime, &session, "review task", true, &cancellation),
         Ok(TuiSelectedTaskLaunch::Dispatched)
     );
-    crate::test_support::wait_for(
+    agens_tui_app::test_support::wait_for(
         "a completed background subagent to persist one durable turn",
         || session.lock().unwrap().identifier,
     );
@@ -235,7 +235,7 @@ fn p1c3_completed_background_subagent_notifies_the_next_main_turn() {
     // The notice is posted after the turn is persisted, so the identifier the
     // launch waits on is set strictly earlier. Drain until the notice lands
     // rather than assuming one drain is enough.
-    crate::test_support::wait_for("the completed subagent's mailbox notice", || {
+    agens_tui_app::test_support::wait_for("the completed subagent's mailbox notice", || {
         block_on_headless_turn(provider.next_parts(&[], &cancellation))
             .unwrap()
             .unwrap();

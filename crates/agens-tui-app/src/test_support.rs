@@ -1,7 +1,11 @@
-//! Fixture helpers shared by more than one module's test suite, so a consumer
-//! reaches a named function instead of duplicating setup. The surface-free ones
-//! come from `agens-fixtures`; what stays here is what drives a terminal.
-#![cfg(test)]
+//! Fixture helpers shared by more than one test suite, so a consumer reaches a
+//! named function instead of duplicating setup.
+//!
+//! These build on the terminal application, so they live here rather than in
+//! `agens-fixtures`, which stays surface-free. The binary's tests reach them
+//! through the `test-support` feature: `cfg(test)` does not cross a crate
+//! boundary, so a feature is the only way to offer a module to a consumer's
+//! tests without compiling it into a production build.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -21,9 +25,9 @@ use agens_tui::{
     TuiRuntimeEvent,
 };
 
-use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
-use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
-use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
+use crate::engine::{ProductionTuiEngine, run_tui_prompt_with};
+use crate::metrics::{TuiMetricsPublisher, finish_tui_metrics};
+use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use agens_bootstrap::Bootstrap;
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::CliError;
@@ -33,7 +37,7 @@ use agens_permissions::{
     ProductionPermissionResolver, ProductionPromptAuthorization,
 };
 
-pub(crate) use agens_fixtures::{
+pub use agens_fixtures::{
     bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
     session_bootstrap as tui_session_bootstrap,
     session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
@@ -44,10 +48,10 @@ pub(crate) use agens_fixtures::{
 /// be told, per call, to inject a permission-evaluator failure or a
 /// tool-execution failure. Backs the production-turn permission-batch
 /// harness below.
-pub(crate) struct BatchTool {
-    pub(crate) name: String,
-    pub(crate) calls: Arc<Mutex<Vec<String>>>,
-    pub(crate) cancellation: Option<HeadlessTurnCancellation>,
+pub struct BatchTool {
+    pub name: String,
+    pub calls: Arc<Mutex<Vec<String>>>,
+    pub cancellation: Option<HeadlessTurnCancellation>,
 }
 
 impl DispatchTool for BatchTool {
@@ -128,9 +132,9 @@ impl CompletedTurnRepository for BatchRepository {
     }
 }
 
-pub(crate) struct RecordingPrompt {
-    pub(crate) answers: Vec<PermissionPromptAnswer>,
-    pub(crate) calls: Arc<Mutex<Vec<String>>>,
+pub struct RecordingPrompt {
+    pub answers: Vec<PermissionPromptAnswer>,
+    pub calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl PermissionPrompter for RecordingPrompt {
@@ -147,7 +151,7 @@ impl PermissionPrompter for RecordingPrompt {
     }
 }
 
-pub(crate) fn batch_call(id: &str, path: &str) -> MessagePart {
+pub fn batch_call(id: &str, path: &str) -> MessagePart {
     MessagePart::ToolCall {
         id: id.into(),
         name: "native::read".into(),
@@ -155,7 +159,7 @@ pub(crate) fn batch_call(id: &str, path: &str) -> MessagePart {
     }
 }
 
-pub(crate) fn native_batch_call(id: &str, name: &str, arguments: serde_json::Value) -> MessagePart {
+pub fn native_batch_call(id: &str, name: &str, arguments: serde_json::Value) -> MessagePart {
     MessagePart::ToolCall {
         id: id.into(),
         name: name.into(),
@@ -179,15 +183,15 @@ fn batch_policy() -> PermissionPolicy {
 /// TUI metrics envelope it produced. Shared by the permission-gate,
 /// dispatcher, and TUI-metrics test clusters that all drive the same
 /// production headless-turn wiring end to end.
-pub(crate) struct BatchOutcome {
-    pub(crate) result: Result<CompletedTurnSnapshot, HeadlessTurnError>,
-    pub(crate) prompts: Vec<String>,
-    pub(crate) executions: Vec<String>,
-    pub(crate) progress: Vec<TurnEvent>,
-    pub(crate) metrics: Vec<TuiRuntimeEvent>,
+pub struct BatchOutcome {
+    pub result: Result<CompletedTurnSnapshot, HeadlessTurnError>,
+    pub prompts: Vec<String>,
+    pub executions: Vec<String>,
+    pub progress: Vec<TurnEvent>,
+    pub metrics: Vec<TuiRuntimeEvent>,
 }
 
-pub(crate) struct ProductionBatchInput<'a> {
+pub struct ProductionBatchInput<'a> {
     directory_name: &'a str,
     answers: Vec<PermissionPromptAnswer>,
     calls: Vec<MessagePart>,
@@ -200,7 +204,7 @@ pub(crate) struct ProductionBatchInput<'a> {
 }
 
 impl<'a> ProductionBatchInput<'a> {
-    pub(crate) fn new(
+    pub fn new(
         directory_name: &'a str,
         answers: Vec<PermissionPromptAnswer>,
         calls: Vec<MessagePart>,
@@ -218,7 +222,7 @@ impl<'a> ProductionBatchInput<'a> {
         }
     }
 
-    pub(crate) fn with_runtime(
+    pub fn with_runtime(
         mut self,
         cancellation: Option<HeadlessTurnCancellation>,
         provider_error: Option<HeadlessTurnPortError>,
@@ -230,17 +234,17 @@ impl<'a> ProductionBatchInput<'a> {
         self
     }
 
-    pub(crate) fn with_policy(mut self, policy: PermissionPolicy) -> Self {
+    pub fn with_policy(mut self, policy: PermissionPolicy) -> Self {
         self.policy = policy;
         self
     }
 
-    pub(crate) fn with_bypass(mut self) -> Self {
+    pub fn with_bypass(mut self) -> Self {
         self.bypass = true;
         self
     }
 
-    pub(crate) fn with_dangerous_override(mut self) -> Self {
+    pub fn with_dangerous_override(mut self) -> Self {
         self.dangerous_override = true;
         self
     }
@@ -261,7 +265,7 @@ fn run_ready<T>(
 /// Drives one production headless turn through the real permission gate,
 /// resolver, and tool dispatcher wiring, using the given directory name to
 /// isolate the grant store, and returns everything the batch produced.
-pub(crate) fn run_production_batch(
+pub fn run_production_batch(
     directory_name: &str,
     answers: Vec<PermissionPromptAnswer>,
     calls: Vec<MessagePart>,
@@ -278,7 +282,7 @@ pub(crate) fn run_production_batch(
     )
 }
 
-pub(crate) fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) -> BatchOutcome {
+pub fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) -> BatchOutcome {
     let ProductionBatchInput {
         directory_name,
         answers,
@@ -410,11 +414,7 @@ pub(crate) fn run_production_batch_with_policy(input: ProductionBatchInput<'_>) 
     }
 }
 
-pub(crate) fn render_tui_test_backend(
-    tui: &Tui<ProductionTuiEngine>,
-    width: u16,
-    height: u16,
-) -> String {
+pub fn render_tui_test_backend(tui: &Tui<ProductionTuiEngine>, width: u16, height: u16) -> String {
     let terminal =
         ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
     let mut renderer = agens_tui::RatatuiRenderer::new(terminal);
@@ -429,7 +429,7 @@ pub(crate) fn render_tui_test_backend(
         .collect()
 }
 
-pub(crate) struct RotationTool;
+pub struct RotationTool;
 
 impl DispatchTool for RotationTool {
     fn execute(
@@ -441,7 +441,7 @@ impl DispatchTool for RotationTool {
     }
 }
 
-pub(crate) fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) -> AgentDefinition {
+pub fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) -> AgentDefinition {
     AgentDefinition {
         name: name.into(),
         description: format!("{name} agent"),
@@ -462,7 +462,7 @@ pub(crate) fn rotation_agent(name: &str, model: Option<&str>, allow_read: bool) 
     }
 }
 
-pub(crate) fn rotation_dispatcher() -> ToolDispatcher {
+pub fn rotation_dispatcher() -> ToolDispatcher {
     let mut dispatcher = ToolDispatcher::new();
     dispatcher
         .register_native("native::read", ToolAccess::ReadOnly, RotationTool)
@@ -470,7 +470,7 @@ pub(crate) fn rotation_dispatcher() -> ToolDispatcher {
     dispatcher
 }
 
-pub(crate) fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> String {
+pub fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -> String {
     for character in input.chars() {
         tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
     }
@@ -481,11 +481,11 @@ pub(crate) fn enter_tui_input(tui: &mut Tui<ProductionTuiEngine>, input: &str) -
     input
 }
 
-pub(crate) fn tui_project(temporary: &Path) -> String {
+pub fn tui_project(temporary: &Path) -> String {
     temporary.join("project").display().to_string()
 }
 
-pub(crate) fn tui_session_messages() -> Vec<Message> {
+pub fn tui_session_messages() -> Vec<Message> {
     vec![
         Message {
             role: Role::User,
@@ -514,7 +514,7 @@ pub(crate) fn tui_session_messages() -> Vec<Message> {
     ]
 }
 
-pub(crate) fn persist_tui_session(
+pub fn persist_tui_session(
     store: &mut SessionStore,
     project: &str,
     title: &str,
@@ -547,7 +547,7 @@ pub(crate) fn persist_tui_session(
         .unwrap()
 }
 
-pub(crate) fn persist_tui_session_metadata(
+pub fn persist_tui_session_metadata(
     store: &mut SessionStore,
     project: &str,
     title: &str,
@@ -561,7 +561,7 @@ pub(crate) fn persist_tui_session_metadata(
     metadata
 }
 
-pub(crate) fn open_tui_palette_dialog(
+pub fn open_tui_palette_dialog(
     tui: &mut Tui<ProductionTuiEngine>,
     router: &TuiRuntimeRouter,
     prefix: &str,
@@ -579,7 +579,7 @@ pub(crate) fn open_tui_palette_dialog(
     assert!(tui.apply_submission_outcome(outcome).is_none());
 }
 
-pub(crate) fn dispatch_tui_dialog_selection(
+pub fn dispatch_tui_dialog_selection(
     tui: &mut Tui<ProductionTuiEngine>,
     router: &TuiRuntimeRouter,
     progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -591,7 +591,7 @@ pub(crate) fn dispatch_tui_dialog_selection(
     assert!(tui.apply_submission_outcome(outcome).is_none());
 }
 
-pub(crate) fn submit_tui_command(
+pub fn submit_tui_command(
     tui: &mut Tui<ProductionTuiEngine>,
     router: &TuiRuntimeRouter,
     bootstrap: &Bootstrap,

@@ -24,23 +24,21 @@ use agens_tui::{
     TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
 };
 
-use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
-use crate::tui::extensions::{
+use crate::dialogs::{diagnostics_dialog, mcp_status_dialog};
+use crate::extensions::{
     RESERVED_TUI_COMMANDS, discover_tui_command_catalog, render_tui_help, resolved_tui_palette,
 };
-use crate::tui::files::{selected_tui_file, tui_picker_file_candidates, tui_select_candidates};
-use crate::tui::models::{
+use crate::files::{selected_tui_file, tui_picker_file_candidates, tui_select_candidates};
+use crate::models::{
     apply_tui_effort, apply_tui_model, apply_tui_selection, apply_tui_unverified_model,
     format_model_metadata, select_tui_effort, select_tui_model,
 };
-use crate::tui::resume::{
+use crate::resume::{
     ResumedTuiSession, commit_tui_session_resume, load_tui_session_for_resume,
     prepare_loaded_tui_session_resume, resume_tui_session, tui_project_identifier,
 };
-use crate::tui::session::{
-    parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry,
-};
-use crate::tui::turn::tui_session_presentation;
+use crate::session::{parse_recovery_action, recovery_confirmation_dialog, session_dialog_entry};
+use crate::turn::tui_session_presentation;
 use agens_agents::{
     agent_catalog_for_context, persist_pending_agent_correction, select_subagent, subagent_catalog,
 };
@@ -60,12 +58,12 @@ use agens_session::provider::{
 use agens_tool_runtime::mcp::load_configured_mcp_registry;
 use agens_tool_runtime::rotation::rotate_agent;
 
-pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
+pub const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
 #[derive(Clone)]
-pub(crate) struct TuiRuntimeRouter {
+pub struct TuiRuntimeRouter {
     bootstrap: Arc<Mutex<Bootstrap>>,
-    pub(crate) session: Arc<Mutex<SessionContext>>,
+    pub session: Arc<Mutex<SessionContext>>,
     cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
     auth: ChatGptAuthCoordinator,
     credentials: CredentialResolver,
@@ -73,7 +71,7 @@ pub(crate) struct TuiRuntimeRouter {
     /// post-startup resume can swap all three atomically to the resumed session's own root
     /// instead of leaving them pinned to whatever root the router was constructed with.
     extensions: Arc<Mutex<RouterExtensions>>,
-    pub(crate) mcp_status: McpStatusHandle,
+    pub mcp_status: McpStatusHandle,
     _mcp_registry: Arc<Mutex<McpRegistry>>,
     clock: fn() -> i64,
     credential_restorer: Arc<CredentialRestorer>,
@@ -89,7 +87,7 @@ type CredentialRestorer =
     dyn Fn(&Path, ChatGptCredentialSnapshot) -> Result<(), CliError> + Send + Sync;
 
 impl TuiRuntimeRouter {
-    pub(crate) fn new(
+    pub fn new(
         bootstrap: Bootstrap,
         session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -106,7 +104,7 @@ impl TuiRuntimeRouter {
         )
     }
 
-    pub(crate) fn with_auth_coordinator(
+    pub fn with_auth_coordinator(
         mut bootstrap: Bootstrap,
         session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -146,8 +144,8 @@ impl TuiRuntimeRouter {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_credential_restorer(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_credential_restorer(
         mut self,
         restore: impl Fn(&Path, ChatGptCredentialSnapshot) -> Result<(), CliError>
         + Send
@@ -158,8 +156,8 @@ impl TuiRuntimeRouter {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_credential_resolver(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_credential_resolver(
         bootstrap: Bootstrap,
         session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -172,8 +170,8 @@ impl TuiRuntimeRouter {
         router
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_clock(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(
         bootstrap: Bootstrap,
         session: Arc<Mutex<SessionContext>>,
         cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,
@@ -186,14 +184,14 @@ impl TuiRuntimeRouter {
         router
     }
 
-    #[cfg(test)]
-    pub(crate) fn route(&self, input: String) -> TuiSubmissionOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route(&self, input: String) -> TuiSubmissionOutcome {
         let (progress, _) = std::sync::mpsc::channel();
         self.route_with_progress(input, progress)
     }
 
-    #[cfg(test)]
-    pub(crate) fn route_with_progress(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_with_progress(
         &self,
         input: String,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -222,8 +220,8 @@ impl TuiRuntimeRouter {
             })
     }
 
-    #[cfg(test)]
-    pub(crate) fn route_request(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_request(
         &self,
         request: TuiRouteRequest,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -231,7 +229,7 @@ impl TuiRuntimeRouter {
         self.route_request_with_cancellation(request, progress, TuiRouteCancellation::new())
     }
 
-    pub(crate) fn route_request_with_cancellation(
+    pub fn route_request_with_cancellation(
         &self,
         request: TuiRouteRequest,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -259,7 +257,7 @@ impl TuiRuntimeRouter {
         })
     }
 
-    pub(crate) fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
+    pub fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
         let dialog = match route_id {
             "dangerous" => return self.toggle_dangerous_mode(),
@@ -539,8 +537,8 @@ impl TuiRuntimeRouter {
         Ok(DialogView::sessions_page(entries, request, next_cursor))
     }
 
-    #[cfg(test)]
-    pub(crate) fn route_dialog_action(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn route_dialog_action(
         &self,
         action_id: &str,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -717,7 +715,7 @@ impl TuiRuntimeRouter {
         })
     }
 
-    pub(crate) fn skills(&self) -> Result<Arc<SkillCatalog>, CliError> {
+    pub fn skills(&self) -> Result<Arc<SkillCatalog>, CliError> {
         self.extensions
             .lock()
             .map(|extensions| Arc::clone(&extensions.skills))
@@ -731,7 +729,7 @@ impl TuiRuntimeRouter {
             .map_err(|_| CliError::storage("TUI extension catalogs are unavailable"))
     }
 
-    pub(crate) fn palette_entries(&self) -> Result<Vec<PaletteEntry>, CliError> {
+    pub fn palette_entries(&self) -> Result<Vec<PaletteEntry>, CliError> {
         self.extensions
             .lock()
             .map(|extensions| extensions.palette.clone())
@@ -787,8 +785,8 @@ impl TuiRuntimeRouter {
         (file_candidates, palette_entries)
     }
 
-    #[cfg(test)]
-    pub(crate) fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resolve(&self, input: String) -> Result<TuiSubmissionOutcome, CliError> {
         self.resolve_with_cancellation(input, &TuiRouteCancellation::new())
     }
 
@@ -924,7 +922,7 @@ impl TuiRuntimeRouter {
         Ok(outcome)
     }
 
-    pub(crate) fn presentation(&self) -> Result<TuiPresentation, CliError> {
+    pub fn presentation(&self) -> Result<TuiPresentation, CliError> {
         let bootstrap = self.bootstrap()?;
         let session = self
             .session
@@ -949,14 +947,14 @@ impl TuiRuntimeRouter {
         })
     }
 
-    pub(crate) fn bootstrap(&self) -> Result<Bootstrap, CliError> {
+    pub fn bootstrap(&self) -> Result<Bootstrap, CliError> {
         self.bootstrap
             .lock()
             .map(|bootstrap| bootstrap.clone())
             .map_err(|_| CliError::storage("TUI provider state is unavailable"))
     }
 
-    pub(crate) fn turn_bootstrap(&self) -> Result<Bootstrap, CliError> {
+    pub fn turn_bootstrap(&self) -> Result<Bootstrap, CliError> {
         let mut bootstrap = self.bootstrap()?;
         let context = self
             .session
@@ -999,7 +997,7 @@ impl TuiRuntimeRouter {
         Ok(bootstrap)
     }
 
-    pub(crate) fn task_parent_request_config(&self) -> Result<agens_core::RequestConfig, CliError> {
+    pub fn task_parent_request_config(&self) -> Result<agens_core::RequestConfig, CliError> {
         self.session
             .lock()
             .map_err(|_| CliError::storage("TUI session is unavailable"))
@@ -1012,7 +1010,7 @@ impl TuiRuntimeRouter {
             })
     }
 
-    pub(crate) fn connect(
+    pub fn connect(
         &self,
         flow: ChatGptAuthFlow,
         progress: std::sync::mpsc::Sender<TuiRouteProgress>,
@@ -1075,7 +1073,7 @@ impl TuiRuntimeRouter {
         Ok("Connected to ChatGPT.".into())
     }
 
-    pub(crate) fn disconnect(&self) -> Result<String, AuthRouteError> {
+    pub fn disconnect(&self) -> Result<String, AuthRouteError> {
         let path = self
             .bootstrap()
             .map_err(AuthRouteError::Runtime)?
@@ -1194,12 +1192,12 @@ impl TuiRuntimeRouter {
     }
 }
 
-pub(crate) enum AuthRouteError {
+pub enum AuthRouteError {
     Auth(agens_auth::ChatGptAuthError),
     Runtime(CliError),
 }
 
-pub(crate) fn auth_route_outcome(result: Result<String, AuthRouteError>) -> TuiSubmissionOutcome {
+pub fn auth_route_outcome(result: Result<String, AuthRouteError>) -> TuiSubmissionOutcome {
     match result {
         Ok(message) => TuiSubmissionOutcome::LocalInfo(message),
         Err(AuthRouteError::Auth(error)) => TuiSubmissionOutcome::LocalActionableError {
@@ -1213,7 +1211,7 @@ pub(crate) fn auth_route_outcome(result: Result<String, AuthRouteError>) -> TuiS
     }
 }
 
-pub(crate) fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
+pub fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
     match result {
         Ok(output) => TuiProviderOutcome::Completed(output),
         Err(error) if error.category == "cancelled" => TuiProviderOutcome::Cancelled {
@@ -1250,6 +1248,8 @@ mod tests {
     use agens_tui::{Action, Event, Key, Tui};
 
     use super::*;
+    use crate::engine::{ProductionTuiEngine, run_tui_prompt_with};
+    use crate::extensions::{start_tui_commands, start_tui_skills};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1257,8 +1257,6 @@ mod tests {
         run_production_batch, submit_tui_command, tui_project, tui_session_bootstrap,
         tui_session_bootstrap_for_provider, tui_session_directory, tui_session_messages,
     };
-    use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
-    use crate::tui::extensions::{start_tui_commands, start_tui_skills};
     use agens_agents::ensure_active_agent_runtime;
     use agens_headless::HeadlessChatCompletion;
     use agens_models::ModelSource;

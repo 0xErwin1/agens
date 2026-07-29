@@ -7,7 +7,7 @@ use agens_tui::{DialogEntry, DialogView};
 
 use agens_diagnostics::DIAGNOSTIC_FILE_LIMIT_BYTES;
 
-pub(crate) fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
+pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
     let entries = snapshot
         .servers()
         .iter()
@@ -38,7 +38,7 @@ pub(crate) fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
         .with_empty_message("No MCP servers configured.")
 }
 
-pub(crate) fn diagnostics_dialog(data_directory: &Path) -> DialogView {
+pub fn diagnostics_dialog(data_directory: &Path) -> DialogView {
     let directory = data_directory.join("diagnostics");
     let safe_directory =
         fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir());
@@ -196,11 +196,11 @@ mod tests {
     use agens_tui::Tui;
 
     use super::*;
+    use crate::engine::ProductionTuiEngine;
+    use crate::router::TuiRuntimeRouter;
     use crate::test_support::{
         render_tui_test_backend, tui_session_bootstrap, tui_session_directory,
     };
-    use crate::tui::engine::ProductionTuiEngine;
-    use crate::tui::router::TuiRuntimeRouter;
     use agens_session::context::SessionContext;
 
     #[test]

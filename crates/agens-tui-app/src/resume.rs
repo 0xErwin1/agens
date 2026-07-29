@@ -13,8 +13,8 @@ use agens_tui::{
     Conversation, PaletteEntry, TuiRouteCancellation, TuiRuntimeEvent, TuiSubmissionOutcome,
 };
 
-use crate::tui::session::resume_retry_notice;
-use crate::tui::turn::tui_session_presentation;
+use crate::session::resume_retry_notice;
+use crate::turn::tui_session_presentation;
 use agens_agents::{persist_pending_agent_correction, reconcile_persisted_active_agent};
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
@@ -24,8 +24,8 @@ use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::{CredentialResolver, ProviderKind};
 use agens_session::turns::sanitize_subagent_summary;
 
-#[cfg(test)]
-pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliError> {
     let project = tui_project_identifier(bootstrap)?;
     let store = SessionStore::open(bootstrap.data_directory())
         .map_err(|_| CliError::storage("sessions database is unavailable"))?;
@@ -47,10 +47,10 @@ pub(crate) fn list_tui_sessions(bootstrap: &Bootstrap) -> Result<String, CliErro
         .join("\n"))
 }
 
-pub(crate) struct LoadedTuiSessionResume {
-    pub(crate) session: StoredSession,
-    pub(crate) retry_boundary: Option<RetryBoundary>,
-    pub(crate) confinement_root: std::path::PathBuf,
+pub struct LoadedTuiSessionResume {
+    pub session: StoredSession,
+    pub retry_boundary: Option<RetryBoundary>,
+    pub confinement_root: std::path::PathBuf,
 }
 
 impl std::ops::Deref for LoadedTuiSessionResume {
@@ -65,12 +65,12 @@ impl std::ops::Deref for LoadedTuiSessionResume {
 /// The history is a handoff, not session state: it is derived from the session's
 /// own messages and consumed once, so it stays out of [`SessionContext`].
 #[derive(Clone, Debug)]
-pub(crate) struct ResumedTuiSession {
-    pub(crate) context: SessionContext,
-    pub(crate) history: Vec<Conversation>,
+pub struct ResumedTuiSession {
+    pub context: SessionContext,
+    pub history: Vec<Conversation>,
 }
 
-pub(crate) fn resume_tui_session(
+pub fn resume_tui_session(
     bootstrap: &Bootstrap,
     identifier: i64,
     _skills: &SkillCatalog,
@@ -80,7 +80,7 @@ pub(crate) fn resume_tui_session(
     prepare_loaded_tui_session_resume(bootstrap, identifier, session, credentials)
 }
 
-pub(crate) fn load_tui_session_for_resume(
+pub fn load_tui_session_for_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
 ) -> Result<LoadedTuiSessionResume, CliError> {
@@ -121,7 +121,7 @@ pub(crate) fn load_tui_session_for_resume(
     })
 }
 
-pub(crate) fn prepare_loaded_tui_session_resume(
+pub fn prepare_loaded_tui_session_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
     loaded: LoadedTuiSessionResume,
@@ -206,7 +206,7 @@ pub(crate) fn prepare_loaded_tui_session_resume(
 /// candidate list, the rendered composer palette): this function only owns the session slot
 /// itself, so it cannot refresh those on the caller's behalf. It returns the picker candidates and
 /// palette entries to attach to the outcome.
-pub(crate) fn commit_tui_session_resume(
+pub fn commit_tui_session_resume(
     bootstrap: &Bootstrap,
     session: &Arc<Mutex<SessionContext>>,
     expected: &SessionContext,
@@ -253,7 +253,7 @@ pub(crate) fn commit_tui_session_resume(
 
 const MAX_RESTORED_SUBAGENT_TOOL_USES: usize = 256;
 
-pub(crate) fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
+pub fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEvent> {
     let mut restored = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -331,7 +331,7 @@ pub(crate) fn resumed_subagent_cards(messages: &[Message]) -> Vec<TuiRuntimeEven
 /// Identifies the process's own current project, used to filter the session picker to sessions
 /// belonging to it. This is a listing/grouping concern distinct from a session's own confinement
 /// root, so it is one of the few sites allowed to read the process-wide discovered root.
-pub(crate) fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
+pub fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError> {
     agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
         .map(|root| root.path().display().to_string())
         .ok_or_else(|| CliError::configuration("TUI sessions require a project root"))
@@ -348,7 +348,8 @@ mod tests {
     use rusqlite::Connection;
 
     use super::*;
-    use crate::commands::chat::{chat_args_with_prompt, chat_request};
+    use crate::engine::ProductionTuiEngine;
+    use crate::models::apply_tui_model;
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
@@ -356,8 +357,6 @@ mod tests {
         tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
         tui_session_messages,
     };
-    use crate::tui::engine::ProductionTuiEngine;
-    use crate::tui::models::apply_tui_model;
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
     use agens_session::attempt::attempt_failure_status;
@@ -854,64 +853,6 @@ mod tests {
     }
 
     #[test]
-    fn resumed_primary_inherits_every_effective_pinned_model_and_compatible_effort() {
-        for provider in ["openai-api", "openai-chatgpt"] {
-            for model in [
-                "gpt-5.5",
-                "gpt-5.6",
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-            ] {
-                let temporary =
-                    tui_session_directory(&format!("resume-primary-{provider}-{model}"));
-                let bootstrap =
-                    tui_session_bootstrap_for_provider(&temporary, &[], provider, model);
-                let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
-                let mut metadata =
-                    persist_tui_session(&mut store, &tui_project(&temporary), "inherited");
-                metadata.provider_id = Some(provider.into());
-                metadata.model_id = Some(model.into());
-                metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
-                store.update_session_selection(&metadata).unwrap();
-                drop(store);
-
-                let resumed = resume_tui_session(
-                    &bootstrap,
-                    metadata.id,
-                    &SkillCatalog::default(),
-                    &CredentialResolver::production(),
-                )
-                .unwrap()
-                .context;
-                assert!(resumed.active_agent.is_none());
-                let session = Arc::new(Mutex::new(resumed));
-                let dispatcher = Arc::new(Mutex::new(rotation_dispatcher()));
-
-                ensure_active_agent_runtime(&bootstrap, &session, &dispatcher).unwrap();
-
-                let context = session.lock().unwrap();
-                let active = context.active_agent.as_ref().unwrap();
-                assert_eq!(active.name, "primary", "{provider} {model}");
-                assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
-                let request = agens_headless::apply_session_to_request(
-                    &context,
-                    chat_request(chat_args_with_prompt("first submission")).unwrap(),
-                );
-                assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
-                assert_eq!(
-                    request.request_config.reasoning_effort(),
-                    Some(agens_core::ReasoningEffort::High),
-                    "{provider} {model}"
-                );
-                drop(context);
-
-                std::fs::remove_dir_all(temporary).unwrap();
-            }
-        }
-    }
-
-    #[test]
     fn model_switch_invalidates_and_rematerializes_inherited_primary_without_stale_model() {
         let temporary = tui_session_directory("active-agent-model-switch");
         let bootstrap =
@@ -1120,86 +1061,6 @@ mod tests {
             assert!(diagnostics.contains(r#""event":"agent_unavailable""#));
             assert!(!diagnostics.contains(definition));
 
-            std::fs::remove_dir_all(temporary).unwrap();
-        }
-    }
-
-    #[test]
-    fn explicit_agent_models_use_the_provider_aware_effective_registry() {
-        for (provider, model, expected_effort) in [
-            ("openai-api", "gpt-4o", None),
-            ("openai-chatgpt", "gpt-5.4", None),
-            ("openai-api", "gpt-5.6-luna", None),
-            ("openai-chatgpt", "gpt-5.6-luna", None),
-            (
-                "openai-api",
-                "gpt-5.5",
-                Some(agens_core::ReasoningEffort::High),
-            ),
-            (
-                "openai-chatgpt",
-                "gpt-5.5",
-                Some(agens_core::ReasoningEffort::High),
-            ),
-        ] {
-            let temporary = tui_session_directory(&format!("explicit-{provider}-{model}"));
-            let definition = format!(
-                "---\nname: reviewer\ndescription: reviewer\nmode: primary\nmodel: {model}\npermissions: []\n---\nReview.\n"
-            );
-            let bootstrap = tui_session_bootstrap_for_provider(
-                &temporary,
-                &[("reviewer", &definition)],
-                provider,
-                "gpt-5.5",
-            );
-            let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
-            let mut metadata = persist_tui_session_metadata(
-                &mut store,
-                &tui_project(&temporary),
-                "explicit",
-                "reviewer",
-                100,
-            );
-            metadata.provider_id = Some(provider.into());
-            metadata.model_id = Some("gpt-5.5".into());
-            metadata.reasoning_effort = Some(agens_core::ReasoningEffort::High);
-            store.update_session_selection(&metadata).unwrap();
-            drop(store);
-            let resumed = resume_tui_session(
-                &bootstrap,
-                metadata.id,
-                &SkillCatalog::default(),
-                &CredentialResolver::production(),
-            )
-            .unwrap()
-            .context;
-            let session = Arc::new(Mutex::new(resumed));
-
-            ensure_active_agent_runtime(
-                &bootstrap,
-                &session,
-                &Arc::new(Mutex::new(rotation_dispatcher())),
-            )
-            .unwrap();
-
-            let context = session.lock().unwrap();
-            assert_eq!(context.active_agent.as_ref().unwrap().name, "reviewer");
-            assert_eq!(
-                context.active_agent.as_ref().unwrap().model.as_deref(),
-                Some(model),
-                "{provider} {model}"
-            );
-            let request = agens_headless::apply_session_to_request(
-                &context,
-                chat_request(chat_args_with_prompt("review")).unwrap(),
-            );
-            assert_eq!(request.model.as_deref(), Some(model), "{provider} {model}");
-            assert_eq!(
-                request.request_config.reasoning_effort(),
-                expected_effort,
-                "{provider} {model}"
-            );
-            drop(context);
             std::fs::remove_dir_all(temporary).unwrap();
         }
     }

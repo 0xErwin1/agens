@@ -16,7 +16,7 @@ use agens_session::context::SessionContext;
 use agens_session::model::current_provider;
 use agens_session::provider::ProviderKind;
 
-pub(crate) fn apply_tui_selection(
+pub fn apply_tui_selection(
     bootstrap: &Bootstrap,
     context: &mut SessionContext,
     provider: ProviderKind,
@@ -52,7 +52,7 @@ pub(crate) fn apply_tui_selection(
 /// silently overrides it. Returns the notice the user must see when a remembered selection cannot
 /// be honored, because falling back to a different model without saying so is indistinguishable
 /// from the preference being ignored.
-pub(crate) fn seed_remembered_tui_selection(
+pub fn seed_remembered_tui_selection(
     bootstrap: &Bootstrap,
     context: &mut SessionContext,
 ) -> Option<String> {
@@ -91,7 +91,7 @@ pub(crate) fn seed_remembered_tui_selection(
     notice
 }
 
-pub(crate) fn format_model_metadata(model: &agens_models::ModelMetadata) -> String {
+pub fn format_model_metadata(model: &agens_models::ModelMetadata) -> String {
     let context = model
         .context
         .map(format_token_count)
@@ -108,7 +108,7 @@ pub(crate) fn format_model_metadata(model: &agens_models::ModelMetadata) -> Stri
     format!("{context} context | {output} output | {reasoning}")
 }
 
-pub(crate) fn format_token_count(tokens: u64) -> String {
+pub fn format_token_count(tokens: u64) -> String {
     if tokens.is_multiple_of(1_000) {
         format!("{}K", tokens / 1_000)
     } else {
@@ -116,7 +116,7 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
     }
 }
 
-pub(crate) fn select_tui_model(
+pub fn select_tui_model(
     bootstrap: &Bootstrap,
     command: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -143,7 +143,7 @@ pub(crate) fn select_tui_model(
     apply_tui_model(bootstrap, model, session)
 }
 
-pub(crate) fn apply_tui_model(
+pub fn apply_tui_model(
     bootstrap: &Bootstrap,
     model: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -173,7 +173,7 @@ pub(crate) fn apply_tui_model(
     ))
 }
 
-pub(crate) fn apply_tui_unverified_model(
+pub fn apply_tui_unverified_model(
     bootstrap: &Bootstrap,
     model: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -200,7 +200,7 @@ pub(crate) fn apply_tui_unverified_model(
     })
 }
 
-pub(crate) fn select_tui_effort(
+pub fn select_tui_effort(
     bootstrap: &Bootstrap,
     command: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -222,7 +222,7 @@ pub(crate) fn select_tui_effort(
     apply_tui_effort(bootstrap, effort, session)
 }
 
-pub(crate) fn apply_tui_effort(
+pub fn apply_tui_effort(
     bootstrap: &Bootstrap,
     effort: &str,
     session: &Arc<Mutex<SessionContext>>,
@@ -254,7 +254,6 @@ pub(crate) fn apply_tui_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
 
     fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
@@ -262,40 +261,6 @@ mod tests {
             .unwrap()
             .remember_model(&ModelPreference::new(model, effort))
             .unwrap();
-    }
-
-    #[test]
-    fn a_new_session_inherits_the_remembered_model_and_its_effort() {
-        let temporary = tui_session_directory("remembered-selection-fresh");
-        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
-        bootstrap.model = None;
-        remember(
-            &bootstrap,
-            "gpt-5.5",
-            Some(agens_core::ReasoningEffort::High),
-        );
-        let mut context = SessionContext::fresh();
-
-        assert_eq!(
-            seed_remembered_tui_selection(&bootstrap, &mut context),
-            None
-        );
-
-        assert_eq!(
-            agens_session::model::effective_model(&bootstrap, &context),
-            "gpt-5.5"
-        );
-        let request = agens_headless::apply_session_to_request(
-            &context,
-            chat_request(chat_args_with_prompt("work")).unwrap(),
-        );
-        assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(
-            request.session_reasoning_effort,
-            Some(agens_core::ReasoningEffort::High)
-        );
-
-        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[test]

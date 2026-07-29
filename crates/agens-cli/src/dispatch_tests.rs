@@ -31,11 +31,6 @@ use agens_tui::{
 
 use super::*;
 use crate::CliError;
-use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
-use crate::test_support::{
-    BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
-    run_production_batch_with_policy, tui_session_bootstrap, tui_session_directory,
-};
 use agens_agents::ensure_active_agent_runtime;
 use agens_agents::select_subagent;
 use agens_core::HeadlessPermissionGate;
@@ -51,6 +46,11 @@ use agens_session::context::SessionContext;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls};
 use agens_tool_runtime::runtime::production_dangerous_child_tool_runtime;
 use agens_tool_runtime::task::production_tui_task_runtime_with_runner;
+use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
+use agens_tui_app::test_support::{
+    BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
+    run_production_batch_with_policy, tui_session_bootstrap, tui_session_directory,
+};
 use std::path::Path;
 
 #[test]

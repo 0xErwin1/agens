@@ -8,7 +8,7 @@ use agens_tui::{Engine as TuiEngine, PaletteEntry, PaletteEntryKind, Tui};
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
-pub(crate) const RESERVED_TUI_COMMANDS: &[&str] = &[
+pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
     "connect",
     "disconnect",
@@ -63,7 +63,7 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
 ///
 /// Shared by [`start_tui_commands`] (which adds startup diagnostics) and by a session's
 /// post-resume catalog refresh, which has no `Tui` handle to report diagnostics to.
-pub(crate) fn discover_tui_command_catalog(
+pub fn discover_tui_command_catalog(
     bootstrap: &Bootstrap,
     project_root: &Path,
 ) -> Result<agens_tools::CommandDiscovery, CliError> {
@@ -85,7 +85,7 @@ pub(crate) fn discover_tui_command_catalog(
         .map_err(CliError::configuration)
 }
 
-pub(crate) fn start_tui_commands<E: TuiEngine>(
+pub fn start_tui_commands<E: TuiEngine>(
     tui: &mut Tui<E>,
     bootstrap: &Bootstrap,
     project_root: &Path,
@@ -108,7 +108,7 @@ pub(crate) fn start_tui_commands<E: TuiEngine>(
     Ok(Arc::new(discovery.catalog().clone()))
 }
 
-pub(crate) fn start_tui_skills<E: TuiEngine>(
+pub fn start_tui_skills<E: TuiEngine>(
     tui: &mut Tui<E>,
     bootstrap: &Bootstrap,
     project_root: &Path,
@@ -131,7 +131,7 @@ pub(crate) fn start_tui_skills<E: TuiEngine>(
     Ok(Arc::new(discovery.catalog().clone()))
 }
 
-pub(crate) fn resolved_tui_palette(
+pub fn resolved_tui_palette(
     commands: &CommandCatalog,
     skills: &SkillCatalog,
     has_subagents: bool,
@@ -197,7 +197,7 @@ pub(crate) fn resolved_tui_palette(
     entries
 }
 
-pub(crate) fn render_tui_help(entries: &[PaletteEntry]) -> String {
+pub fn render_tui_help(entries: &[PaletteEntry]) -> String {
     let surface = entries
         .iter()
         .map(|entry| {
@@ -227,11 +227,11 @@ mod tests {
     use agens_tui::{TuiProviderOutcome, TuiSubmissionOutcome};
 
     use super::*;
+    use crate::engine::{ProductionTuiEngine, report_tui_extension_collisions};
+    use crate::router::TuiRuntimeRouter;
     use crate::test_support::{
         enter_tui_input, submit_tui_command, tui_session_bootstrap, tui_session_directory,
     };
-    use crate::tui::engine::{ProductionTuiEngine, report_tui_extension_collisions};
-    use crate::tui::router::TuiRuntimeRouter;
     use agens_session::context::SessionContext;
     use agens_tool_runtime::runtime::production_tool_runtime;
 

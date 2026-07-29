@@ -20,6 +20,7 @@ members = [
   "crates/agens-tool-runtime",
   "crates/agens-store",
   "crates/agens-tui",
+  "crates/agens-tui-app",
   "crates/agens-server",
   "crates/agens-cli",
 ]

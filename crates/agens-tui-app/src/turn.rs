@@ -17,7 +17,7 @@ use agens_session::provider::ProviderKind;
 use agens_session::turns::SUBAGENT_CALL_ID_PREFIX;
 use agens_tui::TuiPresentation;
 
-pub(crate) fn complete_tui_turn(
+pub fn complete_tui_turn(
     session: &mut SessionContext,
     completion: Result<HeadlessChatCompletion, HeadlessChatFailure>,
     consumed_reminder: bool,
@@ -46,13 +46,13 @@ pub(crate) fn complete_tui_turn(
 /// A background subagent turn can be persisted after the foreground turn reloaded the session, so
 /// adopting the turn's history alone would drop that turn from the in-process request history for
 /// the rest of the process even though the store keeps it.
-pub(crate) fn adopt_turn_history(session: &mut SessionContext, history: Vec<Message>) {
+pub fn adopt_turn_history(session: &mut SessionContext, history: Vec<Message>) {
     let preserved = missing_subagent_turns(&session.messages, &history);
     session.messages = history;
     session.messages.extend(preserved);
 }
 
-pub(crate) fn missing_subagent_turns(previous: &[Message], history: &[Message]) -> Vec<Message> {
+pub fn missing_subagent_turns(previous: &[Message], history: &[Message]) -> Vec<Message> {
     let known = history
         .iter()
         .flat_map(|message| message.parts.iter())
@@ -81,14 +81,14 @@ pub(crate) fn missing_subagent_turns(previous: &[Message], history: &[Message]) 
         .collect()
 }
 
-pub(crate) fn subagent_call_id(part: &MessagePart) -> Option<&str> {
+pub fn subagent_call_id(part: &MessagePart) -> Option<&str> {
     match part {
         MessagePart::ToolCall { id, .. } if id.starts_with(SUBAGENT_CALL_ID_PREFIX) => Some(id),
         _ => None,
     }
 }
 
-pub(crate) fn tui_session_presentation(
+pub fn tui_session_presentation(
     bootstrap: &Bootstrap,
     session: &SessionContext,
 ) -> TuiPresentation {
@@ -130,10 +130,10 @@ mod tests {
     use agens_core::SessionMetadata;
 
     use super::*;
+    use crate::engine::{ProductionTuiEngine, configure_tui_project_identity};
     use crate::test_support::{
         render_tui_test_backend, tui_session_bootstrap_for_provider, tui_session_directory,
     };
-    use crate::tui::engine::{ProductionTuiEngine, configure_tui_project_identity};
     use agens_tui::Tui;
 
     #[test]

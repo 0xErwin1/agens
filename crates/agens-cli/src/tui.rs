@@ -1,13 +1,8 @@
-pub(crate) mod dialogs;
-pub(crate) mod engine;
-pub(crate) mod extensions;
-pub(crate) mod files;
-pub(crate) mod metrics;
-pub(crate) mod models;
-pub(crate) mod resume;
-pub(crate) mod router;
-pub(crate) mod session;
-pub(crate) mod turn;
+//! Launching the terminal surface.
+//!
+//! The surface itself is `agens-tui-app`. What stays here is the one decision
+//! the binary owns: resolving the run's configuration and handing it to the
+//! launcher the composition root installed.
 
 use crate::CliDependencies;
 use crate::deps::bootstrap;

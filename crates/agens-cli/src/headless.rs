@@ -11,7 +11,7 @@ use agens_headless::{
     HeadlessChatFailure, HeadlessChatRequest, run_production_headless_chat_with_progress,
 };
 
-use crate::permission_prompt::TtyPermissionPrompter;
+use agens_tui_app::permission_prompt::TtyPermissionPrompter;
 
 pub(crate) fn run_production_headless_chat(
     request: HeadlessChatRequest,

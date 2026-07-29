@@ -11,8 +11,8 @@ mod resolution {
     use crate::CliDependencies;
     use crate::commands::chat::{chat_args_with_prompt, chat_request};
     use crate::deps::bootstrap;
-    use crate::test_support::bootstrap_from_configuration;
     use agens_bootstrap::*;
+    use agens_tui_app::test_support::bootstrap_from_configuration;
 
     #[test]
     fn bootstrap_retains_the_ui_collapse_thinking_setting() {

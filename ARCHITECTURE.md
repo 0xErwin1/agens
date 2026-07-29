@@ -26,6 +26,7 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-session      what a session is: identity, context, provider, attempts
   -> agens-server       the machine's daemon and its sync/async boundary
   -> agens-tui          terminal rendering surface
+  -> agens-tui-app      the terminal application that drives it
 ```
 
 ## What each crate is
@@ -56,6 +57,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-server` | The machine's daemon: its single-instance guard, its runtime, and the one named crossing into synchronous code. Grows to hold the coordinator. | A project. One daemon serves many. |
 | `agens-tui` | Terminal rendering: widgets, layout, the conversation projection, and the bridges a surface needs. | Any decision the runtime would still have to make with no terminal attached. |
 | `agens-fixtures` | Test fixtures more than one crate needs: an isolated project directory, a `Bootstrap` resolved from a fixed host, a deadline-based wait. A dev-dependency. | Anything a surface would render. Keeping it surface-free is what lets a logic crate use it without pulling a terminal into its test build. |
+| `agens-tui-app` | The terminal application: routing a submission or a slash command, resuming a session, choosing a model, answering a permission question, reporting what the runtime is doing. A surface, so it may depend on logic and logic may never depend on it. | Any decision the runtime would still have to make with no terminal attached. |
 | `agens-cli` | Argument parsing, the command table, and wiring production implementations together. | Logic. If deleting the CLI would delete a capability, that capability is in the wrong crate. |
 
 ## Dependency direction

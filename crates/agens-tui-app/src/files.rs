@@ -11,14 +11,14 @@ const TUI_SELECT_FILE_LIMIT: usize = 100;
 /// frame ever touches the filesystem.
 const TUI_PICKER_FILE_LIMIT: usize = 2_000;
 
-pub(crate) fn tui_file_candidates(
+pub fn tui_file_candidates(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
     tui_file_candidates_with_limit(context, bootstrap, TUI_SELECT_FILE_LIMIT)
 }
 
-pub(crate) fn tui_picker_file_candidates(
+pub fn tui_picker_file_candidates(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
@@ -33,7 +33,7 @@ pub(crate) fn tui_picker_file_candidates(
 /// been created yet. This must never re-derive the process's discovered root directly, or a
 /// resumed session confined to a different root than the resuming process's working directory
 /// would leak that other root's file listing.
-pub(crate) fn tui_file_candidates_with_limit(
+pub fn tui_file_candidates_with_limit(
     context: &SessionContext,
     bootstrap: &Bootstrap,
     limit: usize,
@@ -44,7 +44,7 @@ pub(crate) fn tui_file_candidates_with_limit(
         .map_err(|output| CliError::new(ExitStatus::Failure, "file", output.content))
 }
 
-pub(crate) fn selected_tui_file(
+pub fn selected_tui_file(
     context: &SessionContext,
     bootstrap: &Bootstrap,
     selection: &str,
@@ -59,7 +59,7 @@ pub(crate) fn selected_tui_file(
         .ok_or_else(|| CliError::usage("selected file is unavailable"))
 }
 
-pub(crate) fn tui_select_candidates(
+pub fn tui_select_candidates(
     context: &SessionContext,
     bootstrap: &Bootstrap,
 ) -> Result<Vec<String>, CliError> {
@@ -73,7 +73,7 @@ pub(crate) fn tui_select_candidates(
 /// Resolves the root the same way [`tui_file_candidates_with_limit`] does; see that function's
 /// documentation for why the session's own recorded root must be used instead of re-deriving the
 /// process's discovered root.
-pub(crate) fn expand_tui_file_reference(
+pub fn expand_tui_file_reference(
     context: &SessionContext,
     bootstrap: &Bootstrap,
     prompt: &str,
@@ -114,12 +114,12 @@ mod tests {
     use agens_tui::Tui;
 
     use super::*;
+    use crate::engine::ProductionTuiEngine;
+    use crate::resume::resume_tui_session;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
         tui_session_bootstrap, tui_session_directory,
     };
-    use crate::tui::engine::ProductionTuiEngine;
-    use crate::tui::resume::resume_tui_session;
     use agens_session::provider::CredentialResolver;
 
     #[test]

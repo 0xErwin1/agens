@@ -1,55 +1,44 @@
 [package]
-name = "agens"
+name = "agens-tui-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-default-run = "agens"
 publish.workspace = true
 
 [lints]
 workspace = true
 
-[[bin]]
-name = "agens"
-path = "src/main.rs"
-
-[[bin]]
-name = "agens-cli-fake-mcp-child"
-path = "../agens-tools/src/bin/fake-mcp-child.rs"
+[features]
+# Fixtures the binary's tests reach for. `cfg(test)` never reaches a dependency,
+# so a consumer opts in here; production builds never enable it.
+test-support = ["dep:agens-fixtures", "dep:ratatui"]
 
 [dependencies]
-agens-config = { path = "../agens-config" }
 agens-agents = { path = "../agens-agents" }
 agens-auth = { path = "../agens-auth" }
-agens-diagnostics = { path = "../agens-diagnostics" }
-agens-dispatch = { path = "../agens-dispatch" }
-agens-core = { path = "../agens-core" }
 agens-bootstrap = { path = "../agens-bootstrap" }
 agens-bus = { path = "../agens-bus" }
 agens-callcount = { path = "../agens-callcount" }
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
+agens-diagnostics = { path = "../agens-diagnostics" }
+agens-dispatch = { path = "../agens-dispatch" }
 agens-error = { path = "../agens-error" }
 agens-headless = { path = "../agens-headless" }
 agens-models = { path = "../agens-models" }
 agens-permissions = { path = "../agens-permissions" }
 agens-providers = { path = "../agens-providers" }
-agens-server = { path = "../agens-server" }
 agens-session = { path = "../agens-session" }
 agens-store = { path = "../agens-store" }
-agens-tool-runtime = { path = "../agens-tool-runtime" }
+agens-tool-runtime = { path = "../agens-tool-runtime", features = ["probe"] }
 agens-tools = { path = "../agens-tools" }
+agens-fixtures = { path = "../agens-fixtures", optional = true }
 agens-tui = { path = "../agens-tui" }
-agens-tui-app = { path = "../agens-tui-app" }
-toml = "0.8"
-tokio = { version = "1", features = ["net", "rt", "signal", "time"] }
+ratatui = { version = "0.30.2", optional = true }
 serde_json = "1"
-serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
-libc = "0.2"
-clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+tokio = { version = "1", features = ["rt", "time"] }
 
 [dev-dependencies]
 agens-fixtures = { path = "../agens-fixtures" }
-agens-tui-app = { path = "../agens-tui-app", features = ["test-support"] }
-agens-tool-runtime = { path = "../agens-tool-runtime", features = ["probe"] }
 ratatui = "0.30.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }

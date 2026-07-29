@@ -27,6 +27,7 @@ dependencies = [
  "agens-tool-runtime",
  "agens-tools",
  "agens-tui",
+ "agens-tui-app",
  "clap",
  "libc",
  "ratatui",
@@ -283,6 +284,36 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "unicode-width",
+]
+
+[[package]]
+name = "agens-tui-app"
+version = "0.1.0"
+dependencies = [
+ "agens-agents",
+ "agens-auth",
+ "agens-bootstrap",
+ "agens-bus",
+ "agens-callcount",
+ "agens-config",
+ "agens-core",
+ "agens-diagnostics",
+ "agens-dispatch",
+ "agens-error",
+ "agens-fixtures",
+ "agens-headless",
+ "agens-models",
+ "agens-permissions",
+ "agens-providers",
+ "agens-session",
+ "agens-store",
+ "agens-tool-runtime",
+ "agens-tools",
+ "agens-tui",
+ "ratatui",
+ "rusqlite",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

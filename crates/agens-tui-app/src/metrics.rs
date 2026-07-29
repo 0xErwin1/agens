@@ -8,7 +8,7 @@ use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState,
 use agens_error::CliError;
 use agens_permissions::ParseToolInput;
 
-pub(crate) struct TuiMetricsPublisher {
+pub struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
     cancellation: BridgeCancel,
     model_id: String,
@@ -17,7 +17,7 @@ pub(crate) struct TuiMetricsPublisher {
 }
 
 impl TuiMetricsPublisher {
-    pub(crate) fn new(
+    pub fn new(
         bridge: BridgeTx<TuiRuntimeEvent>,
         cancellation: BridgeCancel,
         model_id: impl Into<String>,
@@ -31,7 +31,7 @@ impl TuiMetricsPublisher {
         }
     }
 
-    pub(crate) fn observe(&mut self, event: &TurnEvent) {
+    pub fn observe(&mut self, event: &TurnEvent) {
         let now = std::time::Instant::now();
         let completed_tool = match event {
             TurnEvent::ToolResult(MessagePart::ToolResult { tool_call_id, .. }) => {
@@ -117,7 +117,7 @@ impl TuiMetricsPublisher {
         }
     }
 
-    pub(crate) fn finish(&mut self, result: Result<(), &CliError>) {
+    pub fn finish(&mut self, result: Result<(), &CliError>) {
         let status = match result {
             Ok(()) => TurnState::Completed,
             Err(error) if error.category == "cancelled" => TurnState::Cancelled,
@@ -132,7 +132,7 @@ impl TuiMetricsPublisher {
     }
 }
 
-pub(crate) fn finish_tui_metrics<T>(
+pub fn finish_tui_metrics<T>(
     metrics: &Arc<Mutex<TuiMetricsPublisher>>,
     result: &Result<T, CliError>,
 ) {

@@ -14,7 +14,7 @@ use agens_permissions::{
     PermissionPromptAnswer, PermissionPromptContext, PermissionPrompter, sanitize_permission_target,
 };
 
-pub(crate) struct TtyPermissionPrompter;
+pub struct TtyPermissionPrompter;
 
 impl PermissionPrompter for TtyPermissionPrompter {
     fn prompt(
@@ -42,10 +42,9 @@ impl PermissionPrompter for TtyPermissionPrompter {
 
 /// The terminal UI's implementation of the permission port. Each surface owns
 /// its own, so the engine never chooses between them.
-pub(crate) struct TuiPermissionPrompter(pub(crate) TuiPermissionBridge);
+pub struct TuiPermissionPrompter(pub TuiPermissionBridge);
 
-pub(crate) fn production_tui_permission_bridge()
--> (TuiPermissionBridge, Receiver<TuiPermissionRequest>) {
+pub fn production_tui_permission_bridge() -> (TuiPermissionBridge, Receiver<TuiPermissionRequest>) {
     TuiPermissionBridge::channel()
 }
 
@@ -72,7 +71,7 @@ impl PermissionPrompter for TuiPermissionPrompter {
     }
 }
 
-pub(crate) fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAnswer> {
+pub fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPromptAnswer> {
     match value.trim().to_ascii_lowercase().as_str() {
         "a" | "allow-once" | "allow once" => Some(PermissionPromptAnswer::AllowOnce),
         "always" | "allow-always" | "allow always" => Some(PermissionPromptAnswer::AllowAlways),
@@ -83,7 +82,7 @@ pub(crate) fn parse_permission_prompt_answer(value: &str) -> Option<PermissionPr
     }
 }
 
-pub(crate) fn render_permission_prompt(context: &PermissionPromptContext) -> String {
+pub fn render_permission_prompt(context: &PermissionPromptContext) -> String {
     format!(
         "Permission required for {} ({:?})\nTarget: {}\n[a]llow once, allow [always], [d]eny once, deny [always], or [c]ancel: ",
         context.qualified_tool_name,

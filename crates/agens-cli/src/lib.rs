@@ -16,7 +16,7 @@ mod child_task_tests;
 mod dispatch_tests;
 mod headless;
 mod headless_tests;
-mod permission_prompt;
+
 #[cfg(test)]
 mod permission_tests;
 #[cfg(test)]
@@ -25,8 +25,8 @@ mod rotation_tests;
 #[cfg(test)]
 mod task_runner_tests;
 mod task_tool_tests;
-mod test_support;
 mod tui;
+mod tui_tests;
 #[cfg(test)]
 mod turns_tests;
 

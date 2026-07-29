@@ -63,14 +63,14 @@ fn list_agents(
     ))
 }
 
+use agens_session::provider::CredentialResolver;
+use agens_tui_app::resume::resume_tui_session;
 #[cfg(test)]
-use crate::test_support::{
+use agens_tui_app::test_support::{
     bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
     persist_tui_session, rotation_dispatcher, tui_project, tui_session_bootstrap,
     tui_session_directory,
 };
-use crate::tui::resume::resume_tui_session;
-use agens_session::provider::CredentialResolver;
 
 #[test]
 fn a_resumed_cross_directory_session_reads_agents_from_its_own_root_not_the_process_root() {

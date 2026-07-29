@@ -11,24 +11,29 @@ metadata="$(cargo metadata --format-version 1 --no-deps)"
 
 jq -e '
   {
-    "agens-core": [],
-    "agens-bus": [],
-    "agens-error": [
-      "agens-core"
-    ],
-    "agens-bootstrap": [
+    "agens": [
+      "agens-agents",
+      "agens-auth",
+      "agens-bootstrap",
+      "agens-bus",
+      "agens-callcount",
       "agens-config",
       "agens-core",
+      "agens-diagnostics",
+      "agens-dispatch",
       "agens-error",
-      "agens-tools"
-    ],
-    "agens-auth": [
-      "agens-error",
-      "agens-providers"
-    ],
-    "agens-callcount": [],
-    "agens-models": [
-      "agens-core"
+      "agens-fixtures",
+      "agens-headless",
+      "agens-models",
+      "agens-permissions",
+      "agens-providers",
+      "agens-server",
+      "agens-session",
+      "agens-store",
+      "agens-tool-runtime",
+      "agens-tools",
+      "agens-tui",
+      "agens-tui-app"
     ],
     "agens-agents": [
       "agens-bootstrap",
@@ -42,12 +47,20 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
-    "agens-fixtures": [
-      "agens-bootstrap",
+    "agens-auth": [
       "agens-error",
-      "agens-models",
+      "agens-providers"
+    ],
+    "agens-bootstrap": [
+      "agens-config",
+      "agens-core",
+      "agens-error",
       "agens-tools"
     ],
+    "agens-bus": [],
+    "agens-callcount": [],
+    "agens-config": [],
+    "agens-core": [],
     "agens-diagnostics": [
       "agens-bootstrap",
       "agens-core",
@@ -59,33 +72,14 @@ jq -e '
       "agens-permissions",
       "agens-tools"
     ],
-    "agens-permissions": [
-      "agens-config",
-      "agens-core",
-      "agens-error",
-      "agens-store",
-      "agens-tools"
+    "agens-error": [
+      "agens-core"
     ],
-    "agens-session": [
+    "agens-fixtures": [
       "agens-bootstrap",
-      "agens-core",
       "agens-error",
       "agens-models",
-      "agens-providers",
-      "agens-store",
       "agens-tools"
-    ],
-    "agens-config": [],
-    "agens-providers": [
-      "agens-config",
-      "agens-core"
-    ],
-    "agens-tools": [
-      "agens-config",
-      "agens-core"
-    ],
-    "agens-store": [
-      "agens-core"
     ],
     "agens-headless": [
       "agens-agents",
@@ -102,6 +96,35 @@ jq -e '
       "agens-store",
       "agens-tool-runtime",
       "agens-tools"
+    ],
+    "agens-models": [
+      "agens-core"
+    ],
+    "agens-permissions": [
+      "agens-config",
+      "agens-core",
+      "agens-error",
+      "agens-store",
+      "agens-tools"
+    ],
+    "agens-providers": [
+      "agens-config",
+      "agens-core"
+    ],
+    "agens-server": [
+      "agens-core"
+    ],
+    "agens-session": [
+      "agens-bootstrap",
+      "agens-core",
+      "agens-error",
+      "agens-models",
+      "agens-providers",
+      "agens-store",
+      "agens-tools"
+    ],
+    "agens-store": [
+      "agens-core"
     ],
     "agens-tool-runtime": [
       "agens-agents",
@@ -121,14 +144,15 @@ jq -e '
       "agens-store",
       "agens-tools"
     ],
+    "agens-tools": [
+      "agens-config",
+      "agens-core"
+    ],
     "agens-tui": [
       "agens-bus",
       "agens-core"
     ],
-    "agens-server": [
-      "agens-core"
-    ],
-    "agens": [
+    "agens-tui-app": [
       "agens-agents",
       "agens-auth",
       "agens-bootstrap",
@@ -144,7 +168,6 @@ jq -e '
       "agens-models",
       "agens-permissions",
       "agens-providers",
-      "agens-server",
       "agens-session",
       "agens-store",
       "agens-tool-runtime",

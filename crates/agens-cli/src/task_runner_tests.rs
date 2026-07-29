@@ -27,13 +27,13 @@ use agens_tools::{
 };
 use agens_tui::TuiPermissionReply;
 
-use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 use agens_error::CliError;
 use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap, session_directory as tui_session_directory,
 };
 use agens_tool_runtime::runner::*;
 use agens_tool_runtime::task::production_tui_task_runtime_with_runner;
+use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 
 #[test]
 fn production_task_error_mapping_reserves_provider_for_provider_failures() {
@@ -108,11 +108,12 @@ fn p1c1_terminal_observer_excludes_non_completed_matrix() {
                 &worker_cancellation,
             )
         });
-        let lifecycle = crate::test_support::wait_for("the running task to be observed", || {
-            controls
-                .0
-                .lifecycle(agens_tools::TaskExecutionId::from_value(1))
-        });
+        let lifecycle =
+            agens_tui_app::test_support::wait_for("the running task to be observed", || {
+                controls
+                    .0
+                    .lifecycle(agens_tools::TaskExecutionId::from_value(1))
+            });
 
         assert!(session.lock().unwrap().identifier.is_none());
         assert!(lifecycle.transition_to_background());
@@ -340,7 +341,7 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
         ]
     );
     assert_eq!(probe.lock().unwrap().len(), 1);
-    let session_id = crate::test_support::wait_for(
+    let session_id = agens_tui_app::test_support::wait_for(
         "the completed terminal to persist exactly one durable turn",
         || session.lock().unwrap().identifier,
     );

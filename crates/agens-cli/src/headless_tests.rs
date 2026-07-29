@@ -23,7 +23,7 @@ use agens_headless::{
 use agens_store::{SessionStore, ToolFactStore};
 use agens_tools::SkillCatalog;
 
-use crate::permission_prompt::TtyPermissionPrompter;
+use agens_tui_app::permission_prompt::TtyPermissionPrompter;
 
 use agens_core::{CompletedSessionTurn, SessionMessage};
 
@@ -35,13 +35,15 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
     use agens_store::SessionStore;
     use agens_tools::SkillCatalog;
 
-    use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
-    use crate::test_support::{
+    use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
+    use agens_tool_runtime::task::production_tui_task_runtime;
+    use agens_tui_app::permission_prompt::{
+        TuiPermissionPrompter, production_tui_permission_bridge,
+    };
+    use agens_tui_app::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
         tui_session_bootstrap, tui_session_directory,
     };
-    use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
-    use agens_tool_runtime::task::production_tui_task_runtime;
 
     let origin = tui_session_directory("headless-root-origin");
     let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
@@ -55,7 +57,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
         agens_bootstrap::session_root::discovered_root_for_tests(&resume_bootstrap);
     assert_ne!(discovered_process_root, origin.join("project"));
 
-    let resumed = crate::tui::resume::resume_tui_session(
+    let resumed = agens_tui_app::resume::resume_tui_session(
         &resume_bootstrap,
         metadata.id,
         &SkillCatalog::default(),
@@ -587,7 +589,7 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         .persist_completed_session_turn(&metadata, &initial_turn)
         .expect("normalized session should persist");
 
-    let resumed = crate::tui::resume::resume_tui_session(
+    let resumed = agens_tui_app::resume::resume_tui_session(
         &bootstrap,
         1,
         &SkillCatalog::default(),
