@@ -1769,7 +1769,9 @@ fn agents_md_instructions_reach_both_the_parent_and_a_subagents_request_body_end
         // than going through `discover_agent_catalog`'s `primary` agent — but appends this
         // session's own AGENTS.md instructions to whichever base prompt it resolves (here, the
         // hardcoded default, since no `--system` flag or `agent.system_prompt` applies), so it
-        // still carries the same sentinel as the `task`-dispatched subagent below, exactly once.
+        // still carries the same sentinel as the `task`-dispatched subagent below. The `@once:`
+        // fragment below asserts the sentinel appears exactly once in this request body, i.e.
+        // it was appended once and not double-injected.
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"model\":\"gpt-5.5\"".into(),
@@ -1777,7 +1779,7 @@ fn agents_md_instructions_reach_both_the_parent_and_a_subagents_request_body_end
                 "general".into(),
                 "parent general request".into(),
                 "You are Agens, a helpful coding agent.".into(),
-                "PROJECT-AGENTS-MD-SENTINEL".into(),
+                "@once:PROJECT-AGENTS-MD-SENTINEL".into(),
             ],
             response: native_tool_call_response(
                 "task-general",
@@ -4656,6 +4658,15 @@ impl ScriptedNativeOpenAiMockServer {
                         assert!(
                             !body.contains(forbidden),
                             "request body leaked {forbidden:?}: {body}"
+                        );
+                        continue;
+                    }
+                    if let Some(once) = fragment.strip_prefix("@once:") {
+                        let visible = model_visible_fragment(once);
+                        let occurrences = body.matches(&visible).count();
+                        assert_eq!(
+                            occurrences, 1,
+                            "request body should contain {visible:?} exactly once, found {occurrences}: {body}"
                         );
                         continue;
                     }

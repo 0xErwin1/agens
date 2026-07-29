@@ -457,6 +457,24 @@ mod session_instructions_tests {
     }
 
     #[test]
+    fn an_ancestor_file_is_not_discovered() {
+        let fixture = fixture();
+        // `fixture.root` is the PARENT of `fixture.project_root`, and is a temp directory this
+        // test controls — not a real ancestor of the repository. Discovery must consider only
+        // the global path and the project root's own path, with no walk up the directory tree.
+        fs::write(fixture.root.join("AGENTS.md"), "ANCESTOR-TEXT").unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+
+        assert_eq!(
+            instructions.text(),
+            None,
+            "an AGENTS.md in a parent directory of the session root must be ignored"
+        );
+    }
+
+    #[test]
     fn neither_present_leaves_text_absent() {
         let fixture = fixture();
         let bootstrap = bootstrap(&fixture);

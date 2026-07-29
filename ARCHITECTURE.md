@@ -96,7 +96,7 @@ There is no ancestor-directory search; only these two exact paths are considered
 
 `SessionInstructions` (`agens-bootstrap`, `session_config.rs`) owns discovery and composition for every caller. It reads each candidate through `agens-tools`' `markdown::load_instruction_file`, which rejects symlinks, non-regular files, oversized files, and non-UTF-8 content. A missing, empty, oversized (over 256 KiB), symlinked, unreadable, or non-UTF-8 file is skipped silently, and skipping one file never affects the other. Each accepted file is labelled `## Instructions from <path>` and appended global-then-project; identical canonical paths are deduplicated; the combined appended text is capped at 256 KiB, dropping the whole offending file rather than truncating it mid-content.
 
-`SessionInstructions` is read at three points, each appending into a different prompt surface:
+`SessionInstructions` is read at two points, each appending into a different prompt surface:
 
 - `discover_agent_catalog` (`agens-agents`, `catalog.rs`) resolves it once per session and passes the composed text to `AgentCatalog::with_appended_instructions` (`agens-tools`, `agents.rs`), which appends it to every catalog agent's own prompt: the primary agent, the built-in `explore` and `general` agents, and every markdown-defined custom agent.
 - `headless_turn_own_system_prompt` (`agens-headless`, `turn.rs`) appends it to the headless `agens chat` parent turn's own prompt, including when `--system` supplies an explicit prompt. This is the only path that would otherwise miss instructions entirely, since a headless parent turn with no live TUI task runtime never goes through `discover_agent_catalog`.

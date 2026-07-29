@@ -259,6 +259,58 @@ fn agents_md_instructions_do_not_leak_across_roots_and_the_own_root_wins() {
 }
 
 #[test]
+fn a_configured_system_prompt_is_preserved_with_agents_md_instructions_appended_after_it() {
+    use std::collections::BTreeMap;
+
+    use crate::CliDependencies;
+    use crate::deps::bootstrap;
+
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-configured-prompt-preserved-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-INSTRUCTIONS-TEXT").unwrap();
+
+    let mut files = BTreeMap::new();
+    files.insert(
+        project_root.join(".agens/config.toml"),
+        "[agent]\nsystem_prompt = \"CONFIGURED-CUSTOM-PROMPT\"\n".to_owned(),
+    );
+
+    let bootstrap_for_project = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .unwrap();
+
+    let catalog = task_agent_catalog(&bootstrap_for_project, &project_root).unwrap();
+    let primary = catalog.agent("primary").unwrap();
+
+    let canonical_instructions_path =
+        std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
+    let expected = format!(
+        "CONFIGURED-CUSTOM-PROMPT\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS-TEXT",
+        canonical_instructions_path.display()
+    );
+    assert_eq!(
+        primary.system_prompt, expected,
+        "a TOML-configured system_prompt must remain the agent's own prompt, with AGENTS.md \
+         instructions appended after it, never replacing it"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap_for_project.data_directory()).ok();
+}
+
+#[test]
 fn explicit_agent_missing_keeps_active_primary_and_persisted_metadata_unchanged() {
     let temporary = tui_session_directory("explicit-agent-missing");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
