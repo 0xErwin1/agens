@@ -52,7 +52,10 @@
 //! change makes — see this module's call sites, which wrap an already-resolved, already-correct
 //! `project_root` rather than deriving one themselves.
 
+use std::path::PathBuf;
+
 use agens_config::{ConfigPermissionRule, ConfigPermissionScope, extract_permission_rules};
+use agens_tools::markdown::{MAX_MARKDOWN_FILE_BYTES, load_instruction_file};
 
 use crate::Bootstrap;
 use crate::session_root::SessionRoot;
@@ -122,6 +125,79 @@ impl SessionConfig {
     }
 }
 
+/// The composed `AGENTS.md` instruction text for a session's own root, re-derived fresh every
+/// time it is asked for — the same shape of problem [`SessionConfig`] closes for
+/// `agent.system_prompt` and `provider.base_url`, and for the same reason: this text is
+/// model-facing, so trusting the wrong root's file would be a direct prompt-injection path, not
+/// merely a stale setting.
+///
+/// The only constructor takes a [`SessionRoot`], never a bare `&Path`, and nothing is stored on
+/// [`Bootstrap`]: those two properties are what make the session-root confinement invariant
+/// structural rather than conventional, mirroring `SessionConfig`'s own constructor shape.
+///
+/// Both candidate files are read through the real filesystem via
+/// [`load_instruction_file`](agens_tools::markdown::load_instruction_file), deliberately NOT
+/// through `Bootstrap`'s injected `config_reader`: that reader hands back an already-decoded
+/// `String`, which makes the symlink, non-regular-file, oversized, and invalid-UTF-8 rejection
+/// modes unreachable through it.
+///
+/// [`SessionInstructions::resolve`] is infallible: every rejection (missing, symlink, non-regular
+/// file, oversized, invalid UTF-8, unreadable, or blank content) is a deliberate, silent skip, so
+/// a broken candidate on one path never prevents the other from being appended.
+pub struct SessionInstructions {
+    text: Option<String>,
+}
+
+impl SessionInstructions {
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+
+    /// Reads GLOBAL (`bootstrap.paths().global_config.with_file_name("AGENTS.md")`) then PROJECT
+    /// (`root.path().join("AGENTS.md")`), composing accepted, non-blank, not-already-seen
+    /// content into provenance-labelled blocks joined with `"\n\n"`. A block that would push the
+    /// composed text over [`MAX_MARKDOWN_FILE_BYTES`] is dropped WHOLE — content is never
+    /// truncated mid-file.
+    pub fn resolve(root: &SessionRoot, bootstrap: &Bootstrap) -> Self {
+        let global_path = bootstrap.paths().global_config.with_file_name("AGENTS.md");
+        let project_path = root.path().join("AGENTS.md");
+
+        let mut accumulated = String::new();
+        let mut seen_sources: Vec<PathBuf> = Vec::new();
+
+        for path in [global_path, project_path] {
+            let Ok(Some(file)) = load_instruction_file(&path) else {
+                continue;
+            };
+            if file.contents().trim().is_empty() {
+                continue;
+            }
+            if seen_sources.contains(&file.source().to_path_buf()) {
+                continue;
+            }
+
+            let block = format!(
+                "## Instructions from {}\n{}",
+                file.source().display(),
+                file.contents()
+            );
+            if accumulated.len() + 2 + block.len() > MAX_MARKDOWN_FILE_BYTES {
+                continue;
+            }
+
+            if !accumulated.is_empty() {
+                accumulated.push_str("\n\n");
+            }
+            accumulated.push_str(&block);
+            seen_sources.push(file.source().to_path_buf());
+        }
+
+        Self {
+            text: (!accumulated.is_empty()).then_some(accumulated),
+        }
+    }
+}
+
 /// Reads and validates a single TOML configuration document fresh from disk, through the same
 /// `config_reader` `bootstrap()` itself used, so a session-scoped re-read observes the same
 /// document a fresh `bootstrap()` at that path would.
@@ -150,4 +226,300 @@ fn document_text(document: &toml::Table, section: &str, key: &str) -> Option<Str
         .and_then(|table| table.get(key))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod session_instructions_tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::SessionInstructions;
+    use crate::HostEnvironment;
+    use crate::session_root::SessionRoot;
+
+    static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
+
+    struct Fixture {
+        root: PathBuf,
+        config_home: PathBuf,
+        project_root: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    /// Roots the session under a fresh temp directory AND points `AGENS_CONFIG_HOME` at a
+    /// distinct temp directory, so a broken test can never accidentally read the developer's
+    /// own `~/.config/agens/AGENTS.md` (this repo's own root `AGENTS.md` is 21 KB).
+    fn fixture() -> Fixture {
+        let suffix = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "agens-session-instructions-{}-{suffix}",
+            std::process::id()
+        ));
+        let config_home = root.join("config");
+        let project_root = root.join("project");
+        fs::create_dir_all(&config_home).unwrap();
+        fs::create_dir_all(&project_root).unwrap();
+        Fixture {
+            root,
+            config_home,
+            project_root,
+        }
+    }
+
+    fn bootstrap(fixture: &Fixture) -> crate::Bootstrap {
+        let host = HostEnvironment::fixed(
+            fixture.project_root.clone(),
+            Some(fixture.root.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                fixture.config_home.display().to_string(),
+            )]),
+            BTreeMap::new(),
+        );
+        crate::resolve(&host).expect("bootstrap resolves against an empty configuration")
+    }
+
+    fn global_path(fixture: &Fixture) -> PathBuf {
+        fixture.config_home.join("AGENTS.md")
+    }
+
+    fn project_path(fixture: &Fixture) -> PathBuf {
+        fixture.project_root.join("AGENTS.md")
+    }
+
+    fn session_root(fixture: &Fixture) -> SessionRoot {
+        SessionRoot::confined_to(fixture.project_root.clone())
+    }
+
+    #[test]
+    fn global_instructions_precede_project_instructions() {
+        let fixture = fixture();
+        fs::write(global_path(&fixture), "GLOBAL-TEXT").unwrap();
+        fs::write(project_path(&fixture), "PROJECT-TEXT").unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+        let text = instructions.text().expect("both files are present");
+
+        let global_index = text.find("GLOBAL-TEXT").expect("global text is present");
+        let project_index = text.find("PROJECT-TEXT").expect("project text is present");
+        assert!(
+            global_index < project_index,
+            "global instructions must precede project instructions: {text:?}"
+        );
+    }
+
+    #[test]
+    fn label_uses_the_exact_provenance_format() {
+        let fixture = fixture();
+        fs::write(project_path(&fixture), "ONLY-PROJECT-TEXT").unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+        let text = instructions.text().expect("the project file is present");
+
+        let canonical = fs::canonicalize(project_path(&fixture)).unwrap();
+        let expected = format!(
+            "## Instructions from {}\nONLY-PROJECT-TEXT",
+            canonical.display()
+        );
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn identical_canonical_paths_are_deduplicated() {
+        let fixture = fixture();
+        // Redirect the config home to the project root itself, so GLOBAL and PROJECT are
+        // literally the same path (`project_root/AGENTS.md`) once canonicalized — a hard link
+        // would only make them the same INODE at two different paths, and canonicalization does
+        // not collapse hard links back to one path.
+        let host = HostEnvironment::fixed(
+            fixture.project_root.clone(),
+            Some(fixture.root.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                fixture.project_root.display().to_string(),
+            )]),
+            BTreeMap::new(),
+        );
+        let bootstrap = crate::resolve(&host).expect("bootstrap resolves");
+        fs::write(fixture.project_root.join("AGENTS.md"), "SHARED-TEXT").unwrap();
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+        let text = instructions.text().expect("the shared file is present");
+
+        assert_eq!(
+            text.matches("SHARED-TEXT").count(),
+            1,
+            "identical canonical paths must contribute their content exactly once: {text:?}"
+        );
+    }
+
+    fn block(path: &Path, content: &str) -> String {
+        format!("## Instructions from {}\n{}", path.display(), content)
+    }
+
+    #[test]
+    fn combined_text_at_the_cap_boundary_keeps_both_blocks() {
+        let fixture = fixture();
+        let global_canonical_len_estimate = block(&global_path(&fixture), "").len();
+        let project_canonical_len_estimate = block(&project_path(&fixture), "").len();
+
+        // Reserve exactly enough room so `global_block.len() + 2 + project_block.len()` equals
+        // the cap, using the canonicalized paths (temp-dir paths already are absolute).
+        let global_canonical = fixture.config_home.join("AGENTS.md");
+        let project_canonical = fixture.project_root.join("AGENTS.md");
+        let label_overhead = global_canonical_len_estimate + project_canonical_len_estimate;
+        let budget = agens_tools::markdown::MAX_MARKDOWN_FILE_BYTES - label_overhead - 2;
+        let global_content = "g".repeat(budget / 2);
+        let project_content = "p".repeat(budget - budget / 2);
+
+        fs::write(global_path(&fixture), &global_content).unwrap();
+        fs::write(project_path(&fixture), &project_content).unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+        let text = instructions.text().expect("both files fit exactly");
+
+        let expected = format!(
+            "{}\n\n{}",
+            block(&global_canonical, &global_content),
+            block(&project_canonical, &project_content)
+        );
+        assert_eq!(text, expected);
+        assert_eq!(text.len(), agens_tools::markdown::MAX_MARKDOWN_FILE_BYTES);
+    }
+
+    #[test]
+    fn one_byte_over_the_cap_drops_the_whole_offending_file() {
+        let fixture = fixture();
+        let global_canonical = fixture.config_home.join("AGENTS.md");
+        let project_canonical = fixture.project_root.join("AGENTS.md");
+        let label_overhead =
+            block(&global_canonical, "").len() + block(&project_canonical, "").len();
+        let budget = agens_tools::markdown::MAX_MARKDOWN_FILE_BYTES - label_overhead - 2;
+        let global_content = "g".repeat(budget / 2);
+        let project_content = "p".repeat(budget - budget / 2 + 1);
+
+        fs::write(global_path(&fixture), &global_content).unwrap();
+        fs::write(project_path(&fixture), &project_content).unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+        let text = instructions
+            .text()
+            .expect("the global file alone still fits");
+
+        assert_eq!(
+            text,
+            block(&global_canonical, &global_content),
+            "the global block must be present in full and no partial project content may leak in"
+        );
+    }
+
+    #[test]
+    fn only_global_present() {
+        let fixture = fixture();
+        fs::write(global_path(&fixture), "GLOBAL-ONLY").unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+
+        assert_eq!(
+            instructions.text(),
+            Some(block(&fixture.config_home.join("AGENTS.md"), "GLOBAL-ONLY")).as_deref()
+        );
+    }
+
+    #[test]
+    fn only_project_present() {
+        let fixture = fixture();
+        fs::write(project_path(&fixture), "PROJECT-ONLY").unwrap();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+
+        assert_eq!(
+            instructions.text(),
+            Some(block(
+                &fixture.project_root.join("AGENTS.md"),
+                "PROJECT-ONLY"
+            ))
+            .as_deref()
+        );
+    }
+
+    #[test]
+    fn neither_present_leaves_text_absent() {
+        let fixture = fixture();
+        let bootstrap = bootstrap(&fixture);
+
+        let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+
+        assert_eq!(instructions.text(), None);
+    }
+
+    fn break_with_symlink(path: &Path) {
+        let target = path.with_file_name("elsewhere.md");
+        fs::write(&target, "unused").unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+    }
+
+    fn break_with_unreadable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, "unreadable").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    fn break_with_invalid_utf8(path: &Path) {
+        fs::write(path, [0xff, 0xfe, 0xfd]).unwrap();
+    }
+
+    fn break_with_empty(path: &Path) {
+        fs::write(path, "").unwrap();
+    }
+
+    type BreakFn = fn(&Path);
+
+    #[test]
+    fn a_broken_global_file_does_not_suppress_a_valid_project_file() {
+        let cases: [(&str, BreakFn); 4] = [
+            ("symlink", break_with_symlink),
+            ("unreadable", break_with_unreadable),
+            ("invalid utf-8", break_with_invalid_utf8),
+            ("empty", break_with_empty),
+        ];
+
+        for (name, break_global) in cases {
+            let fixture = fixture();
+            break_global(&global_path(&fixture));
+            fs::write(project_path(&fixture), "VALID-PROJECT-TEXT").unwrap();
+            let bootstrap = bootstrap(&fixture);
+
+            let instructions = SessionInstructions::resolve(&session_root(&fixture), &bootstrap);
+
+            if name == "unreadable" {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(global_path(&fixture), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+
+            assert_eq!(
+                instructions.text(),
+                Some(block(
+                    &fixture.project_root.join("AGENTS.md"),
+                    "VALID-PROJECT-TEXT"
+                ))
+                .as_deref(),
+                "case {name}: a broken global file must not suppress a valid project file"
+            );
+        }
+    }
 }
