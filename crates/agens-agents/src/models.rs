@@ -35,12 +35,15 @@ impl AgentModelCompatibility {
     pub fn for_context(bootstrap: &Bootstrap, context: &SessionContext) -> Result<Self, CliError> {
         Self::for_source(model_source(bootstrap, context))
     }
+
+    pub fn is_available(&self, model: &str) -> bool {
+        self.available.contains(model)
+    }
 }
 
 impl AgentModelValidator for AgentModelCompatibility {
     fn validate_model(&self, model: &str) -> Result<(), agens_tools::AgentModelValidationError> {
-        self.available
-            .contains(model)
+        self.is_available(model)
             .then_some(())
             .ok_or(agens_tools::AgentModelValidationError::Unavailable)
     }

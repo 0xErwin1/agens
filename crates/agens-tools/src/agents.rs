@@ -5,6 +5,7 @@ use std::{
 
 use agens_core::{
     AgentDefinition, AgentMode, PermissionDecision, PermissionPattern, PermissionRule,
+    ReasoningEffort, RequestConfig,
 };
 
 use crate::markdown::{self, FrontmatterValue, MarkdownDocument};
@@ -147,17 +148,20 @@ fn load_built_ins(
     }
     for agent in built_ins {
         let source = PathBuf::from(format!("<built-in:{}>", agent.name));
-        if names[&agent.name] != 1
-            || agent.validate().is_err()
-            || agent
-                .model
-                .as_deref()
-                .is_some_and(|model| validator.validate_model(model).is_err())
-        {
+        if names[&agent.name] != 1 || agent.validate().is_err() {
             discovery
                 .diagnostics
                 .push(diagnostic(source, "invalid or duplicate built-in agent"));
             continue;
+        }
+        if agent
+            .model
+            .as_deref()
+            .is_some_and(|model| validator.validate_model(model).is_err())
+        {
+            discovery
+                .diagnostics
+                .push(diagnostic(source.clone(), "agent model is unavailable"));
         }
         discovery.catalog.insert(agent.clone(), source);
     }
@@ -195,7 +199,7 @@ fn load_root(
     let mut accepted = 0;
     let mut definition_limit_reported = false;
     for (_, document) in candidates {
-        match parse_agent(&document, validator) {
+        match parse_agent(&document) {
             Ok(agent) => {
                 if accepted == markdown::MAX_MARKDOWN_DEFINITIONS {
                     if !definition_limit_reported {
@@ -208,6 +212,16 @@ fn load_root(
                     continue;
                 }
                 accepted += 1;
+                if agent
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| validator.validate_model(model).is_err())
+                {
+                    discovery.diagnostics.push(diagnostic(
+                        document.source().into(),
+                        "agent model is unavailable",
+                    ));
+                }
                 if let Some(previous) = discovery
                     .catalog
                     .insert(agent.clone(), document.source().into())
@@ -227,10 +241,7 @@ fn load_root(
     Ok(())
 }
 
-fn parse_agent(
-    document: &MarkdownDocument,
-    validator: &dyn AgentModelValidator,
-) -> Result<AgentDefinition, String> {
+fn parse_agent(document: &MarkdownDocument) -> Result<AgentDefinition, String> {
     let field = |name| {
         document
             .parsed()
@@ -252,6 +263,11 @@ fn parse_agent(
         Some(_) => return Err("agent field model must be a string".into()),
         None => None,
     };
+    let reasoning_effort = match document.parsed().field("effort") {
+        Some(FrontmatterValue::Scalar(value)) => parse_effort(value)?,
+        Some(_) => return Err("agent field effort must be a string".into()),
+        None => None,
+    };
     let skills = list(document, "skills")?;
     let permissions = list(document, "permissions")?
         .iter()
@@ -266,6 +282,7 @@ fn parse_agent(
         description: scalar("description")?,
         mode,
         model,
+        reasoning_effort,
         system_prompt: document.parsed().body().trim().into(),
         permission_rules: permissions,
         skills,
@@ -273,12 +290,13 @@ fn parse_agent(
     agent
         .validate()
         .map_err(|error| format!("invalid agent definition: {error:?}"))?;
-    if let Some(model) = agent.model.as_deref() {
-        validator
-            .validate_model(model)
-            .map_err(|_| "agent model is unavailable")?;
-    }
     Ok(agent)
+}
+
+fn parse_effort(value: &str) -> Result<Option<ReasoningEffort>, String> {
+    RequestConfig::with_reasoning_effort(value)
+        .map(|config| config.reasoning_effort())
+        .map_err(|_| "agent field effort is unsupported".to_owned())
 }
 
 fn list(document: &MarkdownDocument, name: &str) -> Result<Vec<String>, String> {

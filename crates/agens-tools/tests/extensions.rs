@@ -214,6 +214,7 @@ fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
         skills: vec![],
@@ -431,6 +432,7 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
         skills: vec![],
@@ -450,7 +452,37 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
 }
 
 #[test]
-fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
+fn agent_catalog_parses_valid_effort_and_diagnoses_invalid_effort() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("low-effort.md"),
+        "---\nname: low-effort\ndescription: low effort\nmode: subagent\neffort: low\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        global.join("invalid-effort.md"),
+        "---\nname: invalid-effort\ndescription: invalid effort\nmode: subagent\neffort: opus\n---\nbody\n",
+    )
+    .unwrap();
+
+    let discovery = AgentCatalog::discover(&[], &global, &temporary.path.join("missing")).unwrap();
+
+    assert_eq!(
+        discovery
+            .catalog()
+            .agent("low-effort")
+            .unwrap()
+            .reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+    assert!(discovery.catalog().agent("invalid-effort").is_none());
+    assert!(discovery.diagnostics()[0].message().contains("effort"));
+}
+
+#[test]
+fn catalog_preserves_models_rejected_by_the_tools_owned_validator() {
     let temporary = TemporaryDirectory::new();
     let global = temporary.path.join("global");
     let project = temporary.path.join("project");
@@ -468,7 +500,15 @@ fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
             .unwrap();
 
     assert!(discovery.catalog().agent("allowed").is_some());
-    assert!(discovery.catalog().agent("rejected").is_none());
+    assert_eq!(
+        discovery
+            .catalog()
+            .agent("rejected")
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("unsupported")
+    );
     assert_eq!(
         discovery.diagnostics()[0].message(),
         "agent model is unavailable"
@@ -2073,6 +2113,7 @@ fn agent_with_rules(permission_rules: Vec<PermissionRule>) -> AgentDefinition {
         description: "agent".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "body".into(),
         permission_rules,
         skills: vec![],
