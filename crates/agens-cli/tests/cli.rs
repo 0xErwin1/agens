@@ -1753,6 +1753,82 @@ fn built_in_explore_inherits_the_effective_openai_parent_model_without_agent_fil
 }
 
 #[test]
+fn agents_md_instructions_reach_a_subagents_request_body_end_to_end() {
+    let temporary = TemporaryDirectory::new("agents-md-instructions-e2e");
+    let project_root = temporary.path().join("project");
+    let config_home = temporary.path().join("config");
+    let data_directory = temporary.path().join("data");
+    std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
+    std::fs::create_dir_all(&config_home).expect("config directory should exist");
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-AGENTS-MD-SENTINEL")
+        .expect("project AGENTS.md should be written");
+    let server = ScriptedNativeOpenAiMockServer::start(vec![
+        // This first request is the top-level `chat` command's own turn. Its
+        // `instructions` field comes from `headless_turn_system_prompt`
+        // (`crates/agens-headless/src/turn.rs`), which re-reads
+        // `SessionConfig` directly rather than going through
+        // `discover_agent_catalog`'s `primary` agent — so it never carries
+        // the appended AGENTS.md text; only a catalog-resolved agent (the
+        // `task`-dispatched subagent below, or a TUI-rotated primary/custom
+        // agent) does.
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.5\"".into(),
+                "explore".into(),
+                "general".into(),
+                "parent general request".into(),
+            ],
+            response: native_tool_call_response(
+                "task-general",
+                "task",
+                r#"{"agent":"general","description":"implement child"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec![
+                "\"model\":\"gpt-5.5\"".into(),
+                "implement child".into(),
+                "general-purpose subagent".into(),
+                "PROJECT-AGENTS-MD-SENTINEL".into(),
+                "!parent general request".into(),
+                "!\"name\":\"task\"".into(),
+            ],
+            response: text_response("child implemented"),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["child implemented".into()],
+            response: text_response("parent complete"),
+        },
+    ]);
+    std::fs::write(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-chatgpt\"\nmodel = \"gpt-5.4\"\nbase_url = \"{}\"\n\n[options]\ndata_dir = \"{}\"\n\n[permissions]\nallow = [\"task(general)\"]\n",
+            server.base_url(),
+            data_directory.display(),
+        ),
+    )
+    .expect("configuration should be written");
+    write_chatgpt_credentials(&config_home, "header.eyJleHAiOjE4OTM0NTYwMDB9.signature");
+
+    let output = isolated_agens_command(&temporary)
+        .current_dir(&project_root)
+        .args(["chat", "--model", "gpt-5.5", "parent general request"])
+        .env("AGENS_CONFIG_HOME", &config_home)
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("production binary should run");
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "parent complete\n");
+}
+
+#[test]
 fn explicit_task_model_selects_a_second_available_openai_model() {
     let temporary = TemporaryDirectory::new("task-explicit-openai-model");
     let project_root = temporary.path().join("project");
