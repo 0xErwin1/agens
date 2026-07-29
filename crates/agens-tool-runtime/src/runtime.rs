@@ -23,7 +23,7 @@ use agens_bootstrap::Bootstrap;
 use agens_bootstrap::discover_skill_catalog;
 use agens_dispatch::RegisteredNativeTool;
 use agens_error::CliError;
-use agens_models::default_model;
+use agens_models::{default_model, unknown_provider_message};
 use agens_permissions::SharedToolDispatcher;
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
@@ -95,10 +95,14 @@ pub fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     skills: Option<&SkillCatalog>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    let parent_model = bootstrap
-        .model()
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
-        .to_owned();
+    let parent_model = match bootstrap.model() {
+        Some(model) => model.to_owned(),
+        None => default_model(bootstrap.provider_type())
+            .ok_or_else(|| {
+                CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
+            })?
+            .to_owned(),
+    };
     production_tool_runtime_with_parent_task_runner(
         bootstrap,
         project_root,

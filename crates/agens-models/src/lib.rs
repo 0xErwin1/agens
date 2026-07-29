@@ -498,11 +498,34 @@ struct MoonshotReasoningEfforts {
 /// The model a run falls back to when nothing selected one. Takes the provider
 /// identifier rather than a resolved configuration: the choice depends on which
 /// provider is in play and on nothing else.
-pub fn default_model(provider_type: Option<&str>) -> &'static str {
+///
+/// Returns `None` for an unrecognized or absent provider. There is deliberately
+/// no catch-all: guessing a model for an unknown provider would route the run,
+/// and the billing that follows it, to whichever provider the guess happened to
+/// name.
+pub fn default_model(provider_type: Option<&str>) -> Option<&'static str> {
+    match provider_type? {
+        "openai-api" => Some("gpt-4.1"),
+        "openai-chatgpt" => Some("gpt-5.5"),
+        "moonshotai" => Some("kimi-k3"),
+        _ => None,
+    }
+}
+
+/// The provider identifiers [`default_model`] resolves, for error messages that
+/// tell the user what they may write instead of what they wrote.
+pub const KNOWN_PROVIDER_TYPES: [&str; 3] = ["openai-api", "openai-chatgpt", "moonshotai"];
+
+/// Explains a [`default_model`] miss in the terms the user can act on: what they
+/// configured, and what the accepted values are.
+pub fn unknown_provider_message(provider_type: Option<&str>) -> String {
+    let valid = KNOWN_PROVIDER_TYPES.join(", ");
+
     match provider_type {
-        Some("openai-chatgpt") => "gpt-5.5",
-        Some("moonshotai") => "kimi-k3",
-        _ => "gpt-4.1",
+        Some(configured) if !configured.is_empty() => {
+            format!("provider.type \"{configured}\" is not supported; valid values are {valid}")
+        }
+        _ => format!("provider.type is not configured; valid values are {valid}"),
     }
 }
 
@@ -686,5 +709,22 @@ mod tests {
             crate::context_window_for("kimi-k2.7-code-highspeed"),
             Some(262_144)
         );
+    }
+
+    #[test]
+    fn default_model_resolves_every_known_provider() {
+        assert_eq!(crate::default_model(Some("openai-api")), Some("gpt-4.1"));
+        assert_eq!(
+            crate::default_model(Some("openai-chatgpt")),
+            Some("gpt-5.5")
+        );
+        assert_eq!(crate::default_model(Some("moonshotai")), Some("kimi-k3"));
+    }
+
+    #[test]
+    fn default_model_refuses_to_guess_for_an_unknown_provider() {
+        assert_eq!(crate::default_model(Some("moonshot")), None);
+        assert_eq!(crate::default_model(Some("")), None);
+        assert_eq!(crate::default_model(None), None);
     }
 }

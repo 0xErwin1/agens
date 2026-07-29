@@ -12,7 +12,7 @@ use crate::models::apply_tui_selection;
 use agens_auth::{ChatGptAuthFlow, ChatGptAuthProgress};
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::CliError;
-use agens_models::{ModelSelection, default_model};
+use agens_models::ModelSelection;
 use agens_session::provider::{ProviderKind, snapshot_chatgpt_credentials};
 
 use super::{AuthRouteError, TuiRuntimeRouter};
@@ -191,7 +191,7 @@ impl TuiRuntimeRouter {
             }
         } else {
             let previous = current_model.clone();
-            let default = default_model(Some(provider.identifier()));
+            let default = provider.default_model();
             next = ModelSelection::for_source(default, provider.source());
             format!(
                 "Provider: {label}. Model reset to {default} and reasoning effort reset to Default because {previous} is unavailable."

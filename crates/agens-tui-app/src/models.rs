@@ -3,7 +3,7 @@
 //! seeding a fresh session from the last remembered selection, and rendering
 //! model metadata for `/model` and `/effort` command responses.
 
-use agens_session::model::model_source;
+use agens_session::model::{model_source, resolved_provider};
 use std::sync::{Arc, Mutex};
 
 use agens_store::{ModelPreference, PreferenceStore, SessionStore};
@@ -11,7 +11,6 @@ use agens_store::{ModelPreference, PreferenceStore, SessionStore};
 use agens_bootstrap::Bootstrap;
 use agens_error::{CliError, ExitStatus};
 use agens_models::ModelSelection;
-use agens_models::default_model;
 use agens_session::context::SessionContext;
 use agens_session::model::current_provider;
 use agens_session::provider::ProviderKind;
@@ -68,7 +67,7 @@ pub fn seed_remembered_tui_selection(
         Err(_) => return Some("Remembered model selection could not be read.".to_owned()),
     };
     let source = model_source(bootstrap, context);
-    let default = default_model(bootstrap.provider_type());
+    let default = resolved_provider(bootstrap, context).default_model();
     let mut selector = ModelSelection::for_source(default, source);
     if selector.apply_model(preference.model()).is_err() {
         return Some(format!(
@@ -136,7 +135,7 @@ pub fn select_tui_model(
             .as_ref()
             .map(|selection| selection.model())
             .or_else(|| bootstrap.model())
-            .unwrap_or_else(|| default_model(bootstrap.provider_type()));
+            .unwrap_or_else(|| resolved_provider(bootstrap, &context).default_model());
         return Ok(format!("Model: {current}. Available: {values}."));
     }
 
@@ -235,7 +234,7 @@ pub fn apply_tui_effort(
         .as_ref()
         .map(|selection| selection.model())
         .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()));
+        .unwrap_or_else(|| resolved_provider(bootstrap, &context).default_model());
     let mut selector = ModelSelection::for_source(model, model_source(bootstrap, &context));
     selector
         .apply_reasoning_effort(effort)

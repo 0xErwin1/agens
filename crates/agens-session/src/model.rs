@@ -4,7 +4,7 @@
 //! the answer: a headless turn and a rendered header ask the same question.
 
 use agens_bootstrap::Bootstrap;
-use agens_models::{ModelSelection, ModelSource, default_model};
+use agens_models::{ModelSelection, ModelSource};
 
 use crate::context::SessionContext;
 use crate::provider::ProviderKind;
@@ -27,6 +27,13 @@ pub fn current_provider(bootstrap: &Bootstrap, context: &SessionContext) -> Opti
         .or_else(|| bootstrap.provider_type().and_then(ProviderKind::parse))
 }
 
+/// The provider a session falls back to once [`current_provider`] declines to
+/// name one. Shared so the effective model and the effective source can never
+/// disagree about which provider they are describing.
+pub fn resolved_provider(bootstrap: &Bootstrap, context: &SessionContext) -> ProviderKind {
+    current_provider(bootstrap, context).unwrap_or(ProviderKind::OpenAiApi)
+}
+
 pub fn effective_model(bootstrap: &Bootstrap, context: &SessionContext) -> String {
     context
         .selection
@@ -39,12 +46,10 @@ pub fn effective_model(bootstrap: &Bootstrap, context: &SessionContext) -> Strin
                 .and_then(|metadata| metadata.model_id.as_deref())
         })
         .or_else(|| bootstrap.model())
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
+        .unwrap_or_else(|| resolved_provider(bootstrap, context).default_model())
         .to_owned()
 }
 
 pub fn model_source(bootstrap: &Bootstrap, context: &SessionContext) -> ModelSource {
-    current_provider(bootstrap, context)
-        .unwrap_or(ProviderKind::OpenAiApi)
-        .source()
+    resolved_provider(bootstrap, context).source()
 }

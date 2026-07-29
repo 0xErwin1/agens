@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
-use agens_models::default_model;
 use agens_models::{ModelSelection, ModelSource};
+use agens_models::{default_model, unknown_provider_message};
 use agens_session::context::SessionContext;
 use agens_session::model::model_source;
 use agens_session::provider::ProviderKind;
@@ -74,7 +74,11 @@ pub fn task_model_catalog(bootstrap: &Bootstrap) -> Result<Vec<String>, CliError
         .and_then(ProviderKind::parse)
         .map(ProviderKind::source)
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
-    ModelSelection::for_source(default_model(bootstrap.provider_type()), source)
+    let model = default_model(bootstrap.provider_type()).ok_or_else(|| {
+        CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
+    })?;
+
+    ModelSelection::for_source(model, source)
         .model_values()
         .map_err(CliError::unavailable)
 }

@@ -15,7 +15,6 @@ use crate::context::SessionContext;
 use crate::provider::ProviderKind;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
-use agens_models::default_model;
 
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
 /// session (its `project` was already recorded), or freshly seeded from the process's own
@@ -252,7 +251,11 @@ pub fn persist_completed_subagent_turn(
         .as_ref()
         .map(|selection| selection.model().to_owned())
         .or_else(|| bootstrap.model().map(ToOwned::to_owned))
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()).to_owned());
+        .unwrap_or_else(|| {
+            crate::model::resolved_provider(bootstrap, &context)
+                .default_model()
+                .to_owned()
+        });
     let active_agent = context
         .active_agent
         .as_ref()

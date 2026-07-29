@@ -21,7 +21,7 @@ use agens_bootstrap::Bootstrap;
 use agens_diagnostics::{next_diagnostic_reference, record_subagent_terminal};
 use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use agens_error::CliError;
-use agens_models::default_model;
+use agens_models::{default_model, unknown_provider_message};
 use agens_permissions::PermissionPrompter;
 use agens_permissions::{
     ProductionPermissionGate, ProductionPermissionResolver, ProductionPromptAuthorization,
@@ -95,10 +95,14 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
     model_resolution_reference: Option<String>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     let task_registry = task_runner.execution_registry().unwrap_or_default();
-    let parent_model = bootstrap
-        .model()
-        .unwrap_or_else(|| default_model(bootstrap.provider_type()))
-        .to_owned();
+    let parent_model = match bootstrap.model() {
+        Some(model) => model.to_owned(),
+        None => default_model(bootstrap.provider_type())
+            .ok_or_else(|| {
+                CliError::configuration(unknown_provider_message(bootstrap.provider_type()))
+            })?
+            .to_owned(),
+    };
     let (provider_tools, dispatcher) = production_tool_runtime_with_parent_task_runner(
         bootstrap,
         project_root,

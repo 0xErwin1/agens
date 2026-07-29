@@ -1,6 +1,6 @@
 //! Opening a dialog and acting on what a person picked in it.
 
-use agens_session::model::{current_provider, model_source};
+use agens_session::model::{current_provider, model_source, resolved_provider};
 
 use agens_core::{AttemptKey, RecoveryOutcome};
 use agens_store::{SessionCursor, SessionStore};
@@ -27,7 +27,6 @@ use agens_auth::ChatGptAuthFlow;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 use agens_models::ModelSelection;
-use agens_models::default_model;
 use agens_session::attempt::active_session_attempts;
 use agens_session::context::current_session_timestamp;
 use agens_session::provider::{CredentialStatus, ProviderKind};
@@ -111,7 +110,7 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| default_model(bootstrap.provider_type()))
+                    .unwrap_or_else(|| resolved_provider(&bootstrap, &context).default_model())
                     .to_owned();
                 let source = model_source(&bootstrap, &context);
                 drop(context);
@@ -159,7 +158,7 @@ impl TuiRuntimeRouter {
                     .as_ref()
                     .map(ModelSelection::model)
                     .or_else(|| bootstrap.model())
-                    .unwrap_or_else(|| default_model(bootstrap.provider_type()));
+                    .unwrap_or_else(|| resolved_provider(&bootstrap, &context).default_model());
                 let selector = context.selection.clone().unwrap_or_else(|| {
                     ModelSelection::for_source(model, model_source(&bootstrap, &context))
                 });

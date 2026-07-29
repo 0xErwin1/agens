@@ -56,6 +56,17 @@ impl ProviderKind {
         }
     }
 
+    /// The model a run falls back to for this provider. Total where
+    /// [`agens_models::default_model`] is partial: a `ProviderKind` has already
+    /// been validated, so there is no unknown provider left to reject.
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "gpt-4.1",
+            Self::OpenAiChatGpt => "gpt-5.5",
+            Self::Moonshot => "kimi-k3",
+        }
+    }
+
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
@@ -254,5 +265,17 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    #[test]
+    fn typed_and_string_default_model_lookups_agree() {
+        for provider in ProviderKind::ALL {
+            assert_eq!(
+                Some(provider.default_model()),
+                agens_models::default_model(Some(provider.identifier())),
+                "default model disagrees for {}",
+                provider.identifier()
+            );
+        }
     }
 }
