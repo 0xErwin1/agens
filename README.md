@@ -186,7 +186,7 @@ nix develop --no-pure-eval -c just verify
 
 ## Documentation
 
-- `ARCHITECTURE.md`: crate boundaries and runtime dependency direction.
+- `ARCHITECTURE.md`: crate boundaries and runtime dependency direction, including how global and project `AGENTS.md` instructions are discovered and appended to every agent's prompt.
 - `AGENTS.md`: concise execution rules for coding agents.
 - `CODE_STYLE.md`: Rust engineering, lint, security, and verification standards.
 - `CONTRIBUTING.md`: setup, TDD, review, dependency, and security workflow.
