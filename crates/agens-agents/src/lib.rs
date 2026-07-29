@@ -7,6 +7,7 @@
 mod active;
 mod catalog;
 mod models;
+mod resolver;
 
 pub use active::{
     PersistedAgentResolution, PersistedAgentResolutionError, ensure_active_agent_runtime,
@@ -18,3 +19,6 @@ pub use catalog::{
     select_subagent, subagent_catalog, task_agent_catalog,
 };
 pub use models::{AgentModelCompatibility, TaskModelValidator, task_model_catalog};
+pub use resolver::{
+    AgentProfileResolver, ProfileOrigin, ResolvedAgentProfile, ResolvedProfileValue,
+};

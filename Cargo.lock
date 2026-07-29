@@ -44,6 +44,7 @@ name = "agens-agents"
 version = "0.1.0"
 dependencies = [
  "agens-bootstrap",
+ "agens-config",
  "agens-core",
  "agens-diagnostics",
  "agens-error",
