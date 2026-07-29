@@ -30,8 +30,8 @@ pub struct ProfileEditorRow {
     pub model: ProfileEditorValue<String>,
     pub effort: ProfileEditorValue<Option<String>>,
     pub unavailable: bool,
-    inherited_model: String,
-    inherited_effort: Option<String>,
+    inherited_models: BTreeMap<ProfileScope, ProfileEditorValue<String>>,
+    inherited_efforts: BTreeMap<ProfileScope, ProfileEditorValue<Option<String>>>,
 }
 
 impl ProfileEditorRow {
@@ -44,20 +44,39 @@ impl ProfileEditorRow {
         unavailable: bool,
     ) -> Self {
         let model = model.into();
+        let model = ProfileEditorValue {
+            value: model,
+            origin: model_origin,
+        };
+        let effort = ProfileEditorValue {
+            value: effort.map(ToOwned::to_owned),
+            origin: effort_origin,
+        };
         Self {
             name: name.into(),
-            inherited_model: model.clone(),
-            inherited_effort: effort.map(ToOwned::to_owned),
-            model: ProfileEditorValue {
-                value: model,
-                origin: model_origin,
-            },
-            effort: ProfileEditorValue {
-                value: effort.map(ToOwned::to_owned),
-                origin: effort_origin,
-            },
+            inherited_models: BTreeMap::from([
+                (ProfileScope::Global, model.clone()),
+                (ProfileScope::Project, model.clone()),
+            ]),
+            inherited_efforts: BTreeMap::from([
+                (ProfileScope::Global, effort.clone()),
+                (ProfileScope::Project, effort.clone()),
+            ]),
+            model,
+            effort,
             unavailable,
         }
+    }
+
+    pub fn with_scope_inherited_values(
+        mut self,
+        scope: ProfileScope,
+        model: ProfileEditorValue<String>,
+        effort: ProfileEditorValue<Option<String>>,
+    ) -> Self {
+        self.inherited_models.insert(scope, model);
+        self.inherited_efforts.insert(scope, effort);
+        self
     }
 }
 
@@ -136,9 +155,10 @@ impl ProfileEditor {
             .original
             .iter()
             .find(|row| row.name == name)
-            .map(|row| (row.inherited_model.clone(), row.model.origin));
-        if let (Some(row), Some((value, origin))) = (self.row_mut(name), inherited) {
-            row.model = ProfileEditorValue { value, origin };
+            .and_then(|row| row.inherited_models.get(&self.scope))
+            .cloned();
+        if let (Some(row), Some(value)) = (self.row_mut(name), inherited) {
+            row.model = value;
             self.patch_mut(name).model = Some(None);
         }
     }
@@ -148,9 +168,10 @@ impl ProfileEditor {
             .original
             .iter()
             .find(|row| row.name == name)
-            .map(|row| (row.inherited_effort.clone(), row.effort.origin));
-        if let (Some(row), Some((value, origin))) = (self.row_mut(name), inherited) {
-            row.effort = ProfileEditorValue { value, origin };
+            .and_then(|row| row.inherited_efforts.get(&self.scope))
+            .cloned();
+        if let (Some(row), Some(value)) = (self.row_mut(name), inherited) {
+            row.effort = value;
             self.patch_mut(name).effort = Some(None);
         }
     }

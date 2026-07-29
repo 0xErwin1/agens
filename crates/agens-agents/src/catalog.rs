@@ -15,8 +15,6 @@ use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
 use agens_tools::{AgentCatalog, AgentModelValidator};
 
-use crate::models::AgentModelCompatibility;
-
 pub fn select_subagent(
     bootstrap: &Bootstrap,
     name: &str,
@@ -56,16 +54,9 @@ pub fn subagent_catalog(
         return Ok(Vec::new().into_iter());
     }
 
-    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let agents = agent_catalog_for_context(bootstrap, context)?
         .subagents()
         .filter(|agent| agent.mode == agens_core::AgentMode::Subagent)
-        .filter(|agent| {
-            agent
-                .model
-                .as_deref()
-                .is_none_or(|model| validator.is_available(model))
-        })
         .cloned()
         .collect::<Vec<_>>();
     Ok(agents.into_iter())
@@ -86,9 +77,8 @@ pub fn agent_catalog_for_context(
     bootstrap: &Bootstrap,
     context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
-    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
-    agent_catalog(bootstrap, &project_root, &validator)
+    discover_agent_catalog(bootstrap, &project_root, None)
 }
 
 pub fn task_agent_catalog(

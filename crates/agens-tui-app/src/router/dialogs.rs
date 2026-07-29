@@ -1,5 +1,7 @@
 //! Opening a dialog and acting on what a person picked in it.
 
+use std::collections::BTreeMap;
+
 use agens_session::model::{current_provider, model_source, resolved_provider};
 
 use agens_core::{AttemptKey, RecoveryOutcome};
@@ -300,27 +302,63 @@ impl TuiRuntimeRouter {
                 let session_effort = self.task_parent_request_config()?.reasoning_effort();
                 let compatibility =
                     agens_agents::AgentModelCompatibility::for_context(&bootstrap, &context)?;
+                let profiles = session_config.agent_profiles();
+                let global_profiles = agens_bootstrap::session_config::ScopedAgentProfiles::new(
+                    profiles.global().clone(),
+                    BTreeMap::new(),
+                );
+                let inherited_profiles =
+                    agens_bootstrap::session_config::ScopedAgentProfiles::default();
                 let rows = subagent_catalog(&bootstrap, &context)?
                     .map(|agent| {
-                        let resolved = AgentProfileResolver::new(session_config.agent_profiles())
-                            .resolve(
+                        let resolve = |profiles| {
+                            AgentProfileResolver::new(profiles).resolve(
                                 &agent.name,
                                 agent.model.as_deref(),
                                 agent.reasoning_effort,
                                 presentation.model(),
                                 session_effort,
-                            );
+                            )
+                        };
+                        let resolved = resolve(profiles);
+                        let unavailable = !compatibility.is_available(&resolved.model.value);
+                        let project_inherited = resolve(&global_profiles);
+                        let global_inherited = resolve(&inherited_profiles);
                         ProfileEditorRow::new(
                             &agent.name,
                             resolved.model.value,
                             resolved.model.origin,
                             resolved.effort.value.map(|value| value.as_str()),
                             resolved.effort.origin,
-                            !compatibility.is_available(
-                                &agent
-                                    .model
-                                    .unwrap_or_else(|| presentation.model().to_owned()),
-                            ),
+                            unavailable,
+                        )
+                        .with_scope_inherited_values(
+                            crate::profiles::ProfileScope::Project,
+                            crate::profiles::ProfileEditorValue {
+                                value: project_inherited.model.value,
+                                origin: project_inherited.model.origin,
+                            },
+                            crate::profiles::ProfileEditorValue {
+                                value: project_inherited
+                                    .effort
+                                    .value
+                                    .map(|value| value.as_str().to_owned()),
+                                origin: project_inherited.effort.origin,
+                            },
+                        )
+                        .with_scope_inherited_values(
+                            crate::profiles::ProfileScope::Global,
+                            crate::profiles::ProfileEditorValue {
+                                value: global_inherited.model.value,
+                                origin: global_inherited.model.origin,
+                            },
+                            crate::profiles::ProfileEditorValue {
+                                value: global_inherited
+                                    .effort
+                                    .value
+                                    .map(|value| value.as_str().to_owned()),
+                                origin: global_inherited.effort.origin,
+                            },
                         )
                     })
                     .collect::<Vec<_>>();
