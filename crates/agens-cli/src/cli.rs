@@ -88,6 +88,12 @@ pub(crate) enum AuthAction {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum LoginMethod {
+    #[command(about = "log in to a ChatGPT subscription through OAuth")]
+    Chatgpt {
+        /// Use the device-code flow instead of opening a browser.
+        #[arg(long)]
+        device_auth: bool,
+    },
     #[command(about = "log in with an API key instead of ChatGPT")]
     ApiKey {
         provider: String,

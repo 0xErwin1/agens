@@ -463,7 +463,7 @@ fn unavailable_surfaces_fail_explicitly_without_claiming_success() {
         BTreeMap::new(),
     );
 
-    let result = execute(["auth", "login"], &dependencies);
+    let result = execute(["auth", "login", "chatgpt"], &dependencies);
 
     assert_eq!(result.status, ExitStatus::Unavailable);
     assert_eq!(result.stdout, "");
@@ -563,7 +563,7 @@ fn auth_login_selects_browser_or_device_flow_and_uses_the_compatible_credentials
         }
     });
 
-    let browser = execute(["auth", "login"], &dependencies);
+    let browser = execute(["auth", "login", "chatgpt"], &dependencies);
     let device = execute(["auth", "login", "--device-auth"], &dependencies);
 
     assert_eq!(browser.status, ExitStatus::Success);
@@ -595,7 +595,8 @@ fn auth_login_stops_before_start_for_command_cancellation_or_timeout() {
         (cancelled, "error: auth: ChatGPT login was cancelled\n"),
         (expired, "error: auth: ChatGPT login timed out\n"),
     ] {
-        let result = execute_with_cancellation(["auth", "login"], &dependencies, &cancellation);
+        let result =
+            execute_with_cancellation(["auth", "login", "chatgpt"], &dependencies, &cancellation);
         assert_eq!(result.status, ExitStatus::Authentication);
         assert_eq!(result.stderr, expected);
     }
@@ -1111,7 +1112,7 @@ fn every_leaf_command_accepts_help_without_bootstrapping_configuration() {
     // either way. Each rendering therefore has a known, exact expected text.
     const CONFIG_DOCTOR_HELP: &str = "report the effective configuration and where each setting came from\n\nUsage: agens config doctor\n\nOptions:\n  -h, --help  Print help\n";
     const AUTH_STATUS_HELP: &str = "report authentication status for ChatGPT or an API-key provider\n\nUsage: agens auth status [PROVIDER]\n\nArguments:\n  [PROVIDER]  \n\nOptions:\n  -h, --help  Print help\n";
-    const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  api-key  log in with an API key instead of ChatGPT\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
+    const AUTH_LOGIN_HELP: &str = "log in to ChatGPT or an API-key provider\n\nUsage: agens auth login [OPTIONS] [COMMAND]\n\nCommands:\n  chatgpt  log in to a ChatGPT subscription through OAuth\n  api-key  log in with an API key instead of ChatGPT\n\nOptions:\n      --device-auth  Use the device-code flow instead of opening a browser\n  -h, --help         Print help\n";
     const AUTH_LOGOUT_HELP: &str = "remove stored credentials for a provider\n\nUsage: agens auth logout <PROVIDER>\n\nArguments:\n  <PROVIDER>  \n\nOptions:\n  -h, --help  Print help\n";
     const MODELS_HELP: &str =
         "list provider models\n\nUsage: agens models\n\nOptions:\n  -h, --help  Print help\n";

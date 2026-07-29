@@ -44,12 +44,24 @@ pub(crate) fn run_auth(
             provider_status(&bootstrap.paths.credentials, provider)
         }
         cli::AuthAction::Login {
-            device_auth,
+            device_auth: false,
             method: None,
+        } => Err(CliError::usage(login_methods())),
+        cli::AuthAction::Login {
+            device_auth: true,
+            method: None,
+        }
+        | cli::AuthAction::Login {
+            device_auth: true,
+            method: Some(cli::LoginMethod::Chatgpt { .. }),
+        } => run_auth_login(dependencies, true, cancellation),
+        cli::AuthAction::Login {
+            device_auth: false,
+            method: Some(cli::LoginMethod::Chatgpt { device_auth }),
         } => run_auth_login(dependencies, device_auth, cancellation),
         cli::AuthAction::Login {
             device_auth: true,
-            method: Some(_),
+            method: Some(cli::LoginMethod::ApiKey { .. }),
         } => {
             // clap parses `--device-auth` and `api-key ...` together
             // without complaint (a plain flag cannot `conflicts_with` a
@@ -80,6 +92,32 @@ pub(crate) fn run_auth(
             }
         }
     }
+}
+
+/// What `auth login` offers when it is not told which provider to use.
+///
+/// Naming one of them as the default would be a guess about which account the
+/// user wants to spend, so the command lists them and stops instead.
+fn login_methods() -> String {
+    let mut message = String::from("auth login requires a provider:\n");
+    for (command, description) in [
+        (
+            "agens auth login chatgpt",
+            "ChatGPT subscription, through OAuth in a browser",
+        ),
+        (
+            "agens auth login chatgpt --device-auth",
+            "ChatGPT subscription, through a device code",
+        ),
+        ("agens auth login api-key openai-api", "OpenAI API key"),
+        (
+            "agens auth login api-key moonshotai",
+            "Moonshot AI (Kimi) API key",
+        ),
+    ] {
+        message.push_str(&format!("\n  {command}\n      {description}\n"));
+    }
+    message.trim_end().to_owned()
 }
 
 #[derive(Clone, Copy)]
@@ -175,11 +213,26 @@ fn read_api_key(supplied_key: Option<&str>) -> Result<String, CliError> {
     }
 }
 
+/// The largest key either input path accepts, so a stuck producer cannot grow
+/// the buffer without bound.
+const MAX_API_KEY_INPUT_BYTES: u64 = 8192;
+
+/// Reads a key from the terminal without ever echoing it, showing one mask
+/// character per accepted byte so the terminal does not look frozen.
+///
+/// The terminal is put in raw mode, which means this loop — not the kernel —
+/// owns interrupt handling. That is deliberate: the process installs an async
+/// `ctrl_c` handler that replaces SIGINT's default disposition, so a blocking
+/// line read here would swallow the interrupt and leave the prompt waiting
+/// forever with the terminal still not echoing.
 #[cfg(unix)]
 fn read_hidden_tty_api_key() -> Result<String, CliError> {
-    struct EchoGuard(libc::termios);
+    const MASK: &str = "*";
+    const ERASE: &str = "\u{8} \u{8}";
 
-    impl Drop for EchoGuard {
+    struct TerminalGuard(libc::termios);
+
+    impl Drop for TerminalGuard {
         fn drop(&mut self) {
             unsafe {
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
@@ -192,21 +245,77 @@ fn read_hidden_tty_api_key() -> Result<String, CliError> {
         return Err(CliError::authentication("API-key input is unavailable"));
     }
     let original = unsafe { original.assume_init() };
-    let _guard = EchoGuard(original);
-    let mut hidden = original;
-    hidden.c_lflag &= !libc::ECHO;
-    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+    let _guard = TerminalGuard(original);
+
+    let mut raw = original;
+    raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
         return Err(CliError::authentication("API-key input is unavailable"));
     }
 
-    eprint!("API key: ");
+    eprint!("API key (ctrl-c to cancel): ");
     let _ = std::io::stderr().flush();
+
     let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|_| CliError::authentication("API-key input is unavailable"))?;
+    let mut stdin = std::io::stdin().lock();
+    let mut byte = [0_u8; 1];
+
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => return Err(CliError::authentication("API-key input is unavailable")),
+        }
+
+        match byte[0] {
+            b'\r' | b'\n' => break,
+            0x03 | 0x04 => {
+                eprintln!();
+                return Err(CliError::authentication("API-key login was cancelled"));
+            }
+            0x15 => {
+                for _ in 0..input.chars().count() {
+                    eprint!("{ERASE}");
+                }
+                input.clear();
+            }
+            0x7f | 0x08 => {
+                if input.pop().is_some() {
+                    eprint!("{ERASE}");
+                }
+            }
+            0x1b => discard_escape_sequence(&mut stdin),
+            value
+                if (value.is_ascii_graphic() || value == b' ')
+                    && input.len() < MAX_API_KEY_INPUT_BYTES as usize =>
+            {
+                input.push(char::from(value));
+                eprint!("{MASK}");
+            }
+            _ => {}
+        }
+
+        let _ = std::io::stderr().flush();
+    }
+
     eprintln!();
     normalize_api_key_input(&input)
+}
+
+/// Swallows the rest of a terminal escape sequence so an arrow key does not
+/// arrive as the printable characters that follow the escape byte.
+#[cfg(unix)]
+fn discard_escape_sequence(stdin: &mut std::io::StdinLock<'_>) {
+    let mut byte = [0_u8; 1];
+    if stdin.read(&mut byte).unwrap_or(0) == 0 || byte[0] != b'[' {
+        return;
+    }
+
+    while stdin.read(&mut byte).unwrap_or(0) == 1 {
+        if byte[0].is_ascii_alphabetic() || byte[0] == b'~' {
+            return;
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -215,8 +324,6 @@ fn read_hidden_tty_api_key() -> Result<String, CliError> {
 }
 
 fn read_stdin_api_key() -> Result<String, CliError> {
-    const MAX_API_KEY_INPUT_BYTES: u64 = 8192;
-
     let mut input = String::new();
     std::io::stdin()
         .take(MAX_API_KEY_INPUT_BYTES + 1)
