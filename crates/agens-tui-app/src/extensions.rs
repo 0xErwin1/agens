@@ -12,6 +12,7 @@ pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "agent",
     "bypass",
     "connect",
+    "dangerous",
     "disconnect",
     "diagnostics",
     "effort",
@@ -53,6 +54,18 @@ const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
         "Show or set reasoning effort",
         "[level]",
         Some("effort"),
+    ),
+    (
+        "bypass",
+        "Toggle skipping permission prompts",
+        "",
+        Some("bypass"),
+    ),
+    (
+        "dangerous",
+        "Toggle dangerous mode for subagent tools",
+        "",
+        Some("dangerous"),
     ),
     ("help", "Show commands and skills", "", Some("help")),
     ("mcp", "Show configured MCP servers", "", Some("mcp")),
@@ -582,6 +595,23 @@ mod tests {
         std::fs::remove_dir_all(temporary).unwrap();
     }
 
+    /// Both safety toggles are routed and reserved, but a command absent from the palette is
+    /// unreachable in practice: the palette stays open once `/` is typed and Enter runs the
+    /// highlighted entry, so typing the full name selects a different command instead.
+    #[test]
+    fn the_palette_offers_both_safety_toggles() {
+        let palette =
+            resolved_tui_palette(&CommandCatalog::default(), &SkillCatalog::default(), false);
+
+        for name in ["bypass", "dangerous"] {
+            let entry = palette
+                .iter()
+                .find(|entry| entry.name() == name)
+                .unwrap_or_else(|| panic!("palette should offer /{name}"));
+            assert_eq!(entry.kind(), PaletteEntryKind::BuiltIn);
+        }
+    }
+
     #[test]
     fn tui_palette_uses_the_resolved_surface_and_renders_inside_a_narrow_resize() {
         let temporary = tui_session_directory("resolved-palette");
@@ -641,6 +671,8 @@ mod tests {
                 "provider",
                 "model",
                 "effort",
+                "bypass",
+                "dangerous",
                 "help",
                 "mcp",
                 "select",
