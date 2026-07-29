@@ -622,6 +622,9 @@ impl TuiRuntimeRouter {
                 "Subagent profile edits discarded.".into(),
             ));
         }
+        if action == "back" {
+            return self.open_dialog("subagent-profiles");
+        }
         if let Some(scope) = action.strip_prefix("scope:") {
             let scope = match scope {
                 "global" => ProfileScope::Global,
@@ -687,11 +690,10 @@ impl TuiRuntimeRouter {
                     )
                 })
                 .collect();
-            return Ok(TuiSubmissionOutcome::Dialog(DialogView::selection(
-                "Choose effort",
-                Some("Profile effort"),
-                entries,
-            )));
+            return Ok(TuiSubmissionOutcome::Dialog(
+                DialogView::selection("Choose effort", Some("Profile effort · Esc back"), entries)
+                    .with_cancellation_action("subagent-profiles:back"),
+            ));
         }
         if let Some(rest) = action.strip_prefix("set-model:") {
             let (name, model) = rest
@@ -756,11 +758,14 @@ impl TuiRuntimeRouter {
                 ));
             }
         }
-        Ok(TuiSubmissionOutcome::Dialog(DialogView::selection(
-            "Choose profile model",
-            Some("Active provider catalog"),
-            entries,
-        )))
+        Ok(TuiSubmissionOutcome::Dialog(
+            DialogView::selection(
+                "Choose profile model",
+                Some("Active provider catalog · Esc back"),
+                entries,
+            )
+            .with_cancellation_action("subagent-profiles:back"),
+        ))
     }
 
     pub(super) fn recover_tui_session_attempt(

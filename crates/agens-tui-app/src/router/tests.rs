@@ -418,6 +418,103 @@ fn subagent_profile_overlay_stages_scope_specific_save_and_cancel_actions() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+#[test]
+fn subagent_profile_pickers_escape_back_to_the_agent_list_keeping_staged_edits() {
+    let bootstrap = bootstrap_from_configuration(
+        "subagent-profile-picker-back",
+        Some("[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n"),
+        None,
+    );
+    let root = std::env::temp_dir()
+        .join(format!(
+            "agens-subagent-profile-picker-back-{}",
+            std::process::id()
+        ))
+        .join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut context = SessionContext::fresh();
+    context.confinement_root = Some(root.clone());
+    let session = Arc::new(Mutex::new(context));
+    let cancellation = Arc::new(Mutex::new(None));
+    let store = Arc::new(RecordingProfileStore {
+        saved: Mutex::new(Vec::new()),
+    });
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        session,
+        cancellation,
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    )
+    .with_profile_store(store.clone());
+    let progress = std::sync::mpsc::channel().0;
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+
+    tui.apply_submission_outcome(router.route_request(
+        TuiRouteRequest::OpenDialog("subagent-profiles".into()),
+        progress.clone(),
+    ));
+    router.route_dialog_action("subagent-profiles:scope:project", progress.clone());
+    router.route_dialog_action(
+        "subagent-profiles:set-effort:explore:high",
+        progress.clone(),
+    );
+
+    let model_picker =
+        router.route_dialog_action("subagent-profiles:edit:explore", progress.clone());
+    assert!(tui.apply_submission_outcome(model_picker).is_none());
+    assert!(render_tui_test_backend(&tui, 120, 24).contains("Choose profile model"));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Escape)),
+        Action::SafeDialogAction("subagent-profiles:back".into()),
+        "Escape in the model picker must go back to the agent list, not close"
+    );
+    let back = router.route_request(
+        TuiRouteRequest::DialogAction("subagent-profiles:back".into()),
+        progress.clone(),
+    );
+    assert!(tui.apply_submission_outcome(back).is_none());
+    let overlay = render_tui_test_backend(&tui, 120, 24);
+    assert!(
+        overlay.contains("Subagent profiles"),
+        "back must reopen the agent list: {overlay:?}"
+    );
+
+    let effort_picker =
+        router.route_dialog_action("subagent-profiles:effort:explore", progress.clone());
+    assert!(tui.apply_submission_outcome(effort_picker).is_none());
+    assert!(render_tui_test_backend(&tui, 120, 24).contains("Choose effort"));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Escape)),
+        Action::SafeDialogAction("subagent-profiles:back".into()),
+        "Escape in the effort picker must go back to the agent list, not close"
+    );
+    let back = router.route_request(
+        TuiRouteRequest::DialogAction("subagent-profiles:back".into()),
+        progress.clone(),
+    );
+    assert!(tui.apply_submission_outcome(back).is_none());
+    assert!(render_tui_test_backend(&tui, 120, 24).contains("Subagent profiles"));
+
+    assert!(matches!(
+        router.route_dialog_action("subagent-profiles:save", progress),
+        TuiSubmissionOutcome::LocalInfo(message) if message == "Subagent profiles saved."
+    ));
+    let saved = store.saved.lock().unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].0, ProfileScope::Project);
+    assert_eq!(saved[0].1, "explore");
+    assert_eq!(
+        saved[0].2.effort,
+        Some(Some("high".to_owned())),
+        "the staged edit must survive picker back navigation"
+    );
+
+    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+}
+
 fn test_chatgpt_credentials(
     access_token: &str,
 ) -> agens_providers::chatgpt_login::ChatGptCredentials {
