@@ -2487,13 +2487,13 @@ fn tui_native_select_preserves_running_turn_outcomes_and_terminal_cleanup() {
         tui.handle(Event::Key(Key::Escape)),
         Action::SafeDialogAction("select:cancel".into())
     );
-    assert_eq!(
-        router.route_request(
-            TuiRouteRequest::DialogAction("select:cancel".into()),
-            std::sync::mpsc::channel().0,
-        ),
-        TuiSubmissionOutcome::SelectionCancelled
+    let cancelled = router.route_request(
+        TuiRouteRequest::DialogAction("select:cancel".into()),
+        std::sync::mpsc::channel().0,
     );
+    assert_eq!(cancelled, TuiSubmissionOutcome::SelectionCancelled);
+    assert!(tui.apply_submission_outcome(cancelled).is_none());
+    assert!(tui.view().dialog.is_none());
     guard.restore(&mut control).unwrap();
     assert_tui_terminal_restored(&control);
 

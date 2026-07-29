@@ -4941,7 +4941,6 @@ where
                 }
                 _ => None,
             })?;
-        self.dialog = None;
         Some(matched)
     }
 
@@ -4959,7 +4958,6 @@ where
                 .find(|(index, _)| *index == dialog.selected)
                 .and_then(|(_, entry)| entry.id.clone())
         })?;
-        self.dialog = None;
         Some(Action::DialogAction(
             template.replace("{selected}", id.as_str()),
         ))
@@ -4994,7 +4992,6 @@ where
                         .find(|(key, _)| *key == character)
                         .map(|(_, action)| action.clone())
                 }) {
-                    self.dialog = None;
                     return Action::DialogAction(action_id);
                 }
                 if let Some(action) = self.try_confirm_shortcut(character) {
@@ -5102,14 +5099,8 @@ where
                         .and_then(|(_, entry)| entry.action.clone())
                 });
                 match action {
-                    Some(DialogEntryAction::Dispatch(action_id)) => {
-                        if !is_session_resume_action(&action_id) {
-                            self.dialog = None;
-                        }
-                        Action::DialogAction(action_id)
-                    }
+                    Some(DialogEntryAction::Dispatch(action_id)) => Action::DialogAction(action_id),
                     Some(DialogEntryAction::SafeDispatch(action_id)) => {
-                        self.dialog = None;
                         Action::SafeDialogAction(action_id)
                     }
                     Some(DialogEntryAction::SelectTranscript(id)) => {
@@ -5141,7 +5132,9 @@ where
                         .as_ref()
                         .is_some_and(|entries| entries.loading)
                 });
-                self.dialog = None;
+                if action_id.is_none() || session_request_loading {
+                    self.dialog = None;
+                }
                 if session_request_loading {
                     Action::CancelRoute
                 } else {
@@ -7844,7 +7837,10 @@ mod runtime_tests {
             tui.handle(Event::Key(Key::Right)),
             Action::DialogAction("profiles:cycle:worker:next".into())
         );
-        assert!(tui.view().dialog.is_none());
+        assert!(
+            tui.view().dialog.is_some(),
+            "the dialog must stay visible until the outcome replaces it"
+        );
 
         tui.show_selection_dialog(dialog());
         tui.handle(Event::Key(Key::Down));
@@ -7852,7 +7848,10 @@ mod runtime_tests {
             tui.handle(Event::Key(Key::Backspace)),
             Action::DialogAction("profiles:reset:scout".into())
         );
-        assert!(tui.view().dialog.is_none());
+        assert!(
+            tui.view().dialog.is_some(),
+            "the dialog must stay visible until the outcome replaces it"
+        );
 
         // A non-empty query keeps Backspace as query editing.
         tui.show_selection_dialog(dialog());
@@ -7871,6 +7870,44 @@ mod runtime_tests {
         );
         assert_eq!(tui.handle(Event::Key(Key::Right)), Action::Render);
         assert!(tui.view().dialog.is_some());
+    }
+
+    #[test]
+    fn dispatched_actions_keep_the_dialog_until_the_outcome_replaces_it() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.show_selection_dialog(DialogView::selection(
+            "Profiles",
+            Some("help"),
+            vec![DialogEntry::action("worker", "profiles:edit:worker")],
+        ));
+
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("profiles:edit:worker".into())
+        );
+        assert!(
+            tui.view().dialog.is_some(),
+            "dispatch must not blank the current dialog"
+        );
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::selection(
+            "Choose profile model",
+            Some("help"),
+            vec![DialogEntry::action(
+                "gpt-4.1",
+                "profiles:set-model:worker:gpt-4.1",
+            )],
+        )));
+        assert!(
+            tui.view().dialog.is_some(),
+            "a dialog outcome replaces the previous one atomically"
+        );
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::LocalInfo("done".into()));
+        assert!(
+            tui.view().dialog.is_none(),
+            "a non-dialog outcome closes the dialog"
+        );
     }
 
     #[test]
