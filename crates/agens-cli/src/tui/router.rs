@@ -25,7 +25,6 @@ use agens_tui::{
 };
 
 use crate::chatgpt_auth::{self, ChatGptAuthCoordinator, ChatGptAuthFlow, ChatGptAuthProgress};
-use crate::mcp::load_configured_mcp_registry;
 use crate::session::agents::rotate_agent;
 use crate::tui::dialogs::{diagnostics_dialog, mcp_status_dialog};
 use crate::tui::extensions::{
@@ -59,6 +58,7 @@ use agens_session::provider::{
     ChatGptCredentialSnapshot, CredentialResolver, CredentialStatus, ProviderKind,
     restore_chatgpt_credentials, snapshot_chatgpt_credentials,
 };
+use agens_tool_runtime::mcp::load_configured_mcp_registry;
 
 pub(crate) const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 

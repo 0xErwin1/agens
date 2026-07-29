@@ -12,7 +12,6 @@ use agens_store::SessionStore;
 use agens_tools::AgentModelValidator;
 use agens_tools::SkillCatalog;
 
-use crate::tools::runtime::production_tool_runtime;
 use agens_agents::{
     AgentModelCompatibility, agent_catalog, agent_rotation_error, ensure_active_agent_runtime,
 };
@@ -25,6 +24,7 @@ use agens_models::{ModelSelection, ModelSource};
 use agens_session::context::SessionContext;
 use agens_session::context::rotate_active_agent;
 use agens_session::model::effective_model;
+use agens_tool_runtime::runtime::production_tool_runtime;
 pub(crate) fn rotate_agent(
     bootstrap: &Bootstrap,
     name: &str,

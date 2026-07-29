@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# Pins which workspace crates each crate may reach.
+#
+# The list is deduplicated because a crate legitimately appears in both
+# `[dependencies]` and `[dev-dependencies]` when the dev entry exists only to
+# enable a test-seam feature. What this contract pins is which crates are
+# reachable, not how many manifest entries name them.
 set -euo pipefail
 
 metadata="$(cargo metadata --format-version 1 --no-deps)"
@@ -55,6 +61,24 @@ jq -e '
     "agens-providers": ["agens-config", "agens-core"],
     "agens-tools": ["agens-config", "agens-core"],
     "agens-store": ["agens-core"],
+    "agens-tool-runtime": [
+      "agens-agents",
+      "agens-bootstrap",
+      "agens-bus",
+      "agens-callcount",
+      "agens-config",
+      "agens-core",
+      "agens-diagnostics",
+      "agens-dispatch",
+      "agens-error",
+      "agens-fixtures",
+      "agens-models",
+      "agens-permissions",
+      "agens-providers",
+      "agens-session",
+      "agens-store",
+      "agens-tools"
+    ],
     "agens-tui": ["agens-bus", "agens-core"],
     "agens-server": ["agens-core"],
     "agens": [
@@ -74,6 +98,7 @@ jq -e '
       "agens-server",
       "agens-session",
       "agens-store",
+      "agens-tool-runtime",
       "agens-tools",
       "agens-tui"
     ]
@@ -86,6 +111,7 @@ jq -e '
             .dependencies
             | map(.name as $name | select($workspace_names | index($name)) | $name)
             | sort
+            | unique
           )
         })
       | from_entries) as $actual

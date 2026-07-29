@@ -16,6 +16,7 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-providers    OpenAI and ChatGPT authentication and streaming adapters
   -> agens-store        SQLite sessions, grants, and the evidence ledger
   -> agens-tools        native tools, MCP, skills, and subagents
+  -> agens-tool-runtime assembling and running the tools a turn can call
   -> agens-permissions  whether a tool call is allowed
   -> agens-dispatch     binding a tool call to the thing that runs it
   -> agens-diagnostics  the sanitized, capacity-bounded record of what went wrong
@@ -42,6 +43,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-providers` | Provider adapters: authentication, streaming, and their error taxonomy. | Choosing a provider or a model for a session. |
 | `agens-store` | SQLite: the unified database, migrations, sessions, attempts, grants, the evidence ledger, and paginated transcript reads. | Interpreting what it stores. |
 | `agens-tools` | Native tools and their confinement, permission capabilities, MCP transports, skills, and subagent plumbing. | Deciding whether a call is allowed for a given session. |
+| `agens-tool-runtime` | Assembly and execution: building the native catalog and the MCP registry for a project root, registering the `task` tool, running a delegated task in a confined child process, and launching a subagent a caller armed for the next prompt. | Who asked. A headless run, a terminal session and a daemon worker assemble the same runtime. |
 | `agens-permissions` | Deciding whether a tool call is allowed: rules, grants, session authorization, and which tools a delegated subagent may reach. | Asking a person. That is a surface, and it reaches policy through the `PermissionPrompter` port. |
 | `agens-agents` | Agents as configuration resolved at run time: catalog discovery against the session's own root, the two model validators, and which agent a session is actually running once a persisted choice may have gone away. | Switching agent. Rotation needs a tool runtime, so it sits above this crate. |
 | `agens-diagnostics` | The local failure record: a rotating, size-capped JSONL log written with a closed set of fields, and the reference-scoped handles a provider writes through. | Showing any of it. A surface reads the files and decides what a person sees. |

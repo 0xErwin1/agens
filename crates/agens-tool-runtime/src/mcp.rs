@@ -14,20 +14,18 @@ use agens_tools::{
     RemoteToolMetadata, ToolDispatcher,
 };
 
-use crate::Bootstrap;
+use agens_bootstrap::Bootstrap;
 use agens_dispatch::RegisteredMcpTool;
 use agens_error::CliError;
 use agens_permissions::SharedToolDispatcher;
 
-pub(crate) struct ProductionMcpRuntime {
-    pub(crate) registry: Arc<Mutex<McpRegistry>>,
-    pub(crate) dispatcher: SharedToolDispatcher,
+pub struct ProductionMcpRuntime {
+    pub registry: Arc<Mutex<McpRegistry>>,
+    pub dispatcher: SharedToolDispatcher,
 }
 
 impl ProductionMcpRuntime {
-    pub(crate) fn discover_configured_tools(
-        &mut self,
-    ) -> Result<Vec<RemoteToolMetadata>, CliError> {
+    pub fn discover_configured_tools(&mut self) -> Result<Vec<RemoteToolMetadata>, CliError> {
         let servers = self
             .registry
             .lock()
@@ -41,7 +39,7 @@ impl ProductionMcpRuntime {
         self.tools()
     }
 
-    pub(crate) fn discover_server(
+    pub fn discover_server(
         &mut self,
         server: &str,
     ) -> Result<agens_tools::McpServerReport, CliError> {
@@ -61,7 +59,7 @@ impl ProductionMcpRuntime {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn reload_server(
+    pub fn reload_server(
         &mut self,
         server: &str,
     ) -> Result<agens_tools::McpServerReport, CliError> {
@@ -81,7 +79,7 @@ impl ProductionMcpRuntime {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn diagnostics(&self) -> Result<Vec<agens_tools::McpServerDiagnostic>, CliError> {
+    pub fn diagnostics(&self) -> Result<Vec<agens_tools::McpServerDiagnostic>, CliError> {
         Ok(self
             .registry
             .lock()
@@ -132,10 +130,7 @@ fn synchronize_server_dispatcher(
     Ok(())
 }
 
-pub(crate) fn load_configured_mcp_registry(
-    bootstrap: &Bootstrap,
-    project_root: &Path,
-) -> McpRegistry {
+pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
     let mut registry = bootstrap
         .mcp_status
         .clone()
@@ -221,7 +216,7 @@ fn configured_mcp_transport(
     }
 }
 
-pub(crate) fn native_model_tool_name(qualified_name: &str) -> Result<String, CliError> {
+pub fn native_model_tool_name(qualified_name: &str) -> Result<String, CliError> {
     qualified_name
         .strip_prefix("native::")
         .filter(|name| !name.is_empty())
@@ -229,11 +224,11 @@ pub(crate) fn native_model_tool_name(qualified_name: &str) -> Result<String, Cli
         .ok_or_else(|| CliError::configuration("native tool metadata is invalid"))
 }
 
-pub(crate) fn mcp_model_tool_name(metadata: &RemoteToolMetadata) -> String {
+pub fn mcp_model_tool_name(metadata: &RemoteToolMetadata) -> String {
     format!("{}_{}", metadata.server_name, metadata.tool_name)
 }
 
-pub(crate) fn remote_function_tool(
+pub fn remote_function_tool(
     metadata: &RemoteToolMetadata,
     model_name: String,
 ) -> Result<OpenAiFunctionTool, CliError> {

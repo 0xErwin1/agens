@@ -15,7 +15,6 @@ use agens_tui::{
 };
 
 use crate::Bootstrap;
-use crate::dispatch::{launch_selected_tui_task, selected_tui_task_skips_parent};
 use crate::headless::seed_configured_reasoning_effort;
 use crate::headless::{
     HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
@@ -25,11 +24,6 @@ use crate::headless::{
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
-use crate::tools::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
-use crate::tools::runtime::task_execution_limits;
-use crate::tools::task::{
-    production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
-};
 use crate::tui::extensions::{start_tui_commands, start_tui_skills};
 use crate::tui::files::{expand_tui_file_reference, tui_picker_file_candidates};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
@@ -44,6 +38,15 @@ use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
+use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
+use agens_tool_runtime::runtime::task_execution_limits;
+use agens_tool_runtime::task::{
+    production_tui_task_runtime, production_tui_task_runtime_with_runner_and_parent_config,
+};
+use agens_tool_runtime::{
+    launch_selected_task as launch_selected_tui_task,
+    selected_task_skips_parent as selected_tui_task_skips_parent,
+};
 
 pub(crate) struct ProductionTuiEngine {
     pub(crate) cancellation: Arc<Mutex<Option<HeadlessTurnCancellation>>>,

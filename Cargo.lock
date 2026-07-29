@@ -22,6 +22,7 @@ dependencies = [
  "agens-server",
  "agens-session",
  "agens-store",
+ "agens-tool-runtime",
  "agens-tools",
  "agens-tui",
  "clap",
@@ -191,6 +192,30 @@ dependencies = [
  "agens-core",
  "rusqlite",
  "serde_json",
+]
+
+[[package]]
+name = "agens-tool-runtime"
+version = "0.1.0"
+dependencies = [
+ "agens-agents",
+ "agens-bootstrap",
+ "agens-bus",
+ "agens-callcount",
+ "agens-config",
+ "agens-core",
+ "agens-diagnostics",
+ "agens-dispatch",
+ "agens-error",
+ "agens-fixtures",
+ "agens-models",
+ "agens-permissions",
+ "agens-providers",
+ "agens-session",
+ "agens-store",
+ "agens-tools",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

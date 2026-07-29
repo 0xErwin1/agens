@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use clap::Parser as _;
 
 use agens_core::HeadlessTurnCancellation;
-use agens_core::SubagentErrorKind;
 
 #[cfg(test)]
 mod attempt_tests;
@@ -14,9 +13,9 @@ mod cli;
 mod commands;
 mod deps;
 
-mod dispatch;
+mod child_task_tests;
+mod dispatch_tests;
 mod headless;
-mod mcp;
 mod permission_prompt;
 #[cfg(test)]
 mod permission_tests;
@@ -24,19 +23,16 @@ mod permission_tests;
 mod provider_tests;
 mod session;
 #[cfg(test)]
+mod task_runner_tests;
+mod task_tool_tests;
 mod test_support;
-mod tools;
 mod tui;
 #[cfg(test)]
 mod turns_tests;
 
 use agens_bootstrap::effective_max_iterations;
-use agens_diagnostics::{
-    next_diagnostic_reference, operation_diagnostics, record_parent_terminal,
-    record_subagent_terminal,
-};
+use agens_diagnostics::{operation_diagnostics, record_parent_terminal};
 use agens_error::cancellation_result;
-use headless::block_on_headless_turn;
 use tui::run_tui;
 
 pub use agens_bootstrap::Bootstrap;

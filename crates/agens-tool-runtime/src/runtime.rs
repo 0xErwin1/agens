@@ -13,13 +13,13 @@ use agens_tools::{
     TaskExecutionRegistry, TaskMessageSource, TaskMessageTool, TaskRunner, ToolDispatcher,
 };
 
-use crate::Bootstrap;
 use crate::mcp::{
     ProductionMcpRuntime, load_configured_mcp_registry, mcp_model_tool_name,
     native_model_tool_name, remote_function_tool,
 };
-use crate::tools::runner::ProductionTaskRunner;
-use crate::tools::task::{TaskParentSelection, register_production_task_tool};
+use crate::runner::ProductionTaskRunner;
+use crate::task::{TaskParentSelection, register_production_task_tool};
+use agens_bootstrap::Bootstrap;
 use agens_bootstrap::discover_skill_catalog;
 use agens_dispatch::RegisteredNativeTool;
 use agens_error::CliError;
@@ -27,7 +27,7 @@ use agens_models::default_model;
 use agens_permissions::SharedToolDispatcher;
 
 /// Converts configured tool bounds into the runtime shape the tools crate owns.
-pub(crate) fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {
+pub fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::NativeToolLimits {
     agens_tools::NativeToolLimits {
         max_list_entries: settings.max_list_entries,
         max_search_entries: settings.max_search_entries,
@@ -41,9 +41,7 @@ pub(crate) fn native_tool_limits(settings: ToolLimitSettings) -> agens_tools::Na
 /// Converts configured subagent bounds into the runtime shape the task tool
 /// owns. The `[subagents]` table names the user-facing concept; the registry
 /// names the mechanism that enforces it.
-pub(crate) fn task_execution_limits(
-    settings: SubagentSettings,
-) -> agens_tools::TaskExecutionLimits {
+pub fn task_execution_limits(settings: SubagentSettings) -> agens_tools::TaskExecutionLimits {
     agens_tools::TaskExecutionLimits {
         max_iterations: settings.max_iterations,
         max_concurrency: settings.max_concurrency,
@@ -51,7 +49,7 @@ pub(crate) fn task_execution_limits(
     }
 }
 
-pub(crate) fn open_native_tools(
+pub fn open_native_tools(
     project_root: &Path,
     settings: ToolLimitSettings,
 ) -> Result<NativeTools, CliError> {
@@ -59,7 +57,7 @@ pub(crate) fn open_native_tools(
         .map_err(|_| CliError::configuration("native tools are unavailable"))
 }
 
-pub(crate) fn production_tool_runtime(
+pub fn production_tool_runtime(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
@@ -72,7 +70,7 @@ pub(crate) fn production_tool_runtime(
     )
 }
 
-pub(crate) fn production_tool_runtime_for_parent(
+pub fn production_tool_runtime_for_parent(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
@@ -91,7 +89,7 @@ pub(crate) fn production_tool_runtime_for_parent(
     )
 }
 
-pub(crate) fn production_tool_runtime_with_task_runner<R: TaskRunner>(
+pub fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
@@ -112,7 +110,7 @@ pub(crate) fn production_tool_runtime_with_task_runner<R: TaskRunner>(
     )
 }
 
-pub(crate) fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
+pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     bootstrap: &Bootstrap,
     project_root: &Path,
     skills: Option<&SkillCatalog>,
@@ -121,7 +119,6 @@ pub(crate) fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
     model_resolution_reference: Option<String>,
     task_runner: R,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
-    #[cfg(test)]
     agens_callcount::note_tool_runtime_build();
 
     let native_catalog = Arc::new(Mutex::new(NativeToolCatalog::new(open_native_tools(
@@ -242,7 +239,7 @@ fn production_read_only_tool_runtime(
     Ok((vec![tool], Arc::new(Mutex::new(dispatcher))))
 }
 
-pub(crate) fn production_dangerous_child_tool_runtime(
+pub fn production_dangerous_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
 ) -> Result<(Vec<OpenAiFunctionTool>, SharedToolDispatcher), CliError> {
@@ -284,7 +281,7 @@ pub(crate) fn production_dangerous_child_tool_runtime(
     Ok((provider_tools, Arc::new(Mutex::new(dispatcher))))
 }
 
-pub(crate) fn production_child_tool_runtime(
+pub fn production_child_tool_runtime(
     project_root: &Path,
     tool_limits: ToolLimitSettings,
     dangerous_mode: bool,
@@ -352,11 +349,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::test_support::{
-        bootstrap_from_configuration, tui_session_bootstrap, tui_session_bootstrap_for_provider,
-        tui_session_directory,
-    };
     use agens_agents::task_model_catalog;
+    use agens_fixtures::{
+        bootstrap_from_configuration, session_bootstrap as tui_session_bootstrap,
+        session_bootstrap_for_provider as tui_session_bootstrap_for_provider,
+        session_directory as tui_session_directory,
+    };
 
     #[test]
     fn configured_tool_limits_reach_the_native_tool_runtime() {

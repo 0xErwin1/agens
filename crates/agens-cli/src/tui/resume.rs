@@ -84,7 +84,6 @@ pub(crate) fn load_tui_session_for_resume(
     bootstrap: &Bootstrap,
     identifier: i64,
 ) -> Result<LoadedTuiSessionResume, CliError> {
-    #[cfg(test)]
     agens_callcount::note_session_resume_load();
 
     let store = SessionStore::open(bootstrap.data_directory())
@@ -133,7 +132,6 @@ pub(crate) fn prepare_loaded_tui_session_resume(
         retry_boundary,
         confinement_root,
     } = loaded;
-    #[cfg(test)]
     agens_callcount::note_session_resume_projection();
     let restored_history =
         Conversation::from_messages_with_parser(&session.messages, |name, input| {
@@ -358,13 +356,13 @@ mod tests {
         tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
         tui_session_messages,
     };
-    use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
-    use crate::tools::task::production_tui_task_runtime;
     use crate::tui::engine::ProductionTuiEngine;
     use crate::tui::models::apply_tui_model;
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
     use agens_session::attempt::attempt_failure_status;
+    use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
+    use agens_tool_runtime::task::production_tui_task_runtime;
 
     #[test]
     fn resuming_from_a_different_working_directory_confines_to_the_originally_recorded_root() {

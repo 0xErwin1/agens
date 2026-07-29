@@ -18,9 +18,6 @@ use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, SkillCatalog, TaskMessageTarget};
 
 use crate::permission_prompt::TtyPermissionPrompter;
-use crate::tools::child::TaskMailboxProvider;
-use crate::tools::runtime::production_tool_runtime_for_parent;
-use crate::tools::task::ProductionTuiTaskRuntime;
 use crate::{
     Bootstrap, cancellation_result, effective_max_iterations, operation_diagnostics,
     record_parent_terminal,
@@ -41,6 +38,10 @@ use agens_session::provider::ProviderKind;
 use agens_session::turns::{
     completed_session_turn, next_session_metadata, sanitize_subagent_summary,
 };
+use agens_tool_runtime::block_on_headless_turn;
+use agens_tool_runtime::child::TaskMailboxProvider;
+use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
+use agens_tool_runtime::task::ProductionTuiTaskRuntime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeadlessChatRequest {
@@ -223,7 +224,6 @@ pub(crate) fn run_production_headless_chat_with_progress(
     task_runtime: Option<&ProductionTuiTaskRuntime>,
     operation_reference: Option<&str>,
 ) -> Result<HeadlessChatCompletion, HeadlessChatFailure> {
-    #[cfg(test)]
     agens_callcount::note_provider_runtime_build();
 
     let source = bootstrap
@@ -776,18 +776,6 @@ pub(crate) fn seed_configured_reasoning_effort(
     request.request_config = config;
 }
 
-pub(crate) fn block_on_headless_turn<T>(
-    future: impl std::future::Future<Output = T>,
-) -> Result<T, CliError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .map_err(|_| CliError::runtime(HeadlessTurnError::Provider))?;
-
-    Ok(runtime.block_on(future))
-}
-
 pub(crate) fn explicit_task_delegation_prompt(base: &str) -> String {
     const INSTRUCTION: &str = "When the user explicitly asks for subagent delegation, use the `task` tool instead of completing the delegated work inline. Use `task_control` to inspect, background, or cancel a live execution and `task_message` to send bounded coordination without waiting for completion.";
 
@@ -816,8 +804,8 @@ mod tests {
             bootstrap_from_a_different_working_directory, persist_tui_session, tui_project,
             tui_session_bootstrap, tui_session_directory,
         };
-        use crate::tools::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
-        use crate::tools::task::production_tui_task_runtime;
+        use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
+        use agens_tool_runtime::task::production_tui_task_runtime;
 
         let origin = tui_session_directory("headless-root-origin");
         let creation_bootstrap = tui_session_bootstrap(&origin, &[]);
@@ -888,7 +876,7 @@ mod tests {
      {
         use agens_core::{PermissionDecision, PermissionRequest, PermissionSession, ToolAccess};
 
-        use crate::tools::runtime::production_tool_runtime_for_parent;
+        use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
 
         let temporary = std::env::temp_dir().join(format!(
             "agens-headless-permission-scope-{}",

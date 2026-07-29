@@ -1,0 +1,37 @@
+[package]
+name = "agens-tool-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Test seams (call probes on the task runner) that a dependent crate's tests
+# need to reach. `cfg(test)` cannot cross a crate boundary, so a consumer opts
+# in through this feature instead; production builds never enable it.
+probe = []
+
+[dependencies]
+agens-agents = { path = "../agens-agents" }
+agens-bootstrap = { path = "../agens-bootstrap" }
+agens-bus = { path = "../agens-bus" }
+agens-callcount = { path = "../agens-callcount" }
+agens-config = { path = "../agens-config" }
+agens-core = { path = "../agens-core" }
+agens-diagnostics = { path = "../agens-diagnostics" }
+agens-dispatch = { path = "../agens-dispatch" }
+agens-error = { path = "../agens-error" }
+agens-models = { path = "../agens-models" }
+agens-permissions = { path = "../agens-permissions" }
+agens-providers = { path = "../agens-providers" }
+agens-session = { path = "../agens-session" }
+agens-store = { path = "../agens-store" }
+agens-tools = { path = "../agens-tools" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+
+[dev-dependencies]
+agens-fixtures = { path = "../agens-fixtures" }
