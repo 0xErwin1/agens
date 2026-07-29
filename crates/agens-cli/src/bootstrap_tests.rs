@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod resolution {
-    use crate::headless::seed_configured_reasoning_effort;
+    use agens_headless::seed_configured_reasoning_effort;
     use std::collections::BTreeMap;
 
     use crate::CliDependencies;

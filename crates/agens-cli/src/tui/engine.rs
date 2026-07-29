@@ -15,11 +15,6 @@ use agens_tui::{
 };
 
 use crate::Bootstrap;
-use crate::headless::seed_configured_reasoning_effort;
-use crate::headless::{
-    HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
-    run_production_headless_chat_with_progress,
-};
 #[cfg(test)]
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
@@ -36,6 +31,11 @@ use agens_agents::persist_pending_agent_correction;
 use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
 use agens_error::{CliError, ExitStatus};
+use agens_headless::seed_configured_reasoning_effort;
+use agens_headless::{
+    HeadlessChatCompletion, HeadlessChatFailure, HeadlessChatRequest,
+    run_production_headless_chat_with_progress,
+};
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
@@ -394,7 +394,7 @@ pub(crate) fn run_tui_prompt_with(
             return Err(CliError::runtime(HeadlessTurnError::State));
         }
         session.running = true;
-        let mut request = crate::headless::apply_session_to_request(
+        let mut request = agens_headless::apply_session_to_request(
             &session,
             HeadlessChatRequest {
                 prompt,

@@ -285,7 +285,7 @@ mod tests {
             agens_session::model::effective_model(&bootstrap, &context),
             "gpt-5.5"
         );
-        let request = crate::headless::apply_session_to_request(
+        let request = agens_headless::apply_session_to_request(
             &context,
             chat_request(chat_args_with_prompt("work")).unwrap(),
         );

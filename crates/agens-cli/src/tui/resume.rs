@@ -894,7 +894,7 @@ mod tests {
                 let active = context.active_agent.as_ref().unwrap();
                 assert_eq!(active.name, "primary", "{provider} {model}");
                 assert_eq!(active.model.as_deref(), Some(model), "{provider} {model}");
-                let request = crate::headless::apply_session_to_request(
+                let request = agens_headless::apply_session_to_request(
                     &context,
                     chat_request(chat_args_with_prompt("first submission")).unwrap(),
                 );
@@ -1189,7 +1189,7 @@ mod tests {
                 Some(model),
                 "{provider} {model}"
             );
-            let request = crate::headless::apply_session_to_request(
+            let request = agens_headless::apply_session_to_request(
                 &context,
                 chat_request(chat_args_with_prompt("review")).unwrap(),
             );

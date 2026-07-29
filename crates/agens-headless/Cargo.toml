@@ -1,0 +1,26 @@
+[package]
+name = "agens-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+agens-agents = { path = "../agens-agents" }
+agens-bootstrap = { path = "../agens-bootstrap" }
+agens-callcount = { path = "../agens-callcount" }
+agens-core = { path = "../agens-core" }
+agens-diagnostics = { path = "../agens-diagnostics" }
+agens-dispatch = { path = "../agens-dispatch" }
+agens-error = { path = "../agens-error" }
+agens-models = { path = "../agens-models" }
+agens-permissions = { path = "../agens-permissions" }
+agens-providers = { path = "../agens-providers" }
+agens-session = { path = "../agens-session" }
+agens-store = { path = "../agens-store" }
+agens-tool-runtime = { path = "../agens-tool-runtime" }
+agens-tools = { path = "../agens-tools" }
+serde_json = "1"

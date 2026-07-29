@@ -8,9 +8,9 @@ use std::collections::BTreeSet;
 
 use agens_core::{Message, MessagePart, Role};
 
-use crate::headless::{HeadlessChatCompletion, HeadlessChatFailure};
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
+use agens_headless::{HeadlessChatCompletion, HeadlessChatFailure};
 use agens_models::ModelSelection;
 use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;

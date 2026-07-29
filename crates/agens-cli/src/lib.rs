@@ -16,6 +16,7 @@ mod deps;
 mod child_task_tests;
 mod dispatch_tests;
 mod headless;
+mod headless_tests;
 mod permission_prompt;
 #[cfg(test)]
 mod permission_tests;
@@ -30,17 +31,14 @@ mod tui;
 #[cfg(test)]
 mod turns_tests;
 
-use agens_bootstrap::effective_max_iterations;
-use agens_diagnostics::{operation_diagnostics, record_parent_terminal};
-use agens_error::cancellation_result;
 use tui::run_tui;
 
 pub use agens_bootstrap::Bootstrap;
 pub use agens_error::{CliError, CommandResult, ExitStatus};
+pub use agens_headless::HeadlessChatRequest;
 pub use agens_models::{ModelSelection, ModelSource};
 pub use deps::CliDependencies;
 pub use deps::bootstrap;
-pub use headless::HeadlessChatRequest;
 
 pub fn execute<I, S>(arguments: I, dependencies: &CliDependencies) -> CommandResult
 where

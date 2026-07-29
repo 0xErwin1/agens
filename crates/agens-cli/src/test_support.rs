@@ -21,13 +21,13 @@ use agens_tui::{
     TuiRuntimeEvent,
 };
 
-use crate::headless::HeadlessChatCompletion;
 use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
 use crate::tui::metrics::{TuiMetricsPublisher, finish_tui_metrics};
 use crate::tui::router::{TuiRuntimeRouter, tui_provider_outcome};
 use agens_bootstrap::Bootstrap;
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::CliError;
+use agens_headless::HeadlessChatCompletion;
 use agens_permissions::{
     NativePermissionTarget, PermissionPromptAnswer, PermissionPrompter, ProductionPermissionGate,
     ProductionPermissionResolver, ProductionPromptAuthorization,
@@ -596,7 +596,7 @@ pub(crate) fn submit_tui_command(
     router: &TuiRuntimeRouter,
     bootstrap: &Bootstrap,
     input: &str,
-    captured: &Arc<Mutex<Vec<crate::headless::HeadlessChatRequest>>>,
+    captured: &Arc<Mutex<Vec<agens_headless::HeadlessChatRequest>>>,
 ) {
     let input = enter_tui_input(tui, input);
     let Some(prompt) = tui.apply_submission_outcome(router.route(input)) else {

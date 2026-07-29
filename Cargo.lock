@@ -16,6 +16,7 @@ dependencies = [
  "agens-dispatch",
  "agens-error",
  "agens-fixtures",
+ "agens-headless",
  "agens-models",
  "agens-permissions",
  "agens-providers",
@@ -121,6 +122,27 @@ version = "0.1.0"
 dependencies = [
  "agens-bootstrap",
  "agens-error",
+]
+
+[[package]]
+name = "agens-headless"
+version = "0.1.0"
+dependencies = [
+ "agens-agents",
+ "agens-bootstrap",
+ "agens-callcount",
+ "agens-core",
+ "agens-diagnostics",
+ "agens-dispatch",
+ "agens-error",
+ "agens-models",
+ "agens-permissions",
+ "agens-providers",
+ "agens-session",
+ "agens-store",
+ "agens-tool-runtime",
+ "agens-tools",
+ "serde_json",
 ]
 
 [[package]]

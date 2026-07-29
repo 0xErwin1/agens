@@ -1250,7 +1250,6 @@ mod tests {
     use agens_tui::{Action, Event, Key, Tui};
 
     use super::*;
-    use crate::headless::HeadlessChatCompletion;
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection,
         enter_tui_input, open_tui_palette_dialog, persist_tui_session,
@@ -1261,6 +1260,7 @@ mod tests {
     use crate::tui::engine::{ProductionTuiEngine, run_tui_prompt_with};
     use crate::tui::extensions::{start_tui_commands, start_tui_skills};
     use agens_agents::ensure_active_agent_runtime;
+    use agens_headless::HeadlessChatCompletion;
     use agens_models::ModelSource;
 
     fn write_router_test_skill(root: &Path, name: &str, body: &str) {

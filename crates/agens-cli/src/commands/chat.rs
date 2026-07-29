@@ -6,9 +6,9 @@ use agens_core::{HeadlessTurnCancellation, PermissionMode};
 use crate::CliDependencies;
 use crate::cli;
 use crate::deps::bootstrap;
-use crate::headless::HeadlessChatRequest;
-use crate::headless::seed_configured_reasoning_effort;
 use agens_error::{CliError, cancellation_result};
+use agens_headless::HeadlessChatRequest;
+use agens_headless::seed_configured_reasoning_effort;
 
 pub(crate) fn run_chat(
     arguments: cli::ChatArgs,

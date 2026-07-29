@@ -27,6 +27,7 @@ agens-bootstrap = { path = "../agens-bootstrap" }
 agens-bus = { path = "../agens-bus" }
 agens-callcount = { path = "../agens-callcount" }
 agens-error = { path = "../agens-error" }
+agens-headless = { path = "../agens-headless" }
 agens-models = { path = "../agens-models" }
 agens-permissions = { path = "../agens-permissions" }
 agens-providers = { path = "../agens-providers" }

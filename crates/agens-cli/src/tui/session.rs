@@ -170,7 +170,7 @@ mod tests {
     use agens_core::Message;
     use agens_session::context::SessionContext;
 
-    use crate::headless::HeadlessChatRequest;
+    use agens_headless::HeadlessChatRequest;
     use agens_session::context::{
         AgentRotationError, SessionMutationError, reset_session, rotate_active_agent,
     };
@@ -187,9 +187,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::headless::provider_messages;
     use crate::session::agents::BundledModelValidator;
     use crate::test_support::{rotation_agent, rotation_dispatcher};
+    use agens_headless::provider_messages;
     use agens_permissions::permission_policy;
     use agens_session::turns::completed_session_turn;
 
@@ -350,7 +350,7 @@ mod tests {
             Some("Agent capabilities expanded: primary -> reviewer.")
         );
 
-        let request = crate::headless::apply_session_to_request(
+        let request = agens_headless::apply_session_to_request(
             &context,
             HeadlessChatRequest {
                 prompt: "next".into(),
@@ -601,7 +601,7 @@ mod tests {
             active_agent,
             std::path::PathBuf::from("project"),
         );
-        let request = crate::headless::apply_session_to_request(
+        let request = agens_headless::apply_session_to_request(
             &context,
             HeadlessChatRequest {
                 prompt: "next question".into(),
@@ -630,7 +630,7 @@ mod tests {
 
     #[test]
     fn fresh_tui_session_does_not_reuse_prior_context() {
-        let request = crate::headless::apply_session_to_request(
+        let request = agens_headless::apply_session_to_request(
             &SessionContext::fresh(),
             HeadlessChatRequest {
                 prompt: "new question".into(),
