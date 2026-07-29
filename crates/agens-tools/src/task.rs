@@ -854,6 +854,7 @@ pub struct TaskTurnRequest {
     request_config: RequestConfig,
     skills: Vec<TaskSkill>,
     description: String,
+    fallback_warning: Option<String>,
 }
 
 impl TaskTurnRequest {
@@ -900,9 +901,13 @@ pub enum TaskRunnerError {
     ChildFailure,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskModelResolutionError {
-    ModelUnavailable,
+    ModelUnavailable {
+        agent: String,
+        requested_model: String,
+        fallback_model: String,
+    },
 }
 
 #[derive(Clone)]
@@ -1135,17 +1140,17 @@ impl<R: TaskRunner> TaskTool<R> {
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let (model, mut request_config) = match invocation.model {
+        let (model, mut request_config, fallback_warning) = match invocation.model {
             Some(model) => {
                 if self.model_validator.validate_model(&model).is_err() {
-                    return Err(self.model_unavailable_output());
+                    return Err(self.model_unavailable_output(&agent.name, &model));
                 }
                 let request_config = if model == self.parent_model {
                     self.parent_request_config.clone()
                 } else {
                     RequestConfig::default()
                 };
-                (model, request_config)
+                (model, request_config, None)
             }
             None => match agent.model.clone() {
                 Some(model) if self.model_validator.validate_model(&model).is_ok() => {
@@ -1154,18 +1159,26 @@ impl<R: TaskRunner> TaskTool<R> {
                     } else {
                         RequestConfig::default()
                     };
-                    (model, request_config)
+                    (model, request_config, None)
                 }
-                Some(_) => {
-                    self.record_model_unavailable();
+                Some(model) => {
+                    let reference = self.record_model_unavailable(&agent.name, &model);
+                    let warning = fallback_warning(
+                        &agent.name,
+                        &model,
+                        &self.parent_model,
+                        reference.as_deref(),
+                    );
                     (
                         self.parent_model.clone(),
                         self.parent_request_config.clone(),
+                        Some(warning),
                     )
                 }
                 None => (
                     self.parent_model.clone(),
                     self.parent_request_config.clone(),
+                    None,
                 ),
             },
         };
@@ -1182,12 +1195,13 @@ impl<R: TaskRunner> TaskTool<R> {
             request_config,
             skills,
             description: invocation.description,
+            fallback_warning,
         })
     }
 
-    fn model_unavailable_output(&self) -> ToolOutput {
+    fn model_unavailable_output(&self, agent: &str, requested_model: &str) -> ToolOutput {
         let mut output = task_terminal(HeadlessTaskTerminal::ModelUnavailable);
-        let reference = self.record_model_unavailable();
+        let reference = self.record_model_unavailable(agent, requested_model);
         if let Some(reference) = reference {
             output.content.push_str(" [ref: ");
             output.content.push_str(&reference);
@@ -1196,10 +1210,16 @@ impl<R: TaskRunner> TaskTool<R> {
         output
     }
 
-    fn record_model_unavailable(&self) -> Option<String> {
+    fn record_model_unavailable(&self, agent: &str, requested_model: &str) -> Option<String> {
         self.model_resolution_diagnostics
             .as_ref()
-            .and_then(|diagnostics| diagnostics(TaskModelResolutionError::ModelUnavailable))
+            .and_then(|diagnostics| {
+                diagnostics(TaskModelResolutionError::ModelUnavailable {
+                    agent: agent.to_owned(),
+                    requested_model: requested_model.to_owned(),
+                    fallback_model: self.parent_model.clone(),
+                })
+            })
             .filter(|reference| is_diagnostic_reference(reference))
     }
 
@@ -1311,6 +1331,7 @@ impl<R: TaskRunner> TaskTool<R> {
         let registry = self.registry.clone();
         let worker_context = context.clone();
         let worker = thread::spawn(move || {
+            let fallback_warning = request.fallback_warning.clone();
             let mut output = {
                 let _panic_hook = TaskPanicHookGuard::new();
                 let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1327,6 +1348,10 @@ impl<R: TaskRunner> TaskTool<R> {
             worker_context.run_before_publication_hook();
             if let Some(cancelled) = worker_context.terminal_output() {
                 output = cancelled;
+            } else if let Some(warning) = fallback_warning
+                && !output.is_error
+            {
+                output.content = format!("{warning}\n{}", output.content);
             }
             registry.finish(execution_id, task_terminal_state(&output), output.clone());
             let _ = sender.send(output);
@@ -1418,6 +1443,23 @@ impl Drop for TaskPanicHookGuard {
 
 fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
     ToolOutput::task_terminal(terminal)
+}
+
+fn fallback_warning(
+    agent: &str,
+    requested_model: &str,
+    fallback_model: &str,
+    reference: Option<&str>,
+) -> String {
+    let mut warning = format!(
+        "warning: agent {agent} requested unavailable model {requested_model}; using {fallback_model}"
+    );
+    if let Some(reference) = reference {
+        warning.push_str(" [ref: ");
+        warning.push_str(reference);
+        warning.push(']');
+    }
+    warning
 }
 
 fn is_diagnostic_reference(reference: &str) -> bool {

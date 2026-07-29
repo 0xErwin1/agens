@@ -38,19 +38,23 @@ impl<'a> AgentProfileResolver<'a> {
         session_model: &str,
         session_effort: Option<ReasoningEffort>,
     ) -> ResolvedAgentProfile {
+        let model = resolve_value(
+            self.profiles
+                .project()
+                .get(agent_name)
+                .and_then(|profile| profile.model.clone()),
+            self.profiles
+                .global()
+                .get(agent_name)
+                .and_then(|profile| profile.model.clone()),
+            frontmatter_model.map(str::to_owned),
+            session_model.to_owned(),
+        );
+        let session_effort = (model.value == session_model)
+            .then_some(session_effort)
+            .flatten();
+
         ResolvedAgentProfile {
-            model: resolve_value(
-                self.profiles
-                    .project()
-                    .get(agent_name)
-                    .and_then(|profile| profile.model.clone()),
-                self.profiles
-                    .global()
-                    .get(agent_name)
-                    .and_then(|profile| profile.model.clone()),
-                frontmatter_model.map(str::to_owned),
-                session_model.to_owned(),
-            ),
             effort: resolve_optional_value(
                 self.profiles
                     .project()
@@ -65,6 +69,7 @@ impl<'a> AgentProfileResolver<'a> {
                 frontmatter_effort,
                 session_effort,
             ),
+            model,
         }
     }
 }

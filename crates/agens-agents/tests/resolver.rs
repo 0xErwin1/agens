@@ -44,6 +44,29 @@ fn project_and_global_profiles_win_independently_per_field() {
 }
 
 #[test]
+fn pinned_model_without_explicit_effort_uses_the_model_default() {
+    let profiles = profiles(
+        Some(AgentProfile {
+            model: Some("pinned-model".to_owned()),
+            effort: None,
+        }),
+        None,
+    );
+
+    let resolved = AgentProfileResolver::new(&profiles).resolve(
+        "research",
+        None,
+        None,
+        "session-model",
+        Some(ReasoningEffort::High),
+    );
+
+    assert_eq!(resolved.model.value, "pinned-model");
+    assert_eq!(resolved.effort.value, None);
+    assert_eq!(resolved.effort.origin, ProfileOrigin::SessionInherited);
+}
+
+#[test]
 fn frontmatter_then_session_values_are_used_without_profiles() {
     let resolved = AgentProfileResolver::new(&ScopedAgentProfiles::default()).resolve(
         "research",

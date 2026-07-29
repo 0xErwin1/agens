@@ -71,19 +71,28 @@ fn updates_only_the_requested_axis_in_an_existing_profile() {
 }
 
 #[test]
-fn rejects_malformed_agent_profile_entries_with_the_offending_key() {
-    for (document, key) in [
-        ("[agents.x]\nmodel = 42\n", "agents.x.model"),
-        ("[agents.x]\neffort = \"ludicrous\"\n", "agents.x.effort"),
-        ("[agents.x]\nunknown = \"value\"\n", "agents.x.unknown"),
-        ("[agents]\nmodel = \"gpt-5\"\n", "agents.model"),
+fn rejects_malformed_agent_profile_entries_with_the_offending_key_and_effort_values() {
+    for (document, expected) in [
+        (
+            "[agents.x]\nmodel = 42\n",
+            "invalid configuration field agents.x.model",
+        ),
+        (
+            "[agents.x]\neffort = \"ludicrous\"\n",
+            "invalid configuration field agents.x.effort; allowed values: none, minimal, low, medium, high, xhigh, max",
+        ),
+        (
+            "[agents.x]\nunknown = \"value\"\n",
+            "invalid configuration field agents.x.unknown",
+        ),
+        (
+            "[agents]\nmodel = \"gpt-5\"\n",
+            "invalid configuration field agents.model",
+        ),
     ] {
         let document = parse_toml_document(document).expect("fixture must parse");
         let error = validate_toml_document(&document).expect_err("profile must be rejected");
 
-        assert_eq!(
-            error.to_string(),
-            format!("invalid configuration field {key}")
-        );
+        assert_eq!(error.to_string(), expected);
     }
 }

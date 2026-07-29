@@ -4,8 +4,8 @@ use std::fmt;
 use toml_edit::{DocumentMut, Item, Table, value as toml_value};
 
 use crate::{
-    ConfigValidationError, invalid_field, parse_toml_document, reject_unknown_fields,
-    validate_toml_document,
+    ConfigValidationError, invalid_field, invalid_field_with_detail, parse_toml_document,
+    reject_unknown_fields, validate_toml_document,
 };
 
 const EFFORT_VALUES: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -141,7 +141,11 @@ pub(crate) fn validate_agent_profiles(document: &toml::Table) -> Result<(), Conf
                 .as_str()
                 .is_some_and(|effort| EFFORT_VALUES.contains(&effort))
         }) {
-            return Err(invalid_field(&path, "effort"));
+            return Err(invalid_field_with_detail(
+                &path,
+                "effort",
+                format!("allowed values: {}", EFFORT_VALUES.join(", ")),
+            ));
         }
     }
 

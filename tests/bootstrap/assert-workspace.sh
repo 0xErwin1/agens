@@ -37,6 +37,7 @@ jq -e '
     ],
     "agens-agents": [
       "agens-bootstrap",
+      "agens-config",
       "agens-core",
       "agens-diagnostics",
       "agens-error",

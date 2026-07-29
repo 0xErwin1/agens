@@ -550,11 +550,16 @@ pub const SETTINGS: &[SettingSpec] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigValidationError {
     field: String,
+    detail: Option<String>,
 }
 
 impl fmt::Display for ConfigValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid configuration field {}", self.field)
+        write!(formatter, "invalid configuration field {}", self.field)?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, "; {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -1438,7 +1443,20 @@ fn invalid_field(path: &str, field: &str) -> ConfigValidationError {
         format!("{path}.{field}")
     };
 
-    ConfigValidationError { field }
+    ConfigValidationError {
+        field,
+        detail: None,
+    }
+}
+
+fn invalid_field_with_detail(
+    path: &str,
+    field: &str,
+    detail: impl Into<String>,
+) -> ConfigValidationError {
+    let mut error = invalid_field(path, field);
+    error.detail = Some(detail.into());
+    error
 }
 
 fn invalid_indexed_field(path: &str, field: &str, index: usize) -> ConfigValidationError {

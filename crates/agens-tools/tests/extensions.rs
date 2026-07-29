@@ -749,14 +749,23 @@ fn unavailable_agent_model_degrades_to_the_parent_and_records_a_diagnostic() {
         )
         .unwrap();
 
-    assert_eq!(output, ToolOutput::success("captured"));
+    assert_eq!(
+        output,
+        ToolOutput::success(
+            "warning: agent worker requested unavailable model unavailable; using parent-model [ref: abc12345]\ncaptured"
+        )
+    );
     assert_eq!(
         *calls.lock().unwrap(),
         vec![("parent-model".to_owned(), Some(ReasoningEffort::High))]
     );
     assert_eq!(
         *diagnostics.lock().unwrap(),
-        vec![TaskModelResolutionError::ModelUnavailable]
+        vec![TaskModelResolutionError::ModelUnavailable {
+            agent: "worker".to_owned(),
+            requested_model: "unavailable".to_owned(),
+            fallback_model: "parent-model".to_owned(),
+        }]
     );
 }
 

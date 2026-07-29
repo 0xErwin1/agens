@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{PermissionMode, PermissionSession};
-use agens_providers::{OpenAiFunctionTool, ProviderDiagnosticClass};
+use agens_providers::OpenAiFunctionTool;
 use agens_store::PermissionGrantStore;
 use agens_tools::{
     SkillCatalog, TaskControlTool, TaskExecutionRegistry, TaskMessageSource, TaskMessageTool,
@@ -18,7 +18,7 @@ use crate::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::runtime::production_tool_runtime_with_parent_task_runner;
 use agens_agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use agens_bootstrap::Bootstrap;
-use agens_diagnostics::{next_diagnostic_reference, record_subagent_terminal};
+use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
 use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use agens_error::CliError;
 use agens_models::{default_model, unknown_provider_message};
@@ -200,15 +200,21 @@ pub fn register_production_task_tool<R: TaskRunner>(
         task_runner,
     )
     .with_model_resolution_diagnostics(move |error| match error {
-        TaskModelResolutionError::ModelUnavailable => {
+        TaskModelResolutionError::ModelUnavailable {
+            agent,
+            requested_model,
+            fallback_model,
+        } => {
             let reference = parent
                 .diagnostic_reference
                 .clone()
                 .unwrap_or_else(next_diagnostic_reference);
-            record_subagent_terminal(
+            record_subagent_model_unavailable(
                 &diagnostic_bootstrap,
                 &reference,
-                ProviderDiagnosticClass::ModelUnavailable,
+                &agent,
+                &requested_model,
+                &fallback_model,
             );
             Some(reference)
         }
