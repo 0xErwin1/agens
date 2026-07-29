@@ -14,6 +14,7 @@ use agens_core::{
     PermissionPolicy, PermissionRule, PermissionSession, ToolAccess,
 };
 use agens_tool_runtime::runner::ProductionTaskRunner;
+use agens_tool_runtime::runtime::production_tool_runtime_with_parent_task_runner;
 use agens_tools::{SkillCatalog, TaskLaunchMode};
 
 use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
@@ -200,6 +201,121 @@ fn u15_a1b1_production_task_runtime_assembles_current_turn_registration() {
     assert_eq!(probe[0].1, TaskLaunchMode::Foreground);
     assert_eq!(probe[0].2, "gpt-5.6-sol");
     assert_eq!(probe[0].3, Some(agens_core::ReasoningEffort::High));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_and_headless_task_tool_construction_delegate_profiles_identically() {
+    let temporary = tui_session_directory("profile-parity");
+    let mut bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\nmodel: unavailable-model\neffort: low\n---\nReview work.\n",
+        )],
+    );
+    bootstrap.model = Some("gpt-5.6-sol".into());
+    bootstrap.debug = true;
+    std::fs::create_dir_all(bootstrap.data_directory()).unwrap();
+    let project_root = agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap);
+    let parent_config = agens_core::RequestConfig::with_reasoning_effort("high").unwrap();
+    let tui_probe = Arc::new(Mutex::new(Vec::new()));
+    let tui = production_tui_task_runtime_with_runner_and_parent_config(
+        &bootstrap,
+        &project_root,
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        ProductionTaskRunner::with_probe(
+            bootstrap.clone(),
+            project_root.clone(),
+            Arc::clone(&tui_probe),
+        ),
+        parent_config.clone(),
+        Some("abcd1234".into()),
+    )
+    .unwrap();
+    let headless_probe = Arc::new(Mutex::new(Vec::new()));
+    let (_, headless) = production_tool_runtime_with_parent_task_runner(
+        &bootstrap,
+        &project_root,
+        Some(&SkillCatalog::default()),
+        "gpt-5.6-sol".into(),
+        parent_config,
+        Some("abcd1234".into()),
+        ProductionTaskRunner::with_probe(
+            bootstrap.clone(),
+            project_root.clone(),
+            Arc::clone(&headless_probe),
+        ),
+    )
+    .unwrap();
+    let policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Allow,
+            PermissionPattern::Exact("native::task".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let dispatch = |dispatcher: &agens_permissions::SharedToolDispatcher| {
+        let mut dispatcher = dispatcher.lock().unwrap();
+        let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+            .evaluate(
+                &policy,
+                &[],
+                &PermissionSession::new(),
+                ToolDispatchRequest::new(
+                    "project",
+                    "native::task",
+                    serde_json::json!({"agent":"reviewer","description":"parity"}),
+                ),
+            )
+            .unwrap()
+        else {
+            panic!("task should authorize");
+        };
+        dispatcher
+            .execute(
+                handle,
+                &ToolExecutionContext::with_timeout(std::time::Duration::from_secs(1)),
+            )
+            .unwrap()
+    };
+
+    let tui_output = dispatch(&tui.dispatcher);
+    let headless_output = dispatch(&headless);
+
+    assert_eq!(tui_output, headless_output);
+    assert_eq!(*tui_probe.lock().unwrap(), *headless_probe.lock().unwrap());
+    assert_eq!(
+        *tui_probe.lock().unwrap(),
+        vec![(
+            agens_tools::TaskExecutionId::from_value(1),
+            TaskLaunchMode::Foreground,
+            "gpt-5.6-sol".to_owned(),
+            Some(agens_core::ReasoningEffort::Low),
+        )]
+    );
+    let diagnostics = std::fs::read_to_string(
+        bootstrap
+            .data_directory()
+            .join("diagnostics")
+            .join(format!("agens-{}.jsonl", std::process::id())),
+    )
+    .unwrap()
+    .lines()
+    .map(|line| {
+        let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+        value.as_object_mut().unwrap().remove("timestamp_ms");
+        value
+    })
+    .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(diagnostics[0], diagnostics[1]);
+    assert_eq!(diagnostics[0]["agent"], "reviewer");
+    assert_eq!(diagnostics[0]["requested_model"], "unavailable-model");
+    assert_eq!(diagnostics[0]["fallback_model"], "gpt-5.6-sol");
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

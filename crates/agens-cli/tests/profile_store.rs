@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agens::profile_store::{AgentProfileStore, ProfileScope};
-use agens_agents::AgentProfileResolver;
+use agens_agents::{AgentProfileResolver, TaskModelValidator};
 use agens_bootstrap::session_config::ScopedAgentProfiles;
 use agens_config::{AgentProfilePatch, parse_agent_profiles, parse_toml_document};
 use agens_core::{ReasoningEffort, RequestConfig};
@@ -212,6 +212,119 @@ fn saves_then_freshly_resolves_and_delegates_the_profile_model() {
         *calls.lock().unwrap(),
         vec![("worker-model".to_owned(), None)]
     );
+
+    fs::remove_dir_all(root).expect("temporary directory must be removed");
+}
+
+#[test]
+fn fixing_an_unavailable_stored_profile_removes_the_fallback_warning() {
+    let root = temporary_directory("fix-unavailable");
+    let global = root.join("global/config.toml");
+    let project = root.join("project/.agens/config.toml");
+    fs::create_dir_all(global.parent().expect("global parent")).expect("global parent must exist");
+    fs::write(
+        &global,
+        "[provider]\nmodel = \"session-model\"\n\n[agents.worker]\nmodel = \"unavailable-model\"\n",
+    )
+    .expect("fixture must be written");
+    let store = AgentProfileStore::new(global.clone(), project);
+    let resolve = || {
+        let document = parse_toml_document(
+            &fs::read_to_string(&global).expect("saved config must be readable"),
+        )
+        .expect("saved config must parse");
+        AgentProfileResolver::new(&ScopedAgentProfiles::new(
+            parse_agent_profiles(&document).expect("saved profile must validate"),
+            Default::default(),
+        ))
+        .resolve(
+            "worker",
+            None,
+            None,
+            "session-model",
+            Some(ReasoningEffort::High),
+        )
+    };
+    let delegate = |model: String, diagnostics: Arc<Mutex<Vec<()>>>| {
+        let agents_root = root.join("agents");
+        fs::create_dir_all(&agents_root).expect("agents directory must be created");
+        fs::write(
+            agents_root.join("worker.md"),
+            "---\nname: worker\ndescription: worker\nmode: subagent\n---\nworker instructions\n",
+        )
+        .expect("agent fixture must be written");
+        let missing = root.join("missing");
+        let agents = AgentCatalog::discover(&[], &agents_root, &missing)
+            .expect("agent catalog must load")
+            .catalog()
+            .clone()
+            .map_agents(|agent| {
+                let mut agent = agent.clone();
+                agent.model = Some(model.clone());
+                agent
+            });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut task = TaskTool::from_catalogs_with_parent_config(
+            agents,
+            SkillCatalog::default(),
+            "session-model",
+            RequestConfig::with_reasoning_effort_value(ReasoningEffort::High),
+            vec!["session-model".to_owned(), "worker-model".to_owned()],
+            TaskModelValidator::new(&["session-model".to_owned(), "worker-model".to_owned()]),
+            CapturingRunner(Arc::clone(&calls)),
+        )
+        .with_model_resolution_diagnostics(move |_| {
+            diagnostics.lock().unwrap().push(());
+            Some("abc12345".to_owned())
+        });
+        let output = task
+            .execute(
+                &ToolExecutionContext::with_timeout(Duration::from_secs(1)),
+                serde_json::json!({"agent":"worker","description":"delegate"}),
+            )
+            .expect("delegation must execute");
+        (output, calls)
+    };
+
+    let diagnostics = Arc::new(Mutex::new(Vec::new()));
+    let unavailable = resolve();
+    assert_eq!(unavailable.model.value, "unavailable-model");
+    let (unavailable_output, unavailable_calls) =
+        delegate(unavailable.model.value, Arc::clone(&diagnostics));
+    assert_eq!(
+        unavailable_output.content,
+        "warning: agent worker requested unavailable model unavailable-model; using session-model [ref: abc12345]\ndelegated"
+    );
+    assert_eq!(
+        *unavailable_calls.lock().unwrap(),
+        vec![("session-model".to_owned(), Some(ReasoningEffort::High))]
+    );
+    assert_eq!(diagnostics.lock().unwrap().len(), 1);
+
+    let snapshot = store
+        .read(ProfileScope::Global)
+        .expect("stored profile snapshot must load");
+    store
+        .save(
+            ProfileScope::Global,
+            &snapshot,
+            "worker",
+            &AgentProfilePatch {
+                model: Some(Some("worker-model".to_owned())),
+                effort: None,
+            },
+        )
+        .expect("overlay-equivalent patch must save");
+
+    let fixed = resolve();
+    assert_eq!(fixed.model.value, "worker-model");
+    let (fixed_output, fixed_calls) = delegate(fixed.model.value, Arc::clone(&diagnostics));
+    assert_eq!(fixed_output.content, "delegated");
+    assert_eq!(
+        *fixed_calls.lock().unwrap(),
+        vec![("worker-model".to_owned(), None)]
+    );
+    assert_eq!(diagnostics.lock().unwrap().len(), 1);
 
     fs::remove_dir_all(root).expect("temporary directory must be removed");
 }
