@@ -18,7 +18,7 @@ use std::sync::Arc;
 use agens_providers::chatgpt_login::{remove_provider_entry, upsert_provider_entry};
 use agens_providers::{ChatGptAuthState, load_chatgpt_auth_state};
 
-use agens_bootstrap::openai_api_key;
+use agens_bootstrap::provider_api_key;
 use agens_error::CliError;
 use agens_models::ModelSource;
 
@@ -125,14 +125,15 @@ impl CredentialResolver {
         }
     }
 
-    pub fn api_key(&self, path: &Path) -> Option<String> {
+    /// The stored or environment-provided API key for one provider. Delegates to
+    /// [`provider_api_key`] so precedence stays defined in exactly one place.
+    pub fn provider_api_key(&self, path: &Path, provider: ProviderKind) -> Option<String> {
         let credentials = fs::read_to_string(path).ok();
-        openai_api_key(credentials.as_deref(), &(self.environment)())
-    }
-
-    pub fn moonshot_api_key(&self, path: &Path) -> Option<String> {
-        let credentials = fs::read_to_string(path).ok();
-        moonshot_api_key(credentials.as_deref(), &(self.environment)())
+        provider_api_key(
+            provider.identifier(),
+            credentials.as_deref(),
+            &(self.environment)(),
+        )
     }
 
     pub fn status(&self, path: &Path, provider: ProviderKind) -> CredentialStatus {
@@ -144,15 +145,8 @@ impl CredentialResolver {
                     Err(_) => CredentialStatus::ConnectRequired,
                 }
             }
-            ProviderKind::OpenAiApi => {
-                if self.api_key(path).is_some() {
-                    CredentialStatus::Ready
-                } else {
-                    CredentialStatus::CredentialRequired
-                }
-            }
-            ProviderKind::Moonshot => {
-                if self.moonshot_api_key(path).is_some() {
+            ProviderKind::OpenAiApi | ProviderKind::Moonshot => {
+                if self.provider_api_key(path, provider).is_some() {
                     CredentialStatus::Ready
                 } else {
                     CredentialStatus::CredentialRequired
@@ -160,31 +154,6 @@ impl CredentialResolver {
             }
         }
     }
-}
-
-/// Resolves the Moonshot API key with the same env-over-stored precedence as
-/// [`openai_api_key`]: the `MOONSHOT_API_KEY` environment variable wins over a
-/// stored `moonshotai.api_key` credential entry.
-fn moonshot_api_key(
-    credentials: Option<&str>,
-    environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    environment
-        .get("MOONSHOT_API_KEY")
-        .filter(|key| !key.is_empty())
-        .cloned()
-        .or_else(|| {
-            credentials
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
-                .and_then(|credentials| {
-                    credentials
-                        .get("moonshotai")?
-                        .get("api_key")?
-                        .as_str()
-                        .filter(|key| !key.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-        })
 }
 
 pub enum ChatGptCredentialSnapshot {

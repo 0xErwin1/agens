@@ -24,8 +24,8 @@ use crate::test_support::{
     bootstrap_from_a_different_working_directory, dispatch_tui_dialog_selection, enter_tui_input,
     open_tui_palette_dialog, persist_tui_session, persist_tui_session_metadata,
     render_tui_test_backend, rotation_dispatcher, run_production_batch, submit_tui_command,
-    tui_project, tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
-    tui_session_messages,
+    tui_project, tui_session_bootstrap, tui_session_bootstrap_for_provider,
+    tui_session_bootstrap_without_provider, tui_session_directory, tui_session_messages,
 };
 use agens_agents::ensure_active_agent_runtime;
 use agens_headless::HeadlessChatCompletion;
@@ -474,7 +474,7 @@ fn tui_router_connect_device_disconnect_uses_coordinator_without_provider_histor
     let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
     bootstrap.provider_source = ProviderSource::Auto;
     bootstrap.provider_type = Some("openai-api".into());
-    bootstrap.openai_api_key = Some("preserved".into());
+    bootstrap.api_key = Some("preserved".into());
     let flows = Arc::new(Mutex::new(Vec::new()));
     let coordinator = ChatGptAuthCoordinator::with_authenticator({
         let flows = Arc::clone(&flows);
@@ -534,7 +534,7 @@ fn runtime_chatgpt_refresh_atomicity_preserves_intervening_unrelated_provider_wr
     let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
     bootstrap.provider_source = ProviderSource::Auto;
     bootstrap.provider_type = Some("openai-api".into());
-    bootstrap.openai_api_key = Some("preserved".into());
+    bootstrap.api_key = Some("preserved".into());
     let session = Arc::new(Mutex::new(SessionContext {
         running: true,
         ..SessionContext::fresh()
@@ -643,7 +643,7 @@ fn runtime_chatgpt_refresh_atomicity_fails_closed_when_credential_restore_fails(
     let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
     bootstrap.provider_source = ProviderSource::Auto;
     bootstrap.provider_type = Some("openai-api".into());
-    bootstrap.openai_api_key = Some("preserved".into());
+    bootstrap.api_key = Some("preserved".into());
     let session = Arc::new(Mutex::new(SessionContext {
         running: true,
         ..SessionContext::fresh()
@@ -900,14 +900,12 @@ fn u15_c1a_subagent_overlay_and_alias_expose_only_eligible_agents() {
         TuiSubmissionOutcome::LocalActionableError { .. }
     ));
 
-    let unavailable_bootstrap = tui_session_bootstrap_for_provider(
+    let unavailable_bootstrap = tui_session_bootstrap_without_provider(
         &temporary,
         &[(
             "unavailable-provider",
             "---\nname: unavailable-provider\ndescription: unavailable\nmode: subagent\npermissions: []\n---\nUnavailable work.\n",
         )],
-        "unavailable-provider",
-        "gpt-4.1",
     );
     let unavailable_session = Arc::new(Mutex::new(SessionContext::fresh()));
     let unavailable_router = TuiRuntimeRouter::new(
@@ -1352,7 +1350,7 @@ fn tui_turn_bootstrap_resolves_moonshot_api_key_from_environment() {
 
     let resolved = router.turn_bootstrap().unwrap();
     assert_eq!(resolved.provider_type.as_deref(), Some("moonshotai"));
-    assert_eq!(resolved.openai_api_key.as_deref(), Some("moonshot-secret"));
+    assert_eq!(resolved.api_key.as_deref(), Some("moonshot-secret"));
 
     std::fs::remove_dir_all(temporary).unwrap();
 }
@@ -1380,12 +1378,12 @@ fn tui_turn_bootstrap_resolves_changed_and_removed_credentials_without_stale_reu
 
     std::fs::write(&credentials, r#"{"openai-api":{"api_key":"file-one"}}"#).unwrap();
     assert_eq!(
-        router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+        router.turn_bootstrap().unwrap().api_key.as_deref(),
         Some("file-one")
     );
     std::fs::write(&credentials, r#"{"openai-api":{"api_key":"file-two"}}"#).unwrap();
     assert_eq!(
-        router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+        router.turn_bootstrap().unwrap().api_key.as_deref(),
         Some("file-two")
     );
     environment
@@ -1393,7 +1391,7 @@ fn tui_turn_bootstrap_resolves_changed_and_removed_credentials_without_stale_reu
         .unwrap()
         .insert("OPENAI_API_KEY".into(), "env-current".into());
     assert_eq!(
-        router.turn_bootstrap().unwrap().openai_api_key.as_deref(),
+        router.turn_bootstrap().unwrap().api_key.as_deref(),
         Some("env-current")
     );
     environment.lock().unwrap().clear();

@@ -91,7 +91,7 @@ pub fn run_production_headless_chat_with_progress(
     let provider_diagnostics = diagnostics.provider;
     let result = match bootstrap.provider_type() {
         Some("openai-api") => {
-            let api_key = bootstrap.openai_api_key.clone().ok_or_else(|| {
+            let api_key = bootstrap.api_key.clone().ok_or_else(|| {
                 CliError::authentication("OpenAI API authentication is unavailable")
             })?;
             let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;

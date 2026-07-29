@@ -86,6 +86,7 @@ pub(crate) fn run_auth(
 enum CredentialProvider {
     OpenAiApi,
     OpenAiChatGpt,
+    Moonshot,
 }
 
 impl CredentialProvider {
@@ -93,6 +94,7 @@ impl CredentialProvider {
         match value {
             "openai-api" => Ok(Self::OpenAiApi),
             "openai-chatgpt" => Ok(Self::OpenAiChatGpt),
+            "moonshotai" => Ok(Self::Moonshot),
             _ => Err(CliError::usage("auth provider is unsupported")),
         }
     }
@@ -101,6 +103,15 @@ impl CredentialProvider {
         match self {
             Self::OpenAiApi => "openai-api",
             Self::OpenAiChatGpt => "openai-chatgpt",
+            Self::Moonshot => "moonshotai",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "OpenAI API",
+            Self::OpenAiChatGpt => "ChatGPT subscription",
+            Self::Moonshot => "Moonshot AI",
         }
     }
 }
@@ -111,8 +122,10 @@ fn run_api_key_login(
     dependencies: &CliDependencies,
 ) -> Result<String, CliError> {
     let provider = CredentialProvider::parse(provider)?;
-    if !matches!(provider, CredentialProvider::OpenAiApi) {
-        return Err(CliError::usage("API-key login supports only openai-api"));
+    if matches!(provider, CredentialProvider::OpenAiChatGpt) {
+        return Err(CliError::usage(
+            "openai-chatgpt signs in through OAuth; run auth login instead",
+        ));
     }
 
     let supplied_key = validate_api_key_flag(api_key)?;
@@ -237,22 +250,23 @@ fn normalize_api_key_input(input: &str) -> Result<String, CliError> {
 
 fn provider_status(path: &Path, provider: CredentialProvider) -> Result<String, CliError> {
     match provider {
-        CredentialProvider::OpenAiApi => {
-            let contents = fs::read_to_string(path).map_err(|_| {
-                CliError::authentication("OpenAI API credentials are unavailable or invalid")
-            })?;
+        CredentialProvider::OpenAiApi | CredentialProvider::Moonshot => {
+            let label = provider.label();
+            let unavailable = || {
+                CliError::authentication(format!("{label} credentials are unavailable or invalid"))
+            };
+            let contents = fs::read_to_string(path).map_err(|_| unavailable())?;
             let ready = serde_json::from_str::<serde_json::Value>(&contents)
                 .ok()
                 .and_then(|root| root.get(provider.identifier()).cloned())
                 .and_then(|entry| entry.get("api_key").cloned())
                 .and_then(|key| key.as_str().map(|key| !key.trim().is_empty()))
                 .unwrap_or(false);
+
             if ready {
-                Ok("OpenAI API authentication: ready\n".to_owned())
+                Ok(format!("{label} authentication: ready\n"))
             } else {
-                Err(CliError::authentication(
-                    "OpenAI API credentials are unavailable or invalid",
-                ))
+                Err(unavailable())
             }
         }
         CredentialProvider::OpenAiChatGpt => {

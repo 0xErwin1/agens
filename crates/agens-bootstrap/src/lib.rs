@@ -47,7 +47,7 @@ pub struct Bootstrap {
     pub subagent_limits: SubagentSettings,
     pub mcp_defaults: McpDefaultSettings,
     pub settings: ResolvedSettings,
-    pub openai_api_key: Option<String>,
+    pub api_key: Option<String>,
     pub data_directory: PathBuf,
     pub project_root: Option<PathBuf>,
     pub mcp_servers: Vec<agens_config::McpServerConfig>,
@@ -83,7 +83,7 @@ impl Clone for Bootstrap {
             subagent_limits: self.subagent_limits,
             mcp_defaults: self.mcp_defaults,
             settings: self.settings.clone(),
-            openai_api_key: self.openai_api_key.clone(),
+            api_key: self.api_key.clone(),
             data_directory: self.data_directory.clone(),
             project_root: self.project_root.clone(),
             mcp_servers: self.mcp_servers.clone(),
@@ -234,6 +234,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
     let documented_global = global.clone();
     let documented_project = project.clone();
     let global = expand_global_mcp(global, &environment)?;
+
     let document = merge_toml_documents(global, project);
     let document = expand_document(document, &environment)?;
     let settings = resolve_settings(&documented_global, &documented_project, &document);
@@ -248,7 +249,11 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         Some(_) => ProviderSource::ExplicitOther,
     };
     let provider_type =
-        resolve_provider_type(configured_provider, credentials.as_deref(), &environment);
+        resolve_provider_type(configured_provider, credentials.as_deref(), &environment)?;
+    let api_key = provider_type
+        .as_deref()
+        .and_then(|provider| provider_api_key(provider, credentials.as_deref(), &environment));
+
     Ok(Bootstrap {
         model: settings.text("provider.model").map(ToOwned::to_owned),
         provider_type,
@@ -270,7 +275,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         subagent_limits: SubagentSettings::from(&settings),
         mcp_defaults: McpDefaultSettings::from(&settings),
         settings,
-        openai_api_key: openai_api_key(credentials.as_deref(), &environment),
+        api_key,
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
@@ -386,14 +391,74 @@ fn expand_global_mcp(
     Ok(document)
 }
 
+/// The environment variable each API-key provider reads its credential from.
+/// `openai-chatgpt` is absent on purpose: it authenticates through OAuth, not a
+/// key.
+const API_KEY_ENVIRONMENT: [(&str, &str); 2] = [
+    ("openai-api", "OPENAI_API_KEY"),
+    ("moonshotai", "MOONSHOT_API_KEY"),
+];
+
+/// Resolves one provider's API key, environment first and stored credential
+/// second. Keyed by provider so a key configured for one provider can never
+/// authenticate a run against another.
+pub fn provider_api_key(
+    provider: &str,
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
+    let variable = API_KEY_ENVIRONMENT
+        .iter()
+        .find_map(|(identifier, variable)| (*identifier == provider).then_some(*variable))?;
+
+    environment
+        .get(variable)
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .or_else(|| stored_api_key(credentials, provider))
+}
+
+fn stored_api_key(credentials: Option<&str>, provider: &str) -> Option<String> {
+    credentials
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
+        .and_then(|credentials| {
+            credentials
+                .get(provider)?
+                .get("api_key")?
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+/// Resolves which provider a run speaks to: the configured value when there is
+/// one, otherwise whichever provider the available credentials imply.
+///
+/// An unrecognized configured value is an error rather than a fallback. Guessing
+/// here would send the run, and the spend that follows it, to a provider the
+/// user did not name.
 pub fn resolve_provider_type(
     configured: Option<String>,
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    if matches!(configured.as_deref(), Some("openai-api" | "openai-chatgpt")) {
-        return configured;
+) -> Result<Option<String>, CliError> {
+    if let Some(configured) = configured {
+        return if agens_models::KNOWN_PROVIDER_TYPES.contains(&configured.as_str()) {
+            Ok(Some(configured))
+        } else {
+            Err(CliError::configuration(
+                agens_models::unknown_provider_message(Some(&configured)),
+            ))
+        };
     }
+
+    Ok(sniff_provider_type(credentials, environment))
+}
+
+fn sniff_provider_type(
+    credentials: Option<&str>,
+    environment: &BTreeMap<String, String>,
+) -> Option<String> {
     let credentials =
         credentials.and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok());
     let chatgpt = credentials
@@ -411,41 +476,22 @@ pub fn resolve_provider_type(
     }) {
         return Some("openai-chatgpt".to_owned());
     }
-    if credentials
-        .as_ref()
-        .and_then(|credentials| credentials.get("openai-api"))
-        .and_then(|entry| entry.get("api_key"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.is_empty())
-        || environment
-            .get("OPENAI_API_KEY")
-            .is_some_and(|value| !value.is_empty())
-    {
-        return Some("openai-api".to_owned());
-    }
-    None
+    let stored = credentials.as_ref().map(ToString::to_string);
+    API_KEY_ENVIRONMENT
+        .iter()
+        .find(|(identifier, _)| {
+            provider_api_key(identifier, stored.as_deref(), environment).is_some()
+        })
+        .map(|(identifier, _)| (*identifier).to_owned())
 }
 
+/// The OpenAI API key, resolved through [`provider_api_key`] so it cannot drift
+/// from how every other provider's key is found.
 pub fn openai_api_key(
     credentials: Option<&str>,
     environment: &BTreeMap<String, String>,
 ) -> Option<String> {
-    environment
-        .get("OPENAI_API_KEY")
-        .filter(|key| !key.is_empty())
-        .cloned()
-        .or_else(|| {
-            credentials
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(contents).ok())
-                .and_then(|credentials| {
-                    credentials
-                        .get("openai-api")?
-                        .get("api_key")?
-                        .as_str()
-                        .filter(|key| !key.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-        })
+    provider_api_key("openai-api", credentials, environment)
 }
 
 fn expand_value_in_place(
@@ -517,4 +563,134 @@ pub fn discover_skill_catalog(
         project_root.join(".agens/skills"),
     )
     .map_err(|_| CliError::configuration("skill catalog is unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_api_key, resolve_provider_type};
+    use std::collections::BTreeMap;
+
+    fn environment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    const CREDENTIALS: &str = r#"{
+        "openai-api": {"api_key": "stored-openai"},
+        "moonshotai": {"api_key": "stored-moonshot"}
+    }"#;
+
+    #[test]
+    fn environment_key_wins_over_the_stored_credential() {
+        let environment = environment(&[
+            ("OPENAI_API_KEY", "env-openai"),
+            ("MOONSHOT_API_KEY", "env-moonshot"),
+        ]);
+
+        assert_eq!(
+            provider_api_key("openai-api", Some(CREDENTIALS), &environment),
+            Some("env-openai".to_owned())
+        );
+        assert_eq!(
+            provider_api_key("moonshotai", Some(CREDENTIALS), &environment),
+            Some("env-moonshot".to_owned())
+        );
+    }
+
+    #[test]
+    fn stored_credential_is_used_when_the_environment_is_silent() {
+        let environment = environment(&[]);
+
+        assert_eq!(
+            provider_api_key("openai-api", Some(CREDENTIALS), &environment),
+            Some("stored-openai".to_owned())
+        );
+        assert_eq!(
+            provider_api_key("moonshotai", Some(CREDENTIALS), &environment),
+            Some("stored-moonshot".to_owned())
+        );
+    }
+
+    #[test]
+    fn one_providers_environment_key_never_answers_for_another() {
+        let environment = environment(&[("OPENAI_API_KEY", "env-openai")]);
+
+        assert_eq!(
+            provider_api_key("moonshotai", None, &environment),
+            None,
+            "an OpenAI key must not authenticate a Moonshot run"
+        );
+    }
+
+    #[test]
+    fn a_provider_without_an_api_key_path_resolves_to_nothing() {
+        let environment = environment(&[("OPENAI_API_KEY", "env-openai")]);
+
+        assert_eq!(
+            provider_api_key("openai-chatgpt", Some(CREDENTIALS), &environment),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_provider_type_accepts_every_known_identifier() {
+        let environment = environment(&[]);
+
+        for identifier in ["openai-api", "openai-chatgpt", "moonshotai"] {
+            assert_eq!(
+                resolve_provider_type(Some(identifier.to_owned()), None, &environment)
+                    .expect("known provider type is accepted"),
+                Some(identifier.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_configured_provider_type_is_rejected_by_name() {
+        let environment = environment(&[]);
+
+        let error = resolve_provider_type(Some("moonshot".to_owned()), None, &environment)
+            .expect_err("an unknown provider type must not resolve");
+        let message = error.to_string();
+
+        assert!(message.contains("moonshot"), "{message}");
+        assert!(message.contains("moonshotai"), "{message}");
+        assert!(message.contains("openai-api"), "{message}");
+        assert!(message.contains("openai-chatgpt"), "{message}");
+    }
+
+    #[test]
+    fn an_absent_provider_type_still_sniffs_credentials() {
+        let moonshot_only = environment(&[("MOONSHOT_API_KEY", "env-moonshot")]);
+        assert_eq!(
+            resolve_provider_type(None, None, &moonshot_only).expect("sniffing does not fail"),
+            Some("moonshotai".to_owned())
+        );
+
+        let openai_only = environment(&[("OPENAI_API_KEY", "env-openai")]);
+        assert_eq!(
+            resolve_provider_type(None, None, &openai_only).expect("sniffing does not fail"),
+            Some("openai-api".to_owned())
+        );
+
+        assert_eq!(
+            resolve_provider_type(None, None, &environment(&[])).expect("sniffing does not fail"),
+            None
+        );
+    }
+
+    #[test]
+    fn credential_sniffing_prefers_openai_over_moonshot() {
+        let both = environment(&[
+            ("OPENAI_API_KEY", "env-openai"),
+            ("MOONSHOT_API_KEY", "env-moonshot"),
+        ]);
+
+        assert_eq!(
+            resolve_provider_type(None, None, &both).expect("sniffing does not fail"),
+            Some("openai-api".to_owned())
+        );
+    }
 }

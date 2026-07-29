@@ -112,7 +112,7 @@ impl TuiRuntimeRouter {
                         None,
                         credentials.as_deref(),
                         &(self.credentials.environment)(),
-                    )
+                    )?
                     .ok_or_else(|| {
                         CliError::authentication(
                             "ChatGPT credentials are unavailable; run /connect",

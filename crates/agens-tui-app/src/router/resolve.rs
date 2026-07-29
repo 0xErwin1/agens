@@ -207,14 +207,7 @@ impl TuiRuntimeRouter {
         drop(context);
 
         bootstrap.provider_type = Some(provider.identifier().into());
-        bootstrap.openai_api_key = match provider {
-            ProviderKind::OpenAiApi => Some(
-                self.credentials
-                    .api_key(&bootstrap.paths.credentials)
-                    .ok_or_else(|| {
-                        CliError::authentication("OpenAI API authentication is unavailable")
-                    })?,
-            ),
+        bootstrap.api_key = match provider {
             ProviderKind::OpenAiChatGpt => {
                 if !self
                     .credentials
@@ -227,11 +220,14 @@ impl TuiRuntimeRouter {
                 }
                 None
             }
-            ProviderKind::Moonshot => Some(
+            ProviderKind::OpenAiApi | ProviderKind::Moonshot => Some(
                 self.credentials
-                    .moonshot_api_key(&bootstrap.paths.credentials)
+                    .provider_api_key(&bootstrap.paths.credentials, provider)
                     .ok_or_else(|| {
-                        CliError::authentication("Moonshot API authentication is unavailable")
+                        CliError::authentication(format!(
+                            "{} authentication is unavailable",
+                            provider.label()
+                        ))
                     })?,
             ),
         };

@@ -71,6 +71,7 @@ dependencies = [
  "agens-config",
  "agens-core",
  "agens-error",
+ "agens-models",
  "agens-tools",
  "serde_json",
  "toml",

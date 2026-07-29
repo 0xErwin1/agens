@@ -526,7 +526,7 @@ fn table_a_auth_holds() {
                 dependencies,
                 expected: failure(
                     ExitStatus::Usage,
-                    "usage: API-key login supports only openai-api",
+                    "usage: openai-chatgpt signs in through OAuth; run auth login instead",
                 ),
                 _temporary: temporary,
             }

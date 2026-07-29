@@ -172,10 +172,7 @@ pub fn run_production_task(
 
     match bootstrap.provider_type() {
         Some("openai-api") => {
-            let api_key = bootstrap
-                .openai_api_key
-                .clone()
-                .ok_or(ChildRunError::Runtime)?;
+            let api_key = bootstrap.api_key.clone().ok_or(ChildRunError::Runtime)?;
             let base_url = task_provider_base_url(bootstrap, project_root)
                 .map_err(|_| ChildRunError::Runtime)?;
             let provider =

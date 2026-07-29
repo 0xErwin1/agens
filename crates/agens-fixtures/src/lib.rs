@@ -163,6 +163,35 @@ pub fn session_bootstrap_for_provider(
     .expect("session bootstrap fixture should be valid")
 }
 
+/// A `Bootstrap` fixture with no `provider.type` configured at all.
+///
+/// The state a run is in before any provider is chosen: provider-dependent
+/// lookups decline rather than resolve, so a test can exercise that path
+/// without inventing a provider identifier the configuration would reject.
+pub fn session_bootstrap_without_provider(temporary: &Path, agents: &[(&str, &str)]) -> Bootstrap {
+    let config_home = temporary.join("config");
+    let agents_directory = config_home.join("agents");
+
+    std::fs::create_dir_all(&agents_directory).expect("fixture agents directory should be created");
+    for (name, contents) in agents {
+        std::fs::write(agents_directory.join(format!("{name}.md")), contents)
+            .expect("fixture agent definition should be written");
+    }
+
+    let configuration = format!(
+        "[options]\ndata_dir = \"{}\"\n",
+        temporary.join("data").display()
+    );
+
+    resolve(
+        temporary.join("project"),
+        Some(temporary.join("home")),
+        config_home_environment(&config_home),
+        BTreeMap::from([(config_home.join("config.toml"), configuration)]),
+    )
+    .expect("session bootstrap fixture should be valid")
+}
+
 /// Accepts any model the bundled catalog knows, under either provider.
 ///
 /// Tests that care about agent selection rather than about model availability

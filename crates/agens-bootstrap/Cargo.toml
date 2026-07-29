@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 agens-config = { path = "../agens-config" }
+agens-models = { path = "../agens-models" }
 agens-core = { path = "../agens-core" }
 agens-error = { path = "../agens-error" }
 agens-tools = { path = "../agens-tools" }
