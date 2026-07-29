@@ -436,6 +436,13 @@ impl TaskRunner for ProductionTaskRunner {
         self.task_registry.clone()
     }
 
+    /// `self.bypass` deliberately does NOT reach [`ProductionTaskExecutionContext`] below, unlike
+    /// `self.dangerous_mode`: `child.rs`'s own permission session is always `PermissionSession::new()`
+    /// and its resolver (`ChildPermissionResolver`) always returns `Deny` on `Ask`, regardless of
+    /// what a `ProductionTaskExecutionContext` field says — see `child.rs`'s characterization test.
+    /// Adding a `bypass` field there would be a field nothing reads. `bypass` instead stops at this
+    /// runner's own two `PermissionSession`s (`task.rs`'s gate and prompt-authorization sessions),
+    /// which are what a TUI-launched subagent's tool calls are actually evaluated against.
     fn run(
         &self,
         request: TaskTurnRequest,

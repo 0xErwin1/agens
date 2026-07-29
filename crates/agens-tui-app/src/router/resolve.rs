@@ -198,13 +198,19 @@ impl TuiRuntimeRouter {
             session.bypass_permissions = !session.bypass_permissions;
             (session.bypass_permissions, session.identifier)
         };
+        let mut message = format!("Permission bypass: {}.", if enabled { "on" } else { "off" });
         if let Some(identifier) = identifier {
             let bootstrap = self.bootstrap()?;
-            write_through_bypass_permission_prompts(&bootstrap, identifier, enabled);
+            // This is the moment the user actually asked for a change, so a failed write is
+            // surfaced here rather than swallowed — leaving it silent would let a deliberate
+            // OFF toggle appear to have worked while the persisted value stayed stale ON.
+            if write_through_bypass_permission_prompts(&bootstrap, identifier, enabled).is_err() {
+                message.push_str(" This could not be saved and may not persist across resume.");
+            }
         }
 
         Ok(TuiSubmissionOutcome::ContextChanged {
-            message: format!("Permission bypass: {}.", if enabled { "on" } else { "off" }),
+            message,
             presentation: self.presentation()?,
         })
     }

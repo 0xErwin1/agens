@@ -931,6 +931,64 @@ fn bypass_toggle_writes_through_once_a_session_row_exists_and_never_mutates_conf
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// Pins the WARNING fix: a write-through failure must not resolve to a stale/re-enabled "on" and
+/// must not be silently swallowed the way it was before. The toggle still takes effect in memory
+/// (this is the one call site the user directly acted on), but its confirmation message now names
+/// the failure instead of reporting success as if the value had actually been persisted.
+#[test]
+#[cfg(unix)]
+fn bypass_toggle_surfaces_a_failed_write_through_without_erroring_or_losing_the_in_memory_toggle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tui_session_directory("bypass-write-through-failure");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-session");
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    session.lock().unwrap().identifier = Some(metadata.id);
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let data_directory = bootstrap.data_directory().to_path_buf();
+    let original_mode = std::fs::metadata(&data_directory)
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(&data_directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let outcome = router.route("/bypass".into());
+
+    std::fs::set_permissions(
+        &data_directory,
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .unwrap();
+
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!(
+            "a failed write-through must still resolve as a normal toggle outcome, not an error"
+        );
+    };
+    assert!(
+        message.contains("could not be saved"),
+        "a failed write-through must be surfaced in the toggle confirmation: {message:?}"
+    );
+    assert!(
+        session.lock().unwrap().bypass_permissions,
+        "the in-memory toggle must still take effect even when persisting it failed"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 #[test]
 fn u15_c1a_subagent_overlay_and_alias_expose_only_eligible_agents() {
     let temporary = tui_session_directory("u15-c1a-subagents");

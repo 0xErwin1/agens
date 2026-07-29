@@ -425,6 +425,7 @@ mod tests {
             ),
             agens_core::RequestConfig::default(),
             "confinement-check".to_owned(),
+            false,
         )
         .unwrap();
         ensure_active_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
@@ -896,6 +897,7 @@ mod tests {
             TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),
+            false,
         )
         .unwrap();
         ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();

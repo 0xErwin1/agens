@@ -217,6 +217,17 @@ pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<
                 Ok(skills) => skills,
                 Err(error) => return tui_provider_outcome(Err(error)),
             };
+            // The runtime built here backs `runtime.authorized`, the ONLY path a TUI-selected
+            // subagent launch reaches (`launch_selected_tui_task` below). It must carry the same
+            // bypass state as the session's own turn, or a bypassed session still prompts when
+            // launching a selected subagent — see the discovery this fixed for the full trace.
+            let session_bypass =
+                match router.session.lock().map_err(|_| {
+                    CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable")
+                }) {
+                    Ok(context) => context.bypass_permissions,
+                    Err(error) => return tui_provider_outcome(Err(error)),
+                };
             let mut task_runtime = match production_tui_task_runtime(
                 &runtime_bootstrap,
                 &session_project_root,
@@ -225,6 +236,7 @@ pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<
                 lifecycle_bridge.clone(),
                 task_parent_request_config.clone(),
                 task_diagnostic_reference.clone(),
+                session_bypass,
             ) {
                 Ok(runtime) => runtime,
                 Err(error) => return tui_provider_outcome(Err(error)),
@@ -433,7 +445,14 @@ pub fn run_tui_prompt_with(
     session.running = false;
     let result = complete_tui_turn(&mut session, completion, consumed_reminder);
     if let Some(identifier) = session.identifier {
-        write_through_bypass_permission_prompts(bootstrap, identifier, session.bypass_permissions);
+        // Best-effort, like the write above: this call gets another attempt on every subsequent
+        // completed turn, and the toggle command (the moment the user actually asked for a
+        // change) surfaces a failed write directly instead of staying silent here too.
+        let _ = write_through_bypass_permission_prompts(
+            bootstrap,
+            identifier,
+            session.bypass_permissions,
+        );
     }
     result
 }
@@ -457,16 +476,22 @@ pub fn seed_bypass_permissions_from_configuration(
 }
 
 /// Records a session's bypass-permission-prompts value once it has an identifier to record it
-/// against. Best-effort, like [`agens_agents::persist_pending_agent_correction`]'s own write:
-/// a session toggled and then abandoned before its first completed turn has no row to write to
-/// yet, and that is an accepted, documented edge rather than a failure to surface.
+/// against. The write itself stays best-effort — like [`agens_agents::persist_pending_agent_correction`]'s
+/// own write, a session toggled and then abandoned before its first completed turn has no row to
+/// write to yet, and a turn must not hard-fail just because this side record could not be made.
+/// Unlike that precedent, though, a failed write here has an unsafe direction: it can leave a
+/// stale `true` (or `NULL`, falling back to a `true` global configuration) on disk after the user
+/// asked for `false`. The `Result` is therefore returned rather than swallowed, so callers on the
+/// toggle path (the moment the user actually asked for a change) can surface it instead of staying
+/// silent; see [`crate::router::TuiRuntimeRouter::toggle_bypass_permissions`].
 pub(crate) fn write_through_bypass_permission_prompts(
     bootstrap: &Bootstrap,
     identifier: i64,
     enabled: bool,
-) {
-    let _ = SessionStore::open(bootstrap.data_directory())
-        .and_then(|mut store| store.set_bypass_permission_prompts(identifier, enabled));
+) -> Result<(), CliError> {
+    SessionStore::open(bootstrap.data_directory())
+        .and_then(|mut store| store.set_bypass_permission_prompts(identifier, enabled))
+        .map_err(|_| CliError::storage("permission bypass state could not be saved"))
 }
 
 /// The configured system prompt fallback a TUI turn must fall back to, re-derived from the
