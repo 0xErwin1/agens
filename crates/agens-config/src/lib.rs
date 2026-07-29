@@ -3,6 +3,10 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod agent_profiles;
+
+pub use agent_profiles::{AgentProfile, parse_agent_profiles};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigPermissionDecision {
     Allow,
@@ -824,7 +828,7 @@ pub fn starter_document() -> String {
 
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
     let mut root_tables = catalog_tables();
-    root_tables.extend_from_slice(&["mcp", "permissions"]);
+    root_tables.extend_from_slice(&["agents", "mcp", "permissions"]);
     reject_unknown_fields(document, "", &root_tables)?;
 
     for table in catalog_tables() {
@@ -840,6 +844,7 @@ pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValida
             validate_optional(table, "deny", path, is_string_array)
         },
     )?;
+    agent_profiles::validate_agent_profiles(document)?;
     validate_mcp(document)
 }
 

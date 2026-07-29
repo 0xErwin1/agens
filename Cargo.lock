@@ -90,6 +90,7 @@ name = "agens-config"
 version = "0.1.0"
 dependencies = [
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

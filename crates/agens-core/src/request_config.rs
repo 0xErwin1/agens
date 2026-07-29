@@ -29,6 +29,12 @@ pub struct RequestConfig {
 }
 
 impl RequestConfig {
+    pub const fn with_reasoning_effort_value(reasoning_effort: ReasoningEffort) -> Self {
+        Self {
+            reasoning_effort: Some(reasoning_effort),
+        }
+    }
+
     pub fn with_reasoning_effort(value: &str) -> Result<Self, RequestConfigError> {
         let reasoning_effort = match value {
             "none" => ReasoningEffort::None,
@@ -45,9 +51,7 @@ impl RequestConfig {
             }
         };
 
-        Ok(Self {
-            reasoning_effort: Some(reasoning_effort),
-        })
+        Ok(Self::with_reasoning_effort_value(reasoning_effort))
     }
 
     pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {

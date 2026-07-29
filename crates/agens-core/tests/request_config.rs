@@ -19,6 +19,20 @@ fn reasoning_effort_accepts_provider_supported_values() {
 }
 
 #[test]
+fn reasoning_effort_value_preserves_the_requested_effort() {
+    let config = RequestConfig::with_reasoning_effort_value(ReasoningEffort::High);
+
+    assert_eq!(config.reasoning_effort(), Some(ReasoningEffort::High));
+}
+
+#[test]
+fn reasoning_effort_value_handles_a_different_supported_effort() {
+    let config = RequestConfig::with_reasoning_effort_value(ReasoningEffort::None);
+
+    assert_eq!(config.reasoning_effort(), Some(ReasoningEffort::None));
+}
+
+#[test]
 fn request_config_leaves_reasoning_effort_unset_by_default() {
     assert_eq!(RequestConfig::default().reasoning_effort(), None);
 }
