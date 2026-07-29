@@ -50,6 +50,7 @@ pub struct TuiRuntimeRouter {
     clock: fn() -> i64,
     credential_restorer: Arc<CredentialRestorer>,
     profile_editor: Arc<Mutex<Option<ProfileEditor>>>,
+    profile_focus: Arc<Mutex<Option<String>>>,
     profile_store: Option<Arc<dyn AgentProfileStore>>,
 }
 
@@ -118,6 +119,7 @@ impl TuiRuntimeRouter {
             clock: current_session_timestamp,
             credential_restorer: Arc::new(restore_chatgpt_credentials),
             profile_editor: Arc::new(Mutex::new(None)),
+            profile_focus: Arc::new(Mutex::new(None)),
             profile_store: None,
         }
     }

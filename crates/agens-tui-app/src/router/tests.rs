@@ -363,8 +363,8 @@ impl AgentProfileStore for RecordingProfileStore {
 }
 
 #[test]
-fn subagent_profile_overlay_stages_scope_specific_save_and_cancel_actions() {
-    let temporary = tui_session_directory("subagent-profile-overlay-save-cancel");
+fn subagent_profile_overlay_autosaves_in_the_selected_scope() {
+    let temporary = tui_session_directory("subagent-profile-overlay-autosave");
     let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let session = Arc::new(Mutex::new(SessionContext::fresh()));
     let cancellation = Arc::new(Mutex::new(None));
@@ -385,64 +385,94 @@ fn subagent_profile_overlay_stages_scope_specific_save_and_cancel_actions() {
         TuiRouteRequest::OpenDialog("subagent-profiles".into()),
         progress.clone(),
     );
-    router.route_dialog_action("subagent-profiles:scope:project", progress.clone());
     router.route_dialog_action(
         "subagent-profiles:set-model:explore:gpt-4.1",
         progress.clone(),
     );
-    assert!(matches!(
-        router.route_dialog_action("subagent-profiles:cancel", progress.clone()),
-        TuiSubmissionOutcome::LocalInfo(message) if message == "Subagent profile edits discarded."
-    ));
-    assert!(store.saved.lock().unwrap().is_empty());
+    router.route_dialog_action("subagent-profiles:scope:toggle", progress.clone());
+    router.route_dialog_action("subagent-profiles:set-model:explore:gpt-4.1-mini", progress);
 
-    router.route_request(
-        TuiRouteRequest::OpenDialog("subagent-profiles".into()),
-        progress.clone(),
-    );
-    router.route_dialog_action("subagent-profiles:scope:project", progress.clone());
-    router.route_dialog_action(
-        "subagent-profiles:set-model:explore:gpt-4.1",
-        progress.clone(),
-    );
-    assert!(matches!(
-        router.route_dialog_action("subagent-profiles:save", progress),
-        TuiSubmissionOutcome::LocalInfo(message) if message == "Subagent profiles saved."
-    ));
     let saved = store.saved.lock().unwrap();
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].0, ProfileScope::Project);
-    assert_eq!(saved[0].1, "explore");
-    assert_eq!(saved[0].2.model, Some(Some("gpt-4.1".to_owned())));
-
+    assert_eq!(saved.len(), 2);
+    assert_eq!(
+        saved[0],
+        (
+            ProfileScope::Global,
+            "explore".into(),
+            agens_config::AgentProfilePatch {
+                model: Some(Some("gpt-4.1".into())),
+                effort: None
+            }
+        )
+    );
+    assert_eq!(
+        saved[1],
+        (
+            ProfileScope::Project,
+            "explore".into(),
+            agens_config::AgentProfilePatch {
+                model: Some(Some("gpt-4.1-mini".into())),
+                effort: None
+            }
+        )
+    );
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
 #[test]
-fn subagent_profile_pickers_escape_back_to_the_agent_list_keeping_staged_edits() {
-    let bootstrap = bootstrap_from_configuration(
-        "subagent-profile-picker-back",
-        Some("[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n"),
-        None,
-    );
-    let root = std::env::temp_dir()
-        .join(format!(
-            "agens-subagent-profile-picker-back-{}",
-            std::process::id()
-        ))
-        .join("project");
-    std::fs::create_dir_all(&root).unwrap();
-    let mut context = SessionContext::fresh();
-    context.confinement_root = Some(root.clone());
-    let session = Arc::new(Mutex::new(context));
-    let cancellation = Arc::new(Mutex::new(None));
+fn subagent_profile_cycle_and_reset_autosave_patches() {
+    let temporary = tui_session_directory("subagent-profile-overlay-cycle-reset");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
     let store = Arc::new(RecordingProfileStore {
         saved: Mutex::new(Vec::new()),
     });
     let router = TuiRuntimeRouter::new(
         bootstrap,
-        session,
-        cancellation,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    )
+    .with_profile_store(store.clone());
+    let progress = std::sync::mpsc::channel().0;
+
+    router.route_request(
+        TuiRouteRequest::OpenDialog("subagent-profiles".into()),
+        progress.clone(),
+    );
+    router.route_dialog_action(
+        "subagent-profiles:cycle-effort:explore:next",
+        progress.clone(),
+    );
+    router.route_dialog_action("subagent-profiles:reset-row:explore", progress);
+
+    let saved = store.saved.lock().unwrap();
+    assert_eq!(saved[0].2.effort, Some(Some("none".into())));
+    assert_eq!(
+        saved[1],
+        (
+            ProfileScope::Global,
+            "explore".into(),
+            agens_config::AgentProfilePatch {
+                model: Some(None),
+                effort: Some(None)
+            }
+        )
+    );
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn subagent_profile_root_searches_letters_and_focuses_the_autosaved_row() {
+    let temporary = tui_session_directory("subagent-profile-overlay-search");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let store = Arc::new(RecordingProfileStore {
+        saved: Mutex::new(Vec::new()),
+    });
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
         Arc::new(CommandCatalog::default()),
         Arc::new(SkillCatalog::default()),
     )
@@ -456,63 +486,53 @@ fn subagent_profile_pickers_escape_back_to_the_agent_list_keeping_staged_edits()
         TuiRouteRequest::OpenDialog("subagent-profiles".into()),
         progress.clone(),
     ));
-    router.route_dialog_action("subagent-profiles:scope:project", progress.clone());
-    router.route_dialog_action(
-        "subagent-profiles:set-effort:explore:high",
-        progress.clone(),
-    );
-
-    let model_picker =
-        router.route_dialog_action("subagent-profiles:edit:explore", progress.clone());
-    assert!(tui.apply_submission_outcome(model_picker).is_none());
-    assert!(render_tui_test_backend(&tui, 120, 24).contains("Choose profile model"));
-    assert_eq!(
-        tui.handle(Event::Key(Key::Escape)),
-        Action::SafeDialogAction("subagent-profiles:back".into()),
-        "Escape in the model picker must go back to the agent list, not close"
-    );
-    let back = router.route_request(
-        TuiRouteRequest::DialogAction("subagent-profiles:back".into()),
-        progress.clone(),
-    );
-    assert!(tui.apply_submission_outcome(back).is_none());
+    for key in [Key::Char('m'), Key::Char('s')] {
+        assert_eq!(tui.handle(Event::Key(key)), Action::Render);
+    }
+    assert!(store.saved.lock().unwrap().is_empty());
+    assert!(!render_tui_test_backend(&tui, 120, 24).contains("Choose profile model"));
+    for _ in 0..2 {
+        assert_eq!(tui.handle(Event::Key(Key::Backspace)), Action::Render);
+    }
+    for key in [Key::Char('e'), Key::Char('x'), Key::Char('p')] {
+        assert_eq!(tui.handle(Event::Key(key)), Action::Render);
+    }
     let overlay = render_tui_test_backend(&tui, 120, 24);
     assert!(
-        overlay.contains("Subagent profiles"),
-        "back must reopen the agent list: {overlay:?}"
+        overlay.contains("explore"),
+        "query must retain the matching root row: {overlay:?}"
+    );
+    assert!(!overlay.contains("Choose profile model"));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("subagent-profiles:edit:explore".into())
     );
 
-    let effort_picker =
-        router.route_dialog_action("subagent-profiles:effort:explore", progress.clone());
-    assert!(tui.apply_submission_outcome(effort_picker).is_none());
-    assert!(render_tui_test_backend(&tui, 120, 24).contains("Choose effort"));
-    assert_eq!(
-        tui.handle(Event::Key(Key::Escape)),
-        Action::SafeDialogAction("subagent-profiles:back".into()),
-        "Escape in the effort picker must go back to the agent list, not close"
-    );
-    let back = router.route_request(
-        TuiRouteRequest::DialogAction("subagent-profiles:back".into()),
+    router.route_dialog_action(
+        "subagent-profiles:set-model:explore:gpt-4.1",
         progress.clone(),
     );
-    assert!(tui.apply_submission_outcome(back).is_none());
-    assert!(render_tui_test_backend(&tui, 120, 24).contains("Subagent profiles"));
-
-    assert!(matches!(
-        router.route_dialog_action("subagent-profiles:save", progress),
-        TuiSubmissionOutcome::LocalInfo(message) if message == "Subagent profiles saved."
+    tui.apply_submission_outcome(router.route_request(
+        TuiRouteRequest::OpenDialog("subagent-profiles".into()),
+        progress.clone(),
     ));
-    let saved = store.saved.lock().unwrap();
-    assert_eq!(saved.len(), 1);
-    assert_eq!(saved[0].0, ProfileScope::Project);
-    assert_eq!(saved[0].1, "explore");
     assert_eq!(
-        saved[0].2.effort,
-        Some(Some("high".to_owned())),
-        "the staged edit must survive picker back navigation"
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("subagent-profiles:edit:explore".into())
     );
-
-    std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    tui.apply_submission_outcome(
+        router.route_dialog_action("subagent-profiles:edit:explore", progress.clone()),
+    );
+    assert_eq!(
+        tui.handle(Event::Key(Key::Escape)),
+        Action::SafeDialogAction("subagent-profiles:back".into())
+    );
+    tui.apply_submission_outcome(router.route_request(
+        TuiRouteRequest::DialogAction("subagent-profiles:back".into()),
+        progress,
+    ));
+    assert_eq!(store.saved.lock().unwrap().len(), 1);
+    std::fs::remove_dir_all(temporary).unwrap();
 }
 
 fn test_chatgpt_credentials(
