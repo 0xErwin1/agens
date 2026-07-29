@@ -352,7 +352,7 @@ fn tui_model_effort_and_help_palette_routes_open_local_overlays_and_dispatch_onc
     let (progress, _) = std::sync::mpsc::channel();
 
     for (prefix, route_id, expected) in [
-        ("/mo", "model", ["Choose model", "gpt-4.1 (current)"]),
+        ("/mo", "model", ["Choose model", "gpt-4.1 · OpenAI API"]),
         ("/ef", "effort", ["Choose effort", "Default"]),
         ("/he", "help", ["Commands and skills", "/connect"]),
     ] {
@@ -1042,10 +1042,19 @@ fn tui_model_overlay_labels_source_metadata_current_and_compatible_sets() {
         );
         let text = render_tui_test_backend(&tui, 140, 60);
 
-        assert!(text.contains(source), "{provider}: {text:?}");
-        assert!(text.contains("gpt-5.5 (current)"), "{provider}: {text:?}");
+        assert!(
+            text.contains(&format!("All providers · current: {source}")),
+            "{provider}: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("gpt-5.5 · {source} (current)")),
+            "{provider}: {text:?}"
+        );
         assert!(text.contains(included), "{provider}: {text:?}");
-        assert!(!text.contains(excluded), "{provider}: {text:?}");
+        assert!(
+            !text.contains(&format!("{excluded} · {source}")),
+            "{provider}: {text:?}"
+        );
         assert!(text.contains("272K context"), "{provider}: {text:?}");
         assert!(text.contains("128K output"), "{provider}: {text:?}");
         assert!(text.contains("reasoning"), "{provider}: {text:?}");
@@ -1214,9 +1223,21 @@ fn tui_provider_overlay_filters_unavailable_entries_and_switches_without_history
     dispatch_tui_dialog_selection(&mut tui, &router, progress);
     assert_eq!(tui.view().provider_model, "openai-chatgpt / gpt-5.5");
     tui.apply_submission_outcome(router.open_dialog("model").unwrap());
-    let model_overlay = render_tui_test_backend(&tui, 80, 24);
-    assert!(model_overlay.contains("Source: ChatGPT subscription"));
-    assert!(model_overlay.contains("gpt-5.5 (current)"));
+    let model_overlay = render_tui_test_backend(&tui, 140, 40);
+    assert!(model_overlay.contains("All providers · current: ChatGPT subscription"));
+    assert!(model_overlay.contains("gpt-5.5 · ChatGPT subscription (current)"));
+    for character in "kimi".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+    let searched = render_tui_test_backend(&tui, 140, 40);
+    assert!(
+        searched.contains("kimi-k3 · Moonshot AI"),
+        "searching reaches another provider's models: {searched:?}"
+    );
+    assert!(
+        !searched.contains("gpt-5.5 · ChatGPT"),
+        "the search filters the active provider out too: {searched:?}"
+    );
     assert!(tui.transcript().is_empty());
     assert!(session.lock().unwrap().messages.is_empty());
 

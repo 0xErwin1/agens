@@ -1,14 +1,14 @@
 //! Connecting, disconnecting and reconciling the provider a session speaks
 //! through.
 
-use agens_session::model::effective_model;
+use agens_session::model::{effective_model, resolved_provider};
 use std::fs;
 
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError};
 use agens_providers::chatgpt_login::LoginCancellation;
 use agens_tui::TuiRouteProgress;
 
-use crate::models::apply_tui_selection;
+use crate::models::{apply_tui_model, apply_tui_selection};
 use agens_auth::{ChatGptAuthFlow, ChatGptAuthProgress};
 use agens_bootstrap::{Bootstrap, ProviderSource, resolve_provider_type};
 use agens_error::CliError;
@@ -139,6 +139,40 @@ impl TuiRuntimeRouter {
         context.chatgpt_unavailable = true;
         context.active_agent = None;
         Ok(())
+    }
+
+    /// Selects a model that may belong to a provider other than the active one.
+    ///
+    /// Switching first is what makes the model picker able to list every
+    /// provider: choosing a model the current provider cannot serve would
+    /// otherwise be rejected, or worse, accepted and sent to the wrong account.
+    /// The provider switch keeps its own credential check, so picking a model
+    /// from a provider you are not signed in to fails there rather than here.
+    pub(super) fn apply_provider_model(
+        &self,
+        bootstrap: &Bootstrap,
+        provider: &str,
+        model: &str,
+    ) -> Result<String, CliError> {
+        let requested = ProviderKind::parse(provider)
+            .ok_or_else(|| CliError::usage("provider is not implemented"))?;
+
+        let active = {
+            let context = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            resolved_provider(bootstrap, &context)
+        };
+
+        if requested == active {
+            return apply_tui_model(bootstrap, model, &self.session);
+        }
+
+        self.apply_provider(bootstrap, provider)?;
+        let message = apply_tui_model(bootstrap, model, &self.session)?;
+
+        Ok(format!("Provider: {}. {message}", requested.label()))
     }
 
     pub(super) fn apply_provider(

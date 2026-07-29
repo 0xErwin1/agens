@@ -34,6 +34,18 @@ use agens_tool_runtime::rotation::rotate_agent;
 
 use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
+/// Every provider, the active one first, so the models a person is most likely
+/// to want are at the top of the picker without hiding the rest.
+fn providers_with_active_first(active: ProviderKind) -> Vec<ProviderKind> {
+    let mut providers = vec![active];
+    providers.extend(
+        ProviderKind::ALL
+            .into_iter()
+            .filter(|provider| *provider != active),
+    );
+    providers
+}
+
 impl TuiRuntimeRouter {
     pub fn open_dialog(&self, route_id: &str) -> Result<TuiSubmissionOutcome, CliError> {
         let bootstrap = self.bootstrap()?;
@@ -112,32 +124,46 @@ impl TuiRuntimeRouter {
                     .or_else(|| bootstrap.model())
                     .unwrap_or_else(|| resolved_provider(&bootstrap, &context).default_model())
                     .to_owned();
-                let source = model_source(&bootstrap, &context);
+                let active = resolved_provider(&bootstrap, &context);
                 drop(context);
-                let selector = ModelSelection::for_source(current.clone(), source);
-                let values = selector.models().map_err(CliError::unavailable)?;
-                let selected = values
-                    .iter()
-                    .position(|model| model.id == current)
-                    .unwrap_or_default();
-                let entries = values
-                    .into_iter()
-                    .map(|model| {
-                        let label = if model.id == current {
-                            format!("{} (current)", model.id)
+
+                let mut entries = Vec::new();
+                let mut selected = 0;
+                for provider in providers_with_active_first(active) {
+                    let selector =
+                        ModelSelection::for_source(provider.default_model(), provider.source());
+                    let values = selector.models().map_err(CliError::unavailable)?;
+
+                    for model in values {
+                        let is_current = provider == active && model.id == current;
+                        if is_current {
+                            selected = entries.len();
+                        }
+
+                        let label = if is_current {
+                            format!("{} · {} (current)", model.id, provider.label())
                         } else {
-                            model.id.clone()
+                            format!("{} · {}", model.id, provider.label())
                         };
-                        DialogEntry::action_with_detail(
+
+                        entries.push(DialogEntry::action_with_metadata(
                             label,
-                            Some(format_model_metadata(&model)),
-                            format!("model:{}", model.id),
-                        )
-                    })
-                    .collect();
+                            format_model_metadata(&model),
+                            format!(
+                                "{} {} {}",
+                                model.id,
+                                provider.identifier(),
+                                provider.label()
+                            ),
+                            format_model_metadata(&model),
+                            format!("model:{}:{}", provider.identifier(), model.id),
+                        ));
+                    }
+                }
+
                 DialogView::selection(
                     "Choose model",
-                    Some(format!("Source: {}", selector.source_label())),
+                    Some(format!("All providers · current: {}", active.label())),
                     entries,
                 )
                 .with_selected(selected)
@@ -402,8 +428,13 @@ impl TuiRuntimeRouter {
                         |context| self.on_session_resume_committed(&bootstrap, context),
                     );
                 }
-                let message = if let Some(model) = action_id.strip_prefix("model:") {
-                    apply_tui_model(&bootstrap, model, &self.session)?
+                let message = if let Some(selection) = action_id.strip_prefix("model:") {
+                    match selection.split_once(':') {
+                        Some((provider, model)) => {
+                            self.apply_provider_model(&bootstrap, provider, model)?
+                        }
+                        None => apply_tui_model(&bootstrap, selection, &self.session)?,
+                    }
                 } else if let Some(model) = action_id.strip_prefix("model-custom:") {
                     apply_tui_unverified_model(&bootstrap, model, &self.session)?
                 } else if let Some(provider) = action_id.strip_prefix("provider:") {
