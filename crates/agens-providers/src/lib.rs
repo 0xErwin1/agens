@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime};
 
+mod moonshot;
+pub use moonshot::MoonshotProvider;
+
 use agens_core::{
     Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
     Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
@@ -193,6 +196,7 @@ impl ProviderDiagnosticScope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderDiagnosticComponent {
     Responses,
+    ChatCompletions,
     OauthRefresh,
     Subagent,
     Agent,
@@ -202,6 +206,7 @@ impl ProviderDiagnosticComponent {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat_completions",
             Self::OauthRefresh => "oauth_refresh",
             Self::Subagent => "subagent",
             Self::Agent => "agent",
@@ -662,9 +667,25 @@ fn classify_openai_response_status(status: u16, context_exceeded: bool) -> Headl
     }
 }
 
+/// Whether a failed response says the request outran the model's context, for
+/// providers that answer with the OpenAI error code.
 async fn read_safe_openai_context_error(
+    response: reqwest::Response,
+    cancellation: &HeadlessTurnCancellation,
+) -> Result<bool, HeadlessTurnPortError> {
+    read_safe_context_error(response, cancellation, &[]).await
+}
+
+/// The same question for a provider that signals context overflow in the error
+/// message instead of a code. `message_markers` are matched against the raw
+/// body; passing none leaves only the OpenAI code check.
+///
+/// The body is read under a size cap and discarded: it can echo the request, so
+/// nothing beyond the verdict survives this function.
+async fn read_safe_context_error(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
+    message_markers: &[&str],
 ) -> Result<bool, HeadlessTurnPortError> {
     let mut body = Vec::new();
     while body.len() < MAX_CHATGPT_ERROR_BODY_BYTES {
@@ -683,6 +704,13 @@ async fn read_safe_openai_context_error(
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     stop_before_mapping(cancellation)?;
+
+    if !message_markers.is_empty()
+        && let Ok(text) = std::str::from_utf8(&body)
+        && message_markers.iter().any(|marker| text.contains(marker))
+    {
+        return Ok(true);
+    }
 
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return Ok(false);

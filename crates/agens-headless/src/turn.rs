@@ -15,8 +15,8 @@ use agens_core::{
     run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
-    ChatGptResponsesProvider, OpenAiFunctionTool, OpenAiResponsesProvider, ProgressAwareProvider,
-    ProviderDiagnosticScope,
+    ChatGptResponsesProvider, MoonshotProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
+    ProgressAwareProvider, ProviderDiagnosticScope,
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{EffectiveCapabilitySet, TaskMessageTarget};
@@ -130,6 +130,46 @@ pub fn run_production_headless_chat_with_progress(
                 },
             )
         }
+        Some("moonshotai") => {
+            let api_key = bootstrap.api_key.clone().ok_or_else(|| {
+                CliError::authentication("Moonshot AI authentication is unavailable")
+            })?;
+            let base_url = headless_turn_provider_base_url(bootstrap, &agent_catalog_root)?;
+            run_production_headless_chat_with_provider(
+                request,
+                HeadlessProviderContext {
+                    bootstrap,
+                    cancellation,
+                    progress,
+                    prompter,
+                    task_runtime,
+                    diagnostic_reference: &diagnostic_reference,
+                    include_system_prompt: true,
+                },
+                move |model, messages, tools, request_config| {
+                    MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
+                        api_key,
+                        base_url.as_deref(),
+                        model,
+                        messages,
+                        tools,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .map(|provider| {
+                        provider
+                            .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                            .with_request_config(request_config)
+                            .with_diagnostics(provider_diagnostics)
+                    })
+                    .map_err(|error| {
+                        provider_construction_error(
+                            error,
+                            "Moonshot AI authentication is unavailable",
+                        )
+                    })
+                },
+            )
+        }
         Some("openai-chatgpt") => {
             let credentials_path = bootstrap.paths.credentials.clone();
             let instructions = match request.system_prompt.clone() {
@@ -176,7 +216,7 @@ pub fn run_production_headless_chat_with_progress(
             )
         }
         _ => Err(HeadlessChatFailure::from(CliError::configuration(
-            "headless chat requires provider.type = \"openai-api\" or \"openai-chatgpt\"",
+            "headless chat requires provider.type = \"openai-api\", \"openai-chatgpt\", or \"moonshotai\"",
         ))),
     };
     result.map_err(|failure| {

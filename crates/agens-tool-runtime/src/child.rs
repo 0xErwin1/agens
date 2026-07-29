@@ -13,7 +13,7 @@ use agens_core::{
     TurnProgressSink, TurnProvider, run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
-    ChatGptResponsesProvider, OpenAiResponsesProvider, ProgressAwareProvider,
+    ChatGptResponsesProvider, MoonshotProvider, OpenAiResponsesProvider, ProgressAwareProvider,
     ProviderDiagnosticClass, ProviderDiagnosticEvent, ProviderDiagnosticScope, ProviderDiagnostics,
 };
 use agens_tools::{
@@ -191,6 +191,38 @@ pub fn run_production_task(
                         .with_diagnostics(provider_diagnostics)
                 })
                 .map_err(|_| ChildRunError::Runtime)?;
+            run_isolated_task_turn(
+                provider,
+                tool_runtime,
+                project_root,
+                dangerous_mode,
+                cancellation,
+                progress,
+                TaskMailboxContext {
+                    registry: task_registry.clone(),
+                    target: TaskMessageTarget::Execution(execution_id),
+                },
+            )
+        }
+        Some("moonshotai") => {
+            let api_key = bootstrap.api_key.clone().ok_or(ChildRunError::Runtime)?;
+            let base_url = task_provider_base_url(bootstrap, project_root)
+                .map_err(|_| ChildRunError::Runtime)?;
+            let provider = MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
+                api_key,
+                base_url.as_deref(),
+                request.model().to_owned(),
+                messages,
+                provider_tools,
+                std::time::Duration::from_secs(120),
+            )
+            .map(|provider| {
+                provider
+                    .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
+                    .with_request_config(request.request_config().clone())
+                    .with_diagnostics(provider_diagnostics)
+            })
+            .map_err(|_| ChildRunError::Runtime)?;
             run_isolated_task_turn(
                 provider,
                 tool_runtime,
