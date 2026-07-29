@@ -5,7 +5,10 @@ use std::process::{Command, Stdio};
 
 mod agent_profiles;
 
-pub use agent_profiles::{AgentProfile, parse_agent_profiles};
+pub use agent_profiles::{
+    AgentProfile, AgentProfileEditError, AgentProfilePatch, apply_agent_profile_patch,
+    parse_agent_profiles,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigPermissionDecision {
