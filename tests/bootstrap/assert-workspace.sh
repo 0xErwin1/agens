@@ -55,6 +55,7 @@ jq -e '
       "agens-config",
       "agens-core",
       "agens-error",
+      "agens-models",
       "agens-tools"
     ],
     "agens-bus": [],
