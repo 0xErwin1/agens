@@ -1135,8 +1135,7 @@ impl<R: TaskRunner> TaskTool<R> {
     fn resolve(&self, invocation: TaskInvocation) -> Result<TaskTurnRequest, ToolOutput> {
         let agent = self.resolve_agent(invocation.agent.as_deref())?;
 
-        let explicit_model = invocation.model.or_else(|| agent.model.clone());
-        let (model, request_config) = match explicit_model {
+        let (model, mut request_config) = match invocation.model {
             Some(model) => {
                 if self.model_validator.validate_model(&model).is_err() {
                     return Err(self.model_unavailable_output());
@@ -1148,11 +1147,31 @@ impl<R: TaskRunner> TaskTool<R> {
                 };
                 (model, request_config)
             }
-            None => (
-                self.parent_model.clone(),
-                self.parent_request_config.clone(),
-            ),
+            None => match agent.model.clone() {
+                Some(model) if self.model_validator.validate_model(&model).is_ok() => {
+                    let request_config = if model == self.parent_model {
+                        self.parent_request_config.clone()
+                    } else {
+                        RequestConfig::default()
+                    };
+                    (model, request_config)
+                }
+                Some(_) => {
+                    self.record_model_unavailable();
+                    (
+                        self.parent_model.clone(),
+                        self.parent_request_config.clone(),
+                    )
+                }
+                None => (
+                    self.parent_model.clone(),
+                    self.parent_request_config.clone(),
+                ),
+            },
         };
+        if let Some(effort) = agent.reasoning_effort {
+            request_config = RequestConfig::with_reasoning_effort_value(effort);
+        }
 
         let skills = self.resolve_skills(agent, invocation.skills.as_deref())?;
         Ok(TaskTurnRequest {
@@ -1168,17 +1187,20 @@ impl<R: TaskRunner> TaskTool<R> {
 
     fn model_unavailable_output(&self) -> ToolOutput {
         let mut output = task_terminal(HeadlessTaskTerminal::ModelUnavailable);
-        let reference = self
-            .model_resolution_diagnostics
-            .as_ref()
-            .and_then(|diagnostics| diagnostics(TaskModelResolutionError::ModelUnavailable))
-            .filter(|reference| is_diagnostic_reference(reference));
+        let reference = self.record_model_unavailable();
         if let Some(reference) = reference {
             output.content.push_str(" [ref: ");
             output.content.push_str(&reference);
             output.content.push(']');
         }
         output
+    }
+
+    fn record_model_unavailable(&self) -> Option<String> {
+        self.model_resolution_diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics(TaskModelResolutionError::ModelUnavailable))
+            .filter(|reference| is_diagnostic_reference(reference))
     }
 
     fn resolve_skills(

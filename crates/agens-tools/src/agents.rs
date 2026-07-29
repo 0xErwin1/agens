@@ -72,6 +72,12 @@ impl AgentCatalog {
             .filter(|agent| agent.mode != AgentMode::Primary)
     }
 
+    pub fn map_agents(&self, map: impl Fn(&AgentDefinition) -> AgentDefinition) -> Self {
+        let mut catalog = self.clone();
+        catalog.agents = self.agents.iter().map(map).collect();
+        catalog
+    }
+
     fn insert(&mut self, agent: AgentDefinition, source: PathBuf) -> Option<PathBuf> {
         if let Some(index) = self.positions.get(&agent.name).copied() {
             self.agents[index] = agent;
