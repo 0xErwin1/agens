@@ -1753,7 +1753,7 @@ fn built_in_explore_inherits_the_effective_openai_parent_model_without_agent_fil
 }
 
 #[test]
-fn agents_md_instructions_reach_a_subagents_request_body_end_to_end() {
+fn agents_md_instructions_reach_both_the_parent_and_a_subagents_request_body_end_to_end() {
     let temporary = TemporaryDirectory::new("agents-md-instructions-e2e");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -1763,20 +1763,21 @@ fn agents_md_instructions_reach_a_subagents_request_body_end_to_end() {
     std::fs::write(project_root.join("AGENTS.md"), "PROJECT-AGENTS-MD-SENTINEL")
         .expect("project AGENTS.md should be written");
     let server = ScriptedNativeOpenAiMockServer::start(vec![
-        // This first request is the top-level `chat` command's own turn. Its
-        // `instructions` field comes from `headless_turn_system_prompt`
-        // (`crates/agens-headless/src/turn.rs`), which re-reads
-        // `SessionConfig` directly rather than going through
-        // `discover_agent_catalog`'s `primary` agent — so it never carries
-        // the appended AGENTS.md text; only a catalog-resolved agent (the
-        // `task`-dispatched subagent below, or a TUI-rotated primary/custom
-        // agent) does.
+        // This first request is the top-level `chat` command's own turn. Its `instructions`
+        // field comes from `headless_turn_own_system_prompt`
+        // (`crates/agens-headless/src/turn.rs`), which re-reads `SessionConfig` directly rather
+        // than going through `discover_agent_catalog`'s `primary` agent — but appends this
+        // session's own AGENTS.md instructions to whichever base prompt it resolves (here, the
+        // hardcoded default, since no `--system` flag or `agent.system_prompt` applies), so it
+        // still carries the same sentinel as the `task`-dispatched subagent below, exactly once.
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"model\":\"gpt-5.5\"".into(),
                 "explore".into(),
                 "general".into(),
                 "parent general request".into(),
+                "You are Agens, a helpful coding agent.".into(),
+                "PROJECT-AGENTS-MD-SENTINEL".into(),
             ],
             response: native_tool_call_response(
                 "task-general",

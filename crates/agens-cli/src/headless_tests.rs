@@ -17,8 +17,8 @@ use agens_headless::{
     record_tool_result_fact, run_production_headless_chat_with_progress,
 };
 use agens_headless::{
-    headless_turn_permission_policy, headless_turn_project_root, headless_turn_provider_base_url,
-    headless_turn_system_prompt,
+    headless_turn_own_system_prompt, headless_turn_permission_policy, headless_turn_project_root,
+    headless_turn_provider_base_url, headless_turn_system_prompt,
 };
 use agens_store::{SessionStore, ToolFactStore};
 use agens_tools::SkillCatalog;
@@ -322,6 +322,136 @@ fn a_headless_turns_provider_base_url_is_scoped_to_its_own_root_not_the_bootstra
 
     std::fs::remove_dir_all(&temporary).ok();
     std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
+}
+
+/// The gap this closes: `headless_turn_system_prompt` (exercised above) never carries this
+/// session's own AGENTS.md instruction text, so a plain `agens chat` parent turn built entirely
+/// from `headless_turn_own_system_prompt` received none, while the agent catalog (TUI agents and
+/// `task` subagents) already did.
+#[test]
+fn a_headless_turns_own_system_prompt_appends_this_sessions_agents_md_instructions_to_the_hardcoded_fallback()
+ {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-own-system-prompt-fallback-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-INSTRUCTIONS")
+        .expect("project AGENTS.md should be written");
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::new(),
+    ))
+    .unwrap();
+
+    let prompt = headless_turn_own_system_prompt(&bootstrap, &project_root, None).unwrap();
+
+    let canonical = std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        prompt,
+        format!(
+            "You are Agens, a helpful coding agent.\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS",
+            canonical.display()
+        ),
+        "the hardcoded fallback must still carry this session's own AGENTS.md instructions"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
+/// The `--system` CLI flag replaces the agent's own configured prompt, not the project's
+/// instructions: an explicit base prompt must still receive them.
+#[test]
+fn a_headless_turns_own_system_prompt_appends_this_sessions_agents_md_instructions_to_an_explicit_prompt()
+ {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-own-system-prompt-explicit-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+
+    std::fs::write(project_root.join("AGENTS.md"), "PROJECT-INSTRUCTIONS")
+        .expect("project AGENTS.md should be written");
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::new(),
+    ))
+    .unwrap();
+
+    let prompt = headless_turn_own_system_prompt(
+        &bootstrap,
+        &project_root,
+        Some("Explicit --system prompt.".to_owned()),
+    )
+    .unwrap();
+
+    let canonical = std::fs::canonicalize(project_root.join("AGENTS.md")).unwrap();
+    assert_eq!(
+        prompt,
+        format!(
+            "Explicit --system prompt.\n\n## Instructions from {}\nPROJECT-INSTRUCTIONS",
+            canonical.display()
+        ),
+        "an explicit --system prompt replaces the agent's own prompt, not the project's \
+         instructions, so it must still carry them"
+    );
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
+}
+
+/// Neither AGENTS.md exists, so the base prompt is returned byte-identical: appending an empty
+/// instruction set must be a true no-op, not an empty trailing separator.
+#[test]
+fn a_headless_turns_own_system_prompt_is_unchanged_when_no_agents_md_exists() {
+    let temporary = std::env::temp_dir().join(format!(
+        "agens-headless-own-system-prompt-absent-{}",
+        std::process::id()
+    ));
+    let config_home = temporary.join("config");
+    let project_root = temporary.join("project");
+    std::fs::create_dir_all(&project_root).expect("project root should be created");
+
+    let bootstrap = bootstrap(&CliDependencies::for_test(
+        project_root.clone(),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        BTreeMap::new(),
+    ))
+    .unwrap();
+
+    let prompt = headless_turn_own_system_prompt(
+        &bootstrap,
+        &project_root,
+        Some("Explicit --system prompt.".to_owned()),
+    )
+    .unwrap();
+
+    assert_eq!(prompt, "Explicit --system prompt.");
+
+    std::fs::remove_dir_all(&temporary).ok();
+    std::fs::remove_dir_all(bootstrap.data_directory()).ok();
 }
 
 #[test]
