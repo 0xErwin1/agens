@@ -25,7 +25,8 @@ use crate::test_support::{
     open_tui_palette_dialog, persist_tui_session, persist_tui_session_metadata,
     render_tui_test_backend, rotation_dispatcher, run_production_batch, submit_tui_command,
     tui_project, tui_session_bootstrap, tui_session_bootstrap_for_provider,
-    tui_session_bootstrap_without_provider, tui_session_directory, tui_session_messages,
+    tui_session_bootstrap_with_global_bypass, tui_session_bootstrap_without_provider,
+    tui_session_directory, tui_session_messages,
 };
 use agens_agents::ensure_active_agent_runtime;
 use agens_headless::HeadlessChatCompletion;
@@ -328,6 +329,30 @@ fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
     let input = enter_tui_input(&mut tui, &format!("/resume {}", metadata.id));
     tui.apply_submission_outcome(router.route(input));
     assert_eq!(tui.view().session, format!("session #{}", metadata.id));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_new_command_reseeds_bypass_permissions_from_configuration_after_a_toggle() {
+    let temporary = tui_session_directory("new-command-reseeds-bypass");
+    let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, true);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    // The user turns bypass off, then starts a new session; configuration re-seeds it to on.
+    session.lock().unwrap().bypass_permissions = false;
+    let outcome = router.route("/new".into());
+    assert!(matches!(
+        outcome,
+        TuiSubmissionOutcome::ResetSucceeded { .. }
+    ));
+    assert!(session.lock().unwrap().bypass_permissions);
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

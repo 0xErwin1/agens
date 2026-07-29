@@ -478,6 +478,7 @@ mod tests {
             context.active_agent.clone().unwrap(),
             std::path::PathBuf::from("project"),
         );
+        assert!(!no_expansion.bypass_permissions);
         no_expansion.metadata = None;
         rotate_active_agent(
             &mut no_expansion,

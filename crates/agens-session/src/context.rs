@@ -33,6 +33,13 @@ pub struct SessionContext {
     pub resume_draft: Option<ResumeDraft>,
     pub selected_subagent: Option<String>,
     pub dangerous_mode: bool,
+    /// Whether `Ask` permission prompts are bypassed for this session. Seeded from
+    /// `agent.bypass_permission_prompts` (global configuration only) for a brand-new session, but
+    /// carried as the session's OWN recorded value on resume rather than re-seeded — see
+    /// [`crate::root::resolve_tui_session_root`]'s sibling in `agens-bootstrap` for the
+    /// configuration read, and `agens-store`'s `bypass_permission_prompts` accessor for the
+    /// persisted value a resume reads back.
+    pub bypass_permissions: bool,
     pub running: bool,
 }
 
@@ -216,6 +223,7 @@ impl SessionContext {
             resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
+            bypass_permissions: false,
             running: false,
         }
     }
@@ -248,6 +256,7 @@ impl SessionContext {
             resume_draft: None,
             selected_subagent: None,
             dangerous_mode: false,
+            bypass_permissions: false,
             running: false,
         }
     }
@@ -270,5 +279,36 @@ impl SessionContext {
             "Resumed session {identifier}: agent={} turns={}",
             metadata.active_agent, metadata.completed_turn_count
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bypass_permissions_defaults_to_false_for_a_fresh_session() {
+        assert!(!SessionContext::fresh().bypass_permissions);
+    }
+
+    #[test]
+    fn bypass_permissions_defaults_to_false_for_a_restored_session() {
+        let metadata = SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: true,
+        };
+        let restored =
+            SessionContext::restored(1, metadata, Vec::new(), std::path::PathBuf::from("project"));
+
+        assert!(!restored.bypass_permissions);
     }
 }

@@ -5,6 +5,7 @@ use agens_session::model::current_provider;
 use agens_core::HeadlessTurnError;
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
+use crate::engine::seed_bypass_permissions_from_configuration;
 use crate::extensions::RESERVED_TUI_COMMANDS;
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
@@ -67,6 +68,7 @@ impl TuiRuntimeRouter {
                 })?;
                 reset_session(&mut session)
                     .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
+                seed_bypass_permissions_from_configuration(&bootstrap, &mut session)?;
                 drop(session);
                 TuiSubmissionOutcome::ResetSucceeded {
                     message: "Started a new session.".into(),

@@ -68,6 +68,7 @@ pub fn apply_session_to_request(
     mut request: HeadlessChatRequest,
 ) -> HeadlessChatRequest {
     request.dangerous_mode = context.dangerous_mode;
+    request.dangerously_allow_all |= context.bypass_permissions;
     if context.identifier.is_some() {
         request.history = context.messages.clone();
         request.session = context.metadata.clone();
@@ -126,5 +127,60 @@ pub fn explicit_task_delegation_prompt(base: &str) -> String {
         base.to_owned()
     } else {
         format!("{base}\n\n{INSTRUCTION}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agens_core::PermissionMode;
+    use agens_session::context::SessionContext;
+
+    fn bare_request() -> HeadlessChatRequest {
+        HeadlessChatRequest {
+            prompt: String::new(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+        }
+    }
+
+    #[test]
+    fn session_bypass_widens_the_request_to_allow_all() {
+        let context = SessionContext {
+            bypass_permissions: true,
+            ..SessionContext::fresh()
+        };
+
+        let request = apply_session_to_request(&context, bare_request());
+
+        assert!(request.dangerously_allow_all);
+    }
+
+    #[test]
+    fn session_bypass_never_narrows_a_request_that_already_allows_all() {
+        let context = SessionContext {
+            bypass_permissions: false,
+            ..SessionContext::fresh()
+        };
+        let request = HeadlessChatRequest {
+            dangerously_allow_all: true,
+            ..bare_request()
+        };
+
+        let request = apply_session_to_request(&context, request);
+
+        assert!(request.dangerously_allow_all);
     }
 }

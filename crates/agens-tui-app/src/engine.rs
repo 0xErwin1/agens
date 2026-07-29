@@ -38,6 +38,7 @@ use agens_headless::{
 };
 use agens_session::context::{ResumeDraft, SessionContext};
 use agens_session::provider::CredentialResolver;
+use agens_store::SessionStore;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
 use agens_tool_runtime::runtime::task_execution_limits;
 use agens_tool_runtime::task::{
@@ -114,6 +115,7 @@ pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
         let notice = seed_remembered_tui_selection(bootstrap, &mut context);
+        seed_bypass_permissions_from_configuration(bootstrap, &mut context)?;
         tui.apply_presentation(tui_session_presentation(bootstrap, &context));
         drop(context);
         if let Some(notice) = notice {
@@ -428,7 +430,38 @@ pub fn run_tui_prompt_with(
         .lock()
         .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
     session.running = false;
-    complete_tui_turn(&mut session, completion, consumed_reminder)
+    let result = complete_tui_turn(&mut session, completion, consumed_reminder);
+    if let Some(identifier) = session.identifier {
+        write_through_bypass_permission_prompts(bootstrap, identifier, session.bypass_permissions);
+    }
+    result
+}
+
+/// Seeds `context.bypass_permissions` from the GLOBAL `agent.bypass_permission_prompts`
+/// configuration, for a session that has nothing of its own recorded yet: a brand-new session, or
+/// one just reset by `/new`. A RESUMED session must never call this — its own recorded value (or,
+/// absent one, this same configuration fallback) is read once in
+/// [`crate::resume::prepare_loaded_tui_session_resume`] instead, so re-seeding it here would
+/// silently re-enable a bypass the user deliberately turned off.
+pub fn seed_bypass_permissions_from_configuration(
+    bootstrap: &Bootstrap,
+    context: &mut SessionContext,
+) -> Result<(), CliError> {
+    let root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
+    let session_root = agens_bootstrap::session_root::SessionRoot::confined_to(root);
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    context.bypass_permissions = session_config.bypass_permission_prompts();
+    Ok(())
+}
+
+/// Records a session's bypass-permission-prompts value once it has an identifier to record it
+/// against. Best-effort, like [`agens_agents::persist_pending_agent_correction`]'s own write:
+/// a session toggled and then abandoned before its first completed turn has no row to write to
+/// yet, and that is an accepted, documented edge rather than a failure to surface.
+fn write_through_bypass_permission_prompts(bootstrap: &Bootstrap, identifier: i64, enabled: bool) {
+    let _ = SessionStore::open(bootstrap.data_directory())
+        .and_then(|mut store| store.set_bypass_permission_prompts(identifier, enabled));
 }
 
 /// The configured system prompt fallback a TUI turn must fall back to, re-derived from the
@@ -501,7 +534,8 @@ mod tests {
     use super::*;
     use crate::test_support::{
         persist_tui_session, rotation_agent, rotation_dispatcher, tui_project,
-        tui_session_bootstrap, tui_session_directory, tui_session_messages,
+        tui_session_bootstrap, tui_session_bootstrap_with_global_bypass, tui_session_directory,
+        tui_session_messages,
     };
     use agens_fixtures::BundledModelValidator;
     use agens_models::ModelSelection;
@@ -725,6 +759,64 @@ mod tests {
                 .as_ref()
                 .map(|agent| agent.name.as_str()),
             Some("primary")
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_session_seeds_bypass_permissions_from_global_configuration() {
+        let temporary = tui_session_directory("fresh-session-bypass-on");
+        let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, true);
+        let mut context = SessionContext::fresh();
+
+        seed_bypass_permissions_from_configuration(&bootstrap, &mut context).unwrap();
+
+        assert!(context.bypass_permissions);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_session_without_a_global_declaration_stays_off() {
+        let temporary = tui_session_directory("fresh-session-bypass-off");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut context = SessionContext::fresh();
+
+        seed_bypass_permissions_from_configuration(&bootstrap, &mut context).unwrap();
+
+        assert!(!context.bypass_permissions);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_completed_turn_writes_the_session_bypass_value_through_once_an_identifier_exists() {
+        let temporary = tui_session_directory("write-through-bypass");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "seed");
+        drop(store);
+        let session = Arc::new(Mutex::new(SessionContext {
+            bypass_permissions: true,
+            ..SessionContext::fresh()
+        }));
+
+        let mut next_turn = metadata.clone();
+        next_turn.completed_turn_count += 1;
+        let result = run_tui_prompt_with(&bootstrap, "next request", &session, None, |_| {
+            Ok(HeadlessChatCompletion {
+                text: "captured".into(),
+                metadata: next_turn,
+                messages: Vec::new(),
+            })
+        });
+        assert!(result.is_ok());
+
+        let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        assert_eq!(
+            store.bypass_permission_prompts(metadata.id).unwrap(),
+            Some(true)
         );
 
         std::fs::remove_dir_all(temporary).unwrap();
