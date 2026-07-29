@@ -1510,7 +1510,9 @@ fn selection_metadata_round_trips_updates_atomically_and_preserves_crud_boundari
             |row| row.get::<_, String>(0),
         )
         .unwrap();
-    assert!(schema.ends_with("provider_id,model_id,reasoning_effort,confinement_root"));
+    assert!(schema.ends_with(
+        "provider_id,model_id,reasoning_effort,confinement_root,bypass_permission_prompts"
+    ));
     for forbidden in [
         "credential",
         "token",
@@ -1595,6 +1597,78 @@ fn confinement_root_falls_back_to_project_for_rows_recorded_before_the_column_ex
     assert_eq!(
         store.confinement_root(session_id).unwrap(),
         std::path::PathBuf::from("/legacy/root")
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_freshly_created_session_has_no_recorded_bypass_permission_prompts_value() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "/original/root".into(),
+        title: "bypass".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "prompt".into())
+        .unwrap();
+
+    assert_eq!(
+        store
+            .bypass_permission_prompts(attempt.key().session_id())
+            .unwrap(),
+        None
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn setting_bypass_permission_prompts_round_trips_true_and_false() {
+    let directory = directory();
+    let metadata = SessionMetadata {
+        id: 0,
+        project: "/original/root".into(),
+        title: "bypass".into(),
+        active_agent: "primary".into(),
+        provider_id: None,
+        model_id: None,
+        reasoning_effort: None,
+        created_at: 10,
+        updated_at: 20,
+        completed_turn_count: 0,
+        resumable: false,
+    };
+    let mut store = SessionStore::open(&directory).unwrap();
+    let attempt = store
+        .begin_session_attempt(&metadata, "prompt".into())
+        .unwrap();
+    let session_id = attempt.key().session_id();
+
+    store
+        .set_bypass_permission_prompts(session_id, true)
+        .unwrap();
+    assert_eq!(
+        store.bypass_permission_prompts(session_id).unwrap(),
+        Some(true)
+    );
+
+    store
+        .set_bypass_permission_prompts(session_id, false)
+        .unwrap();
+    assert_eq!(
+        store.bypass_permission_prompts(session_id).unwrap(),
+        Some(false)
     );
 
     fs::remove_dir_all(directory).unwrap();

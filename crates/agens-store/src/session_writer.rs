@@ -798,6 +798,55 @@ impl SessionStore {
         Ok(PathBuf::from(confinement_root.unwrap_or(project)))
     }
 
+    /// The session's recorded bypass-permission-prompts value. `None` means it was never
+    /// recorded — either the session predates migration `0006` or no turn has completed since it
+    /// was created — and the caller falls back to configuration, exactly as `confinement_root`
+    /// falls back to `project`.
+    pub fn bypass_permission_prompts(
+        &self,
+        session_id: i64,
+    ) -> Result<Option<bool>, SessionStoreError> {
+        let stored: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT bypass_permission_prompts FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "load bypass permission prompts",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        Ok(stored.map(|value| value != 0))
+    }
+
+    /// Records the session's bypass-permission-prompts value, overwriting whatever was recorded
+    /// before.
+    pub fn set_bypass_permission_prompts(
+        &mut self,
+        session_id: i64,
+        enabled: bool,
+    ) -> Result<(), SessionStoreError> {
+        self.connection
+            .execute(
+                "UPDATE sessions SET bypass_permission_prompts = ?1 WHERE id = ?2",
+                params![enabled as i64, session_id],
+            )
+            .map_err(|error| {
+                SessionStoreError::operation(
+                    "record bypass permission prompts",
+                    &self.database_path,
+                    error,
+                )
+            })?;
+
+        Ok(())
+    }
+
     pub fn load_session_for_resume(&self, id: i64) -> Result<StoredSession, SessionStoreError> {
         let metadata = self
             .connection

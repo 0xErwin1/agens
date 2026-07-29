@@ -36,6 +36,13 @@
 //! including these two, with no name-level signal that a session-scoped decision is being made
 //! from the wrong root.
 //!
+//! `agent.bypass_permission_prompts` is a THIRD session-scoped, security-relevant value read
+//! here, and it goes further than the first two: it is not merely re-read fresh per session, it
+//! is GLOBAL-only. [`SessionConfig::resolve`] never passes `project_document` to the helper that
+//! reads it, so a project's own `.agens/config.toml` cannot enable this key no matter what it
+//! declares — the same "unreachable by construction" discipline `document_text` already applies
+//! to scope, applied here to make an entire SOURCE unreachable rather than just a competing root.
+//!
 //! What this makes IMPOSSIBLE: reaching `Bootstrap`'s process-captured `permission_rules` field,
 //! or its merged `settings` (and therefore `agent.system_prompt` / `provider.base_url` through
 //! it), from outside `crate::bootstrap` — those identifiers are no longer reachable at all
@@ -63,6 +70,7 @@ pub struct SessionConfig {
     permission_rules: Vec<ConfigPermissionRule>,
     system_prompt: Option<String>,
     provider_base_url: Option<String>,
+    bypass_permission_prompts: bool,
 }
 
 impl SessionConfig {
@@ -76,6 +84,16 @@ impl SessionConfig {
 
     pub fn provider_base_url(&self) -> Option<&str> {
         self.provider_base_url.as_deref()
+    }
+
+    /// Whether the session should bypass `Ask` permission prompts. This is a THIRD
+    /// session-scoped, security-relevant value re-read fresh from disk (alongside
+    /// `system_prompt` and `provider_base_url`), and unlike those two it is deliberately
+    /// GLOBAL-only: [`SessionConfig::resolve`] never passes the project document to the helper
+    /// that reads this key, so a project's own `.agens/config.toml` cannot enable it no matter
+    /// what it declares.
+    pub fn bypass_permission_prompts(&self) -> bool {
+        self.bypass_permission_prompts
     }
 
     /// Combines the process's GLOBAL-scope permission rules (global configuration is keyed by
@@ -114,10 +132,14 @@ impl SessionConfig {
         let provider_base_url = document_text(&project_document, "provider", "base_url")
             .or_else(|| document_text(&global_document, "provider", "base_url"));
 
+        let bypass_permission_prompts =
+            document_bool(&global_document, "agent", "bypass_permission_prompts").unwrap_or(false);
+
         Ok(Self {
             permission_rules,
             system_prompt,
             provider_base_url,
+            bypass_permission_prompts,
         })
     }
 }
@@ -150,4 +172,15 @@ fn document_text(document: &toml::Table, section: &str, key: &str) -> Option<Str
         .and_then(|table| table.get(key))
         .and_then(toml::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+/// Reads `document.section.key` as a boolean directly from a single document, mirroring
+/// [`document_text`]'s scope discipline: the caller decides which document to pass, so a value
+/// can be made unreachable from a given scope structurally rather than by convention.
+fn document_bool(document: &toml::Table, section: &str, key: &str) -> Option<bool> {
+    document
+        .get(section)
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get(key))
+        .and_then(toml::Value::as_bool)
 }

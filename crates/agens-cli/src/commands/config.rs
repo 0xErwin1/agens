@@ -369,9 +369,9 @@ mod tests {
             run_config(cli::ConfigAction::Doctor, &dependencies).expect("doctor should run");
 
         assert!(report.contains("Status:  valid\n"));
-        assert!(report.contains("tools.max_search_depth      8             global\n"));
-        assert!(report.contains("tools.max_search_results    25            project\n"));
-        assert!(report.contains("tools.max_list_entries      1000          default\n"));
-        assert!(report.contains("agent.default_agent         -             default\n"));
+        assert!(report.contains("tools.max_search_depth           8             global\n"));
+        assert!(report.contains("tools.max_search_results         25            project\n"));
+        assert!(report.contains("tools.max_list_entries           1000          default\n"));
+        assert!(report.contains("agent.default_agent              -             default\n"));
     }
 }

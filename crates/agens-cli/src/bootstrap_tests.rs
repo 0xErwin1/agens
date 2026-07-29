@@ -395,4 +395,87 @@ mod session_configuration {
         std::fs::remove_dir_all(&temporary).ok();
         std::fs::remove_dir_all(bootstrap_from_root_b.data_directory()).ok();
     }
+
+    /// `agent.bypass_permission_prompts` MUST be read from the global document only: a project
+    /// document setting it `true` must never activate bypass, even though the same key set in the
+    /// global document does. This is the security-critical scenario in the spec — the setting
+    /// cannot become reachable via untrusted project configuration.
+    #[test]
+    fn bypass_permission_prompts_is_read_from_the_global_document_only() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-session-config-bypass-permission-prompts-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            config_home.join("config.toml"),
+            "[agent]\nbypass_permission_prompts = true\n".to_owned(),
+        );
+
+        let bootstrap_with_global_true = bootstrap(&CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let session_root = SessionRoot::confined_to(project_root.clone());
+        let session_config = SessionConfig::resolve(&session_root, &bootstrap_with_global_true)
+            .expect("session configuration should resolve");
+
+        assert!(
+            session_config.bypass_permission_prompts(),
+            "a global bypass_permission_prompts = true must activate bypass"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_with_global_true.data_directory()).ok();
+    }
+
+    #[test]
+    fn a_project_declared_bypass_permission_prompts_cannot_activate_bypass() {
+        let temporary = std::env::temp_dir().join(format!(
+            "agens-session-config-bypass-permission-prompts-project-{}",
+            std::process::id()
+        ));
+        let config_home = temporary.join("config");
+        let project_root = temporary.join("project");
+
+        let mut files = BTreeMap::new();
+        files.insert(
+            project_root.join(".agens/config.toml"),
+            "[agent]\nbypass_permission_prompts = true\n".to_owned(),
+        );
+
+        let bootstrap_with_project_true = bootstrap(&CliDependencies::for_test(
+            project_root.clone(),
+            Some(temporary.join("home")),
+            BTreeMap::from([(
+                "AGENS_CONFIG_HOME".to_owned(),
+                config_home.display().to_string(),
+            )]),
+            files,
+        ))
+        .unwrap();
+
+        let session_root = SessionRoot::confined_to(project_root.clone());
+        let session_config = SessionConfig::resolve(&session_root, &bootstrap_with_project_true)
+            .expect("session configuration should resolve");
+
+        assert!(
+            !session_config.bypass_permission_prompts(),
+            "a project-declared bypass_permission_prompts must never activate bypass, \
+             regardless of its value"
+        );
+
+        std::fs::remove_dir_all(&temporary).ok();
+        std::fs::remove_dir_all(bootstrap_with_project_true.data_directory()).ok();
+    }
 }
