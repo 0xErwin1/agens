@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use agens_config::McpTransport;
 use agens_providers::OpenAiFunctionTool;
 use agens_tools::{
-    McpEndpointSummary, McpHttpTransport, McpLimits, McpRegistry, McpServerDescriptor,
-    McpServerSource, McpServerTransport, McpSseTransport, McpStdioTransport,
-    McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort, McpTransportError,
-    RemoteToolMetadata, ToolDispatcher,
+    McpEndpointSummary, McpErrorCategory, McpHttpTransport, McpLimits, McpRegistry,
+    McpServerDescriptor, McpServerReport, McpServerSource, McpServerTransport, McpSseTransport,
+    McpStdioTransport, McpStdioTransportConfig, McpTimeouts, McpTransport as McpTransportPort,
+    McpTransportError, RemoteToolMetadata, ToolDispatcher,
 };
 
 use agens_bootstrap::Bootstrap;
@@ -25,18 +25,28 @@ pub struct ProductionMcpRuntime {
 }
 
 impl ProductionMcpRuntime {
-    pub fn discover_configured_tools(&mut self) -> Result<Vec<RemoteToolMetadata>, CliError> {
+    /// Discovers every configured server and returns both the merged tool
+    /// metadata and each server's discovery report.
+    ///
+    /// The reports are load-bearing, not incidental: a caller that only
+    /// wanted the tools used to discard them (`let _ = ...`), which meant a
+    /// server that failed to connect vanished from the returned data entirely
+    /// instead of surfacing as failed.
+    pub fn discover_configured_tools(
+        &mut self,
+    ) -> Result<(Vec<RemoteToolMetadata>, Vec<McpServerReport>), CliError> {
         let servers = self
             .registry
             .lock()
             .map_err(|_| CliError::configuration("MCP tools are unavailable"))?
             .configured_server_names();
 
+        let mut reports = Vec::with_capacity(servers.len());
         for server in servers {
-            let _ = self.discover_server(&server)?;
+            reports.push(self.discover_server(&server)?);
         }
 
-        self.tools()
+        Ok((self.tools()?, reports))
     }
 
     pub fn discover_server(
@@ -58,7 +68,6 @@ impl ProductionMcpRuntime {
         Ok(report)
     }
 
-    #[allow(dead_code)]
     pub fn reload_server(
         &mut self,
         server: &str,
@@ -78,7 +87,6 @@ impl ProductionMcpRuntime {
         Ok(report)
     }
 
-    #[allow(dead_code)]
     pub fn diagnostics(&self) -> Result<Vec<agens_tools::McpServerDiagnostic>, CliError> {
         Ok(self
             .registry
@@ -131,10 +139,7 @@ fn synchronize_server_dispatcher(
 }
 
 pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) -> McpRegistry {
-    let mut registry = bootstrap
-        .mcp_status
-        .clone()
-        .map_or_else(McpRegistry::new, McpRegistry::with_status_handle);
+    let mut registry = McpRegistry::with_status_handle(bootstrap.mcp_status.clone());
 
     for server in &bootstrap.mcp_servers {
         let descriptor = mcp_server_descriptor(server);
@@ -142,22 +147,43 @@ pub fn load_configured_mcp_registry(bootstrap: &Bootstrap, project_root: &Path) 
             let _ = registry.register_disabled_server(descriptor);
             continue;
         }
+
         let timeout = std::time::Duration::from_millis(server.timeout_ms);
-        let Ok(timeouts) = McpTimeouts::new(timeout, timeout, timeout) else {
-            continue;
+        let timeouts = match McpTimeouts::new(timeout, timeout, timeout) {
+            Ok(timeouts) => timeouts,
+            Err(error) => {
+                register_configuration_failure(&mut registry, descriptor, &error);
+                continue;
+            }
         };
 
         let server = server.clone();
         let project_root = project_root.to_path_buf();
-        let _ = registry.configure_server_with_descriptor(
-            descriptor,
+        if let Err(error) = registry.configure_server_with_descriptor(
+            descriptor.clone(),
             move || configured_mcp_transport(&server, &project_root),
             timeouts,
             McpLimits::default(),
-        );
+        ) {
+            register_configuration_failure(&mut registry, descriptor, &error);
+        }
     }
 
     registry
+}
+
+/// Records a server that failed before any connect attempt was possible
+/// (an invalid timeout or a rejected server name) as `Failed` on the shared
+/// status handle, so it stays visible in `/mcp` instead of silently
+/// disappearing from the configured set.
+fn register_configuration_failure(
+    registry: &mut McpRegistry,
+    descriptor: McpServerDescriptor,
+    error: &McpTransportError,
+) {
+    let category = McpErrorCategory::from(error);
+    let message = format!("{}: server configuration is invalid", category.label());
+    let _ = registry.register_failed_server(descriptor, category, &message);
 }
 
 fn mcp_server_descriptor(server: &agens_config::McpServerConfig) -> McpServerDescriptor {
@@ -249,9 +275,44 @@ mod tests {
         PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
         PermissionSession,
     };
-    use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
+    use agens_tools::{
+        McpLifecycleState, ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext,
+    };
 
     use super::*;
+
+    #[test]
+    fn invalid_timeout_still_yields_an_mcp_visible_failed_descriptor() {
+        let mut bootstrap =
+            agens_fixtures::bootstrap_from_configuration("invalid-mcp-timeout", None, None);
+        bootstrap.mcp_servers = vec![agens_config::McpServerConfig {
+            name: "broken".into(),
+            disabled: false,
+            transport: McpTransport::Stdio,
+            command: Some("/bin/echo".into()),
+            args: Vec::new(),
+            environment: std::collections::BTreeMap::new(),
+            cwd: None,
+            url: None,
+            headers: std::collections::BTreeMap::new(),
+            max_retries: 0,
+            timeout_ms: 0,
+        }];
+
+        let registry = load_configured_mcp_registry(&bootstrap, Path::new("/tmp"));
+        let snapshot = registry.status_handle().snapshot();
+        let broken = snapshot
+            .server("broken")
+            .expect("an invalid-timeout server must remain visible in /mcp instead of vanishing");
+
+        assert_eq!(broken.state(), McpLifecycleState::Failed);
+        assert!(
+            !registry
+                .configured_server_names()
+                .contains(&"broken".to_owned()),
+            "an invalid-timeout server was never successfully configured for connect attempts"
+        );
+    }
 
     #[test]
     fn production_mcp_runtime_reloads_dispatcher_and_retains_failed_generation() {
@@ -291,7 +352,7 @@ mod tests {
             TestTransport(
                 [
                     agens_tools::McpResponse::Initialized(agens_tools::McpInitializeResult::new(
-                        "2025-06-18",
+                        agens_tools::MCP_PROTOCOL_VERSION,
                         serde_json::json!({"tools": {}}),
                     )),
                     agens_tools::McpResponse::ToolsListed(agens_tools::McpToolsPage::new(

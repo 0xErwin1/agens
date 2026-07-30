@@ -200,7 +200,11 @@ pub fn production_tool_runtime_with_parent_task_runner<R: TaskRunner>(
         registry: mcp_registry,
         dispatcher: Arc::new(Mutex::new(dispatcher)),
     };
-    let remote_tools = runtime.discover_configured_tools()?;
+    // Per-server discovery reports are surfaced through the shared
+    // `McpStatusHandle` that `runtime.registry` already writes to; the caller
+    // here only needs the merged tool metadata to build the provider's tool
+    // list.
+    let (remote_tools, _reports) = runtime.discover_configured_tools()?;
 
     for metadata in remote_tools {
         let model_name = mcp_model_tool_name(&metadata);

@@ -1046,7 +1046,8 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::Diff { .. }
             | TuiRuntimeEvent::TaskExecution { .. }
             | TuiRuntimeEvent::SubagentExecution(_)
-            | TuiRuntimeEvent::RestoredCompletedSubagent { .. } => {}
+            | TuiRuntimeEvent::RestoredCompletedSubagent { .. }
+            | TuiRuntimeEvent::Notice(_) => {}
         }
     }
 

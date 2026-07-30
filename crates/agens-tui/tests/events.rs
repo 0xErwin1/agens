@@ -3646,3 +3646,15 @@ fn device_auth_overlay_escape_cancels_active_auth_route() {
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
 }
+
+#[test]
+fn notice_runtime_event_surfaces_as_a_status_line_without_touching_the_transcript() {
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice(
+        "mcp: files failed to connect".into(),
+    ));
+
+    assert_eq!(tui.view().status, Some("mcp: files failed to connect"));
+    assert!(tui.transcript().is_empty());
+}

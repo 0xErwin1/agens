@@ -2894,6 +2894,10 @@ pub enum TuiRuntimeEvent {
         final_result: String,
         tool_uses: usize,
     },
+    /// A one-line, already-sanitized informational message to surface as a
+    /// status line outside the transcript — for example an MCP server
+    /// failure discovered while building this turn's tools.
+    Notice(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -51,7 +51,15 @@ pub struct Bootstrap {
     pub data_directory: PathBuf,
     pub project_root: Option<PathBuf>,
     pub mcp_servers: Vec<agens_config::McpServerConfig>,
-    pub mcp_status: Option<McpStatusHandle>,
+    /// The shared MCP status handle every per-turn and long-lived registry
+    /// built from this bootstrap registers against.
+    ///
+    /// Non-optional: headless has no other way to inject a handle, so if this
+    /// were `None` the per-turn registry would silently fall back to a
+    /// private handle nobody else reads, and the failure-visibility surfaces
+    /// (`/mcp`, the TUI notice, the headless stderr line) would have nothing
+    /// to observe.
+    pub mcp_status: McpStatusHandle,
     pub permission_rules: Vec<ConfigPermissionRule>,
     /// Re-reads a project configuration document from an arbitrary path, the same way
     /// `bootstrap()` read this process's own project config, so [`session_config::SessionConfig`]
@@ -279,7 +287,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),
         project_root,
         mcp_servers,
-        mcp_status: None,
+        mcp_status: McpStatusHandle::default(),
         permission_rules,
         config_reader: Arc::clone(&host.read_file),
         paths,

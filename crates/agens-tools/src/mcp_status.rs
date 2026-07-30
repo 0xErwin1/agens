@@ -269,12 +269,29 @@ impl McpStatusHandle {
     /// state, tool count, tool names, and last error: re-registering a server
     /// (e.g. because a new per-turn registry is constructed against the same
     /// shared handle) must not falsify a `Ready` server back to `Idle`.
+    ///
+    /// The one exception is `Closed`: it only ever means "no registry
+    /// currently claims this name". A fresh claim on a closed enabled server
+    /// means no connect attempt has been made by its new owner yet, so
+    /// preserving `Closed` would misreport a healthy-until-proven-otherwise
+    /// server as permanently closed. That entry resets to `Idle` instead.
     pub(crate) fn register(&self, descriptor: McpServerDescriptor, claim: bool) {
         let mut inner = self.lock();
         if claim {
             *inner.claims.entry(descriptor.name.clone()).or_insert(0) += 1;
         }
         match inner.servers.get_mut(&descriptor.name) {
+            Some(existing)
+                if existing.descriptor.enabled == descriptor.enabled
+                    && existing.state == McpLifecycleState::Closed
+                    && descriptor.enabled =>
+            {
+                existing.descriptor = descriptor;
+                existing.state = McpLifecycleState::Idle;
+                existing.tool_count = 0;
+                existing.tool_names.clear();
+                existing.last_error = None;
+            }
             Some(existing) if existing.descriptor.enabled == descriptor.enabled => {
                 existing.descriptor = descriptor;
             }

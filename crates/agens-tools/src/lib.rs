@@ -2231,6 +2231,37 @@ impl McpRegistry {
         Ok(())
     }
 
+    /// Records a server as `Failed` without ever configuring it for connect
+    /// attempts.
+    ///
+    /// Some failures are known before any transport can be built — an
+    /// invalid timeout, a rejected server name — so there is no factory to
+    /// register and no later `discover_server` call will resolve them. Without
+    /// this, such a server would never appear in the shared status handle and
+    /// would silently vanish from `/mcp` instead of surfacing as failed.
+    pub fn register_failed_server(
+        &mut self,
+        descriptor: McpServerDescriptor,
+        category: McpErrorCategory,
+        message: &str,
+    ) -> Result<(), McpTransportError> {
+        if !descriptor.enabled() {
+            return Err(McpTransportError::Protocol(
+                "enabled MCP server must be enabled".into(),
+            ));
+        }
+        validate_server_name(descriptor.name())?;
+        let server_name = descriptor.name().to_owned();
+        let first_claim = self.claimed.insert(server_name.clone());
+        self.status.register(descriptor, first_claim);
+        let report = McpServerReport::Failed {
+            server_name,
+            message: message.to_owned(),
+        };
+        self.record_report(&report, Some(category));
+        Ok(())
+    }
+
     pub fn configure_server<F>(
         &mut self,
         server_name: &str,

@@ -11,8 +11,8 @@ use std::{
 };
 
 use agens_tools::{
-    McpClient, McpInitialize, McpLimits, McpOperationContext, McpRequest, McpStdioTransport,
-    McpStdioTransportConfig, McpTimeouts, McpTransport, McpTransportError,
+    MCP_PROTOCOL_VERSION, McpClient, McpInitialize, McpLimits, McpOperationContext, McpRequest,
+    McpStdioTransport, McpStdioTransportConfig, McpTimeouts, McpTransport, McpTransportError,
 };
 use serde_json::json;
 
@@ -35,7 +35,7 @@ fn client(mode: &str, timeout: Duration) -> McpClient<McpStdioTransport> {
 }
 
 fn initialize() -> McpInitialize {
-    McpInitialize::new("2025-06-18", json!({}), "agens", "test")
+    McpInitialize::new(MCP_PROTOCOL_VERSION, json!({}), "agens", "test")
 }
 
 #[test]

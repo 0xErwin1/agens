@@ -273,10 +273,7 @@ impl McpSseTransport {
                 ));
             }
             if !(200..300).contains(&response.status) {
-                return Err(McpTransportError::Transport(format!(
-                    "MCP HTTP request failed with status {}",
-                    response.status
-                )));
+                return Err(McpTransportError::HttpStatus(response.status));
             }
             if notify {
                 return Ok(None);

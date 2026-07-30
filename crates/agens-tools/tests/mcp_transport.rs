@@ -858,6 +858,54 @@ fn dropping_one_of_two_registries_sharing_a_server_name_preserves_ready_state_an
 }
 
 #[test]
+fn reregistering_a_closed_enabled_server_resets_it_to_idle_instead_of_preserving_closed() {
+    let status = McpStatusHandle::default();
+
+    let mut first_owner = McpRegistry::with_status_handle(status.clone());
+    first_owner
+        .configure_server_with_descriptor(
+            status_descriptor("recycled", McpServerTransport::Http, true),
+            || Ok(Box::new(LocalTransport::with_responses([])) as Box<dyn McpTransport>),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    drop(first_owner);
+    assert_eq!(
+        status.snapshot().server("recycled").unwrap().state(),
+        McpLifecycleState::Closed,
+        "dropping the only claimant must close the server"
+    );
+
+    let mut new_owner = McpRegistry::with_status_handle(status.clone());
+    new_owner
+        .configure_server_with_descriptor(
+            status_descriptor("recycled", McpServerTransport::Http, true),
+            || {
+                Ok(Box::new(LocalTransport::with_responses([
+                    Ok(initialized()),
+                    Ok(page(vec![], None)),
+                ])) as Box<dyn McpTransport>)
+            },
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        status.snapshot().server("recycled").unwrap().state(),
+        McpLifecycleState::Idle,
+        "a fresh claim on a closed enabled server must reset it to Idle, not preserve Closed"
+    );
+
+    assert!(!new_owner.discover_server("recycled").is_failed());
+    assert_eq!(
+        status.snapshot().server("recycled").unwrap().state(),
+        McpLifecycleState::Ready,
+        "a live Ready state must still be preserved across an intervening claim"
+    );
+}
+
+#[test]
 fn timeout_and_cancellation_preserve_primary_result_despite_cleanup_error_and_suppress_late_success()
  {
     #[derive(Clone)]
@@ -1262,15 +1310,15 @@ fn legacy_sse_transport_rejects_non_retryable_protocols_and_cross_origin_endpoin
     for (response, expected) in [
         (
             "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
-            "MCP HTTP request failed with status 401",
+            McpTransportError::HttpStatus(401),
         ),
         (
             "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
-            "MCP HTTP request failed with status 400",
+            McpTransportError::HttpStatus(400),
         ),
         (
             "HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n",
-            "MCP HTTP redirect refused",
+            McpTransportError::Transport("MCP HTTP redirect refused".into()),
         ),
     ] {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1292,7 +1340,7 @@ fn legacy_sse_transport_rejects_non_retryable_protocols_and_cross_origin_endpoin
                 McpRequest::Initialize(initialize()),
                 &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1))
             ),
-            Err(McpTransportError::Transport(expected.into()))
+            Err(expected)
         );
         server.join().unwrap();
     }
