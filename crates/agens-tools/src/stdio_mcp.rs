@@ -256,7 +256,11 @@ pub(crate) fn request_wire(request: McpRequest, id: Option<u64>) -> Value {
             json!({"protocolVersion": value.protocol_version, "capabilities": value.capabilities, "clientInfo": {"name": value.client_info_name, "version": value.client_info_version}}),
         ),
         McpRequest::Initialized => ("notifications/initialized", json!({})),
-        McpRequest::ListTools { cursor } => ("tools/list", json!({"cursor": cursor})),
+        McpRequest::ListTools { cursor } => {
+            let params = cursor.map_or_else(|| json!({}), |cursor| json!({"cursor": cursor}));
+
+            ("tools/list", params)
+        }
         McpRequest::CallTool { name, arguments } => {
             ("tools/call", json!({"name": name, "arguments": arguments}))
         }
@@ -473,4 +477,23 @@ fn drain_stderr(mut stderr: impl std::io::Read + Send + 'static) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_list_omits_an_absent_cursor_instead_of_sending_null() {
+        let absent = request_wire(McpRequest::ListTools { cursor: None }, Some(1));
+        assert_eq!(absent["params"], json!({}));
+
+        let present = request_wire(
+            McpRequest::ListTools {
+                cursor: Some("next".into()),
+            },
+            Some(2),
+        );
+        assert_eq!(present["params"], json!({"cursor": "next"}));
+    }
 }
