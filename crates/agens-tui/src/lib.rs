@@ -4958,7 +4958,7 @@ where
                 .find(|(index, _)| *index == dialog.selected)
                 .and_then(|(_, entry)| entry.id.clone())
         })?;
-        Some(Action::DialogAction(
+        Some(Action::SafeDialogAction(
             template.replace("{selected}", id.as_str()),
         ))
     }
@@ -7835,7 +7835,7 @@ mod runtime_tests {
         tui.show_selection_dialog(dialog());
         assert_eq!(
             tui.handle(Event::Key(Key::Right)),
-            Action::DialogAction("profiles:cycle:worker:next".into())
+            Action::SafeDialogAction("profiles:cycle:worker:next".into())
         );
         assert!(
             tui.view().dialog.is_some(),
@@ -7846,7 +7846,7 @@ mod runtime_tests {
         tui.handle(Event::Key(Key::Down));
         assert_eq!(
             tui.handle(Event::Key(Key::Backspace)),
-            Action::DialogAction("profiles:reset:scout".into())
+            Action::SafeDialogAction("profiles:reset:scout".into())
         );
         assert!(
             tui.view().dialog.is_some(),

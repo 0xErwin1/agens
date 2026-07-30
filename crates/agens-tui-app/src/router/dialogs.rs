@@ -354,7 +354,7 @@ impl TuiRuntimeRouter {
                             ""
                         };
                         let effort = row.effort.value.as_deref().unwrap_or("default");
-                        DialogEntry::action(
+                        DialogEntry::safe_action(
                             format!(
                                 "{} · {} [{}] · {} [{}]{}",
                                 row.name,
@@ -752,7 +752,7 @@ impl TuiRuntimeRouter {
         for provider in providers_with_active_first(active) {
             let selector = ModelSelection::for_source(provider.default_model(), provider.source());
             for model in selector.models().map_err(CliError::unavailable)? {
-                entries.push(DialogEntry::action(
+                entries.push(DialogEntry::safe_action(
                     format!("{} · {}", model.id, provider.label()),
                     format!("subagent-profiles:set-model:{name}:{}", model.id),
                 ));

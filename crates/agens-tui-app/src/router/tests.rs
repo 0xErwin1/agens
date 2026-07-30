@@ -505,7 +505,7 @@ fn subagent_profile_root_searches_letters_and_focuses_the_autosaved_row() {
     assert!(!overlay.contains("Choose profile model"));
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
-        Action::DialogAction("subagent-profiles:edit:explore".into())
+        Action::SafeDialogAction("subagent-profiles:edit:explore".into())
     );
 
     router.route_dialog_action(
@@ -518,7 +518,7 @@ fn subagent_profile_root_searches_letters_and_focuses_the_autosaved_row() {
     ));
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
-        Action::DialogAction("subagent-profiles:edit:explore".into())
+        Action::SafeDialogAction("subagent-profiles:edit:explore".into())
     );
     tui.apply_submission_outcome(
         router.route_dialog_action("subagent-profiles:edit:explore", progress.clone()),
