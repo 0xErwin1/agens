@@ -2110,6 +2110,10 @@ fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("second".into())
     );
+    assert!(tui.view().dialog.is_some());
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SelectionInfo(
+        "Selected file: second".into(),
+    ));
     assert!(tui.view().dialog.is_none());
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
@@ -2978,7 +2982,10 @@ fn permission_confirm_short_keys_dispatch_allow_deny_once_and_always() {
             Action::DialogAction(expected.into()),
             "short key {key}"
         );
-        assert!(tui.view().dialog.is_none(), "short key {key} closes dialog");
+        assert!(
+            tui.view().dialog.is_some(),
+            "short key {key} keeps the dialog until the outcome arrives"
+        );
         assert_eq!(tui.engine().cancellations, 0);
     }
 }
@@ -3000,7 +3007,7 @@ fn permission_confirm_list_enter_dispatches_selected_choice() {
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("permission:3:allow-always".into())
     );
-    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().dialog.is_some());
 }
 
 #[test]
@@ -3088,7 +3095,7 @@ fn safe_dialog_while_running_remains_usable_and_esc_does_not_cancel_turn() {
         tui.handle(Event::Key(Key::Enter)),
         Action::SafeDialogAction("select:src/main.rs".into())
     );
-    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().dialog.is_some());
     assert!(tui.view().running);
     assert_eq!(tui.engine().cancellations, 0);
 
@@ -3104,7 +3111,7 @@ fn safe_dialog_while_running_remains_usable_and_esc_does_not_cancel_turn() {
         tui.handle(Event::Key(Key::Escape)),
         Action::SafeDialogAction("select:cancel".into())
     );
-    assert!(tui.view().dialog.is_none());
+    assert!(tui.view().dialog.is_some());
     assert!(tui.view().running);
     assert_eq!(tui.engine().cancellations, 0);
 }

@@ -59,14 +59,42 @@
 //! change makes — see this module's call sites, which wrap an already-resolved, already-correct
 //! `project_root` rather than deriving one themselves.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agens_config::{ConfigPermissionRule, ConfigPermissionScope, extract_permission_rules};
+use agens_config::{
+    AgentProfile, ConfigPermissionRule, ConfigPermissionScope, extract_permission_rules,
+    parse_agent_profiles,
+};
 use agens_tools::markdown::{MAX_MARKDOWN_FILE_BYTES, load_instruction_file};
 
 use crate::Bootstrap;
 use crate::session_root::SessionRoot;
 use agens_error::CliError;
+
+/// Agent profiles read independently from the global and project configuration documents.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopedAgentProfiles {
+    global: BTreeMap<String, AgentProfile>,
+    project: BTreeMap<String, AgentProfile>,
+}
+
+impl ScopedAgentProfiles {
+    pub fn new(
+        global: BTreeMap<String, AgentProfile>,
+        project: BTreeMap<String, AgentProfile>,
+    ) -> Self {
+        Self { global, project }
+    }
+
+    pub fn global(&self) -> &BTreeMap<String, AgentProfile> {
+        &self.global
+    }
+
+    pub fn project(&self) -> &BTreeMap<String, AgentProfile> {
+        &self.project
+    }
+}
 
 /// Session-scoped configuration, re-derived fresh every time it is asked for.
 pub struct SessionConfig {
@@ -74,6 +102,7 @@ pub struct SessionConfig {
     system_prompt: Option<String>,
     provider_base_url: Option<String>,
     bypass_permission_prompts: bool,
+    agent_profiles: ScopedAgentProfiles,
 }
 
 impl SessionConfig {
@@ -97,6 +126,10 @@ impl SessionConfig {
     /// what it declares.
     pub fn bypass_permission_prompts(&self) -> bool {
         self.bypass_permission_prompts
+    }
+
+    pub fn agent_profiles(&self) -> &ScopedAgentProfiles {
+        &self.agent_profiles
     }
 
     /// Combines the process's GLOBAL-scope permission rules (global configuration is keyed by
@@ -134,6 +167,12 @@ impl SessionConfig {
 
         let provider_base_url = document_text(&project_document, "provider", "base_url")
             .or_else(|| document_text(&global_document, "provider", "base_url"));
+        let agent_profiles = ScopedAgentProfiles::new(
+            parse_agent_profiles(&global_document)
+                .map_err(|_| CliError::configuration("global configuration is invalid"))?,
+            parse_agent_profiles(&project_document)
+                .map_err(|_| CliError::configuration("project configuration is invalid"))?,
+        );
 
         let bypass_permission_prompts =
             document_bool(&global_document, "agent", "bypass_permission_prompts").unwrap_or(false);
@@ -143,6 +182,7 @@ impl SessionConfig {
             system_prompt,
             provider_base_url,
             bypass_permission_prompts,
+            agent_profiles,
         })
     }
 }
@@ -572,5 +612,113 @@ mod session_instructions_tests {
                 "case {name}: a broken global file must not suppress a valid project file"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use crate::host::HostEnvironment;
+    use crate::session_root::SessionRoot;
+    use crate::{resolve, session_config::SessionConfig};
+
+    #[test]
+    fn agent_profiles_are_read_from_each_scope_without_merging() {
+        let home = PathBuf::from("/home/tester");
+        let session_root = PathBuf::from("/session");
+        let files = BTreeMap::from([
+            (
+                home.join(".config/agens/config.toml"),
+                "[agents.research]\nmodel = \"global-model\"\n".to_owned(),
+            ),
+            (
+                session_root.join(".agens/config.toml"),
+                "[agents.research]\neffort = \"high\"\n".to_owned(),
+            ),
+        ]);
+        let bootstrap = resolve(&HostEnvironment::fixed(
+            PathBuf::from("/process"),
+            Some(home),
+            BTreeMap::new(),
+            files,
+        ))
+        .expect("bootstrap configuration resolves");
+
+        let config = SessionConfig::resolve(&SessionRoot::confined_to(session_root), &bootstrap)
+            .expect("session configuration resolves");
+        let profiles = config.agent_profiles();
+
+        assert_eq!(
+            profiles
+                .global()
+                .get("research")
+                .and_then(|profile| profile.model.as_deref()),
+            Some("global-model")
+        );
+        assert_eq!(
+            profiles
+                .project()
+                .get("research")
+                .and_then(|profile| profile.effort.as_deref()),
+            Some("high")
+        );
+        assert_eq!(
+            profiles
+                .project()
+                .get("research")
+                .and_then(|profile| profile.model.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_profiles_are_re_read_for_each_session_resolution() {
+        let home = PathBuf::from("/home/tester");
+        let session_root = PathBuf::from("/session");
+        let global_config = home.join(".config/agens/config.toml");
+        let document = Arc::new(Mutex::new(
+            "[agents.research]\nmodel = \"first\"\n".to_owned(),
+        ));
+        let reader_document = Arc::clone(&document);
+        let host = HostEnvironment {
+            current_directory: Box::new(|| Ok(PathBuf::from("/process"))),
+            home_directory: Box::new({
+                let home = home.clone();
+                move || Some(home.clone())
+            }),
+            environment: Box::new(BTreeMap::new),
+            read_file: Arc::new(move |path: &Path| {
+                Ok((path == global_config)
+                    .then(|| reader_document.lock().expect("document lock").clone()))
+            }),
+        };
+        let bootstrap = resolve(&host).expect("bootstrap configuration resolves");
+        let root = SessionRoot::confined_to(session_root);
+
+        assert_eq!(
+            SessionConfig::resolve(&root, &bootstrap)
+                .expect("first session configuration resolves")
+                .agent_profiles()
+                .global()
+                .get("research")
+                .and_then(|profile| profile.model.as_deref()),
+            Some("first")
+        );
+
+        *document.lock().expect("document lock") =
+            "[agents.research]\nmodel = \"second\"\n".to_owned();
+
+        assert_eq!(
+            SessionConfig::resolve(&root, &bootstrap)
+                .expect("second session configuration resolves")
+                .agent_profiles()
+                .global()
+                .get("research")
+                .and_then(|profile| profile.model.as_deref()),
+            Some("second")
+        );
     }
 }

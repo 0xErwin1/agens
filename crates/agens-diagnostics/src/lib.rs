@@ -49,6 +49,24 @@ impl SafeDiagnosticStore {
         let _ = self.write(event);
     }
 
+    pub fn record_subagent_model_unavailable(
+        &self,
+        event: &ProviderDiagnosticEvent,
+        agent: &str,
+        requested_model: &str,
+        fallback_model: &str,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let _guard = DIAGNOSTIC_FILE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ =
+            self.write_subagent_model_unavailable(event, agent, requested_model, fallback_model);
+    }
+
     fn write(&self, event: &ProviderDiagnosticEvent) -> std::io::Result<()> {
         ensure_private_diagnostics_directory(&self.directory)?;
         let line = diagnostic_json_line(event)?;
@@ -67,6 +85,40 @@ impl SafeDiagnosticStore {
             self.rotate()?;
         }
 
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(active)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(&line)
+    }
+
+    fn write_subagent_model_unavailable(
+        &self,
+        event: &ProviderDiagnosticEvent,
+        agent: &str,
+        requested_model: &str,
+        fallback_model: &str,
+    ) -> std::io::Result<()> {
+        ensure_private_diagnostics_directory(&self.directory)?;
+        let line =
+            subagent_model_unavailable_json_line(event, agent, requested_model, fallback_model)?;
+        let active = self.active_path();
+        let existing_size = match fs::symlink_metadata(&active) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata.len(),
+            Ok(_) => {
+                return Err(std::io::Error::other(
+                    "diagnostics path is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
+        if existing_size.saturating_add(line.len() as u64) > DIAGNOSTIC_FILE_LIMIT_BYTES {
+            self.rotate()?;
+        }
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -148,6 +200,36 @@ fn diagnostic_json_line(event: &ProviderDiagnosticEvent) -> std::io::Result<Vec<
     Ok(line)
 }
 
+fn subagent_model_unavailable_json_line(
+    event: &ProviderDiagnosticEvent,
+    agent: &str,
+    requested_model: &str,
+    fallback_model: &str,
+) -> std::io::Result<Vec<u8>> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "timestamp_ms": u64::try_from(timestamp_ms).unwrap_or(u64::MAX),
+        "reference": event.reference.as_str(),
+        "scope": event.scope.as_str(),
+        "component": event.component.as_str(),
+        "event": event.event.as_str(),
+        "attempt": event.attempt,
+        "max_attempts": event.max_attempts,
+        "delay_ms": event.delay_ms,
+        "status": event.status,
+        "class": event.class.map(ProviderDiagnosticClass::as_str),
+        "agent": agent,
+        "requested_model": requested_model,
+        "fallback_model": fallback_model,
+    }))
+    .map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
 pub struct OperationDiagnostics {
     pub reference: String,
     pub provider: ProviderDiagnostics,
@@ -184,6 +266,35 @@ pub fn next_diagnostic_reference() -> String {
         .wrapping_add(sequence.wrapping_mul(0x9e37_79b9))
         ^ u64::from(std::process::id());
     format!("{:08x}", mixed as u32)
+}
+
+pub fn record_subagent_model_unavailable(
+    bootstrap: &Bootstrap,
+    reference: &str,
+    agent: &str,
+    requested_model: &str,
+    fallback_model: &str,
+) {
+    let Ok(reference) = DiagnosticRef::new(reference.to_owned()) else {
+        return;
+    };
+    let event = ProviderDiagnosticEvent {
+        reference,
+        scope: ProviderDiagnosticScope::Subagent,
+        component: ProviderDiagnosticComponent::Subagent,
+        event: ProviderDiagnosticKind::Terminal,
+        attempt: 0,
+        max_attempts: 0,
+        delay_ms: None,
+        status: None,
+        class: Some(ProviderDiagnosticClass::ModelUnavailable),
+    };
+    diagnostic_store(bootstrap).record_subagent_model_unavailable(
+        &event,
+        agent,
+        requested_model,
+        fallback_model,
+    );
 }
 
 pub fn record_subagent_terminal(
@@ -289,6 +400,48 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temporary).ok();
+    }
+
+    #[test]
+    fn unavailable_subagent_model_diagnostics_include_resolution_context() {
+        let data_directory = std::env::temp_dir().join(format!(
+            "agens-model-diagnostic-{}-{}",
+            std::process::id(),
+            DIAGNOSTIC_REFERENCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&data_directory).expect("test data directory should be created");
+        let store = SafeDiagnosticStore::with_capture(data_directory.clone(), true);
+        let event = ProviderDiagnosticEvent {
+            reference: DiagnosticRef::new("abc12345".into()).expect("reference should be valid"),
+            scope: ProviderDiagnosticScope::Subagent,
+            component: ProviderDiagnosticComponent::Subagent,
+            event: ProviderDiagnosticKind::Terminal,
+            attempt: 0,
+            max_attempts: 0,
+            delay_ms: None,
+            status: None,
+            class: Some(ProviderDiagnosticClass::ModelUnavailable),
+        };
+
+        store.record_subagent_model_unavailable(
+            &event,
+            "worker",
+            "unavailable-model",
+            "session-model",
+        );
+
+        let active = data_directory
+            .join("diagnostics")
+            .join(format!("agens-{}.jsonl", std::process::id()));
+        let line = std::fs::read_to_string(active).expect("diagnostic should be readable");
+        let object =
+            serde_json::from_str::<serde_json::Value>(&line).expect("diagnostic should be JSON");
+        assert_eq!(object["agent"], "worker");
+        assert_eq!(object["requested_model"], "unavailable-model");
+        assert_eq!(object["fallback_model"], "session-model");
+        assert_eq!(object["class"], "model_unavailable");
+
+        std::fs::remove_dir_all(data_directory).expect("test directory should be removed");
     }
 
     #[cfg(unix)]

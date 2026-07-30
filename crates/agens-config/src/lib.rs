@@ -3,6 +3,13 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod agent_profiles;
+
+pub use agent_profiles::{
+    AgentProfile, AgentProfileEditError, AgentProfilePatch, apply_agent_profile_patch,
+    parse_agent_profiles,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigPermissionDecision {
     Allow,
@@ -549,11 +556,16 @@ pub const SETTINGS: &[SettingSpec] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigValidationError {
     field: String,
+    detail: Option<String>,
 }
 
 impl fmt::Display for ConfigValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "invalid configuration field {}", self.field)
+        write!(formatter, "invalid configuration field {}", self.field)?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, "; {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -830,7 +842,7 @@ pub fn starter_document() -> String {
 
 pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValidationError> {
     let mut root_tables = catalog_tables();
-    root_tables.extend_from_slice(&["mcp", "permissions"]);
+    root_tables.extend_from_slice(&["agents", "mcp", "permissions"]);
     reject_unknown_fields(document, "", &root_tables)?;
 
     for table in catalog_tables() {
@@ -846,6 +858,7 @@ pub fn validate_toml_document(document: &toml::Table) -> Result<(), ConfigValida
             validate_optional(table, "deny", path, is_string_array)
         },
     )?;
+    agent_profiles::validate_agent_profiles(document)?;
     validate_mcp(document)
 }
 
@@ -1436,7 +1449,20 @@ fn invalid_field(path: &str, field: &str) -> ConfigValidationError {
         format!("{path}.{field}")
     };
 
-    ConfigValidationError { field }
+    ConfigValidationError {
+        field,
+        detail: None,
+    }
+}
+
+fn invalid_field_with_detail(
+    path: &str,
+    field: &str,
+    detail: impl Into<String>,
+) -> ConfigValidationError {
+    let mut error = invalid_field(path, field);
+    error.detail = Some(detail.into());
+    error
 }
 
 fn invalid_indexed_field(path: &str, field: &str, index: usize) -> ConfigValidationError {

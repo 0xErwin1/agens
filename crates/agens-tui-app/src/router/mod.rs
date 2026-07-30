@@ -15,6 +15,7 @@ mod routing;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::profiles::{AgentProfileStore, ProfileEditor};
 use agens_core::HeadlessTurnCancellation;
 use agens_tools::{CommandCatalog, McpRegistry, McpStatusHandle, SkillCatalog};
 use agens_tui::{PaletteEntry, TuiProviderOutcome, TuiSubmissionOutcome};
@@ -48,6 +49,9 @@ pub struct TuiRuntimeRouter {
     _mcp_registry: Arc<Mutex<McpRegistry>>,
     clock: fn() -> i64,
     credential_restorer: Arc<CredentialRestorer>,
+    profile_editor: Arc<Mutex<Option<ProfileEditor>>>,
+    profile_focus: Arc<Mutex<Option<String>>>,
+    profile_store: Option<Arc<dyn AgentProfileStore>>,
 }
 
 struct RouterExtensions {
@@ -114,7 +118,15 @@ impl TuiRuntimeRouter {
             _mcp_registry: registry,
             clock: current_session_timestamp,
             credential_restorer: Arc::new(restore_chatgpt_credentials),
+            profile_editor: Arc::new(Mutex::new(None)),
+            profile_focus: Arc::new(Mutex::new(None)),
+            profile_store: None,
         }
+    }
+
+    pub fn with_profile_store(mut self, store: Arc<dyn AgentProfileStore>) -> Self {
+        self.profile_store = Some(store);
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]

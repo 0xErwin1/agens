@@ -2174,6 +2174,7 @@ pub struct AgentDefinition {
     pub description: String,
     pub mode: AgentMode,
     pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub system_prompt: String,
     pub permission_rules: Vec<PermissionRule>,
     pub skills: Vec<String>,

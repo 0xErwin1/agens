@@ -15,8 +15,6 @@ use agens_session::context::SessionContext;
 use agens_session::provider::ProviderKind;
 use agens_tools::{AgentCatalog, AgentModelValidator};
 
-use crate::models::AgentModelCompatibility;
-
 pub fn select_subagent(
     bootstrap: &Bootstrap,
     name: &str,
@@ -79,9 +77,8 @@ pub fn agent_catalog_for_context(
     bootstrap: &Bootstrap,
     context: &SessionContext,
 ) -> Result<AgentCatalog, CliError> {
-    let validator = AgentModelCompatibility::for_context(bootstrap, context)?;
     let project_root = agens_session::root::resolve_tui_session_root(context, bootstrap)?;
-    agent_catalog(bootstrap, &project_root, &validator)
+    discover_agent_catalog(bootstrap, &project_root, None)
 }
 
 pub fn task_agent_catalog(
@@ -110,6 +107,7 @@ pub fn discover_agent_catalog(
         description: "Default interactive agent".into(),
         mode: agens_core::AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt,
         permission_rules: Vec::new(),
         skills: Vec::new(),
@@ -119,6 +117,7 @@ pub fn discover_agent_catalog(
         description: "Explore the codebase without modifying files".into(),
         mode: agens_core::AgentMode::Subagent,
         model: None,
+        reasoning_effort: None,
         system_prompt: "You are the read-only exploration subagent. Inspect the codebase without modifying files and return concise, grounded findings."
             .into(),
         permission_rules: Vec::new(),
@@ -129,6 +128,7 @@ pub fn discover_agent_catalog(
         description: "Handle a general delegated coding task".into(),
         mode: agens_core::AgentMode::Subagent,
         model: None,
+        reasoning_effort: None,
         system_prompt: "You are the general-purpose subagent. Complete the delegated task with the available native tools and return a concise result."
             .into(),
         permission_rules: Vec::new(),

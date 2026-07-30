@@ -147,6 +147,8 @@ pub enum Key {
     CtrlShiftN,
     /// Opens the eligible subagent selection dialog.
     CtrlShiftA,
+    /// Opens the subagent model profile editor.
+    CtrlShiftM,
     /// Toggles the visible dangerous-mode session state through the composition layer.
     CtrlShiftD,
     /// Toggles the visible permission-bypass session state through the composition layer.
@@ -689,6 +691,7 @@ pub struct DialogEntry {
     search_text: Option<String>,
     selected_detail: Option<String>,
     action: Option<DialogEntryAction>,
+    id: Option<String>,
 }
 
 impl DialogEntry {
@@ -729,6 +732,7 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
     }
 
@@ -742,6 +746,7 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
     }
 
@@ -761,7 +766,14 @@ impl DialogEntry {
                 action_id.as_ref(),
                 128,
             ))),
+            id: None,
         }
+    }
+
+    /// Attaches the row identity substituted into selected-key action templates.
+    pub fn with_id(mut self, id: impl AsRef<str>) -> Self {
+        self.id = Some(bounded_dialog_text(id.as_ref(), 128));
+        self
     }
 
     pub fn cancel(label: impl AsRef<str>) -> Self {
@@ -771,6 +783,7 @@ impl DialogEntry {
             search_text: None,
             selected_detail: None,
             action: Some(DialogEntryAction::Cancel),
+            id: None,
         }
     }
 
@@ -781,6 +794,7 @@ impl DialogEntry {
             search_text: None,
             selected_detail: None,
             action: None,
+            id: None,
         }
     }
 
@@ -795,6 +809,7 @@ impl DialogEntry {
             search_text: Some(bounded_dialog_text(search_text.as_ref(), 512)),
             selected_detail: Some(bounded_dialog_multiline(selected_detail.as_ref(), 2_048)),
             action: Some(DialogEntryAction::ToggleDetails),
+            id: None,
         }
     }
 }
@@ -901,6 +916,8 @@ pub struct DialogView {
     details_open: bool,
     empty_message: Option<String>,
     cancellation_action: Option<String>,
+    shortcut_actions: Vec<(char, String)>,
+    selected_key_actions: Vec<(Key, String)>,
     overlay_kind: widgets::OverlayKind,
 }
 
@@ -928,6 +945,8 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            shortcut_actions: Vec::new(),
+            selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -954,6 +973,21 @@ impl DialogView {
 
     pub fn with_cancellation_action(mut self, action_id: impl AsRef<str>) -> Self {
         self.cancellation_action = Some(bounded_dialog_text(action_id.as_ref(), 128));
+        self
+    }
+
+    pub fn with_shortcut_action(mut self, key: char, action_id: impl AsRef<str>) -> Self {
+        self.shortcut_actions
+            .push((key, bounded_dialog_text(action_id.as_ref(), 128)));
+        self
+    }
+
+    /// Registers a template dispatched for the selected row when `key` is pressed.
+    /// The literal `{selected}` is replaced with the selected entry's `with_id`
+    /// identity; without an identity the key keeps its default behavior.
+    pub fn with_selected_key_action(mut self, key: Key, template: impl AsRef<str>) -> Self {
+        self.selected_key_actions
+            .push((key, bounded_dialog_text(template.as_ref(), 128)));
         self
     }
 
@@ -1050,6 +1084,8 @@ impl DialogView {
             details_open: false,
             empty_message: None,
             cancellation_action: None,
+            shortcut_actions: Vec::new(),
+            selected_key_actions: Vec::new(),
             overlay_kind: widgets::OverlayKind::Picker,
         }
     }
@@ -4524,6 +4560,11 @@ where
             return Action::OpenDialog("subagent".into());
         }
 
+        if key == Key::CtrlShiftM {
+            self.palette_open = false;
+            return Action::OpenDialog("subagent-profiles".into());
+        }
+
         if key == Key::CtrlShiftD {
             self.palette_open = false;
             return Action::OpenDialog("dangerous".into());
@@ -4936,8 +4977,26 @@ where
                 }
                 _ => None,
             })?;
-        self.dialog = None;
         Some(matched)
+    }
+
+    fn selected_key_dialog_action(&mut self, key: Key) -> Option<Action> {
+        let template = self
+            .dialog
+            .as_ref()?
+            .selected_key_actions
+            .iter()
+            .find(|(candidate, _)| *candidate == key)
+            .map(|(_, template)| template.clone())?;
+        let id = self.dialog.as_ref().and_then(|dialog| {
+            dialog_matches(dialog)
+                .into_iter()
+                .find(|(index, _)| *index == dialog.selected)
+                .and_then(|(_, entry)| entry.id.clone())
+        })?;
+        Some(Action::SafeDialogAction(
+            template.replace("{selected}", id.as_str()),
+        ))
     }
 
     fn handle_selection_dialog_key(&mut self, key: Key) -> Action {
@@ -4962,6 +5021,15 @@ where
                 self.toggle_session_dialog_scope()
             }
             Key::Char(character) => {
+                if let Some(action_id) = self.dialog.as_ref().and_then(|dialog| {
+                    dialog
+                        .shortcut_actions
+                        .iter()
+                        .find(|(key, _)| *key == character)
+                        .map(|(_, action)| action.clone())
+                }) {
+                    return Action::DialogAction(action_id);
+                }
                 if let Some(action) = self.try_confirm_shortcut(character) {
                     return action;
                 }
@@ -4995,6 +5063,14 @@ where
                 Action::Render
             }
             Key::Backspace => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.query.is_empty())
+                    && let Some(action) = self.selected_key_dialog_action(Key::Backspace)
+                {
+                    return action;
+                }
                 if let Some(request) = self.session_dialog_request() {
                     let mut request = request.clone();
                     request.query.pop();
@@ -5030,6 +5106,9 @@ where
                 self.reset_dialog_selection();
                 Action::Render
             }
+            key @ (Key::Left | Key::Right | Key::Tab) => self
+                .selected_key_dialog_action(key)
+                .unwrap_or(Action::Render),
             Key::Up | Key::Down | Key::ScrollUp | Key::ScrollDown => {
                 self.move_dialog_selection(key, 1, true);
                 Action::Render
@@ -5056,14 +5135,8 @@ where
                         .and_then(|(_, entry)| entry.action.clone())
                 });
                 match action {
-                    Some(DialogEntryAction::Dispatch(action_id)) => {
-                        if !is_session_resume_action(&action_id) {
-                            self.dialog = None;
-                        }
-                        Action::DialogAction(action_id)
-                    }
+                    Some(DialogEntryAction::Dispatch(action_id)) => Action::DialogAction(action_id),
                     Some(DialogEntryAction::SafeDispatch(action_id)) => {
-                        self.dialog = None;
                         Action::SafeDialogAction(action_id)
                     }
                     Some(DialogEntryAction::SelectTranscript(id)) => {
@@ -5095,7 +5168,9 @@ where
                         .as_ref()
                         .is_some_and(|entries| entries.loading)
                 });
-                self.dialog = None;
+                if action_id.is_none() || session_request_loading {
+                    self.dialog = None;
+                }
                 if session_request_loading {
                     Action::CancelRoute
                 } else {
@@ -6672,18 +6747,24 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::CtrlShiftA
         }
         (KeyCode::Char('A'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftA,
-        (KeyCode::Char('d'), modifiers)
-            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
-        {
-            Key::CtrlShiftD
-        }
-        (KeyCode::Char('D'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftD,
         (KeyCode::Char('p'), modifiers)
             if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
         {
             Key::CtrlShiftP
         }
         (KeyCode::Char('P'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftP,
+        (KeyCode::Char('d'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftD
+        }
+        (KeyCode::Char('D'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftD,
+        (KeyCode::Char('m'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftM
+        }
+        (KeyCode::Char('M'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftM,
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlB
         }
@@ -7806,6 +7887,100 @@ mod runtime_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rows, ["AAA AAA", "AAAAA AA", "AAAAAA"]);
+    }
+
+    #[test]
+    fn selected_key_actions_dispatch_the_selected_entry_identity() {
+        let mut tui = Tui::new(NoopEngine);
+        let dialog = || {
+            DialogView::selection(
+                "Profiles",
+                Some("help"),
+                vec![
+                    DialogEntry::action("worker", "profiles:edit:worker").with_id("worker"),
+                    DialogEntry::action("scout", "profiles:edit:scout").with_id("scout"),
+                ],
+            )
+            .with_selected_key_action(Key::Right, "profiles:cycle:{selected}:next")
+            .with_selected_key_action(Key::Backspace, "profiles:reset:{selected}")
+        };
+
+        tui.show_selection_dialog(dialog());
+        assert_eq!(
+            tui.handle(Event::Key(Key::Right)),
+            Action::SafeDialogAction("profiles:cycle:worker:next".into())
+        );
+        assert!(
+            tui.view().dialog.is_some(),
+            "the dialog must stay visible until the outcome replaces it"
+        );
+
+        tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Down));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Backspace)),
+            Action::SafeDialogAction("profiles:reset:scout".into())
+        );
+        assert!(
+            tui.view().dialog.is_some(),
+            "the dialog must stay visible until the outcome replaces it"
+        );
+
+        // A non-empty query keeps Backspace as query editing.
+        tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Char('x')));
+        assert_eq!(tui.handle(Event::Key(Key::Backspace)), Action::Render);
+        assert!(tui.view().dialog.is_some());
+
+        // Rows without an identity keep the key's default behavior.
+        tui.show_selection_dialog(
+            DialogView::selection(
+                "Profiles",
+                Some("help"),
+                vec![DialogEntry::action("worker", "profiles:edit:worker")],
+            )
+            .with_selected_key_action(Key::Right, "profiles:cycle:{selected}:next"),
+        );
+        assert_eq!(tui.handle(Event::Key(Key::Right)), Action::Render);
+        assert!(tui.view().dialog.is_some());
+    }
+
+    #[test]
+    fn dispatched_actions_keep_the_dialog_until_the_outcome_replaces_it() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.show_selection_dialog(DialogView::selection(
+            "Profiles",
+            Some("help"),
+            vec![DialogEntry::action("worker", "profiles:edit:worker")],
+        ));
+
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("profiles:edit:worker".into())
+        );
+        assert!(
+            tui.view().dialog.is_some(),
+            "dispatch must not blank the current dialog"
+        );
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::Dialog(DialogView::selection(
+            "Choose profile model",
+            Some("help"),
+            vec![DialogEntry::action(
+                "gpt-4.1",
+                "profiles:set-model:worker:gpt-4.1",
+            )],
+        )));
+        assert!(
+            tui.view().dialog.is_some(),
+            "a dialog outcome replaces the previous one atomically"
+        );
+
+        tui.apply_submission_outcome(TuiSubmissionOutcome::LocalInfo("done".into()));
+        assert!(
+            tui.view().dialog.is_none(),
+            "a non-dialog outcome closes the dialog"
+        );
     }
 
     #[test]

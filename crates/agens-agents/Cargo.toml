@@ -19,3 +19,6 @@ agens-providers = { path = "../agens-providers" }
 agens-session = { path = "../agens-session" }
 agens-store = { path = "../agens-store" }
 agens-tools = { path = "../agens-tools" }
+
+[dev-dependencies]
+agens-config = { path = "../agens-config" }

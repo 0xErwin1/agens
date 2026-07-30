@@ -64,6 +64,14 @@ impl TuiEngine for ProductionTuiEngine {
 }
 
 pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
+    run_production_tui_with_profile_store(bootstrap, resume, None)
+}
+
+pub fn run_production_tui_with_profile_store(
+    bootstrap: &Bootstrap,
+    resume: Option<i64>,
+    profile_store: Option<Arc<dyn crate::profiles::AgentProfileStore>>,
+) -> Result<String, CliError> {
     let cancellation = Arc::new(Mutex::new(None));
     let session = Arc::new(Mutex::new(SessionContext::fresh()));
     let task_controls = TuiTaskControls(TaskExecutionRegistry::with_limits(task_execution_limits(
@@ -139,6 +147,7 @@ pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<
         commands,
         Arc::clone(&skills),
     );
+    let router = profile_store.map_or(router.clone(), |store| router.with_profile_store(store));
     tui.set_palette_entries(router.palette_entries()?);
     let picker_candidates = router
         .session

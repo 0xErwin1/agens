@@ -214,6 +214,7 @@ fn discovers_agents_with_deterministic_precedence_modes_and_diagnostics() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
         skills: vec![],
@@ -431,6 +432,7 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
         description: "built-in".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "built-in".into(),
         permission_rules: vec![],
         skills: vec![],
@@ -450,7 +452,37 @@ fn isolates_unsafe_mismatched_and_oversized_agent_documents() {
 }
 
 #[test]
-fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
+fn agent_catalog_parses_valid_effort_and_diagnoses_invalid_effort() {
+    let temporary = TemporaryDirectory::new();
+    let global = temporary.path.join("global");
+    fs::create_dir_all(&global).unwrap();
+    fs::write(
+        global.join("low-effort.md"),
+        "---\nname: low-effort\ndescription: low effort\nmode: subagent\neffort: low\n---\nbody\n",
+    )
+    .unwrap();
+    fs::write(
+        global.join("invalid-effort.md"),
+        "---\nname: invalid-effort\ndescription: invalid effort\nmode: subagent\neffort: opus\n---\nbody\n",
+    )
+    .unwrap();
+
+    let discovery = AgentCatalog::discover(&[], &global, &temporary.path.join("missing")).unwrap();
+
+    assert_eq!(
+        discovery
+            .catalog()
+            .agent("low-effort")
+            .unwrap()
+            .reasoning_effort,
+        Some(ReasoningEffort::Low)
+    );
+    assert!(discovery.catalog().agent("invalid-effort").is_none());
+    assert!(discovery.diagnostics()[0].message().contains("effort"));
+}
+
+#[test]
+fn catalog_preserves_models_rejected_by_the_tools_owned_validator() {
     let temporary = TemporaryDirectory::new();
     let global = temporary.path.join("global");
     let project = temporary.path.join("project");
@@ -468,7 +500,15 @@ fn catalog_isolates_models_rejected_by_the_tools_owned_validator() {
             .unwrap();
 
     assert!(discovery.catalog().agent("allowed").is_some());
-    assert!(discovery.catalog().agent("rejected").is_none());
+    assert_eq!(
+        discovery
+            .catalog()
+            .agent("rejected")
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("unsupported")
+    );
     assert_eq!(
         discovery.diagnostics()[0].message(),
         "agent model is unavailable"
@@ -614,7 +654,7 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
     write_agent(&agents, "inherited", "inherited agent", "subagent");
     fs::write(
         agents.join("explicit.md"),
-        "---\nname: explicit\ndescription: explicit agent\nmode: subagent\nmodel: worker-model\n---\nexplicit instructions\n",
+        "---\nname: explicit\ndescription: explicit agent\nmode: subagent\nmodel: worker-model\neffort: low\n---\nexplicit instructions\n",
     )
     .unwrap();
     let agents = AgentCatalog::discover(&[], &agents, &missing)
@@ -661,7 +701,7 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
         *calls.lock().unwrap(),
         vec![
             ("parent-model".to_owned(), Some(ReasoningEffort::High)),
-            ("worker-model".to_owned(), None),
+            ("worker-model".to_owned(), Some(ReasoningEffort::Low)),
         ]
     );
     assert_eq!(
@@ -671,7 +711,7 @@ fn task_inherits_parent_model_and_effort_but_validates_explicit_overrides() {
 }
 
 #[test]
-fn unavailable_explicit_task_model_reports_once_without_running_the_child() {
+fn unavailable_agent_model_degrades_to_the_parent_and_records_a_diagnostic() {
     let temporary = TemporaryDirectory::new();
     let agents = temporary.path.join("agents");
     let missing = temporary.path.join("missing");
@@ -685,17 +725,17 @@ fn unavailable_explicit_task_model_reports_once_without_running_the_child() {
         .unwrap()
         .catalog()
         .clone();
-    let calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::new()));
     let diagnostics = Arc::new(Mutex::new(Vec::new()));
     let diagnostic_probe = Arc::clone(&diagnostics);
     let mut task = TaskTool::from_catalogs_with_parent_config(
         agents,
         SkillCatalog::default(),
         "parent-model",
-        RequestConfig::default(),
+        RequestConfig::with_reasoning_effort("high").unwrap(),
         vec!["parent-model".to_owned(), "worker-model".to_owned()],
         TaskModels,
-        CountingTaskRunner(Arc::clone(&calls)),
+        CapturingTaskRunner(Arc::clone(&calls)),
     )
     .with_model_resolution_diagnostics(move |error| {
         diagnostic_probe.lock().unwrap().push(error);
@@ -705,22 +745,27 @@ fn unavailable_explicit_task_model_reports_once_without_running_the_child() {
     let output = task
         .execute(
             &task_context(),
-            serde_json::json!({"agent":"worker","description":"reject"}),
+            serde_json::json!({"agent":"worker","description":"degrade"}),
         )
         .unwrap();
 
     assert_eq!(
         output,
-        ToolOutput::failure("task: requested model is unavailable [ref: abc12345]")
+        ToolOutput::success(
+            "warning: agent worker requested unavailable model unavailable; using parent-model [ref: abc12345]\ncaptured"
+        )
     );
     assert_eq!(
-        output.terminal(),
-        Some(HeadlessTaskTerminal::ModelUnavailable)
+        *calls.lock().unwrap(),
+        vec![("parent-model".to_owned(), Some(ReasoningEffort::High))]
     );
-    assert_eq!(calls.load(Ordering::Acquire), 0);
     assert_eq!(
         *diagnostics.lock().unwrap(),
-        vec![TaskModelResolutionError::ModelUnavailable]
+        vec![TaskModelResolutionError::ModelUnavailable {
+            agent: "worker".to_owned(),
+            requested_model: "unavailable".to_owned(),
+            fallback_model: "parent-model".to_owned(),
+        }]
     );
 }
 
@@ -2073,6 +2118,7 @@ fn agent_with_rules(permission_rules: Vec<PermissionRule>) -> AgentDefinition {
         description: "agent".into(),
         mode: AgentMode::Primary,
         model: None,
+        reasoning_effort: None,
         system_prompt: "body".into(),
         permission_rules,
         skills: vec![],

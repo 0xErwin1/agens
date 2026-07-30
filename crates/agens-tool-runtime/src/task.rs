@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agens_core::{PermissionMode, PermissionSession};
-use agens_providers::{OpenAiFunctionTool, ProviderDiagnosticClass};
+use agens_providers::OpenAiFunctionTool;
 use agens_store::PermissionGrantStore;
 use agens_tools::{
     SkillCatalog, TaskControlTool, TaskExecutionRegistry, TaskMessageSource, TaskMessageTool,
@@ -18,7 +18,7 @@ use crate::runner::{ProductionTaskRunner, TuiTaskLifecycleBridge};
 use crate::runtime::production_tool_runtime_with_parent_task_runner;
 use agens_agents::{TaskModelValidator, task_agent_catalog, task_model_catalog};
 use agens_bootstrap::Bootstrap;
-use agens_diagnostics::{next_diagnostic_reference, record_subagent_terminal};
+use agens_diagnostics::{next_diagnostic_reference, record_subagent_model_unavailable};
 use agens_dispatch::{AuthorizedNativeTaskRuntime, ProductionToolDispatcher};
 use agens_error::CliError;
 use agens_models::{default_model, unknown_provider_message};
@@ -198,7 +198,7 @@ pub fn register_production_task_tool<R: TaskRunner>(
 ) -> Result<(), CliError> {
     let available_models = task_model_catalog(bootstrap)?;
     let validator = TaskModelValidator::new(&available_models);
-    let agents = task_agent_catalog(bootstrap, project_root)?;
+    let agents = resolved_task_agents(bootstrap, project_root, &parent)?;
     if !agents
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent)
@@ -217,15 +217,21 @@ pub fn register_production_task_tool<R: TaskRunner>(
         task_runner,
     )
     .with_model_resolution_diagnostics(move |error| match error {
-        TaskModelResolutionError::ModelUnavailable => {
+        TaskModelResolutionError::ModelUnavailable {
+            agent,
+            requested_model,
+            fallback_model,
+        } => {
             let reference = parent
                 .diagnostic_reference
                 .clone()
                 .unwrap_or_else(next_diagnostic_reference);
-            record_subagent_terminal(
+            record_subagent_model_unavailable(
                 &diagnostic_bootstrap,
                 &reference,
-                ProviderDiagnosticClass::ModelUnavailable,
+                &agent,
+                &requested_model,
+                &fallback_model,
             );
             Some(reference)
         }
@@ -252,6 +258,32 @@ pub fn register_production_task_tool<R: TaskRunner>(
         task_registry,
         TaskMessageSource::Main,
     )
+}
+
+fn resolved_task_agents(
+    bootstrap: &Bootstrap,
+    project_root: &Path,
+    parent: &TaskParentSelection,
+) -> Result<agens_tools::AgentCatalog, CliError> {
+    let session_root = agens_bootstrap::session_root::SessionRoot::confined_to(project_root.into());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let resolver = agens_agents::AgentProfileResolver::new(session_config.agent_profiles());
+    let agents = task_agent_catalog(bootstrap, project_root)?;
+
+    Ok(agents.map_agents(|agent| {
+        let profile = resolver.resolve(
+            &agent.name,
+            agent.model.as_deref(),
+            agent.reasoning_effort,
+            &parent.model,
+            parent.request_config.reasoning_effort(),
+        );
+        let mut agent = agent.clone();
+        agent.model = Some(profile.model.value);
+        agent.reasoning_effort = profile.effort.value;
+        agent
+    }))
 }
 
 fn register_task_coordination_tools(
@@ -292,4 +324,44 @@ fn register_task_coordination_tools(
             TaskMessageTool::new(registry, source),
         )
         .map_err(|_| CliError::configuration("tool catalog is invalid"))
+}
+
+#[cfg(test)]
+mod tests {
+    use agens_core::{ReasoningEffort, RequestConfig};
+    use agens_fixtures::bootstrap_from_configuration;
+
+    use super::{TaskParentSelection, resolved_task_agents};
+
+    #[test]
+    fn task_agents_resolve_profiles_for_the_shared_tui_and_headless_builder() {
+        let bootstrap = bootstrap_from_configuration(
+            "task-agent-profiles",
+            Some(
+                "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[agents.explore]\nmodel = \"global-model\"\n\n[agents.general]\neffort = \"low\"\n",
+            ),
+            Some("[agents.explore]\nmodel = \"project-model\"\neffort = \"max\"\n"),
+        );
+        let project_root = bootstrap
+            .paths
+            .project_config
+            .parent()
+            .and_then(|path| path.parent())
+            .unwrap()
+            .to_path_buf();
+        let parent = TaskParentSelection {
+            model: "session-model".into(),
+            request_config: RequestConfig::with_reasoning_effort_value(ReasoningEffort::High),
+            diagnostic_reference: None,
+        };
+
+        let agents = resolved_task_agents(&bootstrap, &project_root, &parent).unwrap();
+        let explore = agents.agent("explore").unwrap();
+        assert_eq!(explore.model.as_deref(), Some("project-model"));
+        assert_eq!(explore.reasoning_effort, Some(ReasoningEffort::Max));
+
+        let general = agents.agent("general").unwrap();
+        assert_eq!(general.model.as_deref(), Some("session-model"));
+        assert_eq!(general.reasoning_effort, Some(ReasoningEffort::Low));
+    }
 }

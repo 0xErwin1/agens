@@ -121,6 +121,7 @@ impl TuiRuntimeRouter {
                 presentation: self.presentation()?,
             },
             "/subagent" => self.open_dialog("subagent")?,
+            "/subagent-profiles" => self.open_dialog("subagent-profiles")?,
             "/subagents" => TuiSubmissionOutcome::TranscriptDialog,
             "/model" => self.open_dialog("model")?,
             command if command.starts_with("/model ") => TuiSubmissionOutcome::ContextChanged {
