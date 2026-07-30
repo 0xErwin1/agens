@@ -127,6 +127,22 @@ fn cancellation_wins_when_a_remote_error_completes_after_cancellation() {
     server.join();
 }
 
+/// A response event echoes the whole request back, so a session carrying many
+/// MCP tool definitions produces `response.created` / `response.completed`
+/// frames far larger than any model output. Such a frame must still decode.
+#[test]
+fn a_response_event_echoing_a_large_tool_set_is_decoded_rather_than_rejected() {
+    let server = LocalResponsesServer::start(ServerMode::LargeToolEchoFrame);
+    let result = run_provider(
+        server.base_url(),
+        HeadlessTurnCancellation::with_deadline(Duration::from_secs(5)),
+        Duration::from_secs(5),
+    );
+
+    assert_eq!(result, Ok(()));
+    server.join();
+}
+
 #[test]
 fn malformed_unterminated_or_oversized_frames_and_remote_errors_are_sanitized_provider_failures() {
     for (mode, expected) in [
@@ -985,6 +1001,7 @@ enum ServerMode {
     StalledBody,
     LateEvent,
     MalformedFrame,
+    LargeToolEchoFrame,
     OversizedFrame,
     UnterminatedOversizedFrame,
     ErrorBody,
@@ -1210,11 +1227,25 @@ impl LocalResponsesServer {
                         .write_all(b"data: {not-json}\n\n")
                         .expect("malformed frame should be written");
                 }
+                ServerMode::LargeToolEchoFrame => {
+                    write_sse_headers(&mut stream);
+                    let frame = format!(
+                        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_1\",\"instructions\":\"{}\"}}}}\n\n",
+                        "x".repeat(400 * 1024)
+                    );
+                    stream
+                        .write_all(frame.as_bytes())
+                        .expect("large tool echo frame should be written");
+                    let _ = stream.write_all(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                    );
+                    let _ = stream.write_all(b"data: {\"type\":\"response.completed\"}\n\n");
+                }
                 ServerMode::OversizedFrame => {
                     write_sse_headers(&mut stream);
                     let frame = format!(
                         "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}\n\n",
-                        "x".repeat(128 * 1024)
+                        "x".repeat(2 * 1024 * 1024)
                     );
                     stream
                         .write_all(frame.as_bytes())
@@ -1226,7 +1257,7 @@ impl LocalResponsesServer {
                         .write_all(
                             format!(
                                 "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"{}\"}}",
-                                "x".repeat(128 * 1024)
+                                "x".repeat(2 * 1024 * 1024)
                             )
                             .as_bytes(),
                         )

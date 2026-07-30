@@ -31,7 +31,10 @@ const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
 const HTTP_RETRY_MAX_JITTER: u64 = 100;
 const HTTP_RETRY_AFTER_CAP: Duration = Duration::from_secs(5);
 const DEFAULT_OPENAI_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_SSE_FRAME_BYTES: usize = 128 * 1024;
+/// Bounds one SSE frame. Response lifecycle events echo the entire request,
+/// so this has to accommodate a full tool catalogue rather than the largest
+/// plausible model output; a session with many MCP servers exceeds 128 KiB.
+const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
