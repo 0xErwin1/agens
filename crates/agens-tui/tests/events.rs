@@ -2991,8 +2991,8 @@ fn permission_confirm_short_keys_dispatch_allow_deny_once_and_always() {
             "short key {key}"
         );
         assert!(
-            tui.view().dialog.is_some(),
-            "short key {key} keeps the dialog until the outcome arrives"
+            tui.view().dialog.is_none(),
+            "short key {key} dismisses the permission dialog immediately"
         );
         assert_eq!(tui.engine().cancellations, 0);
     }
@@ -3015,7 +3015,7 @@ fn permission_confirm_list_enter_dispatches_selected_choice() {
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("permission:3:allow-always".into())
     );
-    assert!(tui.view().dialog.is_some());
+    assert!(tui.view().dialog.is_none());
 }
 
 #[test]
@@ -3054,6 +3054,10 @@ fn picker_overlay_types_a_query_only_once_search_is_armed() {
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),
         Action::DialogAction("alpha".into())
+    );
+    assert!(
+        tui.view().dialog.is_some(),
+        "non-permission dialog actions retain their existing lifecycle"
     );
 
     tui.show_selection_dialog(DialogView::selection(

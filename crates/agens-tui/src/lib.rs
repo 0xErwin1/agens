@@ -5565,7 +5565,16 @@ where
                 }
                 _ => None,
             })?;
+        if let Action::DialogAction(action_id) = &matched {
+            self.dismiss_permission_dialog(action_id);
+        }
         Some(matched)
+    }
+
+    fn dismiss_permission_dialog(&mut self, action_id: &str) {
+        if parse_permission_reply(action_id).is_some() {
+            self.dialog = None;
+        }
     }
 
     fn selected_key_dialog_action(&mut self, key: Key) -> Option<Action> {
@@ -5663,7 +5672,10 @@ where
                         .and_then(|(_, entry)| entry.action.clone())
                 });
                 match action {
-                    Some(DialogEntryAction::Dispatch(action_id)) => Action::DialogAction(action_id),
+                    Some(DialogEntryAction::Dispatch(action_id)) => {
+                        self.dismiss_permission_dialog(&action_id);
+                        Action::DialogAction(action_id)
+                    }
                     Some(DialogEntryAction::SafeDispatch(action_id)) => {
                         Action::SafeDialogAction(action_id)
                     }
