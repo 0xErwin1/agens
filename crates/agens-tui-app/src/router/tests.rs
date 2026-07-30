@@ -535,6 +535,213 @@ fn subagent_profile_root_searches_letters_and_focuses_the_autosaved_row() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+#[test]
+fn tui_login_command_palette_and_selector_are_exact() {
+    let temporary = tui_session_directory("login-selector");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let entry = router
+        .palette_entries()
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.name() == "login")
+        .expect("/login is in the palette");
+    assert_eq!(entry.description(), "Sign in to a provider");
+    assert_eq!(entry.argument_hint(), "");
+    assert_eq!(
+        router.route("/login".into()),
+        router.open_dialog("login").unwrap()
+    );
+    assert!(matches!(
+        router.route("/login anything".into()),
+        TuiSubmissionOutcome::LocalActionableError { message, .. }
+            if message == "usage: unknown TUI command: /login anything"
+    ));
+
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+    tui.apply_submission_outcome(router.open_dialog("login").unwrap());
+    let selector = render_tui_test_backend(&tui, 100, 24);
+    for text in [
+        "Sign in",
+        "Choose a provider",
+        "ChatGPT subscription",
+        "OpenAI API key",
+        "Moonshot AI API key",
+    ] {
+        assert!(selector.contains(text), "{selector:?}");
+    }
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("login:chatgpt".into())
+    );
+    tui.apply_submission_outcome(
+        router.route_dialog_action("login:chatgpt", std::sync::mpsc::channel().0),
+    );
+    assert!(render_tui_test_backend(&tui, 100, 24).contains("Connect to ChatGPT"));
+
+    tui.apply_submission_outcome(router.open_dialog("login").unwrap());
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("login:api-key:openai-api".into())
+    );
+    tui.apply_submission_outcome(router.open_dialog("login").unwrap());
+    tui.handle(Event::Key(Key::Down));
+    tui.handle(Event::Key(Key::Down));
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("login:api-key:moonshotai".into())
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_login_api_key_entries_mask_and_persist_without_runtime_mutation() {
+    let temporary = tui_session_directory("login-api-key");
+    let config_home = temporary.join("config");
+    let credentials = config_home.join("auth.json");
+    std::fs::create_dir_all(&config_home).unwrap();
+    std::fs::write(
+        &credentials,
+        r#"{"openai-chatgpt":{"access_token":"kept"},"other":{"sentinel":"kept"}}"#,
+    )
+    .unwrap();
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let session = Arc::new(Mutex::new(SessionContext {
+        provider: Some(ProviderKind::OpenAiChatGpt),
+        ..SessionContext::fresh()
+    }));
+    let original_session = session.lock().unwrap().clone();
+    let original_bootstrap = (
+        bootstrap.provider_type().map(str::to_owned),
+        bootstrap.model().map(str::to_owned),
+        bootstrap.api_key.clone(),
+    );
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+
+    for (action, title, help, key, success) in [
+        (
+            "login:api-key:openai-api",
+            "Sign in to OpenAI API",
+            "Enter your OpenAI API key",
+            "  openai-secret  ",
+            "Logged in to openai-api.",
+        ),
+        (
+            "login:api-key:moonshotai",
+            "Sign in to Moonshot AI",
+            "Enter your Moonshot AI API key",
+            " moonshot-secret ",
+            "Logged in to moonshotai.",
+        ),
+    ] {
+        tui.apply_submission_outcome(
+            router.route_dialog_action(action, std::sync::mpsc::channel().0),
+        );
+        let overlay = render_tui_test_backend(&tui, 100, 24);
+        assert!(overlay.contains(title), "{overlay:?}");
+        assert!(overlay.contains(help), "{overlay:?}");
+        assert_eq!(tui.handle(Event::Paste(key.into())), Action::Render);
+        let masked = render_tui_test_backend(&tui, 100, 24);
+        assert!(!masked.contains(key.trim()), "{masked:?}");
+        let Action::SubmitSecret { action_id, secret } = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("secret overlay must submit through the secret route");
+        };
+        let outcome = router.route_request(
+            TuiRouteRequest::SubmitSecret { action_id, secret },
+            std::sync::mpsc::channel().0,
+        );
+        assert!(
+            matches!(outcome, TuiSubmissionOutcome::LocalInfo(ref message) if message == success)
+        );
+        tui.apply_submission_outcome(outcome);
+    }
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&credentials).unwrap()).unwrap();
+    assert_eq!(stored["openai-api"]["api_key"], "openai-secret");
+    assert_eq!(stored["moonshotai"]["api_key"], "moonshot-secret");
+    assert_eq!(stored["openai-chatgpt"]["access_token"], "kept");
+    assert_eq!(stored["other"]["sentinel"], "kept");
+    assert_eq!(*session.lock().unwrap(), original_session);
+    let bootstrap = router.bootstrap().unwrap();
+    assert_eq!(
+        (
+            bootstrap.provider_type().map(str::to_owned),
+            bootstrap.model().map(str::to_owned),
+            bootstrap.api_key.clone(),
+        ),
+        original_bootstrap
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_login_rejects_unknown_actions_and_sanitizes_write_failures() {
+    let temporary = tui_session_directory("login-errors");
+    let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+    bootstrap.paths.credentials = temporary.join("credentials-directory");
+    std::fs::create_dir_all(&bootstrap.paths.credentials).unwrap();
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+
+    for (action, expected) in [
+        ("login:api-key:unknown", "login action is invalid"),
+        ("login:chatgpt", "login action is invalid"),
+        ("other-sentinel", "login action is invalid"),
+        (
+            "login:api-key:openai-api",
+            "API-key credentials could not be saved",
+        ),
+    ] {
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(
+            agens_tui::SecretEntryView::new("Secret", None::<String>, action),
+        ));
+        tui.handle(Event::Paste("secret-sentinel".into()));
+        let Action::SubmitSecret { action_id, secret } = tui.handle(Event::Key(Key::Enter)) else {
+            panic!("secret overlay must submit");
+        };
+        let outcome = router.route_request(
+            TuiRouteRequest::SubmitSecret { action_id, secret },
+            std::sync::mpsc::channel().0,
+        );
+        assert!(
+            matches!(outcome, TuiSubmissionOutcome::LocalActionableError { ref message, .. } if message == expected)
+        );
+        assert!(!format!("{outcome:?}").contains("secret-sentinel"));
+    }
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 fn test_chatgpt_credentials(
     access_token: &str,
 ) -> agens_providers::chatgpt_login::ChatGptCredentials {
@@ -735,6 +942,62 @@ fn tui_connect_and_disconnect_overlays_select_flows_and_cancel_without_credentia
     assert_eq!(after_cancel, connected);
     open_tui_palette_dialog(&mut tui, &router, "/di", "disconnect", progress);
     dispatch_tui_dialog_selection(&mut tui, &router, std::sync::mpsc::channel().0);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn device_auth_browser_opening_uses_injected_adapter_and_sanitizes_failures() {
+    let temporary = tui_session_directory("device-auth-browser-open");
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let router = TuiRuntimeRouter::with_auth_coordinator(
+        tui_session_bootstrap(&temporary, &[]),
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        ChatGptAuthCoordinator::with_authenticator_and_browser_opener(
+            |_, _, _| Ok(test_chatgpt_credentials("unused")),
+            {
+                let opened = Arc::clone(&opened);
+                Arc::new(move |url| {
+                    opened.lock().unwrap().push(url.to_owned());
+                    Ok(())
+                })
+            },
+        ),
+    );
+
+    assert!(matches!(
+        router.open_device_auth_url("https://auth.example/device"),
+        Ok(message) if message == "Browser opened."
+    ));
+    assert_eq!(*opened.lock().unwrap(), vec!["https://auth.example/device"]);
+
+    let failing_router = TuiRuntimeRouter::with_auth_coordinator(
+        tui_session_bootstrap(&temporary, &[]),
+        Arc::new(Mutex::new(SessionContext::fresh())),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+        ChatGptAuthCoordinator::with_authenticator_and_browser_opener(
+            |_, _, _| Ok(test_chatgpt_credentials("unused")),
+            Arc::new(|_| {
+                Err(std::io::Error::other(
+                    "command diagnostic must not reach UI",
+                ))
+            }),
+        ),
+    );
+    let outcome =
+        auth_route_outcome(failing_router.open_device_auth_url("https://auth.example/device"));
+    assert!(matches!(
+        outcome,
+        TuiSubmissionOutcome::LocalActionableError { ref message, ref action }
+            if message == "ChatGPT verification page could not be opened"
+                && action == "Copy the verification link and open it in a browser."
+    ));
+    assert!(!format!("{outcome:?}").contains("command diagnostic"));
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

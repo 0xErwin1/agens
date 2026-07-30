@@ -59,6 +59,7 @@ impl TuiRuntimeRouter {
             "/sessions" | "/resume" => self.open_dialog("sessions")?,
             "/connect" => self.open_dialog("connect")?,
             "/disconnect" => self.open_dialog("disconnect")?,
+            "/login" => self.open_dialog("login")?,
             "/diagnostics" => self.open_dialog("diagnostics")?,
             "/provider" => self.open_dialog("provider")?,
             command if command.starts_with("/provider ") => TuiSubmissionOutcome::ContextChanged {

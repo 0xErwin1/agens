@@ -3535,3 +3535,90 @@ fn a_background_submission_leaves_no_file_picker_behind_for_escape() {
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
 }
+
+#[test]
+fn device_auth_overlay_renders_separate_values_and_explicit_actions() {
+    let backend = TestBackend::new(100, 24);
+    let terminal = Terminal::new(backend).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine::default());
+
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+    renderer.render(tui.view()).unwrap();
+    let text = renderer
+        .terminal()
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+
+    for label in [
+        "ChatGPT device authentication",
+        "Verification URL",
+        "Device code",
+        "Enter this code on the opened page.",
+        "Open browser",
+        "Copy link",
+        "Copy code",
+    ] {
+        assert!(text.contains(label), "missing {label:?} in {text:?}");
+    }
+    assert!(text.contains("https://auth.example/device"));
+    assert!(text.contains("ABCD-EFGH"));
+}
+
+#[test]
+fn device_auth_overlay_actions_copy_exact_values_open_and_keep_route_alive() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::OpenDeviceAuthUrl
+    );
+    assert_eq!(
+        tui.device_auth_clipboard_text(),
+        Some("https://auth.example/device")
+    );
+    assert!(tui.view().running);
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::CopyDeviceAuthUrl
+    );
+    assert_eq!(
+        tui.device_auth_clipboard_text(),
+        Some("https://auth.example/device")
+    );
+    assert!(tui.view().running);
+    assert_eq!(tui.handle(Event::Key(Key::Down)), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::CopyDeviceAuthCode
+    );
+    assert_eq!(tui.device_auth_clipboard_text(), Some("ABCD-EFGH"));
+    assert!(tui.view().running);
+}
+
+#[test]
+fn device_auth_overlay_escape_cancels_active_auth_route() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_route();
+    tui.apply_route_progress(TuiRouteProgress::DeviceCode {
+        verification_url: "https://auth.example/device".into(),
+        user_code: "ABCD-EFGH".into(),
+    });
+
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
+    assert_eq!(tui.engine().cancellations, 1);
+}

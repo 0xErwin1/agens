@@ -368,6 +368,7 @@ pub fn run_tui_prompt(
                 | TuiSubmissionOutcome::ContextChanged { message, .. }
                 | TuiSubmissionOutcome::SessionResumed { message, .. } => Ok(message),
                 TuiSubmissionOutcome::ProviderTurn { .. }
+                | TuiSubmissionOutcome::SecretEntry(_)
                 | TuiSubmissionOutcome::LocalActionableError { .. }
                 | TuiSubmissionOutcome::Dialog(_)
                 | TuiSubmissionOutcome::SafeDialog(_)

@@ -17,6 +17,7 @@ pub const RESERVED_TUI_COMMANDS: &[&str] = &[
     "diagnostics",
     "effort",
     "help",
+    "login",
     "mcp",
     "model",
     "new",
@@ -33,6 +34,7 @@ pub const RESERVED_TUI_COMMANDS: &[&str] = &[
 const TUI_PALETTE_BUILT_INS: &[(&str, &str, &str, Option<&str>)] = &[
     ("connect", "Connect to ChatGPT", "[--device-auth]", None),
     ("disconnect", "Disconnect ChatGPT credentials", "", None),
+    ("login", "Sign in to a provider", "", Some("login")),
     (
         "diagnostics",
         "Show sanitized runtime diagnostics",
@@ -670,6 +672,7 @@ mod tests {
             vec![
                 "connect",
                 "disconnect",
+                "login",
                 "diagnostics",
                 "new",
                 "sessions",

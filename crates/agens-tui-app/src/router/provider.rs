@@ -81,6 +81,13 @@ impl TuiRuntimeRouter {
         Ok("Connected to ChatGPT.".into())
     }
 
+    pub fn open_device_auth_url(&self, url: &str) -> Result<String, AuthRouteError> {
+        self.auth
+            .open_device_auth_url(url)
+            .map_err(AuthRouteError::Auth)?;
+        Ok("Browser opened.".into())
+    }
+
     pub fn disconnect(&self) -> Result<String, AuthRouteError> {
         let path = self
             .bootstrap()

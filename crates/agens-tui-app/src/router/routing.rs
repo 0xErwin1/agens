@@ -3,9 +3,13 @@
 //! Every route runs under a cancellation the caller owns, so a keystroke can
 //! stop a turn that is already in flight.
 
-use agens_tui::{TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome};
+use agens_tui::{
+    SecretInput, TuiRouteCancellation, TuiRouteProgress, TuiRouteRequest, TuiSubmissionOutcome,
+};
 
 use agens_auth::ChatGptAuthFlow;
+use agens_providers::chatgpt_login::upsert_provider_entry;
+use agens_session::provider::ProviderKind;
 
 use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
@@ -62,8 +66,14 @@ impl TuiRuntimeRouter {
         cancellation: TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
         let result = match request {
+            TuiRouteRequest::DeviceAuthOpenUrl(url) => {
+                return auth_route_outcome(self.open_device_auth_url(&url));
+            }
             TuiRouteRequest::Input(input) => {
                 return self.route_with_progress_cancellable(input, progress, cancellation);
+            }
+            TuiRouteRequest::SubmitSecret { action_id, secret } => {
+                return self.submit_secret(action_id, secret);
             }
             TuiRouteRequest::OpenDialog(route_id) => self.open_dialog(&route_id),
             TuiRouteRequest::SessionPage(request) => {
@@ -81,5 +91,37 @@ impl TuiRuntimeRouter {
             message: error.to_string(),
             action: TUI_ERROR_ACTION.into(),
         })
+    }
+
+    fn submit_secret(&self, action_id: String, secret: SecretInput) -> TuiSubmissionOutcome {
+        let provider = match action_id.as_str() {
+            "login:api-key:openai-api" => ProviderKind::OpenAiApi,
+            "login:api-key:moonshotai" => ProviderKind::Moonshot,
+            _ => {
+                return TuiSubmissionOutcome::LocalActionableError {
+                    message: "login action is invalid".into(),
+                    action: TUI_ERROR_ACTION.into(),
+                };
+            }
+        };
+        let result = self.bootstrap().and_then(|bootstrap| {
+            upsert_provider_entry(
+                &bootstrap.paths.credentials,
+                provider.identifier(),
+                serde_json::json!({ "api_key": secret.into_string() }),
+            )
+            .map_err(|_| {
+                agens_error::CliError::authentication("API-key credentials could not be saved")
+            })
+        });
+        match result {
+            Ok(()) => {
+                TuiSubmissionOutcome::LocalInfo(format!("Logged in to {}.", provider.identifier()))
+            }
+            Err(_) => TuiSubmissionOutcome::LocalActionableError {
+                message: "API-key credentials could not be saved".into(),
+                action: TUI_ERROR_ACTION.into(),
+            },
+        }
     }
 }

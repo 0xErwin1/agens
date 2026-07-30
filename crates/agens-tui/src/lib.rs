@@ -174,12 +174,17 @@ pub enum Key {
 }
 
 /// The result of handling a single terminal event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum Action {
     /// Render the current view state.
     Render,
     /// Send this prompt to the composition layer.
     Submit(String),
+    /// Submit a redacted credential through the dedicated route only.
+    SubmitSecret {
+        action_id: String,
+        secret: SecretInput,
+    },
     SubmitBackground(String),
     TransitionToBackground(u64),
     CancelExecution(u64),
@@ -198,6 +203,12 @@ pub enum Action {
     Cancel,
     /// Copies bounded selected transcript text through an explicit terminal clipboard action.
     CopySelection(String),
+    /// Opens the verification page for the active device-authentication overlay.
+    OpenDeviceAuthUrl,
+    /// Copies the active device-authentication verification URL through OSC-52.
+    CopyDeviceAuthUrl,
+    /// Copies the active device-authentication code through OSC-52.
+    CopyDeviceAuthCode,
     /// A local route was cancelled before its result could be applied.
     CancelRoute,
     /// End the terminal event loop.
@@ -264,6 +275,8 @@ pub enum TuiSubmissionOutcome {
         display: String,
         prompt: String,
     },
+    /// Opens an isolated credential-entry overlay.
+    SecretEntry(SecretEntryView),
     LocalInfo(String),
     LocalActionableError {
         message: String,
@@ -307,12 +320,160 @@ pub enum TuiSubmissionOutcome {
     Quit,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum TuiRouteRequest {
     Input(String),
+    /// Opens a device-authentication URL through the application adapter.
+    DeviceAuthOpenUrl(String),
+    SubmitSecret {
+        action_id: String,
+        secret: SecretInput,
+    },
     OpenDialog(String),
     DialogAction(String),
     SessionPage(SessionDialogRequest),
+}
+
+const MAX_SECRET_INPUT_BYTES: usize = 8192;
+const SECRET_REQUIRED_ERROR: &str = "API key is required.";
+
+/// A credential buffer deliberately kept separate from all presentation input.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SecretInput(String);
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SecretInput(<redacted>)")
+    }
+}
+
+impl SecretInput {
+    /// Consumes the already-normalized secret at the persistence boundary.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Non-secret metadata for a dedicated credential-entry overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecretEntryView {
+    title: String,
+    help: Option<String>,
+    submit_action: String,
+}
+
+impl SecretEntryView {
+    pub fn new<H>(title: impl AsRef<str>, help: Option<H>, submit_action: impl AsRef<str>) -> Self
+    where
+        H: AsRef<str>,
+    {
+        Self {
+            title: bounded_dialog_text(title.as_ref(), 64),
+            help: help.map(|help| bounded_dialog_text(help.as_ref(), 256)),
+            submit_action: bounded_dialog_text(submit_action.as_ref(), 128),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecretEntryRender<'a> {
+    title: &'a str,
+    help: Option<&'a str>,
+    mask: usize,
+    error: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SecretEntryState {
+    view: SecretEntryView,
+    input: SecretInput,
+    error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceAuthRender<'a> {
+    verification_url: &'a str,
+    user_code: &'a str,
+    selected: usize,
+    confirmation: Option<&'static str>,
+}
+
+#[derive(Clone)]
+struct DeviceAuthState {
+    verification_url: String,
+    user_code: String,
+    selected: usize,
+    confirmation: Option<&'static str>,
+}
+
+impl std::fmt::Debug for Action {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubmitSecret { action_id, .. } => formatter
+                .debug_struct("SubmitSecret")
+                .field("action_id", action_id)
+                .field("secret", &"<redacted>")
+                .finish(),
+            Self::Render => formatter.write_str("Render"),
+            Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
+            Self::SubmitBackground(value) => formatter
+                .debug_tuple("SubmitBackground")
+                .field(value)
+                .finish(),
+            Self::TransitionToBackground(id) => formatter
+                .debug_tuple("TransitionToBackground")
+                .field(id)
+                .finish(),
+            Self::CancelExecution(id) => {
+                formatter.debug_tuple("CancelExecution").field(id).finish()
+            }
+            Self::SendTaskMessage { id, message } => formatter
+                .debug_struct("SendTaskMessage")
+                .field("id", id)
+                .field("message", message)
+                .finish(),
+            Self::OpenDialog(value) => formatter.debug_tuple("OpenDialog").field(value).finish(),
+            Self::LoadSessionPage(value) => formatter
+                .debug_tuple("LoadSessionPage")
+                .field(value)
+                .finish(),
+            Self::DialogAction(value) => {
+                formatter.debug_tuple("DialogAction").field(value).finish()
+            }
+            Self::SafeDialogAction(value) => formatter
+                .debug_tuple("SafeDialogAction")
+                .field(value)
+                .finish(),
+            Self::Cancel => formatter.write_str("Cancel"),
+            Self::CopySelection(value) => {
+                formatter.debug_tuple("CopySelection").field(value).finish()
+            }
+            Self::OpenDeviceAuthUrl => formatter.write_str("OpenDeviceAuthUrl"),
+            Self::CopyDeviceAuthUrl => formatter.write_str("CopyDeviceAuthUrl"),
+            Self::CopyDeviceAuthCode => formatter.write_str("CopyDeviceAuthCode"),
+            Self::CancelRoute => formatter.write_str("CancelRoute"),
+            Self::Quit => formatter.write_str("Quit"),
+        }
+    }
+}
+
+impl std::fmt::Debug for TuiRouteRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SubmitSecret { action_id, .. } => formatter
+                .debug_struct("SubmitSecret")
+                .field("action_id", action_id)
+                .field("secret", &"<redacted>")
+                .finish(),
+            Self::Input(value) => formatter.debug_tuple("Input").field(value).finish(),
+            Self::DeviceAuthOpenUrl(_) => formatter.write_str("DeviceAuthOpenUrl(<redacted>)"),
+            Self::OpenDialog(value) => formatter.debug_tuple("OpenDialog").field(value).finish(),
+            Self::DialogAction(value) => {
+                formatter.debug_tuple("DialogAction").field(value).finish()
+            }
+            Self::SessionPage(value) => formatter.debug_tuple("SessionPage").field(value).finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -538,6 +699,10 @@ pub struct ViewState<'a> {
     pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
+    /// Redacted credential-entry presentation; it carries only a mask length and fixed error.
+    secret_entry: Option<SecretEntryRender<'a>>,
+    /// Active device-authentication flow kept outside generic dialogs so its actions remain local.
+    device_auth: Option<DeviceAuthRender<'a>>,
     /// Slash palette metadata and current filtered selection.
     pub palette: Option<PaletteView<'a>>,
     /// Open `@` file picker, its typed query, and its current selection.
@@ -1335,6 +1500,141 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if let Some(picker) = state.file_picker {
         render_file_picker(frame, area, layout.composer, picker);
     }
+
+    if let Some(secret_entry) = state.secret_entry {
+        render_secret_entry(frame, area, secret_entry);
+    }
+
+    if let Some(device_auth) = state.device_auth {
+        render_device_auth(frame, area, device_auth);
+    }
+}
+
+const SECRET_ENTRY_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
+    widgets::OverlayShortcut {
+        key: "enter",
+        label: "submit",
+    },
+    widgets::OverlayShortcut {
+        key: "esc",
+        label: "cancel",
+    },
+    widgets::OverlayShortcut {
+        key: "ctrl-c",
+        label: "cancel",
+    },
+];
+
+fn render_secret_entry(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    secret_entry: SecretEntryRender<'_>,
+) {
+    let config = widgets::OverlayConfig {
+        title: secret_entry.title,
+        tabs: None,
+        shortcuts: &SECRET_ENTRY_SHORTCUTS,
+        sizing: widgets::OverlaySizing::compact(),
+        desired_content_rows: 4,
+    };
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
+        return;
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+    let mut lines = Vec::new();
+    if let Some(help) = secret_entry.help {
+        lines.push(Line::styled(
+            help.to_owned(),
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+    }
+    if let Some(error) = secret_entry.error {
+        lines.push(Line::styled(
+            error,
+            Style::default().fg(widgets::RolePalette::warning()),
+        ));
+    }
+    lines.push(Line::from(format!(
+        "API key: {}",
+        "*".repeat(secret_entry.mask)
+    )));
+    frame.render_widget(Paragraph::new(Text::from(lines)), layout.content);
+}
+
+const DEVICE_AUTH_SHORTCUTS: [widgets::OverlayShortcut<'static>; 3] = [
+    widgets::OverlayShortcut {
+        key: "↑↓",
+        label: "select",
+    },
+    widgets::OverlayShortcut {
+        key: "enter",
+        label: "run",
+    },
+    widgets::OverlayShortcut {
+        key: "esc",
+        label: "cancel",
+    },
+];
+
+fn render_device_auth(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    device_auth: DeviceAuthRender<'_>,
+) {
+    let config = widgets::OverlayConfig {
+        title: "ChatGPT device authentication",
+        tabs: None,
+        shortcuts: &DEVICE_AUTH_SHORTCUTS,
+        sizing: widgets::OverlaySizing::dialog(),
+        desired_content_rows: 9,
+    };
+    let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
+        return;
+    };
+    widgets::OverlayFrame::render(frame, &layout, &config);
+    let action = |index, label: &str| {
+        let prefix = if device_auth.selected == index {
+            "› "
+        } else {
+            "  "
+        };
+        Line::styled(
+            format!("{prefix}{label}"),
+            if device_auth.selected == index {
+                Style::default()
+                    .fg(widgets::RolePalette::selection_fg())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(widgets::RolePalette::chrome())
+            },
+        )
+    };
+    let mut lines = vec![
+        Line::styled(
+            "Verification URL",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ),
+        Line::from(device_auth.verification_url.to_owned()),
+        Line::styled(
+            "Device code",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ),
+        Line::from(device_auth.user_code.to_owned()),
+        Line::styled(
+            "Enter this code on the opened page.",
+            Style::default().fg(widgets::RolePalette::muted()),
+        ),
+        action(0, "Open browser"),
+        action(1, "Copy link"),
+        action(2, "Copy code"),
+    ];
+    if let Some(confirmation) = device_auth.confirmation {
+        lines.push(Line::styled(
+            confirmation,
+            Style::default().fg(widgets::RolePalette::muted()),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), layout.content);
 }
 
 fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
@@ -2901,6 +3201,8 @@ pub struct Tui<E> {
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     dialog: Option<DialogView>,
+    secret_entry: Option<SecretEntryState>,
+    device_auth: Option<DeviceAuthState>,
     palette_entries: Vec<PaletteEntry>,
     palette_open: bool,
     palette_selected: usize,
@@ -2954,6 +3256,8 @@ where
             completed_conversations: Vec::new(),
             conversation: None,
             dialog: None,
+            secret_entry: None,
+            device_auth: None,
             palette_entries: Vec::new(),
             palette_open: false,
             palette_selected: 0,
@@ -2991,6 +3295,10 @@ where
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
+            Event::Paste(text) if self.secret_entry.is_some() => {
+                self.append_secret_text(&text);
+                Action::Render
+            }
             Event::Paste(text) => {
                 let child_read_only = self.active_transcript != TranscriptId::Main
                     && (self.active_record_mut().terminal
@@ -3270,6 +3578,7 @@ where
         self.turn_duration = None;
         self.latest_usage = None;
         self.dialog = None;
+        self.device_auth = None;
         self.running = true;
         self.turn_started_at = Some(self.now);
         self.assistant_streaming = false;
@@ -3304,14 +3613,16 @@ where
             TuiRouteProgress::DeviceCode {
                 verification_url,
                 user_code,
-            } => (
-                "ChatGPT device authentication",
-                format!(
-                    "Open {}\nCode: {}",
-                    bounded_auth_text(&verification_url, 512),
-                    bounded_auth_text(&user_code, 64)
-                ),
-            ),
+            } => {
+                self.dialog = None;
+                self.device_auth = Some(DeviceAuthState {
+                    verification_url: bounded_auth_text(&verification_url, 512),
+                    user_code: bounded_auth_text(&user_code, 64),
+                    selected: 0,
+                    confirmation: None,
+                });
+                return;
+            }
         };
         self.show_dialog(title, body);
     }
@@ -3360,6 +3671,10 @@ where
 
     pub fn apply_submission_outcome(&mut self, outcome: TuiSubmissionOutcome) -> Option<String> {
         self.palette_open = false;
+        self.device_auth = None;
+        if !matches!(&outcome, TuiSubmissionOutcome::SecretEntry(_)) {
+            self.secret_entry = None;
+        }
         if !matches!(
             &outcome,
             TuiSubmissionOutcome::Dialog(_) | TuiSubmissionOutcome::SafeDialog(_)
@@ -3367,6 +3682,16 @@ where
             self.dialog = None;
         }
         match outcome {
+            TuiSubmissionOutcome::SecretEntry(view) => {
+                self.dialog = None;
+                self.file_picker = None;
+                self.secret_entry = Some(SecretEntryState {
+                    view,
+                    input: SecretInput(String::new()),
+                    error: false,
+                });
+                None
+            }
             TuiSubmissionOutcome::ProviderTurn { display, prompt } => {
                 self.begin_submission(display);
                 Some(prompt)
@@ -4078,6 +4403,18 @@ where
             collapse_thinking: active.collapse_thinking,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
+            secret_entry: self.secret_entry.as_ref().map(|entry| SecretEntryRender {
+                title: &entry.view.title,
+                help: entry.view.help.as_deref(),
+                mask: entry.input.0.len(),
+                error: entry.error.then_some(SECRET_REQUIRED_ERROR),
+            }),
+            device_auth: self.device_auth.as_ref().map(|entry| DeviceAuthRender {
+                verification_url: &entry.verification_url,
+                user_code: &entry.user_code,
+                selected: entry.selected,
+                confirmation: entry.confirmation,
+            }),
             palette: self.palette_open.then_some(PaletteView {
                 entries: &self.palette_entries,
                 selected: self.palette_selected,
@@ -4476,7 +4813,124 @@ where
             .map(|call| call.call_id.as_str())
     }
 
+    fn append_secret_text(&mut self, text: &str) {
+        let Some(entry) = self.secret_entry.as_mut() else {
+            return;
+        };
+        let remaining = MAX_SECRET_INPUT_BYTES.saturating_sub(entry.input.0.len());
+        let accepted = text
+            .bytes()
+            .filter(|byte| byte.is_ascii_graphic() || *byte == b' ')
+            .take(remaining)
+            .collect::<Vec<_>>();
+        if !accepted.is_empty() {
+            entry.input.0.extend(accepted.into_iter().map(char::from));
+            entry.error = false;
+        }
+    }
+
+    fn handle_secret_key(&mut self, key: Key) -> Action {
+        match key {
+            Key::Char(character) if character.is_ascii() => {
+                self.append_secret_text(&character.to_string());
+            }
+            Key::Backspace | Key::Delete => {
+                if let Some(entry) = self.secret_entry.as_mut() {
+                    entry.input.0.pop();
+                }
+            }
+            Key::DeleteToLineStart => {
+                if let Some(entry) = self.secret_entry.as_mut() {
+                    entry.input.0.clear();
+                }
+            }
+            Key::Escape | Key::CtrlC => {
+                self.secret_entry = None;
+            }
+            Key::Enter => {
+                let Some(mut entry) = self.secret_entry.take() else {
+                    return Action::Render;
+                };
+                let trimmed = entry.input.0.trim();
+                if trimmed.is_empty() {
+                    entry.input.0.clear();
+                    entry.error = true;
+                    self.secret_entry = Some(entry);
+                    return Action::Render;
+                }
+                let secret = SecretInput(trimmed.to_owned());
+                return Action::SubmitSecret {
+                    action_id: entry.view.submit_action,
+                    secret,
+                };
+            }
+            _ => {}
+        }
+        Action::Render
+    }
+
+    /// Returns the selected device-authentication value without exposing it through actions.
+    pub fn device_auth_clipboard_text(&self) -> Option<&str> {
+        let entry = self.device_auth.as_ref()?;
+        match entry.selected {
+            0 | 1 => Some(&entry.verification_url),
+            2 => Some(&entry.user_code),
+            _ => None,
+        }
+    }
+
+    /// Returns the verification URL for the runtime's injected browser opener.
+    pub fn device_auth_verification_url(&self) -> Option<&str> {
+        self.device_auth
+            .as_ref()
+            .map(|entry| entry.verification_url.as_str())
+    }
+
+    pub fn apply_device_auth_open_result(&mut self, succeeded: bool) {
+        if let Some(entry) = self.device_auth.as_mut() {
+            entry.confirmation = Some(if succeeded {
+                "Browser opened."
+            } else {
+                "Could not open browser. Copy the link instead."
+            });
+        }
+    }
+
+    fn handle_device_auth_key(&mut self, key: Key) -> Action {
+        let Some(entry) = self.device_auth.as_mut() else {
+            return Action::Render;
+        };
+        match key {
+            Key::Up => entry.selected = entry.selected.saturating_sub(1),
+            Key::Down => entry.selected = (entry.selected + 1).min(2),
+            Key::Enter => match entry.selected {
+                0 => return Action::OpenDeviceAuthUrl,
+                1 => {
+                    entry.confirmation = Some("Link copied.");
+                    return Action::CopyDeviceAuthUrl;
+                }
+                2 => {
+                    entry.confirmation = Some("Code copied.");
+                    return Action::CopyDeviceAuthCode;
+                }
+                _ => unreachable!(),
+            },
+            Key::Escape => {
+                self.device_auth = None;
+                return self.cancel_running();
+            }
+            _ => {}
+        }
+        Action::Render
+    }
+
     fn handle_key(&mut self, key: Key) -> Action {
+        if self.device_auth.is_some() {
+            return self.handle_device_auth_key(key);
+        }
+        if self.secret_entry.is_some() {
+            return self.handle_secret_key(key);
+        }
         if key != Key::CtrlC {
             self.quit_armed_until = None;
         }
@@ -6073,6 +6527,7 @@ where
             }
             Action::Render
             | Action::Submit(_)
+            | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
             | Action::CancelExecution(_)
@@ -6081,6 +6536,9 @@ where
             | Action::LoadSessionPage(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
+            | Action::OpenDeviceAuthUrl
+            | Action::CopyDeviceAuthUrl
+            | Action::CopyDeviceAuthCode
             | Action::Cancel
             | Action::CancelRoute => renderer.render(tui.view())?,
         }
@@ -6134,6 +6592,7 @@ where
                 renderer.render(tui.view())?;
             }
             Action::Render
+            | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
             | Action::CancelExecution(_)
@@ -6142,6 +6601,9 @@ where
             | Action::LoadSessionPage(_)
             | Action::DialogAction(_)
             | Action::SafeDialogAction(_)
+            | Action::OpenDeviceAuthUrl
+            | Action::CopyDeviceAuthUrl
+            | Action::CopyDeviceAuthCode
             | Action::Cancel
             | Action::CancelRoute => renderer.render(tui.view())?,
         }
@@ -6565,6 +7027,21 @@ where
                     let _ = route_sender.send((route_id, outcome));
                 });
             }
+            Action::SubmitSecret { action_id, secret } => {
+                let request = TuiRouteRequest::SubmitSecret { action_id, secret };
+                tui.begin_route();
+                next_route_id = next_route_id.wrapping_add(1).max(1);
+                let route_id = next_route_id;
+                let cancellation = TuiRouteCancellation::new();
+                active_route = Some((route_id, cancellation.clone(), false));
+                let route = Arc::clone(&route);
+                let route_sender = route_sender.clone();
+                let progress = route_progress_sender.clone();
+                thread::spawn(move || {
+                    let outcome = route(request, progress, cancellation);
+                    let _ = route_sender.send((route_id, outcome));
+                });
+            }
             Action::SubmitBackground(prompt) => {
                 let submit = Arc::clone(&submit);
                 let sender = sender.clone();
@@ -6694,6 +7171,25 @@ where
                     tui.cancel_session_load();
                 }
             }
+            Action::OpenDeviceAuthUrl => {
+                let Some(url) = tui.device_auth_verification_url().map(str::to_owned) else {
+                    continue;
+                };
+                let outcome = route(
+                    TuiRouteRequest::DeviceAuthOpenUrl(url),
+                    route_progress_sender.clone(),
+                    TuiRouteCancellation::new(),
+                );
+                tui.apply_device_auth_open_result(matches!(
+                    outcome,
+                    TuiSubmissionOutcome::LocalInfo(_)
+                ));
+            }
+            Action::CopyDeviceAuthUrl | Action::CopyDeviceAuthCode => {
+                if let Some(text) = tui.device_auth_clipboard_text() {
+                    runtime_terminal.copy_selection(text)?;
+                }
+            }
             Action::CopySelection(text) => {
                 runtime_terminal.copy_selection(&text)?;
             }
@@ -6740,13 +7236,17 @@ fn is_session_resume_request(request: &TuiRouteRequest) -> bool {
             .strip_prefix("/resume ")
             .is_some_and(|identifier| identifier.trim().parse::<i64>().is_ok()),
         TuiRouteRequest::DialogAction(action_id) => is_session_resume_action(action_id),
-        TuiRouteRequest::OpenDialog(_) | TuiRouteRequest::SessionPage(_) => false,
+        TuiRouteRequest::DeviceAuthOpenUrl(_)
+        | TuiRouteRequest::SubmitSecret { .. }
+        | TuiRouteRequest::OpenDialog(_)
+        | TuiRouteRequest::SessionPage(_) => false,
     }
 }
 
 fn is_session_browser_request(request: &TuiRouteRequest) -> bool {
     match request {
         TuiRouteRequest::Input(input) => matches!(input.trim(), "/resume" | "/sessions"),
+        TuiRouteRequest::DeviceAuthOpenUrl(_) | TuiRouteRequest::SubmitSecret { .. } => false,
         TuiRouteRequest::OpenDialog(route_id) => route_id == "sessions",
         TuiRouteRequest::SessionPage(_) => true,
         TuiRouteRequest::DialogAction(_) => false,
@@ -8499,5 +8999,105 @@ mod runtime_tests {
                 layout.composer
             );
         }
+    }
+
+    fn secret_entry_view() -> SecretEntryView {
+        SecretEntryView::new("API key", Some("Paste your API key."), "openai-api")
+    }
+
+    #[test]
+    fn secret_entry_masks_typed_and_pasted_sentinel_in_test_backend() {
+        let sentinel = "SECRET_TYPED_AND_PASTED_SENTINEL";
+        let mut tui = Tui::new(NoopEngine);
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        assert_eq!(tui.handle(Event::Key(Key::Char('A'))), Action::Render);
+        assert_eq!(tui.handle(Event::Paste(sentinel.into())), Action::Render);
+
+        let terminal = RatatuiTerminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut renderer = RatatuiRenderer::new(terminal);
+        renderer.render(tui.view()).unwrap();
+        let rendered = renderer
+            .terminal()
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains(sentinel));
+        assert!(rendered.contains("***"));
+    }
+
+    #[test]
+    fn secret_entry_isolated_from_composer_dialog_and_transcript() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Paste("composer".into()));
+        tui.show_selection_dialog(DialogView::selection("ordinary", None::<&str>, Vec::new()));
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        tui.handle(Event::Paste("SECRET_ISOLATION_SENTINEL".into()));
+        assert_eq!(tui.input(), "composer");
+        assert!(tui.view().dialog.is_none());
+        assert!(tui.transcript().is_empty());
+    }
+
+    #[test]
+    fn secret_entry_escape_and_ctrl_c_close_before_global_quit_copy_or_cancel() {
+        for key in [Key::Escape, Key::CtrlC] {
+            let mut tui = Tui::new(NoopEngine);
+            tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+            tui.handle(Event::Paste("SECRET_CANCEL_SENTINEL".into()));
+            assert_eq!(tui.handle(Event::Key(key)), Action::Render);
+            assert!(tui.view().secret_entry.is_none());
+            assert!(!tui.quit_is_armed());
+        }
+    }
+
+    #[test]
+    fn secret_entry_filters_edits_and_caps_at_8192_bytes() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        tui.handle(Event::Paste(format!(
+            "{}\n\u{00e9}\t{}",
+            "a".repeat(8192),
+            "b"
+        )));
+        tui.handle(Event::Key(Key::Backspace));
+        tui.handle(Event::Key(Key::Delete));
+        tui.handle(Event::Key(Key::DeleteToLineStart));
+        tui.handle(Event::Paste(" x".into()));
+        let action = tui.handle(Event::Key(Key::Enter));
+        assert!(format!("{action:?}").contains("SubmitSecret"));
+        assert!(!format!("{action:?}").contains(" x"));
+    }
+
+    #[test]
+    fn secret_entry_empty_submit_has_fixed_error_and_next_edit_clears_it() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        tui.handle(Event::Paste("   ".into()));
+        assert_eq!(tui.handle(Event::Key(Key::Enter)), Action::Render);
+        assert_eq!(
+            tui.view().secret_entry.unwrap().error,
+            Some("API key is required.")
+        );
+        tui.handle(Event::Key(Key::Char('x')));
+        assert!(tui.view().secret_entry.unwrap().error.is_none());
+    }
+
+    #[test]
+    fn secret_entry_submits_trimmed_dedicated_redacted_action_and_request() {
+        let mut tui = Tui::new(NoopEngine);
+        tui.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        tui.handle(Event::Paste("  SECRET_SUBMISSION_SENTINEL  ".into()));
+        let action = tui.handle(Event::Key(Key::Enter));
+        let Action::SubmitSecret { action_id, secret } = action else {
+            panic!("secret action")
+        };
+        assert_eq!(action_id, "openai-api");
+        assert!(!format!("{secret:?}").contains("SECRET_SUBMISSION_SENTINEL"));
+        let request = TuiRouteRequest::SubmitSecret { action_id, secret };
+        assert!(!format!("{request:?}").contains("SECRET_SUBMISSION_SENTINEL"));
+        assert!(!is_session_resume_request(&request));
+        assert!(!is_session_browser_request(&request));
     }
 }

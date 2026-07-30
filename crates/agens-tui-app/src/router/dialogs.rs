@@ -81,6 +81,15 @@ impl TuiRuntimeRouter {
                     DialogEntry::cancel("Cancel"),
                 ],
             ),
+            "login" => DialogView::selection(
+                "Sign in",
+                Some("Choose a provider"),
+                vec![
+                    DialogEntry::action("ChatGPT subscription", "login:chatgpt"),
+                    DialogEntry::action("OpenAI API key", "login:api-key:openai-api"),
+                    DialogEntry::action("Moonshot AI API key", "login:api-key:moonshotai"),
+                ],
+            ),
             "diagnostics" => diagnostics_dialog(bootstrap.data_directory()),
             "provider" => {
                 let context = self
@@ -485,6 +494,28 @@ impl TuiRuntimeRouter {
         cancellation: &TuiRouteCancellation,
     ) -> TuiSubmissionOutcome {
         match action_id {
+            "login:chatgpt" => {
+                return self.open_dialog("connect").unwrap_or_else(|error| {
+                    TuiSubmissionOutcome::LocalActionableError {
+                        message: error.to_string(),
+                        action: TUI_ERROR_ACTION.into(),
+                    }
+                });
+            }
+            "login:api-key:openai-api" => {
+                return TuiSubmissionOutcome::SecretEntry(agens_tui::SecretEntryView::new(
+                    "Sign in to OpenAI API",
+                    Some("Enter your OpenAI API key"),
+                    action_id,
+                ));
+            }
+            "login:api-key:moonshotai" => {
+                return TuiSubmissionOutcome::SecretEntry(agens_tui::SecretEntryView::new(
+                    "Sign in to Moonshot AI",
+                    Some("Enter your Moonshot AI API key"),
+                    action_id,
+                ));
+            }
             "connect:browser" => {
                 return auth_route_outcome(self.connect(ChatGptAuthFlow::Browser, progress));
             }

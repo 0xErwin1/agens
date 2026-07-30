@@ -69,6 +69,7 @@ impl ChatGptAuthError {
     }
 }
 type ProgressSink = Arc<dyn Fn(ChatGptAuthProgress) + Send + Sync>;
+type BrowserOpener = Arc<dyn Fn(&str) -> std::io::Result<()> + Send + Sync>;
 type Authenticator = dyn Fn(ChatGptAuthFlow, LoginCancellation, ProgressSink) -> Result<ChatGptCredentials, LoginError>
     + Send
     + Sync;
@@ -76,41 +77,47 @@ type Authenticator = dyn Fn(ChatGptAuthFlow, LoginCancellation, ProgressSink) ->
 #[derive(Clone)]
 pub struct ChatGptAuthCoordinator {
     authenticate: Arc<Authenticator>,
+    open_browser: BrowserOpener,
 }
 
 impl ChatGptAuthCoordinator {
     pub fn production() -> Self {
-        Self::with_authenticator(|flow, cancellation, publish| match flow {
-            ChatGptAuthFlow::Browser => {
-                let progress = Arc::clone(&publish);
-                let options = ChatGptLoginOptions::new(
-                    Arc::new(|url| {
-                        std::process::Command::new("xdg-open")
-                            .arg(url)
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .spawn()
-                            .map(|_| ())
-                    }),
-                    Arc::new(move |url| {
-                        progress(ChatGptAuthProgress::BrowserUrl(url.to_owned()));
-                    }),
-                );
-                login(options, cancellation)
-            }
-            ChatGptAuthFlow::Device => device_code_login_with_progress(
-                ChatGptDeviceCodeLoginOptions::default(),
-                cancellation,
-                move |verification_url, user_code| {
-                    publish(ChatGptAuthProgress::DeviceCode {
-                        verification_url: verification_url.to_owned(),
-                        user_code: user_code.to_owned(),
-                    });
-                },
-            )
-            .map(|result| result.credentials),
-        })
+        let open_browser: BrowserOpener = Arc::new(|url| {
+            std::process::Command::new("xdg-open")
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map(|_| ())
+        });
+        let browser_login = Arc::clone(&open_browser);
+        Self::with_authenticator_and_browser_opener(
+            move |flow, cancellation, publish| match flow {
+                ChatGptAuthFlow::Browser => {
+                    let progress = Arc::clone(&publish);
+                    let options = ChatGptLoginOptions::new(
+                        Arc::clone(&browser_login),
+                        Arc::new(move |url| {
+                            progress(ChatGptAuthProgress::BrowserUrl(url.to_owned()));
+                        }),
+                    );
+                    login(options, cancellation)
+                }
+                ChatGptAuthFlow::Device => device_code_login_with_progress(
+                    ChatGptDeviceCodeLoginOptions::default(),
+                    cancellation,
+                    move |verification_url, user_code| {
+                        publish(ChatGptAuthProgress::DeviceCode {
+                            verification_url: verification_url.to_owned(),
+                            user_code: user_code.to_owned(),
+                        });
+                    },
+                )
+                .map(|result| result.credentials),
+            },
+            open_browser,
+        )
     }
 
     pub fn with_authenticator(
@@ -123,9 +130,32 @@ impl ChatGptAuthCoordinator {
         + Sync
         + 'static,
     ) -> Self {
+        Self::with_authenticator_and_browser_opener(authenticate, Arc::new(|_| Ok(())))
+    }
+
+    pub fn with_authenticator_and_browser_opener(
+        authenticate: impl Fn(
+            ChatGptAuthFlow,
+            LoginCancellation,
+            ProgressSink,
+        ) -> Result<ChatGptCredentials, LoginError>
+        + Send
+        + Sync
+        + 'static,
+        open_browser: BrowserOpener,
+    ) -> Self {
         Self {
             authenticate: Arc::new(authenticate),
+            open_browser,
         }
+    }
+
+    /// Opens only the base verification URL, preserving the active device polling flow.
+    pub fn open_device_auth_url(&self, url: &str) -> Result<(), ChatGptAuthError> {
+        (self.open_browser)(url).map_err(|_| ChatGptAuthError {
+            message: "ChatGPT verification page could not be opened",
+            action: "Copy the verification link and open it in a browser.",
+        })
     }
 
     pub fn login(
