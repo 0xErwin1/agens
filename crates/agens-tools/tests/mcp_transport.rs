@@ -17,8 +17,8 @@ use agens_tools::{
     McpErrorCategory, McpHttpTransport, McpInitialize, McpInitializeResult, McpLifecycleState,
     McpLimits, McpOperationContext, McpProtocolError, McpRegistry, McpRequest, McpResponse,
     McpServerDescriptor, McpServerReport, McpServerSource, McpServerTransport, McpSseTransport,
-    McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage, McpTransport,
-    McpTransportError, RemoteToolAccess, ToolOutput,
+    McpStatusHandle, McpTimeouts, McpToolAnnotations, McpToolDefinition, McpToolsPage,
+    McpTransport, McpTransportError, RemoteToolAccess, ToolOutput,
 };
 use serde_json::json;
 
@@ -723,6 +723,51 @@ fn registry_status_snapshot_tracks_authoritative_lifecycle_without_forcing_disco
     assert_eq!(
         closed.server("disabled").unwrap().state(),
         McpLifecycleState::Disabled
+    );
+}
+
+#[test]
+fn dropping_one_registry_leaves_the_servers_of_another_registry_on_the_shared_handle_open() {
+    let status = McpStatusHandle::default();
+
+    let mut long_lived = McpRegistry::with_status_handle(status.clone());
+    long_lived
+        .configure_server_with_descriptor(
+            status_descriptor("long-lived", McpServerTransport::Http, true),
+            || Ok(Box::new(LocalTransport::with_responses([])) as Box<dyn McpTransport>),
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+
+    {
+        let mut short_lived = McpRegistry::with_status_handle(status.clone());
+        short_lived
+            .configure_server_with_descriptor(
+                status_descriptor("short-lived", McpServerTransport::Http, true),
+                || Ok(Box::new(LocalTransport::with_responses([])) as Box<dyn McpTransport>),
+                timeouts(),
+                limits(),
+            )
+            .unwrap();
+    }
+
+    let snapshot = status.snapshot();
+    assert_eq!(
+        snapshot.server("short-lived").unwrap().state(),
+        McpLifecycleState::Closed,
+        "the dropped registry must retire its own server"
+    );
+    assert_eq!(
+        snapshot.server("long-lived").unwrap().state(),
+        McpLifecycleState::Idle,
+        "a live registry must keep its servers off the closed state"
+    );
+
+    drop(long_lived);
+    assert_eq!(
+        status.snapshot().server("long-lived").unwrap().state(),
+        McpLifecycleState::Closed
     );
 }
 

@@ -255,14 +255,20 @@ impl McpStatusHandle {
         }
     }
 
-    pub(crate) fn close(&self) {
-        for status in self
+    /// Marks the named servers closed, leaving every other entry untouched.
+    ///
+    /// The handle is shared by every registry built from the same bootstrap, so a
+    /// registry that shuts down must only retire the servers it owns. Closing the
+    /// whole map would retire the entries of registries that are still live.
+    pub(crate) fn close_servers<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
+        let mut statuses = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values_mut()
-        {
-            if status.state != McpLifecycleState::Disabled {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in names {
+            if let Some(status) = statuses.get_mut(name)
+                && status.state != McpLifecycleState::Disabled
+            {
                 status.state = McpLifecycleState::Closed;
             }
         }
