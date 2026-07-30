@@ -94,15 +94,18 @@ impl TuiRuntimeRouter {
         });
         let palette = resolved_tui_palette(&commands, &skills, has_subagents);
         let project_root = bootstrap.project_root.as_deref().unwrap_or(Path::new("."));
+
+        // The handle has to exist before the first registry is built. Building the
+        // registry first gave it a private handle, and every later registry — the tool
+        // runtime's, which is the one that actually discovers — reported into a handle
+        // nobody rendered, so discovery failures never reached the `/mcp` overlay.
+        let mcp_status = McpStatusHandle::default();
+        bootstrap.mcp_status = Some(mcp_status.clone());
+
         let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
             &bootstrap,
             project_root,
         )));
-        let mcp_status = registry
-            .lock()
-            .expect("new MCP registry lock")
-            .status_handle();
-        bootstrap.mcp_status = Some(mcp_status.clone());
         Self {
             bootstrap: Arc::new(Mutex::new(bootstrap)),
             session,
