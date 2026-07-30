@@ -3058,23 +3058,43 @@ impl TuiSubagentEvent {
     }
 }
 
+/// Withholds only the lines that match a credential marker. A document that merely documents a
+/// credential name matches the marker set as readily as a leaked value does, so replacing the whole
+/// projection would blank every unrelated line of it.
 fn sanitize_projection(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if [
+    let bounded = |value: &str| value.chars().take(256).collect::<String>();
+
+    if !contains_credential_marker(value) {
+        return bounded(value);
+    }
+
+    let withheld = value
+        .lines()
+        .map(|line| {
+            if contains_credential_marker(line) {
+                "[redacted]"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    bounded(&withheld)
+}
+
+fn contains_credential_marker(value: &str) -> bool {
+    const MARKERS: [&str; 6] = [
         "api_key",
         "authorization",
         "password",
         "secret",
         "token",
         "prompt:",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-    {
-        "[redacted]".into()
-    } else {
-        value.chars().take(256).collect()
-    }
+    ];
+
+    let lower = value.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3120,4 +3140,55 @@ impl TuiExecution {
 pub enum ToolResultState {
     Success,
     Failure,
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::sanitize_projection;
+
+    /// A document that merely names a credential must stay readable in the subagent panel: only the
+    /// matching line is withheld, because blanking the whole projection costs every unrelated line.
+    #[test]
+    fn projection_withholds_only_the_lines_matching_a_credential_marker() {
+        let document = concat!(
+            "# Agens\n",
+            "\n",
+            "Configure the provider before the first run.\n",
+            "export OPENAI_API_KEY=\"sk-live-abcdef\"\n",
+            "Then start the CLI.\n",
+            "Never commit secret values.\n",
+            "Finally, verify the install."
+        );
+
+        let sanitized = sanitize_projection(document);
+
+        assert!(sanitized.contains("# Agens"), "{sanitized:?}");
+        assert!(
+            sanitized.contains("Configure the provider before the first run."),
+            "{sanitized:?}"
+        );
+        assert!(sanitized.contains("Then start the CLI."), "{sanitized:?}");
+        assert!(
+            sanitized.contains("Finally, verify the install."),
+            "{sanitized:?}"
+        );
+
+        assert!(!sanitized.contains("sk-live-abcdef"), "{sanitized:?}");
+        assert!(!sanitized.contains("OPENAI_API_KEY"), "{sanitized:?}");
+        assert!(!sanitized.contains("secret values"), "{sanitized:?}");
+    }
+
+    /// A projection that is nothing but a credential has no unrelated content to keep, so the whole
+    /// single line is still withheld.
+    #[test]
+    fn single_line_credential_projection_is_withheld_entirely() {
+        assert_eq!(sanitize_projection("token=result-secret"), "[redacted]");
+    }
+
+    /// Content with no marker keeps its exact bytes up to the projection budget.
+    #[test]
+    fn clean_projection_is_only_bounded() {
+        assert_eq!(sanitize_projection("plain body\n"), "plain body\n");
+        assert_eq!(sanitize_projection(&"x".repeat(300)).chars().count(), 256);
+    }
 }

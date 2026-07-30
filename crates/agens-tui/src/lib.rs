@@ -149,6 +149,8 @@ pub enum Key {
     CtrlShiftA,
     /// Toggles the visible dangerous-mode session state through the composition layer.
     CtrlShiftD,
+    /// Toggles the visible permission-bypass session state through the composition layer.
+    CtrlShiftP,
     /// Starts or moves the selected subagent into background execution.
     CtrlB,
     ShiftEnter,
@@ -208,6 +210,7 @@ pub struct TuiPresentation {
     effort: Option<String>,
     context_window: Option<u64>,
     dangerous_mode: bool,
+    bypass: bool,
 }
 
 impl TuiPresentation {
@@ -223,6 +226,7 @@ impl TuiPresentation {
             effort: None,
             context_window: None,
             dangerous_mode: false,
+            bypass: false,
         }
     }
 
@@ -243,6 +247,11 @@ impl TuiPresentation {
 
     pub fn with_dangerous_mode(mut self, enabled: bool) -> Self {
         self.dangerous_mode = enabled;
+        self
+    }
+
+    pub fn with_bypass(mut self, enabled: bool) -> Self {
+        self.bypass = enabled;
         self
     }
 }
@@ -502,6 +511,8 @@ pub struct ViewState<'a> {
     pub turn_state: Option<TurnState>,
     /// Whether the next submitted turn will carry dangerous-mode context.
     pub dangerous_mode: bool,
+    /// Whether the session's permission-bypass mode is active.
+    pub bypass: bool,
     /// Tool name currently being dispatched, when known.
     pub active_tool: Option<&'a str>,
     /// Current character cursor position in the editable prompt.
@@ -1296,6 +1307,7 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         duration: state.turn_duration,
         usage: state.latest_usage,
         dangerous: state.dangerous_mode,
+        bypass: state.bypass,
     }
 }
 
@@ -1984,9 +1996,20 @@ fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if state.dangerous_mode {
+    } else if state.dangerous_mode || state.bypass {
+        // Both can be active at once, and this chain yields a single slot, so they share one
+        // span rather than one silently hiding the other.
+        let mut label = String::new();
+        if state.bypass {
+            label.push_str(" BYPASS");
+        }
+        if state.dangerous_mode {
+            label.push_str(" danger");
+        }
+        label.push(' ');
+
         left.push(Span::styled(
-            " danger ",
+            label,
             Style::default()
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
@@ -2757,6 +2780,7 @@ pub struct Tui<E> {
     agent_catalog: Vec<String>,
     selected_agent: Option<String>,
     dangerous_mode: bool,
+    bypass: bool,
     executions: Vec<TuiExecution>,
     execution_selection: Option<TranscriptId>,
     pending_auto_turns: usize,
@@ -2809,6 +2833,7 @@ where
             agent_catalog: vec!["main".into()],
             selected_agent: None,
             dangerous_mode: false,
+            bypass: false,
             executions: Vec::new(),
             execution_selection: None,
             pending_auto_turns: 0,
@@ -3029,6 +3054,11 @@ where
     /// Sets the dangerous-mode state displayed for the next submitted turn.
     pub fn set_dangerous_mode(&mut self, enabled: bool) {
         self.dangerous_mode = enabled;
+    }
+
+    /// Sets the permission-bypass state displayed for the session.
+    pub fn set_bypass(&mut self, enabled: bool) {
+        self.bypass = enabled;
     }
 
     /// Adds a user prompt before the composition layer starts the shared runtime.
@@ -3896,6 +3926,7 @@ where
             project: &self.project,
             turn_state: self.turn_state,
             dangerous_mode: self.dangerous_mode,
+            bypass: self.bypass,
             active_tool: self.active_tool.as_deref(),
             input_cursor: self.input_cursor,
             runtime_events: &self.runtime_events,
@@ -4496,6 +4527,11 @@ where
         if key == Key::CtrlShiftD {
             self.palette_open = false;
             return Action::OpenDialog("dangerous".into());
+        }
+
+        if key == Key::CtrlShiftP {
+            self.palette_open = false;
+            return Action::OpenDialog("bypass".into());
         }
 
         if matches!(
@@ -5559,6 +5595,7 @@ where
         self.set_reasoning_effort(presentation.effort);
         self.context_window = presentation.context_window;
         self.set_dangerous_mode(presentation.dangerous_mode);
+        self.set_bypass(presentation.bypass);
     }
 }
 
@@ -6641,6 +6678,12 @@ fn map_key(event: KeyEvent) -> Option<Event> {
             Key::CtrlShiftD
         }
         (KeyCode::Char('D'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftD,
+        (KeyCode::Char('p'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftP
+        }
+        (KeyCode::Char('P'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftP,
         (KeyCode::Char('b' | 'B'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlB
         }
@@ -7521,6 +7564,36 @@ mod runtime_tests {
             )),
             Some(Event::Key(Key::Delete))
         );
+    }
+
+    #[test]
+    fn ctrl_shift_p_routes_only_press_events_to_bypass_mode() {
+        for (code, modifiers) in [
+            (
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::Char('P'), KeyModifiers::CONTROL),
+        ] {
+            let mut tui = Tui::new(NoopEngine);
+            let event = KeyEvent::new_with_kind(code, modifiers, KeyEventKind::Press);
+
+            assert_eq!(
+                map_event(CrosstermEvent::Key(event)).map(|event| tui.handle(event)),
+                Some(Action::OpenDialog("bypass".into()))
+            );
+        }
+
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let event = KeyEvent::new_with_kind(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                kind,
+            );
+
+            assert_eq!(map_event(CrosstermEvent::Key(event)), None);
+            assert_eq!(map_key(event), None);
+        }
     }
 
     #[test]

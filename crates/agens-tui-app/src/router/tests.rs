@@ -25,7 +25,8 @@ use crate::test_support::{
     open_tui_palette_dialog, persist_tui_session, persist_tui_session_metadata,
     render_tui_test_backend, rotation_dispatcher, run_production_batch, submit_tui_command,
     tui_project, tui_session_bootstrap, tui_session_bootstrap_for_provider,
-    tui_session_bootstrap_without_provider, tui_session_directory, tui_session_messages,
+    tui_session_bootstrap_with_global_bypass, tui_session_bootstrap_without_provider,
+    tui_session_directory, tui_session_messages,
 };
 use agens_agents::ensure_active_agent_runtime;
 use agens_headless::HeadlessChatCompletion;
@@ -328,6 +329,30 @@ fn tui_enter_routes_unknown_slash_and_local_output_without_provider_history() {
     let input = enter_tui_input(&mut tui, &format!("/resume {}", metadata.id));
     tui.apply_submission_outcome(router.route(input));
     assert_eq!(tui.view().session, format!("session #{}", metadata.id));
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn tui_new_command_reseeds_bypass_permissions_from_configuration_after_a_toggle() {
+    let temporary = tui_session_directory("new-command-reseeds-bypass");
+    let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, true);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap,
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    // The user turns bypass off, then starts a new session; configuration re-seeds it to on.
+    session.lock().unwrap().bypass_permissions = false;
+    let outcome = router.route("/new".into());
+    assert!(matches!(
+        outcome,
+        TuiSubmissionOutcome::ResetSucceeded { .. }
+    ));
+    assert!(session.lock().unwrap().bypass_permissions);
 
     std::fs::remove_dir_all(temporary).unwrap();
 }
@@ -815,6 +840,151 @@ fn dangerous_mode_is_visible_press_once_and_next_turn_only() {
     });
     assert!(result.is_ok());
     assert!(!session.lock().unwrap().dangerous_mode);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn bypass_command_and_keybinding_toggle_both_ways_and_report_state() {
+    let temporary = tui_session_directory("bypass-toggle");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+    let mut tui = Tui::new(ProductionTuiEngine {
+        cancellation: Arc::new(Mutex::new(None)),
+    });
+    tui.set_presentation("openai-api", "gpt-4.1", "new session");
+
+    assert!(!session.lock().unwrap().bypass_permissions);
+
+    let Action::OpenDialog(route_id) = tui.handle(Event::Key(Key::CtrlShiftP)) else {
+        panic!("Ctrl+Shift+P should route through the bypass-mode router path");
+    };
+    assert_eq!(route_id, "bypass");
+    let outcome = router.route_request(
+        TuiRouteRequest::OpenDialog(route_id),
+        std::sync::mpsc::channel().0,
+    );
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!("Ctrl+Shift+P must report the resulting bypass state");
+    };
+    assert_eq!(message, "Permission bypass: on.");
+    assert!(tui.apply_submission_outcome(outcome).is_none());
+    assert!(session.lock().unwrap().bypass_permissions);
+
+    let outcome = router.route("/bypass".into());
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!("/bypass must report the resulting bypass state");
+    };
+    assert_eq!(message, "Permission bypass: off.");
+    assert!(!session.lock().unwrap().bypass_permissions);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+#[test]
+fn bypass_toggle_writes_through_once_a_session_row_exists_and_never_mutates_config_files() {
+    let temporary = tui_session_directory("bypass-write-through");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+    let global_config = bootstrap.paths.global_config.clone();
+    let global_before = std::fs::read(&global_config).unwrap_or_default();
+
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-session");
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    session.lock().unwrap().identifier = Some(metadata.id);
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    assert!(matches!(
+        router.route("/bypass".into()),
+        TuiSubmissionOutcome::ContextChanged { .. }
+    ));
+    assert!(session.lock().unwrap().bypass_permissions);
+
+    let store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    assert_eq!(
+        store.bypass_permission_prompts(metadata.id).unwrap(),
+        Some(true)
+    );
+    drop(store);
+
+    assert_eq!(
+        std::fs::read(&global_config).unwrap_or_default(),
+        global_before,
+        "toggling bypass must never write configuration to disk"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// Pins the WARNING fix: a write-through failure must not resolve to a stale/re-enabled "on" and
+/// must not be silently swallowed the way it was before. The toggle still takes effect in memory
+/// (this is the one call site the user directly acted on), but its confirmation message now names
+/// the failure instead of reporting success as if the value had actually been persisted.
+#[test]
+#[cfg(unix)]
+fn bypass_toggle_surfaces_a_failed_write_through_without_erroring_or_losing_the_in_memory_toggle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tui_session_directory("bypass-write-through-failure");
+    let bootstrap = tui_session_bootstrap(&temporary, &[]);
+
+    let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+    let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-session");
+    drop(store);
+
+    let session = Arc::new(Mutex::new(SessionContext::fresh()));
+    session.lock().unwrap().identifier = Some(metadata.id);
+    let router = TuiRuntimeRouter::new(
+        bootstrap.clone(),
+        Arc::clone(&session),
+        Arc::new(Mutex::new(None)),
+        Arc::new(CommandCatalog::default()),
+        Arc::new(SkillCatalog::default()),
+    );
+
+    let data_directory = bootstrap.data_directory().to_path_buf();
+    let original_mode = std::fs::metadata(&data_directory)
+        .unwrap()
+        .permissions()
+        .mode();
+    std::fs::set_permissions(&data_directory, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let outcome = router.route("/bypass".into());
+
+    std::fs::set_permissions(
+        &data_directory,
+        std::fs::Permissions::from_mode(original_mode),
+    )
+    .unwrap();
+
+    let TuiSubmissionOutcome::ContextChanged { message, .. } = &outcome else {
+        panic!(
+            "a failed write-through must still resolve as a normal toggle outcome, not an error"
+        );
+    };
+    assert!(
+        message.contains("could not be saved"),
+        "a failed write-through must be surfaced in the toggle confirmation: {message:?}"
+    );
+    assert!(
+        session.lock().unwrap().bypass_permissions,
+        "the in-memory toggle must still take effect even when persisting it failed"
+    );
 
     std::fs::remove_dir_all(temporary).unwrap();
 }

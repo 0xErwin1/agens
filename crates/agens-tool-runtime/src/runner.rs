@@ -316,6 +316,7 @@ pub struct ProductionTaskRunner {
     bootstrap: Bootstrap,
     project_root: PathBuf,
     dangerous_mode: bool,
+    bypass: bool,
     lifecycle_bridge: Option<TuiTaskLifecycleBridge>,
     task_registry: Option<TaskExecutionRegistry>,
     #[cfg(any(test, feature = "probe"))]
@@ -332,6 +333,7 @@ impl ProductionTaskRunner {
             bootstrap,
             project_root,
             dangerous_mode: false,
+            bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
             #[cfg(any(test, feature = "probe"))]
@@ -353,6 +355,19 @@ impl ProductionTaskRunner {
         self.dangerous_mode = dangerous_mode;
         self
     }
+
+    /// Marks that this runner's own permission-authorization session (built in
+    /// `task.rs` for the parent's `task` tool call) should bypass `Ask`. This never
+    /// reaches the launched child's own tool session in `child.rs`, which stays
+    /// fail-closed regardless — see the module docs on subagent scope.
+    pub fn with_bypass(mut self, bypass: bool) -> Self {
+        self.bypass = bypass;
+        self
+    }
+
+    pub(crate) fn bypass(&self) -> bool {
+        self.bypass
+    }
     #[cfg(any(test, feature = "probe"))]
     pub fn with_probe(
         bootstrap: Bootstrap,
@@ -363,6 +378,7 @@ impl ProductionTaskRunner {
             bootstrap,
             project_root,
             dangerous_mode: false,
+            bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
             probe: Some(probe),
@@ -382,6 +398,7 @@ impl ProductionTaskRunner {
             bootstrap,
             project_root,
             dangerous_mode: false,
+            bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
             probe: Some(probe),
@@ -401,6 +418,7 @@ impl ProductionTaskRunner {
             bootstrap,
             project_root,
             dangerous_mode: false,
+            bypass: false,
             lifecycle_bridge: None,
             task_registry: None,
             probe: None,
@@ -418,6 +436,13 @@ impl TaskRunner for ProductionTaskRunner {
         self.task_registry.clone()
     }
 
+    /// `self.bypass` deliberately does NOT reach [`ProductionTaskExecutionContext`] below, unlike
+    /// `self.dangerous_mode`: `child.rs`'s own permission session is always `PermissionSession::new()`
+    /// and its resolver (`ChildPermissionResolver`) always returns `Deny` on `Ask`, regardless of
+    /// what a `ProductionTaskExecutionContext` field says — see `child.rs`'s characterization test.
+    /// Adding a `bypass` field there would be a field nothing reads. `bypass` instead stops at this
+    /// runner's own two `PermissionSession`s (`task.rs`'s gate and prompt-authorization sessions),
+    /// which are what a TUI-launched subagent's tool calls are actually evaluated against.
     fn run(
         &self,
         request: TaskTurnRequest,

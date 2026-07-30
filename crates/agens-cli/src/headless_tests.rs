@@ -82,6 +82,7 @@ fn a_live_task_runtime_pins_the_headless_turn_to_its_own_session_root_not_the_pr
         ),
         agens_core::RequestConfig::default(),
         "headless-root-check".to_owned(),
+        false,
     )
     .unwrap();
 

@@ -5,6 +5,9 @@ use agens_session::model::current_provider;
 use agens_core::HeadlessTurnError;
 use agens_tui::{TuiPresentation, TuiRouteCancellation, TuiSubmissionOutcome};
 
+use crate::engine::{
+    seed_bypass_permissions_from_configuration, write_through_bypass_permission_prompts,
+};
 use crate::extensions::RESERVED_TUI_COMMANDS;
 use crate::models::{select_tui_effort, select_tui_model};
 use crate::resume::{commit_tui_session_resume, resume_tui_session};
@@ -48,6 +51,7 @@ impl TuiRuntimeRouter {
         let bootstrap = self.bootstrap()?;
         let outcome = match command {
             "/dangerous" => return self.toggle_dangerous_mode(),
+            "/bypass" => return self.toggle_bypass_permissions(),
             "/help" => self.open_dialog("help")?,
             "/mcp" => self.open_dialog("mcp")?,
             "/select" => self.open_dialog("select")?,
@@ -67,6 +71,7 @@ impl TuiRuntimeRouter {
                 })?;
                 reset_session(&mut session)
                     .map_err(|_| CliError::runtime(HeadlessTurnError::State))?;
+                seed_bypass_permissions_from_configuration(&bootstrap, &mut session)?;
                 drop(session);
                 TuiSubmissionOutcome::ResetSucceeded {
                     message: "Started a new session.".into(),
@@ -177,6 +182,35 @@ impl TuiRuntimeRouter {
 
         Ok(TuiSubmissionOutcome::ContextChanged {
             message: format!("Dangerous mode: {}.", if enabled { "on" } else { "off" }),
+            presentation: self.presentation()?,
+        })
+    }
+
+    /// Toggles the session-only permission-bypass flag. Never writes configuration; when the
+    /// session already has a row (an identifier), the new value is written through immediately
+    /// via the same best-effort path used after a completed turn.
+    pub(super) fn toggle_bypass_permissions(&self) -> Result<TuiSubmissionOutcome, CliError> {
+        let (enabled, identifier) = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| CliError::storage("TUI session is unavailable"))?;
+            session.bypass_permissions = !session.bypass_permissions;
+            (session.bypass_permissions, session.identifier)
+        };
+        let mut message = format!("Permission bypass: {}.", if enabled { "on" } else { "off" });
+        if let Some(identifier) = identifier {
+            let bootstrap = self.bootstrap()?;
+            // This is the moment the user actually asked for a change, so a failed write is
+            // surfaced here rather than swallowed — leaving it silent would let a deliberate
+            // OFF toggle appear to have worked while the persisted value stayed stale ON.
+            if write_through_bypass_permission_prompts(&bootstrap, identifier, enabled).is_err() {
+                message.push_str(" This could not be saved and may not persist across resume.");
+            }
+        }
+
+        Ok(TuiSubmissionOutcome::ContextChanged {
+            message,
             presentation: self.presentation()?,
         })
     }

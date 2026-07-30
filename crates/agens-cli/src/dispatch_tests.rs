@@ -45,7 +45,9 @@ use agens_permissions::{
 use agens_session::context::SessionContext;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls};
 use agens_tool_runtime::runtime::production_dangerous_child_tool_runtime;
-use agens_tool_runtime::task::production_tui_task_runtime_with_runner;
+use agens_tool_runtime::task::{
+    production_tui_task_runtime, production_tui_task_runtime_with_runner,
+};
 use agens_tui_app::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
 use agens_tui_app::test_support::{
     BatchTool, ProductionBatchInput, RecordingPrompt, native_batch_call, run_production_batch,
@@ -462,6 +464,169 @@ fn u15_a1b2_permission_cardinality_is_exact_for_allow_ask_and_deny() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// Pins the CRITICAL fix for the TUI-launched-subagent path: a runner carrying
+/// `with_bypass(true)` must resolve an `Ask` decision to `Allow` on `runtime.authorized`
+/// without prompting, and a runner with `with_bypass(false)` must still prompt. This is the
+/// exact seam `production_tui_task_runtime_with_runner_and_parent_config` feeds and
+/// `crates/agens-tui-app/src/engine.rs`'s selected-subagent-launch runtime must be built through.
+#[test]
+fn u15_bypass_upgrades_ask_to_allow_on_the_authorized_launch_path_and_no_bypass_still_prompts() {
+    fn ask_policy() -> PermissionPolicy {
+        PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Ask,
+                PermissionPattern::Exact("native::task".into()),
+                PermissionPattern::Any,
+            )],
+        )
+    }
+
+    let temporary = tui_session_directory("selected-task-bypass");
+    let bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+        )],
+    );
+    let probe = Arc::new(Mutex::new(Vec::new()));
+    let (bridge, requests) = production_tui_permission_bridge();
+    let mut bypassed_runtime = production_tui_task_runtime_with_runner(
+        &bootstrap,
+        &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(bridge.clone())),
+        ProductionTaskRunner::with_probe(
+            bootstrap.clone(),
+            agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+            Arc::clone(&probe),
+        )
+        .with_bypass(true),
+    )
+    .unwrap();
+    bypassed_runtime.authorized.gate.policy = ask_policy();
+    bypassed_runtime.authorized.resolver.authorization.policy = ask_policy();
+    let selected = || {
+        Arc::new(Mutex::new(SessionContext {
+            selected_subagent: Some("reviewer".into()),
+            ..SessionContext::fresh()
+        }))
+    };
+    let cancellation = HeadlessTurnCancellation::new();
+
+    assert_eq!(
+        launch_selected_tui_task(
+            &mut bypassed_runtime,
+            &selected(),
+            "bypassed",
+            false,
+            &cancellation
+        ),
+        Ok(TuiSelectedTaskLaunch::Dispatched)
+    );
+    assert_eq!(probe.lock().unwrap().len(), 1);
+    assert!(
+        requests.try_recv().is_err(),
+        "an Ask decision must resolve to Allow without prompting when the runner carries a bypass"
+    );
+
+    let probe = Arc::new(Mutex::new(Vec::new()));
+    let (bridge, requests) = production_tui_permission_bridge();
+    let mut unbypassed_runtime = production_tui_task_runtime_with_runner(
+        &bootstrap,
+        &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(bridge.clone())),
+        ProductionTaskRunner::with_probe(
+            bootstrap.clone(),
+            agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+            Arc::clone(&probe),
+        )
+        .with_bypass(false),
+    )
+    .unwrap();
+    unbypassed_runtime.authorized.gate.policy = ask_policy();
+    unbypassed_runtime.authorized.resolver.authorization.policy = ask_policy();
+    let reply_bridge = bridge.clone();
+    let reply = std::thread::spawn(move || {
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("ask should still prompt once without a bypass");
+        reply_bridge.reply(request.id(), TuiPermissionReply::AllowOnce)
+    });
+    assert_eq!(
+        launch_selected_tui_task(
+            &mut unbypassed_runtime,
+            &selected(),
+            "no-bypass",
+            false,
+            &cancellation
+        ),
+        Ok(TuiSelectedTaskLaunch::Dispatched)
+    );
+    assert!(reply.join().unwrap());
+    assert_eq!(probe.lock().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
+/// Pins the actual production entry point `crates/agens-tui-app/src/engine.rs` calls for the
+/// selected-subagent-launch runtime (before this fix, `production_tui_task_runtime` had no
+/// parameter to carry the session's bypass at all, so the flag could never reach `authorized`).
+#[test]
+fn u15_the_production_wrapper_threads_its_bypass_flag_into_the_authorized_gate() {
+    let temporary = tui_session_directory("selected-task-bypass-wrapper");
+    let bootstrap = tui_session_bootstrap(
+        &temporary,
+        &[(
+            "reviewer",
+            "---\nname: reviewer\ndescription: reviewer\nmode: subagent\npermissions: []\n---\nReview work.\n",
+        )],
+    );
+    let mut runtime = production_tui_task_runtime(
+        &bootstrap,
+        &agens_bootstrap::session_root::discovered_root_for_tests(&bootstrap),
+        &SkillCatalog::default(),
+        Box::new(TuiPermissionPrompter(production_tui_permission_bridge().0)),
+        TuiTaskLifecycleBridge::new(
+            agens_tui::BridgeTx::bounded(8).0,
+            TuiTaskControls::default(),
+        ),
+        agens_core::RequestConfig::default(),
+        "bypass-wrapper-check".to_owned(),
+        true,
+    )
+    .unwrap();
+    runtime.authorized.gate.policy = PermissionPolicy::new(
+        PermissionMode::Edit,
+        vec![PermissionRule::global(
+            PermissionDecision::Ask,
+            PermissionPattern::Exact("native::task".into()),
+            PermissionPattern::Any,
+        )],
+    );
+    let call = HeadlessToolCall {
+        id: "call-1".into(),
+        name: "native::task".into(),
+        input: r#"{"agent":"reviewer","description":"probe"}"#.into(),
+    };
+    let cancellation = HeadlessTurnCancellation::new();
+    let decision = agens_tool_runtime::block_on_headless_turn(
+        runtime.authorized.gate.evaluate(&call, &cancellation),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        decision,
+        PermissionDecision::Allow,
+        "the production entry point's selected-subagent-launch runtime must thread its bypass \
+         flag through to the authorized gate's Ask resolution"
+    );
+
+    std::fs::remove_dir_all(temporary).unwrap();
+}
+
 #[test]
 fn u15_a1b2_rejections_leave_the_concrete_runner_and_grants_unchanged() {
     let temporary = tui_session_directory("selected-task-rejections");
@@ -615,6 +780,33 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
     assert_eq!(
         sanitized_native_tool_failure("glob: path is outside project root"),
         "glob: path validation failed"
+    );
+}
+
+/// A missing or unreadable file is the most common native failure, and the model can only stop
+/// retrying it if the reason survives sanitization. These reasons name neither a path nor any
+/// content, while an unmapped reason must still degrade to the generic message.
+#[test]
+fn canonical_filesystem_reasons_survive_sanitization() {
+    for reason in [
+        "file not found",
+        "permission denied",
+        "path is a directory",
+        "path is not a regular file",
+    ] {
+        assert_eq!(
+            sanitized_native_tool_failure(&format!("read: {reason}")),
+            format!("read: {reason}")
+        );
+    }
+
+    assert_eq!(
+        sanitized_native_tool_failure("read: No such file or directory (os error 2)"),
+        "tool execution failed"
+    );
+    assert_eq!(
+        sanitized_native_tool_failure("read: /home/user/.ssh/id_rsa is unreadable"),
+        "tool execution failed"
     );
 }
 

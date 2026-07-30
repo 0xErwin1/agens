@@ -76,8 +76,11 @@ The TUI accepts normal prompts and these slash commands:
 - `/new` starts a fresh session context.
 - `/sessions` lists completed turns.
 - `/resume <id>` restores saved assistant text as context for the next prompt.
+- `/bypass` toggles permission-prompt bypass for the session; `Ctrl+Shift+P` does the same.
 
 Keyboard controls shown by the TUI include Enter to send, Shift+Enter for a newline, Ctrl+C to cancel or quit, Page Up/Page Down to scroll, and End to follow.
+
+`/bypass` and `Ctrl+Shift+P` upgrade `Ask` decisions to `Allow` for the rest of the session; a footer `BYPASS` segment shows while it is active. The toggle never writes configuration and never overrides an explicit `deny` rule or the unconditional safety checks (worktree escapes, writes in chat mode). Subagents launched from the TUI inherit the active session's bypass; a subagent the model launches itself through the `task` tool does not. Setting `agent.bypass_permission_prompts = true` in the GLOBAL configuration turns bypass on by default for every new session and for `/new`; a project `.agens/config.toml` cannot enable it, and `agens config doctor` warns if one declares it anyway. Resuming a session restores whatever value that session last recorded, regardless of the current configuration.
 
 ## Configuration
 
@@ -110,7 +113,7 @@ deny = ["bash(rm *)"]
 
 The optional `[options].data_dir` changes the runtime-state directory. Environment expressions are supported by the configuration parser. MCP server definitions are global-only; project configuration cannot define them.
 
-Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` bounds the task tool (`max_iterations`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own, and `[agent]` also accepts `default_agent` and `reasoning_effort`. Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
+Beyond the keys above, `[tools]` bounds the native tools (`max_list_entries`, `max_search_entries`, `max_search_results`, `max_search_depth`, `operation_timeout_ms`, `bash_timeout_ms`), `[subagents]` bounds the task tool (`max_iterations`, `max_concurrency`, `max_output_chars`), `[mcp_defaults]` supplies `timeout_ms` and `max_retries` to servers that omit their own, and `[agent]` also accepts `default_agent`, `reasoning_effort`, and `bypass_permission_prompts` (bool, default `false`; global configuration only — see "Command surface" for the runtime `/bypass` toggle). Setting `[options].debug = false` stops agens from capturing diagnostics to disk.
 
 Every key is validated on load: an unknown key, a wrong type, or a value outside its documented range fails startup and names the offending field. The authoritative list is the settings catalog in `crates/agens-config`; `agens config init` renders it as a commented starter file at `<project-root>/.agens/config.toml` and refuses to overwrite an existing one.
 

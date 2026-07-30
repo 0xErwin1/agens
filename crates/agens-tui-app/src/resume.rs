@@ -51,6 +51,11 @@ pub struct LoadedTuiSessionResume {
     pub session: StoredSession,
     pub retry_boundary: Option<RetryBoundary>,
     pub confinement_root: std::path::PathBuf,
+    /// The session's own recorded bypass-permission-prompts value. `None` means it was never
+    /// recorded (pre-migration row, or a session that never completed a turn); the resume
+    /// projection then falls back to configuration, exactly as [`Self::confinement_root`] falls
+    /// back to the session's `project` column.
+    pub bypass_permission_prompts: Option<bool>,
 }
 
 impl std::ops::Deref for LoadedTuiSessionResume {
@@ -114,10 +119,14 @@ pub fn load_tui_session_for_resume(
     let confinement_root = store
         .confinement_root(identifier)
         .map_err(|_| CliError::storage("saved session is unavailable"))?;
+    let bypass_permission_prompts = store
+        .bypass_permission_prompts(identifier)
+        .map_err(|_| CliError::storage("saved session is unavailable"))?;
     Ok(LoadedTuiSessionResume {
         session,
         retry_boundary,
         confinement_root,
+        bypass_permission_prompts,
     })
 }
 
@@ -131,6 +140,7 @@ pub fn prepare_loaded_tui_session_resume(
         session,
         retry_boundary,
         confinement_root,
+        bypass_permission_prompts,
     } = loaded;
     agens_callcount::note_session_resume_projection();
     let restored_history =
@@ -172,6 +182,10 @@ pub fn prepare_loaded_tui_session_resume(
             })
         })
         .map(|_| "connect or choose provider".to_owned());
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(confinement_root.clone());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     let mut context = SessionContext::restored(
         identifier,
         session.metadata,
@@ -181,6 +195,10 @@ pub fn prepare_loaded_tui_session_resume(
     context.provider = provider;
     context.selection = selection;
     context.resume_error = resume_error;
+    // A resumed session's own recorded value wins over configuration; configuration only seeds a
+    // session that never recorded one (pre-migration row, or one that never completed a turn).
+    context.bypass_permissions =
+        bypass_permission_prompts.unwrap_or_else(|| session_config.bypass_permission_prompts());
     if let Some(boundary) = retry_boundary {
         let status = session
             .latest_attempt
@@ -354,8 +372,8 @@ mod tests {
     use crate::test_support::{
         bootstrap_from_a_different_working_directory, persist_tui_session,
         persist_tui_session_metadata, render_tui_test_backend, rotation_dispatcher, tui_project,
-        tui_session_bootstrap, tui_session_bootstrap_for_provider, tui_session_directory,
-        tui_session_messages,
+        tui_session_bootstrap, tui_session_bootstrap_for_provider,
+        tui_session_bootstrap_with_global_bypass, tui_session_directory, tui_session_messages,
     };
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
@@ -407,6 +425,7 @@ mod tests {
             ),
             agens_core::RequestConfig::default(),
             "confinement-check".to_owned(),
+            false,
         )
         .unwrap();
         ensure_active_agent_runtime(&resume_bootstrap, &session, &runtime.dispatcher).unwrap();
@@ -657,6 +676,75 @@ mod tests {
     }
 
     #[test]
+    fn resumed_session_keeps_its_own_recorded_bypass_value_off_against_a_true_config() {
+        let temporary = tui_session_directory("resume-bypass-off-over-config-on");
+        let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, true);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-off");
+        store
+            .set_bypass_permission_prompts(metadata.id, false)
+            .unwrap();
+        drop(store);
+
+        let prepared = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert!(!prepared.context.bypass_permissions);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn resumed_session_keeps_its_own_recorded_bypass_value_on_against_a_false_config() {
+        let temporary = tui_session_directory("resume-bypass-on-over-config-off");
+        let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, false);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-on");
+        store
+            .set_bypass_permission_prompts(metadata.id, true)
+            .unwrap();
+        drop(store);
+
+        let prepared = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert!(prepared.context.bypass_permissions);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn resumed_session_with_no_recorded_bypass_value_falls_back_to_configuration() {
+        let temporary = tui_session_directory("resume-bypass-none-falls-back");
+        let bootstrap = tui_session_bootstrap_with_global_bypass(&temporary, true);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = persist_tui_session(&mut store, &tui_project(&temporary), "bypass-none");
+        drop(store);
+
+        let prepared = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert!(prepared.context.bypass_permissions);
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
     fn completed_resume_without_retry_draft_and_cancelled_timeout_taxonomy_stay_explicit() {
         let temporary = tui_session_directory("completed-no-draft");
         let bootstrap = tui_session_bootstrap(&temporary, &[]);
@@ -809,6 +897,7 @@ mod tests {
             TuiTaskLifecycleBridge::new(events, TuiTaskControls::default()),
             agens_core::RequestConfig::default(),
             "abc12345".to_owned(),
+            false,
         )
         .unwrap();
         ensure_active_agent_runtime(&bootstrap, &session, &runtime.dispatcher).unwrap();

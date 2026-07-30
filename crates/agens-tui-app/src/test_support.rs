@@ -486,6 +486,33 @@ pub fn tui_project(temporary: &Path) -> String {
     temporary.join("project").display().to_string()
 }
 
+/// A `tui_session_bootstrap`-equivalent fixture that additionally declares
+/// `agent.bypass_permission_prompts` in the GLOBAL document from construction. `tui_session_bootstrap`
+/// resolves against a `HostEnvironment` fixed in memory at construction time, so writing extra
+/// configuration to the real filesystem afterwards would never be observed by a later re-read.
+pub fn tui_session_bootstrap_with_global_bypass(temporary: &Path, enabled: bool) -> Bootstrap {
+    let config_home = temporary.join("config");
+    let mut files = BTreeMap::new();
+    files.insert(
+        config_home.join("config.toml"),
+        format!(
+            "[provider]\ntype = \"openai-api\"\nmodel = \"gpt-4.1\"\n\n[options]\ndata_dir = \"{}\"\n\n[agent]\nbypass_permission_prompts = {enabled}\n",
+            temporary.join("data").display()
+        ),
+    );
+
+    agens_bootstrap::resolve(&agens_bootstrap::HostEnvironment::fixed(
+        temporary.join("project"),
+        Some(temporary.join("home")),
+        BTreeMap::from([(
+            "AGENS_CONFIG_HOME".to_owned(),
+            config_home.display().to_string(),
+        )]),
+        files,
+    ))
+    .expect("bypass configuration fixture should be valid")
+}
+
 pub fn tui_session_messages() -> Vec<Message> {
     vec![
         Message {

@@ -3627,7 +3627,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
 fn conversation_owns_the_first_row_under_every_notice_condition() {
     type ArmNotice = fn(&mut Tui<FakeEngine>);
 
-    let notices: [(&str, ArmNotice); 4] = [
+    let notices: [(&str, ArmNotice); 5] = [
         ("Press Ctrl+C again to exit", |tui| {
             tui.handle(Event::Key(Key::CtrlC));
         }),
@@ -3643,6 +3643,7 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
             });
         }),
         ("danger", |tui| tui.set_dangerous_mode(true)),
+        ("BYPASS", |tui| tui.set_bypass(true)),
         ("status-sentinel", |tui| tui.add_info("status-sentinel")),
     ];
 
@@ -4170,6 +4171,43 @@ fn the_file_picker_stays_panic_free_and_exact_on_narrow_terminals() {
             rendered_text(&renderer).chars().count(),
             usize::from(width) * usize::from(height),
             "file picker at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_keystroke() {
+    for (needle, presentation) in [
+        (
+            "danger",
+            TuiPresentation::new("provider", "model", "session #1").with_dangerous_mode(true),
+        ),
+        (
+            "BYPASS",
+            TuiPresentation::new("provider", "model", "session #1").with_bypass(true),
+        ),
+    ] {
+        let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 30)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 30,
+        });
+
+        assert!(
+            tui.apply_submission_outcome(TuiSubmissionOutcome::ContextChanged {
+                message: format!("{needle} toggled."),
+                presentation,
+            })
+            .is_none()
+        );
+
+        renderer.render(tui.view()).unwrap();
+
+        assert!(
+            rendered_text(&renderer).contains(needle),
+            "{needle:?} must be visible right after the toggle: {:?}",
+            rendered_text(&renderer)
         );
     }
 }

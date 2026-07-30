@@ -114,6 +114,20 @@ fn rejects_unknown_keys_in_catalog_tables() {
 }
 
 #[test]
+fn bypass_permission_prompts_is_a_global_bool_defaulting_off() {
+    let spec = SETTINGS
+        .iter()
+        .find(|spec| spec.path == "agent.bypass_permission_prompts")
+        .expect("the catalog must declare agent.bypass_permission_prompts");
+
+    assert!(matches!(spec.kind, SettingKind::Bool));
+    assert!(matches!(spec.default, SettingValue::Bool(false)));
+
+    let document = document_for("agent.bypass_permission_prompts", "true");
+    assert!(validate_toml_document(&document).is_ok());
+}
+
+#[test]
 fn rejects_an_unknown_top_level_table() {
     let document = parse_toml_document("[toolz]\nmax_search_depth = 8\n").unwrap();
 

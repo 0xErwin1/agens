@@ -5100,11 +5100,9 @@ fn write_file_confined(
     };
 
     let (directory, file_name) = open_confined_parent(project_root, path, true, "write")?;
-    let existing = match open_confined_file(&directory, &file_name, "write") {
-        Ok(file) => Some(file_identity(&checked_regular_file(&file, "write")?)),
-        Err(output) if output.content.contains("No such file") => None,
-        Err(output) => return Err(output),
-    };
+    let existing = open_confined_file_optional(&directory, &file_name, "write")?
+        .map(|file| checked_regular_file(&file, "write").map(|metadata| file_identity(&metadata)))
+        .transpose()?;
     let temp_name = CString::new(format!(
         ".agens-write-{}-{}",
         std::process::id(),
@@ -5871,6 +5869,18 @@ fn open_confined_file(
     file_name: &std::ffi::CString,
     operation: &str,
 ) -> Result<fs::File, ToolOutput> {
+    open_confined_file_optional(directory, file_name, operation)?
+        .ok_or_else(|| confined_open_error(operation, io::Error::from(io::ErrorKind::NotFound)))
+}
+
+/// Reports an absent target as `Ok(None)`, because the write path has to tell "nothing is there
+/// yet" apart from a real failure and a rendered error message is not a dependable signal for it.
+#[cfg(unix)]
+fn open_confined_file_optional(
+    directory: &fs::File,
+    file_name: &std::ffi::CString,
+    operation: &str,
+) -> Result<Option<fs::File>, ToolOutput> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let descriptor = unsafe {
         libc::openat(
@@ -5880,17 +5890,46 @@ fn open_confined_file(
         )
     };
     if descriptor < 0 {
-        return Err(confined_open_error(operation, io::Error::last_os_error()));
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(confined_open_error(operation, error));
     }
-    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+    Ok(Some(unsafe { fs::File::from_raw_fd(descriptor) }))
 }
+
+/// The closed set of reasons a confined filesystem failure may carry to the model. Each names
+/// neither a path nor any file content, so the dispatcher forwards them verbatim; any failure
+/// outside this set still degrades to the generic message.
+pub const NATIVE_FILESYSTEM_FAILURE_REASONS: [&str; 4] = [
+    "file not found",
+    "permission denied",
+    "path is a directory",
+    "path is not a regular file",
+];
 
 #[cfg(unix)]
 fn confined_open_error(operation: &str, error: io::Error) -> ToolOutput {
     if error.raw_os_error() == Some(libc::ELOOP) || error.kind() == io::ErrorKind::NotADirectory {
         return ToolOutput::failure("path: outside project root");
     }
-    ToolOutput::failure(format!("{operation}: {error}"))
+    match canonical_filesystem_reason(&error) {
+        Some(reason) => ToolOutput::failure(format!("{operation}: {reason}")),
+        None => ToolOutput::failure(format!("{operation}: {error}")),
+    }
+}
+
+/// Maps the kinds worth telling the model apart, so it stops retrying a file that is not there
+/// instead of reading an errno string it cannot act on.
+#[cfg(unix)]
+fn canonical_filesystem_reason(error: &io::Error) -> Option<&'static str> {
+    match error.kind() {
+        io::ErrorKind::NotFound => Some("file not found"),
+        io::ErrorKind::PermissionDenied => Some("permission denied"),
+        io::ErrorKind::IsADirectory => Some("path is a directory"),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -5924,15 +5963,18 @@ fn recheck_write_target(
     file_name: &std::ffi::CString,
     existing: Option<(u64, u64)>,
 ) -> Result<(), ToolOutput> {
-    match (existing, open_confined_file(directory, file_name, "write")) {
-        (Some(expected), Ok(file))
+    match (
+        existing,
+        open_confined_file_optional(directory, file_name, "write"),
+    ) {
+        (Some(expected), Ok(Some(file)))
             if file_identity(&checked_regular_file(&file, "write")?) == expected =>
         {
             Ok(())
         }
         (Some(_), Ok(_)) => Err(ToolOutput::failure("write: target changed during write")),
         (Some(_), Err(output)) => Err(output),
-        (None, Err(output)) if output.content.contains("No such file") => Ok(()),
+        (None, Ok(None)) => Ok(()),
         (None, _) => Err(ToolOutput::failure("write: target changed during write")),
     }
 }

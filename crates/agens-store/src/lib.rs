@@ -995,6 +995,17 @@ fn normalized_session_schema_v6() -> String {
     )
 }
 
+/// The cumulative expected `sessions` shape after migration `0006`: the same splice-before-`CHECK`
+/// behavior as `normalized_session_schema_v6`, applied on top of it for the new
+/// `bypass_permission_prompts` column.
+fn normalized_session_schema_v7() -> String {
+    normalized_session_schema_v6().replacen(
+        "CHECK(resumable = (completed_turn_count > 0))",
+        "bypass_permission_prompts INTEGER,\n        CHECK(resumable = (completed_turn_count > 0))",
+        1,
+    )
+}
+
 fn validate_legacy_archive(
     connection: &Connection,
     database_path: &Path,
@@ -1105,7 +1116,7 @@ fn validate_v5_schema(
     database_path: &Path,
 ) -> Result<(), SessionStoreError> {
     validate_legacy_archive(connection, database_path)?;
-    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v6())
+    validate_normalized_session_schema(connection, database_path, &normalized_session_schema_v7())
 }
 
 fn validate_normalized_session_schema(

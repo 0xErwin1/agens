@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 5] = [
+const MIGRATIONS: [Migration; 6] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -72,6 +72,10 @@ const MIGRATIONS: [Migration; 5] = [
     Migration {
         id: "0005_session_confinement_root",
         ddl: session_confinement_root_ddl,
+    },
+    Migration {
+        id: "0006_session_bypass_permission_prompts",
+        ddl: session_bypass_permission_prompts_ddl,
     },
 ];
 
@@ -341,6 +345,13 @@ fn session_confinement_root_ddl() -> String {
     "ALTER TABLE sessions ADD COLUMN confinement_root TEXT;".to_owned()
 }
 
+/// The recorded per-session bypass-permission-prompts value, distinct from the
+/// `agent.bypass_permission_prompts` configuration setting: NULL means "never recorded" and the
+/// read path falls back to configuration, exactly as `confinement_root` falls back to `project`.
+fn session_bypass_permission_prompts_ddl() -> String {
+    "ALTER TABLE sessions ADD COLUMN bypass_permission_prompts INTEGER;".to_owned()
+}
+
 #[cfg(unix)]
 fn restrict_permissions(path: &Path, maximum_mode: u32) -> Result<(), DatabaseError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -595,6 +606,109 @@ mod tests {
             );
         }
 
+        // `sessions` keeps every pre-existing column, unchanged and in the same order. This test
+        // opens a freshly created database, so every later migration (including 0006) has already
+        // applied too — it asserts confinement_root's own position, not the full column set.
+        assert_eq!(
+            ordered_table_columns(&connection, "sessions"),
+            vec![
+                "id",
+                "project",
+                "title",
+                "active_agent",
+                "created_at",
+                "updated_at",
+                "completed_turn_count",
+                "resumable",
+                "provider_id",
+                "model_id",
+                "reasoning_effort",
+                "confinement_root",
+                "bypass_permission_prompts",
+            ]
+        );
+
+        let (not_null, default_value): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('sessions')
+                 WHERE name = 'confinement_root'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(not_null, 0, "confinement_root must be nullable");
+        assert_eq!(default_value, None);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_0006_is_purely_additive_and_adds_a_nullable_bypass_permission_prompts_column() {
+        let directory = data_directory();
+        let (_, connection) = open_unified_database(&directory).unwrap();
+
+        // Every table migration 0006 must leave untouched keeps the exact column set (name and
+        // order) it already had after migration 0005 — not merely a non-empty column count, which
+        // would stay green even if a migration dropped or renamed columns.
+        for (unaffected_table, expected_columns) in [
+            (
+                "session_attempts",
+                vec![
+                    "id",
+                    "session_id",
+                    "sequence",
+                    "status",
+                    "failure_kind",
+                    "retry_prompt",
+                    "started_at",
+                    "finished_at",
+                    "completed_turn_sequence",
+                ],
+            ),
+            (
+                "permission_grants",
+                vec![
+                    "id",
+                    "project",
+                    "decision",
+                    "tool_kind",
+                    "tool_value",
+                    "target_kind",
+                    "target_value",
+                ],
+            ),
+            ("model_preference", vec!["id", "model", "reasoning_effort"]),
+            (
+                "tool_result_facts",
+                vec![
+                    "id",
+                    "session_id",
+                    "attempt_id",
+                    "sequence",
+                    "tool_call_id",
+                    "tool",
+                    "outcome",
+                    "path",
+                    "path_status",
+                    "exit_code",
+                    "is_new_file",
+                    "bytes_written",
+                    "lines_written",
+                    "lines_added",
+                    "lines_removed",
+                    "match_count",
+                    "truncated",
+                    "recorded_at",
+                ],
+            ),
+        ] {
+            assert_eq!(
+                ordered_table_columns(&connection, unaffected_table),
+                expected_columns,
+                "{unaffected_table} must be unchanged by migration 0006"
+            );
+        }
+
         // `sessions` keeps every pre-existing column, unchanged and in the same order, with
         // exactly one new column appended.
         assert_eq!(
@@ -612,18 +726,19 @@ mod tests {
                 "model_id",
                 "reasoning_effort",
                 "confinement_root",
+                "bypass_permission_prompts",
             ]
         );
 
         let (not_null, default_value): (i64, Option<String>) = connection
             .query_row(
                 "SELECT \"notnull\", dflt_value FROM pragma_table_info('sessions')
-                 WHERE name = 'confinement_root'",
+                 WHERE name = 'bypass_permission_prompts'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(not_null, 0, "confinement_root must be nullable");
+        assert_eq!(not_null, 0, "bypass_permission_prompts must be nullable");
         assert_eq!(default_value, None);
 
         fs::remove_dir_all(directory).unwrap();

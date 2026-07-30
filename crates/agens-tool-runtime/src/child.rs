@@ -446,3 +446,47 @@ impl HeadlessPermissionResolver for ChildPermissionResolver {
         std::future::ready(Ok(PermissionDecision::Deny))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the subagent-scope split (`PermissionSession::new()` above, never
+    /// `with_temporary_bypass()`): a model-launched child's own resolver fails closed on every
+    /// `Ask`, unconditionally and regardless of which tool or arguments produced it. A future edit
+    /// that forwards a session's bypass into `run_production_task` (see `ProductionTaskRunner`'s
+    /// doc comment on `with_bypass`) must not make this resolver return anything but `Deny`.
+    #[test]
+    fn child_permission_resolver_fails_closed_on_every_ask_unconditionally() {
+        let cancellation = HeadlessTurnCancellation::new();
+        for call in [
+            HeadlessToolCall {
+                id: "call-1".into(),
+                name: "native::write".into(),
+                input: r#"{"path":"a.txt","content":"x"}"#.into(),
+            },
+            HeadlessToolCall {
+                id: "call-2".into(),
+                name: "native::task".into(),
+                input: r#"{"agent":"reviewer","description":"probe"}"#.into(),
+            },
+            HeadlessToolCall {
+                id: "call-3".into(),
+                name: "native::bash".into(),
+                input: "{}".into(),
+            },
+        ] {
+            let mut resolver = ChildPermissionResolver;
+            let decision = block_on_headless_turn(resolver.resolve(&call, &cancellation))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                decision,
+                PermissionDecision::Deny,
+                "a model-launched child must fail closed on Ask for {}, with no bypass path \
+                 available to it",
+                call.name
+            );
+        }
+    }
+}

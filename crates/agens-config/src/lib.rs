@@ -422,6 +422,12 @@ pub const SETTINGS: &[SettingSpec] = &[
         doc: "Advertise parallel tool calls to the provider.",
     },
     SettingSpec {
+        path: "agent.bypass_permission_prompts",
+        kind: SettingKind::Bool,
+        default: SettingValue::Bool(false),
+        doc: "Bypass permission prompts for the whole session.",
+    },
+    SettingSpec {
         path: "agent.default_agent",
         kind: SettingKind::Text { max_chars: 64 },
         default: SettingValue::Absent,

@@ -10,7 +10,7 @@ use agens_core::{
     HeadlessTurnPortError,
 };
 use agens_permissions::{AllowedNativeCall, SharedToolDispatcher};
-use agens_tools::{ToolExecutionContext, ToolOutput};
+use agens_tools::{NATIVE_FILESYSTEM_FAILURE_REASONS, ToolExecutionContext, ToolOutput};
 
 pub struct ProductionToolDispatcher {
     dispatcher: SharedToolDispatcher,
@@ -113,20 +113,21 @@ pub fn sanitized_native_tool_failure(content: &str) -> String {
     let safe_reason = matches!(
         reason,
         "operation timed out" | "cancelled" | "invalid regex" | "invalid glob pattern"
-    ) || [
-        ("entry limit of ", " exceeded"),
-        ("result limit of ", " exceeded"),
-        ("traversal depth limit of ", " exceeded"),
-    ]
-    .into_iter()
-    .any(|(prefix, suffix)| {
-        reason
-            .strip_prefix(prefix)
-            .and_then(|value| value.strip_suffix(suffix))
-            .is_some_and(|value| {
-                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-            })
-    });
+    ) || NATIVE_FILESYSTEM_FAILURE_REASONS.contains(&reason)
+        || [
+            ("entry limit of ", " exceeded"),
+            ("result limit of ", " exceeded"),
+            ("traversal depth limit of ", " exceeded"),
+        ]
+        .into_iter()
+        .any(|(prefix, suffix)| {
+            reason
+                .strip_prefix(prefix)
+                .and_then(|value| value.strip_suffix(suffix))
+                .is_some_and(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        });
     if safe_reason {
         format!("{tool}: {reason}")
     } else if reason.contains("outside project root")

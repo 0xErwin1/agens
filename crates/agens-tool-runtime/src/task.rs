@@ -46,6 +46,12 @@ pub struct TaskParentSelection {
     pub diagnostic_reference: Option<String>,
 }
 
+/// Builds the task runtime for a TUI-launched subagent (both the parent turn's own `task` tool
+/// runtime and the selected-subagent-launch runtime `crates/agens-tui-app/src/engine.rs` builds
+/// ahead of the parent turn). `bypass` must be the session's current bypass state at the time this
+/// runtime is built — see `PermissionSession::with_temporary_bypass` below and the module docs on
+/// subagent scope for why `child.rs` never receives it.
+#[allow(clippy::too_many_arguments)]
 pub fn production_tui_task_runtime(
     bootstrap: &Bootstrap,
     project_root: &Path,
@@ -54,6 +60,7 @@ pub fn production_tui_task_runtime(
     lifecycle_bridge: TuiTaskLifecycleBridge,
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: String,
+    bypass: bool,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
     production_tui_task_runtime_with_runner_and_parent_config(
         bootstrap,
@@ -61,7 +68,8 @@ pub fn production_tui_task_runtime(
         skills,
         prompter,
         ProductionTaskRunner::new(bootstrap.clone(), project_root.to_path_buf())
-            .with_lifecycle_bridge(lifecycle_bridge),
+            .with_lifecycle_bridge(lifecycle_bridge)
+            .with_bypass(bypass),
         parent_request_config,
         Some(model_resolution_reference),
     )
@@ -94,6 +102,7 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
     parent_request_config: agens_core::RequestConfig,
     model_resolution_reference: Option<String>,
 ) -> Result<ProductionTuiTaskRuntime, CliError> {
+    let bypass = task_runner.bypass();
     let task_registry = task_runner.execution_registry().unwrap_or_default();
     let parent_model = match bootstrap.model() {
         Some(model) => model.to_owned(),
@@ -130,7 +139,11 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
         .grants_for_project(&project)
         .map_err(|_| CliError::storage("permission grants are unavailable"))?;
     let grants = Arc::new(Mutex::new(grants));
-    let session = PermissionSession::new();
+    let session = if bypass {
+        PermissionSession::with_temporary_bypass()
+    } else {
+        PermissionSession::new()
+    };
     let pending = Arc::new(Mutex::new(BTreeMap::new()));
     let prompts = Arc::new(Mutex::new(BTreeMap::new()));
     let gate = ProductionPermissionGate::new(
@@ -149,7 +162,11 @@ pub fn production_tui_task_runtime_with_runner_and_parent_config(
         prompts,
         ProductionPromptAuthorization {
             policy,
-            session: PermissionSession::new(),
+            session: if bypass {
+                PermissionSession::with_temporary_bypass()
+            } else {
+                PermissionSession::new()
+            },
             project,
             dispatcher: Arc::clone(&dispatcher),
             allowed: Arc::clone(&pending),
