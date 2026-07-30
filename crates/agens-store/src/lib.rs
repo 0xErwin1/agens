@@ -525,10 +525,17 @@ impl PreferenceStore {
         self.database_path.clone()
     }
 
+    /// Remembers `preference` for `source` only, leaving every other source's pick intact.
     pub fn remember_model(
         &mut self,
+        source: &str,
         preference: &ModelPreference,
     ) -> Result<(), PreferenceStoreError> {
+        if source.is_empty() {
+            return Err(PreferenceStoreError::detail(
+                "remembered model source is invalid",
+            ));
+        }
         if !valid_preference_model(&preference.model) {
             return Err(PreferenceStoreError::detail(
                 "remembered model identifier is invalid",
@@ -537,10 +544,11 @@ impl PreferenceStore {
 
         self.connection
             .execute(
-                "INSERT INTO model_preference (id, model, reasoning_effort)
-                 VALUES (1, ?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET model = ?1, reasoning_effort = ?2",
+                "INSERT INTO model_preference_by_source (source, model, reasoning_effort)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(source) DO UPDATE SET model = ?2, reasoning_effort = ?3",
                 params![
+                    source,
                     preference.model,
                     preference.reasoning_effort.map(ReasoningEffort::as_str),
                 ],
@@ -551,12 +559,16 @@ impl PreferenceStore {
         Ok(())
     }
 
-    pub fn remembered_model(&self) -> Result<Option<ModelPreference>, PreferenceStoreError> {
+    /// The last selection made under `source`, or `None` when that source has none yet.
+    pub fn remembered_model(
+        &self,
+        source: &str,
+    ) -> Result<Option<ModelPreference>, PreferenceStoreError> {
         let row = self
             .connection
             .query_row(
-                "SELECT model, reasoning_effort FROM model_preference WHERE id = 1",
-                [],
+                "SELECT model, reasoning_effort FROM model_preference_by_source WHERE source = ?1",
+                params![source],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .map(Some)

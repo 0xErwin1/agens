@@ -42,7 +42,10 @@ use crate::deps::bootstrap;
 fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
     PreferenceStore::open(bootstrap.data_directory())
         .unwrap()
-        .remember_model(&agens_store::ModelPreference::new(model, effort))
+        .remember_model(
+            agens_models::ModelSource::OpenAiApi.storage_key(),
+            &agens_store::ModelPreference::new(model, effort),
+        )
         .unwrap();
 }
 

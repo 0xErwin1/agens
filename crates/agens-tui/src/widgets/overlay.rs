@@ -165,6 +165,43 @@ impl OverlaySizing {
         }
     }
 
+    /// The content width [`OverlayLayout::solve`] resolves for `area`, or `None` when the area
+    /// cannot host a frame at all.
+    ///
+    /// Shared with `solve` rather than duplicated so a caller that must lay content out before
+    /// solving — wrapped prose, whose row count depends on the width it will be painted at —
+    /// cannot disagree with the width it eventually gets.
+    pub(crate) fn inner_width(&self, area: Rect) -> Option<u16> {
+        self.frame_metrics(area).map(|metrics| metrics.inner_width)
+    }
+
+    fn frame_metrics(&self, area: Rect) -> Option<FrameMetrics> {
+        if area.width < 8 || area.height < 3 {
+            return None;
+        }
+
+        let available_width = match self.anchor {
+            OverlayAnchor::Center => area.width,
+            OverlayAnchor::Above(composer) => area.width.min(composer.width),
+        };
+        if available_width < 4 {
+            return None;
+        }
+
+        let width = (u32::from(area.width) * u32::from(self.width_pct) / 100)
+            .try_into()
+            .unwrap_or(u16::MAX)
+            .clamp(self.min_width, self.max_width.max(self.min_width))
+            .clamp(4, available_width);
+        let h_pad = self.h_pad.min(width.saturating_sub(3) / 2);
+
+        Some(FrameMetrics {
+            width,
+            h_pad,
+            inner_width: width - 2 - 2 * h_pad,
+        })
+    }
+
     /// Full-width strip pinned directly above the composer.
     pub(crate) const fn palette(composer: Rect) -> Self {
         Self {
@@ -178,6 +215,12 @@ impl OverlaySizing {
             anchor: OverlayAnchor::Above(composer),
         }
     }
+}
+
+struct FrameMetrics {
+    width: u16,
+    h_pad: u16,
+    inner_width: u16,
 }
 
 /// Everything the shell needs to size and paint one overlay.
@@ -252,29 +295,17 @@ impl OverlayLayout {
     /// Resolves the frame, tab, content and footer rects, or `None` when the
     /// area cannot host even a bordered single content row.
     pub(crate) fn solve(area: Rect, config: &OverlayConfig<'_>) -> Option<Self> {
-        if area.width < 8 || area.height < 3 {
-            return None;
-        }
-
         let sizing = &config.sizing;
-        let (available_width, available_height) = match sizing.anchor {
-            OverlayAnchor::Center => (area.width, area.height),
-            OverlayAnchor::Above(composer) => (
-                area.width.min(composer.width),
-                composer.y.saturating_sub(area.y),
-            ),
-        };
-        if available_width < 4 {
-            return None;
-        }
+        let FrameMetrics {
+            width,
+            h_pad,
+            inner_width,
+        } = sizing.frame_metrics(area)?;
 
-        let width = (u32::from(area.width) * u32::from(sizing.width_pct) / 100)
-            .try_into()
-            .unwrap_or(u16::MAX)
-            .clamp(sizing.min_width, sizing.max_width.max(sizing.min_width))
-            .clamp(4, available_width);
-        let h_pad = sizing.h_pad.min(width.saturating_sub(3) / 2);
-        let inner_width = width - 2 - 2 * h_pad;
+        let available_height = match sizing.anchor {
+            OverlayAnchor::Center => area.height,
+            OverlayAnchor::Above(composer) => composer.y.saturating_sub(area.y),
+        };
 
         let budget = area
             .height

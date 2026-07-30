@@ -52,7 +52,7 @@ struct Migration {
     ddl: fn() -> String,
 }
 
-const MIGRATIONS: [Migration; 6] = [
+const MIGRATIONS: [Migration; 7] = [
     Migration {
         id: "0001_permission_grants",
         ddl: permission_grants_ddl,
@@ -76,6 +76,10 @@ const MIGRATIONS: [Migration; 6] = [
     Migration {
         id: "0006_session_bypass_permission_prompts",
         ddl: session_bypass_permission_prompts_ddl,
+    },
+    Migration {
+        id: "0007_model_preference_by_source",
+        ddl: model_preference_by_source_ddl,
     },
 ];
 
@@ -254,6 +258,24 @@ fn model_preference_ddl() -> String {
     "
     CREATE TABLE model_preference (
         id INTEGER PRIMARY KEY CHECK(id = 1),
+        model TEXT NOT NULL CHECK(model <> ''),
+        reasoning_effort TEXT
+    );
+    "
+    .to_owned()
+}
+
+/// The remembered model and effort, keyed by the model source that produced them.
+///
+/// Supersedes the single-row `model_preference` table, whose one slot made a pick from any source
+/// the pick for every source: the next session on a different provider read a model that provider
+/// cannot serve and had to announce a fallback. The superseded table is left in place because
+/// migrations here are append-only and additive; nothing reads or writes it any more, and its one
+/// row is not carried over, since the source it was chosen under was never recorded.
+fn model_preference_by_source_ddl() -> String {
+    "
+    CREATE TABLE model_preference_by_source (
+        source TEXT PRIMARY KEY CHECK(source <> ''),
         model TEXT NOT NULL CHECK(model <> ''),
         reasoning_effort TEXT
     );
@@ -740,6 +762,33 @@ mod tests {
             .unwrap();
         assert_eq!(not_null, 0, "bypass_permission_prompts must be nullable");
         assert_eq!(default_value, None);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn migration_0007_is_purely_additive_and_leaves_the_superseded_preference_table_intact() {
+        let directory = data_directory();
+        let (_, connection) = open_unified_database(&directory).unwrap();
+
+        assert_eq!(
+            ordered_table_columns(&connection, "model_preference"),
+            vec!["id", "model", "reasoning_effort"],
+            "migration 0007 must not rewrite the superseded preference table"
+        );
+        assert_eq!(
+            ordered_table_columns(&connection, "model_preference_by_source"),
+            vec!["source", "model", "reasoning_effort"]
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO model_preference_by_source (source, model, reasoning_effort)
+                     VALUES ('moonshot-api', 'kimi-k3', NULL);
+                 INSERT INTO model_preference_by_source (source, model, reasoning_effort)
+                     VALUES ('chatgpt-subscription', 'gpt-5.5', NULL);",
+            )
+            .expect("distinct sources must coexist");
 
         fs::remove_dir_all(directory).unwrap();
     }

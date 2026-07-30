@@ -533,19 +533,38 @@ fn parent_skill_system_prompt(base: &str, skills: &SkillCatalog) -> String {
     )
 }
 
+/// Reports skills whose name is also a command as a single line.
+///
+/// Neither side is lost to the collision — only `/name` is claimed by the command, while the skill
+/// stays in the catalog and in the model's skill listing — so this is one informational line rather
+/// than a per-name warning that reads as if the skills had been disabled.
 pub fn report_tui_extension_collisions<E: TuiEngine>(
     tui: &mut Tui<E>,
     commands: &CommandCatalog,
     skills: &SkillCatalog,
 ) {
-    for skill in skills
+    let mut names = skills
         .skills()
-        .filter(|skill| commands.command(skill.name()).is_some())
-    {
-        tui.add_diagnostic(format!(
-            "Skill /{} is shadowed by a command; command routing wins.",
-            skill.name()
-        ));
+        .map(|skill| skill.name())
+        .filter(|name| commands.command(name).is_some())
+        .collect::<Vec<_>>();
+    if names.is_empty() {
+        return;
+    }
+
+    names.sort_unstable();
+    tui.add_diagnostic(format!(
+        "{} a command name; /name runs the command, the skill tool still loads them: {}.",
+        counted_skills_sharing(names.len()),
+        names.join(", ")
+    ));
+}
+
+fn counted_skills_sharing(count: usize) -> String {
+    if count == 1 {
+        "1 skill shares".to_owned()
+    } else {
+        format!("{count} skills share")
     }
 }
 

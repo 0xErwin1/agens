@@ -27,11 +27,11 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
 
     {
         let mut store = PreferenceStore::open(&directory).unwrap();
-        assert_eq!(store.remembered_model().unwrap(), None);
+        assert_eq!(store.remembered_model("openai-api").unwrap(), None);
         assert_eq!(store.database_path(), directory.join("agens.db"));
 
-        store.remember_model(&first).unwrap();
-        assert_eq!(store.remembered_model().unwrap(), Some(first));
+        store.remember_model("openai-api", &first).unwrap();
+        assert_eq!(store.remembered_model("openai-api").unwrap(), Some(first));
     }
 
     let database = directory.join("agens.db");
@@ -51,14 +51,18 @@ fn a_remembered_model_and_effort_survive_a_reopen_as_one_selection() {
             "0003_sessions_v5",
             "0004_tool_result_facts",
             "0005_session_confinement_root",
-            "0006_session_bypass_permission_prompts"
+            "0006_session_bypass_permission_prompts",
+            "0007_model_preference_by_source"
         ]
     );
     drop(connection);
 
     let mut reopened = PreferenceStore::open(&directory).unwrap();
-    reopened.remember_model(&second).unwrap();
-    assert_eq!(reopened.remembered_model().unwrap(), Some(second));
+    reopened.remember_model("openai-api", &second).unwrap();
+    assert_eq!(
+        reopened.remembered_model("openai-api").unwrap(),
+        Some(second)
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -70,20 +74,25 @@ fn an_invalid_model_identifier_never_reaches_the_database() {
 
     assert!(
         store
-            .remember_model(&ModelPreference::new("", None))
+            .remember_model("openai-api", &ModelPreference::new("", None))
             .is_err()
     );
     assert!(
         store
-            .remember_model(&ModelPreference::new("x".repeat(65), None))
+            .remember_model("openai-api", &ModelPreference::new("x".repeat(65), None))
             .is_err()
     );
     assert!(
         store
-            .remember_model(&ModelPreference::new("gpt 5.5", None))
+            .remember_model("openai-api", &ModelPreference::new("gpt 5.5", None))
             .is_err()
     );
-    assert_eq!(store.remembered_model().unwrap(), None);
+    assert!(
+        store
+            .remember_model("", &ModelPreference::new("gpt-5.5", None))
+            .is_err()
+    );
+    assert_eq!(store.remembered_model("openai-api").unwrap(), None);
 
     fs::remove_dir_all(directory).unwrap();
 }
@@ -94,19 +103,25 @@ fn a_corrupted_effort_is_reported_instead_of_silently_dropped() {
     {
         let mut store = PreferenceStore::open(&directory).unwrap();
         store
-            .remember_model(&ModelPreference::new("gpt-5.5", Some(ReasoningEffort::Low)))
+            .remember_model(
+                "openai-api",
+                &ModelPreference::new("gpt-5.5", Some(ReasoningEffort::Low)),
+            )
             .unwrap();
     }
 
     Connection::open(directory.join("agens.db"))
         .unwrap()
-        .execute("UPDATE model_preference SET reasoning_effort = 'turbo'", [])
+        .execute(
+            "UPDATE model_preference_by_source SET reasoning_effort = 'turbo'",
+            [],
+        )
         .unwrap();
 
     assert!(
         PreferenceStore::open(&directory)
             .unwrap()
-            .remembered_model()
+            .remembered_model("openai-api")
             .is_err()
     );
 

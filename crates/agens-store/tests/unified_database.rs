@@ -86,7 +86,8 @@ fn the_ledger_records_each_applied_migration_once() {
             "0003_sessions_v5",
             "0004_tool_result_facts",
             "0005_session_confinement_root",
-            "0006_session_bypass_permission_prompts"
+            "0006_session_bypass_permission_prompts",
+            "0007_model_preference_by_source"
         ]
     );
 
@@ -148,6 +149,7 @@ fn an_unknown_ledger_id_is_tolerated_and_known_missing_migrations_still_apply() 
                 "0006_session_bypass_permission_prompts".to_owned(),
                 rows[5].1
             ),
+            ("0007_model_preference_by_source".to_owned(), rows[6].1),
             ("9999_unknown".to_owned(), 0),
         ]
     );
@@ -208,13 +210,15 @@ fn two_stores_writing_concurrently_in_one_process_do_not_corrupt_or_spuriously_f
         PermissionPattern::Any,
     );
 
-    preference_store.remember_model(&preference).unwrap();
+    preference_store
+        .remember_model("openai-api", &preference)
+        .unwrap();
     permission_store
         .append_grants(std::slice::from_ref(&grant))
         .unwrap();
 
     assert_eq!(
-        preference_store.remembered_model().unwrap(),
+        preference_store.remembered_model("openai-api").unwrap(),
         Some(preference)
     );
     assert_eq!(
@@ -311,11 +315,14 @@ fn legacy_database_files_are_neither_read_nor_modified() {
     assert_eq!(unified_grant_count, 0);
     drop(unified_connection);
 
-    assert_eq!(preference_store.remembered_model().unwrap(), None);
+    assert_eq!(
+        preference_store.remembered_model("openai-api").unwrap(),
+        None
+    );
     assert!(session_store.list_completed_turns().unwrap().is_empty());
 
     preference_store
-        .remember_model(&ModelPreference::new("gpt-5.5", None))
+        .remember_model("openai-api", &ModelPreference::new("gpt-5.5", None))
         .unwrap();
     permission_store
         .append_grants(&[ProjectPermissionGrant::allow(
@@ -385,7 +392,8 @@ fn a_partially_applied_database_is_completed() {
             "0003_sessions_v5",
             "0004_tool_result_facts",
             "0005_session_confinement_root",
-            "0006_session_bypass_permission_prompts"
+            "0006_session_bypass_permission_prompts",
+            "0007_model_preference_by_source"
         ]
     );
 
@@ -465,7 +473,8 @@ fn all_three_domains_share_one_database_file() {
             "0003_sessions_v5",
             "0004_tool_result_facts",
             "0005_session_confinement_root",
-            "0006_session_bypass_permission_prompts"
+            "0006_session_bypass_permission_prompts",
+            "0007_model_preference_by_source"
         ]
     );
 
@@ -488,14 +497,16 @@ fn three_stores_writing_concurrently_in_one_process_do_not_corrupt_or_spuriously
     );
     let snapshot = completed_snapshot("three-store concurrency");
 
-    preference_store.remember_model(&preference).unwrap();
+    preference_store
+        .remember_model("openai-api", &preference)
+        .unwrap();
     permission_store
         .append_grants(std::slice::from_ref(&grant))
         .unwrap();
     block_on_ready(session_store.persist_completed_turn(snapshot.clone())).unwrap();
 
     assert_eq!(
-        preference_store.remembered_model().unwrap(),
+        preference_store.remembered_model("openai-api").unwrap(),
         Some(preference)
     );
     assert_eq!(
@@ -538,7 +549,8 @@ fn a_bootstrap_only_ledger_with_no_user_tables_is_accepted() {
             "0003_sessions_v5",
             "0004_tool_result_facts",
             "0005_session_confinement_root",
-            "0006_session_bypass_permission_prompts"
+            "0006_session_bypass_permission_prompts",
+            "0007_model_preference_by_source"
         ]
     );
 

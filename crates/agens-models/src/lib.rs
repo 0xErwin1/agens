@@ -79,6 +79,18 @@ impl ModelSource {
             Self::MoonshotApi => "Moonshot AI",
         }
     }
+
+    /// The identifier a remembered selection is stored under.
+    ///
+    /// Deliberately separate from [`Self::label`]: labels are display text and may be reworded,
+    /// which would silently orphan every preference already written under the old wording.
+    pub const fn storage_key(self) -> &'static str {
+        match self {
+            Self::OpenAiApi => "openai-api",
+            Self::ChatGptSubscription => "chatgpt-subscription",
+            Self::MoonshotApi => "moonshot-api",
+        }
+    }
 }
 
 /// Validates and retains the bounded selections exposed by the terminal UI adapter.
@@ -109,6 +121,10 @@ impl ModelSelection {
     pub fn model_values(&self) -> Result<Vec<String>, String> {
         self.models()
             .map(|models| models.into_iter().map(|model| model.id).collect())
+    }
+
+    pub const fn source(&self) -> ModelSource {
+        self.source
     }
 
     pub const fn source_label(&self) -> &'static str {

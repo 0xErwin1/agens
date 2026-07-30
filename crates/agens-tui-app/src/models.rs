@@ -32,10 +32,10 @@ pub fn apply_tui_selection(
     }
     PreferenceStore::open(bootstrap.data_directory())
         .and_then(|mut store| {
-            store.remember_model(&ModelPreference::new(
-                selector.model(),
-                selector.reasoning_effort_value(),
-            ))
+            store.remember_model(
+                selector.source().storage_key(),
+                &ModelPreference::new(selector.model(), selector.reasoning_effort_value()),
+            )
         })
         .map_err(|_| CliError::storage("model preference could not be saved"))?;
     context.provider = Some(provider);
@@ -45,12 +45,13 @@ pub fn apply_tui_selection(
 }
 
 /// Resolves the model for a fresh session: a CLI flag or configured model first, then the last
-/// remembered selection, then the hardcoded default.
+/// remembered selection for this session's model source, then the hardcoded default.
 ///
 /// A model written into configuration by hand is a deliberate statement, so a terminal pick never
 /// silently overrides it. Returns the notice the user must see when a remembered selection cannot
 /// be honored, because falling back to a different model without saying so is indistinguishable
-/// from the preference being ignored.
+/// from the preference being ignored. Preferences are read per source, so switching providers
+/// restores that provider's own last pick instead of reporting a model it never offered.
 pub fn seed_remembered_tui_selection(
     bootstrap: &Bootstrap,
     context: &mut SessionContext,
@@ -59,14 +60,14 @@ pub fn seed_remembered_tui_selection(
         return None;
     }
 
+    let source = model_source(bootstrap, context);
     let preference = match PreferenceStore::open(bootstrap.data_directory())
-        .and_then(|store| store.remembered_model())
+        .and_then(|store| store.remembered_model(source.storage_key()))
     {
         Ok(Some(preference)) => preference,
         Ok(None) => return None,
         Err(_) => return Some("Remembered model selection could not be read.".to_owned()),
     };
-    let source = model_source(bootstrap, context);
     let default = resolved_provider(bootstrap, context).default_model();
     let mut selector = ModelSelection::for_source(default, source);
     if selector.apply_model(preference.model()).is_err() {
@@ -256,9 +257,23 @@ mod tests {
     use crate::test_support::{tui_session_bootstrap, tui_session_directory};
 
     fn remember(bootstrap: &Bootstrap, model: &str, effort: Option<agens_core::ReasoningEffort>) {
+        remember_for(
+            bootstrap,
+            agens_models::ModelSource::OpenAiApi,
+            model,
+            effort,
+        );
+    }
+
+    fn remember_for(
+        bootstrap: &Bootstrap,
+        source: agens_models::ModelSource,
+        model: &str,
+        effort: Option<agens_core::ReasoningEffort>,
+    ) {
         PreferenceStore::open(bootstrap.data_directory())
             .unwrap()
-            .remember_model(&ModelPreference::new(model, effort))
+            .remember_model(source.storage_key(), &ModelPreference::new(model, effort))
             .unwrap();
     }
 
@@ -359,7 +374,7 @@ mod tests {
 
         let remembered = PreferenceStore::open(bootstrap.data_directory())
             .unwrap()
-            .remembered_model()
+            .remembered_model(agens_models::ModelSource::OpenAiApi.storage_key())
             .unwrap()
             .unwrap();
         assert_eq!(remembered.model(), "gpt-5.5");
@@ -406,10 +421,54 @@ mod tests {
 
         let remembered = PreferenceStore::open(bootstrap.data_directory())
             .unwrap()
-            .remembered_model()
+            .remembered_model(agens_models::ModelSource::MoonshotApi.storage_key())
             .unwrap()
             .unwrap();
         assert_eq!(remembered.model(), "kimi-k3");
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn a_pick_made_under_one_source_never_seeds_a_session_on_another() {
+        let temporary = tui_session_directory("remembered-selection-per-source");
+        let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
+        bootstrap.model = None;
+        bootstrap.provider_type = Some(ProviderKind::OpenAiChatGpt.identifier().to_owned());
+        remember_for(
+            &bootstrap,
+            agens_models::ModelSource::MoonshotApi,
+            "kimi-k3",
+            None,
+        );
+        let mut context = SessionContext::fresh();
+
+        // The Moonshot pick is invisible here, so there is no fallback to announce.
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            None
+        );
+        assert_eq!(
+            agens_session::model::effective_model(&bootstrap, &context),
+            "gpt-5.5"
+        );
+
+        remember_for(
+            &bootstrap,
+            agens_models::ModelSource::ChatGptSubscription,
+            "gpt-5.4",
+            None,
+        );
+        let mut context = SessionContext::fresh();
+
+        assert_eq!(
+            seed_remembered_tui_selection(&bootstrap, &mut context),
+            None
+        );
+        assert_eq!(
+            agens_session::model::effective_model(&bootstrap, &context),
+            "gpt-5.4"
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
