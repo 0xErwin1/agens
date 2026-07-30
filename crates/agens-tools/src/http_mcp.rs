@@ -14,14 +14,16 @@ use crate::{McpOperationContext, McpRequest, McpResponse, McpTransport, McpTrans
 
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const HTTP_WORKER_CAPACITY: usize = 8;
+const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+const MAX_MCP_SESSION_ID_BYTES: usize = 512;
 
 /// JSON-RPC MCP transport that executes requests on an owned async HTTP worker.
 pub struct McpHttpTransport {
-    headers: BTreeMap<String, String>,
     max_retries: u32,
     next_id: u64,
     worker: HttpWorker,
     endpoint: String,
+    session_id: Option<String>,
 }
 
 impl McpHttpTransport {
@@ -60,11 +62,11 @@ impl McpHttpTransport {
         )
         .map_err(worker_error)?;
         Ok(Self {
-            headers,
             max_retries,
             next_id: 1,
             worker,
             endpoint,
+            session_id: None,
         })
     }
 
@@ -82,13 +84,17 @@ impl McpHttpTransport {
         });
         let body = serde_json::to_vec(&request_wire(request, id))
             .map_err(|_| McpTransportError::Protocol("MCP request is malformed".into()))?;
+        let mut request_headers = BTreeMap::new();
+        if let Some(session_id) = &self.session_id {
+            request_headers.insert(MCP_SESSION_ID_HEADER.to_owned(), session_id.clone());
+        }
         let attempts = self.max_retries + 1;
         for attempt in 0..attempts {
             let response = self.worker.request(
                 HttpRequest {
                     method: "POST".into(),
                     endpoint: self.endpoint.clone(),
-                    headers: self.headers.clone(),
+                    headers: request_headers.clone(),
                     body: body.clone(),
                 },
                 context.cancellation_probe(),
@@ -117,10 +123,10 @@ impl McpHttpTransport {
                 ));
             }
             if !(200..300).contains(&response.status) {
-                return Err(McpTransportError::Transport(format!(
-                    "MCP HTTP request failed with status {}",
-                    response.status
-                )));
+                return Err(McpTransportError::HttpStatus(response.status));
+            }
+            if let Some(session_id) = captured_session_id(&response.headers) {
+                self.session_id = Some(session_id);
             }
             if notify {
                 return Ok(None);
@@ -130,6 +136,19 @@ impl McpHttpTransport {
         }
         Err(McpTransportError::RetriesExhausted)
     }
+}
+
+/// Validates a captured `Mcp-Session-Id` header value before it is trusted.
+///
+/// The value is server-controlled, so it is accepted only if it is visible
+/// ASCII and within a bounded length; anything else is silently ignored
+/// rather than echoed back or rendered anywhere.
+fn captured_session_id(headers: &BTreeMap<String, String>) -> Option<String> {
+    let value = headers.get(MCP_SESSION_ID_HEADER)?;
+    let is_valid = !value.is_empty()
+        && value.len() <= MAX_MCP_SESSION_ID_BYTES
+        && value.chars().all(|character| character.is_ascii_graphic());
+    is_valid.then(|| value.clone())
 }
 
 impl McpTransport for McpHttpTransport {
@@ -318,7 +337,7 @@ impl HttpWorkerOperation for McpHttpOperation {
             .expect("HTTP worker starts before requests")
             .clone();
         Box::pin(async move {
-            let response = client
+            let mut builder = client
                 .request(
                     request
                         .method
@@ -327,11 +346,20 @@ impl HttpWorkerOperation for McpHttpOperation {
                     request.endpoint,
                 )
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json, text/event-stream");
+            for (name, value) in &request.headers {
+                let name = HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| HttpWorkerError::Transport)?;
+                let value = HeaderValue::from_str(value).map_err(|_| HttpWorkerError::Transport)?;
+                builder = builder.header(name, value);
+            }
+            let response = builder
                 .body(request.body)
                 .send()
                 .await
                 .map_err(|_| HttpWorkerError::Transport)?;
             let status = response.status().as_u16();
+            let headers = response_headers(response.headers());
             let mut response = response;
             let mut body = Vec::new();
             while let Some(chunk) = response
@@ -344,13 +372,31 @@ impl HttpWorkerOperation for McpHttpOperation {
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(HttpResponse { status, body })
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            })
         })
     }
 
     fn close(&mut self) {
         self.client = None;
     }
+}
+
+/// Lower-cases header names for observability, dropping any value that is not
+/// visible ASCII rather than lossily reinterpreting it.
+fn response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect()
 }
 
 struct McpSseOperation {
@@ -395,6 +441,7 @@ impl HttpWorkerOperation for McpSseOperation {
             {
                 return Ok(HttpResponse {
                     status,
+                    headers: BTreeMap::new(),
                     body: Vec::new(),
                 });
             }
@@ -441,6 +488,7 @@ impl HttpWorkerOperation for McpSseOperation {
             }
             Ok(HttpResponse {
                 status,
+                headers: BTreeMap::new(),
                 body: Vec::new(),
             })
         })
@@ -498,6 +546,7 @@ impl SseFrame {
                 if !(200..300).contains(&status) {
                     return Ok(Some(HttpResponse {
                         status,
+                        headers: BTreeMap::new(),
                         body: Vec::new(),
                     }));
                 }
@@ -507,6 +556,7 @@ impl SseFrame {
                 {
                     return Ok(Some(HttpResponse {
                         status,
+                        headers: BTreeMap::new(),
                         body: Vec::new(),
                     }));
                 }
@@ -515,6 +565,7 @@ impl SseFrame {
             }
             Some("message") if message_endpoint.is_some() => Ok(Some(HttpResponse {
                 status: 200,
+                headers: BTreeMap::new(),
                 body: data.into_bytes(),
             })),
             Some(_) if !data.is_empty() => Err(HttpWorkerError::Protocol),

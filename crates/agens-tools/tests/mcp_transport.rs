@@ -158,11 +158,19 @@ impl McpTransport for StepDelayTransport {
 }
 
 fn initialize() -> McpInitialize {
-    McpInitialize::new("2025-06-18", json!({}), "agens", "0.1.0")
+    McpInitialize::new(
+        agens_tools::MCP_PROTOCOL_VERSION,
+        json!({}),
+        "agens",
+        "0.1.0",
+    )
 }
 
 fn initialized() -> McpResponse {
-    McpResponse::Initialized(McpInitializeResult::new("2025-06-18", json!({"tools": {}})))
+    McpResponse::Initialized(McpInitializeResult::new(
+        agens_tools::MCP_PROTOCOL_VERSION,
+        json!({"tools": {}}),
+    ))
 }
 
 fn timeouts() -> McpTimeouts {
@@ -326,7 +334,7 @@ fn rejects_invalid_schema_negotiation_and_pagination_without_registry_mutation()
         (
             "capability",
             vec![Ok(McpResponse::Initialized(McpInitializeResult::new(
-                "2025-06-18",
+                agens_tools::MCP_PROTOCOL_VERSION,
                 json!({}),
             )))],
         ),
@@ -768,6 +776,84 @@ fn dropping_one_registry_leaves_the_servers_of_another_registry_on_the_shared_ha
     assert_eq!(
         status.snapshot().server("long-lived").unwrap().state(),
         McpLifecycleState::Closed
+    );
+}
+
+#[test]
+fn dropping_one_of_two_registries_sharing_a_server_name_preserves_ready_state_and_reregistering_does_not_reset_it()
+ {
+    let status = McpStatusHandle::default();
+    let shared = || {
+        Ok(Box::new(LocalTransport::with_responses([
+            Ok(initialized()),
+            Ok(page(vec![], None)),
+        ])) as Box<dyn McpTransport>)
+    };
+
+    let mut long_lived = McpRegistry::with_status_handle(status.clone());
+    long_lived
+        .configure_server_with_descriptor(
+            status_descriptor("shared", McpServerTransport::Http, true),
+            shared,
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert!(!long_lived.discover_server("shared").is_failed());
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Ready
+    );
+
+    let mut ephemeral = McpRegistry::with_status_handle(status.clone());
+    ephemeral
+        .configure_server_with_descriptor(
+            status_descriptor("shared", McpServerTransport::Http, true),
+            shared,
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Ready,
+        "an ephemeral registry configuring the same name must not reset Ready to Idle"
+    );
+
+    drop(ephemeral);
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Ready,
+        "dropping the ephemeral registry must not close a server still claimed by another registry"
+    );
+
+    let mut reregistering = McpRegistry::with_status_handle(status.clone());
+    reregistering
+        .configure_server_with_descriptor(
+            status_descriptor("shared", McpServerTransport::Http, true),
+            shared,
+            timeouts(),
+            limits(),
+        )
+        .unwrap();
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Ready,
+        "re-registering must preserve state, tool count, and last error"
+    );
+
+    drop(reregistering);
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Ready,
+        "long_lived still claims the server, so it must remain open"
+    );
+
+    drop(long_lived);
+    assert_eq!(
+        status.snapshot().server("shared").unwrap().state(),
+        McpLifecycleState::Closed,
+        "once every claiming registry has dropped, the server must close"
     );
 }
 
@@ -1461,10 +1547,7 @@ fn http_transport_retries_only_transient_statuses_and_reports_exhaustion() {
         if retries {
             assert_eq!(result, Err(McpTransportError::RetriesExhausted));
         } else {
-            assert!(
-                matches!(result, Err(McpTransportError::Transport(_))),
-                "unexpected result: {result:?}"
-            );
+            assert_eq!(result, Err(McpTransportError::HttpStatus(status)));
         }
         server.join().unwrap();
         assert_eq!(attempts.load(Ordering::Acquire), expected_attempts);
@@ -1637,6 +1720,175 @@ fn http_transport_never_retries_protocol_errors_and_accepts_exactly_one_mib() {
         Ok(initialized())
     );
     server.join().unwrap();
+}
+
+#[test]
+fn http_transport_sends_the_streamable_http_accept_header_on_every_post() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, headers) = accept_http_request(&listener);
+        assert!(
+            headers.contains("accept: application/json, text/event-stream\r\n"),
+            "missing Accept header: {headers}"
+        );
+        respond(
+            &mut stream,
+            "200 OK",
+            &initialized_body(),
+            "Content-Type: application/json\r\n",
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+    assert_eq!(
+        transport.execute(
+            McpRequest::Initialize(initialize()),
+            &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+        ),
+        Ok(initialized())
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_surfaces_non_retryable_statuses_as_structured_http_status_without_leaking_remote_text()
+ {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = accept_http_request(&listener);
+        respond(
+            &mut stream,
+            "406 Not Acceptable",
+            b"SENTINEL_SECRET body",
+            "",
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+    let result = transport.execute(
+        McpRequest::Initialize(initialize()),
+        &McpOperationContext::new(Arc::new(AtomicBool::new(false)), Duration::from_secs(1)),
+    );
+    assert_eq!(result, Err(McpTransportError::HttpStatus(406)));
+    assert!(!result.unwrap_err().to_string().contains("SENTINEL_SECRET"));
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_captures_and_echoes_the_mcp_session_id() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut first, _) = accept_http_request(&listener);
+        respond(
+            &mut first,
+            "200 OK",
+            &initialized_body(),
+            "Content-Type: application/json\r\nMcp-Session-Id: s-1\r\n",
+        );
+
+        let (mut second, headers) = accept_http_request(&listener);
+        assert!(
+            headers.contains("mcp-session-id: s-1\r\n"),
+            "session id was not echoed back: {headers}"
+        );
+        let body = br#"{"jsonrpc":"2.0","id":2,"result":{"tools":[],"nextCursor":null}}"#.to_vec();
+        respond(
+            &mut second,
+            "200 OK",
+            &body,
+            "Content-Type: application/json\r\n",
+        );
+    });
+    let mut transport =
+        McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_secs(1));
+    assert_eq!(
+        transport.execute(McpRequest::Initialize(initialize()), &context),
+        Ok(initialized())
+    );
+    assert_eq!(
+        transport.execute(McpRequest::ListTools { cursor: None }, &context),
+        Ok(page(vec![], None))
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_transport_ignores_out_of_bounds_session_ids() {
+    for session_id_header in [
+        format!("Mcp-Session-Id: {}\r\n", "s".repeat(513)),
+        "Mcp-Session-Id: caf\u{e9}\r\n".to_string(),
+    ] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = accept_http_request(&listener);
+            respond(
+                &mut first,
+                "200 OK",
+                &initialized_body(),
+                &format!("Content-Type: application/json\r\n{session_id_header}"),
+            );
+
+            let (mut second, headers) = accept_http_request(&listener);
+            assert!(
+                !headers.to_ascii_lowercase().contains("mcp-session-id"),
+                "an invalid session id must never be echoed: {headers}"
+            );
+            let body =
+                br#"{"jsonrpc":"2.0","id":2,"result":{"tools":[],"nextCursor":null}}"#.to_vec();
+            respond(
+                &mut second,
+                "200 OK",
+                &body,
+                "Content-Type: application/json\r\n",
+            );
+        });
+        let mut transport =
+            McpHttpTransport::new(format!("http://{address}/mcp"), Default::default(), 0).unwrap();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let context = McpOperationContext::new(Arc::clone(&cancellation), Duration::from_secs(1));
+        assert_eq!(
+            transport.execute(McpRequest::Initialize(initialize()), &context),
+            Ok(initialized())
+        );
+        assert_eq!(
+            transport.execute(McpRequest::ListTools { cursor: None }, &context),
+            Ok(page(vec![], None))
+        );
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn connect_accepts_any_supported_protocol_version_and_rejects_an_unsupported_one() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    for version in agens_tools::SUPPORTED_MCP_PROTOCOL_VERSIONS {
+        let transport = LocalTransport::with_responses([Ok(McpResponse::Initialized(
+            McpInitializeResult::new(version, json!({"tools": {}})),
+        ))]);
+        let mut client = McpClient::new(transport, timeouts(), limits());
+        assert_eq!(
+            client.connect(initialize(), &cancellation),
+            Ok(()),
+            "version {version} must be accepted"
+        );
+    }
+
+    let transport = LocalTransport::with_responses([Ok(McpResponse::Initialized(
+        McpInitializeResult::new("2024-11-05", json!({"tools": {}})),
+    ))]);
+    let mut client = McpClient::new(transport, timeouts(), limits());
+    assert_eq!(
+        client.connect(initialize(), &cancellation),
+        Err(McpTransportError::Protocol(
+            "MCP protocol version negotiation failed".into()
+        ))
+    );
 }
 
 #[test]

@@ -1705,6 +1705,16 @@ impl Drop for SubagentPermit {
     }
 }
 
+/// Protocol version agens requests during MCP initialize.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Protocol versions agens accepts from an MCP server's initialize response.
+///
+/// A server is free to answer with a different version than the one agens
+/// requested, as long as it is one this build knows how to speak. Any other
+/// answer fails the connection with `McpErrorCategory::Protocol`.
+pub const SUPPORTED_MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-11-25", "2025-06-18", "2025-03-26"];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpInitialize {
     pub protocol_version: String,
@@ -1805,6 +1815,7 @@ pub enum McpTransportError {
     RetriesExhausted,
     Protocol(String),
     Transport(String),
+    HttpStatus(u16),
 }
 
 impl fmt::Display for McpTransportError {
@@ -1815,6 +1826,7 @@ impl fmt::Display for McpTransportError {
             Self::RetriesExhausted => formatter.write_str("mcp HTTP retries exhausted"),
             Self::Protocol(message) => write!(formatter, "mcp protocol error: {message}"),
             Self::Transport(message) => write!(formatter, "mcp transport error: {message}"),
+            Self::HttpStatus(status) => write!(formatter, "mcp http status {status}"),
         }
     }
 }
@@ -2132,6 +2144,13 @@ pub struct McpRegistry {
     configured: BTreeMap<String, ConfiguredMcpServer>,
     diagnostics: BTreeMap<String, McpServerDiagnostic>,
     attempted: std::collections::BTreeSet<String>,
+    /// Server names this registry has claimed on the shared status handle.
+    ///
+    /// A name is claimed exactly once, even across repeated
+    /// `configure_server*` calls for the same name, so that `close()` releases
+    /// exactly one claim per name regardless of how many times it was
+    /// reconfigured during this registry's lifetime.
+    claimed: std::collections::BTreeSet<String>,
     closed: bool,
     status: McpStatusHandle,
 }
@@ -2163,6 +2182,7 @@ impl McpRegistry {
             configured: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
             attempted: BTreeSet::new(),
+            claimed: BTreeSet::new(),
             closed: false,
             status,
         }
@@ -2206,7 +2226,8 @@ impl McpRegistry {
             ));
         }
         validate_server_name(descriptor.name())?;
-        self.status.register(descriptor);
+        let first_claim = self.claimed.insert(descriptor.name().to_owned());
+        self.status.register(descriptor, first_claim);
         Ok(())
     }
 
@@ -2262,7 +2283,8 @@ impl McpRegistry {
     ) -> Result<(), McpTransportError> {
         validate_server_name(descriptor.name())?;
         let name = descriptor.name().to_owned();
-        self.status.register(descriptor);
+        let first_claim = self.claimed.insert(name.clone());
+        self.status.register(descriptor, first_claim);
         self.configured.insert(
             name.clone(),
             ConfiguredMcpServer {
@@ -2313,18 +2335,13 @@ impl McpRegistry {
         self.closed = true;
         self.tools.clear();
 
-        let owned: Vec<String> = self
-            .configured
-            .keys()
-            .chain(self.clients.keys())
-            .cloned()
-            .collect();
-
         for (_, mut client) in std::mem::take(&mut self.clients) {
             client.close();
         }
 
-        self.status.close_servers(owned.iter().map(String::as_str));
+        let claimed: Vec<String> = std::mem::take(&mut self.claimed).into_iter().collect();
+        self.status
+            .close_servers(claimed.iter().map(String::as_str));
     }
 
     pub fn load_server<T: McpTransport + 'static>(
@@ -2356,7 +2373,7 @@ impl McpRegistry {
                     category = Some(McpErrorCategory::Protocol);
                     McpServerReport::Failed {
                         server_name: server_name.into(),
-                        message: "mcp server load failed; reload to retry".into(),
+                        message: MCP_DUPLICATE_TOOL_NAMES_REASON.into(),
                     }
                 } else {
                     let tool_count = metadata.len();
@@ -2373,10 +2390,11 @@ impl McpRegistry {
                 }
             }
             Err(error) => {
-                category = Some(McpErrorCategory::from(&error));
+                let resolved_category = McpErrorCategory::from(&error);
+                category = Some(resolved_category);
                 McpServerReport::Failed {
                     server_name: server_name.into(),
-                    message: sanitized_mcp_load_error(&error).into(),
+                    message: sanitized_mcp_load_error(resolved_category, &error),
                 }
             }
         };
@@ -2453,7 +2471,7 @@ impl McpRegistry {
                 server_name,
                 transport,
                 &McpInitialize::new(
-                    "2025-06-18",
+                    MCP_PROTOCOL_VERSION,
                     Value::Object(Default::default()),
                     "agens",
                     "0.1.0",
@@ -2463,11 +2481,12 @@ impl McpRegistry {
                 Arc::new(AtomicBool::new(false)),
             ),
             Err(error) => {
+                let category = McpErrorCategory::from(&error);
                 let report = McpServerReport::Failed {
                     server_name: server_name.into(),
-                    message: sanitized_mcp_load_error(&error).into(),
+                    message: sanitized_mcp_load_error(category, &error),
                 };
-                self.record_report(&report, Some(McpErrorCategory::from(&error)));
+                self.record_report(&report, Some(category));
                 report
             }
         }
@@ -2593,14 +2612,81 @@ fn mcp_call_error(error: McpTransportError) -> Error {
         McpTransportError::TimedOut => Error::Tool("mcp operation timed out".into()),
         McpTransportError::RetriesExhausted
         | McpTransportError::Protocol(_)
-        | McpTransportError::Transport(_) => {
+        | McpTransportError::Transport(_)
+        | McpTransportError::HttpStatus(_) => {
             Error::Extension("mcp tool infrastructure failure".into())
         }
     }
 }
 
-fn sanitized_mcp_load_error(_: &McpTransportError) -> &'static str {
-    "mcp server load failed; reload to retry"
+const MCP_DUPLICATE_TOOL_NAMES_REASON: &str = "protocol: duplicate tool names";
+
+/// Renders a load failure as a sanitized, agens-authored reason.
+///
+/// The result never interpolates remote text (bodies, headers, or messages
+/// from the MCP server) — only the error category and, for HTTP status
+/// failures, the numeric status code agens itself observed on the wire.
+fn sanitized_mcp_load_error(category: McpErrorCategory, error: &McpTransportError) -> String {
+    match (category, error) {
+        (McpErrorCategory::Cancelled, _) => "cancelled: connect cancelled".into(),
+        (McpErrorCategory::Timeout, _) => "timeout: connect timed out".into(),
+        (McpErrorCategory::RetriesExhausted, _) => {
+            "retries_exhausted: server did not respond".into()
+        }
+        (McpErrorCategory::Protocol, _) => "protocol: server response rejected".into(),
+        (McpErrorCategory::Transport, McpTransportError::HttpStatus(status)) => {
+            format!("transport: http status {status}")
+        }
+        (McpErrorCategory::Transport, _) => "transport: connection failed".into(),
+        (McpErrorCategory::Unavailable, _) => "mcp server load failed; reload to retry".into(),
+    }
+}
+
+#[cfg(test)]
+mod mcp_sanitized_error_tests {
+    use super::*;
+
+    #[test]
+    fn sanitized_mcp_load_error_covers_the_closed_reason_set_without_leaking_remote_text() {
+        let cases = [
+            (
+                McpErrorCategory::Cancelled,
+                McpTransportError::Cancelled,
+                "cancelled: connect cancelled",
+            ),
+            (
+                McpErrorCategory::Timeout,
+                McpTransportError::TimedOut,
+                "timeout: connect timed out",
+            ),
+            (
+                McpErrorCategory::RetriesExhausted,
+                McpTransportError::RetriesExhausted,
+                "retries_exhausted: server did not respond",
+            ),
+            (
+                McpErrorCategory::Protocol,
+                McpTransportError::Protocol("SENTINEL_SECRET body".into()),
+                "protocol: server response rejected",
+            ),
+            (
+                McpErrorCategory::Transport,
+                McpTransportError::Transport("SENTINEL_SECRET body".into()),
+                "transport: connection failed",
+            ),
+            (
+                McpErrorCategory::Transport,
+                McpTransportError::HttpStatus(406),
+                "transport: http status 406",
+            ),
+        ];
+
+        for (category, error, expected) in cases {
+            let message = sanitized_mcp_load_error(category, &error);
+            assert_eq!(message, expected);
+            assert!(!message.contains("SENTINEL_SECRET"));
+        }
+    }
 }
 
 fn load_server_client<T: McpTransport>(
@@ -2658,7 +2744,7 @@ impl<T: McpTransport> McpClient<T> {
         let initialized = expect_initialized(
             self.request(McpRequest::Initialize(initialize.clone()), &context)?,
         )?;
-        if initialized.protocol_version != initialize.protocol_version {
+        if !SUPPORTED_MCP_PROTOCOL_VERSIONS.contains(&initialized.protocol_version.as_str()) {
             return Err(McpTransportError::Protocol(
                 "MCP protocol version negotiation failed".into(),
             ));

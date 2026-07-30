@@ -24,6 +24,8 @@ pub struct HttpRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
+    /// Response headers with lower-cased names, as observed on the wire.
+    pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,6 +337,7 @@ mod tests {
     fn response() -> HttpResponse {
         HttpResponse {
             status: 200,
+            headers: BTreeMap::new(),
             body: b"ok".to_vec(),
         }
     }

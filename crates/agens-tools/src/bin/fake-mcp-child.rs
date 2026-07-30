@@ -118,7 +118,14 @@ fn main() {
         };
         let response = match request.get("method").and_then(Value::as_str) {
             Some("initialize") => {
-                json!({"jsonrpc":"2.0","id":response_id,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}})
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": response_id,
+                    "result": {
+                        "protocolVersion": agens_tools::MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                    },
+                })
             }
             Some("tools/list")
                 if request

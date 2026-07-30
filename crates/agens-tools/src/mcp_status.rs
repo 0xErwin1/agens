@@ -50,7 +50,23 @@ impl From<&McpTransportError> for McpErrorCategory {
             McpTransportError::TimedOut => Self::Timeout,
             McpTransportError::RetriesExhausted => Self::RetriesExhausted,
             McpTransportError::Protocol(_) => Self::Protocol,
-            McpTransportError::Transport(_) => Self::Transport,
+            McpTransportError::Transport(_) | McpTransportError::HttpStatus(_) => Self::Transport,
+        }
+    }
+}
+
+impl McpErrorCategory {
+    /// Stable, lower-case identifier for this category, used as the prefix of
+    /// every sanitized status reason and by any surface that renders the
+    /// category on its own (e.g. the `/mcp` overlay).
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
+            Self::RetriesExhausted => "retries_exhausted",
+            Self::Protocol => "protocol",
+            Self::Transport => "transport",
+            Self::Unavailable => "unavailable",
         }
     }
 }
@@ -210,63 +226,110 @@ impl McpStatusSnapshot {
     }
 }
 
+#[derive(Default)]
+struct McpStatusInner {
+    servers: BTreeMap<String, McpServerStatus>,
+    /// Number of live registries that currently claim a given server name.
+    ///
+    /// Several registries can share one `McpStatusHandle` and configure the
+    /// same server name (e.g. a long-lived router registry and a per-turn
+    /// registry). `close_servers` must only retire an entry once every
+    /// claiming registry has released it, otherwise an ephemeral registry's
+    /// shutdown would falsely report a server owned by another registry as
+    /// `Closed`.
+    claims: BTreeMap<String, usize>,
+}
+
 #[derive(Clone, Default)]
-pub struct McpStatusHandle(pub(crate) Arc<Mutex<BTreeMap<String, McpServerStatus>>>);
+pub struct McpStatusHandle(Arc<Mutex<McpStatusInner>>);
 
 impl McpStatusHandle {
     pub fn snapshot(&self) -> McpStatusSnapshot {
-        let statuses = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self.lock();
         McpStatusSnapshot {
-            servers: statuses.values().cloned().collect(),
+            servers: inner.servers.values().cloned().collect(),
         }
     }
 
-    pub(crate) fn register(&self, descriptor: McpServerDescriptor) {
-        let state = if descriptor.enabled {
-            McpLifecycleState::Idle
-        } else {
-            McpLifecycleState::Disabled
-        };
+    fn lock(&self) -> std::sync::MutexGuard<'_, McpStatusInner> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                descriptor.name.clone(),
-                McpServerStatus {
-                    descriptor,
-                    state,
-                    tool_count: 0,
-                    tool_names: Vec::new(),
-                    last_error: None,
-                },
-            );
+    }
+
+    /// Registers or refreshes a server's descriptor.
+    ///
+    /// `claim` must be `true` exactly once per (registry, server name) pair —
+    /// the caller is responsible for deduplicating repeated configuration
+    /// calls for the same server within one registry, so that the matching
+    /// `close_servers` call retires the entry only when every claiming
+    /// registry has released it.
+    ///
+    /// An existing entry whose enabled-ness is unchanged keeps its lifecycle
+    /// state, tool count, tool names, and last error: re-registering a server
+    /// (e.g. because a new per-turn registry is constructed against the same
+    /// shared handle) must not falsify a `Ready` server back to `Idle`.
+    pub(crate) fn register(&self, descriptor: McpServerDescriptor, claim: bool) {
+        let mut inner = self.lock();
+        if claim {
+            *inner.claims.entry(descriptor.name.clone()).or_insert(0) += 1;
+        }
+        match inner.servers.get_mut(&descriptor.name) {
+            Some(existing) if existing.descriptor.enabled == descriptor.enabled => {
+                existing.descriptor = descriptor;
+            }
+            _ => {
+                let state = if descriptor.enabled {
+                    McpLifecycleState::Idle
+                } else {
+                    McpLifecycleState::Disabled
+                };
+                inner.servers.insert(
+                    descriptor.name.clone(),
+                    McpServerStatus {
+                        descriptor,
+                        state,
+                        tool_count: 0,
+                        tool_names: Vec::new(),
+                        last_error: None,
+                    },
+                );
+            }
+        }
     }
 
     pub(crate) fn update(&self, name: &str, update: impl FnOnce(&mut McpServerStatus)) {
-        let mut statuses = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(status) = statuses.get_mut(name) {
+        let mut inner = self.lock();
+        if let Some(status) = inner.servers.get_mut(name) {
             update(status);
         }
     }
 
-    /// Marks the named servers closed, leaving every other entry untouched.
+    /// Releases one claim per named server, marking it closed only once its
+    /// claim count reaches zero, leaving every other entry untouched.
     ///
     /// The handle is shared by every registry built from the same bootstrap, so a
-    /// registry that shuts down must only retire the servers it owns. Closing the
-    /// whole map would retire the entries of registries that are still live.
+    /// registry that shuts down must only retire the servers it owns, and only
+    /// once no other registry still claims that same name. Closing the whole
+    /// map would retire the entries of registries that are still live.
     pub(crate) fn close_servers<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
-        let mut statuses = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock();
         for name in names {
-            if let Some(status) = statuses.get_mut(name)
+            let released = match inner.claims.get_mut(name) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    inner.claims.remove(name);
+                    true
+                }
+                None => true,
+            };
+            if !released {
+                continue;
+            }
+            if let Some(status) = inner.servers.get_mut(name)
                 && status.state != McpLifecycleState::Disabled
             {
                 status.state = McpLifecycleState::Closed;
