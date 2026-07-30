@@ -1656,3 +1656,39 @@ fn webfetch_bounds_cancelled_request_workers_and_reuses_the_admission_slot() {
     drop(tools);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn confined_open_reports_canonical_filesystem_reasons() {
+    let root = project_root();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("locked.txt"), "body").unwrap();
+    fs::set_permissions(
+        root.join("locked.txt"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    let tools = NativeTools::open(&root).unwrap();
+
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("missing.json")).unwrap(),
+        ToolOutput::failure("read: file not found")
+    );
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("locked.txt")).unwrap(),
+        ToolOutput::failure("read: permission denied")
+    );
+    assert_eq!(
+        tools.read_file(ReadFileInput::new("nested")).unwrap(),
+        ToolOutput::failure("read: path is not a regular file")
+    );
+    assert_eq!(
+        tools
+            .edit_file(EditFileInput::new("missing.json", "a", "b"))
+            .unwrap(),
+        ToolOutput::failure("edit: file not found")
+    );
+
+    drop(tools);
+    fs::remove_dir_all(root).unwrap();
+}

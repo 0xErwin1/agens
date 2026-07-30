@@ -783,6 +783,33 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
     );
 }
 
+/// A missing or unreadable file is the most common native failure, and the model can only stop
+/// retrying it if the reason survives sanitization. These reasons name neither a path nor any
+/// content, while an unmapped reason must still degrade to the generic message.
+#[test]
+fn canonical_filesystem_reasons_survive_sanitization() {
+    for reason in [
+        "file not found",
+        "permission denied",
+        "path is a directory",
+        "path is not a regular file",
+    ] {
+        assert_eq!(
+            sanitized_native_tool_failure(&format!("read: {reason}")),
+            format!("read: {reason}")
+        );
+    }
+
+    assert_eq!(
+        sanitized_native_tool_failure("read: No such file or directory (os error 2)"),
+        "tool execution failed"
+    );
+    assert_eq!(
+        sanitized_native_tool_failure("read: /home/user/.ssh/id_rsa is unreadable"),
+        "tool execution failed"
+    );
+}
+
 #[test]
 fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     let ordinary_deny = PermissionPolicy::new(
