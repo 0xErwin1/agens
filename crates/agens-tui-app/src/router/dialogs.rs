@@ -386,7 +386,7 @@ impl TuiRuntimeRouter {
                 };
                 let dialog = DialogView::selection(
                     "Subagent profiles",
-                    Some(format!("Enter model · ←/→ effort · ⌫ reset · Tab scope: {scope_label} · type to filter · Esc close")),
+                    Some(format!("Enter model · ←/→ effort · ⌫ reset · Tab scope: {scope_label} · / search · Esc close")),
                     entries,
                 )
                 .with_empty_message("No subagents are available.")

@@ -2207,7 +2207,6 @@ fn renderer_clips_a_generic_dialog_inside_the_viewport() {
         text.contains("─ Details"),
         "title sits in the border: {text:?}"
     );
-    assert!(text.contains("[×]"), "{text:?}");
     assert!(text.contains("bounded dialog body"), "{text:?}");
     assert!(text.contains("close"), "derived footer: {text:?}");
 }
@@ -2262,8 +2261,7 @@ fn renderer_clips_selection_help_options_current_and_disabled_states_after_resiz
     let text = rendered_text(&renderer);
 
     assert!(text.contains("─ Choose a model"), "{text:?}");
-    assert!(text.contains("[×]"), "{text:?}");
-    assert!(text.contains("❯ gpt-4.1 (current)"), "{text:?}");
+    assert!(text.contains("▌ gpt-4.1 (current)"), "{text:?}");
     // 28 columns leave 11 label cells once the badge is placed.
     assert!(text.contains("disabled future-mod"), "{text:?}");
     assert!(text.contains("navigate"), "derived footer: {text:?}");
@@ -2292,19 +2290,19 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     }
     renderer.render(tui.view()).unwrap();
     let arrows = rendered_text(&renderer);
-    assert!(arrows.contains("❯ Option 08"), "{arrows:?}");
+    assert!(arrows.contains("▌ Option 08"), "{arrows:?}");
     assert!(!arrows.contains("Option 00"), "{arrows:?}");
     assert!(arrows.contains("█") || arrows.contains("│"), "{arrows:?}");
 
     tui.handle(Event::Key(Key::PageDown));
     renderer.render(tui.view()).unwrap();
     let page = rendered_text(&renderer);
-    assert!(page.contains("❯ Option 10"), "{page:?}");
+    assert!(page.contains("▌ Option 11"), "{page:?}");
 
     tui.handle(Event::Key(Key::ScrollUp));
     renderer.render(tui.view()).unwrap();
     let wheel = rendered_text(&renderer);
-    assert!(wheel.contains("❯ Option 09"), "{wheel:?}");
+    assert!(wheel.contains("▌ Option 10"), "{wheel:?}");
 
     tui.handle(Event::Resize {
         width: 24,
@@ -2312,16 +2310,17 @@ fn long_selection_dialog_scrolls_each_input_and_keeps_selection_visible_after_re
     });
     renderer.render(tui.view()).unwrap();
     let resized = rendered_text(&renderer);
-    assert!(resized.contains("❯ Option 09"), "{resized:?}");
+    assert!(resized.contains("▌ Option 10"), "{resized:?}");
 
+    tui.handle(Event::Key(Key::Char('/')));
     tui.handle(Event::Key(Key::Char('1')));
     for _ in 0..10 {
         tui.handle(Event::Key(Key::PageDown));
     }
     renderer.render(tui.view()).unwrap();
     let filtered = rendered_text(&renderer);
-    assert!(filtered.contains("search: 1"), "{filtered:?}");
-    assert!(filtered.contains("❯ Option 19"), "{filtered:?}");
+    assert!(filtered.contains("/ 1"), "{filtered:?}");
+    assert!(filtered.contains("▌ Option 19"), "{filtered:?}");
     assert!(!filtered.contains("Option 08"), "{filtered:?}");
 }
 
@@ -2356,7 +2355,7 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
         "{project:?}"
     );
     assert!(project.contains("ctrl+a all projects"), "{project:?}");
-    assert!(project.contains("❯ #7 Alpha"), "{project:?}");
+    assert!(project.contains("▌ #7 Alpha"), "{project:?}");
     assert!(project.contains("2 turns · 5m ago"), "{project:?}");
     assert!(project.contains("page 1 · more"), "{project:?}");
     assert!(
@@ -2393,6 +2392,7 @@ fn session_dialog_renders_scope_hints_rows_details_and_distinct_empty_states() {
     assert!(!global.contains("Agent: primary"), "{global:?}");
 
     let mut search_request = None;
+    tui.handle(Event::Key(Key::Char('/')));
     for character in "missing".chars() {
         let Action::LoadSessionPage(request) = tui.handle(Event::Key(Key::Char(character))) else {
             panic!("search should request a page");
@@ -2472,15 +2472,16 @@ fn short_session_dialog_keeps_search_and_selected_row_visible_without_default_de
         width: 34,
         height: 7,
     });
+    tui.handle(Event::Key(Key::Char('/')));
     for _ in 0..8 {
         tui.handle(Event::Key(Key::Down));
     }
 
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
-    assert!(text.contains("search:"), "{text:?}");
+    assert!(text.contains("/ "), "{text:?}");
     // 34 columns keep the right column and truncate the label instead.
-    assert!(text.contains("❯ #8 Sessio"), "{text:?}");
+    assert!(text.contains("▌ #8 Sessio"), "{text:?}");
     assert!(text.contains("2 turns · now"), "{text:?}");
     assert!(!text.contains("Agent: primary"), "{text:?}");
     assert!(!text.contains("#0 Session 0"), "{text:?}");
@@ -2512,9 +2513,8 @@ fn subagent_inspect_dialog_renders_through_the_overlay_shell() {
     let inspect = rendered_text(&renderer);
 
     assert!(inspect.contains("─ Subagents"), "{inspect:?}");
-    assert!(inspect.contains("[×]"), "{inspect:?}");
     assert!(inspect.contains("  Main"), "{inspect:?}");
-    assert!(inspect.contains("❯ Explore #9"), "{inspect:?}");
+    assert!(inspect.contains("▌ Explore #9"), "{inspect:?}");
     assert!(inspect.contains("  Reviewer #10"), "{inspect:?}");
     assert!(inspect.contains("navigate"), "derived footer: {inspect:?}");
     assert!(inspect.contains("select"), "derived footer: {inspect:?}");
@@ -2645,14 +2645,13 @@ fn renderer_draws_a_bounded_palette_overlay_without_reflowing_the_conversation()
     assert!(!palette.contains("[built-in]"), "{palette:?}");
     assert_eq!(
         cell_for_text(&renderer, "commands").fg,
-        Color::Rgb(0xbf, 0xbd, 0xb6)
+        Color::Rgb(0x95, 0xe6, 0xcb)
     );
     assert_eq!(
         cell_for_text(&renderer, "─ commands").fg,
         Color::Rgb(0x6c, 0x73, 0x80)
     );
-    assert!(palette.contains("[×]"), "{palette:?}");
-    assert!(palette.contains("❯ /review"), "{palette:?}");
+    assert!(palette.contains("▌ /review"), "{palette:?}");
     assert!(palette.contains("navigate"), "{palette:?}");
     assert!(palette.contains("close"), "{palette:?}");
     assert_eq!(
@@ -2694,7 +2693,7 @@ fn renderer_draws_the_palette_description_column_right_aligned_when_wide() {
     renderer.render(tui.view()).unwrap();
     let palette = rendered_text(&renderer);
 
-    assert!(palette.contains("❯ /review [scope]"), "{palette:?}");
+    assert!(palette.contains("▌ /review [scope]"), "{palette:?}");
     assert!(palette.contains("Review the patch"), "{palette:?}");
     assert!(palette.contains("Resume a session"), "{palette:?}");
     assert_eq!(
@@ -2704,7 +2703,13 @@ fn renderer_draws_the_palette_description_column_right_aligned_when_wide() {
     );
     assert_eq!(
         cell_for_text(&renderer, "Review the patch").fg,
-        Color::Rgb(0x5c, 0x67, 0x73)
+        Color::Rgb(0xbf, 0xbd, 0xb6),
+        "the selected row lifts its metadata out of the muted grey"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "Resume a session").fg,
+        Color::Rgb(0x5c, 0x67, 0x73),
+        "unselected rows keep the muted metadata column"
     );
     assert_eq!(
         cell_for_text(&renderer, "Review the patch").bg,
@@ -4144,8 +4149,7 @@ fn renderer_draws_the_file_picker_with_the_name_and_its_directory_column() {
     let picker = rendered_text(&renderer);
 
     assert!(picker.contains("files"), "{picker:?}");
-    assert!(picker.contains("[×]"), "{picker:?}");
-    assert!(picker.contains("❯ AGENTS.md"), "{picker:?}");
+    assert!(picker.contains("▌ AGENTS.md"), "{picker:?}");
     assert!(picker.contains("render.rs"), "{picker:?}");
     assert!(picker.contains("crates/agens-tui/src"), "{picker:?}");
     assert!(picker.contains("insert"), "{picker:?}");
@@ -4164,7 +4168,7 @@ fn renderer_draws_the_file_picker_with_the_name_and_its_directory_column() {
     }
     renderer.render(tui.view()).unwrap();
     let filtered = rendered_text(&renderer);
-    assert!(filtered.contains("❯ render.rs"), "{filtered:?}");
+    assert!(filtered.contains("▌ render.rs"), "{filtered:?}");
     assert!(!filtered.contains("AGENTS.md"), "{filtered:?}");
 
     for character in "-missing".chars() {

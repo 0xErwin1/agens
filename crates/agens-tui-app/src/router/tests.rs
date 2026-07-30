@@ -486,6 +486,7 @@ fn subagent_profile_root_searches_letters_and_focuses_the_autosaved_row() {
         TuiRouteRequest::OpenDialog("subagent-profiles".into()),
         progress.clone(),
     ));
+    assert_eq!(tui.handle(Event::Key(Key::Char('/'))), Action::Render);
     for key in [Key::Char('m'), Key::Char('s')] {
         assert_eq!(tui.handle(Event::Key(key)), Action::Render);
     }
@@ -1857,6 +1858,7 @@ fn tui_model_overlay_labels_source_metadata_current_and_compatible_sets() {
         );
 
         tui.apply_submission_outcome(router.open_dialog("model").unwrap());
+        tui.handle(Event::Key(Key::Char('/')));
         for character in "gpt-5.6-sol".chars() {
             tui.handle(Event::Key(Key::Char(character)));
         }
@@ -1902,7 +1904,7 @@ fn tui_provider_overlay_filters_unavailable_entries_and_switches_without_history
         overlay.contains("Current: OpenAI API · credential required"),
         "{overlay:?}"
     );
-    assert!(overlay.contains("❯ ChatGPT subscription"), "{overlay:?}");
+    assert!(overlay.contains("▌ ChatGPT subscription"), "{overlay:?}");
     assert!(overlay.contains("ready"), "{overlay:?}");
     assert!(!overlay.contains("OpenAI API (current)"), "{overlay:?}");
     assert!(!overlay.contains("secret-"), "{overlay:?}");
@@ -1913,6 +1915,7 @@ fn tui_provider_overlay_filters_unavailable_entries_and_switches_without_history
     let model_overlay = render_tui_test_backend(&tui, 140, 40);
     assert!(model_overlay.contains("All providers · current: ChatGPT subscription"));
     assert!(model_overlay.contains("gpt-5.5 · ChatGPT subscription (current)"));
+    tui.handle(Event::Key(Key::Char('/')));
     for character in "kimi".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
@@ -2158,6 +2161,7 @@ fn tui_model_overlay_selects_exact_future_id_with_unknown_metadata_and_default_e
         progress.clone(),
     ));
 
+    tui.handle(Event::Key(Key::Char('/')));
     for character in "gpt-future-1".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
@@ -2571,6 +2575,7 @@ fn session_overlay_uses_real_metadata_scope_search_sort_clock_and_atomic_failure
     assert!(global_rows.find("Beta").unwrap() < global_rows.find("Alpha").unwrap());
 
     let mut search_action = Action::Render;
+    tui.handle(Event::Key(Key::Char('/')));
     for character in "reviewer".chars() {
         search_action = tui.handle(Event::Key(Key::Char(character)));
     }
@@ -2580,10 +2585,12 @@ fn session_overlay_uses_real_metadata_scope_search_sort_clock_and_atomic_failure
     assert!(!agent_search.contains("Alpha"));
     assert!(!agent_search.contains("Beta"));
     tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Escape));
     tui.apply_submission_outcome(router.open_dialog("sessions").unwrap());
     let global_action = tui.handle(Event::Key(Key::LineStart));
     dispatch_tui_session_page(&mut tui, &router, global_action, progress.clone());
     let mut search_action = Action::Render;
+    tui.handle(Event::Key(Key::Char('/')));
     for character in "other-root".chars() {
         search_action = tui.handle(Event::Key(Key::Char(character)));
     }
@@ -2593,6 +2600,7 @@ fn session_overlay_uses_real_metadata_scope_search_sort_clock_and_atomic_failure
     assert!(!root_search.contains("Gamma"));
     assert_eq!(*session.lock().unwrap(), original_context);
 
+    tui.handle(Event::Key(Key::Escape));
     tui.handle(Event::Key(Key::Escape));
     tui.apply_submission_outcome(router.open_dialog("sessions").unwrap());
     SessionStore::open(bootstrap.data_directory())

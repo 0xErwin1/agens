@@ -254,6 +254,7 @@ mod tests {
             tui.apply_submission_outcome(router.route("/mcp".into()))
                 .is_none()
         );
+        tui.handle(agens_tui::Event::Key(agens_tui::Key::Char('/')));
         for character in "idle".chars() {
             tui.handle(agens_tui::Event::Key(agens_tui::Key::Char(character)));
         }

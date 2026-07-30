@@ -89,7 +89,7 @@ impl OverlayShortcut<'_> {
         let key = Span::styled(
             self.key.to_owned(),
             Style::default()
-                .fg(RolePalette::assistant())
+                .fg(RolePalette::accent_active())
                 .add_modifier(Modifier::BOLD),
         );
         let label = Span::styled(
@@ -242,7 +242,6 @@ pub(crate) struct OverlayLayout {
 
 const MAX_FOOTER_ROWS: u16 = 2;
 const FOOTER_SEPARATOR: &str = "  ·  ";
-const CLOSE_AFFORDANCE: &str = "[×]";
 
 /// Greedy packing of footer shortcuts, capped at [`MAX_FOOTER_ROWS`].
 ///
@@ -397,6 +396,11 @@ impl OverlayFrame {
 }
 
 /// Top border row with the title spliced between dashes, degrading by width.
+///
+/// The title is the overlay's only identity marker, so it carries the brand hue
+/// while the rule around it stays chrome. Nothing else is spliced into the
+/// border: a painted close affordance reads as a control the keyboard-only
+/// shell never offers.
 fn top_border(width: u16, title: &str) -> Line<'static> {
     let chrome = Style::default().fg(RolePalette::chrome());
     let dashes = |count: usize| Span::styled("─".repeat(count), chrome);
@@ -406,35 +410,26 @@ fn top_border(width: u16, title: &str) -> Line<'static> {
 
     let width = usize::from(width);
     let inner = width - 2;
-    let close = if width >= title.width() + 10 {
-        CLOSE_AFFORDANCE.width()
-    } else {
-        0
-    };
-    let budget = inner.saturating_sub(3 + close);
     let title = if width < 12 {
         String::new()
     } else {
-        truncate_columns(title, budget)
+        truncate_columns(title, inner.saturating_sub(3))
     };
 
     let mut spans = vec![Span::styled("╭", chrome)];
     if title.is_empty() {
-        spans.push(dashes(inner - close));
+        spans.push(dashes(inner));
     } else {
         spans.push(dashes(1));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             title.clone(),
             Style::default()
-                .fg(RolePalette::assistant())
+                .fg(RolePalette::brand())
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
-        spans.push(dashes(inner - 3 - title.width() - close));
-    }
-    if close > 0 {
-        spans.push(Span::styled(CLOSE_AFFORDANCE, chrome));
+        spans.push(dashes(inner - 3 - title.width()));
     }
     spans.push(Span::styled("╮", chrome));
     Line::from(spans)

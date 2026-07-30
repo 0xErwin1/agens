@@ -79,7 +79,10 @@ impl McpStdioTransport {
         command
             .args(&config.args)
             .current_dir(&config.project_root)
-            .env_clear()
+            // The child inherits the parent environment, and the configured entries
+            // are layered on top. Clearing it first left the child without `PATH`, so
+            // a command named rather than pathed — the portable way to declare one —
+            // could never be resolved, and every stdio server failed to start.
             .envs(&config.environment)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
