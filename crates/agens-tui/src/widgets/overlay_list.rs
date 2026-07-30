@@ -18,7 +18,11 @@ use unicode_width::UnicodeWidthStr;
 use super::{RolePalette, overlay::truncate_columns};
 
 /// Selection marker and its blank counterpart, always the same two columns.
-const SELECTED_MARKER: &str = "❯ ";
+///
+/// A solid rule rather than a chevron: it merges with the selected row's
+/// background wash into one continuous band, so the eye reads the whole row as
+/// selected instead of one glyph in front of it.
+const SELECTED_MARKER: &str = "▌ ";
 const PLAIN_MARKER: &str = "  ";
 const MARKER_COLUMNS: usize = 2;
 /// Gap column plus the track column reserved on the right when the list scrolls.
@@ -30,9 +34,11 @@ const BADGE_GAP: usize = 1;
 const MIN_LABEL_COLUMNS: usize = 8;
 /// Below this the metadata column is dropped instead of squeezed to noise.
 const MIN_RIGHT_COLUMNS: usize = 8;
-const SEARCH_LABEL: &str = "search: ";
+/// The row is only painted while search mode is armed, so it repeats the key
+/// that armed it instead of naming itself.
+const SEARCH_LABEL: &str = "/ ";
 const SEARCH_CURSOR: &str = "▏";
-const SEARCH_HINT: &str = "type to filter";
+const SEARCH_HINT: &str = "type to filter · esc to exit";
 
 /// One list row: left label, optional right-aligned metadata, optional badge.
 #[derive(Default)]
@@ -81,11 +87,18 @@ impl<'a> OverlayRow<'a> {
         }
 
         let muted = Style::default().fg(RolePalette::muted());
+        // On the selection wash the muted grey loses almost all contrast, so the
+        // row's metadata steps up one level while the row is the selected one.
+        let meta = if self.selected {
+            Style::default().fg(RolePalette::assistant())
+        } else {
+            muted
+        };
         if let Some(badge) = self
             .badge
             .filter(|badge| badge.width() + BADGE_GAP <= remaining)
         {
-            spans.push(Span::styled(format!("{badge} "), muted));
+            spans.push(Span::styled(format!("{badge} "), meta));
             remaining -= badge.width() + BADGE_GAP;
         }
 
@@ -119,7 +132,7 @@ impl<'a> OverlayRow<'a> {
         spans.push(Span::raw(" ".repeat(fill)));
 
         if let Some(right) = right {
-            spans.push(Span::styled(right, muted));
+            spans.push(Span::styled(right, meta));
             spans.push(Span::raw(" ".repeat(TRAILING_PAD)));
         }
         Line::from(spans)
@@ -182,7 +195,12 @@ impl OverlayList {
 
         let budget = usize::from(area.width).saturating_sub(SEARCH_LABEL.width() + 1);
         let mut spans = vec![
-            Span::styled(SEARCH_LABEL, Style::default().fg(RolePalette::muted())),
+            Span::styled(
+                SEARCH_LABEL,
+                Style::default()
+                    .fg(RolePalette::brand())
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 truncate_columns(query, budget),
                 Style::default().fg(RolePalette::assistant()),
@@ -403,7 +421,7 @@ mod tests {
 
         let buffer = render_rows(20, &rows, rows.len());
 
-        assert!(row_text(&buffer, 0).starts_with("❯ alpha"), "selected row");
+        assert!(row_text(&buffer, 0).starts_with("▌ alpha"), "selected row");
         assert!(row_text(&buffer, 1).starts_with("  beta"), "plain row");
         assert_eq!(buffer.content[2].fg, RolePalette::selection_fg());
         assert_eq!(buffer.content[19].bg, RolePalette::selection_bg());
@@ -420,11 +438,11 @@ mod tests {
         };
 
         let empty = search("");
-        assert!(empty.starts_with("search: ▏"), "{empty:?}");
+        assert!(empty.starts_with("/ ▏"), "{empty:?}");
         assert!(empty.contains("type to filter"), "{empty:?}");
 
         let typed = search("rev");
-        assert!(typed.starts_with("search: rev▏"), "{typed:?}");
+        assert!(typed.starts_with("/ rev▏"), "{typed:?}");
         assert!(!typed.contains("type to filter"), "{typed:?}");
     }
 

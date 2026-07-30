@@ -455,6 +455,7 @@ fn session_dialog_requests_server_search_scope_and_keyset_pages_with_generations
         Some(SessionDialogCursor::new(250, 438)),
     ));
 
+    assert_eq!(tui.handle(Event::Key(Key::Char('/'))), Action::Render);
     let Action::LoadSessionPage(search) = tui.handle(Event::Key(Key::Char('n'))) else {
         panic!("session search should request a server page");
     };
@@ -2102,7 +2103,7 @@ fn selection_dialog_navigates_dispatches_once_and_precedes_composer_input() {
         ],
     ));
 
-    for character in "sec".chars() {
+    for character in "/sec".chars() {
         assert_eq!(tui.handle(Event::Key(Key::Char(character))), Action::Render);
     }
     assert_eq!(tui.input(), "d");
@@ -2133,7 +2134,7 @@ fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.show_selection_dialog(dialog);
 
-    for character in "gpt-5.6".chars() {
+    for character in "/gpt-5.6".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
 
@@ -2149,7 +2150,7 @@ fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
     )
     .with_identifier_query_action("Use ", " (unverified metadata)", "model-custom:", 8);
     tui.show_selection_dialog(dialog);
-    for character in "model-too-long".chars() {
+    for character in "/model-too-long".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
 
@@ -2162,7 +2163,7 @@ fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
     )
     .with_identifier_query_action("Use ", " (unverified metadata)", "model-custom:", 64);
     tui.show_selection_dialog(dialog);
-    for character in "bad*model".chars() {
+    for character in "/bad*model".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
 
@@ -2170,7 +2171,7 @@ fn selection_dialog_offers_a_bounded_query_action_only_without_matches() {
 }
 
 #[test]
-fn selection_dialog_search_edits_navigates_filtered_rows_and_closes_on_first_escape() {
+fn selection_dialog_search_edits_navigate_rows_and_escape_disarms_before_closing() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Resize {
         width: 24,
@@ -2184,7 +2185,7 @@ fn selection_dialog_search_edits_navigates_filtered_rows_and_closes_on_first_esc
             .collect(),
     ));
 
-    for character in "Option 1x".chars() {
+    for character in "/Option 1x".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
     tui.handle(Event::Key(Key::Backspace));
@@ -2201,13 +2202,19 @@ fn selection_dialog_search_edits_navigates_filtered_rows_and_closes_on_first_esc
         None::<String>,
         vec![DialogEntry::action("Alpha", "alpha")],
     ));
-    for character in "alpha".chars() {
+    for character in "/alpha".chars() {
         tui.handle(Event::Key(Key::Char(character)));
     }
     tui.handle(Event::Key(Key::DeletePreviousWord));
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+    assert!(
+        tui.view().dialog.is_some(),
+        "the first escape only leaves search"
+    );
+    assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
     assert!(tui.view().dialog.is_none());
 
+    // Without search armed the first escape closes the dialog outright.
     tui.show_selection_dialog(DialogView::selection(
         "Choose",
         None::<String>,
@@ -2242,6 +2249,7 @@ fn session_dialog_toggles_scope_preserves_search_and_dispatches_server_selection
     ));
 
     let mut search = None;
+    assert_eq!(tui.handle(Event::Key(Key::Char('/'))), Action::Render);
     for character in "reviewer".chars() {
         let Action::LoadSessionPage(request) = tui.handle(Event::Key(Key::Char(character))) else {
             panic!("session search should load from the store");
@@ -3030,7 +3038,7 @@ fn permission_confirm_short_keys_do_not_append_to_query() {
 }
 
 #[test]
-fn picker_overlay_still_types_query_for_plain_characters() {
+fn picker_overlay_types_a_query_only_once_search_is_armed() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.show_selection_dialog(DialogView::selection(
         "Choose",
@@ -3041,6 +3049,22 @@ fn picker_overlay_still_types_query_for_plain_characters() {
         ],
     ));
 
+    // Unarmed, an unbound character is dropped and the selection stays put.
+    assert_eq!(tui.handle(Event::Key(Key::Char('d'))), Action::Render);
+    assert_eq!(
+        tui.handle(Event::Key(Key::Enter)),
+        Action::DialogAction("alpha".into())
+    );
+
+    tui.show_selection_dialog(DialogView::selection(
+        "Choose",
+        Some("Pick"),
+        vec![
+            DialogEntry::action("alpha", "alpha"),
+            DialogEntry::action("delta", "delta"),
+        ],
+    ));
+    assert_eq!(tui.handle(Event::Key(Key::Char('/'))), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::Char('d'))), Action::Render);
     assert_eq!(
         tui.handle(Event::Key(Key::Enter)),

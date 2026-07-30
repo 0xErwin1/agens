@@ -1072,6 +1072,12 @@ pub struct DialogView {
     help: Option<String>,
     entries: Vec<DialogEntry>,
     query: String,
+    /// Whether typed characters filter instead of acting as keybindings.
+    ///
+    /// Armed by [`DIALOG_SEARCH_KEY`] and disarmed by Escape. Without this gate
+    /// every single-key binding a dialog registers — refresh, the Confirm
+    /// answers, list navigation — would be swallowed as filter text.
+    searching: bool,
     selected: usize,
     offset: usize,
     interactive: bool,
@@ -1101,6 +1107,7 @@ impl DialogView {
             help: help.map(|help| bounded_dialog_text(help.as_ref(), 2_048)),
             entries,
             query: String::new(),
+            searching: false,
             selected,
             offset: 0,
             interactive: true,
@@ -1244,6 +1251,7 @@ impl DialogView {
             help: Some(bounded_dialog_text(body.as_ref(), 2_048)),
             entries: Vec::new(),
             query: String::new(),
+            searching: false,
             selected: 0,
             offset: 0,
             interactive: false,
@@ -1295,10 +1303,10 @@ fn session_dialog_title(scope: SessionDialogScope) -> &'static str {
 fn session_dialog_help(scope: SessionDialogScope) -> &'static str {
     match scope {
         SessionDialogScope::CurrentProject => {
-            "Type to search | Ctrl+A All projects | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
+            "/ search | Ctrl+A All projects | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
         }
         SessionDialogScope::AllProjects => {
-            "Type to search | Ctrl+A Current project | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
+            "/ search | Ctrl+A Current project | Up/Down navigate | PgUp/PgDn page | Enter resume | Esc cancel"
         }
     }
 }
@@ -1965,12 +1973,14 @@ const MAX_DIALOG_DETAIL_ROWS: usize = 3;
 const MAX_DIALOG_HELP_ROWS: usize = 12;
 /// Confirm answers offered as footer shortcuts, in prompt order.
 const CONFIRM_SHORT_KEYS: [char; 4] = ['a', 'd', 'A', 'D'];
+/// Arms the dialog search band; every other character is a keybinding.
+const DIALOG_SEARCH_KEY: char = '/';
 
 /// Body rows the dialog would like, before the shell subtracts its chrome.
 fn dialog_desired_rows(dialog: &DialogView, width: u16) -> u16 {
     saturating_u16(
         usize::from(dialog_help_rows(dialog, width))
-            .saturating_add(usize::from(dialog.interactive))
+            .saturating_add(usize::from(dialog.searching))
             .saturating_add(dialog_matches(dialog).len().max(1))
             .saturating_add(usize::from(dialog_detail_rows(dialog))),
     )
@@ -2091,7 +2101,7 @@ struct DialogSections {
 /// Splits the content rect the shell produced, keeping at least one entry row.
 fn dialog_sections(content: Rect, dialog: &DialogView) -> DialogSections {
     let mut remaining = content.height;
-    let search = u16::from(dialog.interactive && remaining > 1);
+    let search = u16::from(dialog.searching && remaining > 1);
     remaining -= search;
     let details = dialog_detail_rows(dialog).min(remaining.saturating_sub(1));
     remaining -= details;
@@ -2132,7 +2142,14 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
 
     let mut labels = DialogShortcutLabels::new();
     if dialog.interactive {
-        labels.push((Cow::Borrowed("↑↓"), Cow::Borrowed("navigate")));
+        labels.push((
+            Cow::Borrowed(if dialog.searching {
+                "↑↓"
+            } else {
+                "↑↓ jk"
+            }),
+            Cow::Borrowed("navigate"),
+        ));
     }
     if let Some(sessions) = dialog.session_entries.as_ref() {
         let paging = if sessions.next_cursor.is_some() {
@@ -2155,8 +2172,18 @@ fn dialog_shortcut_labels(dialog: &DialogView) -> DialogShortcutLabels {
     } else if dialog.interactive {
         labels.push((Cow::Borrowed("⏎"), Cow::Borrowed("select")));
     }
+    // While search is armed Escape only disarms it, and every letter key is
+    // filter text, so advertising the letter bindings there would be a lie.
+    if dialog.searching {
+        labels.push((Cow::Borrowed("esc"), Cow::Borrowed("exit search")));
+        return labels;
+    }
+
     if dialog.refresh_id.is_some() {
         labels.push((Cow::Borrowed("r"), Cow::Borrowed("refresh")));
+    }
+    if dialog.interactive {
+        labels.push((Cow::Borrowed("/"), Cow::Borrowed("search")));
     }
     labels.push((Cow::Borrowed("esc"), Cow::Borrowed("close")));
     labels
@@ -4338,8 +4365,18 @@ where
             && let Some(current) = self.dialog.as_ref()
         {
             dialog.query.clone_from(&current.query);
+            dialog.searching = current.searching;
             dialog.selected = current.selected.min(dialog.entries.len().saturating_sub(1));
             dialog.details_open = current.details_open;
+        }
+        // A session page replaces the loading placeholder the keystroke created,
+        // so search mode has to survive the swap or the band would vanish under
+        // the cursor on every typed character.
+        if dialog.session_entries.is_some()
+            && let Some(current) = self.dialog.as_ref()
+            && current.session_entries.is_some()
+        {
+            dialog.searching = current.searching;
         }
         self.palette_open = false;
         self.dialog = Some(dialog);
@@ -5568,90 +5605,30 @@ where
                 self.toggle_session_dialog_scope()
             }
             Key::Char(character) => {
-                if let Some(action_id) = self.dialog.as_ref().and_then(|dialog| {
-                    dialog
-                        .shortcut_actions
-                        .iter()
-                        .find(|(key, _)| *key == character)
-                        .map(|(_, action)| action.clone())
-                }) {
-                    return Action::DialogAction(action_id);
+                if self.dialog_is_searching() {
+                    return self.edit_dialog_query(|query| {
+                        if query.chars().count() < 128 {
+                            query.push(character);
+                        }
+                    });
                 }
-                if let Some(action) = self.try_confirm_shortcut(character) {
-                    return action;
-                }
-                if character == 'r'
-                    && self
-                        .dialog
-                        .as_ref()
-                        .is_some_and(|dialog| dialog.query.is_empty())
-                    && let Some(refresh_id) = self
-                        .dialog
-                        .as_ref()
-                        .and_then(|dialog| dialog.refresh_id.clone())
-                {
-                    return Action::OpenDialog(refresh_id);
-                }
-                if let Some(request) = self.session_dialog_request() {
-                    let mut request = request.clone();
-                    if request.query.chars().count() < 128 {
-                        request.query.push(character);
-                    }
-                    request.cursor = None;
-                    request.previous_cursors.clear();
-                    request.page = 1;
-                    return self.start_session_dialog_request(request);
-                }
-                if let Some(dialog) = self.dialog.as_mut() {
-                    dialog.query.push(character);
-                    refresh_dialog_query_action(dialog);
-                }
-                self.reset_dialog_selection();
-                Action::Render
+                self.dialog_character_binding(character)
             }
             Key::Backspace => {
-                if self
-                    .dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.query.is_empty())
-                    && let Some(action) = self.selected_key_dialog_action(Key::Backspace)
-                {
-                    return action;
+                if !self.dialog_is_searching() {
+                    return self
+                        .selected_key_dialog_action(Key::Backspace)
+                        .unwrap_or(Action::Render);
                 }
-                if let Some(request) = self.session_dialog_request() {
-                    let mut request = request.clone();
-                    request.query.pop();
-                    request.cursor = None;
-                    request.previous_cursors.clear();
-                    request.page = 1;
-                    return self.start_session_dialog_request(request);
-                }
-                if let Some(dialog) = self.dialog.as_mut() {
-                    dialog.query.pop();
-                    refresh_dialog_query_action(dialog);
-                }
-                self.reset_dialog_selection();
-                Action::Render
+                self.edit_dialog_query(|query| {
+                    query.pop();
+                })
             }
-            Key::DeletePreviousWord => {
-                if let Some(request) = self.session_dialog_request() {
-                    let mut request = request.clone();
-                    let boundary =
-                        previous_word_boundary(&request.query, request.query.chars().count());
-                    request.query.truncate(byte_index(&request.query, boundary));
-                    request.cursor = None;
-                    request.previous_cursors.clear();
-                    request.page = 1;
-                    return self.start_session_dialog_request(request);
-                }
-                if let Some(dialog) = self.dialog.as_mut() {
-                    let boundary =
-                        previous_word_boundary(&dialog.query, dialog.query.chars().count());
-                    dialog.query.truncate(byte_index(&dialog.query, boundary));
-                    refresh_dialog_query_action(dialog);
-                }
-                self.reset_dialog_selection();
-                Action::Render
+            Key::DeletePreviousWord if self.dialog_is_searching() => {
+                self.edit_dialog_query(|query| {
+                    let boundary = previous_word_boundary(query, query.chars().count());
+                    query.truncate(byte_index(query, boundary));
+                })
             }
             key @ (Key::Left | Key::Right | Key::Tab) => self
                 .selected_key_dialog_action(key)
@@ -5704,17 +5681,17 @@ where
                     None => Action::Render,
                 }
             }
+            // Escape leaves search first, except while a session page is in
+            // flight: there it keeps its older job of cancelling that route.
+            Key::Escape if self.dialog_is_searching() && !self.session_request_loading() => {
+                self.disarm_dialog_search()
+            }
             Key::Escape | Key::CtrlC => {
                 let action_id = self
                     .dialog
                     .as_ref()
                     .and_then(|dialog| dialog.cancellation_action.clone());
-                let session_request_loading = self.dialog.as_ref().is_some_and(|dialog| {
-                    dialog
-                        .session_entries
-                        .as_ref()
-                        .is_some_and(|entries| entries.loading)
-                });
+                let session_request_loading = self.session_request_loading();
                 if action_id.is_none() || session_request_loading {
                     self.dialog = None;
                 }
@@ -5726,6 +5703,140 @@ where
             }
             _ => Action::Render,
         }
+    }
+
+    fn dialog_is_searching(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|dialog| dialog.searching)
+    }
+
+    fn session_request_loading(&self) -> bool {
+        self.dialog.as_ref().is_some_and(|dialog| {
+            dialog
+                .session_entries
+                .as_ref()
+                .is_some_and(|entries| entries.loading)
+        })
+    }
+
+    /// Resolves a character typed outside search mode against the dialog's
+    /// bindings, in precedence order: caller-registered shortcuts, Confirm
+    /// answers, then the built-in navigation and search keys. An unbound
+    /// character is dropped rather than filtering, which is the whole point of
+    /// gating search behind [`DIALOG_SEARCH_KEY`].
+    fn dialog_character_binding(&mut self, character: char) -> Action {
+        if let Some(action_id) = self.dialog.as_ref().and_then(|dialog| {
+            dialog
+                .shortcut_actions
+                .iter()
+                .find(|(key, _)| *key == character)
+                .map(|(_, action)| action.clone())
+        }) {
+            return Action::DialogAction(action_id);
+        }
+        if let Some(action) = self.try_confirm_shortcut(character) {
+            return action;
+        }
+
+        match character {
+            // A Confirm has answers, not a list, so it never offers search.
+            DIALOG_SEARCH_KEY => {
+                if let Some(dialog) = self.dialog.as_mut().filter(|dialog| {
+                    dialog.interactive && dialog.overlay_kind != widgets::OverlayKind::Confirm
+                }) {
+                    dialog.searching = true;
+                }
+                Action::Render
+            }
+            'r' => self
+                .dialog
+                .as_ref()
+                .and_then(|dialog| dialog.refresh_id.clone())
+                .map_or(Action::Render, Action::OpenDialog),
+            'j' => {
+                self.move_dialog_selection(Key::Down, 1, true);
+                Action::Render
+            }
+            'k' => {
+                self.move_dialog_selection(Key::Up, 1, true);
+                Action::Render
+            }
+            'g' => self.select_dialog_edge(false),
+            'G' => self.select_dialog_edge(true),
+            _ => Action::Render,
+        }
+    }
+
+    /// Moves the selection to the first or last selectable match.
+    fn select_dialog_edge(&mut self, last: bool) -> Action {
+        let Some(dialog) = self.dialog.as_mut() else {
+            return Action::Render;
+        };
+        let enabled = dialog_matches(dialog)
+            .into_iter()
+            .filter_map(|(index, entry)| entry.action.as_ref().map(|_| index))
+            .collect::<Vec<_>>();
+        let target = if last {
+            enabled.last().copied()
+        } else {
+            enabled.first().copied()
+        };
+        let Some(target) = target else {
+            return Action::Render;
+        };
+
+        dialog.selected = target;
+        dialog.details_open = false;
+        self.ensure_dialog_selection_visible();
+        Action::Render
+    }
+
+    /// Applies `edit` to whichever query backs the open dialog.
+    ///
+    /// The session browser filters server-side, so its query lives in the
+    /// request and every edit costs a round trip; every other dialog filters its
+    /// own entries in place.
+    fn edit_dialog_query(&mut self, edit: impl FnOnce(&mut String)) -> Action {
+        if let Some(request) = self.session_dialog_request() {
+            let mut request = request.clone();
+            edit(&mut request.query);
+            request.cursor = None;
+            request.previous_cursors.clear();
+            request.page = 1;
+            return self.start_session_dialog_request(request);
+        }
+
+        if let Some(dialog) = self.dialog.as_mut() {
+            edit(&mut dialog.query);
+            refresh_dialog_query_action(dialog);
+        }
+        self.reset_dialog_selection();
+        Action::Render
+    }
+
+    /// Leaves search mode and drops the query, so the list returns to the state
+    /// it had before the search band was armed.
+    ///
+    /// An already-empty query is left untouched: on the session browser
+    /// clearing it would cost a round trip for no change.
+    fn disarm_dialog_search(&mut self) -> Action {
+        let empty = self.dialog.as_ref().is_some_and(|dialog| {
+            dialog
+                .session_entries
+                .as_ref()
+                .map_or(dialog.query.is_empty(), |entries| {
+                    entries.request.query.is_empty()
+                })
+        });
+        let action = if empty {
+            Action::Render
+        } else {
+            self.edit_dialog_query(String::clear)
+        };
+
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.searching = false;
+        }
+        action
     }
 
     fn session_dialog_request(&self) -> Option<&SessionDialogRequest> {
@@ -5741,7 +5852,10 @@ where
             .session_dialog_request()
             .map_or(1, |current| current.generation.wrapping_add(1).max(1));
         request.generation = generation;
-        self.dialog = Some(DialogView::sessions_loading(request.clone()));
+
+        let mut dialog = DialogView::sessions_loading(request.clone());
+        dialog.searching = self.dialog_is_searching();
+        self.dialog = Some(dialog);
         Action::LoadSessionPage(request)
     }
 
@@ -8483,6 +8597,83 @@ mod runtime_tests {
     }
 
     #[test]
+    fn characters_stay_keybindings_until_the_search_key_arms_the_query() {
+        let mut tui = Tui::new(NoopEngine);
+        let dialog = || {
+            DialogView::read_only(
+                "Servers",
+                None::<&str>,
+                (0..4)
+                    .map(|index| {
+                        DialogEntry::action(format!("row {index}"), format!("open:{index}"))
+                    })
+                    .collect(),
+                "servers",
+            )
+        };
+
+        // `r` is the refresh binding, not the first letter of a query.
+        tui.show_selection_dialog(dialog());
+        assert_eq!(
+            tui.handle(Event::Key(Key::Char('r'))),
+            Action::OpenDialog("servers".into())
+        );
+
+        tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Char('j')));
+        tui.handle(Event::Key(Key::Char('j')));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("open:2".into())
+        );
+        tui.handle(Event::Key(Key::Char('k')));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("open:1".into())
+        );
+        tui.handle(Event::Key(Key::Char('G')));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("open:3".into())
+        );
+        tui.handle(Event::Key(Key::Char('g')));
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("open:0".into())
+        );
+        assert!(
+            tui.view()
+                .dialog
+                .is_some_and(|dialog| dialog.query.is_empty()),
+            "navigation keys must never reach the query"
+        );
+
+        // Armed, the very same letters become filter text.
+        tui.handle(Event::Key(Key::Char(DIALOG_SEARCH_KEY)));
+        for character in "row 3".chars() {
+            tui.handle(Event::Key(Key::Char(character)));
+        }
+        assert_eq!(
+            tui.handle(Event::Key(Key::Enter)),
+            Action::DialogAction("open:3".into())
+        );
+
+        // Escape gives the letters back before it closes the overlay.
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert!(
+            tui.view()
+                .dialog
+                .is_some_and(|dialog| dialog.query.is_empty())
+        );
+        assert_eq!(
+            tui.handle(Event::Key(Key::Char('r'))),
+            Action::OpenDialog("servers".into())
+        );
+        assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Render);
+        assert!(tui.view().dialog.is_none());
+    }
+
+    #[test]
     fn selected_key_actions_dispatch_the_selected_entry_identity() {
         let mut tui = Tui::new(NoopEngine);
         let dialog = || {
@@ -8519,8 +8710,9 @@ mod runtime_tests {
             "the dialog must stay visible until the outcome replaces it"
         );
 
-        // A non-empty query keeps Backspace as query editing.
+        // Armed search keeps Backspace as query editing.
         tui.show_selection_dialog(dialog());
+        tui.handle(Event::Key(Key::Char(DIALOG_SEARCH_KEY)));
         tui.handle(Event::Key(Key::Char('x')));
         assert_eq!(tui.handle(Event::Key(Key::Backspace)), Action::Render);
         assert!(tui.view().dialog.is_some());
@@ -8742,6 +8934,11 @@ mod runtime_tests {
         dialog
     }
 
+    fn arm_search(mut dialog: DialogView) -> DialogView {
+        dialog.searching = true;
+        dialog
+    }
+
     #[test]
     fn dialog_desired_rows_counts_body_help_search_matches_and_capped_details() {
         let selection = DialogView::selection(
@@ -8753,7 +8950,12 @@ mod runtime_tests {
                 })
                 .collect(),
         );
-        assert_eq!(dialog_desired_rows(&selection, 30), 5);
+        assert_eq!(dialog_desired_rows(&selection, 30), 4);
+        assert_eq!(
+            dialog_desired_rows(&arm_search(selection), 30),
+            5,
+            "the search band only claims a row once it is armed"
+        );
 
         let sessions = DialogView::sessions_page(
             vec![DialogEntry::action("#7 Alpha", "session:7")],
@@ -8762,7 +8964,7 @@ mod runtime_tests {
         );
         assert_eq!(
             dialog_desired_rows(&sessions, 30),
-            2,
+            1,
             "session help is fully covered by the derived footer"
         );
 
@@ -8771,14 +8973,14 @@ mod runtime_tests {
         assert_eq!(dialog_desired_rows(&informational, 30), 2);
 
         let empty = DialogView::selection("Choose", None::<String>, Vec::new());
-        assert_eq!(dialog_desired_rows(&empty, 30), 2);
+        assert_eq!(dialog_desired_rows(&empty, 30), 1);
 
         let detailed = open_details(DialogView::selection(
             "Choose",
             None::<String>,
             vec![detailed_entry(5)],
         ));
-        assert_eq!(dialog_desired_rows(&detailed, 30), 5);
+        assert_eq!(dialog_desired_rows(&detailed, 30), 4);
 
         let confirm = DialogView::selection(
             "Permission required",
@@ -8786,7 +8988,7 @@ mod runtime_tests {
             vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
         )
         .as_confirm();
-        assert_eq!(dialog_desired_rows(&confirm, 30), 3);
+        assert_eq!(dialog_desired_rows(&confirm, 30), 2);
     }
 
     #[test]
@@ -8845,6 +9047,15 @@ mod runtime_tests {
             vec![DialogEntry::action("Option", "pick")],
         );
 
+        let idle = dialog_sections(content, &selection);
+        assert!(
+            idle.search.is_none(),
+            "an unarmed dialog spends every row on its entries"
+        );
+        assert_eq!(idle.help, Some(Rect::new(4, 2, 30, 1)));
+        assert_eq!(idle.rows, Rect::new(4, 3, 30, 9));
+
+        let selection = arm_search(selection);
         let roomy = dialog_sections(content, &selection);
         assert_eq!(roomy.help, Some(Rect::new(4, 2, 30, 1)));
         assert_eq!(roomy.search, Some(Rect::new(4, 3, 30, 1)));
@@ -8871,11 +9082,11 @@ mod runtime_tests {
         assert!(squeezed.help.is_none(), "the last row belongs to the body");
         assert_eq!(squeezed.rows.height, 1);
 
-        let detailed = open_details(DialogView::selection(
+        let detailed = arm_search(open_details(DialogView::selection(
             "Choose",
             None::<String>,
             vec![detailed_entry(3)],
-        ));
+        )));
         let detail = dialog_sections(Rect::new(0, 0, 30, 4), &detailed);
         assert_eq!(detail.search.map(|rect| rect.y), Some(0));
         assert_eq!(detail.rows, Rect::new(0, 1, 30, 1));
@@ -8919,18 +9130,28 @@ mod runtime_tests {
             ]
         );
 
-        let selection = dialog_shortcut_labels(&DialogView::selection(
+        let picker = DialogView::selection(
             "Choose",
             Some("Up/Down navigate, Enter selects, Esc cancels"),
             vec![DialogEntry::action("Option", "pick")],
-        ));
+        );
         assert_eq!(
-            selection,
+            dialog_shortcut_labels(&picker),
+            vec![
+                (Cow::Borrowed("↑↓ jk"), Cow::Borrowed("navigate")),
+                (Cow::Borrowed("⏎"), Cow::Borrowed("select")),
+                (Cow::Borrowed("/"), Cow::Borrowed("search")),
+                (Cow::Borrowed("esc"), Cow::Borrowed("close")),
+            ]
+        );
+        assert_eq!(
+            dialog_shortcut_labels(&arm_search(picker)),
             vec![
                 (Cow::Borrowed("↑↓"), Cow::Borrowed("navigate")),
                 (Cow::Borrowed("⏎"), Cow::Borrowed("select")),
-                (Cow::Borrowed("esc"), Cow::Borrowed("close")),
-            ]
+                (Cow::Borrowed("esc"), Cow::Borrowed("exit search")),
+            ],
+            "armed search must not advertise the letter bindings it swallows"
         );
 
         let informational = dialog_shortcut_labels(&DialogView::informational("Details", "body"));
