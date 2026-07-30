@@ -71,6 +71,19 @@ impl AgentCatalog {
             .filter(|agent| agent.mode != AgentMode::Primary)
     }
 
+    /// Appends `instructions` to every agent's OWN system prompt, whatever that prompt's origin
+    /// (built-in fallback, `agent.system_prompt` config value, or a markdown definition's body).
+    /// A no-op when `instructions` is empty. Agent positions and sources are unchanged.
+    pub fn with_appended_instructions(mut self, instructions: &str) -> Self {
+        if instructions.is_empty() {
+            return self;
+        }
+        for agent in &mut self.agents {
+            agent.system_prompt = format!("{}\n\n{instructions}", agent.system_prompt);
+        }
+        self
+    }
+
     fn insert(&mut self, agent: AgentDefinition, source: PathBuf) -> Option<PathBuf> {
         if let Some(index) = self.positions.get(&agent.name).copied() {
             self.agents[index] = agent;
@@ -318,5 +331,83 @@ fn diagnostic(path: PathBuf, message: impl Into<String>) -> AgentDiagnostic {
     AgentDiagnostic {
         path,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod with_appended_instructions_tests {
+    use super::*;
+
+    fn agent(name: &str, mode: AgentMode, system_prompt: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            description: format!("{name} description"),
+            mode,
+            model: None,
+            system_prompt: system_prompt.into(),
+            permission_rules: Vec::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    fn sample_catalog() -> AgentCatalog {
+        let mut catalog = AgentCatalog::default();
+        catalog.insert(
+            agent("primary", AgentMode::Primary, "PRIMARY-PROMPT"),
+            PathBuf::from("<built-in:primary>"),
+        );
+        catalog.insert(
+            agent("explore", AgentMode::Subagent, "EXPLORE-PROMPT"),
+            PathBuf::from("<built-in:explore>"),
+        );
+        catalog.insert(
+            agent("general", AgentMode::Subagent, "GENERAL-PROMPT"),
+            PathBuf::from("<built-in:general>"),
+        );
+        catalog.insert(
+            agent("reviewer", AgentMode::All, "REVIEWER-PROMPT"),
+            PathBuf::from("/project/.agens/agents/reviewer.md"),
+        );
+        catalog
+    }
+
+    #[test]
+    fn appends_the_instructions_to_every_agents_own_distinct_prompt() {
+        let catalog = sample_catalog();
+        let positions_before = catalog.positions.clone();
+        let sources_before = catalog.sources.clone();
+
+        let appended = catalog.with_appended_instructions("INSTRUCTIONS-TEXT");
+
+        for (name, own_prompt) in [
+            ("primary", "PRIMARY-PROMPT"),
+            ("explore", "EXPLORE-PROMPT"),
+            ("general", "GENERAL-PROMPT"),
+            ("reviewer", "REVIEWER-PROMPT"),
+        ] {
+            let system_prompt = &appended.agent(name).unwrap().system_prompt;
+            assert_eq!(
+                *system_prompt,
+                format!("{own_prompt}\n\nINSTRUCTIONS-TEXT"),
+                "{name}'s own prompt must be preserved with the instructions appended after it"
+            );
+        }
+        assert_eq!(
+            appended.positions, positions_before,
+            "appending instructions must not change agent positions"
+        );
+        assert_eq!(
+            appended.sources, sources_before,
+            "appending instructions must not change agent sources"
+        );
+    }
+
+    #[test]
+    fn empty_instructions_is_a_no_op() {
+        let catalog = sample_catalog();
+
+        let unchanged = catalog.clone().with_appended_instructions("");
+
+        assert_eq!(unchanged, catalog);
     }
 }

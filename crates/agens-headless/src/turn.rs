@@ -70,6 +70,18 @@ pub fn run_production_headless_chat_with_progress(
         .ok_or_else(|| CliError::configuration("task provider is unavailable"))?;
     let validator = AgentModelCompatibility::for_source(source)?;
     let agent_catalog_root = headless_turn_project_root(bootstrap, task_runtime)?;
+    // Only a genuinely new session (no `task_runtime` yet) resolves its own base prompt through
+    // `headless_turn_system_prompt`'s explicit/fallback dance below. A resumed TUI turn's
+    // `request.system_prompt` is instead the active agent's OWN prompt, already produced by
+    // `discover_agent_catalog` with its AGENTS.md instructions appended — appending them again
+    // here would duplicate that text in a single request.
+    if task_runtime.is_none() {
+        request.system_prompt = Some(headless_turn_own_system_prompt(
+            bootstrap,
+            &agent_catalog_root,
+            request.system_prompt.take(),
+        )?);
+    }
     let has_task = agent_catalog(bootstrap, &agent_catalog_root, &validator)?
         .subagents()
         .any(|agent| agent.mode == agens_core::AgentMode::Subagent);
@@ -308,6 +320,40 @@ pub fn headless_turn_system_prompt(
     let session_config =
         agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
     Ok(session_config.system_prompt().map(ToOwned::to_owned))
+}
+
+/// The system prompt a genuinely new headless parent turn (no `task_runtime` yet, i.e. no agent
+/// catalog resolution of its own) must send: `explicit`, or [`headless_turn_system_prompt`]'s
+/// configured value, or the hardcoded default, followed by this session's own AGENTS.md
+/// instruction text.
+///
+/// `explicit` is appended to as well, not only the fallback: it holds the `--system` CLI flag's
+/// raw text for the standalone `chat` command, which replaces the agent's OWN prompt, not the
+/// project's instructions — those must still reach the model.
+///
+/// Re-derives [`agens_bootstrap::session_config::SessionInstructions`] from `project_root`'s own
+/// `SessionRoot` on every call, mirroring [`headless_turn_system_prompt`]'s no-caching contract:
+/// a wrong root here would splice another project's instruction text into this session's turn.
+pub fn headless_turn_own_system_prompt(
+    bootstrap: &Bootstrap,
+    project_root: &std::path::Path,
+    explicit: Option<String>,
+) -> Result<String, CliError> {
+    let base = match explicit {
+        Some(explicit) => explicit,
+        None => headless_turn_system_prompt(bootstrap, project_root)?
+            .unwrap_or_else(|| "You are Agens, a helpful coding agent.".to_owned()),
+    };
+
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let instructions =
+        agens_bootstrap::session_config::SessionInstructions::resolve(&session_root, bootstrap);
+
+    Ok(match instructions.text() {
+        Some(text) => format!("{base}\n\n{text}"),
+        None => base,
+    })
 }
 
 /// The provider endpoint a headless turn must send its conversation to, re-derived from the

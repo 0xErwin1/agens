@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -168,13 +168,7 @@ pub(crate) fn load_root_with_definition_limit(
 }
 
 fn load_file(root: &Path, path: &Path) -> Result<MarkdownDocument, String> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| format!("cannot inspect file: {error}"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err("definition must be a regular non-symbolic-link file".into());
-    }
-    let source =
-        fs::canonicalize(path).map_err(|error| format!("cannot canonicalize file: {error}"))?;
+    let source = canonical_regular_file(path)?;
     if !source.starts_with(root) {
         return Err("definition escapes its root".into());
     }
@@ -190,8 +184,29 @@ fn load_file(root: &Path, path: &Path) -> Result<MarkdownDocument, String> {
     {
         return Err("definition filename must be canonical".into());
     }
+    let contents = read_capped_utf8(&source)?;
+    Ok(MarkdownDocument {
+        name: name.into(),
+        source,
+        parsed: parse(&contents)?,
+    })
+}
+
+/// Rejects symlinks and non-regular files, returning the canonicalized path
+/// of an accepted regular file.
+fn canonical_regular_file(path: &Path) -> Result<PathBuf, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("cannot inspect file: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("definition must be a regular non-symbolic-link file".into());
+    }
+    fs::canonicalize(path).map_err(|error| format!("cannot canonicalize file: {error}"))
+}
+
+/// Reads `path` as UTF-8 text, rejecting content over `MAX_MARKDOWN_FILE_BYTES`.
+fn read_capped_utf8(path: &Path) -> Result<String, String> {
     let mut bytes = Vec::new();
-    fs::File::open(&source)
+    fs::File::open(path)
         .map_err(|error| format!("cannot open file: {error}"))?
         .take(MAX_MARKDOWN_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -199,13 +214,43 @@ fn load_file(root: &Path, path: &Path) -> Result<MarkdownDocument, String> {
     if bytes.len() > MAX_MARKDOWN_FILE_BYTES {
         return Err("file exceeds byte limit".into());
     }
-    let contents =
-        String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))?;
-    Ok(MarkdownDocument {
-        name: name.into(),
-        source,
-        parsed: parse(&contents)?,
-    })
+    String::from_utf8(bytes).map_err(|error| format!("file is not UTF-8: {error}"))
+}
+
+/// A single successfully read instruction file (e.g. a project or global
+/// `AGENTS.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstructionFile {
+    source: PathBuf,
+    contents: String,
+}
+
+impl InstructionFile {
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+}
+
+/// Reads a single instruction file that may or may not exist.
+///
+/// Returns `Ok(None)` only when `path` does not exist. Every other rejection
+/// (symlink, non-regular file, oversized content, or invalid UTF-8) is
+/// returned as `Err`; deciding whether to skip a rejected file is the
+/// caller's responsibility, not this reader's.
+pub fn load_instruction_file(path: &Path) -> Result<Option<InstructionFile>, String> {
+    if let Err(error) = fs::symlink_metadata(path) {
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(format!("cannot inspect file: {error}"));
+    }
+    let source = canonical_regular_file(path)?;
+    let contents = read_capped_utf8(&source)?;
+    Ok(Some(InstructionFile { source, contents }))
 }
 
 fn split_frontmatter(contents: &str) -> Result<(&str, &str), String> {
@@ -265,5 +310,97 @@ fn diagnostic(path: &Path, message: impl Into<String>) -> MarkdownDiagnostic {
     MarkdownDiagnostic {
         path: path.to_path_buf(),
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod instruction_file_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_CASE: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let suffix = NEXT_CASE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agens-instruction-file-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    enum Setup {
+        Missing,
+        Symlink,
+        Directory,
+        Oversized,
+        InvalidUtf8,
+        Unreadable,
+    }
+
+    #[test]
+    fn rejects_every_unsafe_or_invalid_candidate() {
+        let cases = [
+            ("missing file", Setup::Missing, true),
+            ("symlink", Setup::Symlink, false),
+            ("directory", Setup::Directory, false),
+            ("oversized file", Setup::Oversized, false),
+            ("invalid utf-8", Setup::InvalidUtf8, false),
+            ("unreadable file", Setup::Unreadable, false),
+        ];
+
+        for (name, setup, expect_ok_none) in cases {
+            let dir = temp_dir();
+            let path = dir.join("AGENTS.md");
+
+            match setup {
+                Setup::Missing => {}
+                Setup::Symlink => {
+                    let target = dir.join("real.md");
+                    fs::write(&target, "hello").unwrap();
+                    std::os::unix::fs::symlink(&target, &path).unwrap();
+                }
+                Setup::Directory => {
+                    fs::create_dir_all(&path).unwrap();
+                }
+                Setup::Oversized => {
+                    fs::write(&path, "a".repeat(MAX_MARKDOWN_FILE_BYTES + 1)).unwrap();
+                }
+                Setup::InvalidUtf8 => {
+                    fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+                }
+                Setup::Unreadable => {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::write(&path, "hello").unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+            }
+
+            let result = load_instruction_file(&path);
+
+            if matches!(setup, Setup::Unreadable) {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            }
+
+            match (result, expect_ok_none) {
+                (Ok(None), true) => {}
+                (Err(_), false) => {}
+                (other, _) => panic!("case {name} produced unexpected result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_file_with_canonical_source_and_contents() {
+        let dir = temp_dir();
+        let path = dir.join("AGENTS.md");
+        fs::write(&path, "hello world").unwrap();
+
+        let file = load_instruction_file(&path).unwrap().unwrap();
+
+        assert_eq!(file.contents(), "hello world");
+        assert_eq!(file.source(), fs::canonicalize(&path).unwrap());
     }
 }

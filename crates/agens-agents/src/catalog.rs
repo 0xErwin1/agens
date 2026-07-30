@@ -103,6 +103,8 @@ pub fn discover_agent_catalog(
             .system_prompt()
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "You are Agens, a helpful coding agent.".into());
+    let instructions =
+        agens_bootstrap::session_config::SessionInstructions::resolve(&session_root, bootstrap);
     let primary = AgentDefinition {
         name: "primary".into(),
         description: "Default interactive agent".into(),
@@ -142,7 +144,12 @@ pub fn discover_agent_catalog(
         None => AgentCatalog::discover(&built_ins, &global, &project),
     };
     discovery
-        .map(|discovery| discovery.catalog().clone())
+        .map(|discovery| {
+            discovery
+                .catalog()
+                .clone()
+                .with_appended_instructions(instructions.text().unwrap_or(""))
+        })
         .map_err(|_| CliError::configuration("agent catalog is unavailable"))
 }
 

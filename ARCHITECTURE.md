@@ -83,6 +83,26 @@ A **surface** is anything a user interacts with: argument parsing, terminal rend
 
 The CLI and TUI submit work through one cancellation-aware engine. Providers emit ordered turn events; tool dispatch evaluates permissions before execution; completed turns and grants are persisted by `agens-store` in clean Rust SQLite databases. Adapters add actionable context while typed errors remain distinct from cancellation.
 
+## Agent instructions (AGENTS.md)
+
+Every agent's system prompt is composed, never replaced. The agent's own prompt — TOML-configured or markdown-defined — comes first; two optional instruction files are appended after it, in a fixed order.
+
+| Source | Location |
+|---|---|
+| Global | `AGENTS.md` beside the resolved global config (honors `$AGENS_CONFIG_HOME` / `$XDG_CONFIG_HOME`) |
+| Project | `<session-root>/AGENTS.md` |
+
+There is no ancestor-directory search; only these two exact paths are considered.
+
+`SessionInstructions` (`agens-bootstrap`, `session_config.rs`) owns discovery and composition for every caller. It reads each candidate through `agens-tools`' `markdown::load_instruction_file`, which rejects symlinks, non-regular files, oversized files, and non-UTF-8 content. A missing, empty, oversized (over 256 KiB), symlinked, unreadable, or non-UTF-8 file is skipped silently, and skipping one file never affects the other. Each accepted file is labelled `## Instructions from <path>` and appended global-then-project; identical canonical paths are deduplicated; the combined appended text is capped at 256 KiB, dropping the whole offending file rather than truncating it mid-content.
+
+`SessionInstructions` is read at two points, each appending into a different prompt surface:
+
+- `discover_agent_catalog` (`agens-agents`, `catalog.rs`) resolves it once per session and passes the composed text to `AgentCatalog::with_appended_instructions` (`agens-tools`, `agents.rs`), which appends it to every catalog agent's own prompt: the primary agent, the built-in `explore` and `general` agents, and every markdown-defined custom agent.
+- `headless_turn_own_system_prompt` (`agens-headless`, `turn.rs`) appends it to the headless `agens chat` parent turn's own prompt, including when `--system` supplies an explicit prompt. This is the only path that would otherwise miss instructions entirely, since a headless parent turn with no live TUI task runtime never goes through `discover_agent_catalog`.
+
+Every `task` subagent inherits its prompt from the catalog agent it was dispatched from, so the catalog append point already covers it; no separate subagent call site exists.
+
 ## Repository contracts
 
 - `justfile` is the canonical Rust developer command surface.
