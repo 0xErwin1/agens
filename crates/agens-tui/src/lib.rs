@@ -4163,7 +4163,10 @@ where
                 }
             }
             TuiRuntimeEvent::ToolEnded { .. } => {}
-            TuiRuntimeEvent::Notice(text) => self.add_info(text.clone()),
+            TuiRuntimeEvent::Notice(text) => {
+                self.transcript.push(TranscriptEntry::Info(text.clone()));
+                self.project_conversation(ConversationEvent::Info(text.clone()));
+            }
         }
         self.runtime_events.push(event);
     }

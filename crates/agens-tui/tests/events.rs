@@ -3648,13 +3648,31 @@ fn device_auth_overlay_escape_cancels_active_auth_route() {
 }
 
 #[test]
-fn notice_runtime_event_surfaces_as_a_status_line_without_touching_the_transcript() {
+fn notice_runtime_events_persist_as_distinct_transcript_entries_and_survive_a_key_press() {
     let mut tui = Tui::new(FakeEngine::default());
 
     tui.apply_runtime_event(TuiRuntimeEvent::Notice(
         "mcp: files failed to connect".into(),
     ));
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice(
+        "mcp: atlas failed to connect".into(),
+    ));
 
-    assert_eq!(tui.view().status, Some("mcp: files failed to connect"));
-    assert!(tui.transcript().is_empty());
+    assert_eq!(
+        tui.transcript(),
+        &[
+            TranscriptEntry::Info("mcp: files failed to connect".into()),
+            TranscriptEntry::Info("mcp: atlas failed to connect".into()),
+        ]
+    );
+
+    tui.handle(Event::Key(Key::Char('x')));
+
+    assert_eq!(
+        tui.transcript(),
+        &[
+            TranscriptEntry::Info("mcp: files failed to connect".into()),
+            TranscriptEntry::Info("mcp: atlas failed to connect".into()),
+        ]
+    );
 }

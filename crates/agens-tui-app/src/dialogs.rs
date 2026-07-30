@@ -21,10 +21,9 @@ pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
             let source = format!("{:?}", descriptor.source()).to_lowercase();
             let tools = server.tool_names().join(", ");
             let endpoint = descriptor.endpoint().map_or("not configured", McpEndpointSummary::as_str);
-            let error = server.last_error().map_or_else(
-                || "none".into(),
-                |error| format!("{}: {}", error.category().label(), error.message()),
-            );
+            let error = server
+                .last_error()
+                .map_or_else(|| "none".into(), |error| error.message().to_owned());
             DialogEntry::read_only(
                 format!("{}  {transport}  {enabled}/{state}  {} tools", descriptor.name(), server.tool_count()),
                 format!("{} {transport} {state} {tools}", descriptor.name()),
@@ -323,6 +322,35 @@ mod tests {
         assert!(session.lock().unwrap().messages.is_empty());
         assert!(tui.transcript().is_empty());
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn mcp_status_dialog_renders_the_closed_reason_label_exactly_once() {
+        let status = agens_tools::McpStatusHandle::default();
+        let mut registry = McpRegistry::with_status_handle(status.clone());
+        registry
+            .register_failed_server(
+                McpServerDescriptor::new(
+                    "flaky",
+                    McpServerSource::Global,
+                    McpServerTransport::Http,
+                    true,
+                    std::time::Duration::from_secs(5),
+                    None,
+                ),
+                agens_tools::McpErrorCategory::Transport,
+                "transport: http status 406",
+            )
+            .unwrap();
+
+        let dialog = mcp_status_dialog(status.snapshot());
+        let rendered = format!("{dialog:?}");
+
+        assert!(
+            rendered.contains("Last error: transport: http status 406"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("transport: transport:"), "{rendered:?}");
     }
 
     #[cfg(unix)]
