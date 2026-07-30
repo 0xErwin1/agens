@@ -717,7 +717,19 @@ mod tests {
         );
         assert!(entries.iter().any(|entry| entry.name() == "subagent"));
         assert!(tui.transcript().is_empty());
-        assert!(tui.view().dialog.is_some());
+        let diagnostics = tui
+            .view()
+            .dialog
+            .as_ref()
+            .unwrap()
+            .help()
+            .unwrap()
+            .to_owned();
+        assert!(
+            diagnostics.lines().any(|line| line
+                == "1 skill shares a command name; /name runs the command, the skill tool still loads them: shared."),
+            "{diagnostics:?}"
+        );
 
         tui.set_palette_entries(entries.to_vec());
         for character in "/sha".chars() {
