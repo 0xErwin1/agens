@@ -35,6 +35,7 @@ use agens_session::attempt::active_session_attempts;
 use agens_session::context::current_session_timestamp;
 use agens_session::provider::{CredentialStatus, ProviderKind};
 use agens_tool_runtime::rotation::rotate_agent;
+use agens_tools::McpLifecycleState;
 
 use super::{TUI_ERROR_ACTION, TuiRuntimeRouter, auth_route_outcome};
 
@@ -245,6 +246,10 @@ impl TuiRuntimeRouter {
                 Vec::new(),
             ),
             "mcp" => mcp_status_dialog(self.mcp_status.snapshot()),
+            "mcp:reload" => {
+                self.reload_non_ready_mcp_servers()?;
+                mcp_status_dialog(self.mcp_status.snapshot())
+            }
             "select" => {
                 let context = self
                     .session
@@ -416,11 +421,39 @@ impl TuiRuntimeRouter {
             }
             _ => return Err(CliError::usage("TUI dialog is unavailable")),
         };
-        if route_id == "subagent" {
+        if route_id == "subagent" || route_id == "mcp:reload" {
             Ok(TuiSubmissionOutcome::SafeDialog(dialog))
         } else {
             Ok(TuiSubmissionOutcome::Dialog(dialog))
         }
+    }
+
+    /// Reconnects every configured server that is not currently `Ready`, via
+    /// the runtime's real reload path rather than a local re-snapshot.
+    ///
+    /// A server that never got past configuration (an invalid timeout, a
+    /// rejected name) has no factory to retry and is intentionally skipped —
+    /// `configured_server_names` never included it in the first place.
+    fn reload_non_ready_mcp_servers(&self) -> Result<(), CliError> {
+        let mut runtime = self
+            .mcp_runtime
+            .lock()
+            .map_err(|_| CliError::storage("MCP runtime is unavailable"))?;
+        let configured = runtime
+            .registry
+            .lock()
+            .map_err(|_| CliError::storage("MCP runtime is unavailable"))?
+            .configured_server_names();
+        let snapshot = self.mcp_status.snapshot();
+        for name in configured {
+            let ready = snapshot
+                .server(&name)
+                .is_some_and(|status| status.state() == McpLifecycleState::Ready);
+            if !ready {
+                let _ = runtime.reload_server(&name);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn session_dialog_outcome(

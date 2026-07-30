@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::profiles::{AgentProfileStore, ProfileEditor};
 use agens_core::HeadlessTurnCancellation;
-use agens_tools::{CommandCatalog, McpRegistry, McpStatusHandle, SkillCatalog};
+use agens_tools::{CommandCatalog, McpStatusHandle, SkillCatalog, ToolDispatcher};
 use agens_tui::{PaletteEntry, TuiProviderOutcome, TuiSubmissionOutcome};
 
 use crate::extensions::resolved_tui_palette;
@@ -30,7 +30,7 @@ use agens_session::context::current_session_timestamp;
 use agens_session::provider::{
     ChatGptCredentialSnapshot, CredentialResolver, restore_chatgpt_credentials,
 };
-use agens_tool_runtime::mcp::load_configured_mcp_registry;
+use agens_tool_runtime::mcp::{ProductionMcpRuntime, load_configured_mcp_registry};
 
 pub const TUI_ERROR_ACTION: &str = "Correct the command or runtime condition, then retry.";
 
@@ -46,7 +46,12 @@ pub struct TuiRuntimeRouter {
     /// instead of leaving them pinned to whatever root the router was constructed with.
     extensions: Arc<Mutex<RouterExtensions>>,
     pub mcp_status: McpStatusHandle,
-    _mcp_registry: Arc<Mutex<McpRegistry>>,
+    /// The router's own long-lived MCP runtime: it registers every configured
+    /// server's descriptor so `/mcp` can show it, but it never connects on
+    /// its own. A connect attempt only happens when the user explicitly
+    /// reconnects (`r` in the `/mcp` overlay), which reuses this same
+    /// registry rather than building a throwaway one.
+    mcp_runtime: Arc<Mutex<ProductionMcpRuntime>>,
     clock: fn() -> i64,
     credential_restorer: Arc<CredentialRestorer>,
     profile_editor: Arc<Mutex<Option<ProfileEditor>>>,
@@ -100,12 +105,13 @@ impl TuiRuntimeRouter {
         // runtime's, which is the one that actually discovers — reported into a handle
         // nobody rendered, so discovery failures never reached the `/mcp` overlay.
         let mcp_status = McpStatusHandle::default();
-        bootstrap.mcp_status = Some(mcp_status.clone());
+        bootstrap.mcp_status = mcp_status.clone();
 
-        let registry = Arc::new(Mutex::new(load_configured_mcp_registry(
-            &bootstrap,
-            project_root,
-        )));
+        let registry = load_configured_mcp_registry(&bootstrap, project_root);
+        let mcp_runtime = Arc::new(Mutex::new(ProductionMcpRuntime {
+            registry: Arc::new(Mutex::new(registry)),
+            dispatcher: Arc::new(Mutex::new(ToolDispatcher::new())),
+        }));
         Self {
             bootstrap: Arc::new(Mutex::new(bootstrap)),
             session,
@@ -118,7 +124,7 @@ impl TuiRuntimeRouter {
                 palette,
             })),
             mcp_status,
-            _mcp_registry: registry,
+            mcp_runtime,
             clock: current_session_timestamp,
             credential_restorer: Arc::new(restore_chatgpt_credentials),
             profile_editor: Arc::new(Mutex::new(None)),

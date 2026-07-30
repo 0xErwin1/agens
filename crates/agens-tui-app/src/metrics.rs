@@ -1,12 +1,20 @@
 use agens_permissions::sanitize_metric;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{MessagePart, TurnEvent, TurnState};
+use agens_tools::{McpErrorCategory, McpLifecycleState, McpStatusHandle};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
 use agens_error::CliError;
 use agens_permissions::ParseToolInput;
+
+/// The shared MCP status handle and the set of server names already noticed
+/// this session, so a name is never re-noticed until it recovers to `Ready`.
+struct McpNotices {
+    status: McpStatusHandle,
+    noticed: Arc<Mutex<BTreeSet<String>>>,
+}
 
 pub struct TuiMetricsPublisher {
     bridge: BridgeTx<TuiRuntimeEvent>,
@@ -14,6 +22,7 @@ pub struct TuiMetricsPublisher {
     model_id: String,
     turn_started_at: Option<std::time::Instant>,
     tools: BTreeMap<String, (String, std::time::Instant)>,
+    mcp: Option<McpNotices>,
 }
 
 impl TuiMetricsPublisher {
@@ -28,6 +37,69 @@ impl TuiMetricsPublisher {
             model_id: model_id.into(),
             turn_started_at: None,
             tools: BTreeMap::new(),
+            mcp: None,
+        }
+    }
+
+    /// Adds first-discovery MCP failure notices to this publisher.
+    ///
+    /// `noticed` is expected to be shared across every publisher built for
+    /// the same session, so a server name is noticed at most once per
+    /// failure and freshly re-noticed only after it recovers to `Ready`.
+    pub fn with_mcp_notices(
+        mut self,
+        status: McpStatusHandle,
+        noticed: Arc<Mutex<BTreeSet<String>>>,
+    ) -> Self {
+        self.mcp = Some(McpNotices { status, noticed });
+        self
+    }
+
+    /// Publishes one `Notice` per enabled server currently `Failed` or
+    /// `Degraded` that has not already been noticed, and clears any server
+    /// that has recovered to `Ready` from the noticed set so a later
+    /// failure notices again.
+    ///
+    /// The notice text is composed exclusively from the server name and the
+    /// error category's closed label — never from the server's raw error
+    /// message — so remote-controlled text can never reach it even if a
+    /// future caller of `register_failed_server` forgets to sanitize its
+    /// own message.
+    fn publish_mcp_notices(&self) {
+        let Some(mcp) = self.mcp.as_ref() else {
+            return;
+        };
+        let Ok(mut noticed) = mcp.noticed.lock() else {
+            return;
+        };
+        for server in mcp.status.snapshot().servers() {
+            let descriptor = server.descriptor();
+            if server.state() == McpLifecycleState::Ready {
+                noticed.remove(descriptor.name());
+                continue;
+            }
+            if !descriptor.enabled()
+                || !matches!(
+                    server.state(),
+                    McpLifecycleState::Failed | McpLifecycleState::Degraded
+                )
+            {
+                continue;
+            }
+            if !noticed.insert(descriptor.name().to_owned()) {
+                continue;
+            }
+            let category = server
+                .last_error()
+                .map_or(McpErrorCategory::Unavailable, |error| error.category());
+            let text = format!(
+                "mcp: {} failed to connect ({})",
+                descriptor.name(),
+                category.label()
+            );
+            let _ = self
+                .bridge
+                .publish(TuiRuntimeEvent::Notice(text), &self.cancellation, None);
         }
     }
 
@@ -39,6 +111,8 @@ impl TuiMetricsPublisher {
             }
             _ => None,
         };
+        let first_requesting = matches!(event, TurnEvent::StateChanged(TurnState::Requesting))
+            && self.turn_started_at.is_none();
         let metric = match event {
             TurnEvent::StateChanged(TurnState::Requesting) => {
                 if self.turn_started_at.is_none() {
@@ -92,6 +166,10 @@ impl TuiMetricsPublisher {
 
         if let Some(event) = metric {
             let _ = self.bridge.publish(event, &self.cancellation, None);
+        }
+
+        if first_requesting {
+            self.publish_mcp_notices();
         }
 
         if let TurnEvent::ToolResult(MessagePart::ToolResult {
@@ -552,5 +630,185 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A transport whose responses are scripted in advance, used to drive an
+    /// MCP server through discovery without a real subprocess or socket.
+    struct ScriptedTransport {
+        responses: std::collections::VecDeque<
+            Result<agens_tools::McpResponse, agens_tools::McpTransportError>,
+        >,
+    }
+
+    impl agens_tools::McpTransport for ScriptedTransport {
+        fn execute(
+            &mut self,
+            _request: agens_tools::McpRequest,
+            _context: &agens_tools::McpOperationContext,
+        ) -> Result<agens_tools::McpResponse, agens_tools::McpTransportError> {
+            self.responses.pop_front().unwrap_or_else(|| {
+                Err(agens_tools::McpTransportError::Protocol(
+                    "missing deterministic response".into(),
+                ))
+            })
+        }
+
+        fn notify(
+            &mut self,
+            _request: agens_tools::McpRequest,
+            _context: &agens_tools::McpOperationContext,
+        ) -> Result<(), agens_tools::McpTransportError> {
+            Ok(())
+        }
+
+        fn close(
+            &mut self,
+            _context: &agens_tools::McpOperationContext,
+        ) -> Result<(), agens_tools::McpTransportError> {
+            Ok(())
+        }
+    }
+
+    fn ready_transport_responses()
+    -> std::collections::VecDeque<Result<agens_tools::McpResponse, agens_tools::McpTransportError>>
+    {
+        std::collections::VecDeque::from([
+            Ok(agens_tools::McpResponse::Initialized(
+                agens_tools::McpInitializeResult::new(
+                    agens_tools::MCP_PROTOCOL_VERSION,
+                    serde_json::json!({"tools": {}}),
+                ),
+            )),
+            Ok(agens_tools::McpResponse::ToolsListed(
+                agens_tools::McpToolsPage::new(Vec::new(), None),
+            )),
+        ])
+    }
+
+    fn mcp_test_descriptor(name: &str, enabled: bool) -> agens_tools::McpServerDescriptor {
+        agens_tools::McpServerDescriptor::new(
+            name,
+            agens_tools::McpServerSource::Global,
+            agens_tools::McpServerTransport::Stdio,
+            enabled,
+            std::time::Duration::from_millis(500),
+            None,
+        )
+    }
+
+    #[test]
+    fn tui_metrics_publisher_notices_failed_enabled_servers_once_and_refreshes_after_recovery_and_a_fresh_failure()
+     {
+        let status = agens_tools::McpStatusHandle::default();
+        let mut registry = agens_tools::McpRegistry::with_status_handle(status.clone());
+
+        registry
+            .register_failed_server(
+                mcp_test_descriptor("atlas", true),
+                agens_tools::McpErrorCategory::Transport,
+                "transport: SENTINEL_SECRET must never render",
+            )
+            .unwrap();
+        registry
+            .register_disabled_server(mcp_test_descriptor("vault", false))
+            .unwrap();
+
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory_attempts = std::sync::Arc::clone(&attempts);
+        registry
+            .configure_server_with_descriptor(
+                mcp_test_descriptor("engram", true),
+                move || {
+                    if factory_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(Box::new(ScriptedTransport {
+                            responses: ready_transport_responses(),
+                        })
+                            as Box<dyn agens_tools::McpTransport>)
+                    } else {
+                        Err(agens_tools::McpTransportError::Transport(
+                            "engram unreachable".into(),
+                        ))
+                    }
+                },
+                agens_tools::McpTimeouts::new(
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_millis(50),
+                )
+                .unwrap(),
+                agens_tools::McpLimits::default(),
+            )
+            .unwrap();
+        assert!(!registry.discover_server("engram").is_failed());
+
+        let noticed = Arc::new(Mutex::new(BTreeSet::new()));
+
+        let (bridge_one, receiver_one) = agens_tui::BridgeTx::bounded(8);
+        let mut publisher_one = TuiMetricsPublisher::new(bridge_one, BridgeCancel::new(), "model")
+            .with_mcp_notices(status.clone(), Arc::clone(&noticed));
+        publisher_one.observe(&TurnEvent::StateChanged(TurnState::Requesting));
+
+        let first_turn_events = (0..2)
+            .map(|_| {
+                receiver_one
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .unwrap()
+                    .into_parts()
+                    .1
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            first_turn_events.as_slice(),
+            [TuiRuntimeEvent::TurnStarted, TuiRuntimeEvent::Notice(text)]
+                if text == "mcp: atlas failed to connect (transport)"
+        ));
+        assert!(receiver_one.try_recv().is_err());
+
+        let (bridge_two, receiver_two) = agens_tui::BridgeTx::bounded(8);
+        let mut publisher_two = TuiMetricsPublisher::new(bridge_two, BridgeCancel::new(), "model")
+            .with_mcp_notices(status.clone(), Arc::clone(&noticed));
+        publisher_two.observe(&TurnEvent::StateChanged(TurnState::Requesting));
+
+        let second_turn_event = receiver_two
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .unwrap()
+            .into_parts()
+            .1;
+        assert!(matches!(second_turn_event, TuiRuntimeEvent::TurnStarted));
+        assert!(
+            receiver_two.try_recv().is_err(),
+            "atlas must not be re-noticed while it stays failed"
+        );
+
+        assert!(registry.reload_server("engram").is_failed());
+
+        let (bridge_three, receiver_three) = agens_tui::BridgeTx::bounded(8);
+        let mut publisher_three =
+            TuiMetricsPublisher::new(bridge_three, BridgeCancel::new(), "model")
+                .with_mcp_notices(status.clone(), Arc::clone(&noticed));
+        publisher_three.observe(&TurnEvent::StateChanged(TurnState::Requesting));
+
+        let third_turn_events = (0..2)
+            .map(|_| {
+                receiver_three
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .unwrap()
+                    .into_parts()
+                    .1
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            third_turn_events.as_slice(),
+            [TuiRuntimeEvent::TurnStarted, TuiRuntimeEvent::Notice(text)]
+                if text == "mcp: engram failed to connect (transport)"
+        ));
+        assert!(receiver_three.try_recv().is_err());
+
+        for text in [
+            format!("{first_turn_events:?}"),
+            format!("{third_turn_events:?}"),
+        ] {
+            assert!(!text.contains("SENTINEL_SECRET"), "{text}");
+        }
     }
 }

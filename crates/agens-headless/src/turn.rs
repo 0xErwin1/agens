@@ -19,7 +19,9 @@ use agens_providers::{
     ProgressAwareProvider, ProviderDiagnosticScope,
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
-use agens_tools::{EffectiveCapabilitySet, TaskMessageTarget};
+use agens_tools::{
+    EffectiveCapabilitySet, McpErrorCategory, McpLifecycleState, McpStatusHandle, TaskMessageTarget,
+};
 
 use agens_agents::{AgentModelCompatibility, agent_catalog};
 use agens_bootstrap::Bootstrap;
@@ -374,6 +376,39 @@ pub fn headless_turn_provider_base_url(
     Ok(session_config.provider_base_url().map(ToOwned::to_owned))
 }
 
+/// One sanitized line per enabled server currently `Failed` or `Degraded` on
+/// the shared status handle, in the exact form the parent turn's caller
+/// prints to stderr.
+///
+/// The text is composed exclusively from the server name and the error
+/// category's closed label — never from the server's raw error message — so
+/// remote-controlled text can never reach a terminal even if a future caller
+/// forgets to sanitize its own message.
+fn mcp_failure_notice_lines(status: &McpStatusHandle) -> Vec<String> {
+    status
+        .snapshot()
+        .servers()
+        .iter()
+        .filter(|server| server.descriptor().enabled())
+        .filter(|server| {
+            matches!(
+                server.state(),
+                McpLifecycleState::Failed | McpLifecycleState::Degraded
+            )
+        })
+        .map(|server| {
+            let category = server
+                .last_error()
+                .map_or(McpErrorCategory::Unavailable, |error| error.category());
+            format!(
+                "mcp: {} failed to connect ({})",
+                server.descriptor().name(),
+                category.label()
+            )
+        })
+        .collect()
+}
+
 fn run_production_headless_chat_with_provider<P>(
     request: HeadlessChatRequest,
     context: HeadlessProviderContext<'_>,
@@ -407,14 +442,27 @@ where
             task_runtime.provider_tools.clone(),
             Arc::clone(&task_runtime.dispatcher),
         ),
-        None => production_tool_runtime_for_parent(
-            context.bootstrap,
-            project_root,
-            request.skills.as_deref(),
-            model.clone(),
-            request.request_config.clone(),
-            Some(context.diagnostic_reference.to_owned()),
-        )?,
+        None => {
+            let runtime = production_tool_runtime_for_parent(
+                context.bootstrap,
+                project_root,
+                request.skills.as_deref(),
+                model.clone(),
+                request.request_config.clone(),
+                Some(context.diagnostic_reference.to_owned()),
+            )?;
+            // Discovery for this turn's own registry has already run
+            // synchronously inside `production_tool_runtime_for_parent`, so
+            // the shared status handle now reflects every server it tried.
+            // Only the parent arm reaches this branch — a subagent turn
+            // reuses its parent's already-built runtime instead of building
+            // its own, so it can never emit a second notice for the same
+            // failure.
+            for line in mcp_failure_notice_lines(&context.bootstrap.mcp_status) {
+                eprintln!("{line}");
+            }
+            runtime
+        }
     };
     let task_registry = context
         .task_runtime
@@ -602,5 +650,84 @@ where
             metadata: completion.metadata,
             messages: completion.messages,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_failure_notice_lines;
+    use agens_tools::{
+        McpErrorCategory, McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport,
+        McpStatusHandle,
+    };
+
+    fn descriptor(name: &str, enabled: bool) -> McpServerDescriptor {
+        McpServerDescriptor::new(
+            name,
+            McpServerSource::Global,
+            McpServerTransport::Stdio,
+            enabled,
+            std::time::Duration::from_millis(500),
+            None,
+        )
+    }
+
+    #[test]
+    fn one_failed_enabled_server_yields_one_sanitized_line_and_disabled_ready_servers_yield_none() {
+        let status = McpStatusHandle::default();
+        let mut registry = McpRegistry::with_status_handle(status.clone());
+        registry
+            .register_failed_server(
+                descriptor("atlas", true),
+                McpErrorCategory::Transport,
+                "transport: SENTINEL_SECRET must never render",
+            )
+            .unwrap();
+        registry
+            .register_disabled_server(descriptor("vault", false))
+            .unwrap();
+
+        let lines = mcp_failure_notice_lines(&status);
+
+        assert_eq!(lines, vec!["mcp: atlas failed to connect (transport)"]);
+        assert!(!lines.join("\n").contains("SENTINEL_SECRET"));
+    }
+
+    #[test]
+    fn two_failed_enabled_servers_yield_two_sanitized_lines() {
+        let status = McpStatusHandle::default();
+        let mut registry = McpRegistry::with_status_handle(status.clone());
+        registry
+            .register_failed_server(
+                descriptor("atlas", true),
+                McpErrorCategory::Transport,
+                "transport: connection failed",
+            )
+            .unwrap();
+        registry
+            .register_failed_server(
+                descriptor("engram", true),
+                McpErrorCategory::Timeout,
+                "timeout: connect timed out",
+            )
+            .unwrap();
+
+        let mut lines = mcp_failure_notice_lines(&status);
+        lines.sort();
+
+        assert_eq!(
+            lines,
+            vec![
+                "mcp: atlas failed to connect (transport)",
+                "mcp: engram failed to connect (timeout)",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_configured_servers_yield_no_lines() {
+        let status = McpStatusHandle::default();
+
+        assert!(mcp_failure_notice_lines(&status).is_empty());
     }
 }

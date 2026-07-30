@@ -3626,7 +3626,10 @@ fn production_binary_composes_configured_mcp_tools_with_native_catalog_and_persi
         String::from_utf8_lossy(&output.stdout),
         "MCP tool completed\n"
     );
-    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "mcp: broken failed to connect (protocol)\nmcp: crashed failed to connect (transport)\n"
+    );
     let diagnostics = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),

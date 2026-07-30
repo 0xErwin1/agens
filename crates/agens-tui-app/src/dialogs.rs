@@ -7,6 +7,8 @@ use agens_tui::{DialogEntry, DialogView};
 
 use agens_diagnostics::DIAGNOSTIC_FILE_LIMIT_BYTES;
 
+const MCP_STATUS_REFRESH_ROUTE: &str = "mcp:reload";
+
 pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
     let entries = snapshot
         .servers()
@@ -21,7 +23,7 @@ pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
             let endpoint = descriptor.endpoint().map_or("not configured", McpEndpointSummary::as_str);
             let error = server.last_error().map_or_else(
                 || "none".into(),
-                |error| format!("{}: {}", format!("{:?}", error.category()).to_lowercase(), error.message()),
+                |error| format!("{}: {}", error.category().label(), error.message()),
             );
             DialogEntry::read_only(
                 format!("{}  {transport}  {enabled}/{state}  {} tools", descriptor.name(), server.tool_count()),
@@ -34,8 +36,13 @@ pub fn mcp_status_dialog(snapshot: McpStatusSnapshot) -> DialogView {
             )
         })
         .collect();
-    DialogView::read_only("MCP servers", None::<&str>, entries, "mcp")
-        .with_empty_message("No MCP servers configured.")
+    DialogView::read_only(
+        "MCP servers",
+        None::<&str>,
+        entries,
+        MCP_STATUS_REFRESH_ROUTE,
+    )
+    .with_empty_message("No MCP servers configured.")
 }
 
 pub fn diagnostics_dialog(data_directory: &Path) -> DialogView {
@@ -204,7 +211,7 @@ mod tests {
     use agens_session::context::SessionContext;
 
     #[test]
-    fn tui_mcp_overlay_is_local_safe_refreshable_and_includes_disabled_servers() {
+    fn tui_mcp_overlay_reports_shared_state_reconnects_on_refresh_and_hides_secrets() {
         let temporary = tui_session_directory("mcp-overlay");
         let mut bootstrap = tui_session_bootstrap(&temporary, &[]);
         bootstrap.mcp_servers = vec![
@@ -293,11 +300,26 @@ mod tests {
         let agens_tui::Action::OpenDialog(route_id) =
             tui.handle(agens_tui::Event::Key(agens_tui::Key::Char('r')))
         else {
-            panic!("MCP refresh should remain local");
+            panic!("pressing r on a refreshable dialog must reopen its route");
         };
+        assert_eq!(route_id, "mcp:reload");
         let refreshed = router.open_dialog(&route_id).unwrap();
+        assert!(
+            matches!(refreshed, agens_tui::TuiSubmissionOutcome::SafeDialog(_)),
+            "a real reconnect must not disturb the `running` flag of an in-flight turn"
+        );
         tui.apply_submission_outcome(refreshed);
-        assert!(render_tui_test_backend(&tui, 90, 24).contains("later"));
+        let text = render_tui_test_backend(&tui, 90, 24);
+        assert!(text.contains("later"), "{text:?}");
+        assert!(text.contains("enabled/failed"), "{text:?}");
+        for secret in [
+            "SENTINEL_ARG_SECRET",
+            "SENTINEL_ENV_SECRET",
+            "SENTINEL_URL_SECRET",
+            "SENTINEL_HEADER_SECRET",
+        ] {
+            assert!(!text.contains(secret), "{secret}: {text:?}");
+        }
         assert!(session.lock().unwrap().messages.is_empty());
         assert!(tui.transcript().is_empty());
         std::fs::remove_dir_all(temporary).unwrap();

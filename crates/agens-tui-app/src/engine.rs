@@ -159,6 +159,10 @@ pub fn run_production_tui_with_profile_store(
         Err(error) => tui.add_info(format!("File references are unavailable: {error}")),
     }
     let route_router = router.clone();
+    // Session-scoped, so a server name noticed once stays noticed across every
+    // turn until it recovers to `Ready` — never re-seeded from a fresh discovery.
+    let mcp_noticed: Arc<Mutex<std::collections::BTreeSet<String>>> =
+        Arc::new(Mutex::new(std::collections::BTreeSet::new()));
     let (permission_bridge, permission_requests) = production_tui_permission_bridge();
     let transition_controls = task_controls.clone();
     let cancel_controls = task_controls.clone();
@@ -188,11 +192,10 @@ pub fn run_production_tui_with_profile_store(
                 .presentation()
                 .map(|presentation| presentation.model().to_owned())
                 .unwrap_or_default();
-            let metrics = Arc::new(Mutex::new(TuiMetricsPublisher::new(
-                metrics,
-                BridgeCancel::new(),
-                model_id,
-            )));
+            let metrics = Arc::new(Mutex::new(
+                TuiMetricsPublisher::new(metrics, BridgeCancel::new(), model_id)
+                    .with_mcp_notices(router.mcp_status.clone(), Arc::clone(&mcp_noticed)),
+            ));
             let metrics_progress = Arc::clone(&metrics);
             let sink: TurnProgressSink = Arc::new(move |event| {
                 if let Ok(mut metrics) = metrics_progress.lock() {
