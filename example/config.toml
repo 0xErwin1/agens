@@ -1,0 +1,101 @@
+# Agens configuration example.
+#
+# Copy this file to one of these locations:
+#   Global:  ~/.config/agens/config.toml
+#   Project: <project-root>/.agens/config.toml
+#
+# Project values override global values. MCP servers and
+# agent.bypass_permission_prompts are global-only.
+
+[options]
+# Capture provider and subagent diagnostics under the data directory.
+debug = true
+# Override the runtime-state directory when needed.
+# data_dir = "${XDG_DATA_HOME:-~/.local/share}/agens"
+
+[provider]
+# Use "openai-api" instead when authenticating with OPENAI_API_KEY.
+type = "openai-chatgpt"
+model = "gpt-5.5"
+# base_url = "https://api.openai.com/v1"
+
+[agent]
+# Uncomment to replace the assembled system prompt.
+# system_prompt = "You are a careful coding agent."
+max_iterations = 60
+parallel_tool_calls = true
+# This setting is honored only in the global configuration.
+bypass_permission_prompts = false
+default_agent = "primary"
+# Allowed values: none, minimal, low, medium, high, xhigh, max.
+reasoning_effort = "high"
+
+[ui]
+collapse_thinking = false
+
+[tools]
+max_list_entries = 1000
+max_search_entries = 10000
+max_search_results = 100
+max_search_depth = 32
+operation_timeout_ms = 5000
+bash_timeout_ms = 120000
+
+[subagents]
+max_iterations = 16
+max_concurrency = 4
+max_output_chars = 65536
+
+[mcp_defaults]
+timeout_ms = 10000
+max_retries = 0
+
+# Named agent profiles can select a model and reasoning effort.
+[agents.primary]
+model = "gpt-5.5"
+effort = "high"
+
+# Rules are evaluated in global-then-project order. A target in parentheses
+# is a glob. Keep destructive operations denied explicitly.
+[permissions]
+allow = [
+  "read(**)",
+  "list(**)",
+  "search(**)",
+  "bash(git status *)",
+]
+deny = [
+  "read(**/.env)",
+  "write(**/.env)",
+  "bash(rm *)",
+]
+
+# MCP server definitions are global-only. Uncomment and adapt one or more of
+# these examples in the global configuration.
+#
+# [mcp.filesystem]
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "$HOME/projects"]
+# cwd = "$HOME"
+# timeout_ms = 10000
+# [mcp.filesystem.env]
+# LANG = "C"
+#
+# [mcp.docs]
+# transport = "http"
+# url = "https://mcp.example.com/mcp"
+# headers = { Authorization = "Bearer $MCP_TOKEN" }
+# max_retries = 2
+# timeout_ms = 10000
+#
+# [mcp.events]
+# transport = "sse"
+# url = "https://mcp.example.com/sse"
+# headers = { Authorization = "Bearer $MCP_TOKEN" }
+# max_retries = 2
+# timeout_ms = 10000
+#
+# Keep a configured server available without starting it.
+# [mcp.unavailable]
+# disabled = true

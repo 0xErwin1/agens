@@ -3,6 +3,14 @@ use agens_config::{
 };
 
 #[test]
+fn the_checked_in_example_configuration_is_valid() {
+    let document = parse_toml_document(include_str!("../../../example/config.toml"))
+        .expect("example configuration must parse");
+
+    validate_toml_document(&document).expect("example configuration must validate");
+}
+
+#[test]
 fn the_starter_document_is_valid_as_emitted() {
     let document = parse_toml_document(&starter_document()).expect("starter file must parse");
 
