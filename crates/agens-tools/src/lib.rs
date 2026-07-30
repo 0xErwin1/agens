@@ -2312,10 +2312,19 @@ impl McpRegistry {
         }
         self.closed = true;
         self.tools.clear();
+
+        let owned: Vec<String> = self
+            .configured
+            .keys()
+            .chain(self.clients.keys())
+            .cloned()
+            .collect();
+
         for (_, mut client) in std::mem::take(&mut self.clients) {
             client.close();
         }
-        self.status.close();
+
+        self.status.close_servers(owned.iter().map(String::as_str));
     }
 
     pub fn load_server<T: McpTransport + 'static>(
