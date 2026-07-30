@@ -2213,6 +2213,32 @@ fn renderer_clips_a_generic_dialog_inside_the_viewport() {
 }
 
 #[test]
+fn diagnostics_dialog_wraps_a_long_line_instead_of_clipping_later_diagnostics() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(60, 12)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 60,
+        height: 12,
+    });
+
+    tui.add_diagnostic(
+        "6 skills share a command name; /name runs the command, the skill tool still loads them: sdd-apply, sdd-verify",
+    );
+    tui.add_diagnostic("Command /shared has multiple definitions; applied source precedence.");
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(
+        text.contains("sdd-verify"),
+        "tail of a wrapped line: {text:?}"
+    );
+    assert!(
+        text.contains("precedence"),
+        "a later diagnostic keeps its own rows: {text:?}"
+    );
+}
+
+#[test]
 fn renderer_clips_selection_help_options_current_and_disabled_states_after_resize() {
     let backend = TestBackend::new(28, 8);
     let terminal = Terminal::new(backend).unwrap();

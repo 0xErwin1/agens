@@ -966,6 +966,10 @@ impl DialogView {
         dialog
     }
 
+    pub fn help(&self) -> Option<&str> {
+        self.help.as_deref()
+    }
+
     pub fn with_empty_message(mut self, message: impl AsRef<str>) -> Self {
         self.empty_message = Some(bounded_dialog_text(message.as_ref(), 256));
         self
@@ -1509,7 +1513,7 @@ fn render_file_picker(
 fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView) {
     let labels = dialog_shortcut_labels(dialog);
     let shortcuts = dialog_shortcuts(&labels);
-    let config = dialog_config(dialog, &shortcuts);
+    let config = dialog_config(dialog, &shortcuts, area);
     let Some(layout) = widgets::OverlayLayout::solve(area, &config) else {
         return;
     };
@@ -1519,7 +1523,11 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
     let muted = Style::default().fg(widgets::RolePalette::muted());
     if let Some(help) = sections.help {
         frame.render_widget(
-            Paragraph::new(dialog_prose(dialog.help.as_deref(), help.height, muted)),
+            Paragraph::new(prose_text(
+                dialog_help_lines(dialog, help.width),
+                help.height,
+                muted,
+            )),
             help,
         );
     }
@@ -1540,14 +1548,21 @@ fn render_dialog(frame: &mut ratatui::Frame<'_>, area: Rect, dialog: &DialogView
 }
 
 fn dialog_prose(text: Option<&str>, rows: u16, style: Style) -> Text<'static> {
+    prose_text(
+        text.map(|text| text.lines().map(ToOwned::to_owned).collect())
+            .unwrap_or_default(),
+        rows,
+        style,
+    )
+}
+
+fn prose_text(lines: Vec<String>, rows: u16, style: Style) -> Text<'static> {
     Text::from(
-        text.map(|text| {
-            text.lines()
-                .take(usize::from(rows))
-                .map(|line| Line::styled(line.to_owned(), style))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default(),
+        lines
+            .into_iter()
+            .take(usize::from(rows))
+            .map(|line| Line::styled(line, style))
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -1646,13 +1661,15 @@ fn dialog_status_line(dialog: &DialogView) -> Option<Line<'static>> {
 
 /// Detail lines the expanded selection may claim.
 const MAX_DIALOG_DETAIL_ROWS: usize = 3;
+/// Rows the wrapped help prose may claim before the dialog stops growing for it.
+const MAX_DIALOG_HELP_ROWS: usize = 12;
 /// Confirm answers offered as footer shortcuts, in prompt order.
 const CONFIRM_SHORT_KEYS: [char; 4] = ['a', 'd', 'A', 'D'];
 
 /// Body rows the dialog would like, before the shell subtracts its chrome.
-fn dialog_desired_rows(dialog: &DialogView) -> u16 {
+fn dialog_desired_rows(dialog: &DialogView, width: u16) -> u16 {
     saturating_u16(
-        usize::from(dialog_help_rows(dialog))
+        usize::from(dialog_help_rows(dialog, width))
             .saturating_add(usize::from(dialog.interactive))
             .saturating_add(dialog_matches(dialog).len().max(1))
             .saturating_add(usize::from(dialog_detail_rows(dialog))),
@@ -1670,9 +1687,81 @@ fn dialog_shows_help_body(dialog: &DialogView) -> bool {
     dialog.help.is_some() && dialog.session_entries.is_none()
 }
 
-/// Help is stored control-character free, so the body claims a single row.
-fn dialog_help_rows(dialog: &DialogView) -> u16 {
-    u16::from(dialog_shows_help_body(dialog))
+/// The rows the help prose needs at `width`.
+///
+/// Help arriving through a constructor is stripped of newlines and claims one row, but
+/// [`Tui::add_diagnostic`] appends further lines directly and a single diagnostic can outrun the
+/// frame. Counting the lines it will actually be painted as is what keeps every diagnostic visible
+/// instead of clipping the band to its first row.
+fn dialog_help_rows(dialog: &DialogView, width: u16) -> u16 {
+    if !dialog_shows_help_body(dialog) {
+        return 0;
+    }
+
+    saturating_u16(
+        dialog_help_lines(dialog, width)
+            .len()
+            .clamp(1, MAX_DIALOG_HELP_ROWS),
+    )
+}
+
+fn dialog_help_lines(dialog: &DialogView, width: u16) -> Vec<String> {
+    let Some(help) = dialog.help.as_deref() else {
+        return Vec::new();
+    };
+
+    if dialog_help_is_body(dialog) {
+        return wrapped_prose_lines(help, width);
+    }
+
+    help.lines().map(ToOwned::to_owned).collect()
+}
+
+/// Whether the help prose is the dialog's whole body rather than a caption above entry rows.
+///
+/// Only then may it claim more than one row. A selection dialog needs its rows for the entries, so
+/// its caption keeps yielding to them exactly as before.
+fn dialog_help_is_body(dialog: &DialogView) -> bool {
+    !dialog.interactive && dialog.entries.is_empty()
+}
+
+/// Greedy word wrap that keeps the caller's own line breaks.
+///
+/// The row count and the painted lines both come from here, so the band can never be sized for a
+/// different result than the one rendered. A word wider than the band is split rather than left to
+/// overflow it.
+fn wrapped_prose_lines(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        let mut current = String::new();
+
+        for word in paragraph.split_whitespace() {
+            if current.is_empty() {
+                current.push_str(word);
+            } else if current.chars().count() + 1 + word.chars().count() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current.push_str(word);
+            }
+
+            while current.chars().count() > width {
+                let head = current.chars().take(width).collect::<String>();
+                current = current.chars().skip(width).collect();
+                lines.push(head);
+            }
+        }
+
+        lines.push(current);
+    }
+
+    lines
 }
 
 fn dialog_selected_detail(dialog: &DialogView) -> Option<&str> {
@@ -1706,7 +1795,7 @@ fn dialog_sections(content: Rect, dialog: &DialogView) -> DialogSections {
     remaining -= search;
     let details = dialog_detail_rows(dialog).min(remaining.saturating_sub(1));
     remaining -= details;
-    let help = dialog_help_rows(dialog).min(remaining.saturating_sub(1));
+    let help = dialog_help_rows(dialog, content.width).min(remaining.saturating_sub(1));
     remaining -= help;
 
     let band = |y: u16, height: u16| Rect::new(content.x, y, content.width, height);
@@ -1783,17 +1872,21 @@ fn dialog_shortcuts(labels: &DialogShortcutLabels) -> Vec<widgets::OverlayShortc
 fn dialog_config<'a>(
     dialog: &'a DialogView,
     shortcuts: &'a [widgets::OverlayShortcut<'a>],
+    area: Rect,
 ) -> widgets::OverlayConfig<'a> {
+    let sizing = if dialog.overlay_kind == widgets::OverlayKind::Confirm {
+        widgets::OverlaySizing::compact()
+    } else {
+        widgets::OverlaySizing::dialog()
+    };
+    let content_width = sizing.inner_width(area).unwrap_or_default();
+
     widgets::OverlayConfig {
         title: &dialog.title,
         tabs: None,
         shortcuts,
-        sizing: if dialog.overlay_kind == widgets::OverlayKind::Confirm {
-            widgets::OverlaySizing::compact()
-        } else {
-            widgets::OverlaySizing::dialog()
-        },
-        desired_content_rows: dialog_desired_rows(dialog),
+        desired_content_rows: dialog_desired_rows(dialog, content_width),
+        sizing,
     }
 }
 
@@ -1802,7 +1895,7 @@ fn dialog_config<'a>(
 fn dialog_visible_rows(area: Rect, dialog: &DialogView) -> usize {
     let labels = dialog_shortcut_labels(dialog);
     let shortcuts = dialog_shortcuts(&labels);
-    let config = dialog_config(dialog, &shortcuts);
+    let config = dialog_config(dialog, &shortcuts, area);
     widgets::OverlayLayout::solve(area, &config).map_or(1, |layout| {
         usize::from(dialog_sections(layout.content, dialog).rows.height).max(1)
     })
@@ -3242,7 +3335,7 @@ where
 
     pub fn add_diagnostic(&mut self, text: impl AsRef<str>) {
         const MAX_DIAGNOSTICS: usize = 8;
-        const MAX_DIAGNOSTIC_CHARS: usize = 160;
+        const MAX_DIAGNOSTIC_CHARS: usize = 240;
 
         let text = text
             .as_ref()
@@ -8160,7 +8253,7 @@ mod runtime_tests {
                 })
                 .collect(),
         );
-        assert_eq!(dialog_desired_rows(&selection), 5);
+        assert_eq!(dialog_desired_rows(&selection, 30), 5);
 
         let sessions = DialogView::sessions_page(
             vec![DialogEntry::action("#7 Alpha", "session:7")],
@@ -8168,24 +8261,24 @@ mod runtime_tests {
             None,
         );
         assert_eq!(
-            dialog_desired_rows(&sessions),
+            dialog_desired_rows(&sessions, 30),
             2,
             "session help is fully covered by the derived footer"
         );
 
-        // Dialog help is stored control-character free, so it is one body row.
+        // A constructor strips the newline, and the result still fits one wrapped row.
         let informational = DialogView::informational("Details", "first line\nsecond line");
-        assert_eq!(dialog_desired_rows(&informational), 2);
+        assert_eq!(dialog_desired_rows(&informational, 30), 2);
 
         let empty = DialogView::selection("Choose", None::<String>, Vec::new());
-        assert_eq!(dialog_desired_rows(&empty), 2);
+        assert_eq!(dialog_desired_rows(&empty, 30), 2);
 
         let detailed = open_details(DialogView::selection(
             "Choose",
             None::<String>,
             vec![detailed_entry(5)],
         ));
-        assert_eq!(dialog_desired_rows(&detailed), 5);
+        assert_eq!(dialog_desired_rows(&detailed, 30), 5);
 
         let confirm = DialogView::selection(
             "Permission required",
@@ -8193,7 +8286,54 @@ mod runtime_tests {
             vec![DialogEntry::action("Allow once", "permission:1:allow-once")],
         )
         .as_confirm();
-        assert_eq!(dialog_desired_rows(&confirm), 3);
+        assert_eq!(dialog_desired_rows(&confirm, 30), 3);
+    }
+
+    #[test]
+    fn help_prose_wraps_to_the_band_width_and_every_diagnostic_keeps_a_row() {
+        assert_eq!(
+            wrapped_prose_lines("alpha beta gamma", 11),
+            vec!["alpha beta", "gamma"]
+        );
+        assert_eq!(
+            wrapped_prose_lines("short\nalpha beta gamma", 11),
+            vec!["short", "alpha beta", "gamma"]
+        );
+        assert_eq!(
+            wrapped_prose_lines("supercalifragilistic", 8),
+            vec!["supercal", "ifragili", "stic"],
+            "a word wider than the band is split instead of overflowing it"
+        );
+        assert!(wrapped_prose_lines("alpha", 0).is_empty());
+
+        let mut tui = Tui::new(NoopEngine);
+        tui.add_diagnostic(
+            "first diagnostic that is long enough to need a second row at this width",
+        );
+        tui.add_diagnostic("second diagnostic");
+        let view = tui.view();
+        let dialog = view.dialog.as_ref().unwrap();
+
+        assert_eq!(
+            dialog_help_lines(dialog, 40),
+            vec![
+                "first diagnostic that is long enough to",
+                "need a second row at this width",
+                "second diagnostic",
+            ]
+        );
+        assert_eq!(dialog_help_rows(dialog, 40), 3);
+
+        let selection = DialogView::selection(
+            "Choose",
+            Some("a caption long enough to wrap were it allowed to"),
+            vec![DialogEntry::action("Option", "pick")],
+        );
+        assert_eq!(
+            dialog_help_rows(&selection, 20),
+            1,
+            "a caption above entry rows must not take rows from them"
+        );
     }
 
     #[test]
