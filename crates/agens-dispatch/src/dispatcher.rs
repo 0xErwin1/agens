@@ -5,12 +5,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use agens_core::redaction::{bounded_detail, redact_absolute_paths, redact_credential_values};
 use agens_core::{
     HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation,
     HeadlessTurnPortError,
 };
 use agens_permissions::{AllowedNativeCall, SharedToolDispatcher};
-use agens_tools::{NATIVE_FILESYSTEM_FAILURE_REASONS, ToolExecutionContext, ToolOutput};
+use agens_tools::{ToolExecutionContext, ToolOutput};
 
 pub struct ProductionToolDispatcher {
     dispatcher: SharedToolDispatcher,
@@ -81,60 +82,29 @@ fn headless_output(output: ToolOutput) -> Result<HeadlessToolOutput, HeadlessTur
     })
 }
 
+/// This is the model-visible sink (`MessagePart::ToolResult.content`): both credential
+/// values and host filesystem paths are withheld, per the two-audience rule.
+const MAX_NATIVE_TOOL_FAILURE_CHARS: usize = 16_384;
+
 /// Rewrites a native-tool failure into something the model may see.
 ///
-/// A raw failure carries filesystem paths, command output and other host
-/// detail. Both the tool name and the reason must come from a closed set, so a
-/// new tool or a new error string degrades to the generic message rather than
-/// leaking by default.
+/// A raw failure carries command output, filesystem paths and other host detail. Everything
+/// except the path-validation reasons below passes through, redacted and bounded, instead of
+/// collapsing to a generic message: real bash failures never carry a `"<tool>: "` prefix and
+/// used to lose all compiler and test output as a result.
 pub fn sanitized_native_tool_failure(content: &str) -> String {
-    let Some((tool, reason)) = content.split_once(": ") else {
-        return "tool execution failed".to_owned();
-    };
-    if !matches!(
-        tool,
-        "read"
-            | "list"
-            | "search"
-            | "glob"
-            | "grep"
-            | "write"
-            | "edit"
-            | "bash"
-            | "webfetch"
-            | "file picker"
-    ) {
-        return "tool execution failed".to_owned();
+    if let Some((tool, reason)) = content.split_once(": ")
+        && (reason.contains("outside project root")
+            || reason.contains("traversal is not allowed")
+            || reason.contains("must be a non-empty relative path"))
+    {
+        return format!("{tool}: path validation failed");
     }
 
-    let safe_reason = matches!(
-        reason,
-        "operation timed out" | "cancelled" | "invalid regex" | "invalid glob pattern"
-    ) || NATIVE_FILESYSTEM_FAILURE_REASONS.contains(&reason)
-        || [
-            ("entry limit of ", " exceeded"),
-            ("result limit of ", " exceeded"),
-            ("traversal depth limit of ", " exceeded"),
-        ]
-        .into_iter()
-        .any(|(prefix, suffix)| {
-            reason
-                .strip_prefix(prefix)
-                .and_then(|value| value.strip_suffix(suffix))
-                .is_some_and(|value| {
-                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-                })
-        });
-    if safe_reason {
-        format!("{tool}: {reason}")
-    } else if reason.contains("outside project root")
-        || reason.contains("traversal is not allowed")
-        || reason.contains("must be a non-empty relative path")
-    {
-        format!("{tool}: path validation failed")
-    } else {
-        "tool execution failed".to_owned()
-    }
+    bounded_detail(
+        &redact_absolute_paths(&redact_credential_values(content)),
+        MAX_NATIVE_TOOL_FAILURE_CHARS,
+    )
 }
 
 fn headless_execution_result(
@@ -229,19 +199,22 @@ mod tests {
     /// A sanitized failure still has to carry its facts: the surface reports the
     /// exit code from `facts`, not from the message, so redacting the message
     /// must not cost the caller the structured result.
+    ///
+    /// The fixture is the real `render_bash_result` shape
+    /// (`agens-tools/src/lib.rs:6226-6260`), not the `"bash: exit 127"` shape production
+    /// never emits.
     #[test]
     fn sanitized_tool_failure_keeps_its_facts() {
-        let output = ToolOutput::failure("bash: exit 127").with_facts(ToolResultFacts::Bash {
+        let content =
+            "[stdout]\nbuilding...\n[stderr]\nerror: could not compile\n[exit status: 127]\n";
+        let output = ToolOutput::failure(content).with_facts(ToolResultFacts::Bash {
             outcome: ToolOutcome::Failed,
             exit_code: Some(127),
         });
 
         let converted = headless_output(output).expect("failing tool output is not terminal");
 
-        assert_eq!(
-            converted.content,
-            sanitized_native_tool_failure("bash: exit 127")
-        );
+        assert_eq!(converted.content, sanitized_native_tool_failure(content));
         assert_eq!(
             converted.facts,
             Some(ToolResultFacts::Bash {
@@ -249,5 +222,77 @@ mod tests {
                 exit_code: Some(127)
             })
         );
+    }
+
+    /// Real bash failures never carry a `"<tool>: "` prefix; they are always
+    /// `[stdout]/[stderr]/[exit status: N]`. Before this change every such failure collapsed
+    /// to the generic `"tool execution failed"`, losing all compiler and test output.
+    #[test]
+    fn real_bash_failure_reaches_the_model() {
+        let content = "[stdout]\nrunning tests...\n[stderr]\nassertion failed: left == right\n[exit status: 101]\n";
+        let output = ToolOutput::failure(content);
+
+        let converted = headless_output(output).expect("failing tool output is not terminal");
+
+        assert!(converted.is_error);
+        assert_ne!(converted.content, "tool execution failed");
+        assert!(converted.content.contains("[exit status: 101]"));
+        assert!(
+            converted
+                .content
+                .contains("assertion failed: left == right")
+        );
+    }
+
+    /// MCP `isError` server text (`map_call_result`, `agens-tools/src/lib.rs:3007-3022`)
+    /// already carries the server's own explanation; the dispatcher must forward it, bounded
+    /// and redacted, rather than discard it behind the generic message.
+    #[test]
+    fn mcp_server_error_text_survives() {
+        let server_text = "remote tool rejected the call: quota exceeded for this workspace";
+        let output = ToolOutput::failure(server_text);
+
+        let converted = headless_output(output).expect("failing tool output is not terminal");
+
+        assert!(converted.is_error);
+        assert_ne!(converted.content, "tool execution failed");
+        assert!(
+            converted
+                .content
+                .contains("quota exceeded for this workspace")
+        );
+    }
+
+    /// Path-validation reasons stay a closed, generic message with no host path — the one
+    /// evidenced threat this rewrite still guards against.
+    #[test]
+    fn path_validation_stays_generic() {
+        for content in [
+            "path: outside project root",
+            "read: outside project root",
+            "write: traversal is not allowed",
+            "edit: must be a non-empty relative path",
+        ] {
+            let converted = sanitized_native_tool_failure(content);
+
+            let (tool, _) = content.split_once(": ").expect("fixture has a tool prefix");
+            assert_eq!(converted, format!("{tool}: path validation failed"));
+            assert!(!converted.contains('/'));
+        }
+    }
+
+    /// This is the model-visible sink, so absolute host paths must be withheld even though the
+    /// rest of the failure passes through.
+    #[test]
+    fn absolute_host_path_is_withheld() {
+        let content = "read: /home/user/project/.env: permission denied";
+        let output = ToolOutput::failure(content);
+
+        let converted = headless_output(output).expect("failing tool output is not terminal");
+
+        assert!(converted.is_error);
+        assert!(!converted.content.contains("/home/user/project"));
+        assert!(converted.content.contains("[path]"));
+        assert!(converted.content.contains("permission denied"));
     }
 }
