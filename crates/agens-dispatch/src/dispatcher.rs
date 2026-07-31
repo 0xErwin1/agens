@@ -49,18 +49,17 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
 
                 allowed.remove(&call.id).ok_or(HeadlessTurnPortError::Tool)
             });
-        let output = allowed
-            .and_then(|allowed| {
-                self.dispatcher
-                    .lock()
-                    .map_err(|_| HeadlessTurnPortError::Tool)?
-                    .execute(
-                        allowed.handle,
-                        &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
-                    )
-                    .map_err(headless_tool_error)
-            })
-            .and_then(headless_output);
+        let output = allowed.and_then(|allowed| {
+            let result = self
+                .dispatcher
+                .lock()
+                .map_err(|_| HeadlessTurnPortError::Tool)?
+                .execute(
+                    allowed.handle,
+                    &ToolExecutionContext::from_headless_adapter(cancellation.adapter_view()),
+                );
+            headless_execution_result(result)
+        });
         std::future::ready(output)
     }
 }
@@ -138,12 +137,26 @@ pub fn sanitized_native_tool_failure(content: &str) -> String {
     }
 }
 
+fn headless_execution_result(
+    result: Result<ToolOutput, agens_core::Error>,
+) -> Result<HeadlessToolOutput, HeadlessTurnPortError> {
+    match result {
+        Ok(output) => headless_output(output),
+        Err(agens_core::Error::Tool(message)) if message == "mcp operation timed out" => {
+            Ok(HeadlessToolOutput::failure("tool operation timed out"))
+        }
+        Err(agens_core::Error::Extension(message))
+            if message == "mcp tool infrastructure failure" =>
+        {
+            Ok(HeadlessToolOutput::failure("tool infrastructure failure"))
+        }
+        Err(error) => Err(headless_tool_error(error)),
+    }
+}
+
 fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
     match error {
         agens_core::Error::Cancelled => HeadlessTurnPortError::Cancelled,
-        agens_core::Error::Tool(message) if message == "mcp operation timed out" => {
-            HeadlessTurnPortError::TimedOut
-        }
         agens_core::Error::Tool(_) | agens_core::Error::Extension(_) => HeadlessTurnPortError::Tool,
         _ => HeadlessTurnPortError::Tool,
     }
@@ -153,6 +166,31 @@ fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
 mod tests {
     use super::*;
     use agens_core::{HeadlessTaskTerminal, ToolOutcome, ToolResultFacts};
+
+    #[test]
+    fn mcp_failures_become_recoverable_tool_results() {
+        for (error, expected) in [
+            (
+                agens_core::Error::Tool("mcp operation timed out".into()),
+                "tool operation timed out",
+            ),
+            (
+                agens_core::Error::Extension("mcp tool infrastructure failure".into()),
+                "tool infrastructure failure",
+            ),
+        ] {
+            let converted = headless_execution_result(Err(error))
+                .expect("an MCP failure should not terminate the parent turn");
+
+            assert!(converted.is_error);
+            assert_eq!(converted.content, expected);
+        }
+
+        assert_eq!(
+            headless_execution_result(Err(agens_core::Error::Cancelled)),
+            Err(HeadlessTurnPortError::Cancelled)
+        );
+    }
 
     #[test]
     fn unavailable_task_inputs_return_a_tool_error_the_parent_can_recover_from() {
