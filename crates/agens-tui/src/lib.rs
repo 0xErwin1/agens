@@ -72,6 +72,7 @@ const TRANSCRIPT_ROW_INDENT: u16 = TRANSCRIPT_CONTENT_INDENT - widgets::ACCENT_W
 const TRANSCRIPT_CHROME_ROWS: u16 = 2;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
 const PROGRESS_CHANNEL_BUDGET: usize = 32;
+const TERMINAL_WHEEL_BATCH_BUDGET: usize = 64;
 const MOUSE_SCROLL_ROWS: u16 = 6;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
@@ -3325,10 +3326,7 @@ where
                 Action::Render
             }
             Event::Key(key) => self.handle_key(key),
-            Event::MouseWheel(direction) => self.handle_key(match direction {
-                MouseWheelDirection::Up => Key::ScrollUp,
-                MouseWheelDirection::Down => Key::ScrollDown,
-            }),
+            Event::MouseWheel(direction) => self.handle_mouse_wheel_batch(&[direction]),
             Event::MouseDown { column, row } => self
                 .handle_subagent_tree_click(column, row)
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
@@ -5417,6 +5415,50 @@ where
         Action::SubmitBackground(std::mem::take(&mut self.input))
     }
 
+    fn handle_mouse_wheel_batch(&mut self, directions: &[MouseWheelDirection]) -> Action {
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.interactive)
+            || self.secret_entry.is_some()
+            || self.device_auth.is_some()
+        {
+            for direction in directions {
+                let key = match direction {
+                    MouseWheelDirection::Up => Key::ScrollUp,
+                    MouseWheelDirection::Down => Key::ScrollDown,
+                };
+                let _ = self.handle_key(key);
+            }
+            return Action::Render;
+        }
+
+        let bottom = self.max_scroll_offset();
+        let record = self.active_record_mut();
+        for direction in directions {
+            match direction {
+                MouseWheelDirection::Up => {
+                    let current = if record.following_bottom {
+                        bottom
+                    } else {
+                        record.scroll_offset.min(bottom)
+                    };
+                    record.following_bottom = false;
+                    record.scroll_offset = current.saturating_sub(MOUSE_SCROLL_ROWS);
+                }
+                MouseWheelDirection::Down => {
+                    record.scroll_offset = record
+                        .scroll_offset
+                        .saturating_add(MOUSE_SCROLL_ROWS)
+                        .min(bottom);
+                    record.following_bottom = record.scroll_offset == bottom;
+                }
+            }
+        }
+        record.focus = TranscriptFocus::Viewport;
+        Action::Render
+    }
+
     fn scroll_up(&mut self, rows: u16) {
         let bottom = self.max_scroll_offset();
         let record = self.active_record_mut();
@@ -6653,6 +6695,21 @@ where
     run_with_runtime_terminal(tui, renderer, terminal)
 }
 
+fn wheel_burst<T: RuntimeTerminal>(
+    terminal: &mut T,
+    first: MouseWheelDirection,
+) -> io::Result<(Vec<MouseWheelDirection>, Option<Event>)> {
+    let mut directions = vec![first];
+    while directions.len() < TERMINAL_WHEEL_BATCH_BUDGET {
+        match terminal.poll(Duration::ZERO)? {
+            Some(Event::MouseWheel(direction)) => directions.push(direction),
+            Some(event) => return Ok((directions, Some(event))),
+            None => break,
+        }
+    }
+    Ok((directions, None))
+}
+
 fn run_with_runtime_terminal<E, R, T>(
     tui: &mut Tui<E>,
     renderer: &mut R,
@@ -6664,6 +6721,7 @@ where
     T: RuntimeTerminal,
 {
     let started = Instant::now();
+    let mut pending_event = None;
     renderer.render(tui.view())?;
 
     loop {
@@ -6673,11 +6731,22 @@ where
         if quit_armed && !tui.quit_is_armed() || status != tui.status {
             renderer.render(tui.view())?;
         }
-        let Some(event) = terminal.poll(Duration::from_millis(100))? else {
-            continue;
+        let event = if let Some(event) = pending_event.take() {
+            event
+        } else {
+            let Some(event) = terminal.poll(Duration::from_millis(100))? else {
+                continue;
+            };
+            event
         };
 
-        let action = tui.handle(event);
+        let action = if let Event::MouseWheel(direction) = event {
+            let (directions, deferred) = wheel_burst(&mut terminal, direction)?;
+            pending_event = deferred;
+            tui.handle_mouse_wheel_batch(&directions)
+        } else {
+            tui.handle(event)
+        };
         match action {
             Action::Quit => return Ok(()),
             Action::CopySelection(text) => {
@@ -6717,6 +6786,7 @@ where
     sync_terminal_size(tui)?;
     renderer.render(tui.view())?;
     let started = Instant::now();
+    let mut pending_event = None;
 
     loop {
         let quit_armed = tui.quit_is_armed();
@@ -6730,11 +6800,22 @@ where
             renderer.render(tui.view())?;
         }
 
-        let Some(event) = terminal.poll(Duration::from_millis(100))? else {
-            continue;
+        let event = if let Some(event) = pending_event.take() {
+            event
+        } else {
+            let Some(event) = terminal.poll(Duration::from_millis(100))? else {
+                continue;
+            };
+            event
         };
 
-        let action = tui.handle(event);
+        let action = if let Event::MouseWheel(direction) = event {
+            let (directions, deferred) = wheel_burst(&mut terminal, direction)?;
+            pending_event = deferred;
+            tui.handle_mouse_wheel_batch(&directions)
+        } else {
+            tui.handle(event)
+        };
         match action {
             Action::Quit => return Ok(()),
             Action::CopySelection(text) => {
@@ -7047,6 +7128,7 @@ where
     let started = Instant::now();
     let mut frame_schedule = FrameSchedule::default();
     let mut render_requested = true;
+    let mut pending_event = None;
     let mut next_route_id = 0_u64;
     let mut active_route: Option<(u64, TuiRouteCancellation, bool)> = None;
 
@@ -7146,11 +7228,23 @@ where
         }
         render_progress_frame(tui, &mut renderer, &mut frame_schedule, now, dirty)?;
         let timeout = frame_schedule.poll_timeout(now, tui.running, backlog);
-        let Some(event) = runtime_terminal.poll(timeout)? else {
-            continue;
+        let event = if let Some(event) = pending_event.take() {
+            event
+        } else {
+            let Some(event) = runtime_terminal.poll(timeout)? else {
+                continue;
+            };
+            event
         };
         let cancel_permission = matches!(event, Event::Key(Key::Escape));
-        match tui.handle(event) {
+        let action = if let Event::MouseWheel(direction) = event {
+            let (directions, deferred) = wheel_burst(&mut runtime_terminal, direction)?;
+            pending_event = deferred;
+            tui.handle_mouse_wheel_batch(&directions)
+        } else {
+            tui.handle(event)
+        };
+        match action {
             Action::Quit => {
                 if let Some((_, cancellation, session_load)) = active_route.take()
                     && cancellation.cancel()
@@ -7800,6 +7894,80 @@ mod runtime_tests {
                 TerminalOperation::EnableMouse,
                 TerminalOperation::DisableMouse,
             ]
+        );
+    }
+
+    #[test]
+    fn wheel_burst_preserves_the_first_non_wheel_event() {
+        let resize = Event::Resize {
+            width: 80,
+            height: 24,
+        };
+        let (mut terminal, _) = EventRuntime::new([
+            Event::MouseWheel(MouseWheelDirection::Down),
+            resize.clone(),
+            Event::MouseWheel(MouseWheelDirection::Up),
+        ]);
+
+        let (directions, deferred) = wheel_burst(&mut terminal, MouseWheelDirection::Up).unwrap();
+
+        assert_eq!(
+            directions,
+            [MouseWheelDirection::Up, MouseWheelDirection::Down]
+        );
+        assert_eq!(deferred, Some(resize));
+        assert_eq!(
+            terminal.poll(Duration::ZERO).unwrap(),
+            Some(Event::MouseWheel(MouseWheelDirection::Up))
+        );
+    }
+
+    #[test]
+    fn wheel_burst_stops_at_its_fairness_budget() {
+        let (mut terminal, _) = EventRuntime::new(std::iter::repeat_n(
+            Event::MouseWheel(MouseWheelDirection::Down),
+            TERMINAL_WHEEL_BATCH_BUDGET,
+        ));
+
+        let (directions, deferred) = wheel_burst(&mut terminal, MouseWheelDirection::Up).unwrap();
+
+        assert_eq!(directions.len(), TERMINAL_WHEEL_BATCH_BUDGET);
+        assert_eq!(directions[0], MouseWheelDirection::Up);
+        assert_eq!(deferred, None);
+        assert_eq!(
+            terminal.poll(Duration::ZERO).unwrap(),
+            Some(Event::MouseWheel(MouseWheelDirection::Down))
+        );
+    }
+
+    #[test]
+    fn runtime_coalesces_a_wheel_burst_into_one_scroll_frame() {
+        let events = std::iter::repeat_n(Event::MouseWheel(MouseWheelDirection::Up), 20)
+            .chain([Event::Key(Key::CtrlC), Event::Key(Key::CtrlC)]);
+        let (terminal, _) = EventRuntime::new(events);
+        let mut tui = Tui::new(NoopEngine);
+        tui.handle(Event::Resize {
+            width: 48,
+            height: 12,
+        });
+        tui.begin_submission("request");
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+            (0..200).map(|line| format!("line {line}\n")).collect(),
+        )));
+        tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+        let bottom = tui.max_scroll_offset();
+        let mut renderer = RecordingRenderer::default();
+
+        run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
+
+        assert_eq!(
+            tui.view().scroll_offset,
+            bottom.saturating_sub(20 * MOUSE_SCROLL_ROWS)
+        );
+        assert_eq!(
+            renderer.frames.len(),
+            3,
+            "initial, one coalesced wheel frame, and the armed-quit frame"
         );
     }
 
