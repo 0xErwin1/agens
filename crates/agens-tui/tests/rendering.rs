@@ -402,9 +402,9 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
     let active_later = rendered_text(&renderer);
 
     assert!(active_early.contains("⠋"), "{active_early:?}");
-    assert!(active_early.contains("Waiting"), "{active_early:?}");
+    assert!(active_early.contains("Working…"), "{active_early:?}");
     assert!(active_later.contains("⠙"), "{active_later:?}");
-    assert!(active_later.contains("Waiting"), "{active_later:?}");
+    assert!(active_later.contains("Working…"), "{active_later:?}");
     assert_ne!(active_early, active_later);
 }
 
@@ -2079,7 +2079,7 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
     tui.handle(Event::Key(Key::ScrollUp));
     renderer.render(tui.view()).unwrap();
     let before = rendered_text(&renderer);
-    assert!(before.contains("restored-user-11"), "{before:?}");
+    assert!(before.contains("restored-user-10"), "{before:?}");
     assert!(before.contains("SCROLL"), "{before:?}");
 
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
@@ -2090,7 +2090,7 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
     )));
     renderer.render(tui.view()).unwrap();
     let streamed = rendered_text(&renderer);
-    assert!(streamed.contains("restored-user-11"), "{streamed:?}");
+    assert!(streamed.contains("restored-user-10"), "{streamed:?}");
     assert!(!tui.following_bottom());
 
     tui.handle(Event::Key(Key::Home));
@@ -3658,7 +3658,7 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
 fn conversation_owns_the_first_row_under_every_notice_condition() {
     type ArmNotice = fn(&mut Tui<FakeEngine>);
 
-    let notices: [(&str, ArmNotice); 5] = [
+    let notices: [(&str, ArmNotice); 4] = [
         ("Press Ctrl+C again to exit", |tui| {
             tui.handle(Event::Key(Key::CtrlC));
         }),
@@ -3674,7 +3674,6 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
             });
         }),
         ("danger", |tui| tui.set_dangerous_mode(true)),
-        ("BYPASS", |tui| tui.set_bypass(true)),
         ("status-sentinel", |tui| tui.add_info("status-sentinel")),
     ];
 
@@ -3890,14 +3889,20 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
         );
     }
 
+    let idle_border_color = renderer.terminal().backend().buffer()[(CHROME_GUTTER, top)].fg;
     tui.begin_submission("prompt");
     renderer.render(tui.view()).unwrap();
     let (running_top, running_bottom) = composer_border_rows(&renderer, CHROME_GUTTER);
     assert_eq!((running_top, running_bottom), (top, bottom));
     assert!(
-        rendered_line(&renderer, usize::from(top)).contains(" running "),
-        "the top border keeps its state label: {:?}",
+        !rendered_line(&renderer, usize::from(top)).contains(" running "),
+        "the composer does not carry execution state: {:?}",
         rendered_line(&renderer, usize::from(top))
+    );
+    assert_eq!(
+        renderer.terminal().backend().buffer()[(CHROME_GUTTER, top)].fg,
+        idle_border_color,
+        "the composer keeps its idle color while the turn runs"
     );
     assert!(
         rendered_line(&renderer, usize::from(bottom)).contains("model —"),
@@ -4206,6 +4211,21 @@ fn the_file_picker_stays_panic_free_and_exact_on_narrow_terminals() {
 }
 
 #[test]
+fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.set_bypass(true);
+    tui.begin_submission("prompt");
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
+    assert!(!rendered.contains("BYPASS"), "{rendered:?}");
+    assert!(!rendered.contains("Waiting"), "{rendered:?}");
+}
+
+#[test]
 fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_keystroke() {
     for (needle, presentation) in [
         (
@@ -4213,7 +4233,7 @@ fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_ke
             TuiPresentation::new("provider", "model", "session #1").with_dangerous_mode(true),
         ),
         (
-            "BYPASS",
+            "bypass",
             TuiPresentation::new("provider", "model", "session #1").with_bypass(true),
         ),
     ] {

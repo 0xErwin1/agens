@@ -95,7 +95,7 @@ impl FooterSegments {
             status = format!("danger {status}");
         }
         if ctx.bypass {
-            status = format!("BYPASS {status}");
+            status = "bypass".to_owned();
         }
 
         Self {
@@ -370,22 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn bypass_segment_is_shown_hidden_and_coexists_with_dangerous_mode() {
+    fn bypass_segment_replaces_the_turn_status_without_hiding_when_dangerous() {
         let mut ctx = sample();
         ctx.bypass = true;
         let line = MetricFooter::text(100, ctx);
-        assert!(line.contains("BYPASS"), "{line:?}");
+        assert!(line.contains("bypass"), "{line:?}");
 
         let ctx = sample();
         let line = MetricFooter::text(100, ctx);
-        assert!(!line.contains("BYPASS"), "{line:?}");
+        assert!(!line.contains("bypass"), "{line:?}");
 
         let mut ctx = sample();
         ctx.bypass = true;
         ctx.dangerous = true;
         let line = MetricFooter::text(100, ctx);
-        assert!(line.contains("BYPASS"), "{line:?}");
-        assert!(line.contains("danger"), "{line:?}");
+        assert!(line.contains("bypass"), "{line:?}");
+        assert!(!line.contains("Ready"), "{line:?}");
     }
 
     #[test]

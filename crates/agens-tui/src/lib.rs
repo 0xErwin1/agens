@@ -71,6 +71,7 @@ const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 const TRANSCRIPT_ROW_INDENT: u16 = TRANSCRIPT_CONTENT_INDENT - widgets::ACCENT_WIDTH as u16;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
 const PROGRESS_CHANNEL_BUDGET: usize = 32;
+const MOUSE_SCROLL_ROWS: u16 = 6;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
 const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
@@ -1417,11 +1418,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         );
     }
 
-    let composer_color = if state.running {
-        widgets::RolePalette::warning()
-    } else {
-        widgets::RolePalette::muted()
-    };
+    let composer_color = widgets::RolePalette::muted();
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
         let inner_width = usize::from(layout.composer.width.saturating_sub(2).max(1));
@@ -1431,14 +1428,6 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         let mut composer = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(composer_color));
-        if state.running {
-            composer = composer.title(Span::styled(
-                " running ",
-                Style::default()
-                    .fg(composer_color)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
         if let Some(metrics) = border_metrics(&state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
@@ -2452,20 +2441,9 @@ fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
         ));
-    } else if state.dangerous_mode || state.bypass {
-        // Both can be active at once, and this chain yields a single slot, so they share one
-        // span rather than one silently hiding the other.
-        let mut label = String::new();
-        if state.bypass {
-            label.push_str(" BYPASS");
-        }
-        if state.dangerous_mode {
-            label.push_str(" danger");
-        }
-        label.push(' ');
-
+    } else if state.dangerous_mode {
         left.push(Span::styled(
-            label,
+            " danger ",
             Style::default()
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
@@ -2815,7 +2793,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
     if state.running {
         transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
-                label: turn_state_label(state.turn_state, state.running, state.session_loading),
+                label: "Working…",
                 now: state.now,
                 elapsed: state
                     .turn_started_at
@@ -5224,11 +5202,11 @@ where
                 Action::Render
             }
             Key::ScrollUp => {
-                self.scroll_up(3);
+                self.scroll_up(MOUSE_SCROLL_ROWS);
                 Action::Render
             }
             Key::ScrollDown => {
-                self.scroll_down(3);
+                self.scroll_down(MOUSE_SCROLL_ROWS);
                 Action::Render
             }
             Key::Up if self.palette_open => {
@@ -8518,6 +8496,7 @@ mod runtime_tests {
         .expect("mouse wheel should map");
 
         assert!(tui.following_bottom());
+        let bottom = tui.max_scroll_offset();
         assert_eq!(tui.handle(wheel.clone()), Action::Render);
         assert!(!tui.following_bottom());
 
@@ -8526,6 +8505,7 @@ mod runtime_tests {
             .get(&TranscriptId::Main)
             .unwrap()
             .scroll_offset;
+        assert_eq!(bottom.saturating_sub(scroll_offset), 6);
         let transcript_row = tui.screen_layout().transcript.y.saturating_add(1);
         tui.handle(Event::MouseDown {
             column: TRANSCRIPT_CONTENT_INDENT,
