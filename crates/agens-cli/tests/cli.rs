@@ -2654,7 +2654,7 @@ fn production_binary_executes_allowed_native_read_then_continues_and_persists() 
 }
 
 #[test]
-fn production_binary_executes_allowed_native_search_then_continues() {
+fn production_binary_persists_an_empty_native_search_result() {
     let temporary = TemporaryDirectory::new("production-native-search");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -2673,13 +2673,13 @@ fn production_binary_executes_allowed_native_search_then_continues() {
             response: native_tool_call_response(
                 "call_search",
                 "native::search",
-                r#"{"path":".","query":"needle"}"#,
+                r#"{"path":".","query":"absent"}"#,
             ),
         },
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_search\"".to_owned(),
-                "needle in the native search fixture".to_owned(),
+                "\"output\":\"\"".to_owned(),
             ],
             response: text_response("native search completed"),
         },
@@ -2695,7 +2695,7 @@ fn production_binary_executes_allowed_native_search_then_continues() {
     .expect("config should be written");
 
     let chat = isolated_agens_command(&temporary)
-        .args(["chat", "--dangerously-allow-all", "search the native file"])
+        .args(["chat", "--dangerously-allow-all", "search for absent text"])
         .current_dir(&project_root)
         .env("AGENS_CONFIG_HOME", &config_home)
         .env("OPENAI_API_KEY", "SENTINEL_OPENAI_API_KEY")
@@ -2713,6 +2713,17 @@ fn production_binary_executes_allowed_native_search_then_continues() {
         "native search completed\n"
     );
     assert_eq!(String::from_utf8_lossy(&chat.stderr), "");
+    let session = SessionStore::open(&data_directory)
+        .expect("session store should open")
+        .load_session_for_resume(1)
+        .expect("the completed turn should remain resumable");
+    let persisted_tool_result = session.messages.iter().find_map(|message| {
+        message.parts.iter().find_map(|part| match part {
+            MessagePart::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+    });
+    assert_eq!(persisted_tool_result, Some("[tool returned no output]"));
     assert!(
         PermissionGrantStore::open(&data_directory)
             .expect("grant store should open")

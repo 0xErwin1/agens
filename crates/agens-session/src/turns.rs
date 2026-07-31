@@ -16,6 +16,8 @@ use crate::provider::ProviderKind;
 use agens_bootstrap::Bootstrap;
 use agens_error::CliError;
 
+const EMPTY_TOOL_RESULT_CONTENT: &str = "[tool returned no output]";
+
 /// Builds the metadata for the next persisted attempt: unchanged when resuming an existing
 /// session (its `project` was already recorded), or freshly seeded from the process's own
 /// discovered root when no session exists yet — the only point where that discovery is a valid
@@ -90,8 +92,8 @@ pub fn completed_session_turn_from_events(
     let mut parts = Vec::new();
     for event in events {
         let (next_role, part) = match event {
-            TurnEvent::ProviderPart(part) => (Role::Assistant, part),
-            TurnEvent::ToolResult(part) => (Role::Tool, part),
+            TurnEvent::ProviderPart(part) => (Role::Assistant, part.clone()),
+            TurnEvent::ToolResult(part) => (Role::Tool, persistable_tool_result(part)),
             TurnEvent::StateChanged(_)
             | TurnEvent::Usage(_)
             | TurnEvent::ToolCallRequested { .. }
@@ -103,7 +105,7 @@ pub fn completed_session_turn_from_events(
             }
             role = Some(next_role);
         }
-        parts.push(part.clone());
+        parts.push(part);
     }
     if let Some(role) = role {
         flush_parts(&mut messages, role, &mut parts);
@@ -131,6 +133,11 @@ pub fn completed_subagent_session_turn(
         "description": task,
     })
     .to_string();
+    let tool_result = persistable_tool_result(&MessagePart::ToolResult {
+        tool_call_id: call_id.clone(),
+        content: final_result,
+        is_error: false,
+    });
     let messages = vec![
         Message {
             role: Role::User,
@@ -149,11 +156,7 @@ pub fn completed_subagent_session_turn(
         },
         Message {
             role: Role::Tool,
-            parts: vec![MessagePart::ToolResult {
-                tool_call_id: call_id,
-                content: final_result,
-                is_error: false,
-            }],
+            parts: vec![tool_result],
         },
     ];
     let messages = messages
@@ -296,6 +299,21 @@ fn persisted_provider_identifier(provider: ProviderKind) -> String {
     provider.identifier().to_owned()
 }
 
+fn persistable_tool_result(part: &MessagePart) -> MessagePart {
+    match part {
+        MessagePart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } if content.is_empty() => MessagePart::ToolResult {
+            tool_call_id: tool_call_id.clone(),
+            content: EMPTY_TOOL_RESULT_CONTENT.into(),
+            is_error: *is_error,
+        },
+        _ => part.clone(),
+    }
+}
+
 fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessagePart>) {
     if !parts.is_empty() {
         messages.push(Message {
@@ -308,6 +326,58 @@ fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessageP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_turn_marks_an_empty_tool_result_as_no_output() {
+        let events = [
+            TurnEvent::ProviderPart(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "search".into(),
+                input: r#"{"query":"absent"}"#.into(),
+            }),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: String::new(),
+                is_error: false,
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("No matches found.".into())),
+        ];
+
+        let turn = completed_session_turn_from_events("search", &events, None)
+            .expect("an empty tool result should remain persistable");
+
+        assert_eq!(
+            turn.messages()[2].parts,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "[tool returned no output]".into(),
+                is_error: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn completed_subagent_turn_marks_an_empty_result_as_no_output() {
+        let turn = CompletedSubagentTurn {
+            id: 1,
+            agent: "reviewer".into(),
+            task: "review the patch".into(),
+            final_result: String::new(),
+            tool_uses: 0,
+        };
+
+        let turn = completed_subagent_session_turn(&turn, "subagent:1")
+            .expect("an empty subagent result should remain persistable");
+
+        assert_eq!(
+            turn.messages()[2].parts,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "subagent:1".into(),
+                content: "[tool returned no output]".into(),
+                is_error: false,
+            }]
+        );
+    }
 
     #[test]
     fn moonshot_persisted_identifier_round_trips() {
