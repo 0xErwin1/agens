@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use agens_bootstrap::Bootstrap;
-use agens_core::AgentDefinition;
+use agens_core::{AgentDefinition, ReasoningEffort, RequestConfig};
 use agens_diagnostics::record_agent_diagnostic;
 use agens_error::CliError;
 use agens_permissions::SharedToolDispatcher;
@@ -15,12 +15,13 @@ use agens_providers::ProviderDiagnosticKind;
 use agens_session::context::ActiveAgentRuntime;
 use agens_session::context::SessionContext;
 use agens_session::context::current_session_timestamp;
-use agens_session::model::effective_model;
+use agens_session::model::{effective_model, model_source};
 use agens_store::SessionStore;
 use agens_tools::{AgentCatalog, AgentModelValidator};
 
 use crate::catalog::{agent_catalog, agent_rotation_error, task_agent_catalog};
 use crate::models::AgentModelCompatibility;
+use crate::resolver::{AgentProfileResolver, ProfileOrigin};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedAgentResolution {
@@ -130,19 +131,98 @@ pub fn reconcile_persisted_active_agent(
             },
         )?;
 
-    let Some(stale_name) = resolution.fallback_from.as_deref() else {
-        return Ok(resolution.agent);
-    };
-    if let Some(metadata) = context.metadata.as_mut() {
-        metadata.active_agent = "primary".into();
-        context.agent_correction_pending = true;
+    if let Some(stale_name) = resolution.fallback_from.as_deref() {
+        if let Some(metadata) = context.metadata.as_mut() {
+            metadata.active_agent = "primary".into();
+            context.agent_correction_pending = true;
+        }
+        context.resume_notice = Some(format!(
+            "Agent '{stale_name}' is unavailable; resumed with primary."
+        ));
+        record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentFallback);
     }
-    context.resume_notice = Some(format!(
-        "Agent '{stale_name}' is unavailable; resumed with primary."
-    ));
-    record_agent_diagnostic(bootstrap, ProviderDiagnosticKind::AgentFallback);
 
-    Ok(resolution.agent)
+    apply_configured_agent_profile(
+        bootstrap,
+        context,
+        &project_root,
+        resolution.agent,
+        &validator,
+    )
+}
+
+fn apply_configured_agent_profile(
+    bootstrap: &Bootstrap,
+    context: &mut SessionContext,
+    project_root: &std::path::Path,
+    mut agent: AgentDefinition,
+    validator: &dyn AgentModelValidator,
+) -> Result<AgentDefinition, CliError> {
+    let session_model = effective_model(bootstrap, context);
+    let session_effort = context
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.reasoning_effort_value())
+        .or_else(|| {
+            context
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.reasoning_effort)
+        })
+        .or_else(|| {
+            bootstrap
+                .reasoning_effort()
+                .and_then(parse_reasoning_effort)
+        });
+    let session_root =
+        agens_bootstrap::session_root::SessionRoot::confined_to(project_root.to_path_buf());
+    let session_config =
+        agens_bootstrap::session_config::SessionConfig::resolve(&session_root, bootstrap)?;
+    let profile = AgentProfileResolver::new(session_config.agent_profiles()).resolve(
+        &agent.name,
+        agent.model.as_deref(),
+        agent.reasoning_effort,
+        &session_model,
+        session_effort,
+    );
+    if profile.model.origin == ProfileOrigin::SessionInherited
+        && profile.effort.origin == ProfileOrigin::SessionInherited
+    {
+        return Ok(agent);
+    }
+    if profile.model.origin != ProfileOrigin::SessionInherited {
+        validator
+            .validate_model(&profile.model.value)
+            .map_err(|_| CliError::configuration("agent model is unavailable"))?;
+    }
+
+    let mut selection =
+        agens_models::ModelSelection::for_source(&session_model, model_source(bootstrap, context));
+    if selection.apply_model(&profile.model.value).is_err() {
+        if profile.model.origin == ProfileOrigin::SessionInherited {
+            selection
+                .apply_unverified_model(&profile.model.value)
+                .map_err(|_| CliError::configuration("agent model is unavailable"))?;
+        } else {
+            return Err(CliError::configuration("agent model is unavailable"));
+        }
+    }
+    if let Some(effort) = profile.effort.value {
+        selection
+            .apply_reasoning_effort(effort.as_str())
+            .map_err(|_| CliError::configuration("agent reasoning effort is unavailable"))?;
+    }
+
+    agent.model = Some(profile.model.value);
+    agent.reasoning_effort = profile.effort.value;
+    context.selection = Some(selection);
+    Ok(agent)
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    RequestConfig::with_reasoning_effort(value)
+        .ok()
+        .and_then(|config| config.reasoning_effort())
 }
 
 pub fn persist_pending_agent_correction(bootstrap: &Bootstrap, context: &mut SessionContext) {

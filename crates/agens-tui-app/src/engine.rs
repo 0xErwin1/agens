@@ -25,8 +25,9 @@ use crate::permission_prompt::production_tui_permission_bridge;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
-use agens_agents::ensure_active_agent_runtime;
-use agens_agents::persist_pending_agent_correction;
+use agens_agents::{
+    ensure_active_agent_runtime, persist_pending_agent_correction, reconcile_persisted_active_agent,
+};
 use agens_bootstrap::Bootstrap;
 use agens_diagnostics::next_diagnostic_reference;
 use agens_dispatch::origin_launches_selected_subagent;
@@ -126,8 +127,7 @@ pub fn run_production_tui_with_profile_store(
         let mut context = session
             .lock()
             .map_err(|_| CliError::new(ExitStatus::Failure, "ui", "TUI session is unavailable"))?;
-        let notice = seed_remembered_tui_selection(bootstrap, &mut context);
-        seed_bypass_permissions_from_configuration(bootstrap, &mut context)?;
+        let notice = seed_fresh_tui_context(bootstrap, &mut context)?;
         tui.apply_presentation(tui_session_presentation(bootstrap, &context));
         drop(context);
         if let Some(notice) = notice {
@@ -473,6 +473,20 @@ pub fn run_tui_prompt_with(
     result
 }
 
+pub(crate) fn seed_fresh_tui_context(
+    bootstrap: &Bootstrap,
+    context: &mut SessionContext,
+) -> Result<Option<String>, CliError> {
+    reconcile_persisted_active_agent(bootstrap, context)?;
+    let notice = context
+        .selection
+        .is_none()
+        .then(|| seed_remembered_tui_selection(bootstrap, context))
+        .flatten();
+    seed_bypass_permissions_from_configuration(bootstrap, context)?;
+    Ok(notice)
+}
+
 /// Seeds `context.bypass_permissions` from the GLOBAL `agent.bypass_permission_prompts`
 /// configuration, for a session that has nothing of its own recorded yet: a brand-new session, or
 /// one just reset by `/new`. A RESUMED session must never call this — its own recorded value (or,
@@ -598,13 +612,112 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        persist_tui_session, rotation_agent, rotation_dispatcher, tui_project,
-        tui_session_bootstrap, tui_session_bootstrap_with_global_bypass, tui_session_directory,
-        tui_session_messages,
+        bootstrap_from_configuration, persist_tui_session, rotation_agent, rotation_dispatcher,
+        tui_project, tui_session_bootstrap, tui_session_bootstrap_with_global_bypass,
+        tui_session_directory, tui_session_messages,
     };
     use agens_fixtures::BundledModelValidator;
     use agens_models::ModelSelection;
     use agens_session::context::ActiveAgentRuntime;
+
+    fn bare_headless_request() -> HeadlessChatRequest {
+        HeadlessChatRequest {
+            prompt: "test".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+        }
+    }
+
+    #[test]
+    fn fresh_session_uses_the_configured_primary_profile_model() {
+        let label = "fresh-configured-primary-model";
+        let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(temporary.join("project/.git")).unwrap();
+        let bootstrap = bootstrap_from_configuration(
+            label,
+            Some(
+                "[provider]\ntype = \"openai-chatgpt\"\n\
+                 [agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+            ),
+            None,
+        );
+        let mut context = SessionContext::fresh();
+
+        seed_fresh_tui_context(&bootstrap, &mut context).unwrap();
+
+        let selection = context
+            .selection
+            .as_ref()
+            .expect("profile should select a model");
+        assert_eq!(selection.model(), "gpt-5.6-sol");
+        assert_eq!(selection.reasoning_effort(), Some("high"));
+        assert_eq!(
+            tui_session_presentation(&bootstrap, &context).model(),
+            "gpt-5.6-sol"
+        );
+        let request = agens_headless::apply_session_to_request(&context, bare_headless_request());
+        assert_eq!(request.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            request.request_config.reasoning_effort(),
+            Some(agens_core::ReasoningEffort::High)
+        );
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn new_command_reapplies_the_configured_primary_profile_model() {
+        let label = "new-command-configured-primary-model";
+        let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(temporary.join("project/.git")).unwrap();
+        let bootstrap = bootstrap_from_configuration(
+            label,
+            Some(
+                "[provider]\ntype = \"openai-chatgpt\"\n\
+                 [agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+            ),
+            None,
+        );
+        let session = Arc::new(Mutex::new(SessionContext {
+            selection: Some(ModelSelection::new("gpt-5.5")),
+            ..SessionContext::fresh()
+        }));
+
+        assert_eq!(
+            run_tui_prompt(
+                &bootstrap,
+                "/new",
+                &HeadlessTurnCancellation::new(),
+                &session,
+                None,
+            )
+            .unwrap(),
+            "Started a new session."
+        );
+        let context = session.lock().unwrap();
+        let selection = context
+            .selection
+            .as_ref()
+            .expect("profile should select a model after reset");
+        assert_eq!(selection.model(), "gpt-5.6-sol");
+        assert_eq!(selection.reasoning_effort(), Some("high"));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
 
     #[test]
     fn interactive_turns_have_no_automatic_deadline() {

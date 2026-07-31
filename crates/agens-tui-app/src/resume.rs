@@ -371,17 +371,39 @@ mod tests {
     use crate::models::apply_tui_model;
     use crate::permission_prompt::{TuiPermissionPrompter, production_tui_permission_bridge};
     use crate::test_support::{
-        bootstrap_from_a_different_working_directory, persist_tui_session,
-        persist_tui_session_metadata, render_tui_test_backend, rotation_dispatcher, tui_project,
-        tui_session_bootstrap, tui_session_bootstrap_for_provider,
-        tui_session_bootstrap_with_global_bypass, tui_session_directory, tui_session_messages,
+        bootstrap_from_a_different_working_directory, bootstrap_from_configuration,
+        persist_tui_session, persist_tui_session_metadata, render_tui_test_backend,
+        rotation_dispatcher, tui_project, tui_session_bootstrap,
+        tui_session_bootstrap_for_provider, tui_session_bootstrap_with_global_bypass,
+        tui_session_directory, tui_session_messages,
     };
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
+    use agens_headless::{HeadlessChatRequest, apply_session_to_request};
     use agens_session::attempt::attempt_failure_status;
-    use agens_session::turns::completed_session_turn_from_events;
+    use agens_session::turns::{completed_session_turn_from_events, next_session_metadata};
     use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use agens_tool_runtime::task::production_tui_task_runtime;
+
+    fn bare_headless_request() -> HeadlessChatRequest {
+        HeadlessChatRequest {
+            prompt: "test".into(),
+            history: Vec::new(),
+            model: None,
+            system_prompt: None,
+            max_iterations: None,
+            mode: PermissionMode::Edit,
+            dangerously_allow_all: false,
+            dangerous_mode: false,
+            request_config: agens_core::RequestConfig::default(),
+            session_reasoning_effort: None,
+            session: None,
+            active_agent: None,
+            effective_capabilities: None,
+            pending_system_reminder: None,
+            skills: None,
+        }
+    }
 
     #[test]
     fn resuming_from_a_different_working_directory_confines_to_the_originally_recorded_root() {
@@ -1150,6 +1172,98 @@ mod tests {
         assert!(diagnostics.contains(r#""event":"agent_fallback""#));
         assert!(!diagnostics.contains("Retired work"));
         assert!(!diagnostics.contains(&tui_project(&temporary)));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn resumed_primary_uses_the_configured_profile_instead_of_the_saved_model() {
+        let label = "resume-configured-primary-model";
+        let bootstrap = bootstrap_from_configuration(
+            label,
+            Some(
+                "[provider]\ntype = \"openai-chatgpt\"\n\
+                 [agent]\ndefault_agent = \"primary\"\n\
+                 [agents.primary]\nmodel = \"gpt-5.6-sol\"\neffort = \"high\"\n",
+            ),
+            None,
+        );
+        let temporary = std::env::temp_dir().join(format!("agens-{label}-{}", std::process::id()));
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let mut metadata = persist_tui_session_metadata(
+            &mut store,
+            &tui_project(&temporary),
+            "configured primary",
+            "primary",
+            100,
+        );
+        metadata.provider_id = Some("openai-chatgpt".into());
+        metadata.model_id = Some("gpt-5.5".into());
+        metadata.reasoning_effort = Some(agens_core::ReasoningEffort::Low);
+        store.update_session_selection(&metadata).unwrap();
+        drop(store);
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            metadata.id,
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap()
+        .context;
+
+        let selection = resumed
+            .selection
+            .as_ref()
+            .expect("profile should select a model");
+        assert_eq!(selection.model(), "gpt-5.6-sol");
+        assert_eq!(selection.reasoning_effort(), Some("high"));
+        assert_eq!(
+            tui_session_presentation(&bootstrap, &resumed).model(),
+            "gpt-5.6-sol"
+        );
+
+        let request = apply_session_to_request(&resumed, bare_headless_request());
+        let model = request.model.clone().expect("request model should be set");
+        let effort = request
+            .session_reasoning_effort
+            .or_else(|| request.request_config.reasoning_effort());
+        assert_eq!(model, "gpt-5.6-sol");
+        assert_eq!(effort, Some(agens_core::ReasoningEffort::High));
+        let next = next_session_metadata(
+            &bootstrap,
+            "continued",
+            request.session.as_ref(),
+            request.active_agent.as_deref(),
+            Some("openai-chatgpt".into()),
+            model,
+            effort,
+        )
+        .unwrap();
+        let turn = completed_session_turn_from_events(
+            "continued",
+            &[TurnEvent::ProviderPart(MessagePart::Text("done".into()))],
+            None,
+        )
+        .unwrap();
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let attempt = store
+            .begin_session_attempt(&next, "continued".into())
+            .unwrap();
+        store
+            .persist_completed_session_attempt(
+                attempt.key(),
+                &next,
+                &turn,
+                agens_session::context::current_session_timestamp(),
+            )
+            .unwrap();
+        let persisted = store.load_session_for_resume(metadata.id).unwrap().metadata;
+        assert_eq!(persisted.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            persisted.reasoning_effort,
+            Some(agens_core::ReasoningEffort::High)
+        );
 
         std::fs::remove_dir_all(temporary).unwrap();
     }
