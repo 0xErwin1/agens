@@ -588,12 +588,12 @@ fn multiline_wrapped_user_message_uses_one_accented_identity() {
     assert!(text.contains("deliberately long user"), "{text:?}");
     assert!(text.contains("Second source line."), "{text:?}");
     let user = cell_for_text(&renderer, "❯");
-    assert_eq!(user.fg, Color::Rgb(0x73, 0xd0, 0xff));
+    assert_eq!(user.fg, Color::Rgb(0xd2, 0xa6, 0xff));
     assert!(user.modifier.contains(Modifier::BOLD));
 }
 
 #[test]
-fn user_turns_have_a_blue_rail_and_extra_separation_from_agent_output() {
+fn user_turns_have_a_distinct_identity_rail_and_compact_separation() {
     let terminal = Terminal::new(TestBackend::new(72, 30)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
@@ -617,7 +617,7 @@ fn user_turns_have_a_blue_rail_and_extra_separation_from_agent_output() {
         assert_eq!(buffer[(ACCENT_COLUMN as u16, row as u16)].symbol(), "┃");
         assert_eq!(
             buffer[(ACCENT_COLUMN as u16, row as u16)].fg,
-            Color::Rgb(0x73, 0xd0, 0xff)
+            Color::Rgb(0xd2, 0xa6, 0xff)
         );
     }
     assert_eq!(
@@ -646,8 +646,8 @@ fn user_turns_have_a_blue_rail_and_extra_separation_from_agent_output() {
     );
     assert_eq!(
         second_user_row,
-        second_agent_row + 3,
-        "a new user turn keeps two blank rows above it"
+        second_agent_row + 2,
+        "a new user turn keeps one blank row above it"
     );
 }
 
@@ -1853,12 +1853,22 @@ fn renderer_renders_practical_markdown_semantics() {
         "quoted text",
         "LINKTOKEN",
         "https://example.com/docs",
-        "│ Name │ State │",
-        "│ alpha │ ready │",
-        "│ beta │ blocked │",
+        "│ Name  │ State   │",
+        "│ alpha │ ready   │",
+        "│ beta  │ blocked │",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
+
+    let table_separators = ["│ Name", "│ alpha", "│ beta"].map(|needle| {
+        let row = rendered_row(&renderer, needle);
+        rendered_line(&renderer, row)
+            .char_indices()
+            .filter_map(|(index, character)| (character == '│').then_some(index))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(table_separators[0], table_separators[1]);
+    assert_eq!(table_separators[1], table_separators[2]);
 
     assert!(
         cell_for_text(&renderer, "Result")
@@ -1878,8 +1888,8 @@ fn renderer_renders_practical_markdown_semantics() {
     let body = Color::Rgb(0xbf, 0xbd, 0xb6);
     let markdown_heading = Color::Rgb(0x95, 0xe6, 0xcb);
     let markdown_strong = Color::Rgb(0xd6, 0xd4, 0xcd);
-    let markdown_code = Color::Rgb(0xe6, 0xb4, 0x50);
-    let navigation = Color::Rgb(0x73, 0xd0, 0xff);
+    let markdown_code = Color::Rgb(0xff, 0x8f, 0x40);
+    let navigation = Color::Rgb(0x95, 0xe6, 0xcb);
     let success = Color::Rgb(0xaa, 0xd9, 0x4c);
 
     let inline_code = cell_for_text(&renderer, "INLINE_TOKEN");
@@ -1927,24 +1937,67 @@ fn renderer_renders_practical_markdown_semantics() {
 }
 
 #[test]
-fn markdown_lists_are_compact_with_one_blank_row_between_blocks() {
+fn markdown_lists_wrap_with_hanging_indent_and_stay_compact_between_blocks() {
     let terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
     tui.begin_submission("request");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
-        "Before.\n\n- FIRST_ITEM\n- SECOND_ITEM\n\nAfter.".into(),
+        "Before.\n\n- FIRST_ITEM alpha bravo charlie delta echo foxtrot golf hotel LONG_LIST_TAIL\n- SECOND_ITEM\n\nAfter.".into(),
     )));
     renderer.render(tui.view()).unwrap();
 
     let before = rendered_row(&renderer, "Before.");
     let first = rendered_row(&renderer, "FIRST_ITEM");
+    let tail = rendered_row(&renderer, "LONG_LIST_TAIL");
     let second = rendered_row(&renderer, "SECOND_ITEM");
     let after = rendered_row(&renderer, "After.");
     assert_eq!(first, before + 2);
-    assert_eq!(second, first + 1);
+    assert_eq!(
+        rendered_column(&renderer, "LONG_LIST_TAIL"),
+        rendered_column(&renderer, "FIRST_ITEM"),
+        "wrapped list text keeps a hanging indent"
+    );
+    assert_eq!(second, tail + 1);
     assert_eq!(after, second + 2);
+}
+
+#[test]
+fn wrapped_markdown_preserves_heading_quote_task_and_grapheme_structure() {
+    let terminal = Terminal::new(TestBackend::new(48, 36)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "## HEADING_START alpha bravo charlie delta echo HEADING_TAIL\n\n> QUOTE_START alpha bravo charlie delta echo QUOTE_TAIL\n\n- [x] TASK_START alpha bravo charlie delta echo TASK_TAIL\n\nEmoji 👩‍💻 cafe\u{301} alpha bravo charlie delta EMOJI_TAIL"
+            .into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+
+    for (start, tail) in [
+        ("HEADING_START", "HEADING_TAIL"),
+        ("QUOTE_START", "QUOTE_TAIL"),
+        ("TASK_START", "TASK_TAIL"),
+    ] {
+        let continuation = rendered_line(&renderer, rendered_row(&renderer, tail));
+        let first_text_column = continuation
+            .chars()
+            .position(char::is_alphanumeric)
+            .expect("wrapped continuation text");
+        assert_eq!(
+            first_text_column,
+            rendered_column(&renderer, start),
+            "{tail} loses its structural hanging indent: {continuation:?}"
+        );
+    }
+    let text = rendered_text(&renderer);
+    assert!(text.contains("👩‍💻"), "ZWJ emoji was split: {text:?}");
+    assert!(
+        text.contains("cafe\u{301}"),
+        "combining grapheme was split: {text:?}"
+    );
 }
 
 #[test]

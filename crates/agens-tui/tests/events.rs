@@ -2720,7 +2720,7 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
         .iter()
         .find(|cell| cell.symbol() == "❯")
         .expect("user prompt marker is rendered");
-    assert_eq!(user_cell.fg, ratatui::style::Color::Rgb(0x73, 0xd0, 0xff));
+    assert_eq!(user_cell.fg, ratatui::style::Color::Rgb(0xd2, 0xa6, 0xff));
 
     tui.apply_progress(TurnEvent::ToolCallRequested {
         id: "call-1".into(),

@@ -2610,7 +2610,7 @@ fn tree_branch_lines(
                 Span::styled(
                     glyph,
                     Style::default().fg(if activity.running {
-                        widgets::RolePalette::accent_active()
+                        widgets::RolePalette::running()
                     } else {
                         widgets::RolePalette::success()
                     }),
@@ -2652,7 +2652,7 @@ fn tree_row_style(state: &ViewState<'_>, id: TranscriptId) -> Style {
     let selected = state.execution_selection == Some(id);
     let active = state.active_transcript == id;
     let color = if selected {
-        widgets::RolePalette::accent_active()
+        widgets::RolePalette::navigation()
     } else if active {
         widgets::RolePalette::assistant()
     } else {
@@ -2693,7 +2693,7 @@ const fn execution_state_label(state: TuiExecutionState) -> &'static str {
 fn execution_state_color(state: TuiExecutionState) -> Color {
     match state {
         TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => {
-            widgets::RolePalette::accent_active()
+            widgets::RolePalette::running()
         }
         TuiExecutionState::CompletedRecent => widgets::RolePalette::success(),
         TuiExecutionState::Failed => widgets::RolePalette::error(),
@@ -2780,7 +2780,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
             return;
         }
         if !turn_lines.is_empty() {
-            turn_lines.extend([Line::default(), Line::default()]);
+            turn_lines.push(Line::default());
         }
         turn_lines.extend(lines);
     };

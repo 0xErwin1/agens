@@ -18,6 +18,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::conversation::ConversationItem;
@@ -474,7 +475,7 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
 
 fn user_block(text: &str) -> RenderedBlock {
     let mut rows = Vec::new();
-    let accent = Some(RowAccent::Still(RolePalette::accent_active()));
+    let accent = Some(RowAccent::Still(RolePalette::user_identity()));
     for source_line in text.split('\n') {
         let line = Line::from(Span::styled(
             source_line.to_owned(),
@@ -484,7 +485,7 @@ fn user_block(text: &str) -> RenderedBlock {
         ));
         rows.push(
             if rows.is_empty() {
-                BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::accent_active()))
+                BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::user_identity()))
             } else {
                 BlockLine::new(line)
             }
@@ -560,7 +561,7 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
     let mut spans = vec![Span::styled(
         left.clone(),
         Style::default()
-            .fg(RolePalette::accent_active())
+            .fg(RolePalette::running())
             .add_modifier(Modifier::BOLD),
     )];
     if !right.is_empty() {
@@ -761,7 +762,7 @@ fn verb_group_block(group: &FoldedGroup) -> RenderedBlock {
     }
 
     let accent = if group.running {
-        RowAccent::Wave(RolePalette::accent_active())
+        RowAccent::Wave(RolePalette::running())
     } else {
         RowAccent::Collapsed(group.state().color())
     };
@@ -862,7 +863,7 @@ fn subagent_card_block(
     let mut title = vec![Span::styled(
         agent,
         Style::default()
-            .fg(RolePalette::accent_active())
+            .fg(RolePalette::assistant_identity())
             .add_modifier(Modifier::BOLD),
     )];
     if !summary.is_empty() {
@@ -938,7 +939,7 @@ fn subagent_status_color(status: Option<agens_core::SubagentStatus>) -> Color {
         Some(agens_core::SubagentStatus::Success) => RolePalette::success(),
         Some(agens_core::SubagentStatus::Failure) => RolePalette::error(),
         Some(agens_core::SubagentStatus::Cancelled) => RolePalette::warning(),
-        None => RolePalette::accent_active(),
+        None => RolePalette::running(),
     }
 }
 
@@ -1218,9 +1219,14 @@ struct MarkdownRenderer {
     quote_depth: usize,
     lists: Vec<Option<u64>>,
     links: Vec<String>,
+    table_layouts: VecDeque<Vec<usize>>,
+    table_columns: Vec<usize>,
     table_row: bool,
     table_head: bool,
-    table_cells: usize,
+    table_column: usize,
+    table_cell_start: usize,
+    table_row_start: usize,
+    list_item_indent: Option<usize>,
 }
 
 impl MarkdownRenderer {
@@ -1252,14 +1258,21 @@ impl MarkdownRenderer {
             quote_depth: 0,
             lists: Vec::new(),
             links: Vec::new(),
+            table_layouts: VecDeque::new(),
+            table_columns: Vec::new(),
             table_row: false,
             table_head: false,
-            table_cells: 0,
+            table_column: 0,
+            table_cell_start: 0,
+            table_row_start: 0,
+            list_item_indent: None,
         }
     }
 
     fn render(mut self, markdown: &str) -> Vec<Line<'static>> {
         self.code_panel_widths = code_panel_widths(markdown, self.content_width);
+        let table_width = self.content_width.saturating_sub(self.prefix.width());
+        self.table_layouts = markdown_table_layouts(markdown, table_width);
         for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES) {
             self.event(event);
         }
@@ -1295,16 +1308,22 @@ impl MarkdownRenderer {
                 );
                 self.finish_line();
             }
-            Event::TaskListMarker(checked) => self.text(
-                if checked { "[x] " } else { "[ ] " },
-                self.base_style
-                    .fg(if checked {
-                        RolePalette::success()
-                    } else {
-                        RolePalette::navigation()
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                if let Some(indent) = self.list_item_indent.as_mut() {
+                    *indent = indent.saturating_add(marker.width());
+                }
+                self.text(
+                    marker,
+                    self.base_style
+                        .fg(if checked {
+                            RolePalette::success()
+                        } else {
+                            RolePalette::navigation()
+                        })
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
                 self.text(&text, self.current_style())
             }
@@ -1332,8 +1351,10 @@ impl MarkdownRenderer {
                     }
                     _ => "• ".to_owned(),
                 };
+                let marker = format!("{}{marker}", "  ".repeat(depth));
+                self.list_item_indent = Some(marker.width());
                 self.text(
-                    &format!("{}{marker}", "  ".repeat(depth)),
+                    &marker,
                     self.base_style
                         .fg(RolePalette::navigation())
                         .add_modifier(Modifier::BOLD),
@@ -1360,18 +1381,15 @@ impl MarkdownRenderer {
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
             Tag::Table(_) => {
                 self.finish_line();
-                self.push_table_rule('╭', '╮');
+                self.table_columns = self.table_layouts.pop_front().unwrap_or_default();
+                self.push_table_rule('╭', '┬', '╮');
             }
             Tag::TableHead => {
                 self.table_head = true;
                 self.start_table_row();
             }
             Tag::TableRow => self.start_table_row(),
-            Tag::TableCell => {
-                if self.table_cells > 0 {
-                    self.text(" │ ", self.base_style.fg(RolePalette::chrome()));
-                }
-            }
+            Tag::TableCell => self.start_table_cell(),
             Tag::Paragraph
             | Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
@@ -1389,7 +1407,10 @@ impl MarkdownRenderer {
     fn end(&mut self, tag: TagEnd) {
         match tag {
             TagEnd::Paragraph | TagEnd::Heading(_) => self.finish_block(),
-            TagEnd::Item => self.finish_line(),
+            TagEnd::Item => {
+                self.finish_line();
+                self.list_item_indent = None;
+            }
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::BlockQuote(_) => {
@@ -1425,16 +1446,17 @@ impl MarkdownRenderer {
                     );
                 }
             }
-            TagEnd::TableCell => self.table_cells = self.table_cells.saturating_add(1),
+            TagEnd::TableCell => self.finish_table_cell(),
             TagEnd::TableRow => self.finish_table_row(),
             TagEnd::TableHead => {
                 self.finish_table_row();
                 self.table_head = false;
-                self.push_table_rule('├', '┤');
+                self.push_table_rule('├', '┼', '┤');
             }
             TagEnd::Table => {
                 self.finish_line();
-                self.push_table_rule('╰', '╯');
+                self.push_table_rule('╰', '┴', '╯');
+                self.table_columns.clear();
                 self.blank_line();
             }
             TagEnd::HtmlBlock
@@ -1615,21 +1637,55 @@ impl MarkdownRenderer {
     fn start_table_row(&mut self) {
         self.finish_line();
         self.start_line();
+        self.table_row_start = self.spans.len();
         self.spans.push(Span::styled(
             "│ ",
             self.base_style.fg(RolePalette::chrome()),
         ));
         self.table_row = true;
-        self.table_cells = 0;
+        self.table_column = 0;
+        self.table_cell_start = self.spans.len();
+    }
+
+    fn start_table_cell(&mut self) {
+        if self.table_column > 0 {
+            self.spans.push(Span::styled(
+                " │ ",
+                self.base_style.fg(RolePalette::chrome()),
+            ));
+        }
+        self.table_cell_start = self.spans.len();
+    }
+
+    fn finish_table_cell(&mut self) {
+        let width = self
+            .table_columns
+            .get(self.table_column)
+            .copied()
+            .unwrap_or(1);
+        let mut cell = self
+            .spans
+            .split_off(self.table_cell_start.min(self.spans.len()));
+        truncate_spans(&mut cell, width);
+        let used = Line::from(cell.clone()).width();
+        if used < width {
+            cell.push(Span::raw(" ".repeat(width - used)));
+        }
+        self.spans.extend(cell);
+        self.table_column = self.table_column.saturating_add(1);
     }
 
     fn finish_table_row(&mut self) {
         if !self.table_row {
             return;
         }
-        if self.content_width <= 3 {
-            self.spans.clear();
-            let row = match self.content_width {
+        let row_width = self
+            .content_width
+            .saturating_sub(self.structural_prefix_width());
+        if row_width <= 3 {
+            self.spans
+                .truncate(self.table_row_start.min(self.spans.len()));
+            let row = match row_width {
                 0 => "",
                 1 => "│",
                 2 => "││",
@@ -1637,40 +1693,71 @@ impl MarkdownRenderer {
             };
             self.spans
                 .push(Span::styled(row, self.base_style.fg(RolePalette::chrome())));
-        } else {
-            let closing = " │";
-            truncate_spans(
-                &mut self.spans,
-                self.content_width.saturating_sub(closing.width()),
-            );
-            self.spans.push(Span::styled(
-                closing,
-                self.base_style.fg(RolePalette::chrome()),
-            ));
+            self.finish_line();
+            self.table_row = false;
+            self.table_column = 0;
+            self.table_cell_start = 0;
+            self.table_row_start = 0;
+            return;
         }
+        while self.table_column < self.table_columns.len() {
+            self.start_table_cell();
+            self.finish_table_cell();
+        }
+        let closing = " │";
+        let available = row_width.saturating_sub(closing.width());
+        let mut row = self
+            .spans
+            .split_off(self.table_row_start.min(self.spans.len()));
+        truncate_spans(&mut row, available);
+        self.spans.extend(row);
+        self.spans.push(Span::styled(
+            closing,
+            self.base_style.fg(RolePalette::chrome()),
+        ));
         self.finish_line();
         self.table_row = false;
-        self.table_cells = 0;
+        self.table_column = 0;
+        self.table_cell_start = 0;
+        self.table_row_start = 0;
     }
 
-    fn push_table_rule(&mut self, left: char, right: char) {
+    fn push_table_rule(&mut self, left: char, junction: char, right: char) {
         self.finish_line();
         self.start_line();
-        let used = Line::from(self.spans.clone()).width();
-        let available = self.content_width.saturating_sub(used);
+        let available = self
+            .content_width
+            .saturating_sub(self.structural_prefix_width());
         if available == 0 {
             return;
         }
-        let rule = if available == 1 {
-            left.to_string()
-        } else {
-            format!("{left}{}{right}", "─".repeat(available - 2))
-        };
+        let mut rule = left.to_string();
+        for (index, width) in self.table_columns.iter().enumerate() {
+            if index > 0 {
+                rule.push(junction);
+            }
+            rule.push_str(&"─".repeat(width.saturating_add(2)));
+        }
+        rule.push(right);
+        if rule.width() > available {
+            rule = match available {
+                0 => String::new(),
+                1 => "─".to_owned(),
+                2 => format!("{left}{right}"),
+                _ => format!("{left}{}{right}", "─".repeat(available - 2)),
+            };
+        }
         self.spans.push(Span::styled(
             rule,
             self.base_style.fg(RolePalette::chrome()),
         ));
         self.finish_line();
+    }
+
+    fn structural_prefix_width(&self) -> usize {
+        self.prefix
+            .width()
+            .saturating_add(self.quote_depth.saturating_mul(2))
     }
 
     fn push_code_chrome(&mut self, label: &str, right_corner: char) {
@@ -1707,7 +1794,37 @@ impl MarkdownRenderer {
         if self.code_panel_line || self.code_block {
             self.pad_code_panel_background();
         }
-        self.lines.push(Line::from(std::mem::take(&mut self.spans)));
+        let spans = std::mem::take(&mut self.spans);
+        if self.code_panel_line || self.code_block || self.table_row {
+            self.lines.push(Line::from(spans));
+        } else {
+            let mut continuation = Vec::new();
+            if !self.prefix.is_empty() {
+                continuation.push(Span::styled(
+                    self.prefix.clone(),
+                    self.base_style.fg(RolePalette::chrome()),
+                ));
+            }
+            if self.quote_depth > 0 {
+                continuation.push(Span::styled(
+                    "│ ".repeat(self.quote_depth),
+                    self.base_style
+                        .fg(RolePalette::markdown_quote())
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            if let Some(level) = self.heading {
+                continuation.push(Span::raw(
+                    " ".repeat(markdown_heading_marker(level).width()),
+                ));
+            }
+            if let Some(indent) = self.list_item_indent {
+                continuation.push(Span::raw(" ".repeat(indent)));
+            }
+            clip_spans(&mut continuation, self.content_width.saturating_sub(1));
+            self.lines
+                .extend(wrap_styled_spans(spans, self.content_width, &continuation));
+        }
         // Keep panel flag while body is active so blank body lines still pad.
         self.code_panel_line = self.code_block;
     }
@@ -1795,6 +1912,215 @@ fn truncate_spans(spans: &mut Vec<Span<'static>>, max_width: usize) {
         break;
     }
     *spans = kept;
+}
+
+fn clip_spans(spans: &mut Vec<Span<'static>>, max_width: usize) {
+    let mut kept = Vec::new();
+    let mut remaining = max_width;
+    for span in spans.drain(..) {
+        if remaining == 0 {
+            break;
+        }
+        let width = span.content.width();
+        if width <= remaining {
+            remaining -= width;
+            kept.push(span);
+            continue;
+        }
+        let content = take_visible_width(&span.content, remaining);
+        if !content.is_empty() {
+            kept.push(Span::styled(content, span.style));
+        }
+        break;
+    }
+    *spans = kept;
+}
+
+fn wrap_styled_spans(
+    spans: Vec<Span<'static>>,
+    max_width: usize,
+    continuation: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let max_width = max_width.max(1);
+    if Line::from(spans.clone()).width() <= max_width {
+        return vec![Line::from(spans)];
+    }
+
+    let continuation_width = Line::from(continuation.to_vec()).width().min(max_width);
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    let mut used = 0usize;
+
+    for span in spans {
+        for (chunk, whitespace) in styled_chunks(&span.content) {
+            let chunk_width = chunk.width();
+            if whitespace {
+                if used == 0 || used == continuation_width {
+                    continue;
+                }
+                if used.saturating_add(chunk_width) <= max_width {
+                    push_styled_text(&mut current, &chunk, span.style);
+                    used = used.saturating_add(chunk_width);
+                }
+                continue;
+            }
+
+            let line_capacity = max_width.saturating_sub(if lines.is_empty() {
+                0
+            } else {
+                continuation_width
+            });
+            if chunk_width <= line_capacity && used.saturating_add(chunk_width) > max_width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current.extend_from_slice(continuation);
+                used = continuation_width;
+            }
+
+            for grapheme in chunk.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if used.saturating_add(grapheme_width) > max_width && !current.is_empty() {
+                    lines.push(Line::from(std::mem::take(&mut current)));
+                    current.extend_from_slice(continuation);
+                    used = continuation_width;
+                }
+                if used.saturating_add(grapheme_width) <= max_width {
+                    push_styled_text(&mut current, grapheme, span.style);
+                    used = used.saturating_add(grapheme_width);
+                } else if used < max_width {
+                    push_styled_text(&mut current, "…", span.style);
+                    used = used.saturating_add(1);
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+fn push_styled_text(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push_str(text);
+        return;
+    }
+    spans.push(Span::styled(text.to_owned(), style));
+}
+
+fn styled_chunks(text: &str) -> Vec<(String, bool)> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_whitespace = None;
+    for character in text.chars() {
+        let whitespace = character.is_whitespace();
+        if current_whitespace.is_some_and(|kind| kind != whitespace) {
+            chunks.push((std::mem::take(&mut current), !whitespace));
+        }
+        current_whitespace = Some(whitespace);
+        current.push(character);
+    }
+    if let Some(whitespace) = current_whitespace {
+        chunks.push((current, whitespace));
+    }
+    chunks
+}
+
+fn markdown_table_layouts(markdown: &str, content_width: usize) -> VecDeque<Vec<usize>> {
+    let mut layouts = VecDeque::new();
+    let mut maxima: Option<Vec<usize>> = None;
+    let mut table_width = content_width;
+    let mut quote_depth = 0usize;
+    let mut column = 0usize;
+    let mut cell_width = 0usize;
+
+    for event in Parser::new_ext(markdown, Options::ENABLE_TABLES) {
+        match event {
+            Event::Start(Tag::BlockQuote(_)) => quote_depth = quote_depth.saturating_add(1),
+            Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
+            Event::Start(Tag::Table(_)) => {
+                maxima = Some(Vec::new());
+                table_width = content_width.saturating_sub(quote_depth.saturating_mul(2));
+            }
+            Event::Start(Tag::TableHead | Tag::TableRow) => column = 0,
+            Event::Start(Tag::TableCell) => cell_width = 0,
+            Event::Text(text) | Event::Code(text) if maxima.is_some() => {
+                cell_width = cell_width.saturating_add(text.width());
+            }
+            Event::SoftBreak | Event::HardBreak if maxima.is_some() => {
+                cell_width = cell_width.saturating_add(1);
+            }
+            Event::End(TagEnd::TableCell) => {
+                if let Some(widths) = maxima.as_mut() {
+                    if widths.len() <= column {
+                        widths.resize(column + 1, 1);
+                    }
+                    widths[column] = widths[column].max(cell_width.max(1));
+                    column = column.saturating_add(1);
+                }
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(widths) = maxima.take() {
+                    layouts.push_back(fit_table_columns(&widths, table_width));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    layouts
+}
+
+fn fit_table_columns(natural: &[usize], content_width: usize) -> Vec<usize> {
+    if natural.is_empty() {
+        return Vec::new();
+    }
+    let chrome_width = natural.len().saturating_mul(3).saturating_add(1);
+    let available = content_width.saturating_sub(chrome_width);
+    if available == 0 {
+        return vec![0; natural.len()];
+    }
+    let natural_total = natural.iter().copied().sum::<usize>();
+    if natural_total <= available {
+        return natural.to_vec();
+    }
+
+    let mut widths = natural
+        .iter()
+        .map(|width| width.saturating_mul(available) / natural_total.max(1))
+        .collect::<Vec<_>>();
+    if available >= widths.len() {
+        for width in &mut widths {
+            *width = (*width).max(1);
+        }
+    }
+    let mut assigned = widths.iter().copied().sum::<usize>();
+    while assigned < available {
+        let Some((index, _)) = natural
+            .iter()
+            .enumerate()
+            .filter(|(index, natural)| widths[*index] < **natural)
+            .max_by_key(|(index, natural)| **natural - widths[*index])
+        else {
+            break;
+        };
+        widths[index] = widths[index].saturating_add(1);
+        assigned = assigned.saturating_add(1);
+    }
+    while assigned > available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > 0)
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+        assigned -= 1;
+    }
+    widths
 }
 
 fn code_panel_widths(markdown: &str, content_width: usize) -> VecDeque<usize> {
@@ -2127,13 +2453,13 @@ fn syntax_style(tag: &str) -> Style {
 fn take_visible_width(text: &str, max_width: usize) -> String {
     let mut clipped = String::new();
     let mut width = 0_usize;
-    for character in text.chars() {
-        let character_width = Line::from(character.to_string()).width();
-        if width.saturating_add(character_width) > max_width {
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = grapheme.width();
+        if width.saturating_add(grapheme_width) > max_width {
             break;
         }
-        clipped.push(character);
-        width += character_width;
+        clipped.push_str(grapheme);
+        width += grapheme_width;
     }
     clipped
 }
@@ -2668,7 +2994,7 @@ mod tests {
         );
         assert_eq!(
             bullet_style(&lines_at(&running, &modes), "Reading 2 files…").fg,
-            Some(RolePalette::accent_active())
+            Some(RolePalette::running())
         );
 
         let mut finished = read_conversation(&["c.rs", "d.rs"]);
@@ -2698,10 +3024,10 @@ mod tests {
         let live = lines_at(&running, &BTreeMap::new());
         let bar = accent_span(&live, "Reading 2 files…");
         assert_eq!(bar.content, "┃");
-        assert_eq!(bar.style.fg, Some(RolePalette::accent_active()));
+        assert_eq!(bar.style.fg, Some(RolePalette::running()));
         let prompt_bar = accent_span(&live, "prompt");
         assert_eq!(prompt_bar.content, "┃");
-        assert_eq!(prompt_bar.style.fg, Some(RolePalette::accent_active()));
+        assert_eq!(prompt_bar.style.fg, Some(RolePalette::user_identity()));
 
         let mut folded = read_conversation(&["a.rs", "b.rs"]);
         let mut folded_modes = BTreeMap::new();
@@ -2909,7 +3235,7 @@ mod tests {
     const SETTLED_PALETTE: [Color; 7] = [
         RolePalette::assistant(),
         RolePalette::muted(),
-        RolePalette::accent_active(),
+        RolePalette::user_identity(),
         RolePalette::success(),
         RolePalette::markdown_heading(),
         RolePalette::markdown_strong(),
@@ -3095,7 +3421,7 @@ mod tests {
         let settled = settled_lines(false);
         assert_eq!(
             span_style(&settled, "Success").fg,
-            Some(RolePalette::muted())
+            Some(RolePalette::success())
         );
         assert_eq!(
             span_style(&settled, "1 lines · 25 B").fg,
@@ -3109,7 +3435,7 @@ mod tests {
         let failed = settled_lines(true);
         assert_eq!(
             span_style(&succeeded, "Success").fg,
-            Some(RolePalette::muted())
+            Some(RolePalette::success())
         );
         assert_eq!(
             span_style(&failed, "Failure").fg,
@@ -3126,8 +3452,8 @@ mod tests {
         );
         assert_eq!(
             span_style(&succeeded, "cargo test").fg,
-            Some(RolePalette::accent_active()),
-            "the operand keeps the one accent the transcript spends"
+            Some(RolePalette::assistant()),
+            "tool operands stay neutral so lifecycle colours remain exclusive"
         );
         assert_eq!(
             span_style(&succeeded, "$").fg,
@@ -3152,13 +3478,42 @@ mod tests {
         assert!(body.ends_with(" │"), "{body:?}");
         assert!(body.contains('…'), "{body:?}");
 
-        for width in 1..=3 {
+        for width in 1..=6 {
             let rows = MarkdownRenderer::new(Style::default(), "", width).render(markdown);
             assert!(rows.iter().all(|line| line.width() <= width), "{rows:?}");
             for row in rows.iter().map(line_text).filter(|row| row.contains('│')) {
                 assert!(row.starts_with('│') && row.ends_with('│'), "{row:?}");
             }
+            if width >= 2 {
+                for (row, left, right) in [
+                    (line_text(&rows[0]), '╭', '╮'),
+                    (line_text(&rows[2]), '├', '┤'),
+                    (line_text(rows.last().expect("table bottom")), '╰', '╯'),
+                ] {
+                    assert!(row.starts_with(left) && row.ends_with(right), "{row:?}");
+                }
+            }
         }
+
+        let quoted = markdown
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rows = MarkdownRenderer::new(Style::default(), "", 18).render(&quoted);
+        assert!(rows.iter().all(|line| line.width() <= 18), "{rows:?}");
+        let rows = rows.iter().map(line_text).collect::<Vec<_>>();
+        assert!(
+            rows.iter().all(|row| row.width() == rows[0].width()),
+            "quoted table borders do not align: {rows:?}"
+        );
+        assert!(rows[0].starts_with("│ ╭") && rows[0].ends_with('╮'));
+        assert!(rows[2].starts_with("│ ├") && rows[2].ends_with('┤'));
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.starts_with("│ ╰") && row.ends_with('╯')),
+            "{rows:?}"
+        );
     }
 
     #[test]

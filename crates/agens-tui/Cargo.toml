@@ -40,4 +40,5 @@ crossterm = "0.29"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = { version = "0.30.2", features = ["crossterm_0_29"] }
 serde_json = "1"
+unicode-segmentation = "1.12"
 unicode-width = "0.2"

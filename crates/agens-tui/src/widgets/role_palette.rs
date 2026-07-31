@@ -70,14 +70,19 @@ impl RolePalette {
         rgb(0xd6, 0xd4, 0xcd)
     }
 
-    /// Active work and row operands.
-    pub(crate) const fn accent_active() -> Color {
+    /// Active lifecycle state. This blue is reserved for work still running.
+    pub(crate) const fn running() -> Color {
         rgb(0x73, 0xd0, 0xff)
+    }
+
+    /// User identity marker and rail; deliberately outside the lifecycle palette.
+    pub(crate) const fn user_identity() -> Color {
+        rgb(0xd2, 0xa6, 0xff)
     }
 
     /// Navigation affordances such as links and list markers.
     pub(crate) const fn navigation() -> Color {
-        rgb(0x73, 0xd0, 0xff)
+        Self::brand()
     }
 
     /// Assistant message identity marker and rail.
@@ -100,9 +105,9 @@ impl RolePalette {
         Self::selection_fg()
     }
 
-    /// Markdown inline code: warm enough to separate tokens from prose.
+    /// Markdown inline code; orange remains distinct from warning yellow.
     pub(crate) const fn markdown_code() -> Color {
-        Self::warning()
+        rgb(0xff, 0x8f, 0x40)
     }
 }
 
@@ -113,16 +118,17 @@ mod tests {
     #[test]
     fn role_palette_uses_ayu_rgb_accents() {
         assert_eq!(RolePalette::assistant(), rgb(0xbf, 0xbd, 0xb6));
-        assert_eq!(RolePalette::accent_active(), rgb(0x73, 0xd0, 0xff));
+        assert_eq!(RolePalette::running(), rgb(0x73, 0xd0, 0xff));
+        assert_eq!(RolePalette::user_identity(), rgb(0xd2, 0xa6, 0xff));
         assert_eq!(RolePalette::success(), rgb(0xaa, 0xd9, 0x4c));
         assert_eq!(RolePalette::error(), rgb(0xf0, 0x71, 0x78));
         assert_eq!(RolePalette::brand(), rgb(0x95, 0xe6, 0xcb));
-        assert_eq!(RolePalette::navigation(), RolePalette::accent_active());
+        assert_eq!(RolePalette::navigation(), RolePalette::brand());
         assert_eq!(RolePalette::assistant_identity(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_heading(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_quote(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_strong(), RolePalette::selection_fg());
-        assert_eq!(RolePalette::markdown_code(), RolePalette::warning());
+        assert_eq!(RolePalette::markdown_code(), rgb(0xff, 0x8f, 0x40));
     }
 
     /// The transcript's text colours must stay greys, so a row's words can never
@@ -142,7 +148,7 @@ mod tests {
         }
 
         for hue in [
-            RolePalette::accent_active(),
+            RolePalette::running(),
             RolePalette::success(),
             RolePalette::error(),
         ] {
@@ -152,11 +158,36 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_colors_are_reserved_from_identity_navigation_and_code() {
+        let lifecycle = [
+            RolePalette::running(),
+            RolePalette::success(),
+            RolePalette::error(),
+            RolePalette::warning(),
+        ];
+        let non_lifecycle = [
+            RolePalette::user_identity(),
+            RolePalette::assistant_identity(),
+            RolePalette::navigation(),
+            RolePalette::markdown_code(),
+            RolePalette::assistant(),
+            RolePalette::muted(),
+        ];
+
+        for state in lifecycle {
+            for identity in non_lifecycle {
+                assert_ne!(state, identity);
+            }
+        }
+    }
+
+    #[test]
     fn typed_block_colors_are_distinct_semantic_slots() {
         assert_eq!(RolePalette::diff_insert_bg(), rgb(0x14, 0x2a, 0x1c));
         assert_eq!(RolePalette::diff_delete_bg(), rgb(0x36, 0x18, 0x1c));
         assert_ne!(RolePalette::diff_insert_bg(), RolePalette::diff_delete_bg());
-        assert_ne!(RolePalette::accent_active(), RolePalette::muted());
+        assert_ne!(RolePalette::running(), RolePalette::muted());
+        assert_ne!(RolePalette::user_identity(), RolePalette::running());
     }
 
     #[test]
@@ -174,7 +205,8 @@ mod tests {
             RolePalette::brand(),
             RolePalette::diff_insert_bg(),
             RolePalette::diff_delete_bg(),
-            RolePalette::accent_active(),
+            RolePalette::running(),
+            RolePalette::user_identity(),
         ] {
             assert_ne!(RolePalette::selection_bg(), existing);
             assert_ne!(RolePalette::selection_fg(), existing);

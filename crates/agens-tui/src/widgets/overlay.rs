@@ -89,7 +89,7 @@ impl OverlayShortcut<'_> {
         let key = Span::styled(
             self.key.to_owned(),
             Style::default()
-                .fg(RolePalette::accent_active())
+                .fg(RolePalette::navigation())
                 .add_modifier(Modifier::BOLD),
         );
         let label = Span::styled(

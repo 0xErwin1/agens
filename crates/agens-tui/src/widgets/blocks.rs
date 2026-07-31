@@ -96,7 +96,7 @@ pub(crate) enum RowState {
 impl RowState {
     pub(crate) const fn color(self) -> Color {
         match self {
-            Self::Running => RolePalette::accent_active(),
+            Self::Running => RolePalette::running(),
             Self::Success => RolePalette::success(),
             Self::Failure => RolePalette::error(),
             Self::Muted => RolePalette::muted(),
@@ -308,7 +308,9 @@ impl ToolRow {
         let status_color = if failed {
             RolePalette::error()
         } else if status == "Running…" {
-            RolePalette::accent_active()
+            RolePalette::running()
+        } else if status.starts_with("Success") {
+            RolePalette::success()
         } else {
             RolePalette::muted()
         };
@@ -333,9 +335,9 @@ impl ToolRow {
 
 /// Typed verb + operand header for a tool call.
 ///
-/// Renders `verb operand [suffix]` with the verb in primary bold, the operand in
-/// the transcript's single accent, and muted trailing metadata. The row's words
-/// never encode the call's outcome; that lives in the bullet and the accent bar.
+/// Renders `verb operand [suffix]` with a bold verb, neutral operand, and muted
+/// trailing metadata. Lifecycle colours are reserved for the bullet, accent bar,
+/// and explicit status so commands cannot be mistaken for running work.
 /// Bash renders as a `$ command` shell
 /// prompt. Unknown and MCP tools fall back to the short tool name plus a
 /// single-line, whitespace-collapsed summary of their arguments — never a raw
@@ -368,7 +370,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
     }
     spans.push(Span::styled(
         operand,
-        Style::default().fg(RolePalette::accent_active()),
+        Style::default().fg(RolePalette::assistant()),
     ));
     if let Some(suffix) = parts.suffix {
         spans.push(Span::raw(" "));
@@ -650,7 +652,7 @@ impl ToolCallBlock<'_> {
     /// opaque call keeps a still bar so it stays scannable after the fact.
     fn row_accent(&self) -> Option<RowAccent> {
         match self.state {
-            RowState::Running => Some(RowAccent::Wave(RolePalette::accent_active())),
+            RowState::Running => Some(RowAccent::Wave(RolePalette::running())),
             _ if tool_input_groupable(self.parsed) => None,
             state => Some(RowAccent::Still(state.color())),
         }
@@ -822,10 +824,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(success_text, " · Success · 12ms · 2 lines · 21 B");
-        assert_eq!(success[1].style.fg, Some(RolePalette::muted()));
+        assert_eq!(success[1].style.fg, Some(RolePalette::success()));
 
         let running = ToolRow::lifecycle_suffix("Running…", false, None);
-        assert_eq!(running[1].style.fg, Some(RolePalette::accent_active()));
+        assert_eq!(running[1].style.fg, Some(RolePalette::running()));
         let failure = ToolRow::lifecycle_suffix("Failure", true, None);
         assert_eq!(failure[1].style.fg, Some(RolePalette::error()));
     }
@@ -1253,7 +1255,7 @@ mod tests {
         let bash = ToolInput::Bash {
             command: "cargo check".into(),
         };
-        let running = Some(RowAccent::Wave(RolePalette::accent_active()));
+        let running = Some(RowAccent::Wave(RolePalette::running()));
 
         for parsed in [&read, &bash] {
             assert_eq!(
@@ -1323,7 +1325,7 @@ mod tests {
 
     #[test]
     fn the_accent_bar_moves_in_colour_only_and_dims_when_collapsed() {
-        let wave = RowAccent::Wave(RolePalette::accent_active());
+        let wave = RowAccent::Wave(RolePalette::running());
         let first = wave.span(0, Duration::ZERO);
         let later = wave.span(0, Duration::from_millis(240));
         let travelled = wave.span(1, Duration::ZERO);
@@ -1331,8 +1333,8 @@ mod tests {
         assert_eq!(first.content, later.content, "the glyph never changes");
         assert_eq!(
             first.style.fg,
-            Some(RolePalette::accent_active()),
-            "the wave opens on the full accent"
+            Some(RolePalette::running()),
+            "the wave opens on the full running colour"
         );
         assert_ne!(
             first.style.fg, later.style.fg,
