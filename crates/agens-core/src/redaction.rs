@@ -13,12 +13,15 @@
 //! padded base64 blob, for example) on shape alone, so it is accepted as a residual risk
 //! rather than mangling unrelated content.
 
-const CREDENTIAL_KEYS: [&str; 8] = [
+const CREDENTIAL_KEYS: [&str; 11] = [
     "api_key",
     "apikey",
+    "api-key",
+    "x-api-key",
     "authorization",
     "password",
     "secret",
+    "token",
     "access_token",
     "refresh_token",
     "client_secret",
@@ -375,7 +378,9 @@ fn find_inline_credential_key_operator(word: &str) -> Option<usize> {
 
         let candidate_prefix = &word[..operator_offset];
         let key_start = candidate_prefix
-            .rfind(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .rfind(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+            })
             .map_or(0, |boundary_index| {
                 boundary_index
                     + candidate_prefix[boundary_index..]
@@ -443,23 +448,36 @@ fn is_windows_drive_path(word: &str) -> bool {
         && characters.next() == Some('\\')
 }
 
-/// Bounds `value` to `max_chars` characters, appending a visible truncation marker when it
-/// was cut. Mirrors `SUBAGENT_RESULT_TRUNCATION_MARKER` (`agens-session/src/turns.rs`): the
-/// marker is appended after the cap rather than counted within it, so truncation is always
-/// visible and never silent.
+/// Bounds `value` to `max_chars` characters, keeping both the head and the tail rather than
+/// only the head. A failing native tool call — a bash script, a build — puts its most useful
+/// detail (captured stderr, the exit status) at the end of its output, so a head-only bound
+/// would drop exactly that detail on any failure larger than the cap. Mirrors
+/// `SUBAGENT_RESULT_TRUNCATION_MARKER` (`agens-session/src/turns.rs`): the marker sits between
+/// the two kept halves and is never counted against the cap, so truncation is always visible and
+/// never silent.
 pub fn bounded_detail(value: &str, max_chars: usize) -> String {
-    let total_chars = value.chars().count();
+    let characters: Vec<char> = value.chars().collect();
+    let total_chars = characters.len();
     if total_chars <= max_chars {
         return value.to_owned();
     }
 
-    let mut bounded: String = value.chars().take(max_chars).collect();
-    bounded.push_str(&truncation_marker(max_chars));
-    bounded
+    let head_chars = max_chars.div_ceil(2);
+    let tail_chars = max_chars - head_chars;
+
+    let head: String = characters[..head_chars].iter().collect();
+    let tail: String = characters[total_chars - tail_chars..].iter().collect();
+
+    format!(
+        "{head}{}{tail}",
+        truncation_marker(head_chars, tail_chars, total_chars)
+    )
 }
 
-fn truncation_marker(max_chars: usize) -> String {
-    format!("\n[truncated: only the first {max_chars} characters of this detail were kept]")
+fn truncation_marker(head_chars: usize, tail_chars: usize, total_chars: usize) -> String {
+    format!(
+        "\n[truncated: kept the first {head_chars} and last {tail_chars} of {total_chars} characters]\n"
+    )
 }
 
 #[cfg(test)]
@@ -485,6 +503,9 @@ mod tests {
         let quoted_api_key_value = "hunter2short";
         let quoted_password_value = "hunter2";
         let url_query_value = "abcd1234EFGH5678";
+        let token_equals_value = "SuperSecretToken123";
+        let api_key_hyphenated_value = "AKIAHYPHENVALUE12345";
+        let x_api_key_value = "xk-remote-body-value123";
 
         vec![
             (
@@ -579,8 +600,8 @@ mod tests {
             ),
             (
                 "bare keywords with no value survive",
-                "authorization secret password check".to_owned(),
-                "authorization secret password check".to_owned(),
+                "authorization secret password token check".to_owned(),
+                "authorization secret password token check".to_owned(),
             ),
             (
                 "JSON-quoted api_key pair",
@@ -604,6 +625,30 @@ mod tests {
                 format!(
                     "POST https://api.example.com/v1/x?api_key=[redacted: {} characters] failed",
                     url_query_value.chars().count()
+                ),
+            ),
+            (
+                "bare token key=value glued shape",
+                format!("auth token={token_equals_value} sent"),
+                format!(
+                    "auth token=[redacted: {} characters] sent",
+                    token_equals_value.chars().count()
+                ),
+            ),
+            (
+                "hyphenated api-key=value glued shape",
+                format!("config api-key={api_key_hyphenated_value} saved"),
+                format!(
+                    "config api-key=[redacted: {} characters] saved",
+                    api_key_hyphenated_value.chars().count()
+                ),
+            ),
+            (
+                "hyphenated x-api-key header, spaced value",
+                format!("X-Api-Key: {x_api_key_value} rejected"),
+                format!(
+                    "X-Api-Key: [redacted: {} characters] rejected",
+                    x_api_key_value.chars().count()
                 ),
             ),
             (
@@ -699,9 +744,33 @@ mod tests {
         let long = "x".repeat(100);
         let bounded = bounded_detail(&long, 10);
 
-        assert!(bounded.starts_with(&"x".repeat(10)));
+        assert!(bounded.starts_with("xxxxx"));
+        assert!(bounded.ends_with("xxxxx"));
         assert!(bounded.contains("[truncated:"));
-        assert!(bounded.contains("10"));
+        assert_eq!(
+            bounded
+                .chars()
+                .filter(|&character| character == 'x')
+                .count(),
+            10
+        );
+    }
+
+    /// A failing bash tool call puts its most useful detail — the captured stderr and the exit
+    /// status — at the very end of the content (`render_bash_result`,
+    /// `agens-tools/src/lib.rs:6226-6260`). A head-only bound would drop exactly that detail on
+    /// any failure larger than the cap, which is the case this bound exists to serve.
+    #[test]
+    fn bounded_detail_keeps_both_ends_so_tail_content_survives() {
+        let head_filler = "h".repeat(200);
+        let tail_signal = "TAILSIGNAL";
+        let long = format!("{head_filler}{tail_signal}");
+
+        let bounded = bounded_detail(&long, 20);
+
+        assert!(bounded.starts_with(&"h".repeat(10)));
+        assert!(bounded.ends_with(tail_signal));
+        assert!(bounded.contains("[truncated:"));
     }
 
     #[test]
