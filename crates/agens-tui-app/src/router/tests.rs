@@ -3184,7 +3184,7 @@ fn permission_error_mapping_is_sanitized_and_fails_closed() {
 }
 
 #[test]
-fn provider_context_and_network_render_sanitized_actions() {
+fn provider_failures_render_sanitized_specific_actions() {
     for (turn_error, expected_message, expected_action) in [
         (
             HeadlessTurnError::ProviderContext,
@@ -3196,13 +3196,44 @@ fn provider_context_and_network_render_sanitized_actions() {
             "provider: network request failed",
             "Check the network connection, then retry.",
         ),
+        (
+            HeadlessTurnError::ProviderProtocol,
+            "provider: ChatGPT response protocol failed",
+            "Open /diagnostics for the referenced event, then retry.",
+        ),
     ] {
-        let error = CliError::runtime(turn_error);
+        let error = CliError::runtime(turn_error).with_diagnostic_reference("deadbeef");
+        let expected_message = format!("{expected_message} [ref: deadbeef]");
 
         assert!(matches!(
             tui_provider_outcome(Err(error)),
             TuiProviderOutcome::Failed { message, action }
                 if message == expected_message && action == expected_action
+        ));
+    }
+}
+
+#[test]
+fn provider_specific_actions_reject_malformed_diagnostic_references() {
+    let exact = CliError::runtime(HeadlessTurnError::ProviderProtocol);
+    assert!(matches!(
+        tui_provider_outcome(Err(exact)),
+        TuiProviderOutcome::Failed { action, .. }
+            if action == "Open /diagnostics for the referenced event, then retry."
+    ));
+
+    for reference in [
+        "DEADBEEF",
+        "deadbee",
+        "deadbeef0",
+        "deadbeef] trailing",
+        "dead] [ref: beef",
+    ] {
+        let error = CliError::runtime(HeadlessTurnError::ProviderProtocol)
+            .with_diagnostic_reference(reference);
+        assert!(matches!(
+            tui_provider_outcome(Err(error)),
+            TuiProviderOutcome::Failed { action, .. } if action == TUI_ERROR_ACTION
         ));
     }
 }

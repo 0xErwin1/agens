@@ -9,10 +9,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agens_core::{
-    Error, HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
-    TurnProgressSink, TurnProvider, Usage,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
+    Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
-use agens_providers::{ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider};
+use agens_providers::{
+    ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
+    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+};
 use serde_json::{Value, json};
 
 static TEMP_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
@@ -1467,6 +1470,14 @@ fn subscription_tool_replay_rejects_duplicate_outputs_before_another_http_reques
         "weather",
         r#"{"city":"Paris"}"#,
     ))]);
+    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&diagnostic_events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
     let mut provider =
         ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
             &credentials,
@@ -1478,7 +1489,8 @@ fn subscription_tool_replay_rejects_duplicate_outputs_before_another_http_reques
             Vec::new(),
             Duration::from_secs(1),
         )
-        .expect("provider should be configured");
+        .expect("provider should be configured")
+        .with_diagnostics(diagnostics);
     let result = MessagePart::ToolResult {
         tool_call_id: "call_1".to_owned(),
         content: "sunny".to_owned(),
@@ -1498,12 +1510,111 @@ fn subscription_tool_replay_rejects_duplicate_outputs_before_another_http_reques
             ],
             HeadlessTurnCancellation::new(),
         ),
-        Err(HeadlessTurnPortError::Provider)
+        Err(HeadlessTurnPortError::ProviderProtocol)
     );
+    let diagnostic_events = diagnostic_events.lock().expect("event lock");
+    let rejected = diagnostic_events
+        .last()
+        .expect("rejection should be diagnosed");
+    assert_eq!(
+        rejected.event,
+        ProviderDiagnosticKind::ToolOutputCorrelationRejected
+    );
+    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Protocol));
+    assert_eq!(rejected.status, None);
+    drop(diagnostic_events);
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::Provider)
+        Err(HeadlessTurnPortError::ProviderProtocol)
     );
+    assert_eq!(server.join().len(), 1);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_replay_rejection_reports_a_safe_reason_after_a_successful_response() {
+    let directory = temporary_directory("duplicate-replay-item");
+    let credentials = write_credentials(&directory);
+    let repeated_message = json!({
+        "type": "message",
+        "id": "item_message_repeated",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "checking"}],
+    });
+    let server = ScriptedServer::start(vec![
+        ScriptedResponse::Sse(tool_round_sse(
+            std::slice::from_ref(&repeated_message),
+            &[("item_call_1", "call_1", "weather", r#"{"city":"Paris"}"#)],
+        )),
+        ScriptedResponse::Sse(tool_round_sse(
+            &[repeated_message],
+            &[("item_call_2", "call_2", "weather", r#"{"city":"Rome"}"#)],
+        )),
+    ]);
+    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&diagnostic_events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+    let mut provider = subscription_provider(&credentials, &server).with_diagnostics(diagnostics);
+
+    assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    assert_eq!(
+        run_with_events(
+            &mut provider,
+            &[tool_result("call_1", "sunny", false)],
+            HeadlessTurnCancellation::new(),
+        ),
+        Err(HeadlessTurnPortError::ProviderProtocol)
+    );
+
+    let diagnostic_events = diagnostic_events.lock().expect("event lock");
+    let rejected = diagnostic_events
+        .last()
+        .expect("rejection should be diagnosed");
+    assert_eq!(rejected.event, ProviderDiagnosticKind::ReplayItemRejected);
+    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Protocol));
+    assert_eq!(rejected.status, None);
+    assert_eq!(rejected.max_attempts, 0);
+    drop(diagnostic_events);
+    assert_eq!(server.join().len(), 2);
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn subscription_queue_after_completion_reports_invalid_provider_state() {
+    let directory = temporary_directory("queue-after-completion");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Sse(completed_text_sse("done"))]);
+    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&diagnostic_events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+    let mut provider = subscription_provider(&credentials, &server).with_diagnostics(diagnostics);
+
+    assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    assert_eq!(
+        provider.queue_user_messages(vec![Message {
+            role: Role::User,
+            parts: vec![MessagePart::Text("late input".into())],
+        }]),
+        Err(HeadlessTurnPortError::ProviderProtocol)
+    );
+
+    let diagnostic_events = diagnostic_events.lock().expect("event lock");
+    let rejected = diagnostic_events
+        .last()
+        .expect("invalid state should be diagnosed");
+    assert_eq!(rejected.event, ProviderDiagnosticKind::ProviderStateInvalid);
+    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Protocol));
+    drop(diagnostic_events);
     assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
@@ -1703,11 +1814,11 @@ fn subscription_tool_replay_rejects_missing_foreign_duplicate_and_truncated_resu
                 &continuation_events,
                 HeadlessTurnCancellation::new(),
             ),
-            Err(HeadlessTurnPortError::Provider),
+            Err(HeadlessTurnPortError::ProviderProtocol),
         );
         assert_eq!(
             run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-            Err(HeadlessTurnPortError::Provider),
+            Err(HeadlessTurnPortError::ProviderProtocol),
         );
         assert_eq!(
             server.join().len(),
@@ -1770,7 +1881,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
                     &[tool_result("call_1", "first", false)],
                     HeadlessTurnCancellation::new(),
                 ),
-                Err(HeadlessTurnPortError::Provider),
+                Err(HeadlessTurnPortError::ProviderProtocol),
             );
         } else {
             assert_eq!(
@@ -1780,7 +1891,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
         }
         assert_eq!(
             run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-            Err(HeadlessTurnPortError::Provider),
+            Err(HeadlessTurnPortError::ProviderProtocol),
         );
         assert_eq!(
             server.join().len(),
@@ -1830,6 +1941,7 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
         "item-bound",
         tool_round_sse(&oversized_items, &[("item_call", "call", "weather", "{}")]),
         HeadlessTurnPortError::ProviderProtocol,
+        ProviderDiagnosticKind::Terminal,
     );
 
     let large_content = "x".repeat(65_000);
@@ -1846,7 +1958,8 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     assert_replay_response_rejection(
         "history-bound",
         tool_round_sse(&history_items, &[("item_call", "call", "weather", "{}")]),
-        HeadlessTurnPortError::Provider,
+        HeadlessTurnPortError::ProviderContext,
+        ProviderDiagnosticKind::ReplayLimitExceeded,
     );
 
     let directory = temporary_directory("round-bound");
@@ -1865,7 +1978,15 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
         })
         .collect::<Vec<_>>();
     let server = ScriptedServer::start(responses);
-    let mut provider = subscription_provider(&credentials, &server);
+    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&diagnostic_events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+    let mut provider = subscription_provider(&credentials, &server).with_diagnostics(diagnostics);
     let mut events = Vec::new();
     assert!(run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()).is_ok());
     for index in 0..127 {
@@ -1875,8 +1996,16 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     events.push(tool_result("call_127", "ok", false));
     assert_eq!(
         run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::Provider),
+        Err(HeadlessTurnPortError::ProviderContext),
     );
+    let diagnostic_events = diagnostic_events.lock().expect("event lock");
+    let rejected = diagnostic_events.last().expect("limit should be diagnosed");
+    assert_eq!(
+        rejected.event,
+        ProviderDiagnosticKind::ContinuationLimitExceeded
+    );
+    assert_eq!(rejected.class, Some(ProviderDiagnosticClass::Context));
+    drop(diagnostic_events);
     assert_eq!(server.join().len(), 128);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
@@ -1907,7 +2036,7 @@ fn subscription_tool_replay_rejects_an_oversized_item_without_retaining_or_repla
 
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::Provider),
+        Err(HeadlessTurnPortError::ProviderProtocol),
     );
     assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
@@ -2022,7 +2151,7 @@ fn subscription_tool_replay_cancellation_and_timeout_stop_second_and_third_round
         );
         assert_eq!(
             run_with_events(&mut provider, &events, HeadlessTurnCancellation::new()),
-            Err(HeadlessTurnPortError::Provider),
+            Err(HeadlessTurnPortError::ProviderProtocol),
         );
         if let Some(canceller) = canceller {
             canceller.join().expect("canceller should finish");
@@ -2058,19 +2187,41 @@ fn subscription_provider(credentials: &Path, server: &ScriptedServer) -> ChatGpt
     .expect("provider should be configured")
 }
 
-fn assert_replay_response_rejection(name: &str, response: String, expected: HeadlessTurnPortError) {
+fn assert_replay_response_rejection(
+    name: &str,
+    response: String,
+    expected: HeadlessTurnPortError,
+    expected_event: ProviderDiagnosticKind,
+) {
     let directory = temporary_directory(name);
     let credentials = write_credentials(&directory);
     let server = ScriptedServer::start(vec![ScriptedResponse::Sse(response)]);
-    let mut provider = subscription_provider(&credentials, &server);
+    let diagnostic_events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&diagnostic_events);
+    let diagnostics = ProviderDiagnostics::new(
+        "abc12345",
+        ProviderDiagnosticScope::Parent,
+        Arc::new(move |event| captured.lock().expect("event lock").push(event)),
+    )
+    .expect("diagnostics should be configured");
+    let mut provider = subscription_provider(&credentials, &server).with_diagnostics(diagnostics);
 
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
         Err(expected),
     );
+    let diagnostic_events = diagnostic_events.lock().expect("event lock");
+    assert_eq!(
+        diagnostic_events
+            .last()
+            .expect("rejection should be diagnosed")
+            .event,
+        expected_event
+    );
+    drop(diagnostic_events);
     assert_eq!(
         run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()),
-        Err(HeadlessTurnPortError::Provider),
+        Err(HeadlessTurnPortError::ProviderProtocol),
     );
     assert_eq!(server.join().len(), 1, "{name} must not retry");
     fs::remove_dir_all(directory).expect("temporary directory should be removed");

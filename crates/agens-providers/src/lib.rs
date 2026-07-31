@@ -150,7 +150,14 @@ impl ProviderDiagnostics {
             component,
             event,
             attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
-            max_attempts: if class == Some(ProviderDiagnosticClass::Network) || attempt > 3 {
+            max_attempts: if !matches!(
+                event,
+                ProviderDiagnosticKind::Attempt
+                    | ProviderDiagnosticKind::RetryScheduled
+                    | ProviderDiagnosticKind::Terminal
+            ) || class == Some(ProviderDiagnosticClass::Network)
+                || attempt > 3
+            {
                 0
             } else {
                 MAX_HTTP_STATUS_ATTEMPTS as u8
@@ -228,6 +235,11 @@ pub enum ProviderDiagnosticKind {
     Terminal,
     AgentUnavailable,
     AgentFallback,
+    ContinuationLimitExceeded,
+    ProviderStateInvalid,
+    ReplayItemRejected,
+    ReplayLimitExceeded,
+    ToolOutputCorrelationRejected,
 }
 
 impl ProviderDiagnosticKind {
@@ -238,6 +250,11 @@ impl ProviderDiagnosticKind {
             Self::Terminal => "terminal",
             Self::AgentUnavailable => "agent_unavailable",
             Self::AgentFallback => "agent_fallback",
+            Self::ContinuationLimitExceeded => "continuation_limit_exceeded",
+            Self::ProviderStateInvalid => "provider_state_invalid",
+            Self::ReplayItemRejected => "replay_item_rejected",
+            Self::ReplayLimitExceeded => "replay_limit_exceeded",
+            Self::ToolOutputCorrelationRejected => "tool_output_correlation_rejected",
         }
     }
 }
@@ -1466,6 +1483,24 @@ async fn wait_for_http_retry(
     result
 }
 
+fn local_chatgpt_failure(
+    diagnostics: Option<&ProviderDiagnostics>,
+    event: ProviderDiagnosticKind,
+    error: HeadlessTurnPortError,
+) -> HeadlessTurnPortError {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.emit(
+            ProviderDiagnosticComponent::Responses,
+            event,
+            0,
+            None,
+            None,
+            Some(diagnostic_class_for_port_error(error)),
+        );
+    }
+    error
+}
+
 fn emit_retry_terminal(
     diagnostics: Option<&ProviderDiagnostics>,
     component: ProviderDiagnosticComponent,
@@ -1494,7 +1529,11 @@ impl TurnProvider for ChatGptResponsesProvider {
                 replay_history.extend(input);
             }
             ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
-                return Err(HeadlessTurnPortError::Provider);
+                return Err(local_chatgpt_failure(
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticKind::ProviderStateInvalid,
+                    HeadlessTurnPortError::ProviderProtocol,
+                ));
             }
         }
         Ok(())
@@ -1523,20 +1562,43 @@ impl TurnProvider for ChatGptResponsesProvider {
                 event_cursor,
             } => {
                 if self.continuation_rounds >= MAX_OPENAI_TOOL_CONTINUATION_ROUNDS {
-                    return Err(HeadlessTurnPortError::Provider);
+                    return Err(local_chatgpt_failure(
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticKind::ContinuationLimitExceeded,
+                        HeadlessTurnPortError::ProviderContext,
+                    ));
                 }
                 let Some(new_events) = events.get(event_cursor..) else {
-                    return Err(HeadlessTurnPortError::Provider);
+                    return Err(local_chatgpt_failure(
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticKind::ProviderStateInvalid,
+                        HeadlessTurnPortError::ProviderProtocol,
+                    ));
                 };
-                let outputs = correlated_tool_outputs(&pending_calls, new_events)
-                    .map_err(|()| HeadlessTurnPortError::Provider)?;
+                let outputs =
+                    correlated_tool_outputs(&pending_calls, new_events).map_err(|()| {
+                        local_chatgpt_failure(
+                            self.diagnostics.as_ref(),
+                            ProviderDiagnosticKind::ToolOutputCorrelationRejected,
+                            HeadlessTurnPortError::ProviderProtocol,
+                        )
+                    })?;
                 replay_history.extend(outputs);
-                validate_chatgpt_replay_history(&replay_history)
-                    .map_err(|()| HeadlessTurnPortError::Provider)?;
+                validate_chatgpt_replay_history(&replay_history).map_err(|()| {
+                    local_chatgpt_failure(
+                        self.diagnostics.as_ref(),
+                        ProviderDiagnosticKind::ReplayLimitExceeded,
+                        HeadlessTurnPortError::ProviderContext,
+                    )
+                })?;
                 (self.request_payload(replay_history.clone()), replay_history)
             }
             ChatGptContinuationState::Completed | ChatGptContinuationState::Failed => {
-                return Err(HeadlessTurnPortError::Provider);
+                return Err(local_chatgpt_failure(
+                    self.diagnostics.as_ref(),
+                    ProviderDiagnosticKind::ProviderStateInvalid,
+                    HeadlessTurnPortError::ProviderProtocol,
+                ));
             }
         };
 
@@ -1588,17 +1650,32 @@ impl TurnProvider for ChatGptResponsesProvider {
             item.get("id")
                 .and_then(Value::as_str)
                 .is_none_or(|id| !self.seen_replay_item_ids.insert(id.to_owned()))
-        }) || replay_history.len() + response.replay_items.len() > MAX_CHATGPT_REPLAY_ITEMS
-        {
+        }) {
             self.state = ChatGptContinuationState::Failed;
-            return Err(HeadlessTurnPortError::Provider);
+            return Err(local_chatgpt_failure(
+                self.diagnostics.as_ref(),
+                ProviderDiagnosticKind::ReplayItemRejected,
+                HeadlessTurnPortError::ProviderProtocol,
+            ));
+        }
+        if replay_history.len() + response.replay_items.len() > MAX_CHATGPT_REPLAY_ITEMS {
+            self.state = ChatGptContinuationState::Failed;
+            return Err(local_chatgpt_failure(
+                self.diagnostics.as_ref(),
+                ProviderDiagnosticKind::ReplayLimitExceeded,
+                HeadlessTurnPortError::ProviderContext,
+            ));
         }
 
         let mut replay_history = replay_history;
         replay_history.extend(response.replay_items);
         if validate_chatgpt_replay_history(&replay_history).is_err() {
             self.state = ChatGptContinuationState::Failed;
-            return Err(HeadlessTurnPortError::Provider);
+            return Err(local_chatgpt_failure(
+                self.diagnostics.as_ref(),
+                ProviderDiagnosticKind::ReplayLimitExceeded,
+                HeadlessTurnPortError::ProviderContext,
+            ));
         }
         if response.pending_calls.is_empty() {
             self.state = ChatGptContinuationState::Completed;

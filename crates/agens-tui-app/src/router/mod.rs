@@ -198,6 +198,24 @@ pub fn auth_route_outcome(result: Result<String, AuthRouteError>) -> TuiSubmissi
     }
 }
 
+fn has_error_message(error: &CliError, expected: &str) -> bool {
+    if error.message == expected {
+        return true;
+    }
+    let Some(reference) = error
+        .message
+        .strip_prefix(expected)
+        .and_then(|suffix| suffix.strip_prefix(" [ref: "))
+        .and_then(|suffix| suffix.strip_suffix(']'))
+    else {
+        return false;
+    };
+    reference.len() == 8
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutcome {
     match result {
         Ok(output) => TuiProviderOutcome::Completed(output),
@@ -205,16 +223,24 @@ pub fn tui_provider_outcome(result: Result<String, CliError>) -> TuiProviderOutc
             message: error.to_string(),
             action: TUI_ERROR_ACTION.into(),
         },
-        Err(error) if error.message == "request exceeds the model context window" => {
+        Err(error) if has_error_message(&error, "request exceeds the model context window") => {
             TuiProviderOutcome::Failed {
                 message: error.to_string(),
                 action: "Start a new session or shorten the prompt, then retry.".into(),
             }
         }
-        Err(error) if error.message == "network request failed" => TuiProviderOutcome::Failed {
-            message: error.to_string(),
-            action: "Check the network connection, then retry.".into(),
-        },
+        Err(error) if has_error_message(&error, "network request failed") => {
+            TuiProviderOutcome::Failed {
+                message: error.to_string(),
+                action: "Check the network connection, then retry.".into(),
+            }
+        }
+        Err(error) if has_error_message(&error, "ChatGPT response protocol failed") => {
+            TuiProviderOutcome::Failed {
+                message: error.to_string(),
+                action: "Open /diagnostics for the referenced event, then retry.".into(),
+            }
+        }
         Err(error) => TuiProviderOutcome::Failed {
             message: error.to_string(),
             action: TUI_ERROR_ACTION.into(),

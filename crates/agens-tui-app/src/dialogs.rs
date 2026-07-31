@@ -127,6 +127,11 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
             "terminal",
             "agent_unavailable",
             "agent_fallback",
+            "continuation_limit_exceeded",
+            "provider_state_invalid",
+            "replay_item_rejected",
+            "replay_limit_exceeded",
+            "tool_output_correlation_rejected",
         ],
     )?;
     let attempt = object
@@ -164,7 +169,9 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
     let class_label = class.unwrap_or("success");
     let status_label = status.map_or_else(|| "none".into(), |status| status.to_string());
     let delay_label = delay.map_or_else(|| "none".into(), |delay| format!("{delay}ms"));
-    let attempt_label = if max_attempts == 0 {
+    let attempt_label = if attempt == 0 && max_attempts == 0 {
+        "not applicable".into()
+    } else if max_attempts == 0 {
         format!("{attempt}/unbounded")
     } else {
         format!("{attempt}/{max_attempts}")
@@ -378,7 +385,23 @@ mod tests {
                 "{\"timestamp_ms\":1,\"reference\":\"abc12345\",\"scope\":\"parent\",",
                 "\"component\":\"responses\",\"event\":\"terminal\",\"attempt\":3,",
                 "\"max_attempts\":3,\"delay_ms\":null,\"status\":429,",
-                "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n"
+                "\"class\":\"rate_limited\",\"unknown\":\"SENTINEL_SECRET\"}\n",
+                "{\"timestamp_ms\":2,\"reference\":\"def67890\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"replay_item_rejected\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,",
+                "\"class\":\"protocol\"}\n",
+                "{\"timestamp_ms\":3,\"reference\":\"aaa00001\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"continuation_limit_exceeded\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"context\"}\n",
+                "{\"timestamp_ms\":4,\"reference\":\"aaa00002\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"provider_state_invalid\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n",
+                "{\"timestamp_ms\":5,\"reference\":\"aaa00003\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"replay_limit_exceeded\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"context\"}\n",
+                "{\"timestamp_ms\":6,\"reference\":\"aaa00004\",\"scope\":\"parent\",",
+                "\"component\":\"responses\",\"event\":\"tool_output_correlation_rejected\",\"attempt\":0,",
+                "\"max_attempts\":0,\"delay_ms\":null,\"status\":null,\"class\":\"protocol\"}\n"
             ),
         )
         .expect("diagnostic fixture should be written");
@@ -391,6 +414,19 @@ mod tests {
 
         assert!(rendered.contains("abc12345"));
         assert!(rendered.contains("diagnostics/agens-42.jsonl"));
+        for event in [
+            "continuation_limit_exceeded",
+            "provider_state_invalid",
+            "replay_item_rejected",
+            "replay_limit_exceeded",
+            "tool_output_correlation_rejected",
+        ] {
+            assert!(
+                rendered.contains(event),
+                "missing diagnostic event: {event}"
+            );
+        }
+        assert!(rendered.contains("Attempt: not applicable"));
         assert!(!rendered.contains(&data_directory.display().to_string()));
         assert!(!rendered.contains("SENTINEL_SECRET"));
         assert!(!rendered.contains("SENTINEL_OUTSIDE"));
