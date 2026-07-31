@@ -7,6 +7,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{DisplayMode, ExpandMode, RolePalette, StatusGlyph};
@@ -26,9 +27,8 @@ pub(crate) const ACCENT_WIDTH: usize = 1;
 
 /// Left accent bar marking the rows of a live or consequential block.
 ///
-/// Membership is per block kind, not per role: a row without an accent leaves
-/// the column blank. Motion is colour-only, so the bar never changes a row's
-/// shape as ticks advance.
+/// A row without an accent leaves the column blank. Motion is colour-only, so
+/// animated lifecycle bars never change a row's shape as ticks advance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RowAccent {
     /// Full bar whose brightness breathes down the block.
@@ -481,7 +481,7 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
         ToolInput::Skill { skill } => plain("Skill", skill.clone()),
         ToolInput::Other { name, raw } => HeaderParts {
             verb: "",
-            operand: format!("{} {}", short_tool_name(name), summarize_args(raw))
+            operand: format!("{} {}", short_tool_name(name), summarize_args(name, raw))
                 .trim()
                 .to_owned(),
             suffix: None,
@@ -490,19 +490,45 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
     }
 }
 
-/// Summarize an unknown tool's arguments without echoing their values.
+/// Summarize an unknown tool's arguments without dumping arbitrary values.
 ///
-/// A JSON object payload is reduced to its top-level key shape (`{path, limit}`)
-/// so the header describes the call instead of dumping it; any other payload
-/// collapses to a single whitespace-normalized line. The complete raw arguments
-/// stay reachable through [`DisplayMode::Expanded`].
-fn summarize_args(raw: &str) -> String {
+/// Stable resource identifiers (`readable_id` or `slug`) are safe and useful on
+/// the scan path; a move also includes its destination column. Other JSON objects
+/// retain only their top-level key shape. Complete raw arguments stay reachable
+/// through [`DisplayMode::Expanded`].
+fn summarize_args(tool_name: &str, raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('{') {
-        format_key_shape(&object_keys(trimmed))
+        tool_name
+            .strip_prefix("mcp::atlas_")
+            .and_then(|_| safe_resource_summary(trimmed))
+            .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
     } else {
         collapse_whitespace(trimmed)
     }
+}
+
+const MAX_RESOURCE_SUMMARY_WIDTH: usize = 48;
+const MAX_DESTINATION_SUMMARY_WIDTH: usize = 32;
+
+fn safe_resource_summary(raw: &str) -> Option<String> {
+    let Value::Object(arguments) = serde_json::from_str(raw).ok()? else {
+        return None;
+    };
+    let resource = ["readable_id", "slug"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))?;
+    let resource = truncate_operand(&collapse_whitespace(resource), MAX_RESOURCE_SUMMARY_WIDTH);
+    if resource.is_empty() {
+        return None;
+    }
+    let destination = arguments
+        .get("column")
+        .and_then(Value::as_str)
+        .map(collapse_whitespace)
+        .filter(|value| !value.is_empty())
+        .map(|value| truncate_operand(&value, MAX_DESTINATION_SUMMARY_WIDTH));
+    Some(destination.map_or(resource.clone(), |column| format!("{resource} → {column}")))
 }
 
 fn collapse_whitespace(raw: &str) -> String {
@@ -1036,6 +1062,28 @@ mod tests {
             }),
             "custom {}"
         );
+        assert_eq!(
+            header_of(&ToolInput::Other {
+                name: "mcp::atlas_get_task".into(),
+                raw: r#"{"detail":"full","readable_id":"AGN-37","workspace":"agens","token":"SECRET"}"#.into(),
+            }),
+            "atlas_get_task AGN-37"
+        );
+        assert_eq!(
+            header_of(&ToolInput::Other {
+                name: "mcp::atlas_move_task".into(),
+                raw:
+                    r#"{"board":"Work","column":"Done","readable_id":"AGN-92","workspace":"agens"}"#
+                        .into(),
+            }),
+            "atlas_move_task AGN-92 → Done"
+        );
+        let non_atlas = header_of(&ToolInput::Other {
+            name: "mcp::other_lookup".into(),
+            raw: r#"{"readable_id":"PRIVATE-ID","slug":"PRIVATE-SLUG"}"#.into(),
+        });
+        assert_eq!(non_atlas, "other_lookup {readable_id, slug}");
+        assert!(!non_atlas.contains("PRIVATE"));
         // Non-object payloads keep the collapsed single-line summary.
         assert_eq!(
             header_of(&ToolInput::Other {

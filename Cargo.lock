@@ -286,6 +286,7 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "unicode-width",
 ]
 
