@@ -1971,7 +1971,7 @@ impl TaskRunner for TerminalTaskRunner {
             }),
             Self::Iterations => Ok(TaskTurnResult {
                 output: "ignored".into(),
-                iterations: 17,
+                iterations: 33,
             }),
             Self::Provider => Err(TaskRunnerError::ProviderFailure),
             Self::Child => Err(TaskRunnerError::ChildFailure),

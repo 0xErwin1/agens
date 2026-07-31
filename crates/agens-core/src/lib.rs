@@ -430,6 +430,7 @@ pub enum SubagentErrorKind {
     Rejected,
     Server,
     Tool,
+    IterationLimit,
     Runtime,
 }
 
@@ -1696,16 +1697,20 @@ async fn run_headless_turn_with_iteration_limit(
             check_cancelled(&mut coordinator, cancellation)?;
             flush_progress(&coordinator, progress, &mut progress_cursor);
 
-            let decision = permission_gate
-                .evaluate(&call, cancellation)
-                .await
-                .map_err(|error| {
-                    finish_port_error(
+            let decision = match permission_gate.evaluate(&call, cancellation).await {
+                Ok(decision) => decision,
+                Err(HeadlessTurnPortError::Tool) => {
+                    preflight.push((call, None));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(finish_port_error(
                         &mut coordinator,
                         error,
                         HeadlessTurnError::PermissionEvaluation,
-                    )
-                })?;
+                    ));
+                }
+            };
             check_cancelled(&mut coordinator, cancellation)?;
             let decision = resolve_permission_decision(
                 decision,
@@ -1717,7 +1722,7 @@ async fn run_headless_turn_with_iteration_limit(
             .await?;
             check_cancelled(&mut coordinator, cancellation)?;
 
-            preflight.push((call, decision));
+            preflight.push((call, Some(decision)));
         }
 
         for (call, decision) in preflight {
@@ -1725,20 +1730,23 @@ async fn run_headless_turn_with_iteration_limit(
             flush_progress(&coordinator, progress, &mut progress_cursor);
 
             let output = match decision {
-                PermissionDecision::Allow => dispatcher
+                None => HeadlessToolOutput::failure("invalid tool arguments"),
+                Some(PermissionDecision::Allow) => dispatcher
                     .dispatch(call.clone(), cancellation)
                     .await
                     .map_err(|error| {
                         finish_port_error(&mut coordinator, error, HeadlessTurnError::Tool)
                     })?,
-                PermissionDecision::Deny => {
+                Some(PermissionDecision::Deny) => {
                     let output = HeadlessToolOutput::failure("permission denied");
                     match permission_gate.denial_facts(&call) {
                         Some(facts) => output.with_facts(facts),
                         None => output,
                     }
                 }
-                PermissionDecision::Ask => return Err(permission_required(&mut coordinator)),
+                Some(PermissionDecision::Ask) => {
+                    return Err(permission_required(&mut coordinator));
+                }
             };
 
             coordinator

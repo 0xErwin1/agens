@@ -83,7 +83,7 @@ fn typed_views_match_the_limits_the_runtime_hardcodes_today() {
     assert_eq!(tools.bash_timeout_ms, 120_000);
 
     let subagents = SubagentSettings::from(&resolved);
-    assert_eq!(subagents.max_iterations, 16);
+    assert_eq!(subagents.max_iterations, 32);
     assert_eq!(subagents.max_concurrency, 4);
     assert_eq!(subagents.max_output_chars, 65_536);
 

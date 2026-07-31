@@ -39,10 +39,10 @@ fn a_registry_reports_the_limits_it_was_built_with() {
 }
 
 #[test]
-fn the_documented_defaults_match_the_previously_hardcoded_bounds() {
+fn the_documented_defaults_match_the_runtime_bounds() {
     let limits = TaskExecutionLimits::default();
 
-    assert_eq!(limits.max_iterations, 16);
+    assert_eq!(limits.max_iterations, 32);
     assert_eq!(limits.max_concurrency, 4);
     assert_eq!(limits.max_output_chars, 65_536);
 }

@@ -4,14 +4,16 @@
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::future::ready;
     use std::sync::{Arc, Mutex};
 
     use agens_config::{ConfigPermissionDecision, ConfigPermissionRule, ConfigPermissionScope};
     use agens_core::{
-        FactPath, HeadlessPermissionGate, HeadlessToolCall, HeadlessTurnCancellation,
-        HeadlessTurnError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
+        DiscardCompletedTurnRepository, FactPath, HeadlessPermissionGate,
+        HeadlessPermissionResolver, HeadlessToolCall, HeadlessTurnCancellation, HeadlessTurnError,
+        HeadlessTurnPortError, MessagePart, PermissionDecision, PermissionMode, PermissionPattern,
         PermissionPolicy, PermissionRule, PermissionSession, ToolInput, ToolOutcome,
-        ToolResultFacts, TurnEvent, TurnState,
+        ToolResultFacts, TurnEvent, TurnProvider, TurnState,
     };
     use agens_store::PermissionGrantStore;
     use agens_tools::{
@@ -19,11 +21,82 @@ mod tests {
         ToolEvaluationOutcome, ToolExecutionContext, ToolOutput,
     };
 
+    use agens_dispatch::ProductionToolDispatcher;
     use agens_permissions::*;
+    use agens_tool_runtime::block_on_headless_turn;
     use agens_tui_app::test_support::{
         ProductionBatchInput, batch_call, native_batch_call, run_production_batch,
         run_production_batch_with_policy,
     };
+
+    #[test]
+    fn production_permission_infrastructure_failure_remains_terminal() {
+        struct ToolCallingProvider;
+
+        impl TurnProvider for ToolCallingProvider {
+            fn next_parts(
+                &mut self,
+                _events: &[TurnEvent],
+                _cancellation: &HeadlessTurnCancellation,
+            ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+            {
+                ready(Ok(vec![MessagePart::ToolCall {
+                    id: "call".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"notes.md"}"#.into(),
+                }]))
+            }
+        }
+
+        struct DenyingResolver;
+
+        impl HeadlessPermissionResolver for DenyingResolver {
+            fn resolve(
+                &mut self,
+                _call: &HeadlessToolCall,
+                _cancellation: &HeadlessTurnCancellation,
+            ) -> impl std::future::Future<
+                Output = Result<PermissionDecision, HeadlessTurnPortError>,
+            > + Send {
+                ready(Ok(PermissionDecision::Deny))
+            }
+        }
+
+        let grants = Arc::new(Mutex::new(Vec::new()));
+        let poisoned = Arc::clone(&grants);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoned.lock().unwrap();
+                panic!("poison grants lock");
+            })
+            .join()
+            .is_err()
+        );
+        let dispatcher = Arc::new(Mutex::new(ToolDispatcher::new()));
+        let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut gate = ProductionPermissionGate::new(
+            PermissionPolicy::new(PermissionMode::Edit, Vec::new()),
+            grants,
+            PermissionSession::new(),
+            "project".into(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&allowed),
+            Arc::new(Mutex::new(BTreeMap::new())),
+        );
+        let mut tool_dispatcher = ProductionToolDispatcher::new(dispatcher, allowed);
+
+        let result = block_on_headless_turn(agens_core::run_headless_turn(
+            &mut ToolCallingProvider,
+            &mut gate,
+            &mut DenyingResolver,
+            &mut tool_dispatcher,
+            &mut DiscardCompletedTurnRepository,
+            &HeadlessTurnCancellation::new(),
+        ))
+        .unwrap();
+
+        assert_eq!(result, Err(HeadlessTurnError::PermissionEvaluation));
+    }
 
     #[test]
     fn native_permission_target_projects_each_registered_tool_to_its_canonical_field() {
@@ -62,6 +135,11 @@ mod tests {
                 "native::glob",
                 serde_json::json!({"pattern": "src/**/*.rs"}),
                 NativePermissionTarget::Pattern("src/**/*.rs".into()),
+            ),
+            (
+                "native::git_read",
+                serde_json::json!({"operation": "status"}),
+                NativePermissionTarget::Operation("status".into()),
             ),
             (
                 "native::grep",
@@ -106,6 +184,7 @@ mod tests {
             ("native::list", "path"),
             ("native::search", "path"),
             ("native::glob", "pattern"),
+            ("native::git_read", "operation"),
             ("native::grep", "pattern"),
             ("native::webfetch", "url"),
         ] {
@@ -497,9 +576,19 @@ mod tests {
                 .with_policy(ask_every_native_tool())
                 .with_bypass(),
             );
-            assert_eq!(invalid.result, Err(HeadlessTurnError::PermissionEvaluation));
+            assert!(invalid.result.is_ok());
             assert!(invalid.prompts.is_empty());
             assert!(invalid.executions.is_empty());
+            assert!(invalid.progress.iter().any(|event| {
+                matches!(
+                    event,
+                    TurnEvent::ToolResult(MessagePart::ToolResult {
+                        is_error: true,
+                        content,
+                        ..
+                    }) if content == "invalid tool arguments"
+                )
+            }));
         }
     }
 

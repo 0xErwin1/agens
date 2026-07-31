@@ -481,6 +481,14 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             "failed",
         ),
         (
+            ChildRunError::IterationLimit,
+            TaskRunnerError::IterationLimit,
+            Some(SubagentErrorKind::IterationLimit),
+            TuiExecutionEvent::Failed { id: 1 },
+            SubagentStatus::Failure,
+            "failed",
+        ),
+        (
             ChildRunError::Runtime,
             TaskRunnerError::ChildFailure,
             Some(SubagentErrorKind::Runtime),

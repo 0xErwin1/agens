@@ -902,13 +902,22 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
             )
             .with_dangerous_override(),
         );
-        assert_eq!(
-            rejected.result,
-            Err(HeadlessTurnError::PermissionEvaluation),
-            "{name} must be rejected before policy bypass"
+        assert!(
+            rejected.result.is_ok(),
+            "{name} should return a recoverable tool error"
         );
         assert!(rejected.prompts.is_empty());
         assert!(rejected.executions.is_empty());
+        assert!(rejected.progress.iter().any(|event| {
+            matches!(
+                event,
+                TurnEvent::ToolResult(MessagePart::ToolResult {
+                    is_error: true,
+                    content,
+                    ..
+                }) if content == "invalid tool arguments"
+            )
+        }));
     }
 
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -964,7 +973,7 @@ fn dangerous_override_never_precedes_hard_safety_or_reuses_authorization() {
     };
     assert_eq!(
         poll_permission_port(gate.evaluate(&oversized_call, &cancellation)),
-        Err(HeadlessTurnPortError::Permission)
+        Err(HeadlessTurnPortError::Tool)
     );
 
     let temporary = tui_session_directory("dangerous-confined-write");

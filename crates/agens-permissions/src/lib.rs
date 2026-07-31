@@ -49,6 +49,7 @@ pub enum NativePermissionTarget {
     Command(String),
     Path(String),
     Pattern(String),
+    Operation(String),
     Url(String),
 }
 
@@ -91,6 +92,7 @@ impl NativePermissionTarget {
             "native::read" | "native::write" | "native::edit" | "native::list"
             | "native::search" => field("path").map(Self::Path),
             "native::glob" => field("pattern").map(Self::Pattern),
+            "native::git_read" => field("operation").map(Self::Operation),
             "native::grep" => {
                 if arguments.contains_key("path") {
                     field("path")?;
@@ -105,9 +107,11 @@ impl NativePermissionTarget {
 
     pub fn into_value(self) -> String {
         match self {
-            Self::Command(value) | Self::Path(value) | Self::Pattern(value) | Self::Url(value) => {
-                value
-            }
+            Self::Command(value)
+            | Self::Path(value)
+            | Self::Pattern(value)
+            | Self::Operation(value)
+            | Self::Url(value) => value,
         }
     }
 }
@@ -250,7 +254,7 @@ impl HeadlessPermissionGate for ProductionPermissionGate {
                                 self.dangerous_override
                                     && is_dangerous_child_native_tool(&call.name),
                             )
-                            .map_err(|_| HeadlessTurnPortError::Permission)
+                            .map_err(|_| HeadlessTurnPortError::Tool)
                     })
             })
             .and_then(|outcome| match outcome {
@@ -569,7 +573,7 @@ fn configured_tool_name(name: &str) -> Result<String, CliError> {
 }
 
 fn parse_tool_input(call: &HeadlessToolCall) -> Result<serde_json::Value, HeadlessTurnPortError> {
-    serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Permission)
+    serde_json::from_str(&call.input).map_err(|_| HeadlessTurnPortError::Tool)
 }
 
 pub fn sanitize_permission_target(tool: &str, target: &str) -> String {

@@ -76,7 +76,8 @@ impl ChildRunError {
             Self::Rejected => Some(SubagentErrorKind::Rejected),
             Self::Server => Some(SubagentErrorKind::Server),
             Self::Tool => Some(SubagentErrorKind::Tool),
-            Self::IterationLimit | Self::Runtime => Some(SubagentErrorKind::Runtime),
+            Self::IterationLimit => Some(SubagentErrorKind::IterationLimit),
+            Self::Runtime => Some(SubagentErrorKind::Runtime),
         }
     }
 
@@ -362,6 +363,10 @@ struct TaskMailboxContext {
 
 /// Runs a subagent's isolated turn with no session attempt of its own, so the
 /// facts it emits carry no `session_id`/`attempt_id`.
+fn configured_task_max_iterations(registry: &TaskExecutionRegistry) -> usize {
+    registry.limits().max_iterations
+}
+
 fn run_isolated_task_turn<P>(
     provider: P,
     tool_runtime: SharedToolDispatcher,
@@ -374,6 +379,7 @@ fn run_isolated_task_turn<P>(
 where
     P: ProgressAwareProvider + Send,
 {
+    let max_iterations = configured_task_max_iterations(&mailbox.registry);
     let mut provider = TaskMailboxProvider::new(provider, Some(mailbox.registry), mailbox.target);
     let policy = PermissionPolicy::new(
         PermissionMode::Edit,
@@ -417,7 +423,7 @@ where
         &mut dispatcher,
         &mut repository,
         cancellation,
-        16,
+        max_iterations,
         progress,
         None,
     ))
@@ -456,6 +462,89 @@ mod tests {
     /// `Ask`, unconditionally and regardless of which tool or arguments produced it. A future edit
     /// that forwards a session's bypass into `run_production_task` (see `ProductionTaskRunner`'s
     /// doc comment on `with_bypass`) must not make this resolver return anything but `Deny`.
+    #[test]
+    fn isolated_turn_stops_at_the_task_registrys_configured_iteration_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct IteratingProvider {
+            requests: Arc<AtomicUsize>,
+        }
+
+        impl TurnProvider for IteratingProvider {
+            fn next_parts(
+                &mut self,
+                _events: &[TurnEvent],
+                _cancellation: &HeadlessTurnCancellation,
+            ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+            {
+                let request = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
+                std::future::ready(Ok(vec![MessagePart::ToolCall {
+                    id: format!("read-{request}"),
+                    name: "native::read".into(),
+                    input: r#"{"path":"notes.md"}"#.into(),
+                }]))
+            }
+        }
+
+        impl ProgressAwareProvider for IteratingProvider {
+            fn with_progress_sink(self, _progress: TurnProgressSink) -> Self {
+                self
+            }
+        }
+
+        struct ReadTool;
+
+        impl agens_tools::DispatchTool for ReadTool {
+            fn permission_target(
+                &self,
+                arguments: &serde_json::Value,
+            ) -> Result<String, agens_core::Error> {
+                arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| agens_core::Error::Tool("invalid read arguments".into()))
+            }
+
+            fn execute(
+                &mut self,
+                _context: &agens_tools::ToolExecutionContext,
+                _arguments: serde_json::Value,
+            ) -> Result<agens_tools::ToolOutput, agens_core::Error> {
+                Ok(agens_tools::ToolOutput::success("read"))
+            }
+        }
+
+        let registry = TaskExecutionRegistry::with_limits(agens_tools::TaskExecutionLimits {
+            max_iterations: 3,
+            max_concurrency: 1,
+            max_output_chars: 1_024,
+        });
+        let requests = Arc::new(AtomicUsize::new(0));
+        let mut dispatcher = agens_tools::ToolDispatcher::new();
+        dispatcher
+            .register_native("native::read", agens_core::ToolAccess::ReadOnly, ReadTool)
+            .unwrap();
+
+        let result = run_isolated_task_turn(
+            IteratingProvider {
+                requests: Arc::clone(&requests),
+            },
+            Arc::new(Mutex::new(dispatcher)),
+            Path::new("."),
+            false,
+            &HeadlessTurnCancellation::new(),
+            None,
+            TaskMailboxContext {
+                registry,
+                target: TaskMessageTarget::Main,
+            },
+        );
+
+        assert!(matches!(result, Err(ChildRunError::IterationLimit)));
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
     #[test]
     fn child_permission_resolver_fails_closed_on_every_ask_unconditionally() {
         let cancellation = HeadlessTurnCancellation::new();

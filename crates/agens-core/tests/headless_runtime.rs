@@ -175,6 +175,57 @@ fn headless_turn_forwards_tool_result_facts_to_the_progress_sink() {
 }
 
 #[test]
+fn an_invalid_permission_target_becomes_a_recoverable_tool_result() {
+    struct InvalidInputGate;
+
+    impl HeadlessPermissionGate for InvalidInputGate {
+        fn evaluate(
+            &mut self,
+            _call: &HeadlessToolCall,
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+        {
+            ready(Err(HeadlessTurnPortError::Tool))
+        }
+    }
+
+    let mut provider = Provider {
+        iterations: vec![
+            Ok(vec![MessagePart::ToolCall {
+                id: "invalid".into(),
+                name: "git_read".into(),
+                input: r#"{"operation":"diff"}"#.into(),
+            }]),
+            Ok(vec![MessagePart::Text("recovered".into())]),
+        ],
+    };
+    let mut dispatcher = ToolDispatcher::default();
+    let mut repository = Repository::default();
+
+    let snapshot = block_on_ready(run_headless_turn(
+        &mut provider,
+        &mut InvalidInputGate,
+        &mut PermissionResolver::default(),
+        &mut dispatcher,
+        &mut repository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .expect("invalid tool arguments should be returned to the provider");
+
+    assert!(dispatcher.calls.is_empty());
+    assert!(snapshot.events().iter().any(|event| {
+        matches!(
+            event,
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id,
+                is_error: true,
+                ..
+            }) if tool_call_id == "invalid"
+        )
+    }));
+}
+
+#[test]
 fn a_denied_call_carries_the_gates_denial_facts() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let progress: TurnProgressSink = {

@@ -50,7 +50,7 @@ mod resolution {
         assert_eq!(tools.bash_timeout_ms, 120_000);
 
         let subagents = bootstrap.subagent_limits();
-        assert_eq!(subagents.max_iterations, 16);
+        assert_eq!(subagents.max_iterations, 32);
         assert_eq!(subagents.max_concurrency, 4);
         assert_eq!(subagents.max_output_chars, 65_536);
 

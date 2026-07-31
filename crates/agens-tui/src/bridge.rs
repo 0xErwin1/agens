@@ -155,6 +155,7 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Rejected => "Subagent provider request was rejected.",
             Self::Server => "Subagent provider service failed.",
             Self::Tool => "Subagent tool execution failed.",
+            Self::IterationLimit => "Subagent iteration limit reached.",
             Self::Runtime => "Subagent runtime failed.",
         }
     }
@@ -170,7 +171,26 @@ impl SubagentErrorPresentation for SubagentErrorKind {
             Self::Rejected => "Review the request configuration, then retry.",
             Self::Server => "Retry after the provider service recovers.",
             Self::Tool => "Review the tool call and retry.",
+            Self::IterationLimit => "Increase subagents.max_iterations or narrow the task.",
             Self::Runtime => "Retry the subagent request or inspect diagnostics.",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubagentErrorPresentation;
+    use agens_core::SubagentErrorKind;
+
+    #[test]
+    fn iteration_limit_has_an_exact_actionable_presentation() {
+        assert_eq!(
+            SubagentErrorKind::IterationLimit.message(),
+            "Subagent iteration limit reached."
+        );
+        assert_eq!(
+            SubagentErrorKind::IterationLimit.action(),
+            "Increase subagents.max_iterations or narrow the task."
+        );
     }
 }

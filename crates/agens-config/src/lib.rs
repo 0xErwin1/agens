@@ -512,7 +512,7 @@ pub const SETTINGS: &[SettingSpec] = &[
             minimum: 1,
             maximum: 64,
         },
-        default: SettingValue::Integer(16),
+        default: SettingValue::Integer(32),
         doc: "Maximum provider round trips inside a subagent.",
     },
     SettingSpec {
