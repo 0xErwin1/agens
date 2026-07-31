@@ -17,7 +17,7 @@ use std::sync::Arc;
 use agens_config::{
     ConfigPaths, ConfigPermissionRule, McpDefaultSettings, McpTransport, ResolvedSettings,
     SubagentSettings, ToolLimitSettings, expand_environment, expand_environment_with_commands,
-    extract_permission_rules, mcp_servers, merge_toml_documents, parse_toml_document,
+    extract_permission_rules, mcp_servers_with_defaults, merge_toml_documents, parse_toml_document,
     resolve_paths, resolve_settings, validate_toml_document,
 };
 use agens_tools::{McpStatusHandle, McpStdioTransport, McpStdioTransportConfig};
@@ -247,7 +247,8 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
     let document = expand_document(document, &environment)?;
     let settings = resolve_settings(&documented_global, &documented_project, &document);
 
-    let mcp_servers = mcp_servers(&document)
+    let mcp_defaults = McpDefaultSettings::from(&settings);
+    let mcp_servers = mcp_servers_with_defaults(&document, mcp_defaults)
         .map_err(|_| CliError::configuration("MCP server configuration is invalid"))?;
     let credentials = (host.read_file)(&paths.credentials)?;
     let configured_provider = settings.text("provider.type").map(ToOwned::to_owned);
@@ -281,7 +282,7 @@ pub fn resolve(host: &HostEnvironment) -> Result<Bootstrap, CliError> {
             .map(ToOwned::to_owned),
         tool_limits: ToolLimitSettings::from(&settings),
         subagent_limits: SubagentSettings::from(&settings),
-        mcp_defaults: McpDefaultSettings::from(&settings),
+        mcp_defaults,
         settings,
         api_key,
         data_directory: data_directory(&document, home_directory.as_deref(), &environment),

@@ -54,7 +54,7 @@ mod resolution {
         assert_eq!(subagents.max_concurrency, 4);
         assert_eq!(subagents.max_output_chars, 65_536);
 
-        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 10_000);
+        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 30_000);
         assert_eq!(bootstrap.mcp_defaults().max_retries, 0);
         assert!(bootstrap.debug());
         assert_eq!(bootstrap.default_agent(), None);
@@ -83,6 +83,45 @@ mod resolution {
             bootstrap.settings().origin("tools.max_list_entries"),
             agens_config::Origin::Default
         );
+    }
+
+    #[test]
+    fn configured_mcp_defaults_reach_servers_that_omit_overrides() {
+        let bootstrap = bootstrap_from_configuration(
+            "config-mcp-defaults",
+            Some(
+                "[mcp_defaults]\ntimeout_ms = 60000\nmax_retries = 2\n\
+                 [mcp.engram]\ntransport = \"http\"\nurl = \"https://mcp.example.test\"\n\
+                 [mcp.files]\ntransport = \"stdio\"\ncommand = \"server\"\n\
+                 [mcp.atlas]\ntransport = \"http\"\nurl = \"https://atlas.example.test\"\ntimeout_ms = 5000\nmax_retries = 1\n",
+            ),
+            None,
+        );
+
+        assert_eq!(bootstrap.mcp_defaults().timeout_ms, 60_000);
+        assert_eq!(bootstrap.mcp_defaults().max_retries, 2);
+        assert_eq!(bootstrap.mcp_servers.len(), 3);
+        let engram = bootstrap
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "engram")
+            .unwrap();
+        assert_eq!(engram.timeout_ms, 60_000);
+        assert_eq!(engram.max_retries, 2);
+        let files = bootstrap
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "files")
+            .unwrap();
+        assert_eq!(files.timeout_ms, 60_000);
+        assert_eq!(files.max_retries, 0);
+        let atlas = bootstrap
+            .mcp_servers
+            .iter()
+            .find(|server| server.name == "atlas")
+            .unwrap();
+        assert_eq!(atlas.timeout_ms, 5_000);
+        assert_eq!(atlas.max_retries, 1);
     }
 
     #[test]

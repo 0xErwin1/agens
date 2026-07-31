@@ -1,4 +1,7 @@
-use agens_config::{SETTINGS, SettingKind, SettingSpec, SettingValue, mcp_servers};
+use agens_config::{
+    McpDefaultSettings, SETTINGS, SettingKind, SettingSpec, SettingValue, mcp_servers,
+    mcp_servers_with_defaults,
+};
 use agens_config::{parse_toml_document, validate_toml_document};
 
 fn document_for(path: &str, literal: &str) -> toml::Table {
@@ -173,6 +176,26 @@ fn rejects_an_invalid_per_server_mcp_timeout_instead_of_defaulting() {
     assert!(validate_toml_document(&text).is_err());
     assert!(mcp_servers(&zero).is_err());
     assert!(mcp_servers(&text).is_err());
+}
+
+#[test]
+fn explicit_mcp_defaults_must_stay_inside_catalog_bounds() {
+    let document =
+        parse_toml_document("[mcp.files]\ntransport = \"http\"\nurl = \"https://example.test\"\n")
+            .unwrap();
+
+    for defaults in [
+        McpDefaultSettings {
+            timeout_ms: 0,
+            max_retries: 0,
+        },
+        McpDefaultSettings {
+            timeout_ms: 1,
+            max_retries: 9,
+        },
+    ] {
+        assert!(mcp_servers_with_defaults(&document, defaults).is_err());
+    }
 }
 
 #[test]

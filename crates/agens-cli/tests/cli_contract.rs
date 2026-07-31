@@ -146,7 +146,7 @@ const CONFIG_DOCTOR_DEFAULT_SETTINGS: &str = concat!(
     "  subagents.max_iterations         32            default\n",
     "  subagents.max_concurrency        4             default\n",
     "  subagents.max_output_chars       65536         default\n",
-    "  mcp_defaults.timeout_ms          10000         default\n",
+    "  mcp_defaults.timeout_ms          30000         default\n",
     "  mcp_defaults.max_retries         0             default\n",
 );
 

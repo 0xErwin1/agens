@@ -48,7 +48,7 @@ pub struct ConfigPaths {
     pub project_config: PathBuf,
 }
 
-pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum McpTransport {
@@ -105,7 +105,26 @@ pub fn mcp_stdio_servers(
 }
 
 pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, ConfigValidationError> {
+    mcp_servers_with_defaults(
+        document,
+        McpDefaultSettings {
+            timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+            max_retries: 0,
+        },
+    )
+}
+
+pub fn mcp_servers_with_defaults(
+    document: &toml::Table,
+    defaults: McpDefaultSettings,
+) -> Result<Vec<McpServerConfig>, ConfigValidationError> {
     validate_mcp(document)?;
+    if !(1..=600_000).contains(&defaults.timeout_ms) {
+        return Err(invalid_field("mcp_defaults", "timeout_ms"));
+    }
+    if defaults.max_retries > 8 {
+        return Err(invalid_field("mcp_defaults", "max_retries"));
+    }
     let Some(servers) = document.get("mcp").and_then(toml::Value::as_table) else {
         return Ok(Vec::new());
     };
@@ -133,7 +152,7 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                     url: None,
                     headers: BTreeMap::new(),
                     max_retries: 0,
-                    timeout_ms: DEFAULT_MCP_TIMEOUT_MS,
+                    timeout_ms: defaults.timeout_ms,
                 });
             }
             let transport = match server.get("transport").and_then(toml::Value::as_str) {
@@ -163,7 +182,7 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                         .collect()
                 });
             let timeout_ms = match server.get("timeout_ms") {
-                None => DEFAULT_MCP_TIMEOUT_MS,
+                None => defaults.timeout_ms,
                 Some(value) => value
                     .as_integer()
                     .and_then(|timeout| u64::try_from(timeout).ok())
@@ -185,19 +204,17 @@ pub fn mcp_servers(document: &toml::Table) -> Result<Vec<McpServerConfig>, Confi
                         })
                         .collect()
                 });
-            let max_retries = server
-                .get("max_retries")
-                .and_then(toml::Value::as_integer)
-                .and_then(|retries| u32::try_from(retries).ok())
-                .filter(|retries| *retries <= 8)
-                .ok_or_else(|| invalid_field(&path, "max_retries"))
-                .or_else(|_| {
-                    if server.contains_key("max_retries") {
-                        Err(invalid_field(&path, "max_retries"))
-                    } else {
-                        Ok(0)
-                    }
-                })?;
+            let max_retries = match server.get("max_retries") {
+                None if matches!(transport, McpTransport::Http | McpTransport::Sse) => {
+                    defaults.max_retries
+                }
+                None => 0,
+                Some(value) => value
+                    .as_integer()
+                    .and_then(|retries| u32::try_from(retries).ok())
+                    .filter(|retries| *retries <= 8)
+                    .ok_or_else(|| invalid_field(&path, "max_retries"))?,
+            };
             let cwd = server
                 .get("cwd")
                 .and_then(toml::Value::as_str)

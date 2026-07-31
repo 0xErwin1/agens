@@ -47,7 +47,7 @@ max_concurrency = 4
 max_output_chars = 65536
 
 [mcp_defaults]
-timeout_ms = 10000
+timeout_ms = 30000
 max_retries = 0
 
 # Named agent profiles can select a model and reasoning effort.
@@ -78,7 +78,7 @@ deny = [
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "$HOME/projects"]
 # cwd = "$HOME"
-# timeout_ms = 10000
+# timeout_ms = 30000
 # [mcp.filesystem.env]
 # LANG = "C"
 #
@@ -87,14 +87,14 @@ deny = [
 # url = "https://mcp.example.com/mcp"
 # headers = { Authorization = "Bearer $MCP_TOKEN" }
 # max_retries = 2
-# timeout_ms = 10000
+# timeout_ms = 30000
 #
 # [mcp.events]
 # transport = "sse"
 # url = "https://mcp.example.com/sse"
 # headers = { Authorization = "Bearer $MCP_TOKEN" }
 # max_retries = 2
-# timeout_ms = 10000
+# timeout_ms = 30000
 #
 # Keep a configured server available without starting it.
 # [mcp.unavailable]

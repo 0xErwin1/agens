@@ -88,7 +88,7 @@ fn typed_views_match_the_limits_the_runtime_hardcodes_today() {
     assert_eq!(subagents.max_output_chars, 65_536);
 
     let mcp = McpDefaultSettings::from(&resolved);
-    assert_eq!(mcp.timeout_ms, 10_000);
+    assert_eq!(mcp.timeout_ms, 30_000);
     assert_eq!(mcp.max_retries, 0);
 }
 

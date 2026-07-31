@@ -95,7 +95,7 @@ fn parses_legacy_mcp_transport_shapes_with_default_timeout() {
 
     assert_eq!(servers.len(), 3);
     for server in &servers {
-        assert_eq!(server.timeout_ms, 10_000);
+        assert_eq!(server.timeout_ms, 30_000);
     }
     assert_eq!(
         servers
