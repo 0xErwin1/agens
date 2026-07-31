@@ -250,6 +250,26 @@ fn openai_retries_transient_statuses_twice_then_succeeds() {
 }
 
 #[test]
+fn openai_keeps_retrying_transient_failures_until_success_or_cancellation() {
+    let server = RetryResponsesServer::start(vec![
+        RetryResponse::Disconnect,
+        RetryResponse::Disconnect,
+        RetryResponse::Disconnect,
+        RetryResponse::Sse(completed_text_response("retried", "done")),
+    ]);
+
+    assert_eq!(
+        run_provider(
+            server.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Ok(())
+    );
+    assert_eq!(server.join(), 4);
+}
+
+#[test]
 fn openai_honors_numeric_retry_after_before_the_next_attempt() {
     let server = RetryResponsesServer::start(vec![
         RetryResponse::StatusWithRetryAfter(429, "1"),
@@ -1029,6 +1049,7 @@ struct LocalResponsesServer {
 }
 
 enum RetryResponse {
+    Disconnect,
     Status(u16),
     StatusWithRetryAfter(u16, &'static str),
     Sse(String),
@@ -1074,6 +1095,7 @@ impl RetryResponsesServer {
                     .send(request_number)
                     .expect("test should receive request observation");
                 match responses.pop_front().expect("response should be available") {
+                    RetryResponse::Disconnect => {}
                     RetryResponse::Status(status) => stream
                         .write_all(
                             format!(

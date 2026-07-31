@@ -63,6 +63,10 @@ impl TuiEngine for ProductionTuiEngine {
     }
 }
 
+fn interactive_turn_cancellation() -> HeadlessTurnCancellation {
+    HeadlessTurnCancellation::new()
+}
+
 pub fn run_production_tui(bootstrap: &Bootstrap, resume: Option<i64>) -> Result<String, CliError> {
     run_production_tui_with_profile_store(bootstrap, resume, None)
 }
@@ -176,8 +180,7 @@ pub fn run_production_tui_with_profile_store(
         },
         move |prompt, origin, progress, metrics| {
             let task_events = metrics.clone();
-            let turn_cancellation =
-                HeadlessTurnCancellation::with_deadline(std::time::Duration::from_secs(120));
+            let turn_cancellation = interactive_turn_cancellation();
             let Ok(mut active) = cancellation.lock() else {
                 return tui_provider_outcome(Err(CliError::new(
                     ExitStatus::Failure,
@@ -602,6 +605,14 @@ mod tests {
     use agens_fixtures::BundledModelValidator;
     use agens_models::ModelSelection;
     use agens_session::context::ActiveAgentRuntime;
+
+    #[test]
+    fn interactive_turns_have_no_automatic_deadline() {
+        let cancellation = interactive_turn_cancellation();
+
+        assert!(cancellation.adapter_view().deadline().is_none());
+        assert!(!cancellation.is_expired());
+    }
 
     #[test]
     fn second_control_c_uses_the_owned_turn_cancellation_before_quit() {

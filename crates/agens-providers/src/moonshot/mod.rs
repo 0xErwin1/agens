@@ -24,11 +24,11 @@ use agens_core::{
 use serde_json::Value;
 
 use crate::{
-    Error, MAX_HTTP_REQUEST_ATTEMPTS, MAX_OPENAI_TOOL_CONTINUATION_ROUNDS, MAX_SSE_FRAME_BYTES,
+    Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_OPENAI_TOOL_CONTINUATION_ROUNDS, MAX_SSE_FRAME_BYTES,
     OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticComponent, ProviderDiagnosticKind, ProviderDiagnostics,
     classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
-    is_transient_http_status, is_transient_transport_error, retry_after_from_headers,
+    is_transient_http_status, retry_after_from_headers, should_retry_transport_error,
     stop_before_mapping, wait_for_http_retry, wait_for_stop,
 };
 
@@ -195,6 +195,7 @@ impl MoonshotProvider {
     ) -> Result<reqwest::Response, HeadlessTurnPortError> {
         let mut attempt = 0;
         let mut last_transient_status = None;
+        let mut saw_request_timeout = false;
 
         loop {
             stop_before_mapping(cancellation)?;
@@ -220,9 +221,13 @@ impl MoonshotProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
-                        && is_transient_transport_error(&error)
-                    {
+                    saw_request_timeout |= error.is_timeout();
+                    if should_retry_transport_error(
+                        &error,
+                        attempt,
+                        last_transient_status,
+                        saw_request_timeout,
+                    ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
@@ -251,7 +256,7 @@ impl MoonshotProvider {
             };
 
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
                 last_transient_status = Some(status);
                 let retry_after = retry_after_from_headers(response.headers());
                 drop(response);

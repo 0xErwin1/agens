@@ -132,11 +132,11 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
     let attempt = object
         .get("attempt")?
         .as_u64()
-        .filter(|attempt| *attempt <= 3)?;
+        .filter(|attempt| *attempt <= u64::from(u8::MAX))?;
     let max_attempts = object
         .get("max_attempts")?
         .as_u64()
-        .filter(|attempts| *attempts <= 3)?;
+        .filter(|attempts| *attempts <= u64::from(u8::MAX))?;
     let delay = optional_bounded_u64(object.get("delay_ms"), 5_000)?;
     let status = optional_bounded_u64(object.get("status"), 599)?;
     let class = match object.get("class") {
@@ -164,9 +164,14 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
     let class_label = class.unwrap_or("success");
     let status_label = status.map_or_else(|| "none".into(), |status| status.to_string());
     let delay_label = delay.map_or_else(|| "none".into(), |delay| format!("{delay}ms"));
+    let attempt_label = if max_attempts == 0 {
+        format!("{attempt}/unbounded")
+    } else {
+        format!("{attempt}/{max_attempts}")
+    };
     let label = format!("[ref: {reference}] {scope} · {component} · {event} · {class_label}");
     let detail = format!(
-        "Source: {relative_path}\nTimestamp: {timestamp}\nAttempt: {attempt}/{max_attempts}\nHTTP status: {status_label}\nRetry delay: {delay_label}"
+        "Source: {relative_path}\nTimestamp: {timestamp}\nAttempt: {attempt_label}\nHTTP status: {status_label}\nRetry delay: {delay_label}"
     );
     Some(DialogEntry::read_only(
         label.clone(),

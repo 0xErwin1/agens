@@ -25,7 +25,7 @@ use time::format_description::well_known::Rfc3339;
 const CHATGPT_PROVIDER_ID: &str = "openai-chatgpt";
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const HTTP_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const MAX_HTTP_REQUEST_ATTEMPTS: usize = 3;
+const MAX_HTTP_STATUS_ATTEMPTS: usize = 3;
 const HTTP_RETRY_FIRST_DELAY: Duration = Duration::from_millis(250);
 const HTTP_RETRY_SECOND_DELAY: Duration = Duration::from_secs(1);
 const HTTP_RETRY_MAX_JITTER: u64 = 100;
@@ -150,7 +150,11 @@ impl ProviderDiagnostics {
             component,
             event,
             attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
-            max_attempts: MAX_HTTP_REQUEST_ATTEMPTS as u8,
+            max_attempts: if class == Some(ProviderDiagnosticClass::Network) || attempt > 3 {
+                0
+            } else {
+                MAX_HTTP_STATUS_ATTEMPTS as u8
+            },
             delay_ms: delay.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
             status,
             class,
@@ -532,6 +536,7 @@ impl OpenAiResponsesProvider {
     ) -> Result<DecodedResponse, HeadlessTurnPortError> {
         let mut attempt = 0;
         let mut last_transient_status = None;
+        let mut saw_request_timeout = false;
         let response = loop {
             stop_before_mapping(cancellation)?;
             if let Some(diagnostics) = &self.diagnostics {
@@ -562,9 +567,13 @@ impl OpenAiResponsesProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
-                        && is_transient_transport_error(&error)
-                    {
+                    saw_request_timeout |= error.is_timeout();
+                    if should_retry_transport_error(
+                        &error,
+                        attempt,
+                        last_transient_status,
+                        saw_request_timeout,
+                    ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
@@ -595,7 +604,7 @@ impl OpenAiResponsesProvider {
                 }
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
                 last_transient_status = Some(status);
                 let retry_after = retry_after_from_headers(response.headers());
                 drop(response);
@@ -889,6 +898,7 @@ impl ChatGptResponsesProvider {
     ) -> Result<DecodedResponse, ChatGptResponseError> {
         let mut attempt = 0;
         let mut last_transient_status = None;
+        let mut saw_request_timeout = false;
         let response = loop {
             stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
             if let Some(diagnostics) = &self.diagnostics {
@@ -927,9 +937,13 @@ impl ChatGptResponsesProvider {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
-                        && is_transient_transport_error(&error)
-                    {
+                    saw_request_timeout |= error.is_timeout();
+                    if should_retry_transport_error(
+                        &error,
+                        attempt,
+                        last_transient_status,
+                        saw_request_timeout,
+                    ) {
                         wait_for_http_retry(
                             cancellation,
                             attempt,
@@ -967,7 +981,7 @@ impl ChatGptResponsesProvider {
                 }
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
                 last_transient_status = Some(status);
                 let retry_after = retry_after_from_headers(response.headers());
                 drop(response);
@@ -1107,6 +1121,8 @@ impl ChatGptResponsesProvider {
             .append_pair("refresh_token", refresh_token)
             .finish();
         let mut attempt = 0;
+        let mut last_transient_status = None;
+        let mut saw_request_timeout = false;
         let response = loop {
             stop_before_mapping(cancellation)?;
             if let Some(diagnostics) = &self.diagnostics {
@@ -1138,27 +1154,33 @@ impl ChatGptResponsesProvider {
             };
             let response = match response {
                 Ok(response) => response,
-                Err(error)
-                    if attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS
-                        && is_transient_transport_error(&error) =>
-                {
-                    wait_for_http_retry(
-                        cancellation,
+                Err(error) => {
+                    saw_request_timeout |= error.is_timeout();
+                    if should_retry_transport_error(
+                        &error,
                         attempt,
-                        None,
-                        self.diagnostics.as_ref(),
-                        ProviderDiagnosticComponent::OauthRefresh,
-                        ProviderDiagnosticClass::Network,
-                        None,
-                    )
-                    .await?;
-                    attempt += 1;
-                    continue;
+                        last_transient_status,
+                        saw_request_timeout,
+                    ) {
+                        wait_for_http_retry(
+                            cancellation,
+                            attempt,
+                            None,
+                            self.diagnostics.as_ref(),
+                            ProviderDiagnosticComponent::OauthRefresh,
+                            ProviderDiagnosticClass::Network,
+                            None,
+                        )
+                        .await?;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(HeadlessTurnPortError::Provider);
                 }
-                Err(_) => return Err(HeadlessTurnPortError::Provider),
             };
             let status = response.status().as_u16();
-            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_REQUEST_ATTEMPTS {
+            if is_transient_http_status(status) && attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS {
+                last_transient_status = Some(status);
                 let retry_after = retry_after_from_headers(response.headers());
                 drop(response);
                 wait_for_http_retry(
@@ -1315,7 +1337,19 @@ fn is_transient_http_status(status: u16) -> bool {
 }
 
 fn is_transient_transport_error(error: &reqwest::Error) -> bool {
-    error.is_connect() || error.is_timeout() || error.is_request()
+    error.is_connect() || error.is_request()
+}
+
+fn should_retry_transport_error(
+    error: &reqwest::Error,
+    attempt: usize,
+    last_transient_status: Option<u16>,
+    saw_request_timeout: bool,
+) -> bool {
+    if error.is_timeout() {
+        return attempt + 1 < MAX_HTTP_STATUS_ATTEMPTS;
+    }
+    !saw_request_timeout && last_transient_status.is_none() && is_transient_transport_error(error)
 }
 
 fn chatgpt_transient_status_error(status: u16) -> ChatGptResponseError {

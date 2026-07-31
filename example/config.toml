@@ -22,7 +22,7 @@ model = "gpt-5.5"
 [agent]
 # Uncomment to replace the assembled system prompt.
 # system_prompt = "You are a careful coding agent."
-max_iterations = 60
+# max_iterations = 60
 parallel_tool_calls = true
 # This setting is honored only in the global configuration.
 bypass_permission_prompts = false
