@@ -1,10 +1,9 @@
 //! Ayu-inspired semantic colors (dark) for conversation roles and chrome.
 //! Reference: Ayu Mirage/Dark accents adapted for terminal RGB; not a multi-theme engine.
 //!
-//! The transcript is deliberately close to monochrome: two greys carry text and
-//! chrome, [`RolePalette::accent_active`] is the single accent every row shares,
-//! and a hue beyond that means state (running, success, failure) rather than kind.
-//! Adding a per-feature hue for an ordinary transcript row is a regression.
+//! The transcript keeps prose neutral while spending a small semantic palette on
+//! Markdown hierarchy, navigation, and lifecycle state. Colour reinforces structure;
+//! it does not replace weight, underline, rails, or other non-colour cues.
 
 use ratatui::style::Color;
 
@@ -71,9 +70,34 @@ impl RolePalette {
         rgb(0xd6, 0xd4, 0xcd)
     }
 
-    /// The transcript's single accent: live work, and the operand of a row.
+    /// Active work and row operands.
     pub(crate) const fn accent_active() -> Color {
         rgb(0x73, 0xd0, 0xff)
+    }
+
+    /// Navigation affordances such as links and list markers.
+    pub(crate) const fn navigation() -> Color {
+        rgb(0x73, 0xd0, 0xff)
+    }
+
+    /// Markdown heading accent.
+    pub(crate) const fn markdown_heading() -> Color {
+        Self::brand()
+    }
+
+    /// Markdown quote rail accent.
+    pub(crate) const fn markdown_quote() -> Color {
+        Self::brand()
+    }
+
+    /// Markdown strong text: brighter than body prose without becoming a state.
+    pub(crate) const fn markdown_strong() -> Color {
+        Self::selection_fg()
+    }
+
+    /// Markdown inline code: warm enough to separate tokens from prose.
+    pub(crate) const fn markdown_code() -> Color {
+        Self::warning()
     }
 }
 
@@ -88,6 +112,11 @@ mod tests {
         assert_eq!(RolePalette::success(), rgb(0xaa, 0xd9, 0x4c));
         assert_eq!(RolePalette::error(), rgb(0xf0, 0x71, 0x78));
         assert_eq!(RolePalette::brand(), rgb(0x95, 0xe6, 0xcb));
+        assert_eq!(RolePalette::navigation(), RolePalette::accent_active());
+        assert_eq!(RolePalette::markdown_heading(), RolePalette::brand());
+        assert_eq!(RolePalette::markdown_quote(), RolePalette::brand());
+        assert_eq!(RolePalette::markdown_strong(), RolePalette::selection_fg());
+        assert_eq!(RolePalette::markdown_code(), RolePalette::warning());
     }
 
     /// The transcript's text colours must stay greys, so a row's words can never

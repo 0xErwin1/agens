@@ -423,9 +423,11 @@ fn working_indicator_remains_visible_when_live_transcript_reaches_the_composer()
     renderer.render(tui.view()).unwrap();
     let rendered = rendered_text(&renderer);
 
+    assert!(rendered.contains("output-line-14"), "{rendered:?}");
     assert!(rendered.contains("output-line-19"), "{rendered:?}");
     assert!(rendered.contains("Working…"), "{rendered:?}");
-    assert!(rendered.contains("LIVE"), "{rendered:?}");
+    assert!(!rendered.contains("LIVE"), "{rendered:?}");
+    assert!(!rendered.contains("SCROLL"), "{rendered:?}");
 }
 
 #[test]
@@ -1755,13 +1757,13 @@ fn paragraph_to_fence_has_one_blank_transition_row() {
 
 #[test]
 fn renderer_renders_practical_markdown_semantics() {
-    let terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
+    let terminal = Terminal::new(TestBackend::new(72, 50)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
     tui.begin_submission("request");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
-        "# Result\n\nUse **STRONGTOKEN** and *EMPHASISTOKEN* with `INLINE_TOKEN`.\n\n```rust\nfn example() {}\n```\n\n- first item\n- second item\n\n> quoted text\n\n[LINKTOKEN](https://example.com/docs)"
+        "# Result\n\n## Section Two\n\n#### Detail Four\n\nUse **STRONGTOKEN** and *EMPHASISTOKEN* with `INLINE_TOKEN`.\n\n```rust\nfn example() {}\n```\n\n- first item\n- second item\n- [x] checked item\n- [ ] unchecked item\n\n> quoted text\n\n[LINKTOKEN](https://example.com/docs)"
             .into(),
     )));
 
@@ -1779,6 +1781,8 @@ fn renderer_renders_practical_markdown_semantics() {
     }
     for expected in [
         "Result",
+        "Section Two",
+        "Detail Four",
         "STRONGTOKEN",
         "EMPHASISTOKEN",
         "INLINE_TOKEN",
@@ -1807,20 +1811,25 @@ fn renderer_renders_practical_markdown_semantics() {
             .modifier
             .contains(Modifier::ITALIC)
     );
-    // Emphasis is weight, slant and underline: prose never acquires a hue.
     let body = Color::Rgb(0xbf, 0xbd, 0xb6);
+    let markdown_heading = Color::Rgb(0x95, 0xe6, 0xcb);
+    let markdown_strong = Color::Rgb(0xd6, 0xd4, 0xcd);
+    let markdown_code = Color::Rgb(0xe6, 0xb4, 0x50);
+    let navigation = Color::Rgb(0x73, 0xd0, 0xff);
+    let success = Color::Rgb(0xaa, 0xd9, 0x4c);
+
     let inline_code = cell_for_text(&renderer, "INLINE_TOKEN");
-    assert_eq!(inline_code.fg, body);
+    assert_eq!(inline_code.fg, markdown_code);
     assert_eq!(
         inline_code.bg,
         Color::Rgb(0x1a, 0x1f, 0x29),
-        "inline code is set apart by its panel, not by a colour"
+        "inline code combines a warm foreground with its panel"
     );
     let link = cell_for_text(&renderer, "LINKTOKEN");
-    assert_eq!(link.fg, body);
+    assert_eq!(link.fg, navigation);
     assert!(link.modifier.contains(Modifier::UNDERLINED));
-    assert_eq!(cell_for_text(&renderer, "STRONGTOKEN").fg, body);
-    assert_eq!(cell_for_text(&renderer, "Result").fg, body);
+    assert_eq!(cell_for_text(&renderer, "STRONGTOKEN").fg, markdown_strong);
+    assert_eq!(cell_for_text(&renderer, "Result").fg, markdown_heading);
     assert!(
         cell_for_text(&renderer, "Result")
             .modifier
@@ -1828,10 +1837,28 @@ fn renderer_renders_practical_markdown_semantics() {
         "H1 should underline for hierarchy"
     );
     assert_eq!(cell_for_text(&renderer, "EMPHASISTOKEN").fg, body);
+    assert_eq!(cell_for_text(&renderer, "•").fg, navigation);
+    assert_eq!(cell_for_text(&renderer, "[x]").fg, success);
+    assert_eq!(cell_for_text(&renderer, "[ ]").fg, navigation);
+    assert_eq!(cell_for_text(&renderer, "▌").fg, markdown_heading);
+    assert_eq!(cell_for_text(&renderer, "›").fg, navigation);
+    assert!(
+        cell_for_text(&renderer, "Section Two")
+            .modifier
+            .contains(Modifier::BOLD)
+    );
+    assert!(
+        !cell_for_text(&renderer, "Detail Four")
+            .modifier
+            .contains(Modifier::BOLD),
+        "lower headings should step down in weight as well as colour and marker"
+    );
+    let quote_row = rendered_row(&renderer, "quoted text") as u16;
+    let quote_rail_column = rendered_column(&renderer, "quoted text").saturating_sub(2) as u16;
     assert_eq!(
-        cell_for_text(&renderer, "•").fg,
-        Color::Rgb(0x5c, 0x67, 0x73),
-        "list markers are chrome"
+        renderer.terminal().backend().buffer()[(quote_rail_column, quote_row)].fg,
+        markdown_heading,
+        "quotes carry a distinct semantic rail"
     );
 }
 

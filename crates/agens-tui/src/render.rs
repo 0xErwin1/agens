@@ -13,7 +13,7 @@ use arborium_highlight::spans_to_flat_tokens;
 use arborium_theme::{
     Theme, capture_to_slot, slot_to_highlight_index, tag_to_name, theme::builtin,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -1130,7 +1130,7 @@ impl MarkdownRenderer {
 
     fn render(mut self, markdown: &str) -> Vec<Line<'static>> {
         self.code_panel_widths = code_panel_widths(markdown, self.content_width);
-        for event in Parser::new(markdown) {
+        for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS) {
             self.event(event);
         }
         self.finish_line();
@@ -1152,6 +1152,7 @@ impl MarkdownRenderer {
             Event::Code(code) => self.text(
                 &code,
                 self.current_style()
+                    .fg(RolePalette::markdown_code())
                     .bg(code_block_background())
                     .add_modifier(Modifier::BOLD),
             ),
@@ -1167,7 +1168,11 @@ impl MarkdownRenderer {
             Event::TaskListMarker(checked) => self.text(
                 if checked { "[x] " } else { "[ ] " },
                 self.base_style
-                    .fg(RolePalette::muted())
+                    .fg(if checked {
+                        RolePalette::success()
+                    } else {
+                        RolePalette::navigation()
+                    })
                     .add_modifier(Modifier::BOLD),
             ),
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
@@ -1200,7 +1205,7 @@ impl MarkdownRenderer {
                 self.text(
                     &format!("{}{marker}", "  ".repeat(depth)),
                     self.base_style
-                        .fg(RolePalette::muted())
+                        .fg(RolePalette::navigation())
                         .add_modifier(Modifier::BOLD),
                 );
             }
@@ -1395,19 +1400,21 @@ impl MarkdownRenderer {
     fn current_style(&self) -> Style {
         let mut style = self.base_style;
         if let Some(level) = self.heading {
-            style = style.add_modifier(Modifier::BOLD);
-            if matches!(level, HeadingLevel::H1) {
-                style = style.add_modifier(Modifier::UNDERLINED);
-            }
+            style = markdown_heading_style(style, level);
         }
         if self.strong > 0 {
             style = style.add_modifier(Modifier::BOLD);
+            if self.heading.is_none() {
+                style = style.fg(RolePalette::markdown_strong());
+            }
         }
         if self.emphasis > 0 {
             style = style.add_modifier(Modifier::ITALIC);
         }
         if !self.links.is_empty() {
-            style = style.add_modifier(Modifier::UNDERLINED);
+            style = style
+                .fg(RolePalette::navigation())
+                .add_modifier(Modifier::UNDERLINED);
         }
         style
     }
@@ -1434,7 +1441,15 @@ impl MarkdownRenderer {
         if self.quote_depth > 0 {
             self.spans.push(Span::styled(
                 "│ ".repeat(self.quote_depth),
-                self.base_style.fg(RolePalette::chrome()),
+                self.base_style
+                    .fg(RolePalette::markdown_quote())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(level) = self.heading {
+            self.spans.push(Span::styled(
+                markdown_heading_marker(level),
+                markdown_heading_style(self.base_style, level),
             ));
         }
     }
@@ -1510,6 +1525,37 @@ impl MarkdownRenderer {
             self.lines.push(Line::default());
         }
     }
+}
+
+const fn markdown_heading_marker(level: HeadingLevel) -> &'static str {
+    match level {
+        HeadingLevel::H1 => "█ ",
+        HeadingLevel::H2 => "▌ ",
+        HeadingLevel::H3 => "▸ ",
+        HeadingLevel::H4 => "› ",
+        HeadingLevel::H5 => "· ",
+        HeadingLevel::H6 => "  · ",
+    }
+}
+
+fn markdown_heading_style(base: Style, level: HeadingLevel) -> Style {
+    let mut style = base.fg(if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+        RolePalette::markdown_heading()
+    } else {
+        RolePalette::navigation()
+    });
+    style = match level {
+        HeadingLevel::H1 => style
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED),
+        HeadingLevel::H2 | HeadingLevel::H3 => style.add_modifier(Modifier::BOLD),
+        HeadingLevel::H4 => style,
+        HeadingLevel::H5 => style.add_modifier(Modifier::DIM),
+        HeadingLevel::H6 => style
+            .add_modifier(Modifier::DIM)
+            .add_modifier(Modifier::ITALIC),
+    };
+    style
 }
 
 fn code_panel_widths(markdown: &str, content_width: usize) -> VecDeque<usize> {
@@ -2609,13 +2655,16 @@ mod tests {
 
     /// Every colour a settled, successful transcript screen may paint.
     ///
-    /// Two greys carry text and chrome, one accent marks operands and live work,
-    /// and the success hue is spent on the state channel alone.
-    const SETTLED_PALETTE: [Color; 4] = [
+    /// Neutral prose and chrome remain dominant while a compact Markdown palette
+    /// distinguishes headings, strong text, inline code, and navigation markers.
+    const SETTLED_PALETTE: [Color; 7] = [
         RolePalette::assistant(),
         RolePalette::muted(),
         RolePalette::accent_active(),
         RolePalette::success(),
+        RolePalette::markdown_heading(),
+        RolePalette::markdown_strong(),
+        RolePalette::markdown_code(),
     ];
 
     fn settled_conversation(is_error: bool) -> Conversation {
@@ -2669,7 +2718,7 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_transcript_paints_two_greys_one_accent_and_the_state_colour() {
+    fn a_settled_transcript_uses_only_the_semantic_palette() {
         for span in settled_lines(false).iter().flat_map(|line| &line.spans) {
             let Some(foreground) = span.style.fg else {
                 continue;

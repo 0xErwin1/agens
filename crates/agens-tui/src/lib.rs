@@ -69,7 +69,7 @@ const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 /// The accent bar is carved out of the indent instead of added to it, so bullets
 /// and content keep the screen columns they had before the bar existed.
 const TRANSCRIPT_ROW_INDENT: u16 = TRANSCRIPT_CONTENT_INDENT - widgets::ACCENT_WIDTH as u16;
-const TRANSCRIPT_CHROME_ROWS: u16 = 2;
+const TRANSCRIPT_TOP_BORDER_ROWS: u16 = 1;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
 const PROGRESS_CHANNEL_BUDGET: usize = 32;
 const TERMINAL_WHEEL_BATCH_BUDGET: usize = 64;
@@ -78,6 +78,14 @@ const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
 const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
 const MAX_SELECTION_COPY_BYTES: usize = 64 * 1024;
+
+const fn transcript_chrome_rows(following_bottom: bool) -> u16 {
+    if following_bottom {
+        TRANSCRIPT_TOP_BORDER_ROWS
+    } else {
+        TRANSCRIPT_TOP_BORDER_ROWS + 1
+    }
+}
 
 /// Cancels the active engine turn. The TUI owns no provider or session logic.
 pub trait Engine {
@@ -1377,32 +1385,30 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let visible_rows = layout
         .transcript
         .height
-        .saturating_sub(TRANSCRIPT_CHROME_ROWS) as usize;
+        .saturating_sub(transcript_chrome_rows(state.following_bottom))
+        as usize;
     let bottom_scroll = saturating_u16(transcript.rows.len().saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
         bottom_scroll
     } else {
         state.scroll_offset.min(bottom_scroll)
     };
-    let scroll_label = if state.following_bottom {
-        format!(" LIVE {bottom_scroll}/{bottom_scroll}")
-    } else {
-        format!(" SCROLL {scroll}/{bottom_scroll}")
-    };
     if layout.transcript.height > 0 {
+        let mut transcript_block = Block::default()
+            .borders(Borders::TOP)
+            .padding(Padding::left(TRANSCRIPT_ROW_INDENT))
+            .border_style(Style::default().fg(Color::DarkGray));
+        if !state.following_bottom {
+            transcript_block = transcript_block
+                .title_bottom(Span::styled(
+                    format!(" SCROLL {scroll}/{bottom_scroll}"),
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .title_alignment(Alignment::Right);
+        }
         frame.render_widget(
             Paragraph::new(Text::from(transcript.render_lines(state.selection)))
-                .block(
-                    Block::default()
-                        .borders(Borders::TOP)
-                        .padding(Padding::left(TRANSCRIPT_ROW_INDENT))
-                        .border_style(Style::default().fg(Color::DarkGray))
-                        .title_bottom(Span::styled(
-                            scroll_label,
-                            Style::default().fg(Color::DarkGray),
-                        ))
-                        .title_alignment(Alignment::Right),
-                )
+                .block(transcript_block)
                 .scroll((scroll, 0)),
             layout.transcript,
         );
@@ -3839,7 +3845,7 @@ where
         self.input = draft;
         self.input_cursor = self.input.chars().count();
         self.recovered_failed_prompt = true;
-        let scroll_offset = self.max_scroll_offset();
+        let scroll_offset = self.following_scroll_bottom();
         let record = self.active_record_mut();
         record.focus = TranscriptFocus::Composer;
         record.following_bottom = true;
@@ -4755,14 +4761,10 @@ where
             .max(1);
         let transcript =
             SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
-        let bottom = saturating_u16(
-            transcript.rows.len().saturating_sub(usize::from(
-                layout
-                    .transcript
-                    .height
-                    .saturating_sub(TRANSCRIPT_CHROME_ROWS),
-            )),
-        );
+        let chrome_rows = transcript_chrome_rows(view.following_bottom);
+        let bottom = saturating_u16(transcript.rows.len().saturating_sub(usize::from(
+            layout.transcript.height.saturating_sub(chrome_rows),
+        )));
         let scroll = if view.following_bottom {
             bottom
         } else {
@@ -4777,7 +4779,7 @@ where
             content_bottom: layout
                 .transcript
                 .bottom()
-                .saturating_sub(TRANSCRIPT_CHROME_ROWS.saturating_sub(1)),
+                .saturating_sub(chrome_rows.saturating_sub(1)),
             scroll,
         })
     }
@@ -5433,7 +5435,7 @@ where
             return Action::Render;
         }
 
-        let bottom = self.max_scroll_offset();
+        let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
         for direction in directions {
             match direction {
@@ -5447,6 +5449,9 @@ where
                     record.scroll_offset = current.saturating_sub(MOUSE_SCROLL_ROWS);
                 }
                 MouseWheelDirection::Down => {
+                    if record.following_bottom {
+                        continue;
+                    }
                     record.scroll_offset = record
                         .scroll_offset
                         .saturating_add(MOUSE_SCROLL_ROWS)
@@ -5460,7 +5465,7 @@ where
     }
 
     fn scroll_up(&mut self, rows: u16) {
-        let bottom = self.max_scroll_offset();
+        let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
         let current = if record.following_bottom {
             bottom
@@ -5473,8 +5478,12 @@ where
     }
 
     fn scroll_down(&mut self, rows: u16) {
-        let bottom = self.max_scroll_offset();
+        let bottom = self.detached_scroll_bottom();
         let record = self.active_record_mut();
+        if record.following_bottom {
+            record.focus = TranscriptFocus::Viewport;
+            return;
+        }
         record.scroll_offset = record.scroll_offset.saturating_add(rows).min(bottom);
         record.following_bottom = record.scroll_offset == bottom;
         record.focus = TranscriptFocus::Viewport;
@@ -5488,7 +5497,7 @@ where
     }
 
     fn scroll_to_end(&mut self) {
-        let scroll_offset = self.max_scroll_offset();
+        let scroll_offset = self.following_scroll_bottom();
         let record = self.active_record_mut();
         record.following_bottom = true;
         record.scroll_offset = scroll_offset;
@@ -5506,21 +5515,31 @@ where
     }
 
     fn max_scroll_offset(&self) -> u16 {
+        if self.following_bottom() {
+            self.following_scroll_bottom()
+        } else {
+            self.detached_scroll_bottom()
+        }
+    }
+
+    fn following_scroll_bottom(&self) -> u16 {
+        self.max_scroll_offset_with_chrome(TRANSCRIPT_TOP_BORDER_ROWS)
+    }
+
+    fn detached_scroll_bottom(&self) -> u16 {
+        self.max_scroll_offset_with_chrome(TRANSCRIPT_TOP_BORDER_ROWS + 1)
+    }
+
+    fn max_scroll_offset_with_chrome(&self, chrome_rows: u16) -> u16 {
         let layout = self.screen_layout();
-        let visible_rows = usize::from(
-            layout
-                .transcript
-                .height
-                .saturating_sub(TRANSCRIPT_CHROME_ROWS),
-        );
+        let view = self.view();
+        let visible_rows = usize::from(layout.transcript.height.saturating_sub(chrome_rows));
         let row_width = layout
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT);
-        let transcript = SelectableTranscript::from_lines(
-            &rendered_transcript(&self.view(), row_width),
-            row_width,
-        );
+        let transcript =
+            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
         saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
     }
 
@@ -6356,7 +6375,7 @@ where
                 .get(&self.active_transcript)
                 .expect("active transcript always exists");
             if record.following_bottom {
-                self.max_scroll_offset()
+                self.detached_scroll_bottom()
             } else {
                 record.scroll_offset
             }
@@ -6374,7 +6393,7 @@ where
         };
 
         if let Some(offset) = target {
-            let bottom = self.max_scroll_offset();
+            let bottom = self.detached_scroll_bottom();
             let record = self.active_record_mut();
             record.following_bottom = false;
             record.scroll_offset = offset.min(bottom);
@@ -7955,7 +7974,7 @@ mod runtime_tests {
             (0..200).map(|line| format!("line {line}\n")).collect(),
         )));
         tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
-        let bottom = tui.max_scroll_offset();
+        let bottom = tui.detached_scroll_bottom();
         let mut renderer = RecordingRenderer::default();
 
         run_with_runtime_terminal(&mut tui, &mut renderer, terminal).unwrap();
@@ -8718,7 +8737,9 @@ mod runtime_tests {
         .expect("mouse wheel should map");
 
         assert!(tui.following_bottom());
-        let bottom = tui.max_scroll_offset();
+        let following_bottom = tui.max_scroll_offset();
+        let detached_bottom = tui.detached_scroll_bottom();
+        assert_eq!(detached_bottom, following_bottom.saturating_add(1));
         assert_eq!(tui.handle(wheel.clone()), Action::Render);
         assert!(!tui.following_bottom());
 
@@ -8727,7 +8748,10 @@ mod runtime_tests {
             .get(&TranscriptId::Main)
             .unwrap()
             .scroll_offset;
-        assert_eq!(bottom.saturating_sub(scroll_offset), 6);
+        assert_eq!(
+            detached_bottom.saturating_sub(scroll_offset),
+            MOUSE_SCROLL_ROWS
+        );
         let transcript_row = tui.screen_layout().transcript.y.saturating_add(1);
         tui.handle(Event::MouseDown {
             column: TRANSCRIPT_CONTENT_INDENT,

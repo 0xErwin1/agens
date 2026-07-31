@@ -2755,7 +2755,8 @@ fn ratatui_surface_presents_context_roles_activity_and_responsive_shortcuts() {
     assert!(text.contains("Ready") || text.contains("Responding"));
     assert!(!text.contains("Compose"));
     assert!(!text.contains("Enter send"));
-    assert!(text.contains("LIVE") || text.contains("SCROLL"));
+    assert!(!text.contains("LIVE"));
+    assert!(!text.contains("SCROLL"));
 
     let user_cell = buffer
         .content
