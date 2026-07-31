@@ -27,9 +27,9 @@ use crate::{
     Error, MAX_HTTP_STATUS_ATTEMPTS, MAX_OPENAI_TOOL_CONTINUATION_ROUNDS, MAX_SSE_FRAME_BYTES,
     OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
     ProviderDiagnosticComponent, ProviderDiagnosticKind, ProviderDiagnostics,
-    classify_openai_response_status, diagnostic_class_for_port_error, diagnostic_class_for_status,
-    is_transient_http_status, retry_after_from_headers, should_retry_transport_error,
-    stop_before_mapping, wait_for_http_retry, wait_for_stop,
+    ProviderFailureDetail, classify_openai_response_status, diagnostic_class_for_port_error,
+    diagnostic_class_for_status, is_transient_http_status, retry_after_from_headers,
+    should_retry_transport_error, stop_before_mapping, wait_for_http_retry, wait_for_stop,
 };
 
 use decode::CompletionsDecoder;
@@ -62,6 +62,7 @@ pub struct MoonshotProvider {
     client: reqwest::Client,
     diagnostics: Option<ProviderDiagnostics>,
     progress: Option<TurnProgressSink>,
+    failure_detail: Option<ProviderFailureDetail>,
 }
 
 impl MoonshotProvider {
@@ -136,6 +137,7 @@ impl MoonshotProvider {
                 .map_err(|_| Error::Provider("Moonshot client is unavailable".to_owned()))?,
             diagnostics: None,
             progress: None,
+            failure_detail: None,
         })
     }
 
@@ -154,6 +156,12 @@ impl MoonshotProvider {
     #[must_use]
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    #[must_use]
+    pub fn with_failure_detail(mut self, failure_detail: ProviderFailureDetail) -> Self {
+        self.failure_detail = Some(failure_detail);
         self
     }
 
@@ -275,7 +283,13 @@ impl MoonshotProvider {
             }
 
             if !response.status().is_success() {
-                let context_exceeded = read_context_overflow(response, cancellation).await?;
+                if let Some(failure_detail) = &self.failure_detail {
+                    failure_detail
+                        .record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+                }
+                let context_exceeded =
+                    read_context_overflow(response, cancellation, self.failure_detail.as_ref())
+                        .await?;
                 self.emit(
                     ProviderDiagnosticKind::Terminal,
                     attempt + 1,
@@ -379,13 +393,22 @@ fn accept_frame(
 /// Whether a failed response says the request outran the model's context.
 ///
 /// The body is read through the crate's bounded reader so an error page cannot
-/// be streamed into memory, and only the marker survives — the body may echo the
-/// request and is never retained.
+/// be streamed into memory. Beyond the context-overflow marker it is
+/// otherwise discarded, unless the caller supplies a `ProviderFailureDetail`
+/// handle: the raw body then survives there for a user-visible sink. It can
+/// echo the request, so it must never reach a model-visible path.
 async fn read_context_overflow(
     response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
+    failure_detail: Option<&ProviderFailureDetail>,
 ) -> Result<bool, HeadlessTurnPortError> {
-    crate::read_safe_context_error(response, cancellation, &[compat::CONTEXT_OVERFLOW_MARKER]).await
+    crate::read_safe_context_error(
+        response,
+        cancellation,
+        &[compat::CONTEXT_OVERFLOW_MARKER],
+        failure_detail,
+    )
+    .await
 }
 
 /// The tool results recorded since the last request, in turn order.

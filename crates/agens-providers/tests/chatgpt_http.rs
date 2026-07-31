@@ -14,7 +14,7 @@ use agens_core::{
 };
 use agens_providers::{
     ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
-    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
 };
 use serde_json::{Value, json};
 
@@ -353,6 +353,49 @@ fn subscription_transport_bounds_error_bodies_before_an_open_connection() {
     );
 
     server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn rejected_status_records_body_status_and_model_for_a_user_visible_sink() {
+    let directory = temporary_directory("failure-detail");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Json(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#
+            .to_owned(),
+    )]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.responses_base_url()),
+            Some(&server.oauth_url()),
+            "gpt-9-missing".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured")
+        .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    let detail = failure_detail
+        .take()
+        .expect("a rejected request should record failure detail");
+    assert!(detail.contains("400"), "{detail}");
+    assert!(detail.contains("gpt-9-missing"), "{detail}");
+    assert!(
+        detail.contains("The model `gpt-9-missing` does not exist"),
+        "{detail}"
+    );
+
+    assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 

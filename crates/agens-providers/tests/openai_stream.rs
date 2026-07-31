@@ -450,3 +450,15 @@ fn rejects_failed_or_incomplete_streams_without_returning_partial_parts() {
         ))
     );
 }
+
+#[test]
+fn a_response_failed_event_without_a_message_still_fails_with_the_generic_text() {
+    let failed_without_message = [r#"{"type":"response.failed","response":{}}"#];
+
+    assert_eq!(
+        decode_openai_response_events(failed_without_message),
+        Err(Error::Provider(
+            "OpenAI stream failed: upstream provider reported an error".to_owned()
+        ))
+    );
+}

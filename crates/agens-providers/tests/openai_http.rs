@@ -11,7 +11,7 @@ use agens_core::{
 };
 use agens_providers::{
     OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticKind,
-    ProviderDiagnosticScope, ProviderDiagnostics,
+    ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
 };
 use serde_json::json;
 
@@ -228,6 +228,95 @@ fn openai_transport_uses_frozen_failure_precedence() {
         );
         server.join();
     }
+}
+
+#[test]
+fn rejected_status_records_body_status_and_model_for_a_user_visible_sink() {
+    let server = LocalResponsesServer::start_error_response(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#,
+    );
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "gpt-9-missing".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        provider_runtime()
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .map(|_| ()),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    let detail = failure_detail
+        .take()
+        .expect("a rejected request should record failure detail");
+    assert!(detail.contains("400"), "{detail}");
+    assert!(detail.contains("gpt-9-missing"), "{detail}");
+    assert!(
+        detail.contains("The model `gpt-9-missing` does not exist"),
+        "{detail}"
+    );
+
+    server.join();
+}
+
+#[test]
+fn no_failure_detail_handle_means_nothing_is_recorded() {
+    let server = LocalResponsesServer::start_error_response(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#,
+    );
+
+    assert_eq!(
+        run_provider(
+            server.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    server.join();
+}
+
+#[test]
+fn mid_stream_response_failed_event_records_its_payload_for_a_user_visible_sink() {
+    let server = LocalResponsesServer::start_scripted(vec![concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"the model is temporarily overloaded\"}}}\n\n"
+    )
+    .to_owned()]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        provider_runtime()
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .map(|_| ()),
+        Err(HeadlessTurnPortError::ProviderProtocol)
+    );
+
+    assert_eq!(
+        failure_detail.take(),
+        Some("the model is temporarily overloaded".to_owned())
+    );
+
+    server.join();
 }
 
 #[test]
