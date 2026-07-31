@@ -780,7 +780,7 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
     )));
     assert_eq!(
         sanitized_native_tool_failure("glob: /home/user/private token=SECRET remote body details"),
-        "tool execution failed"
+        "glob: [path] token=[redacted: 6 characters] remote body details"
     );
     assert_eq!(
         sanitized_native_tool_failure("glob: path is outside project root"),
@@ -919,7 +919,8 @@ fn an_mcp_timeout_reaches_the_next_provider_iteration_as_a_tool_result() {
 
 /// A missing or unreadable file is the most common native failure, and the model can only stop
 /// retrying it if the reason survives sanitization. These reasons name neither a path nor any
-/// content, while an unmapped reason must still degrade to the generic message.
+/// credential-shaped value, so they pass through verbatim; a reason naming a host path is
+/// withheld rather than dropped to a generic message.
 #[test]
 fn canonical_filesystem_reasons_survive_sanitization() {
     for reason in [
@@ -936,11 +937,11 @@ fn canonical_filesystem_reasons_survive_sanitization() {
 
     assert_eq!(
         sanitized_native_tool_failure("read: No such file or directory (os error 2)"),
-        "tool execution failed"
+        "read: No such file or directory (os error 2)"
     );
     assert_eq!(
         sanitized_native_tool_failure("read: /home/user/.ssh/id_rsa is unreadable"),
-        "tool execution failed"
+        "read: [path] is unreadable"
     );
 }
 

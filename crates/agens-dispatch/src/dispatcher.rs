@@ -94,6 +94,7 @@ const MAX_NATIVE_TOOL_FAILURE_CHARS: usize = 16_384;
 /// used to lose all compiler and test output as a result.
 pub fn sanitized_native_tool_failure(content: &str) -> String {
     if let Some((tool, reason)) = content.split_once(": ")
+        && !tool.contains('\n')
         && (reason.contains("outside project root")
             || reason.contains("traversal is not allowed")
             || reason.contains("must be a non-empty relative path"))
@@ -279,6 +280,39 @@ mod tests {
             assert_eq!(converted, format!("{tool}: path validation failed"));
             assert!(!converted.contains('/'));
         }
+    }
+
+    /// The path-validation guard must anchor on a genuine `"<tool>: <reason>"` shape. Real bash
+    /// output is multi-line and routinely contains one of the three marker phrases as ordinary
+    /// grep/diff/test-runner output (all three literals live in this crate's own source), so a
+    /// `tool` part spanning multiple lines can never be a real tool name and must not trigger
+    /// the guard — before this fix it destroyed the whole failure and fabricated a false claim.
+    #[test]
+    fn multiline_content_does_not_trigger_the_path_validation_guard() {
+        let content = "[stdout]\ngrep hit: traversal is not allowed\n[stderr]\nreal error here\n[exit status: 2]\n";
+
+        let converted = sanitized_native_tool_failure(content);
+
+        assert_eq!(converted, content);
+    }
+
+    /// `render_bash_result` puts `[stderr]` and `[exit status: N]` at the end of the content, so
+    /// a bound that keeps only the head of a failure larger than the cap would deliver the model
+    /// stdout and neither the error nor the exit code — exactly the case this rewrite exists to
+    /// serve, since a failing `cargo build` easily exceeds the 16,384-char cap.
+    #[test]
+    fn large_bash_failure_keeps_stderr_and_exit_status() {
+        let noisy_stdout = "line of build output\n".repeat(1_000);
+        let content =
+            format!("[stdout]\n{noisy_stdout}[stderr]\nreal error here\n[exit status: 2]\n");
+        assert!(content.chars().count() > MAX_NATIVE_TOOL_FAILURE_CHARS);
+
+        let converted = sanitized_native_tool_failure(&content);
+
+        assert!(converted.chars().count() < content.chars().count());
+        assert!(converted.contains("[truncated:"));
+        assert!(converted.contains("real error here"));
+        assert!(converted.contains("[exit status: 2]"));
     }
 
     /// This is the model-visible sink, so absolute host paths must be withheld even though the
