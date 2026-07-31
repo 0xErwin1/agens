@@ -105,7 +105,7 @@ pub fn completed_session_turn_from_events(
             }
             role = Some(next_role);
         }
-        parts.push(part);
+        push_coalesced_part(&mut parts, part);
     }
     if let Some(role) = role {
         flush_parts(&mut messages, role, &mut parts);
@@ -118,6 +118,16 @@ pub fn completed_session_turn_from_events(
         .map_err(|_| CliError::storage("completed session could not be encoded"))?;
     CompletedSessionTurn::new(messages)
         .map_err(|_| CliError::storage("completed session could not be encoded"))
+}
+
+fn push_coalesced_part(parts: &mut Vec<MessagePart>, part: MessagePart) {
+    match (parts.last_mut(), &part) {
+        (Some(MessagePart::Text(current)), MessagePart::Text(next)) => current.push_str(next),
+        (Some(MessagePart::Reasoning(current)), MessagePart::Reasoning(next)) => {
+            current.push_str(next);
+        }
+        _ => parts.push(part),
+    }
 }
 
 pub fn completed_subagent_session_turn(
@@ -326,6 +336,27 @@ fn flush_parts(messages: &mut Vec<Message>, role: Role, parts: &mut Vec<MessageP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_turn_coalesces_adjacent_streamed_text_and_reasoning_fragments() {
+        let events = [
+            TurnEvent::ProviderPart(MessagePart::Reasoning("think".into())),
+            TurnEvent::ProviderPart(MessagePart::Reasoning("ing".into())),
+            TurnEvent::ProviderPart(MessagePart::Text("hel".into())),
+            TurnEvent::ProviderPart(MessagePart::Text("lo".into())),
+        ];
+
+        let turn = completed_session_turn_from_events("prompt", &events, None).unwrap();
+        let assistant = &turn.messages()[1];
+
+        assert_eq!(
+            assistant.parts,
+            vec![
+                MessagePart::Reasoning("thinking".into()),
+                MessagePart::Text("hello".into()),
+            ]
+        );
+    }
 
     #[test]
     fn completed_turn_marks_an_empty_tool_result_as_no_output() {

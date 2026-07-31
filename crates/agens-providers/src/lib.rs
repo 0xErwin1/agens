@@ -2355,6 +2355,59 @@ pub fn encode_openai_response_request_with_tools(
     Ok(request.to_string())
 }
 
+fn coalesced_message_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
+    const MAX_COALESCED_TEXT_BYTES: usize = MAX_CHATGPT_REPLAY_ITEM_BYTES / 8;
+
+    fn push_text(parts: &mut Vec<MessagePart>, text: &str, reasoning: bool, max_bytes: usize) {
+        if text.is_empty() {
+            parts.push(if reasoning {
+                MessagePart::Reasoning(String::new())
+            } else {
+                MessagePart::Text(String::new())
+            });
+            return;
+        }
+
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(max_bytes);
+            while !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            let chunk = &remaining[..end];
+            match (parts.last_mut(), reasoning) {
+                (Some(MessagePart::Reasoning(current)), true)
+                    if current.len() + chunk.len() <= max_bytes =>
+                {
+                    current.push_str(chunk);
+                }
+                (Some(MessagePart::Text(current)), false)
+                    if current.len() + chunk.len() <= max_bytes =>
+                {
+                    current.push_str(chunk);
+                }
+                _ if reasoning => parts.push(MessagePart::Reasoning(chunk.to_owned())),
+                _ => parts.push(MessagePart::Text(chunk.to_owned())),
+            }
+            remaining = &remaining[end..];
+        }
+    }
+
+    let mut coalesced = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            MessagePart::Text(text) => {
+                push_text(&mut coalesced, text, false, MAX_COALESCED_TEXT_BYTES);
+            }
+            MessagePart::Reasoning(text) => {
+                push_text(&mut coalesced, text, true, MAX_COALESCED_TEXT_BYTES);
+            }
+            _ => coalesced.push(part.clone()),
+        }
+    }
+    coalesced
+}
+
 pub fn encode_openai_response_request_with_messages(
     model: &str,
     messages: &[Message],
@@ -2364,11 +2417,18 @@ pub fn encode_openai_response_request_with_messages(
         return Err(invalid_resumed_history());
     }
 
+    let messages = messages
+        .iter()
+        .map(|message| Message {
+            role: message.role,
+            parts: coalesced_message_parts(&message.parts),
+        })
+        .collect::<Vec<_>>();
     let mut input = Vec::new();
     let mut calls = BTreeSet::new();
     let mut results = BTreeSet::new();
 
-    for message in messages {
+    for message in &messages {
         match message.role {
             Role::System | Role::User => {
                 let content = message
@@ -3399,6 +3459,41 @@ mod tests {
                     "content": [{"type": "input_text", "text": "new input"}],
                 }),
             ]
+        );
+    }
+
+    #[test]
+    fn resumed_input_coalesces_stream_fragments_before_enforcing_replay_item_bounds() {
+        let messages = vec![Message {
+            role: Role::Assistant,
+            parts: (0..MAX_CHATGPT_REPLAY_ITEMS + 1)
+                .map(|_| MessagePart::Text("x".into()))
+                .collect(),
+        }];
+
+        assert_eq!(
+            resumed_input("test-model", &messages, &[]).unwrap(),
+            vec![serde_json::json!({
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "x".repeat(MAX_CHATGPT_REPLAY_ITEMS + 1) }],
+            })]
+        );
+
+        let text = "😀".repeat(MAX_CHATGPT_REPLAY_ITEM_BYTES);
+        let parts = coalesced_message_parts(&[MessagePart::Text(text.clone())]);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| {
+            matches!(part, MessagePart::Text(chunk) if chunk.len() <= MAX_CHATGPT_REPLAY_ITEM_BYTES / 8)
+        }));
+        assert_eq!(
+            parts
+                .iter()
+                .map(|part| match part {
+                    MessagePart::Text(chunk) => chunk.as_str(),
+                    _ => unreachable!(),
+                })
+                .collect::<String>(),
+            text
         );
     }
 
