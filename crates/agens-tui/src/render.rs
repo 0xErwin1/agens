@@ -535,7 +535,7 @@ fn collect_group(
                 members.insert(call_id.as_str());
                 count += 1;
                 failed += usize::from(call_row_state(conversation, call_id) == RowState::Failure);
-                running |= !call_has_result(conversation, call_id);
+                running |= call_row_state(conversation, call_id) == RowState::Running;
             }
             ConversationItem::ToolResult { call_id, .. }
                 if members.contains(call_id.as_str()) || is_task_call(conversation, call_id) => {}
@@ -590,6 +590,7 @@ fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
 /// Lifecycle a call's bullet carries: pending, or settled by its own result.
 fn call_row_state(conversation: &Conversation, call_id: &str) -> RowState {
     match call_result(conversation, call_id) {
+        None if conversation.is_restored() => RowState::Failure,
         None => RowState::Running,
         Some(result) if result.is_error => RowState::Failure,
         Some(_) => RowState::Success,
@@ -2125,6 +2126,30 @@ pub(super) fn syntax_highlight_test_calls() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_restored_tool_call_is_terminal_instead_of_running() {
+        let conversations = Conversation::from_messages(&[
+            agens_core::Message {
+                role: agens_core::Role::User,
+                parts: vec![agens_core::MessagePart::Text("inspect".into())],
+            },
+            agens_core::Message {
+                role: agens_core::Role::Assistant,
+                parts: vec![agens_core::MessagePart::ToolCall {
+                    id: "dangling".into(),
+                    name: "native::read".into(),
+                    input: r#"{"path":"missing"}"#.into(),
+                }],
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            call_row_state(&conversations[0], "dangling"),
+            RowState::Failure
+        );
+    }
 
     fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
         ConversationRenderState {

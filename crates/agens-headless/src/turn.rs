@@ -5,13 +5,13 @@
 use crate::outcome::{HeadlessChatCompletion, HeadlessChatFailure};
 use crate::request::HeadlessChatRequest;
 use crate::request::{explicit_task_delegation_prompt, provider_messages};
-use crate::subagents::{interrupted_turn_note, record_requested_subagent, record_tool_result_fact};
-use std::collections::BTreeMap;
+use crate::subagents::{interrupted_turn_note, record_tool_result_fact};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{
-    BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, PermissionMode,
-    PermissionSession, TurnEvent, TurnProgressSink,
+    BeginSessionAttemptError, HeadlessTurnCancellation, HeadlessTurnError, Message, MessagePart,
+    PermissionMode, PermissionSession, TurnEvent, TurnProgressSink,
     run_headless_turn_with_max_iterations_and_progress,
 };
 use agens_providers::{
@@ -36,13 +36,49 @@ use agens_permissions::{
 use agens_session::attempt::{
     AttemptLifecycleError, active_session_attempts,
     run_session_attempt_lifecycle_with_terminal_writer, write_terminal_attempt,
+    write_terminal_attempt_with_history,
 };
 use agens_session::provider::ProviderKind;
-use agens_session::turns::{completed_session_turn, next_session_metadata};
+use agens_session::turns::{
+    completed_session_turn, completed_session_turn_from_events, next_session_metadata,
+};
 use agens_tool_runtime::block_on_headless_turn;
 use agens_tool_runtime::child::TaskMailboxProvider;
 use agens_tool_runtime::runtime::production_tool_runtime_for_parent;
 use agens_tool_runtime::task::ProductionTuiTaskRuntime;
+
+#[derive(Default)]
+struct PartialTurnRecorder {
+    events: Vec<TurnEvent>,
+    tool_call_ids: BTreeSet<String>,
+    tool_result_ids: BTreeSet<String>,
+}
+
+impl PartialTurnRecorder {
+    fn observe(&mut self, event: TurnEvent) {
+        let accepted = match &event {
+            TurnEvent::ProviderPart(MessagePart::ToolCall { id, .. }) => {
+                self.tool_call_ids.insert(id.clone())
+            }
+            TurnEvent::ToolResult(MessagePart::ToolResult { tool_call_id, .. }) => {
+                self.tool_result_ids.insert(tool_call_id.clone())
+            }
+            _ => true,
+        };
+        if accepted {
+            self.events.push(event);
+        }
+    }
+
+    fn has_partial_history(&self) -> bool {
+        self.events.iter().any(|event| {
+            matches!(
+                event,
+                TurnEvent::ProviderPart(_) | TurnEvent::ToolResult { .. }
+            )
+        })
+    }
+}
 
 struct HeadlessProviderContext<'a> {
     bootstrap: &'a Bootstrap,
@@ -531,8 +567,11 @@ where
         session_model,
         session_effort,
     )?;
-    let requested_subagents = Arc::new(Mutex::new(Vec::new()));
-    let noted_subagents = Arc::clone(&requested_subagents);
+    let partial_events = Arc::new(Mutex::new(PartialTurnRecorder::default()));
+    let runtime_partial_events = Arc::clone(&partial_events);
+    let terminal_partial_events = Arc::clone(&partial_events);
+    let partial_prompt = request.prompt.clone();
+    let partial_system_reminder = request.pending_system_reminder.clone();
     let completion = run_session_attempt_lifecycle_with_terminal_writer(
         active_session_attempts(),
         &mut store,
@@ -554,8 +593,13 @@ where
                     other => progress(other),
                 }) as TurnProgressSink
             });
+            let accepted_partial_events = Arc::clone(&runtime_partial_events);
             let headless_progress: TurnProgressSink = Arc::new(move |event: TurnEvent| {
-                record_requested_subagent(&requested_subagents, &event);
+                if !matches!(event, TurnEvent::ProviderPart(_) | TurnEvent::Usage(_))
+                    && let Ok(mut events) = accepted_partial_events.lock()
+                {
+                    events.observe(event.clone());
+                }
                 if let TurnEvent::ToolResultFacts { identity, facts } = &event {
                     record_tool_result_fact(&fact_store, identity, facts);
                 }
@@ -564,9 +608,18 @@ where
                 }
             });
             let headless_progress = Some(&headless_progress);
-            if let Some(progress) = context.progress {
-                provider = provider.with_progress_sink(Arc::clone(progress));
-            }
+            let streamed_partial_events = Arc::clone(&runtime_partial_events);
+            let visible_progress = context.progress.cloned();
+            provider = provider.with_progress_sink(Arc::new(move |event| {
+                if matches!(event, TurnEvent::ProviderPart(_))
+                    && let Ok(mut events) = streamed_partial_events.lock()
+                {
+                    events.observe(event.clone());
+                }
+                if let Some(progress) = &visible_progress {
+                    progress(event);
+                }
+            }));
             let mut provider =
                 TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
             cancellation_result(context.cancellation)?;
@@ -608,12 +661,19 @@ where
             Ok((snapshot, turn))
         },
         |store, write| {
-            let note = noted_subagents
+            let events = terminal_partial_events
                 .lock()
-                .map(|requested| interrupted_turn_note(&requested))
-                .unwrap_or_else(|_| interrupted_turn_note(&[]));
-
-            write_terminal_attempt(store, write, &note)
+                .map_err(|_| agens_session::attempt::AttemptStoreError)?;
+            if !events.has_partial_history() {
+                return write_terminal_attempt(store, write, &interrupted_turn_note(&[]));
+            }
+            let turn = completed_session_turn_from_events(
+                &partial_prompt,
+                &events.events,
+                partial_system_reminder.as_deref(),
+            )
+            .map_err(|_| agens_session::attempt::AttemptStoreError)?;
+            write_terminal_attempt_with_history(store, write, &turn)
         },
     )
     .map_err(|error| match error {
@@ -655,7 +715,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::mcp_failure_notice_lines;
+    use super::{PartialTurnRecorder, mcp_failure_notice_lines};
+    use agens_core::{MessagePart, TurnEvent};
     use agens_tools::{
         McpErrorCategory, McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport,
         McpStatusHandle,
@@ -670,6 +731,29 @@ mod tests {
             std::time::Duration::from_millis(500),
             None,
         )
+    }
+
+    #[test]
+    fn partial_turn_recorder_keeps_only_the_first_call_and_result_for_each_identity() {
+        let call = MessagePart::ToolCall {
+            id: "reused".into(),
+            name: "native::write".into(),
+            input: r#"{"path":"a"}"#.into(),
+        };
+        let result = MessagePart::ToolResult {
+            tool_call_id: "reused".into(),
+            content: "wrote a".into(),
+            is_error: false,
+        };
+        let mut recorder = PartialTurnRecorder::default();
+
+        recorder.observe(TurnEvent::ProviderPart(call.clone()));
+        recorder.observe(TurnEvent::ToolResult(result.clone()));
+        recorder.observe(TurnEvent::ProviderPart(call));
+        recorder.observe(TurnEvent::ToolResult(result));
+
+        assert_eq!(recorder.events.len(), 2);
+        assert!(recorder.has_partial_history());
     }
 
     #[test]

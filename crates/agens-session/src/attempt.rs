@@ -294,8 +294,8 @@ pub fn run_session_attempt_lifecycle_with_terminal_writer(
 
     let (snapshot, turn) = match runtime(attempt.key()) {
         Ok(completion) => completion,
-        Err(error) => {
-            let partial = terminal_writer(
+        Err(mut error) => {
+            let partial = match terminal_writer(
                 store,
                 TerminalAttemptWrite {
                     key: attempt.key(),
@@ -304,9 +304,15 @@ pub fn run_session_attempt_lifecycle_with_terminal_writer(
                     prompt: &prompt,
                     finished_at: crate::context::current_session_timestamp(),
                 },
-            )
-            .ok()
-            .flatten();
+            ) {
+                Ok(partial) => partial,
+                Err(_) => {
+                    error
+                        .message
+                        .push_str("; failed turn history could not be saved");
+                    None
+                }
+            };
 
             return Err(AttemptLifecycleError::Runtime {
                 error,
@@ -372,11 +378,21 @@ pub fn write_terminal_attempt(
     }
 
     let turn = interrupted_session_turn(write.prompt, note).map_err(|_| AttemptStoreError)?;
+    write_terminal_attempt_with_history(store, write, &turn)
+}
+
+/// Persists the actual message history observed before a failed attempt stopped, regardless of
+/// failure category, and returns the reloaded session so the caller can keep using the same one.
+pub fn write_terminal_attempt_with_history(
+    store: &mut SessionStore,
+    write: TerminalAttemptWrite<'_>,
+    turn: &CompletedSessionTurn,
+) -> Result<Option<PartialTurnRecord>, AttemptStoreError> {
     let outcome = store
         .persist_partial_session_attempt(
             write.key,
             write.metadata,
-            &turn,
+            turn,
             write.status,
             write.finished_at,
         )

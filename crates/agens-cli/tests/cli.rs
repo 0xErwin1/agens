@@ -2043,7 +2043,7 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
 
 #[cfg(unix)]
 #[test]
-fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
+fn production_task_cancellation_prevents_parent_continuation_and_persists_emitted_history() {
     let temporary = TemporaryDirectory::new("production-task-cancellation");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -2098,7 +2098,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persistence() {
         &config_home,
         "parent task cancellation",
     );
-    assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
+    assert_sqlite_has_partial_turn(&data_directory.join("agens.db"), 3);
     assert_sqlite_has_no_sentinels(
         &data_directory.join("agens.db"),
         &[
@@ -2160,7 +2160,12 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     assert_diagnostic_error(&output.stderr, "error: task: provider failure\n");
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        &project_root,
+        &config_home,
+        "parent provider failure",
+    );
     assert_output_and_store_exclude_sentinels(
         &output,
         &data_directory.join("agens.db"),
@@ -3405,7 +3410,12 @@ fn production_binary_rejects_replayed_native_call_id_without_second_execution() 
             .expect("only the first authorized call should execute"),
         "first execution"
     );
-    assert_no_saved_sessions(&temporary, &project_root, &config_home);
+    assert_interrupted_session_saved(
+        &temporary,
+        &project_root,
+        &config_home,
+        "execute exactly once",
+    );
 
     server.join();
 }
@@ -4090,7 +4100,7 @@ fn production_binary_records_each_sessions_own_identity_in_the_evidence_ledger()
 }
 
 #[test]
-fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_or_persistence() {
+fn production_binary_stops_on_mcp_infrastructure_failures_and_persists_emitted_history() {
     for (name, mode, timeout_ms) in [
         ("timeout", "call-sleep", 20),
         ("crash", "call-crash", 1_000),
@@ -4128,18 +4138,13 @@ fn production_binary_stops_on_mcp_infrastructure_failures_without_continuation_o
 
         assert_eq!(output.status.code(), Some(1), "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        if name == "timeout" {
-            assert_interrupted_session_saved(
-                &temporary,
-                &project_root,
-                &config_home,
-                "run broken MCP tool",
-            );
-            assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
-        } else {
-            assert_no_saved_sessions(&temporary, &project_root, &config_home);
-            assert_sqlite_has_terminal_attempt_without_history(&data_directory.join("agens.db"));
-        }
+        assert_interrupted_session_saved(
+            &temporary,
+            &project_root,
+            &config_home,
+            "run broken MCP tool",
+        );
+        assert_sqlite_has_interrupted_turn(&data_directory.join("agens.db"));
 
         server.join();
     }
@@ -4462,7 +4467,16 @@ fn production_binary_fails_closed_for_mcp_duplicate_replay_and_mismatched_call_i
             expected_calls,
             "{name}"
         );
-        assert_no_saved_sessions(&temporary, &project_root, &config_home);
+        if expected_calls.is_some() {
+            assert_interrupted_session_saved(
+                &temporary,
+                &project_root,
+                &config_home,
+                "reject MCP replay",
+            );
+        } else {
+            assert_no_saved_sessions(&temporary, &project_root, &config_home);
+        }
 
         server.join();
     }
@@ -5324,6 +5338,32 @@ fn sqlite_text_values(database: &std::path::Path) -> Vec<(String, String)> {
     sqlite_values
 }
 
+fn assert_sqlite_has_partial_turn(database: &std::path::Path, expected_messages: i64) {
+    assert!(database.exists(), "session database should exist");
+
+    let connection = rusqlite::Connection::open(database).expect("session database should open");
+    let counts = connection
+        .query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM session_attempts WHERE status != 'running'),
+                 (SELECT COUNT(*) FROM session_attempts WHERE retry_prompt IS NOT NULL),
+                 (SELECT COUNT(*) FROM turns),
+                 (SELECT COUNT(*) FROM messages)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .expect("partial attempt should be queryable");
+
+    assert_eq!(counts, (1, 0, 1, expected_messages));
+}
+
 fn assert_sqlite_has_interrupted_turn(database: &std::path::Path) {
     assert!(database.exists(), "session database should exist");
 
@@ -5348,27 +5388,4 @@ fn assert_sqlite_has_interrupted_turn(database: &std::path::Path) {
         .expect("interrupted attempt should be queryable");
 
     assert_eq!(counts, (1, 0, 1, 2));
-}
-
-fn assert_sqlite_has_terminal_attempt_without_history(database: &std::path::Path) {
-    assert!(database.exists(), "session database should exist");
-
-    let connection = rusqlite::Connection::open(database).expect("session database should open");
-    let attempts = connection
-        .query_row(
-            "SELECT COUNT(*) FROM session_attempts WHERE status != 'running'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("attempt status should be queryable");
-    assert_eq!(attempts, 1, "one terminal attempt should be retained");
-
-    for table in ["turns", "messages", "message_parts"] {
-        let row_count = connection
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("history row count should be readable");
-        assert_eq!(row_count, 0, "{table} should have no partial history");
-    }
 }

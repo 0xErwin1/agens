@@ -27,7 +27,7 @@ mod tests {
         record_requested_subagent,
     };
     use agens_session::context::SessionContext;
-    use agens_session::turns::completed_session_turn;
+    use agens_session::turns::{completed_session_turn, completed_session_turn_from_events};
     use agens_tool_runtime::runtime::production_dangerous_child_tool_runtime;
     use agens_tui_app::router::tui_provider_outcome;
     use agens_tui_app::turn::complete_tui_turn;
@@ -182,9 +182,13 @@ mod tests {
             .latest_attempt
             .unwrap();
 
+        let mut expected_terminal_error = CliError::runtime(HeadlessTurnError::Cancelled);
+        expected_terminal_error
+            .message
+            .push_str("; failed turn history could not be saved");
         assert_eq!(
             terminal_error,
-            AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+            AttemptLifecycleError::runtime(expected_terminal_error)
         );
         assert_eq!(running.status(), agens_core::SessionAttemptStatus::Running);
         assert!(!registry.contains(&store.database_path(), running.key()));
@@ -327,6 +331,95 @@ mod tests {
             )
             .is_ok()
         );
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_attempt_persists_the_actual_history_and_reuses_the_session() {
+        let directory =
+            std::env::temp_dir().join(format!("agens-failed-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut store = SessionStore::open(&directory).unwrap();
+        let registry = AttemptActivityRegistry::default();
+        let metadata = SessionMetadata {
+            id: 1,
+            project: "project".into(),
+            title: "inspect failure".into(),
+            active_agent: "primary".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let events = vec![
+            TurnEvent::ProviderPart(MessagePart::Reasoning("checking".into())),
+            TurnEvent::ProviderPart(MessagePart::ToolCall {
+                id: "call-1".into(),
+                name: "native::read".into(),
+                input: r#"{"path":"src/lib.rs"}"#.into(),
+            }),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "file contents".into(),
+                is_error: false,
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("partial answer".into())),
+        ];
+        let partial_turn =
+            completed_session_turn_from_events("inspect failure", &events, None).unwrap();
+
+        let failure = run_session_attempt_lifecycle_with_terminal_writer(
+            &registry,
+            &mut store,
+            metadata.clone(),
+            "inspect failure".into(),
+            |_attempt| Err(CliError::runtime(HeadlessTurnError::ProviderNetwork)),
+            |store, write| write_terminal_attempt_with_history(store, write, &partial_turn),
+        )
+        .unwrap_err();
+
+        let stored = store.load_session_for_resume(metadata.id).unwrap();
+        assert_eq!(stored.messages.len(), 4);
+        assert_eq!(stored.messages[0].role, Role::User);
+        assert_eq!(
+            stored.messages[1].parts,
+            events[0..2]
+                .iter()
+                .filter_map(|event| {
+                    let TurnEvent::ProviderPart(part) = event else {
+                        return None;
+                    };
+                    Some(part.clone())
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            stored.messages[2].parts,
+            vec![MessagePart::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "file contents".into(),
+                is_error: false,
+            }]
+        );
+        assert_eq!(
+            stored.messages[3].parts,
+            vec![MessagePart::Text("partial answer".into())]
+        );
+        assert_eq!(
+            stored.latest_attempt.as_ref().unwrap().status(),
+            agens_core::SessionAttemptStatus::ProviderError
+        );
+        assert!(matches!(
+            failure,
+            AttemptLifecycleError::Runtime {
+                partial: Some(_),
+                ..
+            }
+        ));
 
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -541,9 +634,13 @@ mod tests {
             .latest_attempt
             .unwrap();
 
+        let mut expected_terminal_error = CliError::runtime(HeadlessTurnError::Cancelled);
+        expected_terminal_error
+            .message
+            .push_str("; failed turn history could not be saved");
         assert_eq!(
             terminal_error,
-            AttemptLifecycleError::runtime(CliError::runtime(HeadlessTurnError::Cancelled))
+            AttemptLifecycleError::runtime(expected_terminal_error)
         );
         assert_eq!(terminal.status(), agens_core::SessionAttemptStatus::Running);
         assert!(!registry.contains(&store.database_path(), terminal.key()));

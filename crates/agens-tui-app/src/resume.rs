@@ -358,8 +358,9 @@ pub fn tui_project_identifier(bootstrap: &Bootstrap) -> Result<String, CliError>
 #[cfg(test)]
 mod tests {
     use agens_core::{
-        HeadlessTurnCancellation, PermissionDecision, PermissionMode, PermissionPattern,
-        PermissionPolicy, PermissionRule, PermissionSession, Role, SessionMetadata,
+        HeadlessTurnCancellation, MessagePart, PermissionDecision, PermissionMode,
+        PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, Role,
+        SessionAttemptStatus, SessionMetadata, TurnEvent,
     };
     use agens_tools::{ToolDispatchRequest, ToolEvaluationOutcome, ToolExecutionContext};
     use agens_tui::{Event, Key, Tui, TuiPermissionBridge};
@@ -378,6 +379,7 @@ mod tests {
     use agens_agents::ensure_active_agent_runtime;
     use agens_callcount::{Counts, counts as call_counts, reset as reset_call_counts};
     use agens_session::attempt::attempt_failure_status;
+    use agens_session::turns::completed_session_turn_from_events;
     use agens_tool_runtime::runner::{TuiTaskControls, TuiTaskLifecycleBridge};
     use agens_tool_runtime::task::production_tui_task_runtime;
 
@@ -503,6 +505,69 @@ mod tests {
         assert!(resumed.context.active_agent.is_none());
         assert_eq!(resumed.history.len(), 1);
         assert_eq!(call_counts(), Counts(1, 1, 0, 0));
+
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[test]
+    fn failed_tui_resume_restores_exact_partial_provider_and_tool_history() {
+        let temporary = tui_session_directory("failed-partial-resume");
+        let bootstrap = tui_session_bootstrap(&temporary, &[]);
+        let mut store = SessionStore::open(bootstrap.data_directory()).unwrap();
+        let metadata = SessionMetadata {
+            id: 42,
+            project: tui_project(&temporary),
+            title: "partial".into(),
+            active_agent: "primary".into(),
+            provider_id: Some("openai-api".into()),
+            model_id: Some("test-model".into()),
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 1,
+            completed_turn_count: 0,
+            resumable: false,
+        };
+        let active = store
+            .begin_session_attempt(&metadata, "inspect".into())
+            .unwrap();
+        let events = vec![
+            TurnEvent::ProviderPart(MessagePart::Reasoning("checking".into())),
+            TurnEvent::ProviderPart(MessagePart::ToolCall {
+                id: "call-read".into(),
+                name: "native::read".into(),
+                input: r#"{"path":"Cargo.toml"}"#.into(),
+            }),
+            TurnEvent::ToolResult(MessagePart::ToolResult {
+                tool_call_id: "call-read".into(),
+                content: "[workspace]".into(),
+                is_error: false,
+            }),
+            TurnEvent::ProviderPart(MessagePart::Text("partial answer".into())),
+        ];
+        let turn = completed_session_turn_from_events("inspect", &events, None).unwrap();
+        let expected = turn.messages().to_vec();
+        store
+            .persist_partial_session_attempt(
+                active.key(),
+                &metadata,
+                &turn,
+                SessionAttemptStatus::ProviderError,
+                2,
+            )
+            .unwrap();
+        drop(store);
+
+        let resumed = resume_tui_session(
+            &bootstrap,
+            active.key().session_id(),
+            &SkillCatalog::default(),
+            &CredentialResolver::production(),
+        )
+        .unwrap();
+
+        assert_eq!(resumed.context.messages, expected);
+        assert_eq!(resumed.history.len(), 1);
+        assert_eq!(resumed.context.metadata.unwrap().completed_turn_count, 1);
 
         std::fs::remove_dir_all(temporary).unwrap();
     }

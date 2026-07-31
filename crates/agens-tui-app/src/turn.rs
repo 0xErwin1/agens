@@ -29,6 +29,9 @@ pub fn complete_tui_turn(
                 session.identifier = Some(partial.metadata.id);
                 session.metadata = Some(partial.metadata);
                 adopt_turn_history(session, partial.messages);
+                if consumed_reminder {
+                    session.pending_system_reminder = None;
+                }
             }
 
             return Err(failure.error);
@@ -129,6 +132,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agens_core::SessionMetadata;
+    use agens_session::attempt::PartialTurnRecord;
 
     use super::*;
     use crate::engine::{ProductionTuiEngine, configure_tui_project_identity};
@@ -176,6 +180,52 @@ mod tests {
             complete_tui_turn(&mut context, Err(CliError::storage("failed").into()), true).is_err()
         );
         assert_eq!(context.pending_system_reminder.as_deref(), Some("reminder"));
+    }
+
+    #[test]
+    fn failed_tui_turn_adopts_partial_history_and_clears_its_persisted_reminder() {
+        let metadata = SessionMetadata {
+            id: 2,
+            project: "project".into(),
+            title: "title".into(),
+            active_agent: "reviewer".into(),
+            provider_id: None,
+            model_id: None,
+            reasoning_effort: None,
+            created_at: 1,
+            updated_at: 2,
+            completed_turn_count: 1,
+            resumable: true,
+        };
+        let messages = vec![
+            Message {
+                role: Role::System,
+                parts: vec![MessagePart::Text("reminder".into())],
+            },
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("question".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::Text("partial answer".into())],
+            },
+        ];
+        let mut context = SessionContext::fresh();
+        context.pending_system_reminder = Some("reminder".into());
+        let failure = HeadlessChatFailure {
+            error: CliError::runtime(agens_core::HeadlessTurnError::ProviderServer),
+            partial: Some(Box::new(PartialTurnRecord {
+                metadata: metadata.clone(),
+                messages: messages.clone(),
+            })),
+        };
+
+        assert!(complete_tui_turn(&mut context, Err(failure), true).is_err());
+        assert_eq!(context.identifier, Some(metadata.id));
+        assert_eq!(context.metadata, Some(metadata));
+        assert_eq!(context.messages, messages);
+        assert!(context.pending_system_reminder.is_none());
     }
 
     #[test]
@@ -305,7 +355,7 @@ mod tests {
         session.bypass_permissions = true;
         tui.apply_presentation(tui_session_presentation(&bootstrap, &session));
         let rendered = render_tui_test_backend(&tui, 140, 14);
-        assert!(rendered.contains("BYPASS"), "{rendered:?}");
+        assert!(rendered.contains("bypass"), "{rendered:?}");
 
         std::fs::remove_dir_all(root).unwrap();
     }
