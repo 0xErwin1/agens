@@ -1,4 +1,7 @@
-use agens_core::{AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, RequestConfig};
+use agens_core::{
+    AgentDefinition, AgentMode, Error, HeadlessTaskTerminal, RequestConfig, TaskProviderFailure,
+    TaskSkillRejection,
+};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -896,7 +899,7 @@ pub struct TaskTurnResult {
 pub enum TaskRunnerError {
     Cancelled,
     TimedOut,
-    ProviderFailure,
+    ProviderFailure(TaskProviderFailure),
     IterationLimit,
     ChildFailure,
 }
@@ -1229,8 +1232,11 @@ impl<R: TaskRunner> TaskTool<R> {
         requested: Option<&[String]>,
     ) -> Result<Vec<TaskSkill>, ToolOutput> {
         let names = requested.unwrap_or(&agent.skills);
-        if !names.iter().all(|name| agent.skills.contains(name)) {
-            return Err(task_terminal(HeadlessTaskTerminal::SkillUnavailable));
+        if let Some(undeclared) = names.iter().find(|name| !agent.skills.contains(name)) {
+            return Err(skill_unavailable_output(
+                undeclared,
+                TaskSkillRejection::Undeclared,
+            ));
         }
 
         names
@@ -1239,10 +1245,10 @@ impl<R: TaskRunner> TaskTool<R> {
                 let skill = self
                     .skills
                     .skill(name)
-                    .ok_or_else(|| task_terminal(HeadlessTaskTerminal::SkillUnavailable))?;
+                    .ok_or_else(|| skill_unavailable_output(name, TaskSkillRejection::Unknown))?;
                 let instructions = skill
                     .load_instructions()
-                    .map_err(|_| task_terminal(HeadlessTaskTerminal::SkillUnavailable))?;
+                    .map_err(|_| skill_unavailable_output(name, TaskSkillRejection::Unreadable))?;
                 Ok(TaskSkill {
                     name: skill.name().to_owned(),
                     description: skill.description().to_owned(),
@@ -1419,7 +1425,13 @@ fn task_error_output(error: TaskRunnerError) -> ToolOutput {
     match error {
         TaskRunnerError::Cancelled => task_terminal(HeadlessTaskTerminal::Cancelled),
         TaskRunnerError::TimedOut => task_terminal(HeadlessTaskTerminal::TimedOut),
-        TaskRunnerError::ProviderFailure => task_terminal(HeadlessTaskTerminal::ProviderFailure),
+        TaskRunnerError::ProviderFailure(cause) => {
+            let mut output = task_terminal(HeadlessTaskTerminal::ProviderFailure);
+            output.content.push_str(" [cause: ");
+            output.content.push_str(cause.label());
+            output.content.push(']');
+            output
+        }
         TaskRunnerError::IterationLimit => task_terminal(HeadlessTaskTerminal::IterationLimit),
         TaskRunnerError::ChildFailure => task_terminal(HeadlessTaskTerminal::ChildFailure),
     }
@@ -1443,6 +1455,21 @@ impl Drop for TaskPanicHookGuard {
 
 fn task_terminal(terminal: HeadlessTaskTerminal) -> ToolOutput {
     ToolOutput::task_terminal(terminal)
+}
+
+/// Names the rejected skill and why, so the parent can correct the call itself.
+///
+/// Both halves come from closed sets -- a catalog name and a fixed reason -- so
+/// the sanitizer guarding model-visible output can still verify the whole
+/// message without host detail ever reaching it.
+fn skill_unavailable_output(skill: &str, reason: TaskSkillRejection) -> ToolOutput {
+    let mut output = task_terminal(HeadlessTaskTerminal::SkillUnavailable);
+    output.content.push_str(" [skill: ");
+    output.content.push_str(skill);
+    output.content.push_str("; ");
+    output.content.push_str(reason.label());
+    output.content.push(']');
+    output
 }
 
 fn fallback_warning(

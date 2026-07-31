@@ -20,7 +20,7 @@ use agens_session::context::SessionContext;
 use agens_tool_runtime::child::ChildRunError;
 use agens_tool_runtime::launch_selected_task as launch_selected_tui_task;
 use agens_tool_runtime::runner::{ProductionTaskRunner, TuiTaskControls, TuiTaskLifecycleBridge};
-use agens_tools::{SkillCatalog, TaskLaunchMode, TaskRunnerError};
+use agens_tools::{SkillCatalog, TaskLaunchMode, TaskProviderFailure, TaskRunnerError};
 
 use agens_store::SessionStore;
 use agens_tools::{
@@ -43,7 +43,7 @@ fn production_task_error_mapping_reserves_provider_for_provider_failures() {
     );
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::Provider),
-        TaskRunnerError::ProviderFailure
+        TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
     );
     assert_eq!(
         map_task_turn_error(HeadlessTurnError::Tool),
@@ -410,7 +410,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
     ) in [
         (
             ChildRunError::Authentication,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Authentication),
             Some(SubagentErrorKind::Authentication),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -418,7 +418,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Context,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Context),
             Some(SubagentErrorKind::Context),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -426,7 +426,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Network,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Network),
             Some(SubagentErrorKind::Network),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -434,7 +434,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Provider,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol),
             Some(SubagentErrorKind::Provider),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -442,7 +442,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Protocol,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol),
             Some(SubagentErrorKind::Protocol),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -450,7 +450,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::RateLimited,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::RateLimited),
             Some(SubagentErrorKind::RateLimited),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -458,7 +458,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Rejected,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected),
             Some(SubagentErrorKind::Rejected),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -466,7 +466,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
         ),
         (
             ChildRunError::Server,
-            TaskRunnerError::ProviderFailure,
+            TaskRunnerError::ProviderFailure(TaskProviderFailure::Server),
             Some(SubagentErrorKind::Server),
             TuiExecutionEvent::Failed { id: 1 },
             SubagentStatus::Failure,
@@ -550,12 +550,20 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ..SessionContext::fresh()
         }));
 
-        let terminal = match expected_error {
-            TaskRunnerError::Cancelled => HeadlessTaskTerminal::Cancelled,
-            TaskRunnerError::TimedOut => HeadlessTaskTerminal::TimedOut,
-            TaskRunnerError::ProviderFailure => HeadlessTaskTerminal::ProviderFailure,
-            TaskRunnerError::IterationLimit => HeadlessTaskTerminal::IterationLimit,
-            TaskRunnerError::ChildFailure => HeadlessTaskTerminal::ChildFailure,
+        let reported = match expected_error {
+            TaskRunnerError::Cancelled => HeadlessTaskTerminal::Cancelled.message().to_owned(),
+            TaskRunnerError::TimedOut => HeadlessTaskTerminal::TimedOut.message().to_owned(),
+            TaskRunnerError::ProviderFailure(cause) => format!(
+                "{} [cause: {}]",
+                HeadlessTaskTerminal::ProviderFailure.message(),
+                cause.label()
+            ),
+            TaskRunnerError::IterationLimit => {
+                HeadlessTaskTerminal::IterationLimit.message().to_owned()
+            }
+            TaskRunnerError::ChildFailure => {
+                HeadlessTaskTerminal::ChildFailure.message().to_owned()
+            }
         };
         assert_eq!(
             launch_selected_tui_task(
@@ -566,7 +574,7 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 &HeadlessTurnCancellation::new(),
             ),
             Ok(TuiSelectedTaskLaunch::Rejected(
-                TaskLaunchOutcome::Dispatched(HeadlessToolOutput::failure(terminal.message()))
+                TaskLaunchOutcome::Dispatched(HeadlessToolOutput::failure(reported))
             ))
         );
 

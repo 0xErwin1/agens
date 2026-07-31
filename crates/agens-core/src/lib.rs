@@ -1309,6 +1309,69 @@ impl HeadlessTaskTerminal {
     }
 }
 
+/// Why a subagent's provider call ended, as the parent is allowed to read it.
+///
+/// [`HeadlessTaskTerminal::ProviderFailure`] is one closed message covering
+/// eight distinct causes -- an expired token, an oversized request, a stalled
+/// connection -- and a parent that cannot tell them apart cannot choose between
+/// retrying, shrinking the request, and giving up. The labels are fixed strings
+/// so the sanitizer that guards model-visible output can keep verifying the
+/// whole message against a closed set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskProviderFailure {
+    Authentication,
+    Context,
+    Network,
+    Protocol,
+    RateLimited,
+    Rejected,
+    Server,
+}
+
+impl TaskProviderFailure {
+    pub const ALL: [Self; 7] = [
+        Self::Authentication,
+        Self::Context,
+        Self::Network,
+        Self::Protocol,
+        Self::RateLimited,
+        Self::Rejected,
+        Self::Server,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Context => "context length",
+            Self::Network => "network",
+            Self::Protocol => "response protocol",
+            Self::RateLimited => "rate limited",
+            Self::Rejected => "request rejected",
+            Self::Server => "provider server",
+        }
+    }
+}
+
+/// Why a preloaded skill could not reach a subagent, as a fixed token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskSkillRejection {
+    Undeclared,
+    Unknown,
+    Unreadable,
+}
+
+impl TaskSkillRejection {
+    pub const ALL: [Self; 3] = [Self::Undeclared, Self::Unknown, Self::Unreadable];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Undeclared => "not declared by the agent",
+            Self::Unknown => "not in the skill catalog",
+            Self::Unreadable => "instructions could not be read",
+        }
+    }
+}
+
 impl HeadlessToolOutput {
     pub fn success(content: impl Into<String>) -> Self {
         Self {

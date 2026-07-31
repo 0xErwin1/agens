@@ -17,7 +17,8 @@ use agens_providers::{
     ProviderDiagnosticClass, ProviderDiagnosticEvent, ProviderDiagnosticScope, ProviderDiagnostics,
 };
 use agens_tools::{
-    TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget, TaskRunnerError, TaskTurnRequest,
+    TaskExecutionRegistry, TaskMessageSource, TaskMessageTarget, TaskProviderFailure,
+    TaskRunnerError, TaskTurnRequest,
 };
 
 use crate::block_on_headless_turn;
@@ -85,14 +86,17 @@ impl ChildRunError {
         match self {
             Self::Cancelled => TaskRunnerError::Cancelled,
             Self::TimedOut => TaskRunnerError::TimedOut,
-            Self::Authentication
-            | Self::Context
-            | Self::Network
-            | Self::Provider
-            | Self::Protocol
-            | Self::RateLimited
-            | Self::Rejected
-            | Self::Server => TaskRunnerError::ProviderFailure,
+            Self::Authentication => {
+                TaskRunnerError::ProviderFailure(TaskProviderFailure::Authentication)
+            }
+            Self::Context => TaskRunnerError::ProviderFailure(TaskProviderFailure::Context),
+            Self::Network => TaskRunnerError::ProviderFailure(TaskProviderFailure::Network),
+            Self::Provider | Self::Protocol => {
+                TaskRunnerError::ProviderFailure(TaskProviderFailure::Protocol)
+            }
+            Self::RateLimited => TaskRunnerError::ProviderFailure(TaskProviderFailure::RateLimited),
+            Self::Rejected => TaskRunnerError::ProviderFailure(TaskProviderFailure::Rejected),
+            Self::Server => TaskRunnerError::ProviderFailure(TaskProviderFailure::Server),
             Self::Tool | Self::Runtime => TaskRunnerError::ChildFailure,
             Self::IterationLimit => TaskRunnerError::IterationLimit,
         }

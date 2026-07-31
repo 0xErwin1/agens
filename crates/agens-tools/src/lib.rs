@@ -38,6 +38,7 @@ mod mcp_status;
 mod stdio_mcp;
 mod task;
 
+pub use agens_core::{TaskProviderFailure, TaskSkillRejection};
 pub use agents::{
     AgentCatalog, AgentDiagnostic, AgentDiscovery, AgentModelValidationError, AgentModelValidator,
     AgentShadow,

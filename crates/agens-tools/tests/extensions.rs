@@ -593,7 +593,9 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
             serde_json::json!({"agent":"zmissing","description":"do not run"}),
         )
         .unwrap(),
-        ToolOutput::failure("task: requested skill is unavailable")
+        ToolOutput::failure(
+            "task: requested skill is unavailable [skill: absent; not in the skill catalog]"
+        )
     );
     assert_eq!(
         task.execute(
@@ -625,7 +627,9 @@ fn task_dispatch_resolves_only_subagents_and_validated_requested_configuration()
             serde_json::json!({"agent":"worker","skills":["unavailable"],"description":"reject skill"}),
         )
         .unwrap(),
-        ToolOutput::failure("task: requested skill is unavailable")
+        ToolOutput::failure(
+            "task: requested skill is unavailable [skill: unavailable; not declared by the agent]"
+        )
     );
     assert!(
         TaskInvocation::from_value(serde_json::json!({"description":"x","unexpected":true}))
@@ -919,11 +923,11 @@ fn task_dispatcher_preserves_late_validation_errors_without_running_the_child() 
         ),
         (
             serde_json::json!({"agent":"worker","skills":["unavailable"],"description":"reject disallowed skill"}),
-            "task: requested skill is unavailable",
+            "task: requested skill is unavailable [skill: unavailable; not declared by the agent]",
         ),
         (
             serde_json::json!({"agent":"missing","description":"reject missing skill"}),
-            "task: requested skill is unavailable",
+            "task: requested skill is unavailable [skill: absent; not in the skill catalog]",
         ),
     ] {
         let ToolEvaluationOutcome::Authorized(handle) = dispatcher
@@ -1040,7 +1044,7 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
         ),
         (
             TerminalTaskRunner::Provider,
-            "task: provider failure",
+            "task: provider failure [cause: response protocol]",
             HeadlessTaskTerminal::ProviderFailure,
         ),
         (
@@ -1056,7 +1060,7 @@ fn task_reports_exact_terminal_taxonomy_without_runner_details() {
     ] {
         let mut task = task_tool(runner);
         let output = task.execute(&task_context(), task_arguments()).unwrap();
-        assert_eq!(output, ToolOutput::task_terminal(terminal));
+        assert!(output.is_error);
         assert_eq!(output.content, expected);
         assert_eq!(output.terminal(), Some(terminal));
         assert!(!output.content.contains("secret panic payload"));
@@ -1973,7 +1977,9 @@ impl TaskRunner for TerminalTaskRunner {
                 output: "ignored".into(),
                 iterations: 33,
             }),
-            Self::Provider => Err(TaskRunnerError::ProviderFailure),
+            Self::Provider => Err(TaskRunnerError::ProviderFailure(
+                agens_tools::TaskProviderFailure::Protocol,
+            )),
             Self::Child => Err(TaskRunnerError::ChildFailure),
             Self::Panic => panic!("secret panic payload"),
         }

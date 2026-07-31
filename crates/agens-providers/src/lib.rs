@@ -1865,13 +1865,51 @@ fn model_visible_tool_output(content: &str, is_error: bool) -> String {
         content == terminal.message()
             || content
                 .strip_prefix(terminal.message())
-                .is_some_and(is_safe_diagnostic_reference_suffix)
+                .is_some_and(is_safe_terminal_detail)
     });
     if safe_terminal {
         bounded_tool_output(content)
     } else {
         "Tool execution failed".to_owned()
     }
+}
+
+/// Whether the detail trailing a terminal message is one the model may read.
+///
+/// A terminal message is a closed string, and so is everything allowed to
+/// follow it: a diagnostic reference, a provider failure cause, or a rejected
+/// skill. Anything else is host detail that has not been proven safe, so the
+/// caller replaces the whole output rather than trusting the suffix.
+fn is_safe_terminal_detail(suffix: &str) -> bool {
+    is_safe_diagnostic_reference_suffix(suffix)
+        || is_safe_provider_cause_suffix(suffix)
+        || is_safe_skill_rejection_suffix(suffix)
+}
+
+fn is_safe_provider_cause_suffix(suffix: &str) -> bool {
+    bracketed_detail(suffix, " [cause: ").is_some_and(|cause| {
+        agens_core::TaskProviderFailure::ALL
+            .iter()
+            .any(|failure| failure.label() == cause)
+    })
+}
+
+fn is_safe_skill_rejection_suffix(suffix: &str) -> bool {
+    let Some(detail) = bracketed_detail(suffix, " [skill: ") else {
+        return false;
+    };
+    let Some((skill, reason)) = detail.split_once("; ") else {
+        return false;
+    };
+
+    agens_core::is_catalog_name(skill)
+        && agens_core::TaskSkillRejection::ALL
+            .iter()
+            .any(|rejection| rejection.label() == reason)
+}
+
+fn bracketed_detail<'a>(suffix: &'a str, prefix: &str) -> Option<&'a str> {
+    suffix.strip_prefix(prefix)?.strip_suffix(']')
 }
 
 fn is_safe_diagnostic_reference_suffix(suffix: &str) -> bool {
@@ -3422,6 +3460,28 @@ mod tests {
             model_visible_tool_output("bash: SENTINEL_SECRET", true),
             "Tool execution failed"
         );
+    }
+
+    #[test]
+    fn terminal_detail_reaches_the_model_only_from_its_closed_sets() {
+        for content in [
+            "task: provider failure [cause: rate limited]",
+            "task: requested skill is unavailable [skill: sdd-explore; not declared by the agent]",
+        ] {
+            assert_eq!(model_visible_tool_output(content, true), content);
+        }
+
+        for forged in [
+            "task: provider failure [cause: /etc/passwd]",
+            "task: requested skill is unavailable [skill: sdd-explore; /home/user/notes.md]",
+            "task: requested skill is unavailable [skill: /home/user; not in the skill catalog]",
+        ] {
+            assert_eq!(
+                model_visible_tool_output(forged, true),
+                "Tool execution failed",
+                "{forged} must not reach the model"
+            );
+        }
     }
 
     #[test]
