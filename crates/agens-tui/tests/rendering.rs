@@ -169,7 +169,7 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
         RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.handle(Event::Resize { width, height });
-    tui.handle(Event::Key(Key::CtrlC));
+    tui.add_info("notice-sentinel");
     start_execution(&mut tui, 9, "explore");
 
     renderer.render(tui.view()).unwrap();
@@ -203,7 +203,7 @@ fn bottom_chrome_bands_share_one_gutter_and_the_composer_keeps_both_edges_free()
         "the subagent tree starts at the shared gutter"
     );
     assert_eq!(
-        rendered_column(&renderer, "Press Ctrl+C again to exit"),
+        rendered_column(&renderer, "notice-sentinel"),
         usize::from(CHROME_GUTTER + 1),
         "the notice starts at the shared gutter plus its own leading space"
     );
@@ -3088,18 +3088,15 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
 }
 
 #[test]
-fn armed_quit_warning_is_visible_with_exact_copy() {
+fn control_c_exits_without_rendering_a_confirmation_notice() {
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
-    assert_eq!(
-        tui.handle(Event::Key(Key::CtrlC)),
-        agens_tui::Action::Render
-    );
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), agens_tui::Action::Quit);
     renderer.render(tui.view()).unwrap();
 
-    assert!(rendered_text(&renderer).contains("Press Ctrl+C again to exit"));
+    assert!(!rendered_text(&renderer).contains("Press Ctrl+C again to exit"));
 }
 
 #[test]
@@ -3811,12 +3808,9 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
 
 #[test]
 fn conversation_owns_the_first_row_under_every_notice_condition() {
-    type ArmNotice = fn(&mut Tui<FakeEngine>);
+    type ShowNotice = fn(&mut Tui<FakeEngine>);
 
-    let notices: [(&str, ArmNotice); 4] = [
-        ("Press Ctrl+C again to exit", |tui| {
-            tui.handle(Event::Key(Key::CtrlC));
-        }),
+    let notices: [(&str, ShowNotice); 3] = [
         ("Recovered failed prompt", |tui| {
             tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
                 message: "Recovered failed prompt.".into(),
@@ -3832,14 +3826,14 @@ fn conversation_owns_the_first_row_under_every_notice_condition() {
         ("status-sentinel", |tui| tui.add_info("status-sentinel")),
     ];
 
-    for (needle, arm) in notices {
+    for (needle, show) in notices {
         let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 30)).unwrap());
         let mut tui = Tui::new(FakeEngine);
         tui.handle(Event::Resize {
             width: 80,
             height: 30,
         });
-        arm(&mut tui);
+        show(&mut tui);
 
         renderer.render(tui.view()).unwrap();
 
@@ -3877,7 +3871,7 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
         rendered_line(&renderer, 0)
     );
 
-    tui.handle(Event::Key(Key::CtrlC));
+    tui.add_info("notice-sentinel");
     start_execution(&mut tui, 9, "explore");
     start_execution(&mut tui, 10, "plan");
     renderer.render(tui.view()).unwrap();
@@ -3887,7 +3881,7 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
         (idle_top, idle_bottom),
         "notices and the subagent tree must not move the composer"
     );
-    let notice_row = rendered_row(&renderer, "Press Ctrl+C again to exit") as u16;
+    let notice_row = rendered_row(&renderer, "notice-sentinel") as u16;
     let tree_row = rendered_row(&renderer, "Tab focus") as u16;
     let footer_row = rendered_row(&renderer, "model —") as u16;
     assert_eq!(
@@ -3972,7 +3966,7 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
         "the metadata keeps the composer's bottom border"
     );
 
-    tui.handle(Event::Key(Key::CtrlC));
+    tui.add_info("notice-sentinel");
     renderer.render(tui.view()).unwrap();
 
     assert_eq!(
@@ -3981,7 +3975,7 @@ fn bottom_chrome_flushes_the_subagent_tree_under_the_composer() {
         "showing a notice must not move the composer"
     );
     assert_eq!(
-        rendered_row(&renderer, "Press Ctrl+C again to exit") as u16,
+        rendered_row(&renderer, "notice-sentinel") as u16,
         bottom + 1,
         "an active notice owns the row under the composer"
     );
@@ -4216,7 +4210,7 @@ fn bottom_chrome_degrades_without_panicking_on_small_terminals() {
             RatatuiRenderer::new(Terminal::new(TestBackend::new(width, height)).unwrap());
         let mut tui = Tui::new(FakeEngine);
         tui.handle(Event::Resize { width, height });
-        tui.handle(Event::Key(Key::CtrlC));
+        tui.add_info("notice-sentinel");
         start_execution(&mut tui, 9, "explore");
 
         renderer.render(tui.view()).unwrap();

@@ -1347,7 +1347,7 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 
     assert_eq!(
         app.reduce(AppEvent::Key(Key::CtrlC, Instant::now())),
-        vec![Effect::ExitWarning]
+        vec![Effect::CancelTurn, Effect::Quit]
     );
     assert_eq!(app.dialog(), Some(&Dialog::Command));
 
@@ -1360,106 +1360,23 @@ fn command_connected_key_dispatch_prioritizes_dialog_global_and_composer_editing
 }
 
 #[test]
-fn command_control_c_arms_in_every_state_then_cancels_and_quits() {
+fn command_control_c_cancels_if_needed_and_quits_immediately() {
     let now = Instant::now();
 
-    let mut app = AppState::new(1);
-    app.reduce(AppEvent::SubmitPrompt("running".into()));
+    let mut running = AppState::new(1);
+    running.reduce(AppEvent::SubmitPrompt("running".into()));
     assert_eq!(
-        app.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    assert_eq!(
-        app.reduce(AppEvent::Command(
-            Command::ControlC,
-            now + Duration::from_secs(1)
-        )),
+        running.reduce(AppEvent::Command(Command::ControlC, now)),
         vec![Effect::CancelTurn, Effect::Quit]
     );
 
-    let mut composer = AppState::new(1);
-    composer.set_composer("draft");
+    let mut idle = AppState::new(1);
+    idle.set_composer("draft");
     assert_eq!(
-        composer.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    assert_eq!(composer.composer(), "draft");
-    assert_eq!(
-        composer.reduce(AppEvent::Command(Command::Navigate, now)),
-        vec![Effect::Render]
-    );
-    assert_eq!(
-        composer.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    assert_eq!(
-        composer.reduce(AppEvent::Command(
-            Command::ControlC,
-            now + Duration::from_secs(1)
-        )),
+        idle.reduce(AppEvent::Command(Command::ControlC, now)),
         vec![Effect::Quit]
     );
-
-    let mut timeout = AppState::new(1);
-    assert_eq!(
-        timeout.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    assert_eq!(
-        timeout.reduce(AppEvent::TimerTick(now + Duration::from_secs(2))),
-        vec![Effect::Render]
-    );
-    assert_eq!(
-        timeout.reduce(AppEvent::Command(
-            Command::ControlC,
-            now + Duration::from_secs(2)
-        )),
-        vec![Effect::ExitWarning]
-    );
-}
-
-#[test]
-fn exit_warning_is_disarmed_by_composer_edits_and_all_runtime_terminal_events() {
-    let now = Instant::now();
-
-    let mut composer = AppState::new(1);
-    assert_eq!(
-        composer.reduce(AppEvent::Command(Command::ControlC, now)),
-        vec![Effect::ExitWarning]
-    );
-    composer.set_composer("");
-    assert_eq!(
-        composer.reduce(AppEvent::Command(
-            Command::ControlC,
-            now + Duration::from_secs(1)
-        )),
-        vec![Effect::ExitWarning]
-    );
-
-    for terminal_event in [
-        AppEvent::TurnCompleted("answer".into()),
-        AppEvent::TurnCancelled,
-        AppEvent::TurnFailed,
-    ] {
-        let mut app = AppState::new(1);
-        assert_eq!(
-            app.reduce(AppEvent::Command(Command::ControlC, now)),
-            vec![Effect::ExitWarning]
-        );
-        assert_eq!(
-            app.reduce(AppEvent::SubmitPrompt("running".into())),
-            vec![Effect::StartPrompt("running".into())]
-        );
-        app.reduce(terminal_event);
-
-        assert_eq!(
-            app.reduce(AppEvent::Command(
-                Command::ControlC,
-                now + Duration::from_secs(1)
-            )),
-            vec![Effect::ExitWarning]
-        );
-    }
+    assert_eq!(idle.composer(), "draft");
 }
 
 #[test]
@@ -1720,9 +1637,8 @@ fn slash_palette_uses_only_the_name_prefix_and_escape_preserves_composer_and_bac
     assert!(tui.view().palette.is_none());
     assert_eq!(tui.engine().cancellations, 0);
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.input(), "/res 42");
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    assert_eq!(tui.input(), "/res 42");
 }
 
 #[test]
@@ -2292,11 +2208,9 @@ fn selection_dialog_escape_and_control_c_preserve_distinct_cancel_and_exit_paths
         None::<String>,
         vec![DialogEntry::action("Proceed", "proceed")],
     ));
-    assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert!(control_c.view().dialog.is_some());
-    assert!(control_c.view().quit_armed);
-    assert_eq!(control_c.engine().cancellations, 0);
     assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    assert!(control_c.view().dialog.is_some());
+    assert_eq!(control_c.engine().cancellations, 0);
 
     for entries in [
         Vec::new(),
@@ -2396,8 +2310,6 @@ fn tui_submission_outcome_local_auth_progress_is_transient_and_cancellable() {
     assert!(text.contains("https://auth.example/device"));
     assert!(text.contains("ABCD-EFGH"));
     assert!(tui.transcript().is_empty());
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
 
@@ -2522,8 +2434,6 @@ fn second_submission_is_rejected_while_a_turn_owns_cancellation() {
             agens_tui::TranscriptEntry::Info("A response is already in progress.".into()),
         ]
     );
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.engine().cancellations, 0);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
 }
@@ -2543,32 +2453,21 @@ fn resize_updates_the_render_state() {
 }
 
 #[test]
-fn control_c_arms_before_cancelling_and_quitting_a_running_turn() {
+fn control_c_cancels_and_quits_a_running_turn_immediately() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.set_running(true);
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert!(tui.view().quit_armed);
-    assert_eq!(tui.engine().cancellations, 0);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
 }
 
 #[test]
-fn control_c_timeout_and_normal_keys_disarm_without_clearing_input() {
+fn control_c_exits_without_clearing_composer_input() {
     let mut tui = Tui::new(FakeEngine::default());
     tui.handle(Event::Key(Key::Char('x')));
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.input(), "x");
-    tui.tick(Duration::from_secs(2));
-    assert!(!tui.view().quit_armed);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
-    assert_eq!(tui.handle(Event::Key(Key::Char('y'))), Action::Render);
-    assert!(!tui.view().quit_armed);
-    assert_eq!(tui.input(), "xy");
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
     assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
+    assert_eq!(tui.input(), "x");
 }
 
 #[test]
@@ -2578,11 +2477,10 @@ fn escape_cancels_running_without_arming_quit() {
 
     assert_eq!(tui.handle(Event::Key(Key::Escape)), Action::Cancel);
     assert_eq!(tui.engine().cancellations, 1);
-    assert!(!tui.view().quit_armed);
 }
 
 #[test]
-fn permission_first_control_c_keeps_pending_and_second_closes_fail_closed() {
+fn permission_control_c_exits_and_runtime_cleanup_can_fail_closed() {
     let (bridge, requests) = TuiPermissionBridge::channel();
     let worker_bridge = bridge.clone();
     let worker = thread::spawn(move || {
@@ -2604,11 +2502,9 @@ fn permission_first_control_c_keeps_pending_and_second_closes_fail_closed() {
         )],
     ));
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert!(bridge.is_pending(request.id()));
     assert!(tui.view().dialog.is_some());
-    assert_eq!(tui.engine().cancellations, 0);
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     assert_eq!(tui.engine().cancellations, 1);
     assert!(bridge.close());
     assert_eq!(worker.join().unwrap(), TuiPermissionReply::Cancelled);
