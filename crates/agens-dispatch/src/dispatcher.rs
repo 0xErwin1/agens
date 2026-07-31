@@ -190,6 +190,17 @@ mod tests {
             headless_execution_result(Err(agens_core::Error::Cancelled)),
             Err(HeadlessTurnPortError::Cancelled)
         );
+        for error in [
+            agens_core::Error::Tool("mcp operation timed out ".into()),
+            agens_core::Error::Tool("other tool failure".into()),
+            agens_core::Error::Extension("mcp tool infrastructure failure!".into()),
+            agens_core::Error::Extension("other extension failure".into()),
+        ] {
+            assert_eq!(
+                headless_execution_result(Err(error)),
+                Err(HeadlessTurnPortError::Tool)
+            );
+        }
     }
 
     #[test]

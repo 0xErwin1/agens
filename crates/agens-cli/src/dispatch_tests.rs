@@ -6,6 +6,8 @@
 #![cfg(test)]
 
 use std::collections::BTreeMap;
+use std::future::ready;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agens_core::{HeadlessTurnError, HeadlessTurnPortError};
@@ -18,18 +20,21 @@ use agens_tool_runtime::{
 
 use agens_config::ToolLimitSettings;
 use agens_core::{
-    HeadlessToolCall, HeadlessToolDispatcher, HeadlessToolOutput, MessagePart, PermissionDecision,
-    PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession,
-    SubmitOrigin, ToolAccess, TurnEvent,
+    DiscardCompletedTurnRepository, HeadlessPermissionResolver, HeadlessToolCall,
+    HeadlessToolDispatcher, HeadlessToolOutput, HeadlessTurnCancellation, MessagePart,
+    PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy, PermissionRule,
+    PermissionSession, SubmitOrigin, ToolAccess, TurnEvent, TurnProvider,
 };
 use agens_store::PermissionGrantStore;
-use agens_tools::{DispatchTool, SkillCatalog, ToolDispatcher, ToolExecutionContext, ToolOutput};
+use agens_tools::{
+    DispatchTool, RemoteToolAccess, RemoteToolMetadata, SkillCatalog, ToolDispatcher,
+    ToolExecutionContext, ToolOutput,
+};
 use agens_tui::{
     BridgeTx, TuiExecutionEvent, TuiPermissionReply, TuiProviderOutcome, TuiRuntimeEvent,
     TuiSubagentEvent,
 };
 
-use super::*;
 use crate::CliError;
 use agens_agents::ensure_active_agent_runtime;
 use agens_agents::select_subagent;
@@ -781,6 +786,135 @@ fn production_dispatcher_preserves_safe_native_failure_reason() {
         sanitized_native_tool_failure("glob: path is outside project root"),
         "glob: path validation failed"
     );
+}
+
+/// A per-tool MCP timeout must not terminate the parent turn: the model needs the failed result
+/// so it can continue or explain the failure.
+#[test]
+fn an_mcp_timeout_reaches_the_next_provider_iteration_as_a_tool_result() {
+    struct TimeoutTool;
+
+    impl DispatchTool for TimeoutTool {
+        fn permission_target(
+            &self,
+            _arguments: &serde_json::Value,
+        ) -> Result<String, agens_core::Error> {
+            Ok("memory".into())
+        }
+
+        fn execute(
+            &mut self,
+            _context: &ToolExecutionContext,
+            _arguments: serde_json::Value,
+        ) -> Result<ToolOutput, agens_core::Error> {
+            Err(agens_core::Error::Tool("mcp operation timed out".into()))
+        }
+    }
+
+    struct RecoveringProvider {
+        iteration: usize,
+        saw_timeout: Arc<AtomicBool>,
+    }
+
+    impl TurnProvider for RecoveringProvider {
+        fn next_parts(
+            &mut self,
+            events: &[TurnEvent],
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl std::future::Future<Output = Result<Vec<MessagePart>, HeadlessTurnPortError>> + Send
+        {
+            let parts = if self.iteration == 0 {
+                vec![MessagePart::ToolCall {
+                    id: "memory".into(),
+                    name: "engram_mem_save".into(),
+                    input: r#"{"target":"memory"}"#.into(),
+                }]
+            } else {
+                self.saw_timeout.store(
+                    events.iter().any(|event| {
+                        matches!(
+                            event,
+                            TurnEvent::ToolResult(MessagePart::ToolResult {
+                                content,
+                                is_error: true,
+                                ..
+                            }) if content == "tool operation timed out"
+                        )
+                    }),
+                    Ordering::SeqCst,
+                );
+                vec![MessagePart::Text("recovered".into())]
+            };
+            self.iteration += 1;
+            ready(Ok(parts))
+        }
+    }
+
+    struct DenyingResolver;
+
+    impl HeadlessPermissionResolver for DenyingResolver {
+        fn resolve(
+            &mut self,
+            _call: &HeadlessToolCall,
+            _cancellation: &HeadlessTurnCancellation,
+        ) -> impl std::future::Future<Output = Result<PermissionDecision, HeadlessTurnPortError>> + Send
+        {
+            ready(Ok(PermissionDecision::Deny))
+        }
+    }
+
+    let shared = Arc::new(Mutex::new(ToolDispatcher::new()));
+    shared
+        .lock()
+        .unwrap()
+        .register_mcp(
+            &RemoteToolMetadata {
+                qualified_name: "engram::mem_save".into(),
+                server_name: "engram".into(),
+                tool_name: "mem_save".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                access: RemoteToolAccess::Write,
+            },
+            TimeoutTool,
+        )
+        .unwrap();
+    let allowed = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut gate = ProductionPermissionGate::new(
+        PermissionPolicy::new(
+            PermissionMode::Edit,
+            vec![PermissionRule::global(
+                PermissionDecision::Allow,
+                PermissionPattern::Any,
+                PermissionPattern::Any,
+            )],
+        ),
+        Arc::new(Mutex::new(Vec::new())),
+        PermissionSession::new(),
+        "project".into(),
+        Arc::clone(&shared),
+        Arc::clone(&allowed),
+        Arc::new(Mutex::new(BTreeMap::new())),
+    );
+    let mut dispatcher = ProductionToolDispatcher::new(shared, allowed);
+    let saw_timeout = Arc::new(AtomicBool::new(false));
+    let mut provider = RecoveringProvider {
+        iteration: 0,
+        saw_timeout: Arc::clone(&saw_timeout),
+    };
+
+    let result = agens_tool_runtime::block_on_headless_turn(agens_core::run_headless_turn(
+        &mut provider,
+        &mut gate,
+        &mut DenyingResolver,
+        &mut dispatcher,
+        &mut DiscardCompletedTurnRepository,
+        &HeadlessTurnCancellation::new(),
+    ))
+    .unwrap();
+
+    assert!(result.is_ok());
+    assert!(saw_timeout.load(Ordering::SeqCst));
 }
 
 /// A missing or unreadable file is the most common native failure, and the model can only stop
