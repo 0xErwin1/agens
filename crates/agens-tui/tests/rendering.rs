@@ -593,6 +593,65 @@ fn multiline_wrapped_user_message_uses_one_accented_identity() {
 }
 
 #[test]
+fn user_turns_have_a_blue_rail_and_extra_separation_from_agent_output() {
+    let terminal = Terminal::new(TestBackend::new(72, 30)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("USER_FIRST_SENTINEL");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "AGENT_FIRST_SENTINEL\n\nAGENT_SECOND_SENTINEL".into(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    tui.begin_submission("USER_SECOND_SENTINEL\nUSER_CONTINUATION_SENTINEL");
+    renderer.render(tui.view()).unwrap();
+
+    let first_user_row = rendered_row(&renderer, "USER_FIRST_SENTINEL");
+    let first_agent_row = rendered_row(&renderer, "AGENT_FIRST_SENTINEL");
+    let second_agent_row = rendered_row(&renderer, "AGENT_SECOND_SENTINEL");
+    let second_user_row = rendered_row(&renderer, "USER_SECOND_SENTINEL");
+    let continuation_row = rendered_row(&renderer, "USER_CONTINUATION_SENTINEL");
+    let buffer = renderer.terminal().backend().buffer();
+
+    for row in [first_user_row, second_user_row, continuation_row] {
+        assert_eq!(buffer[(ACCENT_COLUMN as u16, row as u16)].symbol(), "┃");
+        assert_eq!(
+            buffer[(ACCENT_COLUMN as u16, row as u16)].fg,
+            Color::Rgb(0x73, 0xd0, 0xff)
+        );
+    }
+    assert_eq!(
+        buffer[(BULLET_COLUMN as u16, first_user_row as u16)].symbol(),
+        "❯"
+    );
+    assert_eq!(
+        buffer[(BULLET_COLUMN as u16, second_user_row as u16)].symbol(),
+        "❯"
+    );
+    assert_eq!(
+        buffer[(BULLET_COLUMN as u16, first_agent_row as u16)].symbol(),
+        "●"
+    );
+    assert_eq!(
+        buffer[(ACCENT_COLUMN as u16, first_agent_row as u16)].symbol(),
+        " "
+    );
+    assert_eq!(
+        buffer[(ACCENT_COLUMN as u16, second_agent_row as u16)].symbol(),
+        " "
+    );
+    assert_eq!(
+        buffer[(BULLET_COLUMN as u16, first_agent_row as u16)].fg,
+        Color::Rgb(0x95, 0xe6, 0xcb)
+    );
+    assert_eq!(
+        second_user_row,
+        second_agent_row + 3,
+        "a new user turn keeps two blank rows above it"
+    );
+}
+
+#[test]
 fn live_assistant_content_uses_the_user_body_column_at_normal_width() {
     assert_conversation_content_column(56, false);
 }
@@ -1129,7 +1188,7 @@ fn every_transcript_row_sits_on_the_shared_gutter() {
             continue;
         };
         assert!(
-            column == BULLET_COLUMN || column == CONTENT_COLUMN,
+            [ACCENT_COLUMN, BULLET_COLUMN, CONTENT_COLUMN].contains(&column),
             "row {row:?} starts at column {column}, outside the shared gutter"
         );
     }
@@ -1303,13 +1362,15 @@ fn a_running_row_carries_an_accent_bar_left_of_its_bullet_without_shifting_conte
     );
     assert_eq!(rendered_column(&renderer, "◆"), BULLET_COLUMN);
     assert_eq!(rendered_column(&renderer, "$ cargo check"), CONTENT_COLUMN);
+    let bar_row = rendered_row(&renderer, "$ cargo check");
+    let initial_bar_color =
+        renderer.terminal().backend().buffer()[(ACCENT_COLUMN as u16, bar_row as u16)].fg;
     assert_eq!(
-        cell_for_text(&renderer, "┃").fg,
-        Color::Rgb(0x73, 0xd0, 0xff),
-        "a running bar opens on the full active accent: {first:?}"
+        initial_bar_color,
+        Color::Rgb(0x60, 0xae, 0xd6),
+        "the running row starts at its own wave phase: {first:?}"
     );
 
-    let bar_row = rendered_row(&renderer, "┃");
     let shape = rendered_line(&renderer, bar_row);
     tui.tick(Duration::from_millis(240));
     renderer.render(tui.view()).unwrap();
@@ -1319,8 +1380,8 @@ fn a_running_row_carries_an_accent_bar_left_of_its_bullet_without_shifting_conte
         "the row keeps one shape across ticks; only the accent colour moves"
     );
     assert_ne!(
-        cell_for_text(&renderer, "┃").fg,
-        Color::Rgb(0x73, 0xd0, 0xff),
+        renderer.terminal().backend().buffer()[(ACCENT_COLUMN as u16, bar_row as u16)].fg,
+        initial_bar_color,
         "the running bar breathes with the shared tick clock"
     );
 }
@@ -1352,8 +1413,8 @@ fn finished_read_rows_drop_the_accent_bar_while_a_folded_group_dims_it() {
     let read_row = rendered_row(&renderer, "Read Cargo.toml");
     let read_line = rendered_line(&renderer, read_row);
     assert!(
-        !settled.contains('┃') && !settled.contains('❙'),
-        "a plain finished read carries no accent bar: {settled:?}"
+        !settled.contains('❙'),
+        "a plain finished read never gains a collapsed accent: {settled:?}"
     );
     assert_eq!(
         read_line.chars().nth(ACCENT_COLUMN),
@@ -1757,13 +1818,13 @@ fn paragraph_to_fence_has_one_blank_transition_row() {
 
 #[test]
 fn renderer_renders_practical_markdown_semantics() {
-    let terminal = Terminal::new(TestBackend::new(72, 50)).unwrap();
+    let terminal = Terminal::new(TestBackend::new(72, 60)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
     tui.begin_submission("request");
     tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
-        "# Result\n\n## Section Two\n\n#### Detail Four\n\nUse **STRONGTOKEN** and *EMPHASISTOKEN* with `INLINE_TOKEN`.\n\n```rust\nfn example() {}\n```\n\n- first item\n- second item\n- [x] checked item\n- [ ] unchecked item\n\n> quoted text\n\n[LINKTOKEN](https://example.com/docs)"
+        "# Result\n\n## Section Two\n\n#### Detail Four\n\nUse **STRONGTOKEN** and *EMPHASISTOKEN* with `INLINE_TOKEN`.\n\n```rust\nfn example() {}\n```\n\n- first item\n- second item\n- [x] checked item\n- [ ] unchecked item\n\n> quoted text\n\n| Name | State |\n| --- | --- |\n| alpha | ready |\n| beta | blocked |\n\n[LINKTOKEN](https://example.com/docs)"
             .into(),
     )));
 
@@ -1792,6 +1853,9 @@ fn renderer_renders_practical_markdown_semantics() {
         "quoted text",
         "LINKTOKEN",
         "https://example.com/docs",
+        "│ Name │ State │",
+        "│ alpha │ ready │",
+        "│ beta │ blocked │",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
@@ -1840,8 +1904,8 @@ fn renderer_renders_practical_markdown_semantics() {
     assert_eq!(cell_for_text(&renderer, "•").fg, navigation);
     assert_eq!(cell_for_text(&renderer, "[x]").fg, success);
     assert_eq!(cell_for_text(&renderer, "[ ]").fg, navigation);
-    assert_eq!(cell_for_text(&renderer, "▌").fg, markdown_heading);
-    assert_eq!(cell_for_text(&renderer, "›").fg, navigation);
+    assert_eq!(cell_for_text(&renderer, "◇").fg, markdown_heading);
+    assert_eq!(cell_for_text(&renderer, "▫").fg, navigation);
     assert!(
         cell_for_text(&renderer, "Section Two")
             .modifier
@@ -1860,6 +1924,27 @@ fn renderer_renders_practical_markdown_semantics() {
         markdown_heading,
         "quotes carry a distinct semantic rail"
     );
+}
+
+#[test]
+fn markdown_lists_are_compact_with_one_blank_row_between_blocks() {
+    let terminal = Terminal::new(TestBackend::new(72, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "Before.\n\n- FIRST_ITEM\n- SECOND_ITEM\n\nAfter.".into(),
+    )));
+    renderer.render(tui.view()).unwrap();
+
+    let before = rendered_row(&renderer, "Before.");
+    let first = rendered_row(&renderer, "FIRST_ITEM");
+    let second = rendered_row(&renderer, "SECOND_ITEM");
+    let after = rendered_row(&renderer, "After.");
+    assert_eq!(first, before + 2);
+    assert_eq!(second, first + 1);
+    assert_eq!(after, second + 2);
 }
 
 #[test]
@@ -2193,7 +2278,8 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
 
     // While the next turn is streaming, Ctrl+O targets tools (thinking is live).
     tui.handle(Event::Key(Key::CtrlO));
-    let mut expanded = String::new();
+    renderer.render(tui.view()).unwrap();
+    let mut expanded = rendered_text(&renderer);
     for _ in 0..30 {
         tui.handle(Event::Key(Key::PageDown));
         renderer.render(tui.view()).unwrap();
@@ -3893,7 +3979,6 @@ fn reserved_bottom_chrome_parks_the_composer_and_keeps_it_stable() {
         "bottom chrome order below the composer is notice then tree: {notice_row} {tree_row}"
     );
 
-    tui.handle(Event::Key(Key::CtrlC));
     tui.handle(Event::Key(Key::Escape));
     renderer.render(tui.view()).unwrap();
     assert_eq!(

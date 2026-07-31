@@ -80,6 +80,11 @@ impl RolePalette {
         rgb(0x73, 0xd0, 0xff)
     }
 
+    /// Assistant message identity marker and rail.
+    pub(crate) const fn assistant_identity() -> Color {
+        Self::brand()
+    }
+
     /// Markdown heading accent.
     pub(crate) const fn markdown_heading() -> Color {
         Self::brand()
@@ -113,6 +118,7 @@ mod tests {
         assert_eq!(RolePalette::error(), rgb(0xf0, 0x71, 0x78));
         assert_eq!(RolePalette::brand(), rgb(0x95, 0xe6, 0xcb));
         assert_eq!(RolePalette::navigation(), RolePalette::accent_active());
+        assert_eq!(RolePalette::assistant_identity(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_heading(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_quote(), RolePalette::brand());
         assert_eq!(RolePalette::markdown_strong(), RolePalette::selection_fg());

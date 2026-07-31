@@ -2750,28 +2750,32 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
 fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
     let mut transcript = chrome_rows(transcript_provenance(state));
     let thinking_streaming = state.running;
-    transcript.extend(
-        state
-            .completed_conversations
-            .iter()
-            .flat_map(|conversation| {
-                render::conversation_lines(
-                    conversation,
-                    &[],
-                    state.tool_display_modes,
-                    row_width,
-                    render::ConversationRenderState {
-                        collapse_thinking: state.collapse_thinking,
-                        thinking_streaming: false,
-                        assistant_streaming: !state.highlight_restored_syntax,
-                        now: state.now,
-                    },
-                )
-            })
-            .collect::<Vec<_>>(),
-    );
+    let mut turn_lines = Vec::new();
+    let mut append_turn = |lines: Vec<Line<'static>>| {
+        if lines.is_empty() {
+            return;
+        }
+        if !turn_lines.is_empty() {
+            turn_lines.extend([Line::default(), Line::default()]);
+        }
+        turn_lines.extend(lines);
+    };
+    for conversation in state.completed_conversations {
+        append_turn(render::conversation_lines(
+            conversation,
+            &[],
+            state.tool_display_modes,
+            row_width,
+            render::ConversationRenderState {
+                collapse_thinking: state.collapse_thinking,
+                thinking_streaming: false,
+                assistant_streaming: !state.highlight_restored_syntax,
+                now: state.now,
+            },
+        ));
+    }
     if let Some(conversation) = state.conversation {
-        transcript.extend(render::conversation_lines(
+        append_turn(render::conversation_lines(
             conversation,
             state.runtime_events,
             state.tool_display_modes,
@@ -2784,6 +2788,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
             },
         ));
     }
+    transcript.extend(turn_lines);
     let conversation_is_authoritative =
         !state.completed_conversations.is_empty() || state.conversation.is_some();
     if !conversation_is_authoritative {
@@ -6328,12 +6333,11 @@ where
         let mut user_offsets = Vec::new();
         let mut row = 0usize;
         for line in &lines {
-            let text: String = line
+            if line
                 .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect();
-            if text.trim_start().starts_with('❯') {
+                .get(1)
+                .is_some_and(|span| span.content.starts_with('❯'))
+            {
                 user_offsets.push(saturating_u16(row));
             }
             row += line.width().div_ceil(usize::from(row_width)).max(1);

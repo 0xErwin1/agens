@@ -218,18 +218,11 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             RenderedBlock::plain(label_lines("INFO", RolePalette::muted(), text))
         }
         ConversationItem::User(text) => user_block(text),
-        ConversationItem::Assistant(text) => {
-            let mut lines = Vec::new();
-            markdown_lines_with_syntax(
-                &mut lines,
-                text,
-                Style::default().fg(RolePalette::assistant()),
-                "",
-                context.content_width,
-                !context.state.assistant_streaming,
-            );
-            RenderedBlock::plain(lines)
-        }
+        ConversationItem::Assistant(text) => assistant_block(
+            text,
+            context.content_width,
+            !context.state.assistant_streaming,
+        ),
         ConversationItem::Reasoning(text) => {
             let mut lines = Vec::new();
             let accent = thinking_lines(
@@ -352,8 +345,42 @@ fn tool_result_body_block(
     }
 }
 
+fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> RenderedBlock {
+    let mut lines = Vec::new();
+    markdown_lines_with_syntax(
+        &mut lines,
+        text,
+        Style::default().fg(RolePalette::assistant()),
+        "",
+        content_width,
+        highlight_syntax,
+    );
+    let rows = lines
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                BlockLine::with_bullet(
+                    line,
+                    RowBullet::Identity("●", RolePalette::assistant_identity()),
+                )
+            } else {
+                BlockLine::new(line)
+            }
+        })
+        .collect();
+
+    RenderedBlock {
+        rows,
+        packs: false,
+        call_id: None,
+        closes_call: false,
+    }
+}
+
 fn user_block(text: &str) -> RenderedBlock {
     let mut rows = Vec::new();
+    let accent = Some(RowAccent::Still(RolePalette::accent_active()));
     for source_line in text.split('\n') {
         let line = Line::from(Span::styled(
             source_line.to_owned(),
@@ -361,11 +388,14 @@ fn user_block(text: &str) -> RenderedBlock {
                 .fg(RolePalette::assistant())
                 .add_modifier(Modifier::BOLD),
         ));
-        rows.push(if rows.is_empty() {
-            BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::accent_active()))
-        } else {
-            BlockLine::new(line)
-        });
+        rows.push(
+            if rows.is_empty() {
+                BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::accent_active()))
+            } else {
+                BlockLine::new(line)
+            }
+            .accented(accent),
+        );
     }
 
     RenderedBlock {
@@ -1094,6 +1124,9 @@ struct MarkdownRenderer {
     quote_depth: usize,
     lists: Vec<Option<u64>>,
     links: Vec<String>,
+    table_row: bool,
+    table_head: bool,
+    table_cells: usize,
 }
 
 impl MarkdownRenderer {
@@ -1125,12 +1158,15 @@ impl MarkdownRenderer {
             quote_depth: 0,
             lists: Vec::new(),
             links: Vec::new(),
+            table_row: false,
+            table_head: false,
+            table_cells: 0,
         }
     }
 
     fn render(mut self, markdown: &str) -> Vec<Line<'static>> {
         self.code_panel_widths = code_panel_widths(markdown, self.content_width);
-        for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS) {
+        for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES) {
             self.event(event);
         }
         self.finish_line();
@@ -1228,15 +1264,25 @@ impl MarkdownRenderer {
                 self.code_panel_line = true;
             }
             Tag::Link { dest_url, .. } => self.links.push(dest_url.into_string()),
+            Tag::Table(_) => {
+                self.finish_line();
+                self.push_table_rule('╭', '╮');
+            }
+            Tag::TableHead => {
+                self.table_head = true;
+                self.start_table_row();
+            }
+            Tag::TableRow => self.start_table_row(),
+            Tag::TableCell => {
+                if self.table_cells > 0 {
+                    self.text(" │ ", self.base_style.fg(RolePalette::chrome()));
+                }
+            }
             Tag::Paragraph
             | Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
             | Tag::Strikethrough
             | Tag::Image { .. }
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::MetadataBlock(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
@@ -1248,16 +1294,21 @@ impl MarkdownRenderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => self.finish_block(),
+            TagEnd::Paragraph | TagEnd::Heading(_) => self.finish_block(),
+            TagEnd::Item => self.finish_line(),
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
+                self.blank_line();
             }
             TagEnd::List(_) => {
                 self.finish_line();
                 self.lists.pop();
+                if self.lists.is_empty() {
+                    self.blank_line();
+                }
             }
             TagEnd::CodeBlock => {
                 self.finish_line();
@@ -1280,14 +1331,22 @@ impl MarkdownRenderer {
                     );
                 }
             }
+            TagEnd::TableCell => self.table_cells = self.table_cells.saturating_add(1),
+            TagEnd::TableRow => self.finish_table_row(),
+            TagEnd::TableHead => {
+                self.finish_table_row();
+                self.table_head = false;
+                self.push_table_rule('├', '┤');
+            }
+            TagEnd::Table => {
+                self.finish_line();
+                self.push_table_rule('╰', '╯');
+                self.blank_line();
+            }
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
             | TagEnd::Strikethrough
             | TagEnd::Image
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::MetadataBlock(_)
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
@@ -1411,6 +1470,11 @@ impl MarkdownRenderer {
         if self.emphasis > 0 {
             style = style.add_modifier(Modifier::ITALIC);
         }
+        if self.table_head {
+            style = style
+                .fg(RolePalette::markdown_strong())
+                .add_modifier(Modifier::BOLD);
+        }
         if !self.links.is_empty() {
             style = style
                 .fg(RolePalette::navigation())
@@ -1452,6 +1516,67 @@ impl MarkdownRenderer {
                 markdown_heading_style(self.base_style, level),
             ));
         }
+    }
+
+    fn start_table_row(&mut self) {
+        self.finish_line();
+        self.start_line();
+        self.spans.push(Span::styled(
+            "│ ",
+            self.base_style.fg(RolePalette::chrome()),
+        ));
+        self.table_row = true;
+        self.table_cells = 0;
+    }
+
+    fn finish_table_row(&mut self) {
+        if !self.table_row {
+            return;
+        }
+        if self.content_width <= 3 {
+            self.spans.clear();
+            let row = match self.content_width {
+                0 => "",
+                1 => "│",
+                2 => "││",
+                _ => "│ │",
+            };
+            self.spans
+                .push(Span::styled(row, self.base_style.fg(RolePalette::chrome())));
+        } else {
+            let closing = " │";
+            truncate_spans(
+                &mut self.spans,
+                self.content_width.saturating_sub(closing.width()),
+            );
+            self.spans.push(Span::styled(
+                closing,
+                self.base_style.fg(RolePalette::chrome()),
+            ));
+        }
+        self.finish_line();
+        self.table_row = false;
+        self.table_cells = 0;
+    }
+
+    fn push_table_rule(&mut self, left: char, right: char) {
+        self.finish_line();
+        self.start_line();
+        let used = Line::from(self.spans.clone()).width();
+        let available = self.content_width.saturating_sub(used);
+        if available == 0 {
+            return;
+        }
+        let rule = if available == 1 {
+            left.to_string()
+        } else {
+            format!("{left}{}{right}", "─".repeat(available - 2))
+        };
+        self.spans.push(Span::styled(
+            rule,
+            self.base_style.fg(RolePalette::chrome()),
+        ));
+        self.finish_line();
     }
 
     fn push_code_chrome(&mut self, label: &str, right_corner: char) {
@@ -1529,10 +1654,10 @@ impl MarkdownRenderer {
 
 const fn markdown_heading_marker(level: HeadingLevel) -> &'static str {
     match level {
-        HeadingLevel::H1 => "█ ",
-        HeadingLevel::H2 => "▌ ",
-        HeadingLevel::H3 => "▸ ",
-        HeadingLevel::H4 => "› ",
+        HeadingLevel::H1 => "◆ ",
+        HeadingLevel::H2 => "◇ ",
+        HeadingLevel::H3 => "▪ ",
+        HeadingLevel::H4 => "▫ ",
         HeadingLevel::H5 => "· ",
         HeadingLevel::H6 => "  · ",
     }
@@ -1556,6 +1681,26 @@ fn markdown_heading_style(base: Style, level: HeadingLevel) -> Style {
             .add_modifier(Modifier::ITALIC),
     };
     style
+}
+
+fn truncate_spans(spans: &mut Vec<Span<'static>>, max_width: usize) {
+    let mut kept = Vec::new();
+    let mut remaining = max_width;
+    for span in spans.drain(..) {
+        let width = span.content.width();
+        if width <= remaining {
+            remaining -= width;
+            kept.push(span);
+            continue;
+        }
+        if remaining > 0 {
+            let mut content = take_visible_width(&span.content, remaining.saturating_sub(1));
+            content.push('…');
+            kept.push(Span::styled(content, span.style));
+        }
+        break;
+    }
+    *spans = kept;
 }
 
 fn code_panel_widths(markdown: &str, content_width: usize) -> VecDeque<usize> {
@@ -2442,17 +2587,15 @@ mod tests {
     }
 
     #[test]
-    fn accent_bars_mark_live_and_consequential_rows_only() {
+    fn accent_bars_mark_user_identity_live_work_and_consequential_rows() {
         let running = read_conversation(&["a.rs", "b.rs"]);
         let live = lines_at(&running, &BTreeMap::new());
         let bar = accent_span(&live, "Reading 2 files…");
         assert_eq!(bar.content, "┃");
         assert_eq!(bar.style.fg, Some(RolePalette::accent_active()));
-        assert_eq!(
-            accent_span(&live, "prompt").content,
-            " ",
-            "a user prompt owns no bar"
-        );
+        let prompt_bar = accent_span(&live, "prompt");
+        assert_eq!(prompt_bar.content, "┃");
+        assert_eq!(prompt_bar.style.fg, Some(RolePalette::accent_active()));
 
         let mut folded = read_conversation(&["a.rs", "b.rs"]);
         let mut folded_modes = BTreeMap::new();
@@ -2819,6 +2962,31 @@ mod tests {
             Some(RolePalette::muted()),
             "a shell prompt is chrome, not a verb"
         );
+    }
+
+    #[test]
+    fn narrow_markdown_tables_keep_their_structural_borders_without_wrapping() {
+        let markdown =
+            "| Name | State |\n| --- | --- |\n| very-long-resource-name | still-running |";
+        let lines = MarkdownRenderer::new(Style::default(), "", 18).render(markdown);
+
+        assert!(lines.iter().all(|line| line.width() <= 18), "{lines:?}");
+        let body = lines
+            .iter()
+            .map(line_text)
+            .find(|line| line.contains("very"))
+            .expect("table body row");
+        assert!(body.starts_with("│ "), "{body:?}");
+        assert!(body.ends_with(" │"), "{body:?}");
+        assert!(body.contains('…'), "{body:?}");
+
+        for width in 1..=3 {
+            let rows = MarkdownRenderer::new(Style::default(), "", width).render(markdown);
+            assert!(rows.iter().all(|line| line.width() <= width), "{rows:?}");
+            for row in rows.iter().map(line_text).filter(|row| row.contains('│')) {
+                assert!(row.starts_with('│') && row.ends_with('│'), "{row:?}");
+            }
+        }
     }
 
     #[test]
