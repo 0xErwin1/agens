@@ -409,6 +409,26 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
 }
 
 #[test]
+fn working_indicator_remains_visible_when_live_transcript_reaches_the_composer() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("fill the viewport");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        (0..20)
+            .map(|line| format!("output-line-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("output-line-19"), "{rendered:?}");
+    assert!(rendered.contains("Working…"), "{rendered:?}");
+    assert!(rendered.contains("LIVE"), "{rendered:?}");
+}
+
+#[test]
 fn footer_shows_tokens_used_only_when_window_unknown_without_unavailable() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 14)).unwrap());
     let mut tui = Tui::new(FakeEngine);

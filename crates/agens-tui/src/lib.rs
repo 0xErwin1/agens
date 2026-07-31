@@ -69,6 +69,7 @@ const TRANSCRIPT_CONTENT_INDENT: u16 = 4;
 /// The accent bar is carved out of the indent instead of added to it, so bullets
 /// and content keep the screen columns they had before the bar existed.
 const TRANSCRIPT_ROW_INDENT: u16 = TRANSCRIPT_CONTENT_INDENT - widgets::ACCENT_WIDTH as u16;
+const TRANSCRIPT_CHROME_ROWS: u16 = 2;
 const MAX_CHILD_TRANSCRIPTS: usize = 64;
 const PROGRESS_CHANNEL_BUDGET: usize = 32;
 const MOUSE_SCROLL_ROWS: u16 = 6;
@@ -1372,7 +1373,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         .saturating_sub(TRANSCRIPT_ROW_INDENT);
     let transcript =
         SelectableTranscript::from_lines(&rendered_transcript(&state, row_width), row_width);
-    let visible_rows = layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = layout
+        .transcript
+        .height
+        .saturating_sub(TRANSCRIPT_CHROME_ROWS) as usize;
     let bottom_scroll = saturating_u16(transcript.rows.len().saturating_sub(visible_rows));
     let scroll = if state.following_bottom {
         bottom_scroll
@@ -4696,9 +4700,13 @@ where
         let view = self.view();
         let layout = self.screen_layout();
         let content_y = layout.transcript.y.saturating_add(1);
+        let content_bottom = layout
+            .transcript
+            .bottom()
+            .saturating_sub(TRANSCRIPT_CHROME_ROWS.saturating_sub(1));
         let content_x = layout.transcript.x.saturating_add(TRANSCRIPT_ROW_INDENT);
         if row < content_y
-            || row >= layout.transcript.bottom()
+            || row >= content_bottom
             || column < content_x
             || column >= layout.transcript.right()
         {
@@ -4713,10 +4721,12 @@ where
         let transcript =
             SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
         let bottom = saturating_u16(
-            transcript
-                .rows
-                .len()
-                .saturating_sub(usize::from(layout.transcript.height.saturating_sub(1))),
+            transcript.rows.len().saturating_sub(usize::from(
+                layout
+                    .transcript
+                    .height
+                    .saturating_sub(TRANSCRIPT_CHROME_ROWS),
+            )),
         );
         let scroll = if view.following_bottom {
             bottom
@@ -5419,7 +5429,12 @@ where
 
     fn max_scroll_offset(&self) -> u16 {
         let layout = self.screen_layout();
-        let visible_rows = usize::from(layout.transcript.height.saturating_sub(1));
+        let visible_rows = usize::from(
+            layout
+                .transcript
+                .height
+                .saturating_sub(TRANSCRIPT_CHROME_ROWS),
+        );
         let row_width = layout
             .transcript
             .width
