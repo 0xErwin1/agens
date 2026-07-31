@@ -524,8 +524,12 @@ fn typed_turn_blocks_group_tools_with_status_duration_and_preview() {
     }
     assert!(text.contains("read src/lib.rs"), "{text:?}");
     assert!(text.contains("grep needle"), "{text:?}");
-    assert!(text.contains("└ read · Success"), "{text:?}");
-    assert!(text.contains("└ grep · Failure"), "{text:?}");
+    assert!(
+        text.find("grep preview") < text.find("read preview"),
+        "out-of-order results must keep arrival order: {text:?}"
+    );
+    assert!(!text.contains("└ read"), "{text:?}");
+    assert!(!text.contains("└ grep"), "{text:?}");
     assert!(!text.contains("native::read · read-1"), "{text:?}");
     assert!(!text.contains("native::grep · grep-2"), "{text:?}");
 }
@@ -738,7 +742,7 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
 }
 
 #[test]
-fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
+fn finished_tool_row_keeps_name_args_and_status_on_one_collapsed_line() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
     let mut tui = Tui::new(FakeEngine);
     tui.begin_submission("inspect");
@@ -767,8 +771,17 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
         "{text:?}"
     );
     assert!(text.contains("src/lib.rs"), "{text:?}");
-    assert!(text.contains("output collapsed"), "{text:?}");
+    assert!(text.contains("Success"), "{text:?}");
+    assert!(!text.contains("output collapsed"), "{text:?}");
     assert!(!text.contains("secret-tool-body-sentinel"), "{text:?}");
+    assert_eq!(
+        transcript_rows(&renderer)
+            .iter()
+            .filter(|row| row.contains("read src/lib.rs"))
+            .count(),
+        1,
+        "{text:?}"
+    );
     assert!(
         !text.contains("native::read · read-1"),
         "call_id must stay off the scan path: {text:?}"
@@ -787,6 +800,92 @@ fn tool_rows_always_show_name_and_args_with_collapsed_finished_output() {
     );
     assert!(expanded.contains("read"), "{expanded:?}");
     assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
+}
+
+#[test]
+fn tool_call_updates_one_row_in_place_when_it_finishes() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 30)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "atlas-1".into(),
+        name: "mcp::atlas_get_document".into(),
+        input: r#"{"detail":"full","slug":"spec","workspace":"agens"}"#.into(),
+        parsed: agens_core::ToolInput::Other {
+            name: "mcp::atlas_get_document".into(),
+            raw: r#"{"detail":"full","slug":"spec","workspace":"agens"}"#.into(),
+        },
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    let running_rows = transcript_rows(&renderer);
+    let running = running_rows
+        .iter()
+        .filter(|row| row.contains("atlas_get_document"))
+        .collect::<Vec<_>>();
+    assert_eq!(running.len(), 1, "{running_rows:?}");
+    assert!(running[0].contains("Running"), "{running:?}");
+
+    tui.apply_conversation_event(ConversationEvent::ToolResult {
+        call_id: "atlas-1".into(),
+        output: "document body".into(),
+        is_error: false,
+    })
+    .unwrap();
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "atlas-1".into(),
+        duration: Some(Duration::from_millis(673)),
+        result: ToolResultState::Success,
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let settled_rows = transcript_rows(&renderer);
+    let settled = settled_rows
+        .iter()
+        .filter(|row| row.contains("atlas_get_document"))
+        .collect::<Vec<_>>();
+    assert_eq!(settled.len(), 1, "{settled_rows:?}");
+    assert!(settled[0].contains("Success · 673ms"), "{settled:?}");
+    assert!(settled[0].contains("1 lines · 13 B"), "{settled:?}");
+    assert!(
+        !settled_rows
+            .iter()
+            .any(|row| row.contains("output collapsed"))
+    );
+    assert!(
+        !settled_rows
+            .iter()
+            .any(|row| row.trim_start().starts_with("└"))
+    );
+}
+
+#[test]
+fn unfinished_tool_row_becomes_failure_when_the_turn_is_cancelled() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("inspect");
+    tui.apply_conversation_event(ConversationEvent::ToolCall {
+        call_id: "read-1".into(),
+        name: "native::read".into(),
+        input: "src/lib.rs".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "src/lib.rs".into(),
+        },
+    })
+    .unwrap();
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Cancelled {
+        message: "cancelled".into(),
+        action: "retry".into(),
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let row = transcript_rows(&renderer)
+        .into_iter()
+        .find(|row| row.contains("Read src/lib.rs"))
+        .expect("tool row");
+    assert!(row.contains("Failure"), "{row:?}");
+    assert!(!row.contains("Running"), "{row:?}");
 }
 
 #[test]
@@ -1946,7 +2045,8 @@ fn renderer_recovers_collapsed_long_tool_output_in_a_bounded_viewport() {
     .unwrap();
     renderer.render(tui.view()).unwrap();
     let collapsed = rendered_text(&renderer);
-    assert!(collapsed.contains("output collapsed"), "{collapsed:?}");
+    assert!(collapsed.contains("Success"), "{collapsed:?}");
+    assert!(!collapsed.contains("output collapsed"), "{collapsed:?}");
     assert!(!collapsed.contains("full-output-sentinel"), "{collapsed:?}");
 
     tui.handle(Event::Key(Key::CtrlO));
@@ -2057,22 +2157,23 @@ fn renderer_retains_completed_turns_while_streaming_and_scrolling_the_next_turn(
         "first-reasoning-sentinel",
         "read",
         "first-input",
-        "first-result-sentinel",
         "first-answer-sentinel",
     ] {
         assert!(history.contains(expected), "missing {expected:?}");
     }
+    assert!(!history.contains("first-result-sentinel"), "{history:?}");
     assert!(!history.contains("first-call"), "{history:?}");
 
     // While the next turn is streaming, Ctrl+O targets tools (thinking is live).
     tui.handle(Event::Key(Key::CtrlO));
-    let mut collapsed = String::new();
+    let mut expanded = String::new();
     for _ in 0..30 {
         tui.handle(Event::Key(Key::PageDown));
         renderer.render(tui.view()).unwrap();
-        collapsed.push_str(&rendered_text(&renderer));
+        expanded.push_str(&rendered_text(&renderer));
     }
-    assert!(collapsed.contains("output collapsed"));
+    assert!(expanded.contains("Success"));
+    assert!(expanded.contains("first-result-sentinel"));
 }
 
 #[test]
@@ -2803,7 +2904,7 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
     for expected in [
         "inspect every changed line",
         "live markdown stays visible",
-        "read",
+        "Read",
         "first line",
         "second line",
         "12ms",
@@ -3112,6 +3213,13 @@ fn p1a2_renderer_renders_terminal_status_final_result_and_ordered_expanded_tools
             "duplicated {child_row:?}: {main:?}"
         );
     }
+
+    tui.select_transcript(TranscriptId::Subagent(10));
+    renderer.render(tui.view()).unwrap();
+    let child = rendered_text(&renderer);
+    let pending_row = rendered_line(&renderer, rendered_row(&renderer, "second input"));
+    assert!(pending_row.contains("Failure"), "{child:?}");
+    assert!(!pending_row.contains("Running"), "{child:?}");
 }
 
 #[test]

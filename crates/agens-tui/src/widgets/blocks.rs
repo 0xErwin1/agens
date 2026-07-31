@@ -111,8 +111,6 @@ pub(crate) enum RowBullet {
     Activity(RowState),
     /// A header standing in for several rows (verb run, elided remainder).
     Group(RowState),
-    /// Closing rail of a block whose lead row is above it.
-    Rail(Color),
     /// Fixed identity glyph (user prompt, subagent card).
     Identity(&'static str, Color),
 }
@@ -120,13 +118,11 @@ pub(crate) enum RowBullet {
 impl RowBullet {
     const ACTIVITY: &'static str = "◆";
     const GROUP: &'static str = "◈";
-    const RAIL: &'static str = "└";
 
     pub(crate) fn span(self) -> Span<'static> {
         let (glyph, color) = match self {
             Self::Activity(state) => (Self::ACTIVITY, state.color()),
             Self::Group(state) => (Self::GROUP, state.color()),
-            Self::Rail(color) => (Self::RAIL, color),
             Self::Identity(glyph, color) => (glyph, color),
         };
         Span::styled(
@@ -302,34 +298,21 @@ impl ToolRow {
         ])
     }
 
-    /// Result footer with tool name, status, and optional result-size metadata
-    /// (no call_id on the scan path).
-    ///
-    /// The closing rail glyph lives in the shared gutter, not in this row, so
-    /// the footer never starts left of the rows it closes.
-    ///
-    /// A successful status is muted metadata: the outcome already reads from the
-    /// rail's colour, so only a failure earns a coloured word. `size` carries the
-    /// computed result size (lines/bytes) as muted trailing metadata; it is never
-    /// a fabricated per-call token count.
-    pub(crate) fn result_footer(
-        tool_name: &str,
+    /// Lifecycle metadata appended to the call header so one logical tool use
+    /// keeps one header while it moves from running to a terminal outcome.
+    pub(crate) fn lifecycle_suffix(
         status: &str,
         failed: bool,
         size: Option<&str>,
-    ) -> Line<'static> {
+    ) -> Vec<Span<'static>> {
         let status_color = if failed {
             RolePalette::error()
+        } else if status == "Running…" {
+            RolePalette::accent_active()
         } else {
             RolePalette::muted()
         };
         let mut spans = vec![
-            Span::styled(
-                short_tool_name(tool_name),
-                Style::default()
-                    .fg(RolePalette::assistant())
-                    .add_modifier(Modifier::BOLD),
-            ),
             Span::styled(" · ", Style::default().fg(RolePalette::muted())),
             Span::styled(
                 status.to_owned(),
@@ -344,38 +327,7 @@ impl ToolRow {
                 Style::default().fg(RolePalette::muted()),
             ));
         }
-        Line::from(spans)
-    }
-
-    /// Collapsed successful output placeholder.
-    pub(crate) fn collapsed_output() -> Line<'static> {
-        Line::from(Span::styled(
-            "output collapsed · Ctrl+O to expand",
-            Style::default().fg(RolePalette::muted()),
-        ))
-    }
-
-    /// Collapsed failure always keeps a short reason visible.
-    pub(crate) fn collapsed_failure(preview: &str) -> Line<'static> {
-        let preview = preview.trim();
-        let preview = if preview.is_empty() {
-            "failed (no details)"
-        } else {
-            preview
-        };
-        let preview = preview.lines().next().unwrap_or(preview);
-        let mut preview = preview.chars().take(120).collect::<String>();
-        if preview.chars().count() >= 120 {
-            preview.push('…');
-        }
-        Line::from(vec![
-            Span::styled("reason ", Style::default().fg(RolePalette::muted())),
-            Span::styled(preview, Style::default().fg(RolePalette::error())),
-            Span::styled(
-                " · Ctrl+O for full output",
-                Style::default().fg(RolePalette::muted()),
-            ),
-        ])
+        spans
     }
 }
 
@@ -661,6 +613,7 @@ pub(crate) struct ToolCallBlock<'a> {
     pub(crate) batch: Option<usize>,
     pub(crate) content_width: usize,
     pub(crate) state: RowState,
+    pub(crate) result: Option<&'a ToolResultBlock>,
 }
 
 impl ToolCallBlock<'_> {
@@ -696,13 +649,49 @@ impl BlockContent for ToolCallBlock<'_> {
                 .accented(accent),
             );
         }
-        lines.push(
-            BlockLine::with_bullet(
-                tool_header(self.parsed, self.content_width),
-                RowBullet::Activity(self.state),
-            )
-            .accented(accent),
+
+        let (status, failed, size) = self.result.map_or_else(
+            || match self.state {
+                RowState::Running => ("Running…", false, None),
+                RowState::Success => ("Success", false, None),
+                RowState::Failure => ("Failure", true, None),
+                RowState::Muted => ("Pending…", false, None),
+            },
+            |result| {
+                (
+                    result.status.as_str(),
+                    result.failed,
+                    Some(result.size.as_str()),
+                )
+            },
         );
+        let full_header = tool_header(self.parsed, self.content_width);
+        let minimum_header_width = full_header.width().min(6);
+        let terminal_state = status.split(" · ").next().unwrap_or(status);
+        let suffix = [(status, size), (status, None), (terminal_state, None)]
+            .into_iter()
+            .map(|(status, size)| ToolRow::lifecycle_suffix(status, failed, size))
+            .find(|suffix| {
+                minimum_header_width
+                    + suffix
+                        .iter()
+                        .map(|span| span.content.width())
+                        .sum::<usize>()
+                    <= self.content_width
+            })
+            .unwrap_or_default();
+        let suffix_width = suffix
+            .iter()
+            .map(|span| span.content.width())
+            .sum::<usize>();
+        let mut header = tool_header(
+            self.parsed,
+            self.content_width.saturating_sub(suffix_width).max(1),
+        );
+        header.spans.extend(suffix);
+        lines
+            .push(BlockLine::with_bullet(header, RowBullet::Activity(self.state)).accented(accent));
+
         if mode == DisplayMode::Expanded {
             lines.push(BlockLine::new(ToolRow::args(self.input)).accented(accent));
         }
@@ -710,7 +699,11 @@ impl BlockContent for ToolCallBlock<'_> {
     }
 
     fn default_mode(&self) -> DisplayMode {
-        DisplayMode::Truncated
+        if self.result.is_some() {
+            DisplayMode::Expanded
+        } else {
+            DisplayMode::Truncated
+        }
     }
 
     fn accent(&self) -> Color {
@@ -722,61 +715,11 @@ impl BlockContent for ToolCallBlock<'_> {
     }
 }
 
-/// Tool result footer/body, wrapped as `BlockContent` reproducing today's output exactly.
-///
-/// `collapsed_body` and `full_body` are pre-rendered by the caller (which owns
-/// content width and markdown/syntax wrapping); this block only selects
-/// between them by [`DisplayMode`].
+/// Terminal metadata appended to the tool call's stable header.
 pub(crate) struct ToolResultBlock {
-    pub(crate) footer: Line<'static>,
-    pub(crate) collapsed_body: Vec<Line<'static>>,
-    pub(crate) full_body: Vec<Line<'static>>,
-    pub(crate) accent: Color,
-    /// Whether the call this result closes belongs to the foldable read family;
-    /// both halves of a call must agree so a result never accents a run its own
-    /// call row left bare.
-    pub(crate) groupable: bool,
-}
-
-impl BlockContent for ToolResultBlock {
-    fn lines(&self, mode: DisplayMode) -> Vec<BlockLine> {
-        let accent = (!self.groupable).then_some(RowAccent::Still(self.accent));
-        let mut lines = vec![
-            BlockLine::with_bullet(self.footer.clone(), RowBullet::Rail(self.accent))
-                .accented(accent),
-        ];
-        let body = match mode {
-            DisplayMode::Collapsed => self.collapsed_body.clone(),
-            DisplayMode::Truncated => bounded_preview(&self.full_body),
-            DisplayMode::Expanded => self.full_body.clone(),
-        };
-        lines.extend(
-            body.into_iter()
-                .map(|line| BlockLine::new(line).accented(accent)),
-        );
-        lines
-    }
-
-    /// `Expanded`, deliberately against the collapsed-by-default policy: a
-    /// finished call always gets an explicit `Collapsed` entry recorded at
-    /// completion (see `Tui::apply_conversation_event`), so this fallback only
-    /// reaches calls whose entry was cleared by a new submission, which must
-    /// keep showing their retained output instead of re-collapsing silently.
-    fn default_mode(&self) -> DisplayMode {
-        DisplayMode::Expanded
-    }
-
-    fn mode_on_finish(&self) -> DisplayMode {
-        DisplayMode::Collapsed
-    }
-
-    fn accent(&self) -> Color {
-        self.accent
-    }
-
-    fn is_groupable(&self) -> bool {
-        self.groupable
-    }
+    pub(crate) status: String,
+    pub(crate) failed: bool,
+    pub(crate) size: String,
 }
 
 const PREVIEW_HEAD_LINES: usize = 5;
@@ -786,7 +729,7 @@ const PREVIEW_TAIL_LINES: usize = 3;
 ///
 /// Bodies short enough to fit the window are returned unchanged so the marker
 /// never claims a truncation that did not happen.
-fn bounded_preview(body: &[Line<'static>]) -> Vec<Line<'static>> {
+pub(crate) fn bounded_tool_preview(body: &[Line<'static>]) -> Vec<Line<'static>> {
     if body.len() <= PREVIEW_HEAD_LINES + PREVIEW_TAIL_LINES + 1 {
         return body.to_vec();
     }
@@ -837,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_row_args_and_collapsed_marker_are_stable() {
+    fn tool_row_args_and_lifecycle_suffix_are_stable() {
         let args = ToolRow::args("src/lib.rs");
         let args_text: String = args
             .spans
@@ -847,23 +790,18 @@ mod tests {
         assert!(args_text.contains("input"));
         assert!(args_text.contains("src/lib.rs"));
 
-        let collapsed = ToolRow::collapsed_output();
-        let collapsed_text: String = collapsed
-            .spans
+        let success = ToolRow::lifecycle_suffix("Success · 12ms", false, Some("2 lines · 21 B"));
+        let success_text = success
             .iter()
             .map(|span| span.content.as_ref())
-            .collect();
-        assert!(collapsed_text.contains("output collapsed"));
+            .collect::<String>();
+        assert_eq!(success_text, " · Success · 12ms · 2 lines · 21 B");
+        assert_eq!(success[1].style.fg, Some(RolePalette::muted()));
 
-        let failure = ToolRow::collapsed_failure("glob: deadline exceeded\nmore");
-        let failure_text: String = failure
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(failure_text.contains("glob: deadline exceeded"));
-        assert!(!failure_text.contains("more"));
-        assert!(failure_text.contains("Ctrl+O"));
+        let running = ToolRow::lifecycle_suffix("Running…", false, None);
+        assert_eq!(running[1].style.fg, Some(RolePalette::accent_active()));
+        let failure = ToolRow::lifecycle_suffix("Failure", true, None);
+        assert_eq!(failure[1].style.fg, Some(RolePalette::error()));
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -1072,6 +1010,7 @@ mod tests {
             batch: None,
             content_width: 80,
             state: RowState::Running,
+            result: None,
         };
         assert!(
             !block.is_groupable(),
@@ -1112,17 +1051,8 @@ mod tests {
         let full_body: Vec<Line<'static>> = (1..=40)
             .map(|index| Line::from(format!("row {index}")))
             .collect();
-        let block = ToolResultBlock {
-            footer: ToolRow::result_footer("read", "Success", false, None),
-            collapsed_body: vec![ToolRow::collapsed_output()],
-            full_body,
-            accent: RolePalette::accent_active(),
-            groupable: false,
-        };
-
-        let truncated = block.lines(DisplayMode::Truncated);
-        let truncated_text: Vec<String> =
-            truncated.iter().map(|row| line_text(&row.line)).collect();
+        let truncated = bounded_tool_preview(&full_body);
+        let truncated_text: Vec<String> = truncated.iter().map(line_text).collect();
         assert!(
             truncated.len() < 15,
             "truncated stays bounded: {truncated_text:?}"
@@ -1138,8 +1068,45 @@ mod tests {
             "elision marker names the hidden count: {truncated_text:?}"
         );
 
-        let expanded = block.lines(DisplayMode::Expanded);
-        assert_eq!(expanded.len(), 41, "expanded still shows the whole body");
+        assert_eq!(full_body.len(), 40, "expanded still shows the whole body");
+    }
+
+    #[test]
+    fn narrow_tool_rows_keep_both_identity_and_lifecycle() {
+        let parsed = ToolInput::Other {
+            name: "mcp::atlas_get_document".into(),
+            raw: r#"{"detail":"full","slug":"spec","workspace":"agens"}"#.into(),
+        };
+        let running = ToolCallBlock {
+            input: "{}",
+            parsed: &parsed,
+            batch: None,
+            content_width: 18,
+            state: RowState::Running,
+            result: None,
+        };
+        let running = line_text(&running.lines(DisplayMode::Collapsed)[0].line);
+        assert!(running.contains("atlas"), "{running:?}");
+        assert!(running.contains("Running"), "{running:?}");
+        assert!(running.width() <= 18, "{running:?}");
+
+        let result = ToolResultBlock {
+            status: "Success · 673ms".into(),
+            failed: false,
+            size: "1 line · 13 B".into(),
+        };
+        let settled = ToolCallBlock {
+            input: "{}",
+            parsed: &parsed,
+            batch: None,
+            content_width: 18,
+            state: RowState::Success,
+            result: Some(&result),
+        };
+        let settled = line_text(&settled.lines(DisplayMode::Collapsed)[0].line);
+        assert!(settled.contains("atlas"), "{settled:?}");
+        assert!(settled.contains("Success"), "{settled:?}");
+        assert!(settled.width() <= 18, "{settled:?}");
     }
 
     #[test]
@@ -1152,7 +1119,8 @@ mod tests {
             parsed: &parsed,
             batch: Some(2),
             content_width: 80,
-            state: RowState::Success,
+            state: RowState::Running,
+            result: None,
         };
         assert_eq!(block.default_mode(), DisplayMode::Truncated);
         assert!(block.is_groupable());
@@ -1160,7 +1128,7 @@ mod tests {
         let truncated = block.lines(DisplayMode::Truncated);
         assert_eq!(truncated.len(), 2);
         assert!(line_text(&truncated[0].line).contains("batch 2"));
-        assert_eq!(line_text(&truncated[1].line), "Read src/lib.rs");
+        assert_eq!(line_text(&truncated[1].line), "Read src/lib.rs · Running…");
         assert!(
             truncated
                 .iter()
@@ -1178,29 +1146,36 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_block_selects_body_by_display_mode_and_shows_result_size() {
-        let footer = ToolRow::result_footer("read", "Success", false, Some("2 lines · 21 B"));
-        assert!(line_text(&footer).contains("2 lines · 21 B"));
-
-        let block = ToolResultBlock {
-            footer,
-            collapsed_body: vec![ToolRow::collapsed_output()],
-            full_body: vec![Line::from("full output")],
-            accent: RolePalette::accent_active(),
-            groupable: false,
+    fn finished_tool_call_keeps_status_and_size_on_its_only_collapsed_row() {
+        let parsed = ToolInput::Read {
+            path: "src/lib.rs".into(),
         };
-        assert_eq!(block.mode_on_finish(), DisplayMode::Collapsed);
-        assert!(!block.is_groupable());
+        let result = ToolResultBlock {
+            status: "Success · 12ms".into(),
+            failed: false,
+            size: "2 lines · 21 B".into(),
+        };
+        let block = ToolCallBlock {
+            input: "{\"path\":\"src/lib.rs\"}",
+            parsed: &parsed,
+            batch: None,
+            content_width: 80,
+            state: RowState::Success,
+            result: Some(&result),
+        };
+        assert_eq!(block.default_mode(), DisplayMode::Expanded);
 
         let collapsed = block.lines(DisplayMode::Collapsed);
-        assert_eq!(collapsed.len(), 2);
-        assert!(line_text(&collapsed[1].line).contains("output collapsed"));
+        assert_eq!(collapsed.len(), 1);
+        let row = line_text(&collapsed[0].line);
+        assert!(row.contains("Read src/lib.rs"), "{row:?}");
+        assert!(row.contains("Success · 12ms · 2 lines · 21 B"), "{row:?}");
 
         let truncated = block.lines(DisplayMode::Truncated);
-        assert_eq!(line_text(&truncated[1].line), "full output");
+        assert_eq!(truncated.len(), 1);
 
         let expanded = block.lines(DisplayMode::Expanded);
-        assert_eq!(line_text(&expanded[1].line), "full output");
+        assert!(line_text(&expanded[1].line).contains("input"));
     }
 
     fn call_accents(
@@ -1214,6 +1189,7 @@ mod tests {
             batch: Some(1),
             content_width: 80,
             state,
+            result: None,
         }
         .lines(mode)
         .iter()
@@ -1250,28 +1226,32 @@ mod tests {
             "a settled destructive call keeps a still bar in its own colour"
         );
 
-        let result = |groupable| ToolResultBlock {
-            footer: ToolRow::result_footer("read", "Success", false, None),
-            collapsed_body: vec![ToolRow::collapsed_output()],
-            full_body: vec![Line::from("body")],
-            accent: RolePalette::success(),
-            groupable,
+        let result = ToolResultBlock {
+            status: "Success".into(),
+            failed: false,
+            size: "1 line".into(),
+        };
+        let result_accents = |parsed: &ToolInput, state| {
+            ToolCallBlock {
+                input: "{}",
+                parsed,
+                batch: None,
+                content_width: 80,
+                state,
+                result: Some(&result),
+            }
+            .lines(DisplayMode::Expanded)
+            .iter()
+            .map(|row| row.accent)
+            .collect::<Vec<_>>()
         };
         assert_eq!(
-            result(true)
-                .lines(DisplayMode::Expanded)
-                .iter()
-                .map(|row| row.accent)
-                .collect::<Vec<_>>(),
+            result_accents(&read, RowState::Success),
             vec![None; 2],
             "a read result agrees with its own bare call row"
         );
         assert_eq!(
-            result(false)
-                .lines(DisplayMode::Expanded)
-                .iter()
-                .map(|row| row.accent)
-                .collect::<Vec<_>>(),
+            result_accents(&bash, RowState::Success),
             vec![Some(RowAccent::Still(RolePalette::success())); 2],
             "a destructive result keeps the bar its call row started"
         );
@@ -1338,23 +1318,30 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_failure_keeps_a_visible_reason_line() {
-        let footer = ToolRow::result_footer("bash", "Failure", true, None);
-        let block = ToolResultBlock {
-            footer,
-            collapsed_body: vec![ToolRow::collapsed_failure(
-                "exit 1: command not found\ntrace",
-            )],
-            full_body: vec![Line::from("full stderr")],
-            accent: RolePalette::error(),
-            groupable: false,
+    fn collapsed_failure_is_one_row_and_expansion_adds_only_call_input() {
+        let parsed = ToolInput::Bash {
+            command: "missing-command".into(),
         };
+        let result = ToolResultBlock {
+            status: "Failure".into(),
+            failed: true,
+            size: "2 lines".into(),
+        };
+        let block = ToolCallBlock {
+            input: "{}",
+            parsed: &parsed,
+            batch: None,
+            content_width: 80,
+            state: RowState::Failure,
+            result: Some(&result),
+        };
+
         let collapsed = block.lines(DisplayMode::Collapsed);
-        let reason = line_text(&collapsed[1].line);
-        assert!(reason.contains("exit 1: command not found"), "{reason:?}");
-        assert!(
-            !reason.contains("trace"),
-            "only the first reason line shows"
-        );
+        assert_eq!(collapsed.len(), 1);
+        assert!(line_text(&collapsed[0].line).contains("Failure"));
+        assert!(!line_text(&collapsed[0].line).contains("command not found"));
+
+        let expanded = block.lines(DisplayMode::Expanded);
+        assert_eq!(expanded.len(), 2, "expanded call shows its raw input row");
     }
 }

@@ -10,7 +10,7 @@ mod role_palette;
 
 pub(crate) use blocks::{
     ACCENT_WIDTH, BlockContent, BlockLine, GUTTER_WIDTH, RowAccent, RowBullet, RowState,
-    ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow, VerbGroup,
+    ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup, bounded_tool_preview,
 };
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};

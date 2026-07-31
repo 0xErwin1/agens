@@ -3486,7 +3486,14 @@ where
             self.assistant_streaming = false;
         }
         if finishing {
+            self.settle_active_conversation();
             self.auto_collapse_thinking_on_finish();
+        }
+    }
+
+    fn settle_active_conversation(&mut self) {
+        if let Some(conversation) = self.conversation.as_mut() {
+            conversation.mark_settled();
         }
     }
 
@@ -3551,7 +3558,6 @@ where
         self.conversation = Some(Conversation::new(prompt));
         {
             let record = self.active_record_mut();
-            record.tool_display_modes.clear();
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
         }
@@ -3602,7 +3608,6 @@ where
                 .transcripts
                 .get_mut(&TranscriptId::Main)
                 .expect("main transcript always exists");
-            record.tool_display_modes.clear();
             record.collapse_thinking = false;
             record.thinking_user_pinned = false;
         }
@@ -3879,6 +3884,7 @@ where
                 self.turn_state = Some(TurnState::Failed);
                 self.active_tool = None;
                 if finishing {
+                    self.settle_active_conversation();
                     self.auto_collapse_thinking_on_finish();
                 }
                 self.add_error(message, action);
@@ -3890,6 +3896,7 @@ where
                 self.turn_state = Some(TurnState::Cancelled);
                 self.active_tool = None;
                 if finishing {
+                    self.settle_active_conversation();
                     self.auto_collapse_thinking_on_finish();
                 }
                 self.add_error(message, action);
@@ -4227,6 +4234,9 @@ where
                 .transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
                 .expect("admitted child event has a transcript");
+            if let Some(conversation) = record.conversation.as_mut() {
+                conversation.mark_settled();
+            }
             if !record.thinking_user_pinned {
                 record.collapse_thinking = true;
             }
@@ -4849,6 +4859,7 @@ where
                 self.turn_state = Some(state);
                 self.active_tool = None;
                 if finishing {
+                    self.settle_active_conversation();
                     self.auto_collapse_thinking_on_finish();
                 }
             }
@@ -6259,7 +6270,7 @@ where
         // current mode; sampling the first call's mode (or the shared
         // fallback for a call cleared by a new submission) keeps the whole
         // group synchronized on every press. The fallback matches
-        // `ToolResultBlock::default_mode()` so the sampled "current" state
+        // a finished `ToolCallBlock::default_mode()` so the sampled state
         // agrees with what is actually on screen.
         let modes = &mut self.active_record_mut().tool_display_modes;
         let current = completed_call_ids

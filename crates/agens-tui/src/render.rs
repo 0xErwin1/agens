@@ -23,8 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::conversation::ConversationItem;
 use crate::widgets::{
     ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowAccent,
-    RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, ToolRow,
-    VerbGroup,
+    RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -253,7 +252,7 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             call_id,
             output,
             is_error,
-        } => tool_result_block(context, call_id, output, *is_error),
+        } => tool_result_body_block(context, call_id, output, *is_error),
         ConversationItem::Diff(diff) => {
             let mut lines = Vec::new();
             render_diff(&mut lines, diff, context.content_width);
@@ -283,12 +282,21 @@ fn tool_call_block(
         return RenderedBlock::hidden();
     }
 
+    let result = call_result(context.conversation, call_id).map(|result| {
+        let (result_state, duration) = tool_state(context.events, call_id, result.is_error);
+        ToolResultBlock {
+            status: format!("{result_state:?}{}", duration_label(duration)),
+            failed: result_state == ToolResultState::Failure,
+            size: result_size_label(&result.output),
+        }
+    });
     let block = ToolCallBlock {
         input,
         parsed,
         batch,
         content_width: context.content_width,
         state: call_row_state(context.conversation, call_id),
+        result: result.as_ref(),
     };
     let mode = context
         .tool_display_modes
@@ -298,13 +306,13 @@ fn tool_call_block(
 
     RenderedBlock {
         rows: block.lines(mode),
-        packs: block.is_groupable() && mode != DisplayMode::Expanded,
+        packs: block.is_groupable() && (mode == DisplayMode::Collapsed || result.is_none()),
         call_id: Some(call_id.to_owned()),
         closes_call: false,
     }
 }
 
-fn tool_result_block(
+fn tool_result_body_block(
     context: &ItemContext<'_>,
     call_id: &str,
     output: &str,
@@ -314,33 +322,31 @@ fn tool_result_block(
         return RenderedBlock::hidden();
     }
 
-    let (result_state, duration) = tool_state(context.events, call_id, is_error);
-    let failed = result_state == ToolResultState::Failure;
-    let color = result_color(result_state);
-    let tool_name = tool_name_for_call(context.conversation, call_id);
-    let status = format!("{result_state:?}{}", duration_label(duration));
-    let collapsed_body = if is_error {
-        vec![ToolRow::collapsed_failure(output)]
-    } else {
-        vec![ToolRow::collapsed_output()]
-    };
-    let size = result_size_label(output);
-    let block = ToolResultBlock {
-        footer: ToolRow::result_footer(&tool_name, &status, failed, Some(&size)),
-        collapsed_body,
-        full_body: tool_result_body(call_id, output, context.content_width).to_vec(),
-        accent: color,
-        groupable: call_is_groupable(context.conversation, call_id),
-    };
     let mode = context
         .tool_display_modes
         .get(call_id)
         .copied()
-        .unwrap_or_else(|| block.default_mode());
+        .unwrap_or(DisplayMode::Expanded);
+    if mode == DisplayMode::Collapsed {
+        return RenderedBlock::hidden();
+    }
+
+    let full_body = tool_result_body(call_id, output, context.content_width);
+    let body = match mode {
+        DisplayMode::Collapsed => Vec::new(),
+        DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
+        DisplayMode::Expanded => full_body.to_vec(),
+    };
+    let (result_state, _) = tool_state(context.events, call_id, is_error);
+    let accent = (!call_is_groupable(context.conversation, call_id))
+        .then_some(RowAccent::Still(result_color(result_state)));
 
     RenderedBlock {
-        rows: block.lines(mode),
-        packs: call_is_groupable(context.conversation, call_id) && mode == DisplayMode::Collapsed,
+        rows: body
+            .into_iter()
+            .map(|line| BlockLine::new(line).accented(accent))
+            .collect(),
+        packs: false,
         call_id: Some(call_id.to_owned()),
         closes_call: true,
     }
@@ -587,21 +593,6 @@ fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
     call_result(conversation, call_id).is_some()
 }
 
-/// Lifecycle a call's bullet carries: pending, or settled by its own result.
-fn call_row_state(conversation: &Conversation, call_id: &str) -> RowState {
-    match call_result(conversation, call_id) {
-        None if conversation.is_restored() => RowState::Failure,
-        None => RowState::Running,
-        Some(result) if result.is_error => RowState::Failure,
-        Some(_) => RowState::Success,
-    }
-}
-
-/// Whether a call's rows may pack with their neighbours.
-///
-/// A result item inherits its call's policy: the conversation splits one logical
-/// tool block into a call item and a result item, so both sides of that split
-/// must agree or a result would detach from the run it belongs to.
 fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
     conversation
         .tool_batches
@@ -609,6 +600,16 @@ fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
         .flat_map(|batch| &batch.calls)
         .find(|call| call.call_id == call_id)
         .is_some_and(|call| VerbGroup::of(&call.parsed).is_some())
+}
+
+/// Lifecycle a call's bullet carries: pending, or settled by its own result.
+fn call_row_state(conversation: &Conversation, call_id: &str) -> RowState {
+    match call_result(conversation, call_id) {
+        None if conversation.is_settled() => RowState::Failure,
+        None => RowState::Running,
+        Some(result) if result.is_error => RowState::Failure,
+        Some(_) => RowState::Success,
+    }
 }
 
 /// Header row standing in for a folded run of read-family calls.
@@ -936,16 +937,6 @@ fn is_task_call(conversation: &Conversation, call_id: &str) -> bool {
         .iter()
         .flat_map(|batch| &batch.calls)
         .any(|call| call.call_id == call_id && is_task_tool_name(&call.name))
-}
-
-fn tool_name_for_call(conversation: &Conversation, call_id: &str) -> String {
-    conversation
-        .tool_batches
-        .iter()
-        .flat_map(|batch| &batch.calls)
-        .find(|call| call.call_id == call_id)
-        .map(|call| call.name.clone())
-        .unwrap_or_else(|| "tool".into())
 }
 
 fn bounded_visible_tool_output(output: &str) -> String {
@@ -2149,6 +2140,15 @@ mod tests {
             call_row_state(&conversations[0], "dangling"),
             RowState::Failure
         );
+        let rendered = joined(&conversation_lines(
+            &conversations[0],
+            &[],
+            &BTreeMap::new(),
+            80,
+            conversation_state(false),
+        ));
+        assert!(rendered.contains("Failure"), "{rendered:?}");
+        assert!(!rendered.contains("Running"), "{rendered:?}");
     }
 
     fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
@@ -2451,11 +2451,6 @@ mod tests {
             " ",
             "a plain finished read carries no bar"
         );
-        assert_eq!(
-            accent_span(&plain, "read · Success").content,
-            " ",
-            "its result agrees with the call row"
-        );
         let thinking = accent_span(&plain, "Thinking");
         assert_eq!(thinking.content, "┃");
         assert_eq!(thinking.style.fg, Some(RolePalette::muted()));
@@ -2699,8 +2694,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             error_text,
-            vec!["Failure".to_owned(), "exit 1: command not found".to_owned()],
-            "outside the state channel only the failure itself is coloured"
+            vec!["Failure".to_owned()],
+            "the collapsed row spends the warning colour only on its terminal state"
         );
 
         for span in lines.iter().flat_map(|line| &line.spans) {
@@ -2735,10 +2730,6 @@ mod tests {
 
         let settled = settled_lines(false);
         assert_eq!(
-            span_style(&settled, "output collapsed").fg,
-            Some(RolePalette::muted())
-        );
-        assert_eq!(
             span_style(&settled, "Success").fg,
             Some(RolePalette::muted())
         );
@@ -2749,34 +2740,24 @@ mod tests {
     }
 
     #[test]
-    fn row_text_never_repeats_the_state_its_bullet_already_carries() {
-        let header_styles = |is_error: bool| {
-            let lines = settled_lines(is_error);
-            lines
-                .iter()
-                .find(|line| line_text(line).contains("cargo test"))
-                .map(|line| {
-                    line.spans
-                        .iter()
-                        .skip(2)
-                        .map(|span| span.style)
-                        .collect::<Vec<_>>()
-                })
-                .expect("the call header should render")
-        };
+    fn tool_row_text_and_bullet_update_to_the_same_terminal_state() {
+        let succeeded = settled_lines(false);
+        let failed = settled_lines(true);
         assert_eq!(
-            header_styles(false),
-            header_styles(true),
-            "the header's words read the same however the call ended"
+            span_style(&succeeded, "Success").fg,
+            Some(RolePalette::muted())
+        );
+        assert_eq!(
+            span_style(&failed, "Failure").fg,
+            Some(RolePalette::error())
         );
 
-        let succeeded = settled_lines(false);
         assert_eq!(
             bullet_style(&succeeded, "cargo test").fg,
             Some(RolePalette::success())
         );
         assert_eq!(
-            bullet_style(&settled_lines(true), "cargo test").fg,
+            bullet_style(&failed, "cargo test").fg,
             Some(RolePalette::error())
         );
         assert_eq!(

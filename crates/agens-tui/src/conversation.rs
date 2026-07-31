@@ -126,7 +126,7 @@ pub struct Conversation {
     pub subagent_cards: Vec<SubagentCard>,
     pub(super) items: Vec<ConversationItem>,
     last_was_tool_call: bool,
-    restored: bool,
+    settled: bool,
 }
 
 impl Conversation {
@@ -147,7 +147,7 @@ impl Conversation {
             errors: Vec::new(),
             subagent_cards: Vec::new(),
             last_was_tool_call: false,
-            restored: false,
+            settled: false,
         }
     }
     /// Reconstructs completed conversations from persisted messages.
@@ -194,7 +194,7 @@ impl Conversation {
                         conversations.push(conversation);
                     }
                     let mut conversation = Self::new(String::new());
-                    conversation.restored = true;
+                    conversation.settled = true;
                     for message in pending_system.drain(..) {
                         conversation.apply(ConversationEvent::Info(message))?;
                     }
@@ -266,8 +266,12 @@ impl Conversation {
         Ok(conversations)
     }
 
-    pub(crate) const fn is_restored(&self) -> bool {
-        self.restored
+    pub(crate) const fn is_settled(&self) -> bool {
+        self.settled
+    }
+
+    pub(crate) const fn mark_settled(&mut self) {
+        self.settled = true;
     }
 
     pub fn apply(&mut self, event: ConversationEvent) -> Result<(), ConversationError> {
