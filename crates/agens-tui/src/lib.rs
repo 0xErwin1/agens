@@ -3045,6 +3045,33 @@ fn ordered_selection(selection: TranscriptSelection) -> (TranscriptPosition, Tra
     }
 }
 
+struct MouseSelectionSnapshot {
+    transcript: SelectableTranscript,
+    content_x: u16,
+    content_y: u16,
+    content_right: u16,
+    content_bottom: u16,
+    scroll: u16,
+}
+
+impl MouseSelectionSnapshot {
+    fn position(&self, column: u16, row: u16) -> Option<TranscriptPosition> {
+        if row < self.content_y
+            || row >= self.content_bottom
+            || column < self.content_x
+            || column >= self.content_right
+        {
+            return None;
+        }
+        let absolute_row = usize::from(
+            self.scroll
+                .saturating_add(row.saturating_sub(self.content_y)),
+        );
+        self.transcript
+            .position_at(absolute_row, column.saturating_sub(self.content_x))
+    }
+}
+
 fn append_bounded_selection(output: &mut String, value: &str) -> Result<(), ()> {
     if output.len().saturating_add(value.len()) > MAX_SELECTION_COPY_BYTES {
         return Err(());
@@ -3226,6 +3253,7 @@ pub struct Tui<E> {
     pending_auto_turns: usize,
     now: Duration,
     next_runtime_ordinal: u64,
+    mouse_selection_snapshot: Option<MouseSelectionSnapshot>,
 }
 
 impl<E> Tui<E>
@@ -3281,6 +3309,7 @@ where
             pending_auto_turns: 0,
             now: Duration::ZERO,
             next_runtime_ordinal: 0,
+            mouse_selection_snapshot: None,
         }
     }
 
@@ -3289,6 +3318,7 @@ where
         match event {
             Event::Resize { width, height } => {
                 self.size = (width, height);
+                self.mouse_selection_snapshot = None;
                 self.clamp_palette_selection();
                 self.clamp_scroll_offset();
                 self.ensure_dialog_selection_visible();
@@ -4634,9 +4664,13 @@ where
     }
 
     fn begin_mouse_selection(&mut self, column: u16, row: u16) -> Action {
-        let Some(position) = self.mouse_selection_position(column, row) else {
+        let Some(snapshot) = self.capture_mouse_selection_snapshot() else {
             return Action::Render;
         };
+        let Some(position) = snapshot.position(column, row) else {
+            return Action::Render;
+        };
+        self.mouse_selection_snapshot = Some(snapshot);
         let record = self.active_record_mut();
         record.focus = TranscriptFocus::Viewport;
         record.selection = Some(TranscriptSelection {
@@ -4658,34 +4692,41 @@ where
         {
             return Action::Render;
         }
-        let Some(position) = self.mouse_selection_position(column, row) else {
-            if !dragging {
-                self.active_record_mut().selecting = false;
-            }
+        if let Some(position) = self
+            .mouse_selection_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.position(column, row))
+            && let Some(selection) = self.active_record_mut().selection.as_mut()
+        {
+            selection.head = position;
+        }
+        if dragging {
             return Action::Render;
-        };
+        }
+
         let selection = {
             let record = self.active_record_mut();
-            let Some(selection) = record.selection.as_mut() else {
-                return Action::Render;
-            };
-            selection.head = position;
-            record.selecting = dragging;
-            *selection
+            record.selecting = false;
+            record.selection
         };
-        let selected_text = self.selection_text(selection);
+        let selected_text = selection.and_then(|selection| {
+            self.mouse_selection_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.transcript.selected_text(selection))
+        });
+        self.mouse_selection_snapshot = None;
         let record = self.active_record_mut();
         match selected_text {
-            Ok(text) if !text.is_empty() => {
+            Some(Ok(text)) if !text.is_empty() => {
                 record.selection_text = Some(text);
                 record.selection_too_large = false;
             }
-            Ok(_) => {
+            Some(Ok(_)) | None => {
                 record.selection = None;
                 record.selection_text = None;
                 record.selection_too_large = false;
             }
-            Err(()) => {
+            Some(Err(())) => {
                 record.selection_text = None;
                 record.selection_too_large = true;
             }
@@ -4693,26 +4734,12 @@ where
         Action::Render
     }
 
-    fn mouse_selection_position(&self, column: u16, row: u16) -> Option<TranscriptPosition> {
+    fn capture_mouse_selection_snapshot(&self) -> Option<MouseSelectionSnapshot> {
         if self.dialog.is_some() || self.palette_open {
             return None;
         }
         let view = self.view();
         let layout = self.screen_layout();
-        let content_y = layout.transcript.y.saturating_add(1);
-        let content_bottom = layout
-            .transcript
-            .bottom()
-            .saturating_sub(TRANSCRIPT_CHROME_ROWS.saturating_sub(1));
-        let content_x = layout.transcript.x.saturating_add(TRANSCRIPT_ROW_INDENT);
-        if row < content_y
-            || row >= content_bottom
-            || column < content_x
-            || column >= layout.transcript.right()
-        {
-            return None;
-        }
-
         let row_width = layout
             .transcript
             .width
@@ -4733,20 +4760,18 @@ where
         } else {
             view.scroll_offset.min(bottom)
         };
-        let absolute_row = usize::from(scroll.saturating_add(row.saturating_sub(content_y)));
-        transcript.position_at(absolute_row, column.saturating_sub(content_x))
-    }
 
-    fn selection_text(&self, selection: TranscriptSelection) -> Result<String, ()> {
-        let view = self.view();
-        let layout = self.screen_layout();
-        let row_width = layout
-            .transcript
-            .width
-            .saturating_sub(TRANSCRIPT_ROW_INDENT)
-            .max(1);
-        SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width)
-            .selected_text(selection)
+        Some(MouseSelectionSnapshot {
+            transcript,
+            content_x: layout.transcript.x.saturating_add(TRANSCRIPT_ROW_INDENT),
+            content_y: layout.transcript.y.saturating_add(1),
+            content_right: layout.transcript.right(),
+            content_bottom: layout
+                .transcript
+                .bottom()
+                .saturating_sub(TRANSCRIPT_CHROME_ROWS.saturating_sub(1)),
+            scroll,
+        })
     }
 
     /// Applies ordered runtime progress without changing completed persistence semantics.
@@ -8478,11 +8503,14 @@ mod runtime_tests {
             tui.handle(Event::MouseDrag { column: 30, row: 1 }),
             Action::Render
         );
+        assert_eq!(tui.selected_text(), None);
+        assert!(tui.mouse_selection_snapshot.is_some());
         assert_eq!(
             tui.handle(Event::MouseUp { column: 30, row: 1 }),
             Action::Render
         );
         assert_eq!(tui.selected_text(), Some("café 🙂"));
+        assert!(tui.mouse_selection_snapshot.is_none());
         assert_eq!(
             tui.handle(Event::Key(Key::CtrlC)),
             Action::CopySelection("café 🙂".into())
