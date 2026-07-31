@@ -117,7 +117,13 @@ fn safe_diagnostic_entry(value: &serde_json::Value, relative_path: &str) -> Opti
         allowlisted_diagnostic_value(object.get("scope")?.as_str()?, &["parent", "subagent"])?;
     let component = allowlisted_diagnostic_value(
         object.get("component")?.as_str()?,
-        &["responses", "oauth_refresh", "subagent", "agent"],
+        &[
+            "responses",
+            "chat_completions",
+            "oauth_refresh",
+            "subagent",
+            "agent",
+        ],
     )?;
     let event = allowlisted_diagnostic_value(
         object.get("event")?.as_str()?,
@@ -207,6 +213,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agens_config::McpTransport;
+    use agens_providers::ProviderDiagnosticComponent;
     use agens_tools::{
         CommandCatalog, McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport,
         SkillCatalog,
@@ -363,6 +370,54 @@ mod tests {
             "{rendered:?}"
         );
         assert!(!rendered.contains("transport: transport:"), "{rendered:?}");
+    }
+
+    #[test]
+    fn safe_diagnostic_entry_allowlists_every_provider_diagnostic_component() {
+        fn entry_for_component(component: &str) -> Option<DialogEntry> {
+            let value = serde_json::json!({
+                "timestamp_ms": 1,
+                "reference": "abc12345",
+                "scope": "parent",
+                "component": component,
+                "event": "terminal",
+                "attempt": 1,
+                "max_attempts": 3,
+                "delay_ms": null,
+                "status": 429,
+                "class": "rate_limited",
+            });
+            safe_diagnostic_entry(&value, "diagnostics/agens-1.jsonl")
+        }
+
+        // Exhaustive match: adding a `ProviderDiagnosticComponent` variant makes this fail to
+        // compile until it is handled here too, so the allowlist below cannot silently drift
+        // from the real enum the way the previous string-literal list did.
+        fn component_as_str(component: ProviderDiagnosticComponent) -> &'static str {
+            match component {
+                ProviderDiagnosticComponent::Responses => component.as_str(),
+                ProviderDiagnosticComponent::ChatCompletions => component.as_str(),
+                ProviderDiagnosticComponent::OauthRefresh => component.as_str(),
+                ProviderDiagnosticComponent::Subagent => component.as_str(),
+                ProviderDiagnosticComponent::Agent => component.as_str(),
+            }
+        }
+
+        for component in [
+            ProviderDiagnosticComponent::Responses,
+            ProviderDiagnosticComponent::ChatCompletions,
+            ProviderDiagnosticComponent::OauthRefresh,
+            ProviderDiagnosticComponent::Subagent,
+            ProviderDiagnosticComponent::Agent,
+        ] {
+            let component_str = component_as_str(component);
+            assert!(
+                entry_for_component(component_str).is_some(),
+                "component {component_str} should yield a diagnostic entry"
+            );
+        }
+
+        assert!(entry_for_component("unknown_component").is_none());
     }
 
     #[cfg(unix)]
