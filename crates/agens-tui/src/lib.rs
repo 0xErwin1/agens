@@ -76,6 +76,7 @@ const TERMINAL_WHEEL_BATCH_BUDGET: usize = 64;
 const MOUSE_SCROLL_ROWS: u16 = 6;
 const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
+const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
 const MAX_SELECTION_COPY_BYTES: usize = 64 * 1024;
 
 const fn transcript_chrome_rows(following_bottom: bool) -> u16 {
@@ -662,6 +663,8 @@ pub struct ViewState<'a> {
     pub session_loading: bool,
     /// Whether the current assistant item can still receive ordered text deltas.
     pub assistant_streaming: bool,
+    /// Whether a second Ctrl+C inside the active warning window will quit.
+    pub quit_armed: bool,
     /// Conversation entries rendered in the order they occurred.
     pub transcript: &'a [TranscriptEntry],
     /// Whether new output advances to the bottom of the transcript.
@@ -2437,7 +2440,14 @@ fn screen_layout(area: Rect, input: &str, notice_shown: bool) -> ScreenLayout {
 /// Builds the notice row content, empty when nothing needs announcing.
 fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
     let mut left = Vec::new();
-    if state.recovered_failed_prompt {
+    if state.quit_armed {
+        left.push(Span::styled(
+            " Press Ctrl+C again to exit ",
+            Style::default()
+                .fg(widgets::RolePalette::warning())
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if state.recovered_failed_prompt {
         left.push(Span::styled(
             " Recovered failed prompt · Enter retry · Esc discard ",
             Style::default()
@@ -3219,6 +3229,7 @@ pub struct Tui<E> {
     running: bool,
     session_loading: bool,
     assistant_streaming: bool,
+    quit_armed_until: Option<Duration>,
     transcripts: BTreeMap<TranscriptId, TranscriptRecord>,
     active_transcript: TranscriptId,
     child_transcript_order: Vec<TranscriptId>,
@@ -3274,6 +3285,7 @@ where
             running: false,
             session_loading: false,
             assistant_streaming: false,
+            quit_armed_until: None,
             transcripts: BTreeMap::from([(TranscriptId::Main, TranscriptRecord::main())]),
             active_transcript: TranscriptId::Main,
             child_transcript_order: Vec::new(),
@@ -3334,10 +3346,12 @@ where
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
             Event::Paste(text) if self.secret_entry.is_some() => {
+                self.quit_armed_until = None;
                 self.append_secret_text(&text);
                 Action::Render
             }
             Event::Paste(text) => {
+                self.quit_armed_until = None;
                 let child_read_only = self.active_transcript != TranscriptId::Main
                     && (self.active_record_mut().terminal
                         || self.active_record_mut().focus != TranscriptFocus::Composer);
@@ -3439,6 +3453,9 @@ where
 
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
+        if self.quit_armed_until.is_some_and(|until| now >= until) {
+            self.quit_armed_until = None;
+        }
         if self
             .restored_syntax_ready_at
             .is_some_and(|ready_at| now >= ready_at)
@@ -3622,6 +3639,7 @@ where
         self.turn_started_at = Some(self.now);
         self.assistant_streaming = false;
         self.turn_state = None;
+        self.quit_armed_until = None;
     }
 
     pub fn begin_session_load(&mut self) -> bool {
@@ -4425,6 +4443,7 @@ where
             running: self.running,
             session_loading: self.session_loading,
             assistant_streaming: self.assistant_streaming,
+            quit_armed: self.quit_is_armed(),
             transcript: &active.transcript,
             following_bottom: active.following_bottom,
             scroll_offset: active.scroll_offset,
@@ -4979,6 +4998,9 @@ where
     }
 
     fn handle_key(&mut self, key: Key) -> Action {
+        if key != Key::CtrlC {
+            self.quit_armed_until = None;
+        }
         if key == Key::CtrlShiftC {
             return self.handle_copy_selection();
         }
@@ -5575,6 +5597,7 @@ where
     fn cancel_running(&mut self) -> Action {
         self.palette_open = false;
         self.engine.cancel();
+        self.quit_armed_until = None;
         self.turn_state = Some(TurnState::Cancelled);
         Action::Cancel
     }
@@ -5594,11 +5617,21 @@ where
     }
 
     fn handle_control_c(&mut self) -> Action {
-        if self.running || self.has_active_execution() {
-            self.engine.cancel();
-            self.turn_state = Some(TurnState::Cancelled);
+        if self.quit_is_armed() {
+            self.quit_armed_until = None;
+            if self.running || self.has_active_execution() {
+                self.engine.cancel();
+                self.turn_state = Some(TurnState::Cancelled);
+            }
+            return Action::Quit;
         }
-        Action::Quit
+
+        self.quit_armed_until = Some(self.now.saturating_add(EXIT_WARNING_WINDOW));
+        Action::Render
+    }
+
+    fn quit_is_armed(&self) -> bool {
+        self.quit_armed_until.is_some_and(|until| self.now < until)
     }
 
     fn has_active_execution(&self) -> bool {
@@ -6721,9 +6754,10 @@ where
     renderer.render(tui.view())?;
 
     loop {
+        let quit_armed = tui.quit_is_armed();
         let status = tui.status.clone();
         tui.tick(started.elapsed());
-        if status != tui.status {
+        if quit_armed && !tui.quit_is_armed() || status != tui.status {
             renderer.render(tui.view())?;
         }
         let event = if let Some(event) = pending_event.take() {
@@ -6784,9 +6818,10 @@ where
     let mut pending_event = None;
 
     loop {
+        let quit_armed = tui.quit_is_armed();
         let status = tui.status.clone();
         tui.tick(started.elapsed());
-        if status != tui.status {
+        if quit_armed && !tui.quit_is_armed() || status != tui.status {
             renderer.render(tui.view())?;
         }
         while let Ok(result) = receiver.try_recv() {
@@ -6906,14 +6941,17 @@ where
     R: Renderer,
 {
     let execution_count = tui.executions.len();
+    let quit_armed = tui.quit_is_armed();
     let restored_syntax_ready = tui.highlight_restored_syntax;
     let status = tui.status.clone();
     tui.tick(now);
     let expired_execution = tui.executions.len() != execution_count;
+    let expired_quit_warning = quit_armed && !tui.quit_is_armed();
     let restored_syntax_became_ready = !restored_syntax_ready && tui.highlight_restored_syntax;
     let status_changed = status != tui.status;
     if !dirty
         && !expired_execution
+        && !expired_quit_warning
         && !restored_syntax_became_ready
         && !status_changed
         && !schedule.heartbeat_due(now, tui.running)
@@ -7938,7 +7976,7 @@ mod runtime_tests {
     #[test]
     fn runtime_coalesces_a_wheel_burst_into_one_scroll_frame() {
         let events = std::iter::repeat_n(Event::MouseWheel(MouseWheelDirection::Up), 20)
-            .chain([Event::Key(Key::CtrlC)]);
+            .chain([Event::Key(Key::CtrlC), Event::Key(Key::CtrlC)]);
         let (terminal, _) = EventRuntime::new(events);
         let mut tui = Tui::new(NoopEngine);
         tui.handle(Event::Resize {
@@ -7961,8 +7999,8 @@ mod runtime_tests {
         );
         assert_eq!(
             renderer.frames.len(),
-            2,
-            "initial and one coalesced wheel frame before Ctrl+C exits"
+            3,
+            "initial, one coalesced wheel frame, and the armed-quit frame"
         );
     }
 
@@ -8123,9 +8161,30 @@ mod runtime_tests {
     }
 
     #[test]
-    fn plain_control_c_quits_without_arming_a_warning() {
+    fn control_c_requires_a_second_press_and_the_warning_expires() {
         let mut tui = Tui::new(NoopEngine);
+        let mut renderer = RecordingRenderer::default();
+        let mut schedule = FrameSchedule::default();
 
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert!(tui.view().quit_armed);
+        assert!(
+            render_progress_frame(&mut tui, &mut renderer, &mut schedule, Duration::ZERO, true)
+                .unwrap()
+        );
+        assert!(
+            render_progress_frame(
+                &mut tui,
+                &mut renderer,
+                &mut schedule,
+                EXIT_WARNING_WINDOW,
+                false,
+            )
+            .unwrap()
+        );
+        assert!(!tui.view().quit_armed);
+
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     }
 
@@ -8679,6 +8738,7 @@ mod runtime_tests {
             tui.handle(Event::Key(Key::CtrlShiftC)),
             Action::CopySelection("café 🙂".into())
         );
+        assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Render);
         assert_eq!(tui.handle(Event::Key(Key::CtrlC)), Action::Quit);
     }
 
@@ -9469,7 +9529,7 @@ mod runtime_tests {
     }
 
     #[test]
-    fn secret_entry_escape_closes_while_ctrl_c_exits_globally() {
+    fn secret_entry_escape_closes_while_double_ctrl_c_exits_globally() {
         let mut escape = Tui::new(NoopEngine);
         escape.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
         escape.handle(Event::Paste("SECRET_CANCEL_SENTINEL".into()));
@@ -9478,6 +9538,8 @@ mod runtime_tests {
 
         let mut control_c = Tui::new(NoopEngine);
         control_c.apply_submission_outcome(TuiSubmissionOutcome::SecretEntry(secret_entry_view()));
+        assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Render);
+        assert!(control_c.view().secret_entry.is_some());
         assert_eq!(control_c.handle(Event::Key(Key::CtrlC)), Action::Quit);
     }
 

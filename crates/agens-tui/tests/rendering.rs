@@ -3174,15 +3174,18 @@ fn physical_cursor_follows_main_composer_focus_and_overlay_ownership() {
 }
 
 #[test]
-fn control_c_exits_without_rendering_a_confirmation_notice() {
+fn first_control_c_renders_a_confirmation_notice_instead_of_exiting() {
     let terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
 
-    assert_eq!(tui.handle(Event::Key(Key::CtrlC)), agens_tui::Action::Quit);
+    assert_eq!(
+        tui.handle(Event::Key(Key::CtrlC)),
+        agens_tui::Action::Render
+    );
     renderer.render(tui.view()).unwrap();
 
-    assert!(!rendered_text(&renderer).contains("Press Ctrl+C again to exit"));
+    assert!(rendered_text(&renderer).contains("Press Ctrl+C again to exit"));
 }
 
 #[test]

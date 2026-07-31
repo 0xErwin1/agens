@@ -66,6 +66,7 @@ pub enum Effect {
     /// Present a deterministic refusal without mutating history.
     RefusePrompt(String),
     CancelTurn,
+    ExitWarning,
     Quit,
     Render,
     /// The open dialog consumed this key.
@@ -87,6 +88,7 @@ pub struct AppState {
     completed_history: Vec<(String, String)>,
     composer: String,
     dialog: Option<Dialog>,
+    exit_armed_until: Option<Instant>,
 }
 
 impl AppState {
@@ -102,6 +104,7 @@ impl AppState {
             completed_history: Vec::new(),
             composer: String::new(),
             dialog: None,
+            exit_armed_until: None,
         }
     }
 
@@ -113,12 +116,20 @@ impl AppState {
             AppEvent::TurnCancelled | AppEvent::TurnFailed => {
                 self.runtime = Runtime::Idle;
                 self.active_prompt = None;
+                self.disarm_exit();
                 self.begin_next_queued_turn().into_iter().collect()
             }
             AppEvent::Key(key, now) => self.key(key, now),
             AppEvent::Command(command, now) => self.command(command, now),
             AppEvent::ResetSucceeded => self.reset_after_backend_success(),
-            AppEvent::TimerTick(_) => Vec::new(),
+            AppEvent::TimerTick(now) => {
+                if self.exit_armed_until.is_some_and(|until| now >= until) {
+                    self.disarm_exit();
+                    vec![Effect::Render]
+                } else {
+                    Vec::new()
+                }
+            }
         }
     }
 
@@ -139,6 +150,7 @@ impl AppState {
 
     pub fn set_composer(&mut self, composer: impl Into<String>) {
         self.composer = composer.into();
+        self.disarm_exit();
     }
 
     pub fn composer(&self) -> &str {
@@ -147,6 +159,7 @@ impl AppState {
 
     pub fn set_dialog(&mut self, dialog: Option<Dialog>) {
         self.dialog = dialog;
+        self.disarm_exit();
     }
 
     pub const fn dialog(&self) -> Option<&Dialog> {
@@ -154,6 +167,7 @@ impl AppState {
     }
 
     fn submit_prompt(&mut self, prompt: String) -> Vec<Effect> {
+        self.disarm_exit();
         if self.runtime == Runtime::Idle {
             self.active_prompt = Some(prompt.clone());
             self.runtime = Runtime::Running;
@@ -171,6 +185,7 @@ impl AppState {
     }
 
     fn complete_turn(&mut self, output: String) -> Vec<Effect> {
+        self.disarm_exit();
         let Some(prompt) = self.active_prompt.take() else {
             return Vec::new();
         };
@@ -192,6 +207,7 @@ impl AppState {
 
         self.active_prompt = Some(next_prompt.clone());
         self.runtime = Runtime::Running;
+        self.disarm_exit();
 
         Some(Effect::StartPrompt(next_prompt))
     }
@@ -225,6 +241,7 @@ impl AppState {
             return self.control_c(now);
         }
 
+        self.disarm_exit();
         if command == Command::New {
             return vec![Effect::ResetConversation];
         }
@@ -236,6 +253,7 @@ impl AppState {
         if key == Key::CtrlC {
             return Some(self.global_command(Command::ControlC, now));
         }
+        self.disarm_exit();
         None
     }
 
@@ -267,7 +285,10 @@ impl AppState {
                 Some(vec![Effect::Render])
             }
             (_, Key::CtrlC) => None,
-            _ => Some(vec![Effect::DialogKey(key)]),
+            _ => {
+                self.disarm_exit();
+                Some(vec![Effect::DialogKey(key)])
+            }
         }
     }
 
@@ -289,13 +310,19 @@ impl AppState {
         }
     }
 
-    fn control_c(&mut self, _now: Instant) -> Vec<Effect> {
-        let mut effects = Vec::with_capacity(2);
-        if self.runtime == Runtime::Running {
-            effects.push(Effect::CancelTurn);
+    fn control_c(&mut self, now: Instant) -> Vec<Effect> {
+        if self.exit_armed_until.is_some_and(|until| now < until) {
+            self.disarm_exit();
+            let mut effects = Vec::with_capacity(2);
+            if self.runtime == Runtime::Running {
+                effects.push(Effect::CancelTurn);
+            }
+            effects.push(Effect::Quit);
+            return effects;
         }
-        effects.push(Effect::Quit);
-        effects
+
+        self.exit_armed_until = Some(now + crate::EXIT_WARNING_WINDOW);
+        vec![Effect::ExitWarning]
     }
 
     fn reset_after_backend_success(&mut self) -> Vec<Effect> {
@@ -305,8 +332,13 @@ impl AppState {
         self.completed_history.clear();
         self.composer.clear();
         self.dialog = None;
+        self.disarm_exit();
 
         vec![Effect::Render]
+    }
+
+    fn disarm_exit(&mut self) {
+        self.exit_armed_until = None;
     }
 }
 
