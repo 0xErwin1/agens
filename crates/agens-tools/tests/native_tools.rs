@@ -1057,6 +1057,16 @@ fn grep_uses_regex_filters_and_skips_binary_and_git_files() {
         ToolOutput::success("src/main.rs:1:Needle\nsrc/main.rs:2:needle\n")
     );
     assert_eq!(
+        tools
+            .grep(
+                GrepInput::new("^needle$")
+                    .with_path("src/main.rs")
+                    .with_case_insensitive(true),
+            )
+            .unwrap(),
+        ToolOutput::success("src/main.rs:1:Needle\nsrc/main.rs:2:needle\n")
+    );
+    assert_eq!(
         tools.grep(GrepInput::new("[")).unwrap(),
         ToolOutput::failure("grep: invalid regex")
     );

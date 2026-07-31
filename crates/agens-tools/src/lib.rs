@@ -112,6 +112,22 @@ type EditTestHook = Box<dyn FnOnce(&fs::File, &std::ffi::CString) + Send>;
 static EDIT_TEST_HOOK: Mutex<Option<(EditTestHookPoint, EditTestHook)>> = Mutex::new(None);
 
 #[cfg(all(test, unix))]
+static GREP_TEST_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+#[cfg(all(test, unix))]
+fn set_grep_test_hook(hook: impl FnOnce() + Send + 'static) {
+    *GREP_TEST_HOOK.lock().unwrap() = Some(Box::new(hook));
+}
+
+#[cfg(all(test, unix))]
+fn run_grep_test_hook() {
+    let hook = GREP_TEST_HOOK.lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, unix))]
 fn set_edit_test_hook(
     point: EditTestHookPoint,
     hook: impl FnOnce(&fs::File, &std::ffi::CString) + Send + 'static,
@@ -4074,21 +4090,25 @@ impl NativeTools {
             },
             None => None,
         };
-        let directory = match input.path {
+        let target = match input.path {
             Some(path) => match self.resolve_existing(&path) {
                 Ok(path) => path,
                 Err(output) => return Ok(output),
             },
             None => self.project_root.clone(),
         };
-        if !directory.is_dir() {
-            return Ok(ToolOutput::failure("grep: path is not a directory"));
-        }
 
         let mut files = Vec::new();
         let mut budget = SearchBudget::new(&self.limits, "grep");
-        if let Err(output) = self.collect_tool_files(&directory, &mut budget, &mut files) {
-            return Ok(output);
+        let single_file = target.is_file();
+        if single_file {
+            files.push(target);
+        } else if target.is_dir() {
+            if let Err(output) = self.collect_tool_files(&target, &mut budget, &mut files) {
+                return Ok(output);
+            }
+        } else {
+            return Ok(ToolOutput::failure("grep: path is not a file or directory"));
         }
 
         let mut results = Vec::new();
@@ -4108,14 +4128,31 @@ impl NativeTools {
             if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES) {
                 continue;
             }
-            let content = match fs::read(&path) {
-                Ok(content) if !content.contains(&0) => content,
-                Ok(_) => continue,
-                Err(error) => return Ok(ToolOutput::failure(format!("grep: {error}"))),
-            };
-            let content = match std::str::from_utf8(&content) {
-                Ok(content) => content,
-                Err(_) => continue,
+            let content = if single_file {
+                #[cfg(all(test, unix))]
+                run_grep_test_hook();
+
+                #[cfg(unix)]
+                match read_grep_file_confined(&self.project_root_dir, relative) {
+                    Ok(Some(content)) => content,
+                    Ok(None) => continue,
+                    Err(output) => return Ok(output),
+                }
+
+                #[cfg(not(unix))]
+                return Ok(ToolOutput::failure(
+                    "grep: secure confined reads are unavailable on this platform",
+                ));
+            } else {
+                let content = match fs::read(&path) {
+                    Ok(content) if !content.contains(&0) => content,
+                    Ok(_) => continue,
+                    Err(error) => return Ok(ToolOutput::failure(format!("grep: {error}"))),
+                };
+                match String::from_utf8(content) {
+                    Ok(content) => content,
+                    Err(_) => continue,
+                }
             };
             for (line, text) in content.lines().enumerate() {
                 if let Err(output) = budget.check_deadline() {
@@ -5187,6 +5224,29 @@ impl SearchBudget {
 }
 
 #[cfg(unix)]
+fn read_grep_file_confined(
+    project_root: &fs::File,
+    path: &Path,
+) -> Result<Option<String>, ToolOutput> {
+    let (directory, file_name) = open_confined_parent(project_root, path, false, "grep")?;
+    let mut file = open_confined_file(&directory, &file_name, "grep")?;
+    let metadata = checked_regular_file(&file, "grep")?;
+    if metadata.len() > MAX_FILE_BYTES {
+        return Ok(None);
+    }
+
+    let mut content = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut content)
+        .map_err(|error| ToolOutput::failure(format!("grep: {error}")))?;
+    if content.len() > MAX_FILE_BYTES as usize || content.contains(&0) {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(content).ok())
+}
+
+#[cfg(unix)]
 fn read_file_confined(
     project_root: &fs::File,
     input: &ReadFileInput,
@@ -5506,6 +5566,31 @@ mod native_tool_tests {
 
     fn temp_name(sequence: usize) -> PathBuf {
         PathBuf::from(format!(".agens-edit-{}-{sequence}", std::process::id()))
+    }
+
+    #[test]
+    fn single_file_grep_rejects_a_symlink_swap_after_path_validation() {
+        let root = project_root();
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("target.txt"), "safe").unwrap();
+        fs::write(outside.join("secret.txt"), "SENTINEL_OUTSIDE").unwrap();
+        let tools = NativeTools::open(&root).unwrap();
+        let target = root.join("target.txt");
+        let outside_target = outside.join("secret.txt");
+        set_grep_test_hook(move || {
+            fs::remove_file(&target).unwrap();
+            symlink(outside_target, target).unwrap();
+        });
+
+        let failure = tools
+            .grep(GrepInput::new("SENTINEL_OUTSIDE").with_path("target.txt"))
+            .expect("grep failures should remain tool results");
+        assert_eq!(failure, ToolOutput::failure("path: outside project root"));
+        assert!(!failure.content.contains("SENTINEL_OUTSIDE"));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
