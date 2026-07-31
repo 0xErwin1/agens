@@ -2,10 +2,16 @@
 //!
 //! Detection matches credential-SHAPED VALUES rather than keywords, so prose like
 //! "request exceeds 128000 tokens" survives untouched while a real `sk-`-prefixed key,
-//! bearer token, JWT, or long high-entropy string is replaced. Only the matched value is
+//! bearer token, JWT, or credential-keyed value is replaced. Only the matched value is
 //! ever removed: the surrounding text, and for the key/value shape the key and operator
 //! themselves, always survive. This module is pure text transformation with no I/O, so it
 //! is reachable from every crate in the redaction-consuming graph without adding an edge.
+//!
+//! Detection requires context: a known credential-key prefix, a `Bearer` token, a JWT, or a
+//! credential-keyed pair. There is no standalone high-entropy rule — a raw key with no prefix
+//! and no preceding credential key is not distinguishable from other high-entropy text (a
+//! padded base64 blob, for example) on shape alone, so it is accepted as a residual risk
+//! rather than mangling unrelated content.
 
 const CREDENTIAL_KEYS: [&str; 8] = [
     "api_key",
@@ -313,11 +319,6 @@ fn apply_single_token_rules(
 
         if let Some(redacted) = redact_inline_key_value(word) {
             replacements[index] = Some(redacted);
-            continue;
-        }
-
-        if is_high_entropy_token(word) {
-            replacements[index] = Some(redacted_marker(word));
         }
     }
 }
@@ -351,6 +352,14 @@ fn is_prefixed_key(word: &str) -> bool {
     })
 }
 
+/// A `:` that forms part of a `::` run never binds a credential key: Rust's path-qualification
+/// operator is not a key/value operator, and a credential key/value pair always binds with a
+/// single `:` or `=`. This is what lets a Rust-qualified path such as
+/// `agens_auth::secret::TokenStore::load` survive even though `secret` is a credential key.
+fn is_glued_double_colon(word: &str, colon_offset: usize) -> bool {
+    word[..colon_offset].ends_with(':') || word[colon_offset + 1..].starts_with(':')
+}
+
 /// Finds the byte offset of the `=`/`:` that actually binds a credential key inside a single
 /// glued token, rather than assuming it is the first such character in the token. This
 /// matters for shapes like a URL query string, where the first `:` is the scheme separator
@@ -358,6 +367,9 @@ fn is_prefixed_key(word: &str) -> bool {
 fn find_inline_credential_key_operator(word: &str) -> Option<usize> {
     for (operator_offset, operator_char) in word.char_indices() {
         if operator_char != '=' && operator_char != ':' {
+            continue;
+        }
+        if operator_char == ':' && is_glued_double_colon(word, operator_offset) {
             continue;
         }
 
@@ -404,31 +416,6 @@ fn redact_inline_key_value(word: &str) -> Option<String> {
         "{prefix}{operator}{}",
         redacted_marker(redaction_value)
     ))
-}
-
-fn is_high_entropy_token(word: &str) -> bool {
-    if word.chars().count() < 32 {
-        return false;
-    }
-
-    let mut has_digit = false;
-    let mut has_upper = false;
-    let mut has_lower = false;
-
-    for character in word.chars() {
-        if !is_high_entropy_char(character) {
-            return false;
-        }
-        has_digit |= character.is_ascii_digit();
-        has_upper |= character.is_ascii_uppercase();
-        has_lower |= character.is_ascii_lowercase();
-    }
-
-    has_digit && has_upper && has_lower
-}
-
-fn is_high_entropy_char(character: char) -> bool {
-    character.is_ascii_alphanumeric() || matches!(character, '+' | '=' | '_' | '-')
 }
 
 /// Replaces leading-`/`, `~/`, and Windows drive (`C:\`) tokens with `[path]`, leaving
@@ -494,7 +481,6 @@ mod tests {
         let equals_value = "SuperSecretValue123";
         let spaced_colon_value = "hunter2VeryLongSecretValue";
         let glued_colon_value = "TopSecretValue999";
-        let high_entropy_token = "Aa1".repeat(11);
         let opaque_bearer_token = "abcdefghijklmnopqrstuvwx";
         let quoted_api_key_value = "hunter2short";
         let quoted_password_value = "hunter2";
@@ -621,14 +607,6 @@ mod tests {
                 ),
             ),
             (
-                "high entropy token",
-                format!("token {high_entropy_token} received"),
-                format!(
-                    "token [redacted: {} characters] received",
-                    high_entropy_token.chars().count()
-                ),
-            ),
-            (
                 "negative: exceeds tokens sentence survives verbatim",
                 "request exceeds 128000 tokens".to_owned(),
                 "request exceeds 128000 tokens".to_owned(),
@@ -697,6 +675,14 @@ mod tests {
             (
                 "bash stdout/stderr/exit-status shape",
                 "[stdout]\nbuild ok\n[stderr]\n\n[exit status: 127]",
+            ),
+            (
+                "Rust backtrace line with a ::secret:: segment",
+                "2: at agens_auth::secret::TokenStore::load",
+            ),
+            (
+                "padded base64 blob with no slash",
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
             ),
         ];
 
