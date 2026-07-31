@@ -644,10 +644,24 @@ impl TranscriptRecord {
     }
 }
 
+/// Hands out a transcript generation no other transcript can be addressed by.
+///
+/// Cached descriptions of settled turns are addressed by position, and the
+/// cache outlives any one [`Tui`]: a counter starting from zero per instance
+/// would let a second transcript read the first one's rows at the same index.
+fn next_transcript_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// State passed to renderers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewState<'a> {
     pub active_transcript: TranscriptId,
+    /// Bumped whenever retained conversations are dropped or replaced wholesale,
+    /// so cached descriptions of settled turns cannot outlive the history they
+    /// belong to.
+    pub transcript_generation: u64,
     pub transcript_ids: Vec<TranscriptId>,
     /// Owner label for the active primary viewport.
     pub owner_label: &'a str,
@@ -2770,19 +2784,26 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         }
         turn_lines.extend(lines);
     };
-    for conversation in state.completed_conversations {
-        append_turn(render::conversation_lines(
-            conversation,
-            &[],
-            state.tool_display_modes,
-            row_width,
-            render::ConversationRenderState {
-                collapse_thinking: state.collapse_thinking,
-                thinking_streaming: false,
-                assistant_streaming: !state.highlight_restored_syntax,
-                now: state.now,
-            },
-        ));
+    for (index, conversation) in state.completed_conversations.iter().enumerate() {
+        append_turn(
+            render::settled_conversation_lines(
+                render::SettledConversation {
+                    generation: state.transcript_generation,
+                    transcript: state.active_transcript,
+                    index,
+                },
+                conversation,
+                state.tool_display_modes,
+                row_width,
+                render::ConversationRenderState {
+                    collapse_thinking: state.collapse_thinking,
+                    thinking_streaming: false,
+                    assistant_streaming: !state.highlight_restored_syntax,
+                    now: state.now,
+                },
+            )
+            .to_vec(),
+        );
     }
     if let Some(conversation) = state.conversation {
         append_turn(render::conversation_lines(
@@ -3232,6 +3253,7 @@ pub struct Tui<E> {
     quit_armed_until: Option<Duration>,
     transcripts: BTreeMap<TranscriptId, TranscriptRecord>,
     active_transcript: TranscriptId,
+    transcript_generation: u64,
     child_transcript_order: Vec<TranscriptId>,
     transcript: Vec<TranscriptEntry>,
     provider_model: String,
@@ -3288,6 +3310,7 @@ where
             quit_armed_until: None,
             transcripts: BTreeMap::from([(TranscriptId::Main, TranscriptRecord::main())]),
             active_transcript: TranscriptId::Main,
+            transcript_generation: next_transcript_generation(),
             child_transcript_order: Vec::new(),
             transcript: Vec::new(),
             provider_model: String::new(),
@@ -3919,6 +3942,7 @@ where
 
     /// Clears the current visible conversation for a new session.
     pub fn clear_transcript(&mut self) {
+        self.invalidate_settled_conversations();
         self.transcript.clear();
         self.completed_conversations.clear();
         self.conversation = None;
@@ -3946,6 +3970,7 @@ where
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
             .collect::<Vec<_>>();
+        self.invalidate_settled_conversations();
         self.transcript.clear();
         self.completed_conversations = conversations;
         self.conversation = None;
@@ -4348,7 +4373,17 @@ where
         }
     }
 
+    /// Retires cached descriptions of settled turns before their history changes.
+    ///
+    /// Cached rows are addressed by position, so dropping or replacing retained
+    /// conversations has to move the whole transcript to a new generation rather
+    /// than leave a stale entry addressable at the same index.
+    fn invalidate_settled_conversations(&mut self) {
+        self.transcript_generation = next_transcript_generation();
+    }
+
     fn clear_current_session_transcripts(&mut self) {
+        self.invalidate_settled_conversations();
         self.transcripts.clear();
         self.transcripts
             .insert(TranscriptId::Main, TranscriptRecord::main());
@@ -4433,6 +4468,7 @@ where
             .expect("active transcript always exists");
         ViewState {
             active_transcript: self.active_transcript,
+            transcript_generation: self.transcript_generation,
             transcript_ids: std::iter::once(TranscriptId::Main)
                 .chain(self.child_transcript_order.iter().copied())
                 .collect(),

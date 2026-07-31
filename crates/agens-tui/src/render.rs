@@ -29,6 +29,7 @@ use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEve
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
+const SETTLED_CONVERSATION_CACHE_MAX_ENTRIES: usize = 96;
 const SYNTAX_CACHE_MAX_ENTRIES: usize = 64;
 const SYNTAX_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const SYNTAX_DEFER_SOURCE_BYTES: usize = 4 * 1024;
@@ -40,6 +41,99 @@ pub(super) struct ConversationRenderState {
     pub thinking_streaming: bool,
     pub assistant_streaming: bool,
     pub now: Duration,
+}
+
+/// Identifies one settled conversation across frames.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct SettledConversation {
+    pub generation: u64,
+    pub transcript: crate::TranscriptId,
+    pub index: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SettledConversationKey {
+    conversation: SettledConversation,
+    content_width: u16,
+    collapse_thinking: bool,
+    assistant_streaming: bool,
+    display_modes: u64,
+}
+
+thread_local! {
+    static SETTLED_CONVERSATION_CACHE: std::cell::RefCell<
+        VecDeque<(SettledConversationKey, Arc<[Line<'static>]>)>,
+    > = const { std::cell::RefCell::new(VecDeque::new()) };
+}
+
+/// Described lines for a conversation that can no longer change, reused across frames.
+///
+/// The transcript is rebuilt on every frame, so without this a long session pays
+/// a full markdown parse and layout pass for its whole history on each animation
+/// tick. A conversation only qualifies once nothing in it is still animating:
+/// any unfinished tool call or subagent card keeps its rows tied to the frame
+/// clock, and those are described live.
+pub(super) fn settled_conversation_lines(
+    identity: SettledConversation,
+    conversation: &Conversation,
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    content_width: u16,
+    state: ConversationRenderState,
+) -> Arc<[Line<'static>]> {
+    if !is_settled(conversation) {
+        return conversation_lines(conversation, &[], tool_display_modes, content_width, state)
+            .into();
+    }
+
+    let mut hasher = DefaultHasher::new();
+    for (call_id, mode) in tool_display_modes {
+        call_id.hash(&mut hasher);
+        std::mem::discriminant(mode).hash(&mut hasher);
+    }
+    let key = SettledConversationKey {
+        conversation: identity,
+        content_width,
+        collapse_thinking: state.collapse_thinking,
+        assistant_streaming: state.assistant_streaming,
+        display_modes: hasher.finish(),
+    };
+
+    let cached = SETTLED_CONVERSATION_CACHE.with_borrow(|cache| {
+        cache
+            .iter()
+            .find(|(entry, _)| *entry == key)
+            .map(|(_, lines)| Arc::clone(lines))
+    });
+    if let Some(lines) = cached {
+        return lines;
+    }
+
+    #[cfg(test)]
+    SETTLED_CONVERSATION_RENDERS.with(|renders| renders.set(renders.get() + 1));
+
+    let lines: Arc<[Line<'static>]> =
+        conversation_lines(conversation, &[], tool_display_modes, content_width, state).into();
+    SETTLED_CONVERSATION_CACHE.with_borrow_mut(|cache| {
+        while cache.len() >= SETTLED_CONVERSATION_CACHE_MAX_ENTRIES {
+            cache.pop_front();
+        }
+        cache.push_back((key, Arc::clone(&lines)));
+    });
+
+    lines
+}
+
+/// Whether every row of a conversation is frozen: no spinner, no live elapsed time.
+fn is_settled(conversation: &Conversation) -> bool {
+    conversation
+        .subagent_cards
+        .iter()
+        .all(|card| card.status.is_some() && card.terminal_at.is_some())
+        && conversation
+            .tool_batches
+            .iter()
+            .flat_map(|batch| &batch.calls)
+            .all(|call| call.result.is_some())
 }
 
 pub(super) fn conversation_lines(
@@ -2275,6 +2369,18 @@ fn result_color(result: ToolResultState) -> Color {
 thread_local! {
     static SYNTAX_HIGHLIGHT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOOL_BODY_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SETTLED_CONVERSATION_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_settled_conversation_test_state() {
+    SETTLED_CONVERSATION_CACHE.with_borrow_mut(VecDeque::clear);
+    SETTLED_CONVERSATION_RENDERS.with(|renders| renders.set(0));
+}
+
+#[cfg(test)]
+fn settled_conversation_test_renders() -> usize {
+    SETTLED_CONVERSATION_RENDERS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -2858,6 +2964,72 @@ mod tests {
                 now: Duration::ZERO,
             },
         )
+    }
+
+    fn cached_settled_lines(
+        conversation: &Conversation,
+        identity: SettledConversation,
+    ) -> Arc<[Line<'static>]> {
+        settled_conversation_lines(
+            identity,
+            conversation,
+            &BTreeMap::new(),
+            80,
+            ConversationRenderState {
+                collapse_thinking: true,
+                thinking_streaming: false,
+                assistant_streaming: false,
+                now: Duration::ZERO,
+            },
+        )
+    }
+
+    fn settled_identity(index: usize, generation: u64) -> SettledConversation {
+        SettledConversation {
+            generation,
+            transcript: crate::TranscriptId::Main,
+            index,
+        }
+    }
+
+    #[test]
+    fn a_settled_turn_is_described_once_and_reused_across_frames() {
+        reset_settled_conversation_test_state();
+        let conversation = settled_conversation(false);
+
+        let first = cached_settled_lines(&conversation, settled_identity(0, 0));
+        let second = cached_settled_lines(&conversation, settled_identity(0, 0));
+
+        assert_eq!(settled_conversation_test_renders(), 1);
+        assert_eq!(joined(&first), joined(&second));
+    }
+
+    #[test]
+    fn a_new_generation_retires_cached_rows_addressed_at_the_same_index() {
+        reset_settled_conversation_test_state();
+        let first = settled_conversation(false);
+        let replacement = settled_conversation(true);
+
+        let described = cached_settled_lines(&first, settled_identity(0, 0));
+        let redescribed = cached_settled_lines(&replacement, settled_identity(0, 1));
+
+        assert_eq!(settled_conversation_test_renders(), 2);
+        assert_ne!(joined(&described), joined(&redescribed));
+    }
+
+    #[test]
+    fn an_unfinished_turn_is_described_live_instead_of_cached() {
+        reset_settled_conversation_test_state();
+        let running = read_conversation(&["src/main.rs"]);
+
+        cached_settled_lines(&running, settled_identity(0, 0));
+        cached_settled_lines(&running, settled_identity(0, 0));
+
+        assert_eq!(
+            settled_conversation_test_renders(),
+            0,
+            "a turn with an unresolved tool call never enters the cache"
+        );
     }
 
     #[test]
