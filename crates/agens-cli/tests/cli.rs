@@ -1975,14 +1975,20 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
     let data_directory = temporary.path().join("data");
     std::fs::create_dir_all(project_root.join(".git")).expect("project marker should exist");
     std::fs::create_dir_all(&config_home).expect("config directory should exist");
-    let server = BoundedScriptedOpenAiMockServer::start(vec![ScriptedOpenAiResponse {
-        required_body_fragments: vec!["parent unavailable child".into(), "task".into()],
-        response: native_tool_call_response(
-            "task-unavailable",
-            "task",
-            r#"{"agent":"explore","model":"gpt-4o","description":"must not run"}"#,
-        ),
-    }]);
+    let server = BoundedScriptedOpenAiMockServer::start(vec![
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["parent unavailable child".into(), "task".into()],
+            response: native_tool_call_response(
+                "task-unavailable",
+                "task",
+                r#"{"agent":"explore","model":"gpt-4o","description":"must not run"}"#,
+            ),
+        },
+        ScriptedOpenAiResponse {
+            required_body_fragments: vec!["task: requested model is unavailable".into()],
+            response: text_response("parent recovered from unavailable child"),
+        },
+    ]);
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -2007,10 +2013,12 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
         .expect("production binary should run");
     server.join();
 
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("error: task: requested model is unavailable [ref: "));
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "parent recovered from unavailable child\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     let model_events = diagnostic_json_events(&data_directory)
         .into_iter()
         .filter(|event| {
@@ -2028,8 +2036,6 @@ fn unavailable_explicit_child_model_is_diagnosed_once_without_a_child_provider_r
     );
     assert_eq!(model_events[0]["attempt"], 0);
     assert_eq!(model_events[0]["max_attempts"], 0);
-    let reference = model_events[0]["reference"].as_str().unwrap();
-    assert!(stderr.contains(&format!("[ref: {reference}]")));
     assert!(
         diagnostic_json_events(&data_directory)
             .into_iter()
@@ -2113,7 +2119,7 @@ fn production_task_cancellation_prevents_parent_continuation_and_persists_emitte
 }
 
 #[test]
-fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
+fn production_task_provider_failure_is_sanitized_and_returns_control_to_the_parent() {
     let temporary = TemporaryDirectory::new("production-task-provider-failure");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -2137,6 +2143,10 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
         required_body_fragments: vec!["child provider failure".into()],
         response: "HTTP/1.1 500 Internal Server Error\r\nX-Remote-Secret: SENTINEL_HEADER\r\nContent-Length: 23\r\nConnection: close\r\n\r\nSENTINEL_PROVIDER_ERROR".into(),
     }));
+    responses.push(ScriptedOpenAiResponse {
+        required_body_fragments: vec!["task: provider failure".into()],
+        response: text_response("parent recovered from child provider failure"),
+    });
     let server = BoundedScriptedOpenAiMockServer::start(responses);
     std::fs::write(
         config_home.join("config.toml"),
@@ -2157,9 +2167,12 @@ fn production_task_provider_failure_is_sanitized_and_aborts_the_parent_turn() {
         .expect("production binary should run");
     server.join();
 
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
-    assert_diagnostic_error(&output.stderr, "error: task: provider failure\n");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "parent recovered from child provider failure\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert_interrupted_session_saved(
         &temporary,
         &project_root,

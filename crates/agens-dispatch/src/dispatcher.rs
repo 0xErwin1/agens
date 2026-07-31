@@ -66,12 +66,10 @@ impl HeadlessToolDispatcher for ProductionToolDispatcher {
 }
 
 fn headless_output(output: ToolOutput) -> Result<HeadlessToolOutput, HeadlessTurnPortError> {
-    if let Some(terminal) = output.terminal() {
-        return Err(HeadlessTurnPortError::TaskTerminal(terminal));
-    }
-
     let facts = output.facts().cloned();
-    let content = if output.is_error {
+    let content = if output.terminal().is_some() {
+        output.content
+    } else if output.is_error {
         sanitized_native_tool_failure(&output.content)
     } else {
         output.content
@@ -154,7 +152,30 @@ fn headless_tool_error(error: agens_core::Error) -> HeadlessTurnPortError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agens_core::{ToolOutcome, ToolResultFacts};
+    use agens_core::{HeadlessTaskTerminal, ToolOutcome, ToolResultFacts};
+
+    #[test]
+    fn unavailable_task_inputs_return_a_tool_error_the_parent_can_recover_from() {
+        for terminal in [
+            HeadlessTaskTerminal::Cancelled,
+            HeadlessTaskTerminal::TimedOut,
+            HeadlessTaskTerminal::AgentUnavailable,
+            HeadlessTaskTerminal::ModelUnavailable,
+            HeadlessTaskTerminal::SkillUnavailable,
+            HeadlessTaskTerminal::IterationLimit,
+            HeadlessTaskTerminal::InputLimit,
+            HeadlessTaskTerminal::OutputLimit,
+            HeadlessTaskTerminal::ConcurrencyLimit,
+            HeadlessTaskTerminal::ProviderFailure,
+            HeadlessTaskTerminal::ChildFailure,
+        ] {
+            let converted = headless_output(ToolOutput::task_terminal(terminal))
+                .expect("recoverable task preflight failures must reach the parent model");
+
+            assert!(converted.is_error);
+            assert_eq!(converted.content, terminal.message());
+        }
+    }
 
     /// A sanitized failure still has to carry its facts: the surface reports the
     /// exit code from `facts`, not from the message, so redacting the message

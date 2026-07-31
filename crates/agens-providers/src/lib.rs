@@ -14,8 +14,8 @@ mod moonshot;
 pub use moonshot::MoonshotProvider;
 
 use agens_core::{
-    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
-    Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
+    Error, HeadlessTaskTerminal, HeadlessTurnCancellation, HeadlessTurnPortError, Message,
+    MessagePart, RequestConfig, Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -1765,6 +1765,50 @@ impl OpenAiResponsesProvider {
     }
 }
 
+fn model_visible_tool_output(content: &str, is_error: bool) -> String {
+    if !is_error {
+        return bounded_tool_output(content);
+    }
+
+    let safe_terminal = [
+        HeadlessTaskTerminal::Cancelled,
+        HeadlessTaskTerminal::TimedOut,
+        HeadlessTaskTerminal::AgentUnavailable,
+        HeadlessTaskTerminal::ModelUnavailable,
+        HeadlessTaskTerminal::SkillUnavailable,
+        HeadlessTaskTerminal::IterationLimit,
+        HeadlessTaskTerminal::InputLimit,
+        HeadlessTaskTerminal::OutputLimit,
+        HeadlessTaskTerminal::ConcurrencyLimit,
+        HeadlessTaskTerminal::ProviderFailure,
+        HeadlessTaskTerminal::ChildFailure,
+    ]
+    .into_iter()
+    .any(|terminal| {
+        content == terminal.message()
+            || content
+                .strip_prefix(terminal.message())
+                .is_some_and(is_safe_diagnostic_reference_suffix)
+    });
+    if safe_terminal {
+        bounded_tool_output(content)
+    } else {
+        "Tool execution failed".to_owned()
+    }
+}
+
+fn is_safe_diagnostic_reference_suffix(suffix: &str) -> bool {
+    suffix
+        .strip_prefix(" [ref: ")
+        .and_then(|suffix| suffix.strip_suffix(']'))
+        .is_some_and(|reference| {
+            reference.len() == 8
+                && reference
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+}
+
 fn continuation_payload(
     model: &str,
     request_config: &RequestConfig,
@@ -1794,11 +1838,7 @@ fn continuation_payload(
             return Err(());
         }
 
-        let output = if *is_error {
-            "Tool execution failed".to_owned()
-        } else {
-            bounded_tool_output(content)
-        };
+        let output = model_visible_tool_output(content, *is_error);
         outputs.insert(tool_call_id, output);
     }
 
@@ -1860,11 +1900,7 @@ fn correlated_tool_outputs(
             return Err(());
         }
 
-        let output = if *is_error {
-            "Tool execution failed".to_owned()
-        } else {
-            bounded_tool_output(content)
-        };
+        let output = model_visible_tool_output(content, *is_error);
         outputs.insert(tool_call_id, output);
     }
 
@@ -3217,6 +3253,22 @@ mod tests {
         );
 
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn task_terminal_errors_remain_actionable_while_other_tool_failures_stay_redacted() {
+        assert_eq!(
+            model_visible_tool_output("task: requested skill is unavailable", true),
+            "task: requested skill is unavailable"
+        );
+        assert_eq!(
+            model_visible_tool_output("task: requested model is unavailable [ref: 84ca0a64]", true,),
+            "task: requested model is unavailable [ref: 84ca0a64]"
+        );
+        assert_eq!(
+            model_visible_tool_output("bash: SENTINEL_SECRET", true),
+            "Tool execution failed"
+        );
     }
 
     #[test]

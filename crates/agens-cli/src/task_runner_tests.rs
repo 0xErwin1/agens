@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use agens_bus::BridgeTx;
 use agens_core::{
-    HeadlessTurnCancellation, HeadlessTurnError, MessagePart, PermissionDecision, PermissionMode,
-    PermissionPattern, PermissionPolicy, PermissionRule, PermissionSession, SubagentErrorKind,
-    SubagentStatus, TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent, TurnEvent,
+    HeadlessTaskTerminal, HeadlessToolOutput, HeadlessTurnCancellation, HeadlessTurnError,
+    MessagePart, PermissionDecision, PermissionMode, PermissionPattern, PermissionPolicy,
+    PermissionRule, PermissionSession, SubagentErrorKind, SubagentStatus, TuiExecutionEvent,
+    TuiRuntimeEvent, TuiSubagentEvent, TurnEvent,
 };
-use agens_dispatch::TuiSelectedTaskLaunch;
+use agens_dispatch::{TaskLaunchOutcome, TuiSelectedTaskLaunch};
 use agens_session::context::CompletedSubagentTurn;
 use agens_session::context::SessionContext;
 use agens_tool_runtime::child::ChildRunError;
@@ -27,7 +28,6 @@ use agens_tools::{
 };
 use agens_tui::TuiPermissionReply;
 
-use agens_error::CliError;
 use agens_fixtures::{
     session_bootstrap as tui_session_bootstrap, session_directory as tui_session_directory,
 };
@@ -542,6 +542,13 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
             ..SessionContext::fresh()
         }));
 
+        let terminal = match expected_error {
+            TaskRunnerError::Cancelled => HeadlessTaskTerminal::Cancelled,
+            TaskRunnerError::TimedOut => HeadlessTaskTerminal::TimedOut,
+            TaskRunnerError::ProviderFailure => HeadlessTaskTerminal::ProviderFailure,
+            TaskRunnerError::IterationLimit => HeadlessTaskTerminal::IterationLimit,
+            TaskRunnerError::ChildFailure => HeadlessTaskTerminal::ChildFailure,
+        };
         assert_eq!(
             launch_selected_tui_task(
                 &mut runtime,
@@ -550,7 +557,9 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 false,
                 &HeadlessTurnCancellation::new(),
             ),
-            Err(CliError::runtime(HeadlessTurnError::Tool))
+            Ok(TuiSelectedTaskLaunch::Rejected(
+                TaskLaunchOutcome::Dispatched(HeadlessToolOutput::failure(terminal.message()))
+            ))
         );
 
         let mut expected = vec![
