@@ -852,7 +852,7 @@ impl ChatGptResponsesProvider {
             ),
             client: reqwest::Client::builder()
                 .connect_timeout(request_timeout)
-                .timeout(request_timeout)
+                .read_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("ChatGPT HTTP client is unavailable".into()))?,
             tools,
@@ -2053,6 +2053,22 @@ fn bounded_tool_output(content: &str) -> String {
     content[..end].to_owned()
 }
 
+/// Classifies a failed body read while a response stream is still open.
+///
+/// A stalled or dropped connection is a transport fault, not a malformed
+/// stream: reporting it as a protocol failure blames the decoder for something
+/// it never saw, and hides the one class the caller can act on.
+fn stream_read_failure(
+    error: &reqwest::Error,
+    protocol_failure: HeadlessTurnPortError,
+) -> HeadlessTurnPortError {
+    if error.is_timeout() || error.is_connect() {
+        return HeadlessTurnPortError::ProviderNetwork;
+    }
+
+    protocol_failure
+}
+
 async fn decode_http_response_stream(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
@@ -2068,7 +2084,7 @@ async fn decode_http_response_stream(
         let next_chunk = tokio::select! {
             chunk = response.chunk() => {
                 stop_before_mapping(cancellation)?;
-                chunk.map_err(|_| protocol_failure)?
+                chunk.map_err(|error| stream_read_failure(&error, protocol_failure))?
             }
             stop = wait_for_stop(cancellation) => return Err(stop),
         };

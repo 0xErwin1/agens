@@ -131,7 +131,7 @@ impl MoonshotProvider {
             state: TurnState::Initial,
             continuation_rounds: 0,
             client: reqwest::Client::builder()
-                .timeout(request_timeout)
+                .read_timeout(request_timeout)
                 .build()
                 .map_err(|_| Error::Provider("Moonshot client is unavailable".to_owned()))?,
             diagnostics: None,
@@ -307,7 +307,9 @@ impl MoonshotProvider {
             let next_chunk = tokio::select! {
                 chunk = response.chunk() => {
                     stop_before_mapping(cancellation)?;
-                    chunk.map_err(|_| HeadlessTurnPortError::ProviderProtocol)?
+                    chunk.map_err(|error| {
+                        crate::stream_read_failure(&error, HeadlessTurnPortError::ProviderProtocol)
+                    })?
                 }
                 stop = wait_for_stop(cancellation) => return Err(stop),
             };
