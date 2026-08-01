@@ -3070,6 +3070,20 @@ fn transcript_call_owners(state: &ViewState<'_>, row_width: u16) -> Vec<Option<S
     assemble_transcript(state, row_width, true).1
 }
 
+/// The rows a turn contributes, described only when the caller wants them.
+///
+/// A turn's owners can be shorter than its rows — trailing rows belong to no
+/// call — so the row count always comes from the painted lines. Copying those
+/// lines is what a pointer movement cannot afford, and hit-testing never reads
+/// them, so it gets rows of the right shape and no content.
+fn turn_placeholder_rows(lines: &[Line<'static>], want_owners: bool) -> Vec<Line<'static>> {
+    if want_owners {
+        vec![Line::default(); lines.len()]
+    } else {
+        lines.to_vec()
+    }
+}
+
 fn assemble_transcript(
     state: &ViewState<'_>,
     row_width: u16,
@@ -3086,15 +3100,18 @@ fn assemble_transcript(
     let thinking_streaming = state.running;
     let mut turn_lines = Vec::new();
     let mut turn_owners: Vec<Option<String>> = Vec::new();
+    let mut turn_rows = 0usize;
     let mut append_turn = |lines: Vec<Line<'static>>, mut lines_owners: Vec<Option<String>>| {
         if lines.is_empty() {
             return;
         }
-        if !turn_lines.is_empty() {
+        if turn_rows > 0 {
             turn_lines.push(Line::default());
             turn_owners.push(None);
+            turn_rows += 1;
         }
         lines_owners.resize(lines.len(), None);
+        turn_rows += lines.len();
         turn_lines.extend(lines);
         turn_owners.extend(lines_owners);
     };
@@ -3128,28 +3145,20 @@ fn assemble_transcript(
             transcript: state.active_transcript,
             index,
         };
-        let owners = if want_owners {
-            render::settled_conversation_call_rows(
-                identity,
-                conversation,
-                state.tool_display_modes,
-                row_width,
-                settled_state,
-            )
-            .to_vec()
-        } else {
-            Vec::new()
-        };
+        let blocks = render::settled_conversation_blocks(
+            identity,
+            conversation,
+            state.tool_display_modes,
+            row_width,
+            settled_state,
+        );
         append_turn(
-            render::settled_conversation_lines(
-                identity,
-                conversation,
-                state.tool_display_modes,
-                row_width,
-                settled_state,
-            )
-            .to_vec(),
-            owners,
+            turn_placeholder_rows(&blocks.lines, want_owners),
+            if want_owners {
+                blocks.owners.to_vec()
+            } else {
+                Vec::new()
+            },
         );
     }
     if let Some(conversation) = state.conversation {
@@ -3161,26 +3170,20 @@ fn assemble_transcript(
             focused_call: state.focused_call,
             unicode: state.unicode_level,
         };
-        let owners = if want_owners {
-            render::conversation_call_rows(
-                conversation,
-                state.runtime_events,
-                state.tool_display_modes,
-                row_width,
-                live_state,
-            )
-        } else {
-            Vec::new()
-        };
+        let painted = render::painted_conversation(
+            conversation,
+            state.runtime_events,
+            state.tool_display_modes,
+            row_width,
+            live_state,
+        );
         append_turn(
-            render::conversation_lines(
-                conversation,
-                state.runtime_events,
-                state.tool_display_modes,
-                row_width,
-                live_state,
-            ),
-            owners,
+            turn_placeholder_rows(&painted.lines, want_owners),
+            if want_owners {
+                painted.owners
+            } else {
+                Vec::new()
+            },
         );
     }
     let turn_start = transcript.len();

@@ -88,50 +88,7 @@ thread_local! {
     > = const { std::cell::RefCell::new(VecDeque::new()) };
 }
 
-/// Described lines for a conversation that can no longer change, reused across frames.
-///
-/// The transcript is rebuilt on every frame, so without this a long session pays
-/// a full markdown parse and layout pass for its whole history on each animation
-/// tick. A conversation only qualifies once nothing in it is still animating:
-/// any unfinished tool call or subagent card keeps its rows tied to the frame
-/// clock, and those are described live.
-pub(super) fn settled_conversation_lines(
-    identity: SettledConversation,
-    conversation: &Conversation,
-    tool_display_modes: &BTreeMap<String, DisplayMode>,
-    content_width: u16,
-    state: ConversationRenderState<'_>,
-) -> Arc<[Line<'static>]> {
-    settled_conversation_blocks(
-        identity,
-        conversation,
-        tool_display_modes,
-        content_width,
-        state,
-    )
-    .lines
-}
-
-/// The owning call of each row `settled_conversation_lines` paints, served
-/// from the same cache entry rather than repainting the conversation.
-pub(super) fn settled_conversation_call_rows(
-    identity: SettledConversation,
-    conversation: &Conversation,
-    tool_display_modes: &BTreeMap<String, DisplayMode>,
-    content_width: u16,
-    state: ConversationRenderState<'_>,
-) -> Arc<[Option<String>]> {
-    settled_conversation_blocks(
-        identity,
-        conversation,
-        tool_display_modes,
-        content_width,
-        state,
-    )
-    .owners
-}
-
-fn settled_conversation_blocks(
+pub(super) fn settled_conversation_blocks(
     identity: SettledConversation,
     conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
@@ -214,7 +171,8 @@ fn is_settled(conversation: &Conversation) -> bool {
             .all(|call| call.result.is_some())
 }
 
-pub(super) fn conversation_lines(
+#[cfg(test)]
+fn conversation_lines(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
@@ -231,25 +189,7 @@ pub(super) fn conversation_lines(
     .lines
 }
 
-/// The same rows `conversation_lines` paints, each tagged with its owning call.
-pub(super) fn conversation_call_rows(
-    conversation: &Conversation,
-    events: &[TuiRuntimeEvent],
-    tool_display_modes: &BTreeMap<String, DisplayMode>,
-    content_width: u16,
-    state: ConversationRenderState<'_>,
-) -> Vec<Option<String>> {
-    painted_conversation(
-        conversation,
-        events,
-        tool_display_modes,
-        content_width,
-        state,
-    )
-    .owners
-}
-
-fn painted_conversation(
+pub(super) fn painted_conversation(
     conversation: &Conversation,
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
@@ -4320,7 +4260,7 @@ mod tests {
         conversation: &Conversation,
         identity: SettledConversation,
     ) -> Arc<[Line<'static>]> {
-        settled_conversation_lines(
+        settled_conversation_blocks(
             identity,
             conversation,
             &BTreeMap::new(),
@@ -4334,6 +4274,7 @@ mod tests {
                 unicode: UnicodeLevel::Extended,
             },
         )
+        .lines
     }
 
     fn settled_identity(index: usize, generation: u64) -> SettledConversation {
