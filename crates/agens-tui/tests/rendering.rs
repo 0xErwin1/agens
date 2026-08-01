@@ -1826,10 +1826,10 @@ fn no_header_row_and_the_working_indicator_lives_at_the_end_of_the_chat() {
         rendered_line(&renderer, 0)
     );
     assert!(text.contains("12s"), "{text:?}");
-    assert!(text.contains("3400 tok"), "{text:?}");
+    assert!(text.contains("3.4k tok"), "{text:?}");
 
     let body_row = rendered_row(&renderer, "assistant body");
-    let indicator_row = rendered_row(&renderer, "3400 tok");
+    let indicator_row = rendered_row(&renderer, "3.4k tok");
     let footer_row = rendered_row(&renderer, "model —");
     assert!(
         body_row < indicator_row && indicator_row < footer_row,
@@ -5399,4 +5399,74 @@ fn the_turn_status_row_is_separated_from_what_the_agent_just_said() {
         answer + 2,
         "a blank row separates the answer from the row reporting on it"
     );
+}
+
+#[test]
+fn consecutive_tool_rows_pack_without_blank_rows_between_them() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(90, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("go");
+    for index in 0..3 {
+        let call_id = format!("call-{index}");
+        let name = format!("mcp_server_tool_{index}");
+        tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            input: "{}".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: name.clone(),
+                raw: "{}".into(),
+            },
+        });
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: call_id.clone(),
+            name,
+            input: "{}".into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: call_id.clone(),
+            content: "ok".into(),
+            is_error: false,
+        }));
+        tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+            call_id,
+            duration: Some(Duration::from_millis(9)),
+            result: ToolResultState::Success,
+        });
+    }
+
+    renderer.render(tui.view()).unwrap();
+    let first = rendered_row(&renderer, "mcp_server_tool_0");
+    let last = rendered_row(&renderer, "mcp_server_tool_2");
+    let blank_rows = (first..=last)
+        .filter(|row| rendered_line(&renderer, *row).trim().is_empty())
+        .count();
+
+    assert!(last > first, "the three calls render in order");
+    assert_eq!(
+        blank_rows, 0,
+        "a run of one-line tool rows spends no rows saying nothing"
+    );
+}
+
+#[test]
+fn a_long_turn_reports_its_time_in_units_a_reader_sizes_up() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(90, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(90_000),
+        output_tokens: Some(359),
+        total_tokens: Some(90_359),
+        context_window: Some(200_000),
+    }));
+    tui.tick(Duration::from_secs(253));
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("4m 13s"), "{text:?}");
+    assert!(!text.contains("253s"), "{text:?}");
+    assert!(text.contains("90.4k tok"), "{text:?}");
+    assert!(!text.contains("90359"), "{text:?}");
 }

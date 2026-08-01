@@ -449,7 +449,12 @@ fn tool_call_block(
 
     RenderedBlock {
         rows: block.lines(mode),
-        packs: block.is_groupable() && (mode == DisplayMode::Collapsed || result.is_none()),
+        // Any call showing a single summary row packs against its neighbours.
+        // Packing used to require the call be verb-foldable, which is a
+        // different question: an MCP call cannot fold into "Read files ×3" but
+        // it is still one row, and a run of them separated by blank rows
+        // spends half a screen saying nothing.
+        packs: mode == DisplayMode::Collapsed || result.is_none(),
         call_id: Some(call_id.to_owned()),
         closes_call: false,
     }
@@ -672,7 +677,7 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
         if !right.is_empty() {
             right.push_str(" · ");
         }
-        right.push_str(&format!("{tokens} tok"));
+        right.push_str(&compact_tokens(tokens));
     }
 
     // The metadata never takes the whole row: the label keeps at least the
@@ -703,9 +708,20 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
     Line::from(spans)
 }
 
+/// A duration a reader can size up without counting digits.
+///
+/// Past a minute the seconds stop being a quantity anyone reads — `253s` is
+/// arithmetic, `4m 13s` is a fact — so the label changes unit rather than
+/// growing.
 fn elapsed_label(elapsed: Duration) -> String {
-    if elapsed.as_secs() > 0 {
-        format!("{}s", elapsed.as_secs())
+    let seconds = elapsed.as_secs();
+    if seconds >= 3_600 {
+        let minutes = (seconds % 3_600) / 60;
+        format!("{}h {minutes}m", seconds / 3_600)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else if seconds > 0 {
+        format!("{seconds}s")
     } else {
         format!("{}ms", elapsed.as_millis())
     }
@@ -3154,13 +3170,7 @@ fn line(lines: &mut Vec<Line<'static>>, label: &str, color: Color, text: impl In
 }
 
 fn duration_label(duration: Option<Duration>) -> String {
-    duration.map_or_else(String::new, |value| {
-        if value.as_secs() > 0 {
-            format!(" · {}s", value.as_secs())
-        } else {
-            format!(" · {}ms", value.as_millis())
-        }
-    })
+    duration.map_or_else(String::new, |value| format!(" · {}", elapsed_label(value)))
 }
 
 fn result_color(result: ToolResultState) -> Color {
