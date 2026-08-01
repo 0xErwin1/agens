@@ -2145,7 +2145,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     assert!(!text.contains("context 128"), "{text:?}");
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(!text.contains("**"), "{text:?}");
-    assert!(!text.contains("```"), "{text:?}");
+    assert!(
+        text.contains("```text"),
+        "a tool result is terminal text, so a fence the tool printed stays literal: {text:?}"
+    );
     assert!(!text.contains("native::read · read-1"), "{text:?}");
     assert!(!text.contains("native::write · write-2"), "{text:?}");
     assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
