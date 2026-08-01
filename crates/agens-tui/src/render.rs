@@ -201,8 +201,8 @@ fn painted_conversation(
     content_width: u16,
     state: ConversationRenderState<'_>,
 ) -> PaintedBlocks {
-    let _perf_live_turn = agens_perf::span!(
-        "tui.transcript.live_turn",
+    let _perf_build = agens_perf::span!(
+        "tui.transcript.build_blocks",
         items = conversation.items.len() as u64,
         content_width = content_width,
     );

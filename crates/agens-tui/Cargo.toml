@@ -11,6 +11,10 @@ workspace = true
 [features]
 perf-audit = ["agens-perf/enabled"]
 
+[[bin]]
+name = "agens-perf-audit"
+required-features = ["perf-audit"]
+
 [dependencies]
 agens-bus = { path = "../agens-bus" }
 agens-core = { path = "../agens-core" }

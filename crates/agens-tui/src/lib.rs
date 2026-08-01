@@ -6148,7 +6148,7 @@ where
 
     fn handle_mouse_wheel_batch(&mut self, directions: &[MouseWheelDirection]) -> Action {
         let _perf_event = agens_perf::span!(
-            "tui.event",
+            "tui.event.wheel_batch",
             kind = "mouse_wheel",
             batch = directions.len() as u64,
         );

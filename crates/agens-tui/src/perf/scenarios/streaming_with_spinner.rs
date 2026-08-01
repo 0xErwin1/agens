@@ -18,6 +18,14 @@ const BACKLOG_TURNS: usize = 8;
 const BACKLOG_LINES_PER_TURN: usize = 4;
 const DELTAS: usize = 240;
 
+/// Ticks between deltas that carry no new content, only elapsed time.
+///
+/// These are the frames that answer the scenario's actual question: with
+/// nothing dirty, does the animation force a repaint of its own? Driving
+/// every tick as dirty would have made the gate's skip path unreachable and
+/// the spinner's cost indistinguishable from the streaming cost.
+const IDLE_TICKS_PER_DELTA: usize = 3;
+
 pub(super) const SCENARIO: Scenario = Scenario {
     name: "streaming_with_spinner",
     run,
@@ -46,6 +54,10 @@ fn run(ctx: &mut ScenarioContext) -> io::Result<()> {
             delta,
         ))));
         ctx.render_frame_after(step, true)?;
+
+        for _ in 0..IDLE_TICKS_PER_DELTA {
+            ctx.render_frame_after(step, false)?;
+        }
     }
 
     ctx.set_running(false);
