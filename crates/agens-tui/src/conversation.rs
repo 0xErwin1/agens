@@ -28,7 +28,14 @@ pub enum ConversationEvent {
         output: String,
         is_error: bool,
     },
-    Diff(Vec<DiffLine>),
+    /// The edit whose result this diff describes, and the diff itself.
+    ///
+    /// The call id travels with the lines because the diff alone cannot say
+    /// what file it belongs to, and a diff with no file has no language.
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
     Error {
         message: String,
         action: String,
@@ -116,7 +123,10 @@ pub(super) enum ConversationItem {
         output: String,
         is_error: bool,
     },
-    Diff(Vec<DiffLine>),
+    Diff {
+        call_id: String,
+        lines: Vec<DiffLine>,
+    },
     Error(ActionableError),
     SubagentCard(u64),
 }
@@ -383,9 +393,9 @@ impl Conversation {
                     is_error,
                 });
             }
-            ConversationEvent::Diff(lines) => {
+            ConversationEvent::Diff { call_id, lines } => {
                 self.diffs.extend(lines.clone());
-                self.items.push(ConversationItem::Diff(lines));
+                self.items.push(ConversationItem::Diff { call_id, lines });
             }
             ConversationEvent::Error { message, action } => {
                 let error = ActionableError::sanitized(message, action);

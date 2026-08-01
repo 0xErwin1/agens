@@ -3028,12 +3028,31 @@ struct SelectableCell {
     column: u16,
     width: u16,
     style: Style,
+    /// Whether this cell is part of the text or part of the layout.
+    ///
+    /// A continuation row opens with the indent that keeps it under its
+    /// paragraph. That indent exists because the terminal is narrow, so it is
+    /// painted and highlighted like everything else but never copied.
+    copyable: bool,
+}
+
+/// What separates a row from the one below it in the copied text.
+///
+/// Only `Hard` is a line the author wrote. The soft variants are wrap seams:
+/// rejoining puts back the space the wrap consumed, or nothing at all when the
+/// wrap cut through the middle of a word.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RowBreak {
+    #[default]
+    Hard,
+    SoftSpace,
+    SoftTight,
 }
 
 #[derive(Clone, Debug, Default)]
 struct SelectableRow {
     cells: Vec<SelectableCell>,
-    hard_break_after: bool,
+    break_after: RowBreak,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3046,24 +3065,47 @@ impl SelectableTranscript {
         let width = width.max(1);
         let mut rows = Vec::new();
 
+        let mut continues_into_this_line = false;
         for line in lines {
-            let cells = line
+            let mut cells = line
                 .styled_graphemes(Style::default())
                 .map(|grapheme| SelectableCell {
                     text: grapheme.symbol.to_owned(),
                     column: 0,
                     width: saturating_u16(grapheme.symbol.width()),
                     style: grapheme.style,
+                    copyable: true,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+
+            let joined = match cells.last().map(|cell| cell.text.as_str()) {
+                Some(render::WRAP_JOINER_SPACE) => Some(RowBreak::SoftSpace),
+                Some(render::WRAP_JOINER_TIGHT) => Some(RowBreak::SoftTight),
+                _ => None,
+            };
+            if joined.is_some() {
+                cells.pop();
+            }
+            if continues_into_this_line {
+                for cell in cells
+                    .iter_mut()
+                    .take_while(|cell| selectable_cell_is_whitespace(cell))
+                {
+                    cell.copyable = false;
+                }
+            }
+            continues_into_this_line = joined.is_some();
+
             let wrapped = wrap_selectable_line(cells, width);
             let last = wrapped.len().saturating_sub(1);
-            rows.extend(
-                wrapped
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, cells)| selectable_row(cells, index == last)),
-            );
+            rows.extend(wrapped.into_iter().enumerate().map(|(index, cells)| {
+                let break_after = if index == last {
+                    joined.unwrap_or(RowBreak::Hard)
+                } else {
+                    RowBreak::SoftSpace
+                };
+                selectable_row(cells, break_after)
+            }));
         }
 
         Self { rows }
@@ -3097,13 +3139,21 @@ impl SelectableTranscript {
                     row: row_index,
                     column: cell.column,
                 };
-                if position < start || position > end {
+                if position < start || position > end || !cell.copyable {
                     continue;
                 }
                 append_bounded_selection(&mut text, &cell.text)?;
             }
-            if row_index < end.row && row.hard_break_after {
-                append_bounded_selection(&mut text, "\n")?;
+            if row_index < end.row {
+                match row.break_after {
+                    RowBreak::Hard => append_bounded_selection(&mut text, "\n")?,
+                    RowBreak::SoftSpace
+                        if !text.ends_with(char::is_whitespace) && !text.is_empty() =>
+                    {
+                        append_bounded_selection(&mut text, " ")?;
+                    }
+                    RowBreak::SoftSpace | RowBreak::SoftTight => {}
+                }
             }
         }
         Ok(text)
@@ -3230,16 +3280,13 @@ fn selectable_cell_is_whitespace(cell: &SelectableCell) -> bool {
     cell.text == "\u{200b}" || cell.text != "\u{00a0}" && cell.text.chars().all(char::is_whitespace)
 }
 
-fn selectable_row(mut cells: Vec<SelectableCell>, hard_break_after: bool) -> SelectableRow {
+fn selectable_row(mut cells: Vec<SelectableCell>, break_after: RowBreak) -> SelectableRow {
     let mut column = 0;
     for cell in &mut cells {
         cell.column = column;
         column = column.saturating_add(cell.width);
     }
-    SelectableRow {
-        cells,
-        hard_break_after,
-    }
+    SelectableRow { cells, break_after }
 }
 
 fn ordered_selection(selection: TranscriptSelection) -> (TranscriptPosition, TranscriptPosition) {
@@ -4466,8 +4513,11 @@ where
                 self.accumulate_turn_usage(usage);
                 self.latest_usage = Some(usage.clone());
             }
-            TuiRuntimeEvent::Diff { lines, .. } => {
-                self.project_conversation(ConversationEvent::Diff(lines.clone()));
+            TuiRuntimeEvent::Diff { call_id, lines } => {
+                self.project_conversation(ConversationEvent::Diff {
+                    call_id: call_id.clone(),
+                    lines: lines.clone(),
+                });
             }
             TuiRuntimeEvent::TaskExecution { agent, event } => {
                 self.apply_task_execution_event(agent, *event);

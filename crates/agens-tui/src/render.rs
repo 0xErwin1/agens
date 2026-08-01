@@ -394,9 +394,17 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             output,
             is_error,
         } => tool_result_body_block(context, call_id, output, *is_error),
-        ConversationItem::Diff(diff) => {
+        ConversationItem::Diff {
+            call_id,
+            lines: diff,
+        } => {
             let mut lines = Vec::new();
-            render_diff(&mut lines, diff, context.content_width);
+            render_diff(
+                &mut lines,
+                diff,
+                diff_language(context.conversation, call_id),
+                context.content_width,
+            );
             RenderedBlock::plain(lines)
         }
         ConversationItem::Error(error) => {
@@ -2393,6 +2401,26 @@ fn clip_spans(spans: &mut Vec<Span<'static>>, max_width: usize) {
     *spans = kept;
 }
 
+/// Marks a rendered row as continuing into the next one.
+///
+/// Wrapping is a fact about the terminal, not about the text, so the copy path
+/// has to be able to undo it. The marker is `U+2060 WORD JOINER`: zero width and
+/// dropped by the buffer, so it reaches the selection snapshot without reaching
+/// the screen. It closes the row it marks rather than opening the next one, so
+/// the wrapper's "has anything been placed yet" checks keep meaning what they
+/// meant.
+/// Break taken between words, where the text had a space the row could not fit.
+pub(super) const WRAP_JOINER_SPACE: &str = "\u{2060}";
+
+/// Break taken inside a word too long for any row. Rejoining must not invent a
+/// separator the text never had, or a wrapped path comes back off the clipboard
+/// as two paths.
+pub(super) const WRAP_JOINER_TIGHT: &str = "\u{2061}";
+
+fn wrap_joiner_span(marker: &'static str) -> Span<'static> {
+    Span::raw(marker)
+}
+
 fn wrap_styled_spans(
     spans: Vec<Span<'static>>,
     max_width: usize,
@@ -2428,6 +2456,7 @@ fn wrap_styled_spans(
                 continuation_width
             });
             if chunk_width <= line_capacity && used.saturating_add(chunk_width) > max_width {
+                current.push(wrap_joiner_span(WRAP_JOINER_SPACE));
                 lines.push(Line::from(std::mem::take(&mut current)));
                 current.extend_from_slice(continuation);
                 used = continuation_width;
@@ -2436,6 +2465,7 @@ fn wrap_styled_spans(
             for grapheme in chunk.graphemes(true) {
                 let grapheme_width = grapheme.width();
                 if used.saturating_add(grapheme_width) > max_width && !current.is_empty() {
+                    current.push(wrap_joiner_span(WRAP_JOINER_TIGHT));
                     lines.push(Line::from(std::mem::take(&mut current)));
                     current.extend_from_slice(continuation);
                     used = continuation_width;
@@ -2965,7 +2995,159 @@ fn result_size_label(output: &str) -> String {
 /// so unchanged runs are inferred from line-number jumps and rendered as a
 /// single `… N unchanged lines` marker. No `+`/`-` markers are drawn; the
 /// gutter position and row background encode insert vs. delete.
-fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width: usize) {
+/// The grammar to read an edit's diff with, taken from the file it edits.
+///
+/// The extension is the only signal available here and it is not always right,
+/// so an unrecognized one yields `None` and the diff keeps its plain
+/// red-and-green reading rather than being coloured by a guess.
+fn diff_language(conversation: &Conversation, call_id: &str) -> Option<&'static str> {
+    let path = conversation
+        .tool_batches
+        .iter()
+        .flat_map(|batch| &batch.calls)
+        .find(|call| call.call_id == call_id)
+        .and_then(|call| match &call.parsed {
+            agens_core::ToolInput::Edit { path } | agens_core::ToolInput::Write { path } => {
+                Some(path.as_str())
+            }
+            _ => None,
+        })?;
+
+    let extension = path.rsplit_once('.').map(|(_, extension)| extension)?;
+    language_for_extension(&extension.to_ascii_lowercase())
+}
+
+/// Extensions mapped only to grammars this build actually carries.
+///
+/// Naming a language the `GrammarStore` cannot load would cost a failed parse
+/// on every diff row for no colour, so the table and the enabled feature list
+/// are kept in step deliberately.
+fn language_for_extension(extension: &str) -> Option<&'static str> {
+    Some(match extension {
+        "rs" => "rust",
+        "go" => "go",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" | "jsx" => "tsx",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "cs" => "c-sharp",
+        "java" => "java",
+        "css" => "css",
+        "html" | "htm" => "html",
+        "json" => "json",
+        "md" | "markdown" => "markdown",
+        "nix" => "nix",
+        "sh" | "bash" | "zsh" => "bash",
+        "sql" => "sql",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        _ => return None,
+    })
+}
+
+/// Styled spans for one diff row's text, coloured by the language when the
+/// run it belongs to could be parsed.
+///
+/// Highlighting runs over a contiguous run of same-kind rows rather than over
+/// the whole diff: consecutive added rows are contiguous new-file content and
+/// parse as such, while an added row sitting next to the removed row it
+/// replaces is not a program and would parse as neither.
+/// A parsed run: the source its rows were joined into, and its tokens.
+type ParsedRun = (String, Arc<[SyntaxToken]>);
+
+/// Where one diff row sits inside the run that was parsed for it.
+type RowHighlight = (Arc<ParsedRun>, usize);
+
+fn diff_text_spans(
+    text: &str,
+    highlighted: Option<&ParsedRun>,
+    offset: usize,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let Some((source, tokens)) = highlighted else {
+        return vec![Span::styled(text.to_owned(), base)];
+    };
+
+    let line_end = offset.saturating_add(text.len());
+    let mut spans = Vec::new();
+    let mut cursor = offset;
+
+    for token in tokens.iter() {
+        let start = token.start.max(offset).max(cursor);
+        let end = token.end.min(line_end);
+        if start >= end {
+            continue;
+        }
+        if cursor < start
+            && let Some(gap) = source.get(cursor..start)
+        {
+            spans.push(Span::styled(gap.to_owned(), base));
+        }
+        if let Some(slice) = source.get(start..end) {
+            spans.push(Span::styled(
+                slice.to_owned(),
+                base.fg(token.style.fg.unwrap_or(RolePalette::assistant())),
+            ));
+        }
+        cursor = end;
+    }
+
+    if cursor < line_end
+        && let Some(gap) = source.get(cursor..line_end)
+    {
+        spans.push(Span::styled(gap.to_owned(), base));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_owned(), base));
+    }
+    spans
+}
+
+/// Parses each contiguous run of same-kind rows, returning per-row the source
+/// its run was parsed from and the row's byte offset into it.
+fn diff_run_highlights(diff: &[DiffLine], language: Option<&str>) -> Vec<Option<RowHighlight>> {
+    let mut highlights = vec![None; diff.len()];
+    let Some(language) = language else {
+        return highlights;
+    };
+
+    let mut start = 0;
+    while start < diff.len() {
+        let mut end = start + 1;
+        while end < diff.len() && diff[end].kind == diff[start].kind {
+            end += 1;
+        }
+
+        let mut source = String::new();
+        let mut offsets = Vec::with_capacity(end - start);
+        for change in &diff[start..end] {
+            offsets.push(source.len());
+            source.push_str(&change.text);
+            source.push('\n');
+        }
+
+        if let Some(tokens) = syntax_tokens(language, &source) {
+            let parsed = Arc::new((source, tokens));
+            for (index, offset) in offsets.into_iter().enumerate() {
+                highlights[start + index] = Some((Arc::clone(&parsed), offset));
+            }
+        }
+
+        start = end;
+    }
+
+    highlights
+}
+
+fn render_diff(
+    lines: &mut Vec<Line<'static>>,
+    diff: &[DiffLine],
+    language: Option<&str>,
+    content_width: usize,
+) {
     let gutter_width = diff
         .iter()
         .map(|change| digit_width(change.number))
@@ -2973,6 +3155,7 @@ fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width:
         .unwrap_or(1)
         .max(1);
 
+    let highlights = diff_run_highlights(diff, language);
     let mut old_cursor: Option<u32> = None;
     let mut new_cursor: Option<u32> = None;
 
@@ -3015,10 +3198,15 @@ fn render_diff(lines: &mut Vec<Line<'static>>, diff: &[DiffLine], content_width:
             ),
             DiffLineKind::Context => (Some(change.number), Some(change.number), None),
         };
+        let highlight = highlights
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|(parsed, offset)| (parsed.as_ref(), *offset));
         lines.push(diff_change_line(
             old_number,
             new_number,
             &change.text,
+            highlight,
             background,
             gutter_width,
             content_width,
@@ -3053,6 +3241,7 @@ fn diff_change_line(
     old: Option<u32>,
     new: Option<u32>,
     text: &str,
+    highlight: Option<(&ParsedRun, usize)>,
     background: Option<Color>,
     gutter_width: usize,
     content_width: usize,
@@ -3066,10 +3255,13 @@ fn diff_change_line(
         text_style = text_style.bg(color);
     }
 
-    let mut spans = vec![
-        Span::styled(gutter.clone(), gutter_style),
-        Span::styled(text.to_owned(), text_style),
-    ];
+    let mut spans = vec![Span::styled(gutter.clone(), gutter_style)];
+    spans.extend(diff_text_spans(
+        text,
+        highlight.map(|(parsed, _)| parsed),
+        highlight.map_or(0, |(_, offset)| offset),
+        text_style,
+    ));
 
     if let Some(color) = background {
         let used = gutter.width().saturating_add(text.width());
@@ -4239,6 +4431,7 @@ mod tests {
                 crate::DiffLine::new(7, DiffLineKind::Removed, "old line"),
                 crate::DiffLine::new(8, DiffLineKind::Added, "new line"),
             ],
+            None,
             40,
         );
         assert_eq!(lines.len(), 2);
@@ -4272,6 +4465,78 @@ mod tests {
         );
     }
 
+    /// A large diff painted only in red and green is a wall: the eye has no
+    /// second signal to find the changed identifier by. The language supplies
+    /// that signal without displacing the first — the wash still says added or
+    /// removed, and the foreground says what the line is.
+    #[test]
+    fn a_rust_diff_is_coloured_by_the_language_on_top_of_its_wash() {
+        let _guard = SYNTAX_CACHE_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_syntax_cache();
+
+        let diff = [
+            crate::DiffLine::new(7, DiffLineKind::Removed, "let total = 0;"),
+            crate::DiffLine::new(7, DiffLineKind::Added, "let total = compute(items);"),
+        ];
+
+        let mut plain = Vec::new();
+        render_diff(&mut plain, &diff, None, 60);
+        let mut highlighted = Vec::new();
+        render_diff(&mut highlighted, &diff, Some("rust"), 60);
+
+        assert_eq!(
+            plain.iter().map(line_text).collect::<Vec<_>>(),
+            highlighted.iter().map(line_text).collect::<Vec<_>>(),
+            "highlighting repaints the diff, it does not rewrite it"
+        );
+
+        let colours = |lines: &[Line<'static>]| {
+            let mut seen = Vec::new();
+            for colour in lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.style.fg)
+            {
+                if !seen.contains(&colour) {
+                    seen.push(colour);
+                }
+            }
+            seen
+        };
+        assert!(
+            colours(&highlighted).len() > colours(&plain).len(),
+            "the language adds foreground distinctions the wash alone cannot make"
+        );
+
+        assert!(
+            highlighted
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(RolePalette::diff_insert_bg())),
+            "the added row keeps its wash: {highlighted:?}"
+        );
+        assert!(
+            highlighted
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(RolePalette::diff_delete_bg())),
+            "the removed row keeps its wash: {highlighted:?}"
+        );
+    }
+
+    /// An extension the build carries no grammar for must leave the diff alone
+    /// rather than name a language the store cannot load.
+    #[test]
+    fn only_extensions_backed_by_a_grammar_resolve_to_a_language() {
+        assert_eq!(language_for_extension("rs"), Some("rust"));
+        assert_eq!(language_for_extension("tsx"), Some("tsx"));
+        assert_eq!(language_for_extension("yml"), Some("yaml"));
+        assert_eq!(language_for_extension("swift"), None);
+        assert_eq!(language_for_extension(""), None);
+    }
+
     #[test]
     fn render_diff_collapses_unchanged_runs_into_a_gap_marker() {
         let mut lines = Vec::new();
@@ -4281,6 +4546,7 @@ mod tests {
                 crate::DiffLine::new(3, DiffLineKind::Added, "first change"),
                 crate::DiffLine::new(20, DiffLineKind::Added, "second change"),
             ],
+            None,
             40,
         );
         let joined: String = lines
@@ -4301,7 +4567,7 @@ mod tests {
             })
             .collect();
         let mut lines = Vec::new();
-        render_diff(&mut lines, &diff, 40);
+        render_diff(&mut lines, &diff, None, 40);
         let joined: String = lines
             .iter()
             .map(|line| line_text(line))

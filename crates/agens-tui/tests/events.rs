@@ -1293,11 +1293,10 @@ fn conversation_retains_complete_live_final_markdown_reasoning_diffs_and_errors(
         conversation.apply(event).unwrap();
     }
     conversation
-        .apply(ConversationEvent::Diff(vec![DiffLine::new(
-            7,
-            DiffLineKind::Added,
-            "+ typed",
-        )]))
+        .apply(ConversationEvent::Diff {
+            call_id: "edit-1".into(),
+            lines: vec![DiffLine::new(7, DiffLineKind::Added, "+ typed")],
+        })
         .unwrap();
     conversation
         .apply(ConversationEvent::Error {
