@@ -30,6 +30,8 @@ use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEve
 
 const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
+/// Closes a code-panel row whose source line was wider than the panel.
+const CODE_CLIP_MARKER: &str = "…";
 const SETTLED_CONVERSATION_CACHE_MAX_ENTRIES: usize = 96;
 const SYNTAX_CACHE_MAX_ENTRIES: usize = 64;
 const SYNTAX_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -361,7 +363,7 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             ),
             Some(RowAccent::Still(RolePalette::error())),
         ),
-        ConversationItem::User(text) => user_block(text),
+        ConversationItem::User(text) => user_block(text, context.content_width),
         ConversationItem::Assistant(text) => assistant_block(
             text,
             context.content_width,
@@ -395,7 +397,9 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
             render_diff(&mut lines, diff, context.content_width);
             RenderedBlock::plain(lines)
         }
-        ConversationItem::Error(error) => RenderedBlock::plain(error_lines(error)),
+        ConversationItem::Error(error) => {
+            RenderedBlock::plain(error_lines(error, context.content_width))
+        }
         ConversationItem::SubagentCard(id) => context
             .conversation
             .subagent_cards
@@ -528,24 +532,39 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
     }
 }
 
-fn user_block(text: &str) -> RenderedBlock {
+/// The user's own prompt, wrapped here rather than left to the transcript
+/// widget.
+///
+/// A block that hands over-wide rows to the widget gets them wrapped without
+/// its accent bar or its gutter, so the continuation rows fall out of the
+/// turn's identity rail. Wrapping at the block's own width keeps every row
+/// inside the block that owns it.
+fn user_block(text: &str, content_width: usize) -> RenderedBlock {
     let mut rows = Vec::new();
     let accent = Some(RowAccent::Still(RolePalette::user_identity()));
+    let style = Style::default()
+        .fg(RolePalette::assistant())
+        .add_modifier(Modifier::BOLD);
+
     for source_line in text.split('\n') {
-        let line = Line::from(Span::styled(
-            source_line.to_owned(),
-            Style::default()
-                .fg(RolePalette::assistant())
-                .add_modifier(Modifier::BOLD),
-        ));
-        rows.push(
-            if rows.is_empty() {
-                BlockLine::with_bullet(line, RowBullet::Identity("❯", RolePalette::user_identity()))
-            } else {
-                BlockLine::new(line)
-            }
-            .accented(accent),
+        let wrapped = wrap_styled_spans(
+            vec![Span::styled(source_line.to_owned(), style)],
+            content_width,
+            &[],
         );
+        for line in wrapped {
+            rows.push(
+                if rows.is_empty() {
+                    BlockLine::with_bullet(
+                        line,
+                        RowBullet::Identity("❯", RolePalette::user_identity()),
+                    )
+                } else {
+                    BlockLine::new(line)
+                }
+                .accented(accent),
+            );
+        }
     }
 
     RenderedBlock {
@@ -556,25 +575,32 @@ fn user_block(text: &str) -> RenderedBlock {
     }
 }
 
-fn error_lines(error: &crate::ActionableError) -> Vec<Line<'static>> {
+/// The error card, wrapped so that every row of the message keeps the `│`
+/// gutter that makes it part of the card.
+fn error_lines(error: &crate::ActionableError, content_width: usize) -> Vec<Line<'static>> {
+    let gutter_style = Style::default().fg(RolePalette::error());
+    let gutter = vec![Span::styled("│ ", gutter_style)];
+    let action_style = Style::default().fg(RolePalette::muted());
+
     let mut lines = vec![Line::from(Span::styled(
         "┌ Error",
-        Style::default()
-            .fg(RolePalette::error())
-            .add_modifier(Modifier::BOLD),
+        gutter_style.add_modifier(Modifier::BOLD),
     ))];
 
     for segment in error.message.split('\n') {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(RolePalette::error())),
-            Span::raw(segment.to_owned()),
-        ]));
+        let mut spans = gutter.clone();
+        spans.push(Span::raw(segment.to_owned()));
+        lines.extend(wrap_styled_spans(spans, content_width, &gutter));
     }
 
-    lines.push(Line::from(Span::styled(
-        format!("└ Action: {}", error.action),
-        Style::default().fg(RolePalette::muted()),
-    )));
+    lines.extend(wrap_styled_spans(
+        vec![Span::styled(
+            format!("└ Action: {}", error.action),
+            action_style,
+        )],
+        content_width,
+        &[Span::styled("  ", action_style)],
+    ));
 
     lines
 }
@@ -1521,6 +1547,7 @@ struct MarkdownRenderer {
     base_style: Style,
     prefix: String,
     strong: usize,
+    strikethrough: usize,
     emphasis: usize,
     heading: Option<HeadingLevel>,
     code_block: bool,
@@ -1560,6 +1587,7 @@ impl MarkdownRenderer {
             base_style,
             prefix: prefix.to_owned(),
             strong: 0,
+            strikethrough: 0,
             emphasis: 0,
             heading: None,
             code_block: false,
@@ -1587,7 +1615,10 @@ impl MarkdownRenderer {
         self.code_panel_widths = code_panel_widths(markdown, self.content_width);
         let table_width = self.content_width.saturating_sub(self.prefix.width());
         self.table_layouts = markdown_table_layouts(markdown, table_width);
-        for event in Parser::new_ext(markdown, Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES) {
+        for event in Parser::new_ext(
+            markdown,
+            Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
+        ) {
             self.event(event);
         }
         self.finish_line();
@@ -1602,8 +1633,12 @@ impl MarkdownRenderer {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) if self.code_block => self.code_text(&text),
-            Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                self.text(&text, self.current_style())
+            Event::Text(text) => self.text(&text, self.current_style()),
+            Event::Html(html) | Event::InlineHtml(html) => {
+                let text = strip_html_tags(&html);
+                if !text.trim().is_empty() {
+                    self.text(&text, self.current_style());
+                }
             }
             Event::Code(code) if self.code_block => self.code_text(&code),
             Event::Code(code) => self.text(
@@ -1613,6 +1648,11 @@ impl MarkdownRenderer {
                     .bg(code_block_background())
                     .add_modifier(Modifier::BOLD),
             ),
+            // A soft break is where the author's source wrapped, not where the
+            // paragraph breaks. Honouring it would keep the model's own column
+            // width and leave the terminal's unused, so the paragraph reflows
+            // and only an explicit hard break ends the line.
+            Event::SoftBreak if !self.code_block => self.text(" ", self.current_style()),
             Event::SoftBreak | Event::HardBreak => self.finish_line(),
             Event::Rule => {
                 self.finish_line();
@@ -1651,6 +1691,7 @@ impl MarkdownRenderer {
                 self.heading = Some(level);
             }
             Tag::Strong => self.strong += 1,
+            Tag::Strikethrough => self.strikethrough += 1,
             Tag::Emphasis => self.emphasis += 1,
             Tag::BlockQuote(_) => self.quote_depth += 1,
             Tag::List(start) => self.lists.push(start),
@@ -1707,7 +1748,6 @@ impl MarkdownRenderer {
             Tag::Paragraph
             | Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
-            | Tag::Strikethrough
             | Tag::Image { .. }
             | Tag::MetadataBlock(_)
             | Tag::DefinitionList
@@ -1726,6 +1766,9 @@ impl MarkdownRenderer {
                 self.list_item_indent = None;
             }
             TagEnd::Strong => self.strong = self.strong.saturating_sub(1),
+            TagEnd::Strikethrough => {
+                self.strikethrough = self.strikethrough.saturating_sub(1);
+            }
             TagEnd::Emphasis => self.emphasis = self.emphasis.saturating_sub(1),
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
@@ -1775,7 +1818,6 @@ impl MarkdownRenderer {
             }
             TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
-            | TagEnd::Strikethrough
             | TagEnd::Image
             | TagEnd::MetadataBlock(_)
             | TagEnd::DefinitionList
@@ -1877,13 +1919,49 @@ impl MarkdownRenderer {
         }
     }
 
+    /// Adds one highlighted token to the current code-panel row, marking the
+    /// row when the panel cannot hold the token whole.
+    ///
+    /// Code is not reflowed: a wrapped source line would read as two
+    /// statements. What the panel owes the reader instead is the knowledge
+    /// that something was cut, which a bare clip never gave.
     fn push_code_span(&mut self, text: &str, style: Style) {
         let used = Line::from(self.spans.clone()).width();
         let available = self.code_panel_width.saturating_sub(used.saturating_add(2));
-        let text = take_visible_width(text, available);
-        if !text.is_empty() {
-            self.spans.push(Span::styled(text, style));
+        if available == 0 {
+            self.mark_code_line_clipped(style);
+            return;
         }
+
+        let clipped = take_visible_width(text, available);
+        let fits = clipped.width() == text.width();
+        let kept = if fits {
+            clipped
+        } else {
+            take_visible_width(&clipped, available.saturating_sub(1))
+        };
+
+        if !kept.is_empty() {
+            self.spans.push(Span::styled(kept, style));
+        }
+        if !fits {
+            self.mark_code_line_clipped(style);
+        }
+    }
+
+    /// Closes a clipped code row with the marker that says so, once.
+    fn mark_code_line_clipped(&mut self, style: Style) {
+        if self
+            .spans
+            .last()
+            .is_some_and(|span| span.content.ends_with(CODE_CLIP_MARKER))
+        {
+            return;
+        }
+        self.spans.push(Span::styled(
+            CODE_CLIP_MARKER,
+            style.fg(RolePalette::muted()),
+        ));
     }
 
     fn current_style(&self) -> Style {
@@ -1896,6 +1974,9 @@ impl MarkdownRenderer {
             if self.heading.is_none() {
                 style = style.fg(RolePalette::markdown_strong());
             }
+        }
+        if self.strikethrough > 0 {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
         }
         if self.emphasis > 0 {
             style = style.add_modifier(Modifier::ITALIC);
@@ -2764,6 +2845,28 @@ fn syntax_style(tag: &str) -> Style {
     rendered
 }
 
+/// The readable text of an HTML fragment: markup a terminal cannot render is
+/// dropped, everything between the tags is kept.
+///
+/// Dropping the whole event instead would silently swallow the prose inside an
+/// HTML block, which is the more common case in model output than the tags
+/// themselves carrying meaning.
+fn strip_html_tags(html: &str) -> String {
+    let mut text = String::with_capacity(html.len());
+    let mut inside_tag = false;
+
+    for character in html.chars() {
+        match character {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => text.push(character),
+            _ => {}
+        }
+    }
+
+    text
+}
+
 fn take_visible_width(text: &str, max_width: usize) -> String {
     let mut clipped = String::new();
     let mut width = 0_usize;
@@ -3108,7 +3211,7 @@ mod tests {
             action: "Retry.".to_owned(),
         };
 
-        let lines = error_lines(&error);
+        let lines = error_lines(&error, 80);
 
         assert_eq!(lines.len(), 4);
         let text = |line: &Line<'static>| -> String {
