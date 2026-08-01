@@ -703,6 +703,10 @@ pub struct ViewState<'a> {
     pub session: &'a str,
     /// Project label displayed in the operational footer.
     pub project: &'a str,
+    /// Home directory, so the footer can collapse it to `~`.
+    pub home: Option<&'a str>,
+    /// Branch and working-tree size, refreshed outside the frame path.
+    pub repository: Option<&'a RepositoryStatus>,
     /// Current active-turn state for the dedicated status row.
     pub turn_state: Option<TurnState>,
     /// Whether the next submitted turn will carry dangerous-mode context.
@@ -750,6 +754,31 @@ pub struct ViewState<'a> {
     pub turn_started_at: Option<Duration>,
     /// What the turn is doing, as the single source of every activity label.
     pub turn_activity: TurnActivity<'a>,
+}
+
+/// Reads the already-collected repository state. Never blocks.
+pub type RepositoryProbe = Arc<dyn Fn() -> Option<RepositoryStatus> + Send + Sync>;
+
+/// How often the footer picks up a new repository reading.
+const REPOSITORY_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Working-tree state of the session's repository.
+///
+/// Collected outside the frame path — a footer that shells out to git while
+/// painting would make the whole surface as slow as the slowest `git status`.
+/// An absent value therefore means "not known yet", never "clean".
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RepositoryStatus {
+    pub branch: Option<String>,
+    pub changed_files: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+impl RepositoryStatus {
+    pub const fn is_dirty(&self) -> bool {
+        self.changed_files > 0
+    }
 }
 
 /// One child row of the subagent tree: a bounded, name-only activity label.
@@ -1674,6 +1703,8 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         effort: state.reasoning_effort,
         context_window: state.context_window,
         project: state.project,
+        home: state.home,
+        repository: state.repository,
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
@@ -3278,6 +3309,10 @@ pub struct Tui<E> {
     context_window: Option<u64>,
     session: String,
     project: String,
+    home: Option<String>,
+    repository: Option<RepositoryStatus>,
+    repository_probe: Option<RepositoryProbe>,
+    repository_polled_at: Option<Duration>,
     turn_state: Option<TurnState>,
     /// Whether the visible failure of the current turn is the projection's own
     /// placeholder, still waiting to be replaced by the real cause.
@@ -3345,6 +3380,10 @@ where
             context_window: None,
             session: "new session".to_owned(),
             project: "agens".to_owned(),
+            home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
+            repository: None,
+            repository_probe: None,
+            repository_polled_at: None,
             turn_state: None,
             placeholder_failure: false,
             active_tool: None,
@@ -3508,6 +3547,7 @@ where
 
     pub fn tick(&mut self, now: Duration) {
         self.now = now;
+        self.poll_repository(now);
         if self.quit_armed_until.is_some_and(|until| now >= until) {
             self.quit_armed_until = None;
         }
@@ -3624,6 +3664,30 @@ where
     /// Sets the project identity displayed in the semantic terminal header.
     pub fn set_project(&mut self, project: impl Into<String>) {
         self.project = project.into();
+    }
+
+    /// Installs the source the footer reads branch and working-tree size from.
+    ///
+    /// The probe is called on the tick, so it must already have the answer:
+    /// collecting it is the caller's job, on the caller's own clock. A probe
+    /// that shells out to git here would put every frame behind it.
+    pub fn set_repository_probe(&mut self, probe: RepositoryProbe) {
+        self.repository = probe();
+        self.repository_probe = Some(probe);
+    }
+
+    fn poll_repository(&mut self, now: Duration) {
+        let Some(probe) = self.repository_probe.as_ref() else {
+            return;
+        };
+        if self
+            .repository_polled_at
+            .is_some_and(|polled| now.saturating_sub(polled) < REPOSITORY_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.repository_polled_at = Some(now);
+        self.repository = probe();
     }
 
     /// Sets the dangerous-mode state displayed for the next submitted turn.
@@ -4559,6 +4623,8 @@ where
             context_window: self.context_window,
             session: &self.session,
             project: &self.project,
+            home: self.home.as_deref(),
+            repository: self.repository.as_ref(),
             turn_state: self.turn_state,
             dangerous_mode: self.dangerous_mode,
             bypass: self.bypass,

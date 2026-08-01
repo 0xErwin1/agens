@@ -22,6 +22,7 @@ use crate::models::seed_remembered_tui_selection;
 use crate::permission_prompt::TtyPermissionPrompter;
 use crate::permission_prompt::TuiPermissionPrompter;
 use crate::permission_prompt::production_tui_permission_bridge;
+use crate::repository::start_repository_probe;
 use crate::resume::{ResumedTuiSession, resume_tui_session, resumed_subagent_cards};
 use crate::router::{TuiRuntimeRouter, tui_provider_outcome};
 use crate::turn::{complete_tui_turn, tui_session_presentation};
@@ -597,6 +598,7 @@ pub fn configure_tui_project_identity(tui: &mut Tui<ProductionTuiEngine>, bootst
         agens_bootstrap::session_root::SessionRoot::discover_for_new_session(bootstrap)
     {
         tui.set_project(root.path().display().to_string());
+        tui.set_repository_probe(start_repository_probe(root.path()));
     }
 }
 
