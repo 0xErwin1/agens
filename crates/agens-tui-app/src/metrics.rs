@@ -167,6 +167,7 @@ impl TuiMetricsPublisher {
             TurnEvent::ProviderPart(_) | TurnEvent::StateChanged(_) => None,
             TurnEvent::ToolResult(_) => None,
             TurnEvent::ToolResultFacts { .. } => None,
+            TurnEvent::ProviderRetry { .. } => None,
         };
 
         if let Some(event) = metric {

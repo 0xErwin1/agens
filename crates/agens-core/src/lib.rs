@@ -525,6 +525,31 @@ pub enum TurnEvent {
         identity: FactIdentity,
         facts: ToolResultFacts,
     },
+    /// A transient provider failure the runtime is about to retry.
+    ///
+    /// It carries no failure text: the surfaces that render it are describing
+    /// what the turn is doing right now, not reporting an error the user has
+    /// to act on. A turn that exhausts its retries reports the failure through
+    /// the ordinary terminal path.
+    ProviderRetry {
+        attempt: u8,
+        max_attempts: Option<u8>,
+        delay: Option<Duration>,
+        reason: TurnRetryReason,
+    },
+}
+
+/// Why a turn is waiting before it tries the provider again.
+///
+/// Deliberately coarser than the provider's own diagnostic classes: these are
+/// the distinctions a reader of the status line can act on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TurnRetryReason {
+    RateLimited,
+    ServerError,
+    Network,
+    Timeout,
+    Transient,
 }
 
 /// Typed decomposition of a tool call's raw argument payload.

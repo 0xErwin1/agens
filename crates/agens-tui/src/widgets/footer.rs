@@ -1,5 +1,6 @@
 //! Compact operational footer (Claude Code–inspired density, Agens-owned layout).
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use agens_core::Usage;
@@ -13,13 +14,13 @@ use super::RolePalette;
 use super::overlay::truncate_columns;
 
 /// Context for the single operational footer row.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct FooterContext<'a> {
     pub model: &'a str,
     pub effort: Option<&'a str>,
     pub context_window: Option<u64>,
     pub project: &'a str,
-    pub turn_label: &'a str,
+    pub turn_label: Cow<'a, str>,
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
     pub dangerous: bool,
@@ -100,7 +101,7 @@ impl FooterSegments {
             project
         };
 
-        let mut status = ctx.turn_label.to_owned();
+        let mut status = ctx.turn_label.to_string();
         if let Some(duration) = ctx.duration {
             status.push_str(&if duration.as_secs() > 0 {
                 format!(" {}s", duration.as_secs())
@@ -186,7 +187,7 @@ impl MetricFooter {
     pub(crate) fn spans(width: u16, ctx: FooterContext<'_>) -> Vec<Span<'static>> {
         let turn_status = ctx
             .failed
-            .then(|| FooterSegments::new(ctx).turn_status)
+            .then(|| FooterSegments::new(ctx.clone()).turn_status)
             .flatten();
         let text = Self::text(width, ctx);
 
@@ -352,7 +353,7 @@ mod tests {
                 effort: Some("high"),
                 context_window: Some(200_000),
                 project: "/home/iperez/dev/personal/agens",
-                turn_label: "Ready",
+                turn_label: Cow::Borrowed("Ready"),
                 duration: Some(Duration::from_secs(2)),
                 usage: Some(&Usage {
                     input_tokens: Some(1),
@@ -390,7 +391,7 @@ mod tests {
             effort: Some("high"),
             context_window: Some(200_000),
             project: "/home/iperez/dev/personal/agens",
-            turn_label: "Ready",
+            turn_label: Cow::Borrowed("Ready"),
             duration: None,
             usage: Some(&Usage {
                 input_tokens: Some(1),
@@ -467,7 +468,7 @@ mod tests {
 
     fn failed_spans(mutate: impl FnOnce(&mut FooterContext<'static>)) -> Vec<Span<'static>> {
         let mut ctx = sample();
-        ctx.turn_label = "Failed";
+        ctx.turn_label = Cow::Borrowed("Failed");
         ctx.failed = true;
         mutate(&mut ctx);
         MetricFooter::spans(100, ctx)

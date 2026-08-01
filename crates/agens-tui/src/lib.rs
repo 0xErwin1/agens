@@ -1,5 +1,6 @@
 //! Terminal lifecycle and input-event boundary for the interactive surface.
 
+mod activity;
 mod app;
 mod bridge;
 mod conversation;
@@ -7,6 +8,7 @@ mod render;
 mod terminal;
 mod widgets;
 
+pub use activity::{RetryActivity, TurnActivity};
 pub use agens_bus::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 pub use agens_core::{
     DiffLine, DiffLineKind, NoticeSeverity, ToolResultState, TuiExecution, TuiExecutionEvent,
@@ -746,6 +748,8 @@ pub struct ViewState<'a> {
     pub execution_activities: Vec<TuiExecutionActivity>,
     /// Tick clock reading when the active turn began, for live elapsed time.
     pub turn_started_at: Option<Duration>,
+    /// What the turn is doing, as the single source of every activity label.
+    pub turn_activity: TurnActivity<'a>,
 }
 
 /// One child row of the subagent tree: a bounded, name-only activity label.
@@ -1670,7 +1674,7 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         effort: state.reasoning_effort,
         context_window: state.context_window,
         project: state.project,
-        turn_label: turn_state_label(state.turn_state, state.running, state.session_loading),
+        turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
         dangerous: state.dangerous_mode,
@@ -2734,27 +2738,6 @@ fn execution_state_color(state: TuiExecutionState) -> Color {
     }
 }
 
-fn turn_state_label(
-    state: Option<TurnState>,
-    running: bool,
-    session_loading: bool,
-) -> &'static str {
-    if session_loading {
-        return "Loading session…";
-    }
-
-    match state {
-        Some(TurnState::Requesting) => "Waiting",
-        Some(TurnState::Streaming) => "Responding",
-        Some(TurnState::Dispatching) => "Using tool",
-        Some(TurnState::Cancelled) => "Cancelling",
-        Some(TurnState::Failed) => "Failed",
-        Some(TurnState::Completed) => "Completed",
-        _ if running => "Working",
-        _ => "Ready",
-    }
-}
-
 fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
@@ -2863,9 +2846,10 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         conversation_is_authoritative,
     )));
     if state.running {
+        let label = state.turn_activity.status_label();
         transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
-                label: "Working…",
+                label: &label,
                 now: state.now,
                 elapsed: state
                     .turn_started_at
@@ -3266,7 +3250,7 @@ impl Renderer for PlainRenderer {
         }
 
         if state.running {
-            writeln!(stdout, "Working…")?;
+            writeln!(stdout, "{}", state.turn_activity.status_label())?;
         }
         write!(stdout, "> {}", state.input)?;
         stdout.flush()
@@ -3299,6 +3283,10 @@ pub struct Tui<E> {
     /// placeholder, still waiting to be replaced by the real cause.
     placeholder_failure: bool,
     active_tool: Option<String>,
+    /// The transient provider failure currently being waited out, if any.
+    pending_retry: Option<RetryActivity>,
+    /// Tick clock reading when the current reasoning stretch began.
+    reasoning_started_at: Option<Duration>,
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
@@ -3357,6 +3345,8 @@ where
             turn_state: None,
             placeholder_failure: false,
             active_tool: None,
+            pending_retry: None,
+            reasoning_started_at: None,
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
@@ -3543,6 +3533,8 @@ where
     pub fn set_running(&mut self, running: bool) {
         let finishing = self.running && !running;
         self.running = running;
+        self.pending_retry = None;
+        self.reasoning_started_at = None;
         if running {
             self.turn_started_at = Some(self.now);
             self.palette_open = false;
@@ -4589,6 +4581,7 @@ where
             execution_selection: self.execution_selection,
             execution_activities: self.focused_execution_activities(),
             turn_started_at: self.turn_started_at,
+            turn_activity: self.current_activity(),
         }
     }
 
@@ -4882,6 +4875,8 @@ where
             TurnEvent::ProviderPart(MessagePart::Text(delta)) => {
                 self.project_conversation(ConversationEvent::MarkdownDelta(delta.clone()));
                 self.turn_state = Some(TurnState::Streaming);
+                self.clear_provider_retry();
+                self.reasoning_started_at = None;
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
@@ -4889,6 +4884,10 @@ where
             }
             TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
                 self.project_conversation(ConversationEvent::ReasoningDelta(delta.clone()));
+                self.clear_provider_retry();
+                if self.reasoning_started_at.is_none() {
+                    self.reasoning_started_at = Some(self.now);
+                }
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Reasoning(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Reasoning(delta)),
@@ -4909,6 +4908,8 @@ where
                     },
                 });
                 self.turn_state = Some(TurnState::Dispatching);
+                self.clear_provider_retry();
+                self.reasoning_started_at = None;
                 self.active_tool = (!hidden_task).then_some(name.clone());
                 if !hidden_task {
                     self.transcript
@@ -4950,6 +4951,8 @@ where
                 self.assistant_streaming = false;
                 self.turn_state = Some(state);
                 self.active_tool = None;
+                self.pending_retry = None;
+                self.reasoning_started_at = None;
                 if finishing {
                     self.settle_active_conversation();
                     self.auto_collapse_thinking_on_finish();
@@ -4959,8 +4962,42 @@ where
                 }
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
+            TurnEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay,
+                reason,
+            } => {
+                self.pending_retry = Some(RetryActivity {
+                    attempt,
+                    max_attempts,
+                    delay,
+                    reason,
+                });
+            }
             _ => {}
         }
+    }
+
+    /// Drops the pending retry once the attempt it was waiting for produced
+    /// something. A retry is only ever cleared by evidence of progress or by
+    /// the turn ending — never by a timer, which would leave a long backoff
+    /// silent again.
+    fn clear_provider_retry(&mut self) {
+        self.pending_retry = None;
+    }
+
+    fn current_activity(&self) -> TurnActivity<'_> {
+        activity::TurnActivity::derive(activity::ActivityInputs {
+            turn_state: self.turn_state,
+            running: self.running,
+            session_loading: self.session_loading,
+            active_tool: self.active_tool.as_deref(),
+            retry: self.pending_retry,
+            reasoning_elapsed: self
+                .reasoning_started_at
+                .map(|started| self.now.saturating_sub(started)),
+        })
     }
 
     fn main_task_call_ids(&self) -> impl Iterator<Item = &str> {

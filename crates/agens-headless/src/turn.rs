@@ -26,7 +26,7 @@ use agens_tools::{
 use agens_agents::{AgentModelCompatibility, agent_catalog};
 use agens_bootstrap::Bootstrap;
 use agens_bootstrap::effective_max_iterations;
-use agens_diagnostics::{operation_diagnostics, record_parent_terminal};
+use agens_diagnostics::{operation_diagnostics_with_progress, record_parent_terminal};
 use agens_dispatch::ProductionToolDispatcher;
 use agens_error::{CliError, ExitStatus, cancellation_result};
 use agens_permissions::{
@@ -133,10 +133,11 @@ pub fn run_production_headless_chat_with_progress(
         request.system_prompt = Some(explicit_task_delegation_prompt(&base));
     }
 
-    let diagnostics = operation_diagnostics(
+    let diagnostics = operation_diagnostics_with_progress(
         bootstrap,
         ProviderDiagnosticScope::Parent,
         operation_reference,
+        progress.cloned(),
     );
     let diagnostic_reference = diagnostics.reference;
     let provider_diagnostics = diagnostics.provider;

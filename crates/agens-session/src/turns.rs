@@ -97,7 +97,8 @@ pub fn completed_session_turn_from_events(
             TurnEvent::StateChanged(_)
             | TurnEvent::Usage(_)
             | TurnEvent::ToolCallRequested { .. }
-            | TurnEvent::ToolResultFacts { .. } => continue,
+            | TurnEvent::ToolResultFacts { .. }
+            | TurnEvent::ProviderRetry { .. } => continue,
         };
         if role != Some(next_role) {
             if let Some(role) = role {

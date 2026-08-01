@@ -1,7 +1,7 @@
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
-use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
+use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
@@ -402,9 +402,15 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
     let active_later = rendered_text(&renderer);
 
     assert!(active_early.contains("⠋"), "{active_early:?}");
-    assert!(active_early.contains("Working…"), "{active_early:?}");
+    assert!(
+        active_early.contains("Waiting for the model…"),
+        "{active_early:?}"
+    );
     assert!(active_later.contains("⠙"), "{active_later:?}");
-    assert!(active_later.contains("Working…"), "{active_later:?}");
+    assert!(
+        active_later.contains("Waiting for the model…"),
+        "{active_later:?}"
+    );
     assert_ne!(active_early, active_later);
 }
 
@@ -425,9 +431,70 @@ fn working_indicator_remains_visible_when_live_transcript_reaches_the_composer()
 
     assert!(rendered.contains("output-line-14"), "{rendered:?}");
     assert!(rendered.contains("output-line-19"), "{rendered:?}");
-    assert!(rendered.contains("Working…"), "{rendered:?}");
+    assert!(rendered.contains("Responding…"), "{rendered:?}");
     assert!(!rendered.contains("LIVE"), "{rendered:?}");
     assert!(!rendered.contains("SCROLL"), "{rendered:?}");
+}
+
+#[test]
+fn a_provider_backoff_reads_differently_from_an_ordinary_wait() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+
+    renderer.render(tui.view()).unwrap();
+    let waiting = rendered_text(&renderer);
+
+    tui.apply_progress(TurnEvent::ProviderRetry {
+        attempt: 2,
+        max_attempts: Some(3),
+        delay: Some(Duration::from_millis(1500)),
+        reason: TurnRetryReason::RateLimited,
+    });
+    renderer.render(tui.view()).unwrap();
+    let retrying = rendered_text(&renderer);
+
+    assert!(waiting.contains("Waiting for the model…"), "{waiting:?}");
+    assert!(!waiting.contains("Retrying"), "{waiting:?}");
+    assert!(retrying.contains("Retrying (2/3)"), "{retrying:?}");
+    assert!(retrying.contains("rate limited"), "{retrying:?}");
+    assert!(retrying.contains("retrying in 1.5s"), "{retrying:?}");
+}
+
+#[test]
+fn a_retry_stops_being_reported_once_the_next_attempt_produces_output() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderRetry {
+        attempt: 1,
+        max_attempts: Some(3),
+        delay: Some(Duration::from_millis(250)),
+        reason: TurnRetryReason::ServerError,
+    });
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(!rendered.contains("Retrying"), "{rendered:?}");
+    assert!(rendered.contains("Responding…"), "{rendered:?}");
+}
+
+#[test]
+fn a_reasoning_stretch_reports_how_long_it_has_been_running() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "weighing options".into(),
+    )));
+    tui.tick(Duration::from_secs(9));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("Reasoning… 9s"), "{rendered:?}");
 }
 
 #[test]
@@ -4729,7 +4796,7 @@ fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
 
     assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
     assert!(!rendered.contains("BYPASS"), "{rendered:?}");
-    assert!(!rendered.contains("Waiting"), "{rendered:?}");
+    assert!(!rendered.contains("· Waiting"), "{rendered:?}");
 }
 
 #[test]
