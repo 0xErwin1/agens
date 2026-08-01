@@ -153,9 +153,13 @@ fn transcript_drag_selection_paints_exact_cells_and_preserves_original_text() {
 
     assert_eq!(tui.selected_text(), Some("café"));
     for offset in 0..4 {
+        let cell = &renderer.terminal().backend().buffer()[(column + offset, row)];
+        assert_eq!(cell.bg, Color::Rgb(0x1b, 0x33, 0x30));
         assert_eq!(
-            renderer.terminal().backend().buffer()[(column + offset, row)].bg,
-            Color::Rgb(0x95, 0xe6, 0xcb)
+            cell.fg,
+            Color::Rgb(0xd6, 0xd4, 0xcd),
+            "selected text must take the selection foreground; leaving the \
+             original colour under a selection wash is how it became unreadable"
         );
     }
     let rendered = rendered_text(&renderer);
