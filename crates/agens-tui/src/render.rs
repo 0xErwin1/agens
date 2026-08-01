@@ -156,6 +156,41 @@ pub(super) fn conversation_lines(
     content_width: u16,
     state: ConversationRenderState<'_>,
 ) -> Vec<Line<'static>> {
+    painted_conversation(
+        conversation,
+        events,
+        tool_display_modes,
+        content_width,
+        state,
+    )
+    .lines
+}
+
+/// The same rows `conversation_lines` paints, each tagged with its owning call.
+pub(super) fn conversation_call_rows(
+    conversation: &Conversation,
+    events: &[TuiRuntimeEvent],
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    content_width: u16,
+    state: ConversationRenderState<'_>,
+) -> Vec<Option<String>> {
+    painted_conversation(
+        conversation,
+        events,
+        tool_display_modes,
+        content_width,
+        state,
+    )
+    .owners
+}
+
+fn painted_conversation(
+    conversation: &Conversation,
+    events: &[TuiRuntimeEvent],
+    tool_display_modes: &BTreeMap<String, DisplayMode>,
+    content_width: u16,
+    state: ConversationRenderState<'_>,
+) -> PaintedBlocks {
     let context = ItemContext {
         conversation,
         events,
@@ -289,12 +324,9 @@ struct Neighbour {
 /// separated by exactly one. A tool result never detaches from the call it
 /// closes, even when the user expanded its body. Blocks that render nothing are
 /// transparent, so a hidden item can neither force nor absorb a gap.
-fn paint_blocks(
-    blocks: Vec<RenderedBlock>,
-    now: Duration,
-    unicode: UnicodeLevel,
-) -> Vec<Line<'static>> {
+fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration, unicode: UnicodeLevel) -> PaintedBlocks {
     let mut lines = Vec::new();
+    let mut owners = Vec::new();
     let mut previous: Option<Neighbour> = None;
 
     for block in blocks.into_iter().filter(|block| !block.rows.is_empty()) {
@@ -303,21 +335,30 @@ fn paint_blocks(
             .is_some_and(|previous| separates(previous, &block))
         {
             lines.push(Line::default());
+            owners.push(None);
         }
+        let call_id = block.call_id;
         previous = Some(Neighbour {
             packs: block.packs,
-            call_id: block.call_id,
+            call_id: call_id.clone(),
         });
-        lines.extend(
-            block
-                .rows
-                .into_iter()
-                .enumerate()
-                .map(|(row, line)| painted_row(line, row, now, unicode)),
-        );
+        for (row, line) in block.rows.into_iter().enumerate() {
+            lines.push(painted_row(line, row, now, unicode));
+            owners.push(call_id.clone());
+        }
     }
 
-    lines
+    PaintedBlocks { lines, owners }
+}
+
+/// Painted rows and, per row, the tool call that owns it.
+///
+/// The ownership is kept beside the rows rather than derived from them later:
+/// once a block becomes lines, nothing in a line says which call produced it,
+/// and reconstructing that by reading the text back would be guessing.
+pub(super) struct PaintedBlocks {
+    pub lines: Vec<Line<'static>>,
+    pub owners: Vec<Option<String>>,
 }
 
 fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
