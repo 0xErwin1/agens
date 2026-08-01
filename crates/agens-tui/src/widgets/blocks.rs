@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use agens_core::ToolInput;
-use agens_core::redaction::redact_credential_values;
+use agens_core::redaction::{is_credential_key, redact_credential_values};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -526,6 +526,11 @@ fn summarize_arguments_by_value(raw: &str) -> Option<String> {
             Value::Object(_) => "{…}".to_owned(),
             Value::Array(items) => format!("[{}]", items.len()),
             Value::Null => "null".to_owned(),
+            // A value under a credential-shaped key is withheld on the key
+            // alone. Judging it by its own shape asks the wrong question: a
+            // short or low-entropy secret is still a secret, and the argument
+            // called `token` announced what it holds.
+            _ if is_credential_key(&key) => "[redacted]".to_owned(),
             Value::String(text) => {
                 let text = redact_credential_values(&collapse_whitespace(text));
                 truncate_operand(&text, MAX_SUMMARIZED_VALUE_WIDTH)
@@ -1108,6 +1113,19 @@ mod tests {
         assert!(
             !credential.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
             "an argument that looks like a credential never reaches the row: {credential:?}"
+        );
+
+        // Shape is not the only signal, and it is the weaker one: a short or
+        // low-entropy secret looks like nothing, while the key that holds it
+        // already said what it is.
+        let named = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: r#"{"token":"hunter2","password":"x","tokenizer":"bpe"}"#.into(),
+        });
+        assert_eq!(
+            named, "foo__bar {password=[redacted], token=[redacted], tokenizer=bpe}",
+            "a credential-shaped key withholds its value whatever the value looks like, \
+             and a word that merely contains one does not"
         );
 
         let long = header_of(&ToolInput::Other {

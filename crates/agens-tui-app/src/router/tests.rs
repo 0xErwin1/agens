@@ -3130,8 +3130,13 @@ fn persisted_selection_updates_and_resume_are_atomic_and_credential_fresh() {
     std::fs::remove_dir_all(temporary).unwrap();
 }
 
+/// A tool call whose permission target cannot be read is a call that must not
+/// run — but the turn survives it. Since AGN's tool-failure recovery the runtime
+/// hands the model `invalid tool arguments` instead of aborting, so the agent
+/// can correct itself; what stays absolute is that nothing dispatches and no
+/// argument of the rejected call is echoed anywhere.
 #[test]
-fn permission_error_mapping_is_sanitized_and_fails_closed() {
+fn an_unreadable_permission_target_dispatches_nothing_and_echoes_nothing() {
     let secret_input = r#"{"command":"SENTINEL_COMMAND","token":"SENTINEL_TOKEN"}"#;
     for (name, input) in [
         ("native::read", "{malformed"),
@@ -3151,8 +3156,50 @@ fn permission_error_mapping_is_sanitized_and_fails_closed() {
             false,
         );
 
-        assert_eq!(outcome.result, Err(HeadlessTurnError::PermissionEvaluation));
-        assert!(outcome.executions.is_empty());
+        assert!(outcome.executions.is_empty(), "{name}: {input}");
+        assert!(
+            outcome.prompts.is_empty(),
+            "an unreadable target is never asked about: {name}"
+        );
+
+        let snapshot = outcome
+            .result
+            .as_ref()
+            .expect("the turn recovers rather than aborting");
+        assert!(
+            snapshot.events().iter().any(|event| matches!(
+                event,
+                agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+                    tool_call_id,
+                    content,
+                    is_error: true,
+                }) if tool_call_id == "invalid" && content == "invalid tool arguments"
+            )),
+            "the model is told, in words that carry none of the call: {:?}",
+            snapshot.events()
+        );
+
+        // The call's own arguments travel with the call — that is the
+        // conversation, not a leak. What must carry none of them is the
+        // rejection the runtime writes itself.
+        let rejection = snapshot
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                agens_core::TurnEvent::ToolResult(MessagePart::ToolResult {
+                    content,
+                    is_error: true,
+                    ..
+                }) => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        for sentinel in ["SENTINEL_COMMAND", "SENTINEL_TOKEN", "SENTINEL_PATH"] {
+            assert!(
+                !rejection.contains(sentinel),
+                "{sentinel} leaked into the rejection: {rejection}"
+            );
+        }
     }
 
     for (turn_error, expected) in [
