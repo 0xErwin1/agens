@@ -3306,6 +3306,32 @@ impl SelectableTranscript {
         Self { rows }
     }
 
+    /// How many rows these lines wrap into, without materializing any of them.
+    ///
+    /// Scroll bounds need the row count and nothing else. Building the full
+    /// index for it means allocating a styled, copyable, text-carrying cell
+    /// for every character in the transcript — tens of thousands of them, on
+    /// a path that runs for every scroll tick and every mouse press.
+    fn row_count(lines: &[Line<'_>], width: u16) -> usize {
+        let width = width.max(1);
+        let mut rows = 0;
+
+        for line in lines {
+            let mut shapes = line
+                .styled_graphemes(Style::default())
+                .map(CellShape::from_grapheme)
+                .collect::<Vec<_>>();
+
+            if shapes.last().is_some_and(CellShape::is_wrap_joiner) {
+                shapes.pop();
+            }
+
+            rows += wrap_cells(shapes, width, CellShape::width, CellShape::is_whitespace).len();
+        }
+
+        rows
+    }
+
     fn position_at(&self, row: usize, column: u16) -> Option<TranscriptPosition> {
         let cells = &self.rows.get(row)?.cells;
         let cell = cells
@@ -3397,25 +3423,80 @@ impl SelectableTranscript {
 }
 
 fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<SelectableCell>> {
+    wrap_cells(
+        cells,
+        width,
+        |cell| cell.width,
+        selectable_cell_is_whitespace,
+    )
+}
+
+/// Everything the wrap algorithm needs to know about a cell, and nothing else.
+///
+/// Deliberately `Copy` and three bytes wide: this is what a transcript costs
+/// when it only has to be counted.
+#[derive(Clone, Copy)]
+struct CellShape {
+    width: u16,
+    whitespace: bool,
+    wrap_joiner: bool,
+}
+
+impl CellShape {
+    fn from_grapheme(grapheme: ratatui::text::StyledGrapheme<'_>) -> Self {
+        let symbol = grapheme.symbol;
+        Self {
+            width: saturating_u16(symbol.width()),
+            whitespace: symbol == "\u{200b}"
+                || symbol != "\u{00a0}" && symbol.chars().all(char::is_whitespace),
+            wrap_joiner: symbol == render::WRAP_JOINER_SPACE || symbol == render::WRAP_JOINER_TIGHT,
+        }
+    }
+
+    const fn width(&self) -> u16 {
+        self.width
+    }
+
+    const fn is_whitespace(&self) -> bool {
+        self.whitespace
+    }
+
+    const fn is_wrap_joiner(&self) -> bool {
+        self.wrap_joiner
+    }
+}
+
+/// Wraps a line's cells into rows.
+///
+/// Generic over the cell so that counting rows and materializing them run the
+/// same algorithm: only the advance width and whether a cell is whitespace
+/// affect where a row breaks, and a second implementation for counting would
+/// be free to drift away from this one without any test noticing.
+fn wrap_cells<T>(
+    cells: Vec<T>,
+    width: u16,
+    cell_width: impl Fn(&T) -> u16,
+    is_whitespace_cell: impl Fn(&T) -> bool,
+) -> Vec<Vec<T>> {
     let mut rows = Vec::new();
     let mut line = Vec::new();
     let mut line_width = 0_u16;
     let mut word = Vec::new();
     let mut word_width = 0_u16;
-    let mut whitespace: VecDeque<SelectableCell> = VecDeque::new();
+    let mut whitespace: VecDeque<T> = VecDeque::new();
     let mut whitespace_width = 0_u16;
     let mut previous_was_text = false;
 
     for cell in cells {
-        if cell.width > width {
+        if cell_width(&cell) > width {
             continue;
         }
-        let is_whitespace = selectable_cell_is_whitespace(&cell);
+        let is_whitespace = is_whitespace_cell(&cell);
         let word_finished = previous_was_text && is_whitespace;
         let segment_overflow = line.is_empty()
             && word_width
                 .saturating_add(whitespace_width)
-                .saturating_add(cell.width)
+                .saturating_add(cell_width(&cell))
                 > width;
         if word_finished || segment_overflow {
             line.extend(whitespace.drain(..));
@@ -3427,7 +3508,7 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         let line_full = line_width >= width;
-        let word_overflow = cell.width > 0
+        let word_overflow = cell_width(&cell) > 0
             && line_width
                 .saturating_add(whitespace_width)
                 .saturating_add(word_width)
@@ -3437,11 +3518,11 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
             rows.push(std::mem::take(&mut line));
             line_width = 0;
             while let Some(pending) = whitespace.front() {
-                if pending.width > remaining {
+                if cell_width(pending) > remaining {
                     break;
                 }
-                whitespace_width = whitespace_width.saturating_sub(pending.width);
-                remaining = remaining.saturating_sub(pending.width);
+                whitespace_width = whitespace_width.saturating_sub(cell_width(pending));
+                remaining = remaining.saturating_sub(cell_width(pending));
                 whitespace.pop_front();
             }
             if is_whitespace && whitespace.is_empty() {
@@ -3451,10 +3532,10 @@ fn wrap_selectable_line(cells: Vec<SelectableCell>, width: u16) -> Vec<Vec<Selec
         }
 
         if is_whitespace {
-            whitespace_width = whitespace_width.saturating_add(cell.width);
+            whitespace_width = whitespace_width.saturating_add(cell_width(&cell));
             whitespace.push_back(cell);
         } else {
-            word_width = word_width.saturating_add(cell.width);
+            word_width = word_width.saturating_add(cell_width(&cell));
             word.push(cell);
         }
         previous_was_text = !is_whitespace;
@@ -6272,9 +6353,9 @@ where
             .transcript
             .width
             .saturating_sub(TRANSCRIPT_ROW_INDENT);
-        let transcript =
-            SelectableTranscript::from_lines(&rendered_transcript(&view, row_width), row_width);
-        saturating_u16(transcript.rows.len().saturating_sub(visible_rows))
+        let rows =
+            SelectableTranscript::row_count(&rendered_transcript(&view, row_width), row_width);
+        saturating_u16(rows.saturating_sub(visible_rows))
     }
 
     /// Rows a page advances, bounded by the rows the transcript actually shows:
@@ -9770,6 +9851,29 @@ mod runtime_tests {
             tui.view().scroll_offset > 0,
             "a prompt row is reachable even though the accent column precedes its glyph"
         );
+    }
+
+    #[test]
+    fn counting_rows_agrees_with_building_them() {
+        let lines = vec![
+            Line::raw("short"),
+            Line::raw(""),
+            Line::raw("a much longer paragraph that has to wrap several times at this width"),
+            Line::raw("AAA AAA AAAAA AA AAAAAA"),
+            Line::raw("supercalifragilisticexpialidocious antidisestablishmentarianism"),
+            Line::raw("  indented continuation with trailing space   "),
+            Line::raw("café ñandú 日本語 mixed widths"),
+            Line::raw(format!("joined{}", render::WRAP_JOINER_SPACE)),
+            Line::raw(format!("tight{}", render::WRAP_JOINER_TIGHT)),
+        ];
+
+        for width in [1, 2, 3, 7, 10, 23, 80] {
+            assert_eq!(
+                SelectableTranscript::row_count(&lines, width),
+                SelectableTranscript::from_lines(&lines, width).rows.len(),
+                "row count and row construction disagreed at width {width}"
+            );
+        }
     }
 
     #[test]
