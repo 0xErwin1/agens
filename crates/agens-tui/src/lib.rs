@@ -157,6 +157,8 @@ pub enum Key {
     CtrlShiftO,
     /// Shows or hides the reasoning bodies of the active transcript.
     CtrlT,
+    /// Unfolds the settled turns the transcript elided, or folds them back.
+    CtrlY,
     /// Scrolls the transcript timeline down (composer-safe).
     CtrlJ,
     /// Scrolls the transcript timeline up (composer-safe).
@@ -654,6 +656,8 @@ pub struct TranscriptRecord {
     /// hidden among expanded ones.
     tool_detail: widgets::DisplayMode,
     collapse_thinking: bool,
+    /// When true, the settled turns the transcript would elide stay in view.
+    history_expanded: bool,
     /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+T).
     thinking_user_pinned: bool,
     focus: TranscriptFocus,
@@ -678,6 +682,7 @@ impl TranscriptRecord {
             tool_display_modes: BTreeMap::new(),
             tool_detail: widgets::DisplayMode::Collapsed,
             collapse_thinking: false,
+            history_expanded: false,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
             selection: None,
@@ -787,6 +792,8 @@ pub struct ViewState<'a> {
     pub tool_detail: widgets::DisplayMode,
     /// Whether complete reasoning is collapsed according to the UI setting.
     pub collapse_thinking: bool,
+    /// Whether the reader asked to see the settled turns the transcript elides.
+    pub history_expanded: bool,
     pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
@@ -2935,6 +2942,27 @@ fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
 /// `row_width` counts that column: chrome rows that no conversation block
 /// describes are padded through [`render::unaccented_row`] so their content
 /// keeps the same screen column as block rows.
+/// Settled turns kept in view before the transcript starts eliding.
+///
+/// Enough that the reader can see what led here, few enough that a long session
+/// does not make every scroll a walk through work that is already finished.
+const VISIBLE_SETTLED_TURNS: usize = 6;
+
+/// How many settled turns the transcript folds behind its count row.
+///
+/// Nothing is elided while the reader has asked to see everything, and nothing
+/// is elided when folding would hide fewer turns than the row costs to say so.
+fn elided_turn_count(state: &ViewState<'_>) -> usize {
+    if state.history_expanded {
+        return 0;
+    }
+    let settled = state.completed_conversations.len();
+    if settled <= VISIBLE_SETTLED_TURNS + 1 {
+        return 0;
+    }
+    settled - VISIBLE_SETTLED_TURNS
+}
+
 fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
     let mut transcript = chrome_rows(transcript_provenance(state));
     let thinking_streaming = state.running;
@@ -2948,7 +2976,16 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         }
         turn_lines.extend(lines);
     };
-    for (index, conversation) in state.completed_conversations.iter().enumerate() {
+    let elided = elided_turn_count(state);
+    if elided > 0 {
+        append_turn(vec![render::history_elision_row(elided, row_width)]);
+    }
+    for (index, conversation) in state
+        .completed_conversations
+        .iter()
+        .enumerate()
+        .skip(elided)
+    {
         append_turn(
             render::settled_conversation_lines(
                 render::SettledConversation {
@@ -4691,6 +4728,7 @@ where
                 tool_display_modes: BTreeMap::new(),
                 tool_detail: widgets::DisplayMode::Collapsed,
                 collapse_thinking: false,
+                history_expanded: false,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
                 selection: None,
@@ -4862,6 +4900,7 @@ where
             tool_display_modes: &active.tool_display_modes,
             tool_detail: active.tool_detail,
             collapse_thinking: active.collapse_thinking,
+            history_expanded: active.history_expanded,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
             secret_entry: self.secret_entry.as_ref().map(|entry| SecretEntryRender {
@@ -5675,6 +5714,11 @@ where
             }
             Key::CtrlT => {
                 self.toggle_thinking_expansion();
+                Action::Render
+            }
+            Key::CtrlY => {
+                let record = self.active_record_mut();
+                record.history_expanded = !record.history_expanded;
                 Action::Render
             }
             Key::CtrlJ => {
@@ -8071,6 +8115,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('t' | 'T'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlT
         }
+        (KeyCode::Char('y' | 'Y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlY
+        }
         (KeyCode::Char('j' | 'J'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlJ
         }
@@ -9646,6 +9693,7 @@ mod runtime_tests {
             (KeyCode::Char('o'), ctrl, Key::CtrlO),
             (KeyCode::Char('O'), ctrl, Key::CtrlShiftO),
             (KeyCode::Char('t'), ctrl, Key::CtrlT),
+            (KeyCode::Char('y'), ctrl, Key::CtrlY),
         ] {
             let event = crossterm::event::KeyEvent::new(code, modifiers);
             assert_eq!(map_key(event), Some(Event::Key(expected)));

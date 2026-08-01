@@ -351,6 +351,22 @@ pub(super) fn unaccented_row(line: Line<'static>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The one row standing in for the settled turns the transcript folded away.
+///
+/// It carries its own key because it is the only row for which that key does
+/// anything, and it exists only while something is actually hidden — so the
+/// hint is never advertising a press that would do nothing.
+pub(super) fn history_elision_row(elided: usize, row_width: u16) -> Line<'static> {
+    let noun = if elided == 1 { "turn" } else { "turns" };
+    unaccented_row(Line::from(Span::styled(
+        bounded_single_line(
+            &format!("… {elided} earlier {noun} · ^Y to show"),
+            usize::from(row_width),
+        ),
+        Style::default().fg(RolePalette::muted()),
+    )))
+}
+
 fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlock {
     match item {
         ConversationItem::Info(text) => {
