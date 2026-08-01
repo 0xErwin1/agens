@@ -4,6 +4,8 @@ mod activity;
 mod app;
 mod bridge;
 mod conversation;
+#[cfg(feature = "perf-audit")]
+pub mod perf;
 mod render;
 mod terminal;
 mod widgets;
@@ -128,6 +130,23 @@ pub enum Event {
         width: u16,
         height: u16,
     },
+}
+
+#[cfg(feature = "perf-audit")]
+impl Event {
+    /// Stable trace-field label for the event's discriminant.
+    const fn trace_kind(&self) -> &'static str {
+        match self {
+            Self::Key(_) => "key",
+            Self::MouseWheel(_) => "mouse_wheel",
+            Self::MouseDown { .. } => "mouse_down",
+            Self::MouseDrag { .. } => "mouse_drag",
+            Self::MouseUp { .. } => "mouse_up",
+            Self::MouseMove { .. } => "mouse_move",
+            Self::Paste(_) => "paste",
+            Self::Resize { .. } => "resize",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1505,20 +1524,30 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     render_frame_content(frame, &state);
     // Last, over the finished frame: the buffer is the one place every colour
     // has arrived, including the ones this crate never chose.
+    let _perf_quantize = agens_perf::span!(
+        "tui.frame.quantize",
+        color_level = state.color_level.trace_label(),
+    );
     widgets::quantize_buffer(frame.buffer_mut(), state.color_level);
 }
 
 fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
+    let _perf_content = agens_perf::span!("tui.frame.content");
     let area = frame.area();
     let notice = notice_spans(state);
-    let layout = screen_layout(area, state.input, !notice.is_empty());
+    let layout = {
+        let _perf_layout = agens_perf::span!("tui.frame.layout");
+        screen_layout(area, state.input, !notice.is_empty())
+    };
 
     let row_width = layout
         .transcript
         .width
         .saturating_sub(TRANSCRIPT_ROW_INDENT);
-    let transcript =
-        SelectableTranscript::from_lines(&rendered_transcript(state, row_width), row_width);
+    let transcript = {
+        let _perf_select = agens_perf::span!("tui.transcript.select", row_width = row_width);
+        SelectableTranscript::from_lines(&rendered_transcript(state, row_width), row_width)
+    };
     let visible_rows = layout
         .transcript
         .height
@@ -1543,20 +1572,27 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
                 ))
                 .title_alignment(Alignment::Right);
         }
-        frame.render_widget(
-            Paragraph::new(Text::from(transcript.render_lines(state.selection)))
-                .block(transcript_block)
-                .scroll((scroll, 0)),
-            layout.transcript,
-        );
+        {
+            let _perf_paint =
+                agens_perf::span!("tui.transcript.paint", rows = transcript.rows.len() as u64,);
+            frame.render_widget(
+                Paragraph::new(Text::from(transcript.render_lines(state.selection)))
+                    .block(transcript_block)
+                    .scroll((scroll, 0)),
+                layout.transcript,
+            );
+        }
         // After painting, not during: the pass reads back the laid-out rows, so
         // it is the one place every widget's output has already become columns.
-        widgets::apply_hyperlinks(
-            frame.buffer_mut(),
-            layout.transcript,
-            state.project,
-            state.hyperlinks,
-        );
+        {
+            let _perf_hyperlinks = agens_perf::span!("tui.transcript.hyperlinks");
+            widgets::apply_hyperlinks(
+                frame.buffer_mut(),
+                layout.transcript,
+                state.project,
+                state.hyperlinks,
+            );
+        }
     }
 
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
@@ -1635,6 +1671,7 @@ fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     }
 
     if layout.footer.height > 0 {
+        let _perf_footer = agens_perf::span!("tui.footer");
         frame.render_widget(
             Paragraph::new(Line::from(widgets::MetricFooter::spans(
                 layout.footer.width,
@@ -2684,6 +2721,7 @@ fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'st
 /// The tree is painted without wrapping, so every label is bounded to the
 /// columns left of it by its own rail and glyph.
 fn fitted_subagent_tree_lines(state: &ViewState<'_>, rows: u16, width: u16) -> Vec<Line<'static>> {
+    let _perf_tree = agens_perf::span!("tui.tree", rows = rows, width = width);
     if state.executions.is_empty() || rows == 0 {
         return Vec::new();
     }
@@ -3030,6 +3068,12 @@ fn assemble_transcript(
     row_width: u16,
     want_owners: bool,
 ) -> (Vec<Line<'static>>, Vec<Option<String>>) {
+    let _perf_assemble = agens_perf::span!(
+        "tui.transcript.assemble",
+        row_width = row_width,
+        settled_turns = state.completed_conversations.len() as u64,
+        want_owners = want_owners,
+    );
     let mut transcript = chrome_rows(transcript_provenance(state));
     let mut owners = vec![None; transcript.len()];
     let thinking_streaming = state.running;
@@ -3767,6 +3811,7 @@ where
 
     /// Handles one input or resize event without performing rendering or engine work.
     pub fn handle(&mut self, event: Event) -> Action {
+        let _perf_event = agens_perf::span!("tui.event", kind = event.trace_kind(), batch = 1u64,);
         match event {
             Event::Resize { width, height } => {
                 self.size = (width, height);
@@ -6102,6 +6147,11 @@ where
     }
 
     fn handle_mouse_wheel_batch(&mut self, directions: &[MouseWheelDirection]) -> Action {
+        let _perf_event = agens_perf::span!(
+            "tui.event.wheel_batch",
+            kind = "mouse_wheel",
+            batch = directions.len() as u64,
+        );
         if self
             .dialog
             .as_ref()
@@ -7773,6 +7823,12 @@ where
     E: Engine,
     R: Renderer,
 {
+    let _perf_gate = agens_perf::span!(
+        "tui.frame.gate",
+        rendered = agens_perf::Pending,
+        live_work = agens_perf::Pending,
+    );
+
     let execution_count = tui.executions.len();
     let quit_armed = tui.quit_is_armed();
     let restored_syntax_ready = tui.highlight_restored_syntax;
@@ -7782,17 +7838,28 @@ where
     let expired_quit_warning = quit_armed && !tui.quit_is_armed();
     let restored_syntax_became_ready = !restored_syntax_ready && tui.highlight_restored_syntax;
     let status_changed = status != tui.status;
+    let live_work = tui.has_live_work();
+    agens_perf::field!(live_work = live_work);
     if !dirty
         && !expired_execution
         && !expired_quit_warning
         && !restored_syntax_became_ready
         && !status_changed
-        && !schedule.heartbeat_due(now, tui.has_live_work())
+        && !schedule.heartbeat_due(now, live_work)
     {
+        agens_perf::field!(rendered = false);
         return Ok(false);
     }
 
-    renderer.render(tui.view())?;
+    agens_perf::field!(rendered = true);
+    let view = tui.view();
+    let _perf_frame = agens_perf::span!(
+        "tui.frame",
+        width = view.size.0,
+        height = view.size.1,
+        scroll_offset = view.scroll_offset,
+    );
+    renderer.render(view)?;
     schedule.mark_rendered(now);
     Ok(true)
 }
@@ -7848,6 +7915,13 @@ fn drain_provider_channels<E: Engine>(
     progress_receiver: &mpsc::Receiver<TurnEvent>,
     completion_receiver: &mpsc::Receiver<TuiProviderOutcome>,
 ) -> ProviderDrain {
+    let _perf_drain = agens_perf::span!(
+        "tui.drain",
+        progress = agens_perf::Pending,
+        metrics = agens_perf::Pending,
+        backlog = agens_perf::Pending,
+    );
+
     let progress = drain_channel(progress_receiver, |event| tui.apply_progress(event));
     let metrics = if progress.caught_up {
         drain_channel(metrics_receiver, |envelope| {
@@ -7865,13 +7939,17 @@ fn drain_provider_channels<E: Engine>(
         ChannelDrain::default()
     };
 
-    ProviderDrain {
+    let result = ProviderDrain {
         dirty: progress.dirty() || metrics.dirty() || completion.dirty(),
         backlog: progress.backlog()
             || metrics.backlog()
             || completion.backlog()
             || !(metrics.caught_up && progress.caught_up),
-    }
+    };
+    agens_perf::field!(progress = progress.processed as u64);
+    agens_perf::field!(metrics = metrics.processed as u64);
+    agens_perf::field!(backlog = result.backlog);
+    result
 }
 
 pub fn run_with_default_progress_submit(

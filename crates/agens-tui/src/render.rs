@@ -90,7 +90,15 @@ pub(super) fn settled_conversation_lines(
     content_width: u16,
     state: ConversationRenderState<'_>,
 ) -> Arc<[Line<'static>]> {
+    let _perf_settled = agens_perf::span!(
+        "tui.transcript.settled_turn",
+        index = identity.index as u64,
+        content_width = content_width,
+        cache_hit = agens_perf::Pending,
+    );
+
     if !is_settled(conversation) {
+        agens_perf::field!(cache_hit = false);
         return conversation_lines(conversation, &[], tool_display_modes, content_width, state)
             .into();
     }
@@ -118,6 +126,7 @@ pub(super) fn settled_conversation_lines(
             .map(|(_, lines)| Arc::clone(lines))
     });
     if let Some(lines) = cached {
+        agens_perf::field!(cache_hit = true);
         return lines;
     }
 
@@ -133,6 +142,7 @@ pub(super) fn settled_conversation_lines(
         cache.push_back((key, Arc::clone(&lines)));
     });
 
+    agens_perf::field!(cache_hit = false);
     lines
 }
 
@@ -191,6 +201,12 @@ fn painted_conversation(
     content_width: u16,
     state: ConversationRenderState<'_>,
 ) -> PaintedBlocks {
+    let _perf_build = agens_perf::span!(
+        "tui.transcript.build_blocks",
+        items = conversation.items.len() as u64,
+        content_width = content_width,
+    );
+
     let context = ItemContext {
         conversation,
         events,
@@ -200,7 +216,10 @@ fn painted_conversation(
             .max(1),
         state,
     };
-    let plan = plan_verb_groups(conversation, tool_display_modes);
+    let plan = {
+        let _perf_plan_groups = agens_perf::span!("tui.transcript.plan_groups");
+        plan_verb_groups(conversation, tool_display_modes)
+    };
     let mut blocks = Vec::new();
 
     for (index, item) in conversation.items.iter().enumerate() {
@@ -1067,6 +1086,13 @@ fn tool_result_body(
     content_width: usize,
     failed: bool,
 ) -> Arc<[Line<'static>]> {
+    let _perf_tool_body = agens_perf::span!(
+        "tui.tool_body",
+        content_width = content_width as u64,
+        failed = failed,
+        cache_hit = agens_perf::Pending,
+    );
+
     let mut hasher = DefaultHasher::new();
     output.hash(&mut hasher);
     let output_hash = hasher.finish();
@@ -1083,6 +1109,7 @@ fn tool_result_body(
             .map(|(_, body)| Arc::clone(body))
     });
     if let Some(body) = cached {
+        agens_perf::field!(cache_hit = true);
         return body;
     }
 
@@ -1117,6 +1144,7 @@ fn tool_result_body(
         ));
     });
 
+    agens_perf::field!(cache_hit = false);
     body
 }
 
@@ -2955,7 +2983,15 @@ fn normalized_code_language(token: &str) -> String {
 }
 
 fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
+    let _perf_syntax = agens_perf::span!(
+        "tui.syntax.tokens",
+        language = language,
+        source_bytes = source.len() as u64,
+        outcome = agens_perf::Pending,
+    );
+
     if source.len() > SYNTAX_MAX_SOURCE_BYTES {
+        agens_perf::field!(outcome = "oversize");
         return None;
     }
 
@@ -2970,8 +3006,14 @@ fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
             source.len() >= SYNTAX_DEFER_SOURCE_BYTES,
         );
     match lookup {
-        SyntaxCacheLookup::Ready(tokens) => return tokens,
-        SyntaxCacheLookup::Deferred => return None,
+        SyntaxCacheLookup::Ready(tokens) => {
+            agens_perf::field!(outcome = "ready");
+            return tokens;
+        }
+        SyntaxCacheLookup::Deferred => {
+            agens_perf::field!(outcome = "deferred");
+            return None;
+        }
         SyntaxCacheLookup::Parse => {}
     }
 
@@ -3001,10 +3043,12 @@ fn syntax_tokens(language: &str, source: &str) -> Option<Arc<[SyntaxToken]>> {
             )
         });
 
-    syntax_token_cache()
+    let result = syntax_token_cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .complete(hash, language, source, tokens)
+        .complete(hash, language, source, tokens);
+    agens_perf::field!(outcome = "parse");
+    result
 }
 
 fn syntax_theme() -> &'static Theme {

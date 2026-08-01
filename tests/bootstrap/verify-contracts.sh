@@ -33,7 +33,7 @@ assert_lines 'cargo test --workspace --all-targets --locked' "$(body test)" "Rus
 assert_lines 'cargo build --workspace --locked' "$(body build)" "Rust build"
 assert_lines 'cargo deny check' "$(body deny)" "supply-chain check"
 
-assert_lines $'tests/bootstrap/assert-workspace.sh\ntests/bootstrap/assert-surface-boundary.sh\ntests/bootstrap/docs-contract.sh\ntests/bootstrap/target-budget.sh\ntests/bootstrap/verify-contracts.sh\ntests/bootstrap/standards-contract.sh' "$(body contracts)" "bootstrap contracts"
+assert_lines $'tests/bootstrap/assert-workspace.sh\ntests/bootstrap/assert-surface-boundary.sh\ntests/bootstrap/docs-contract.sh\ntests/bootstrap/target-budget.sh\ntests/bootstrap/verify-contracts.sh\ntests/bootstrap/standards-contract.sh\ntests/bootstrap/perf-offpath.sh' "$(body contracts)" "bootstrap contracts"
 
 for gate in verify build; do
     if just --dry-run "$gate" | grep -Eq '(^|[[:space:]])(cargo clean|just target-clean|rm -rf target)($|[[:space:]])'; then
