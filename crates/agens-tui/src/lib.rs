@@ -794,6 +794,8 @@ pub struct ViewState<'a> {
     pub collapse_thinking: bool,
     /// Whether the reader asked to see the settled turns the transcript elides.
     pub history_expanded: bool,
+    /// Whether this terminal renders OSC 8 hyperlinks.
+    pub hyperlinks: bool,
     pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
@@ -1525,6 +1527,14 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
                 .block(transcript_block)
                 .scroll((scroll, 0)),
             layout.transcript,
+        );
+        // After painting, not during: the pass reads back the laid-out rows, so
+        // it is the one place every widget's output has already become columns.
+        widgets::apply_hyperlinks(
+            frame.buffer_mut(),
+            layout.transcript,
+            state.project,
+            state.hyperlinks,
         );
     }
 
@@ -3538,6 +3548,11 @@ pub struct Tui<E> {
     status: Option<String>,
     restored_syntax_ready_at: Option<Duration>,
     highlight_restored_syntax: bool,
+    /// Whether the terminal this session is attached to renders OSC 8 links.
+    ///
+    /// Decided once from the environment rather than per frame, so the render
+    /// path stays a pure function of state and a test can state the answer.
+    hyperlinks: bool,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     dialog: Option<DialogView>,
@@ -3568,6 +3583,7 @@ where
     pub fn new(engine: E) -> Self {
         Self {
             engine,
+            hyperlinks: widgets::hyperlinks_enabled(),
             input: String::new(),
             input_cursor: 0,
             recovered_failed_prompt: false,
@@ -3698,6 +3714,15 @@ where
     pub fn set_file_candidates(&mut self, candidates: Vec<String>) {
         self.file_candidates = candidates;
         self.refresh_file_picker();
+    }
+
+    /// Overrides the terminal hyperlink capability detected at construction.
+    ///
+    /// The environment is the right source for a real session and the wrong one
+    /// for a test, which must be able to state the answer rather than inherit
+    /// whatever `TERM` the runner happened to export.
+    pub fn set_hyperlinks(&mut self, enabled: bool) {
+        self.hyperlinks = enabled;
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
@@ -4901,6 +4926,7 @@ where
             tool_detail: active.tool_detail,
             collapse_thinking: active.collapse_thinking,
             history_expanded: active.history_expanded,
+            hyperlinks: self.hyperlinks,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
             secret_entry: self.secret_entry.as_ref().map(|entry| SecretEntryRender {
