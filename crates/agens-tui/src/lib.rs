@@ -4785,8 +4785,14 @@ where
         {
             return;
         }
+        // A cancellation is a decision someone already took, not news: waking
+        // the model for it made a cancelled duplicate answer anyway, which is
+        // exactly what cancelling it was meant to prevent.
         let finished_in_background = execution.state == TuiExecutionState::BackgroundRunning
-            && !matches!(state, TuiExecutionState::BackgroundRunning);
+            && !matches!(
+                state,
+                TuiExecutionState::BackgroundRunning | TuiExecutionState::Cancelled
+            );
         execution.state = state;
         execution.last_activity = self.now;
         if !matches!(state, TuiExecutionState::BackgroundRunning) {
