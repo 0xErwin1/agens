@@ -5037,3 +5037,130 @@ fn a_failed_tool_body_is_painted_apart_from_a_successful_one() {
         ERROR_COLOR
     );
 }
+
+#[test]
+fn a_code_line_wider_than_its_panel_says_it_was_cut() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(46, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("show");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "```rust\nlet identificador_muy_largo = otra_funcion_con_nombre_extenso(argumento);\n```"
+            .into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let code_row = transcript_rows(&renderer)
+        .into_iter()
+        .find(|row| row.contains("identificador_muy_largo"))
+        .expect("the code panel should render its source line");
+
+    assert!(code_row.contains('…'), "{code_row:?}");
+    assert!(
+        !code_row.contains("argumento"),
+        "the tail is what got cut: {code_row:?}"
+    );
+}
+
+#[test]
+fn strikethrough_is_styled_instead_of_showing_its_tildes() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 12)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("show");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "deprecado: ~~STRIKESENTINEL~~ ahora".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("STRIKESENTINEL"), "{rendered:?}");
+    assert!(!rendered.contains("~~"), "{rendered:?}");
+    assert!(
+        cell_for_text(&renderer, "STRIKESENTINEL")
+            .modifier
+            .contains(Modifier::CROSSED_OUT)
+    );
+}
+
+#[test]
+fn a_soft_break_reflows_instead_of_keeping_the_model_column_width() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 12)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("show");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "primera parte\nsegunda parte".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let rows = transcript_rows(&renderer);
+
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("primera parte segunda parte")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn html_keeps_its_text_and_drops_its_tags() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 12)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("show");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "un <b>HTMLSENTINEL</b> intercalado".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("HTMLSENTINEL"), "{rendered:?}");
+    assert!(!rendered.contains("<b>"), "{rendered:?}");
+    assert!(!rendered.contains("</b>"), "{rendered:?}");
+}
+
+#[test]
+fn a_wrapped_user_prompt_keeps_its_identity_rail_and_its_indent() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(46, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission(
+        "una linea de usuario deliberadamente larga con palabras extensas incomprensibles",
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let continuation = rendered_row(&renderer, "incomprensibles");
+    let buffer = renderer.terminal().backend().buffer();
+
+    assert_eq!(
+        buffer[(ACCENT_COLUMN as u16, continuation as u16)].symbol(),
+        "┃",
+        "a continuation row stays inside the turn's rail"
+    );
+    let column = rendered_line(&renderer, continuation)
+        .chars()
+        .take_while(|character| character.is_whitespace() || *character == '┃')
+        .count();
+    assert_eq!(
+        column, CONTENT_COLUMN,
+        "a continuation row aligns under the prompt it continues"
+    );
+}
+
+#[test]
+fn a_wrapped_error_card_keeps_its_gutter_on_every_row() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(46, 18)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("show");
+    tui.apply_conversation_event(ConversationEvent::Error {
+        message: "provider: una falla con un mensaje deliberadamente largo que no entra".to_owned(),
+        action: "Reintenta.".to_owned(),
+    })
+    .unwrap();
+
+    renderer.render(tui.view()).unwrap();
+    let continuation = rendered_line(&renderer, rendered_row(&renderer, "entra"));
+
+    assert!(
+        continuation.trim_start().starts_with('│'),
+        "{continuation:?}"
+    );
+}
