@@ -3269,6 +3269,12 @@ pub struct TuiExecution {
     pub id: u64,
     pub agent: String,
     pub state: TuiExecutionState,
+    /// What this delegation runs on, once the runtime has reported it.
+    ///
+    /// A subagent routinely differs from its parent, and from its siblings, in
+    /// model. Supervising several at once means comparing them, and elapsed
+    /// time alone cannot be compared across different models.
+    pub model: Option<String>,
     pub started_at: Duration,
     pub last_activity: Duration,
     pub terminal_at: Option<Duration>,
