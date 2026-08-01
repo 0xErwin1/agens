@@ -338,7 +338,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
         Style::default().fg(RolePalette::muted())
     } else {
         Style::default()
-            .fg(RolePalette::assistant())
+            .fg(RolePalette::machine())
             .add_modifier(Modifier::BOLD)
     };
 
@@ -358,7 +358,7 @@ pub(crate) fn tool_header(parsed: &ToolInput, content_width: usize) -> Line<'sta
     }
     spans.push(Span::styled(
         operand,
-        Style::default().fg(RolePalette::assistant()),
+        Style::default().fg(RolePalette::machine()),
     ));
     if let Some(suffix) = parts.suffix {
         spans.push(Span::raw(" "));

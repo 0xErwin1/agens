@@ -840,7 +840,6 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
         "ASSISTANT_FIRST",
         "ASSISTANT_WRAPPED",
         "THINKING_BODY",
-        "TOOL_BODY",
         "• ASSISTANT_LIST",
         "read {}",
     ] {
@@ -851,6 +850,13 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             rendered_column(&renderer, content)
         );
     }
+    // A tool's output sits right of the call it belongs to, so a reader can
+    // tell what the agent printed from what it ran without reading either.
+    assert_eq!(
+        rendered_column(&renderer, "TOOL_BODY"),
+        rendered_column(&renderer, "read {}") + 2,
+        "{text:?}"
+    );
     // A fenced body sits inside its own panel rail, which owns the content column.
     assert!(
         rendered_column(&renderer, "ASSISTANT_CODE") <= 8,
@@ -5162,5 +5168,96 @@ fn a_wrapped_error_card_keeps_its_gutter_on_every_row() {
     assert!(
         continuation.trim_start().starts_with('│'),
         "{continuation:?}"
+    );
+}
+
+#[test]
+fn a_user_turn_is_a_band_that_spans_the_transcript_width() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(50, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("un pedido que no llega a llenar la fila");
+
+    renderer.render(tui.view()).unwrap();
+    let row = rendered_row(&renderer, "pedido");
+    let buffer = renderer.terminal().backend().buffer();
+    let banded = (0..buffer.area.width)
+        .filter(|column| buffer[(*column, row as u16)].bg != Color::Reset)
+        .count();
+
+    assert_eq!(
+        banded,
+        usize::from(buffer.area.width) - CONTENT_COLUMN,
+        "the band fills the row past the end of the prompt text"
+    );
+    assert_eq!(
+        buffer[(ACCENT_COLUMN as u16, row as u16)].symbol(),
+        "┃",
+        "the rail carries the same meaning where no background is drawn"
+    );
+}
+
+#[test]
+fn only_the_user_turn_is_banded() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(50, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("pedido");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let answer = rendered_row(&renderer, "ANSWER_SENTINEL");
+    let buffer = renderer.terminal().backend().buffer();
+
+    assert!(
+        (0..buffer.area.width).all(|column| buffer[(column, answer as u16)].bg == Color::Reset),
+        "prose carries no band, so the band means one thing only"
+    );
+}
+
+#[test]
+fn the_transcript_greys_run_from_prose_to_tool_header_to_tool_output() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(70, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("go");
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "call-1".into(),
+        name: "native::read".into(),
+        input: "{\"path\":\"PATH_SENTINEL\"}".into(),
+        parsed: agens_core::ToolInput::Read {
+            path: "PATH_SENTINEL".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "call-1".into(),
+        name: "native::read".into(),
+        input: "{\"path\":\"PATH_SENTINEL\"}".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "call-1".into(),
+        content: "OUTPUT_SENTINEL".into(),
+        is_error: false,
+    }));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "PROSE_SENTINEL".into(),
+    )));
+    tui.handle(Event::Key(Key::CtrlO));
+
+    renderer.render(tui.view()).unwrap();
+
+    let luminance = |text: &str| -> u32 {
+        match cell_for_text(&renderer, text).fg {
+            Color::Rgb(red, green, blue) => u32::from(red) + u32::from(green) + u32::from(blue),
+            other => panic!("{text} is painted {other:?}"),
+        }
+    };
+
+    assert!(
+        luminance("PROSE_SENTINEL") > luminance("{path}"),
+        "the answer reads louder than what the agent ran"
+    );
+    assert!(
+        luminance("{path}") > luminance("OUTPUT_SENTINEL"),
+        "what the agent ran reads louder than what it printed"
     );
 }

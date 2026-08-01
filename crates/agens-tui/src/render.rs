@@ -32,6 +32,8 @@ const MAX_VISIBLE_TOOL_OUTPUT_BYTES: usize = 4 * 1024;
 const VISIBLE_TOOL_OUTPUT_MARKER: &str = "\n… visible output truncated";
 /// Closes a code-panel row whose source line was wider than the panel.
 const CODE_CLIP_MARKER: &str = "…";
+/// Columns a tool's output sits right of the call header that produced it.
+const TOOL_BODY_INDENT: usize = 2;
 const SETTLED_CONVERSATION_CACHE_MAX_ENTRIES: usize = 96;
 const SYNTAX_CACHE_MAX_ENTRIES: usize = 64;
 const SYNTAX_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -479,7 +481,11 @@ fn tool_result_body_block(
 
     let (result_state, _) = tool_state(context.events, call_id, is_error);
     let failed = result_state == ToolResultState::Failure;
-    let full_body = tool_result_body(call_id, output, context.content_width, failed);
+    let body_width = context
+        .content_width
+        .saturating_sub(TOOL_BODY_INDENT)
+        .max(1);
+    let full_body = tool_result_body(call_id, output, body_width, failed);
     let body = match mode {
         DisplayMode::Collapsed => Vec::new(),
         DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
@@ -491,7 +497,7 @@ fn tool_result_body_block(
     RenderedBlock {
         rows: body
             .into_iter()
-            .map(|line| BlockLine::new(line).accented(accent))
+            .map(|line| BlockLine::new(indent_line(line, TOOL_BODY_INDENT)).accented(accent))
             .collect(),
         packs: false,
         call_id: Some(call_id.to_owned()),
@@ -532,6 +538,38 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
     }
 }
 
+/// Fills a row's remaining width with the band background, so the prompt reads
+/// as one block of colour rather than as a ragged right edge.
+///
+/// The band is what makes a turn findable without reading it. It is additive:
+/// the identity rail and the `❯` bullet still carry the same meaning on a
+/// terminal that renders no background at all.
+fn band_row(line: Line<'static>, content_width: usize) -> Line<'static> {
+    let padding = content_width.saturating_sub(line.width());
+    if padding == 0 {
+        return line;
+    }
+
+    let mut spans = line.spans;
+    spans.push(Span::styled(
+        " ".repeat(padding),
+        Style::default().bg(RolePalette::user_band()),
+    ));
+    Line::from(spans)
+}
+
+/// Shifts a rendered row right, keeping any background it already carries.
+fn indent_line(line: Line<'static>, columns: usize) -> Line<'static> {
+    let style = line
+        .spans
+        .first()
+        .and_then(|span| span.style.bg)
+        .map_or_else(Style::default, |background| Style::default().bg(background));
+    let mut spans = vec![Span::styled(" ".repeat(columns), style)];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
 /// The user's own prompt, wrapped here rather than left to the transcript
 /// widget.
 ///
@@ -544,6 +582,7 @@ fn user_block(text: &str, content_width: usize) -> RenderedBlock {
     let accent = Some(RowAccent::Still(RolePalette::user_identity()));
     let style = Style::default()
         .fg(RolePalette::assistant())
+        .bg(RolePalette::user_band())
         .add_modifier(Modifier::BOLD);
 
     for source_line in text.split('\n') {
@@ -552,7 +591,10 @@ fn user_block(text: &str, content_width: usize) -> RenderedBlock {
             content_width,
             &[],
         );
-        for line in wrapped {
+        for line in wrapped
+            .into_iter()
+            .map(|line| band_row(line, content_width))
+        {
             rows.push(
                 if rows.is_empty() {
                     BlockLine::with_bullet(
@@ -3753,8 +3795,9 @@ mod tests {
     ///
     /// Neutral prose and chrome remain dominant while a compact Markdown palette
     /// distinguishes headings, strong text, inline code, and navigation markers.
-    const SETTLED_PALETTE: [Color; 7] = [
+    const SETTLED_PALETTE: [Color; 8] = [
         RolePalette::assistant(),
+        RolePalette::machine(),
         RolePalette::muted(),
         RolePalette::user_identity(),
         RolePalette::success(),
@@ -3973,7 +4016,7 @@ mod tests {
         );
         assert_eq!(
             span_style(&succeeded, "cargo test").fg,
-            Some(RolePalette::assistant()),
+            Some(RolePalette::machine()),
             "tool operands stay neutral so lifecycle colours remain exclusive"
         );
         assert_eq!(

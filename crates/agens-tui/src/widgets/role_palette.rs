@@ -35,6 +35,15 @@ impl RolePalette {
         rgb(0xe6, 0xb4, 0x50)
     }
 
+    /// Machine chrome the reader scans rather than reads — tool headers.
+    ///
+    /// One step below [`Self::assistant`] and one above [`Self::muted`], which
+    /// is what puts the transcript's three greys in order: the answer reads
+    /// loudest, what the agent ran reads next, and what it printed reads last.
+    pub(crate) const fn machine() -> Color {
+        rgb(0x8a, 0x91, 0x99)
+    }
+
     /// Muted meta / gutter.
     pub(crate) const fn muted() -> Color {
         rgb(0x5c, 0x67, 0x73)
@@ -73,6 +82,15 @@ impl RolePalette {
     /// Active lifecycle state. This blue is reserved for work still running.
     pub(crate) const fn running() -> Color {
         rgb(0x73, 0xd0, 0xff)
+    }
+
+    /// Band behind the user's own prompt — `user_identity` collapsed to a wash.
+    ///
+    /// It is the transcript's only full-width background outside diffs, which
+    /// is what makes a turn findable at a glance. It never carries meaning on
+    /// its own: the rail and the bullet say the same thing without colour.
+    pub(crate) const fn user_band() -> Color {
+        rgb(0x24, 0x1f, 0x33)
     }
 
     /// User identity marker and rail; deliberately outside the lifecycle palette.
