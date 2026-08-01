@@ -25,20 +25,51 @@ fn assert_diagnostic_error(actual: &[u8], expected_without_reference: &str) {
 }
 
 fn assert_diagnostic_error_text(actual: &str, expected_without_reference: &str) {
+    assert_diagnostic_error_with_detail_text(actual, expected_without_reference, "");
+}
+
+/// Like [`assert_diagnostic_error`], but for a diagnostic that also carries failure detail on
+/// the lines after the `[ref: ...]` envelope (`CliError::with_failure_detail`). `expected_detail`
+/// is matched exactly against everything following the reference's closing bracket and its
+/// newline, so this stays as strict as the no-detail case once the detail text is accounted for.
+fn assert_diagnostic_error_with_detail(
+    actual: &[u8],
+    expected_without_reference: &str,
+    expected_detail: &str,
+) {
+    assert_diagnostic_error_with_detail_text(
+        &String::from_utf8_lossy(actual),
+        expected_without_reference,
+        expected_detail,
+    );
+}
+
+fn assert_diagnostic_error_with_detail_text(
+    actual: &str,
+    expected_without_reference: &str,
+    expected_detail: &str,
+) {
     let prefix = expected_without_reference
         .strip_suffix('\n')
         .expect("expected diagnostic should end with a newline");
-    let reference = actual
+    let after_prefix = actual
         .strip_prefix(prefix)
         .and_then(|suffix| suffix.strip_prefix(" [ref: "))
-        .and_then(|suffix| suffix.strip_suffix("]\n"))
         .expect("diagnostic should append a reference");
+    let closing_bracket = after_prefix
+        .find(']')
+        .expect("reference should be closed with ']'");
+    let reference = &after_prefix[..closing_bracket];
     assert_eq!(reference.len(), 8);
     assert!(
         reference
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
+    let remainder = after_prefix[closing_bracket + 1..]
+        .strip_prefix('\n')
+        .expect("reference should be followed by a newline");
+    assert_eq!(remainder, expected_detail);
 }
 
 #[test]
@@ -2336,36 +2367,41 @@ fn production_binary_rejects_missing_malformed_and_incomplete_chatgpt_credential
 
 #[test]
 fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_credentials() {
-    for (name, response, expected_exit, expected_stderr) in [
+    for (name, response, expected_exit, expected_stderr, expected_detail) in [
         (
             "forbidden",
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
             Some(4),
             "error: auth: ChatGPT credentials are unavailable or invalid\n",
+            Some("HTTP 403 rejected model \"test-model\""),
         ),
         (
             "rejected",
             "HTTP/1.1 422 Unprocessable Content\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: ChatGPT request was rejected\n",
+            Some("HTTP 422 rejected model \"test-model\"\nSENTINEL_CHATGPT_ERROR_BODY"),
         ),
         (
             "rate limit",
             "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: ChatGPT request was rate limited\n",
+            None,
         ),
         (
             "server failure",
             "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\nConnection: close\r\n\r\nSENTINEL_CHATGPT_ERROR_BODY".to_owned(),
             Some(1),
             "error: provider: ChatGPT service failed\n",
+            None,
         ),
         (
             "protocol failure",
             sse_response(&[r#"{"type":"response.incomplete","response":{"error":{"message":"SENTINEL_CHATGPT_ERROR_BODY"}}}"#]),
             Some(1),
             "error: provider: ChatGPT response protocol failed\n",
+            None,
         ),
     ] {
         let temporary = TemporaryDirectory::new(&format!("production-chatgpt-{name}"));
@@ -2396,15 +2432,33 @@ fn production_binary_maps_chatgpt_provider_and_auth_failures_without_leaking_cre
 
         assert_eq!(output.status.code(), expected_exit, "{name}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{name}");
-        assert_diagnostic_error(&output.stderr, expected_stderr);
+        match expected_detail {
+            Some(detail) => assert_diagnostic_error_with_detail(
+                &output.stderr,
+                expected_stderr,
+                &format!("{detail}\n"),
+            ),
+            None => assert_diagnostic_error(&output.stderr, expected_stderr),
+        }
+        // The credential values must remain absent regardless of whether this case's
+        // recorded detail includes the response body.
         for secret in [
             "SENTINEL_CHATGPT_ACCESS",
             "SENTINEL_CHATGPT_REFRESH",
             "SENTINEL_CHATGPT_REMOTE",
-            "SENTINEL_CHATGPT_ERROR_BODY",
         ] {
             assert!(!format!("{output:?}").contains(secret), "{name}: {secret}");
         }
+        // The response body is a message, not a credential: R1/R9 require it to reach
+        // stderr wherever it was actually recorded, and it must never reach the
+        // diagnostics JSONL regardless.
+        let output_contains_body = format!("{output:?}").contains("SENTINEL_CHATGPT_ERROR_BODY");
+        let detail_contains_body = expected_detail
+            .is_some_and(|detail| detail.contains("SENTINEL_CHATGPT_ERROR_BODY"));
+        assert_eq!(
+            output_contains_body, detail_contains_body,
+            "{name}: SENTINEL_CHATGPT_ERROR_BODY presence should match the recorded detail"
+        );
         assert_diagnostics_have_no_sentinels(
             &data_directory,
             &[
@@ -3867,7 +3921,7 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
 }
 
 #[test]
-fn production_binary_persists_model_visible_native_arguments_without_error_output() {
+fn production_binary_persists_model_visible_native_arguments_and_tool_failure_output_in_session() {
     let temporary = TemporaryDirectory::new("production-native-secret-matrix");
     let project_root = temporary.path().join("project");
     let config_home = temporary.path().join("config");
@@ -3886,6 +3940,13 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
             ),
         },
         ScriptedOpenAiResponse {
+            // The immediate continuation still sends the provider the generic string:
+            // `model_visible_tool_output` (`agens-providers/src/lib.rs`) is a separate,
+            // unmodified containment layer that collapses any non-task-terminal tool
+            // failure before it goes back over the wire this same turn (see
+            // `task_terminal_errors_remain_actionable_while_other_tool_failures_stay_redacted`).
+            // AGN-102 only changes what the dispatcher hands to `HeadlessToolOutput` and
+            // what gets persisted, asserted below via the resumable session.
             required_body_fragments: vec![
                 "\"call_id\":\"call_native_secret\"".to_owned(),
                 "\"output\":\"Tool execution failed\"".to_owned(),
@@ -3938,9 +3999,12 @@ fn production_binary_persists_model_visible_native_arguments_without_error_outpu
         format!("{session:?}").contains("SENTINEL_NATIVE_ARGUMENT"),
         "model-visible native arguments must remain resumable conversation content"
     );
-    assert!(session.messages.iter().flat_map(|message| &message.parts).all(|part| {
-        !matches!(part, MessagePart::ToolResult { content, .. } if content.contains("SENTINEL_NATIVE_OUTPUT"))
-    }));
+    assert!(
+        session.messages.iter().flat_map(|message| &message.parts).any(|part| {
+            matches!(part, MessagePart::ToolResult { content, .. } if content.contains("SENTINEL_NATIVE_OUTPUT"))
+        }),
+        "model-visible native tool failure output must remain resumable conversation content"
+    );
     assert_sqlite_has_no_sentinels(
         &data_directory.join("agens.db"),
         &["SENTINEL_OPENAI_API_KEY"],

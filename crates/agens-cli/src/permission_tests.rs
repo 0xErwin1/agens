@@ -654,7 +654,7 @@ mod tests {
                 },
                 TurnEvent::ToolResult(MessagePart::ToolResult {
                     tool_call_id: "first".into(),
-                    content: "tool execution failed".into(),
+                    content: "tool execution cancelled".into(),
                     is_error: true,
                 }),
                 TurnEvent::StateChanged(TurnState::Cancelled),
