@@ -3116,24 +3116,26 @@ fn assemble_transcript(
             focused_call: state.focused_call,
             unicode: state.unicode_level,
         };
+        let identity = render::SettledConversation {
+            generation: state.transcript_generation,
+            transcript: state.active_transcript,
+            index,
+        };
         let owners = if want_owners {
-            render::conversation_call_rows(
+            render::settled_conversation_call_rows(
+                identity,
                 conversation,
-                &[],
                 state.tool_display_modes,
                 row_width,
                 settled_state,
             )
+            .to_vec()
         } else {
             Vec::new()
         };
         append_turn(
             render::settled_conversation_lines(
-                render::SettledConversation {
-                    generation: state.transcript_generation,
-                    transcript: state.active_transcript,
-                    index,
-                },
+                identity,
                 conversation,
                 state.tool_display_modes,
                 row_width,
