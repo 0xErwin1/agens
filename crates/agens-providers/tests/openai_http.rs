@@ -7,7 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agens_core::{
-    HeadlessTurnCancellation, HeadlessTurnPortError, RequestConfig, TurnEvent, TurnProvider,
+    HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
+    TurnProvider,
 };
 use agens_providers::{
     OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticKind,
@@ -315,6 +316,90 @@ fn mid_stream_response_failed_event_records_its_payload_for_a_user_visible_sink(
         failure_detail.take(),
         Some("the model is temporarily overloaded".to_owned())
     );
+
+    server.join();
+}
+
+/// Regression pin for the SSE frame-drain fix (WU-3): with `finish_on_terminal=false`, a
+/// discarded mid-stream decode error must not carry the response's whole output loss with it.
+/// Before that fix, `process_sse_frame` left its buffer undrained on the error path, so the
+/// very next `\n` reprocessed the SAME undrained bytes and this stream reported
+/// `Err(ProviderProtocol)` even though a real, later `output_text.delta` had already arrived —
+/// the whole response was silently lost. Nothing else in this suite pins the recovered
+/// behavior, so a future refactor could reintroduce the loss with every other test green.
+#[test]
+fn a_recovered_mid_stream_error_event_does_not_lose_the_completed_response() {
+    let server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"transient hiccup\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"the answer\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+
+    let parts = provider_runtime()
+        .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+        .expect("a recovered mid-stream error must not lose the completed response");
+
+    assert_eq!(parts, vec![MessagePart::Text("the answer".to_owned())]);
+
+    server.join();
+}
+
+/// A recovered mid-stream `error` event still records its text into the failure-detail handle
+/// (`upstream_error`) even though the round it happened in ultimately succeeds. `agens-headless`
+/// only drains the handle once per whole attempt, so without a drain at the top of every
+/// `next_parts` call, that recovered incident's text would still be sitting in the handle when a
+/// later, unrelated round in the SAME turn fails — making the stale incident look like the cause
+/// of a failure it had nothing to do with.
+#[test]
+fn a_recovered_mid_stream_error_does_not_leak_into_a_later_same_turn_failure() {
+    let server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"transient hiccup\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"the answer\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+    let runtime = provider_runtime();
+
+    let first_round = runtime.block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()));
+    assert_eq!(
+        first_round,
+        Ok(vec![MessagePart::Text("the answer".to_owned())])
+    );
+
+    // The provider is now `Completed`, so this round fails without recording any new detail —
+    // exactly the shape a later, unrelated same-turn failure would take.
+    let second_round = runtime.block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()));
+    assert_eq!(
+        second_round.map(|_| ()),
+        Err(HeadlessTurnPortError::Provider)
+    );
+
+    assert_eq!(failure_detail.take(), None);
 
     server.join();
 }

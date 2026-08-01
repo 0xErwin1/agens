@@ -1639,6 +1639,14 @@ impl TurnProvider for ChatGptResponsesProvider {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        // A prior round in this same turn may have recorded detail for an incident it then
+        // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
+        // succeeded). This handle is shared across every round of one attempt, so draining it
+        // here keeps that recovered incident from being mistaken for the cause of a later,
+        // unrelated failure in this same turn.
+        if let Some(failure_detail) = &self.failure_detail {
+            failure_detail.take();
+        }
         if cancellation.is_cancelled() {
             return Err(HeadlessTurnPortError::Cancelled);
         }
@@ -1829,6 +1837,14 @@ impl TurnProvider for OpenAiResponsesProvider {
         _events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        // A prior round in this same turn may have recorded detail for an incident it then
+        // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
+        // succeeded). This handle is shared across every round of one attempt, so draining it
+        // here keeps that recovered incident from being mistaken for the cause of a later,
+        // unrelated failure in this same turn.
+        if let Some(failure_detail) = &self.failure_detail {
+            failure_detail.take();
+        }
         if cancellation.is_cancelled() {
             return Err(HeadlessTurnPortError::Cancelled);
         }
