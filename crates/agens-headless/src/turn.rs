@@ -16,7 +16,7 @@ use agens_core::{
 };
 use agens_providers::{
     ChatGptResponsesProvider, MoonshotProvider, OpenAiFunctionTool, OpenAiResponsesProvider,
-    ProgressAwareProvider, ProviderDiagnosticScope,
+    ProgressAwareProvider, ProviderDiagnosticScope, ProviderFailureDetail,
 };
 use agens_store::{PermissionGrantStore, SessionStore, ToolFactStore};
 use agens_tools::{
@@ -88,6 +88,7 @@ struct HeadlessProviderContext<'a> {
     task_runtime: Option<&'a ProductionTuiTaskRuntime>,
     diagnostic_reference: &'a str,
     include_system_prompt: bool,
+    failure_detail: ProviderFailureDetail,
 }
 
 pub fn run_production_headless_chat_with_progress(
@@ -139,6 +140,7 @@ pub fn run_production_headless_chat_with_progress(
     );
     let diagnostic_reference = diagnostics.reference;
     let provider_diagnostics = diagnostics.provider;
+    let failure_detail = ProviderFailureDetail::new();
     let result = match bootstrap.provider_type() {
         Some("openai-api") => {
             let api_key = bootstrap.api_key.clone().ok_or_else(|| {
@@ -155,6 +157,7 @@ pub fn run_production_headless_chat_with_progress(
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
+                    failure_detail: failure_detail.clone(),
                 },
                 move |model, messages, tools, request_config| {
                     OpenAiResponsesProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -170,6 +173,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
+                            .with_failure_detail(failure_detail.clone())
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -195,6 +199,7 @@ pub fn run_production_headless_chat_with_progress(
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: true,
+                    failure_detail: failure_detail.clone(),
                 },
                 move |model, messages, tools, request_config| {
                     MoonshotProvider::from_api_key_with_messages_and_tools_and_timeout(
@@ -210,6 +215,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
+                            .with_failure_detail(failure_detail.clone())
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -238,6 +244,7 @@ pub fn run_production_headless_chat_with_progress(
                     task_runtime,
                     diagnostic_reference: &diagnostic_reference,
                     include_system_prompt: false,
+                    failure_detail: failure_detail.clone(),
                 },
                 move |model, messages, tools, request_config| {
                     ChatGptResponsesProvider::from_credentials_with_messages_and_tools_and_timeout_and_auth_url(
@@ -255,6 +262,7 @@ pub fn run_production_headless_chat_with_progress(
                             .with_parallel_tool_calls(bootstrap.parallel_tool_calls)
                             .with_request_config(request_config)
                             .with_diagnostics(provider_diagnostics)
+                            .with_failure_detail(failure_detail.clone())
                     })
                     .map_err(|error| {
                         provider_construction_error(
@@ -273,6 +281,24 @@ pub fn run_production_headless_chat_with_progress(
         record_parent_terminal(bootstrap, &diagnostic_reference, &failure.error);
         failure.map_error(|error| error.with_diagnostic_reference(&diagnostic_reference))
     })
+}
+
+/// Converts a headless attempt's raw outcome into a `CliError`, always draining the
+/// failure-detail handle regardless of whether the attempt succeeded or failed.
+///
+/// Draining only on the error path would let a handle populated during a successful attempt —
+/// for example a mid-stream provider event that was recorded but then recovered, so the overall
+/// attempt still completed — sit undrained, since a successful outcome never reaches an error
+/// branch to take it. If a later, unrelated attempt then reused the same handle and failed, it
+/// would inherit that stale record. Draining unconditionally right here, the moment the outcome
+/// is known, closes that window: a successful outcome discards whatever was recorded, and only a
+/// genuine failure at this exact point inherits it.
+fn attach_recorded_failure_detail<T>(
+    outcome: Result<T, HeadlessTurnError>,
+    failure_detail: &ProviderFailureDetail,
+) -> Result<T, CliError> {
+    let recorded_detail = failure_detail.take();
+    outcome.map_err(|error| CliError::runtime(error).with_failure_detail(recorded_detail))
 }
 
 /// Keeps a rejected local encode of the resumed history distinguishable from missing or invalid
@@ -578,6 +604,11 @@ where
         metadata,
         request.prompt.clone(),
         |attempt_key| {
+            // Discards whatever an earlier use of this handle left behind before this attempt's
+            // own provider is even built. See `attach_recorded_failure_detail`: a successful
+            // outcome never drains on its own error path, so without this the next attempt to
+            // reuse the handle could otherwise inherit a stale, unrelated record.
+            context.failure_detail.take();
             let mut provider = build_provider(
                 model,
                 provider_messages(&request, context.include_system_prompt),
@@ -623,7 +654,7 @@ where
             let mut provider =
                 TaskMailboxProvider::new(provider, task_registry.clone(), TaskMessageTarget::Main);
             cancellation_result(context.cancellation)?;
-            let snapshot = match effective_max_iterations(
+            let turn_outcome = match effective_max_iterations(
                 request.max_iterations,
                 context.bootstrap.max_iterations,
             ) {
@@ -650,8 +681,8 @@ where
                     headless_progress,
                     Some(attempt_key),
                 )),
-            }?
-            .map_err(CliError::runtime)?;
+            }?;
+            let snapshot = attach_recorded_failure_detail(turn_outcome, &context.failure_detail)?;
             let turn = completed_session_turn(
                 &request.prompt,
                 &snapshot,
@@ -715,12 +746,68 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PartialTurnRecorder, mcp_failure_notice_lines};
-    use agens_core::{MessagePart, TurnEvent};
+    use super::{PartialTurnRecorder, attach_recorded_failure_detail, mcp_failure_notice_lines};
+    use agens_core::{HeadlessTurnError, MessagePart, TurnEvent};
+    use agens_providers::ProviderFailureDetail;
     use agens_tools::{
         McpErrorCategory, McpRegistry, McpServerDescriptor, McpServerSource, McpServerTransport,
         McpStatusHandle,
     };
+
+    #[test]
+    fn attach_recorded_failure_detail_carries_the_recorded_text_into_the_cli_error() {
+        let failure_detail = ProviderFailureDetail::new();
+        failure_detail.record("HTTP 400 rejected model \"gpt-9-missing\"");
+
+        let outcome: Result<(), HeadlessTurnError> = Err(HeadlessTurnError::ProviderRejected);
+        let error = attach_recorded_failure_detail(outcome, &failure_detail).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP 400 rejected model \"gpt-9-missing\"")
+        );
+    }
+
+    #[test]
+    fn attach_recorded_failure_detail_discards_a_successful_outcomes_recorded_detail() {
+        let failure_detail = ProviderFailureDetail::new();
+        failure_detail.record("recovered mid-stream event, turn still succeeded");
+
+        let outcome: Result<&str, HeadlessTurnError> = Ok("completed");
+        let result = attach_recorded_failure_detail(outcome, &failure_detail);
+
+        assert_eq!(result, Ok("completed"));
+        assert_eq!(
+            failure_detail.take(),
+            None,
+            "a successful outcome must drain the handle"
+        );
+    }
+
+    #[test]
+    fn a_successful_attempts_stale_detail_never_leaks_into_a_later_unrelated_failure() {
+        let failure_detail = ProviderFailureDetail::new();
+
+        // First attempt: a mid-stream event is recorded but the attempt recovers and succeeds
+        // overall (the SSE frame-drain recovery WU-3 fixed: an `error` event followed by more
+        // valid output can still complete the response).
+        failure_detail.record("stale detail from a recovered mid-stream event");
+        let first_outcome: Result<(), HeadlessTurnError> = Ok(());
+        assert!(attach_recorded_failure_detail(first_outcome, &failure_detail).is_ok());
+
+        // Second, unrelated attempt reuses the same handle and fails for its own reason,
+        // recording nothing new of its own.
+        let second_outcome: Result<(), HeadlessTurnError> = Err(HeadlessTurnError::ProviderServer);
+        let error = attach_recorded_failure_detail(second_outcome, &failure_detail).unwrap_err();
+
+        assert!(
+            !error
+                .to_string()
+                .contains("stale detail from a recovered mid-stream event")
+        );
+        assert_eq!(error.to_string(), "provider: ChatGPT service failed");
+    }
 
     fn descriptor(name: &str, enabled: bool) -> McpServerDescriptor {
         McpServerDescriptor::new(

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::bridge::SubagentErrorPresentation;
+use agens_core::redaction::redact_credential_values;
 use agens_core::{DiffLine, Message, MessagePart, Role, SubagentStatus, ToolInput};
 use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 
@@ -562,24 +563,9 @@ fn push_text_item(items: &mut Vec<ConversationItem>, text: String, reasoning: bo
     }
 }
 
+/// Withholds credential-shaped values from a runtime error message before it reaches the TUI
+/// card. This sink is user-visible-only, so unlike a model-visible sink it keeps host paths —
+/// only [`redact_credential_values`] runs here, never [`agens_core::redaction::redact_absolute_paths`].
 fn sanitize_error_message(message: String) -> String {
-    let value = message.to_ascii_lowercase();
-    let sensitive_markers = [
-        "api_key",
-        "authorization",
-        "password",
-        "secret",
-        "token",
-        "path:",
-        "prompt:",
-    ];
-
-    if sensitive_markers
-        .iter()
-        .any(|marker| value.contains(marker))
-    {
-        "[redacted]".into()
-    } else {
-        message
-    }
+    redact_credential_values(&message)
 }

@@ -9,7 +9,13 @@
 
 use std::fmt;
 
+use agens_core::redaction::{bounded_detail, redact_credential_values};
 use agens_core::{HeadlessTurnCancellation, HeadlessTurnError};
+
+/// Caps rendered failure detail at 2,048 characters, mirroring
+/// `SUBAGENT_RESULT_TRUNCATION_MARKER`'s visible-truncation contract
+/// (`agens-session/src/turns.rs`).
+const FAILURE_DETAIL_MAX_CHARS: usize = 2_048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitStatus {
@@ -46,6 +52,7 @@ pub struct CliError {
     status: ExitStatus,
     pub category: &'static str,
     pub message: String,
+    detail: Option<String>,
     preformatted: bool,
 }
 
@@ -63,6 +70,7 @@ impl CliError {
             status: ExitStatus::Usage,
             category: "usage",
             message: message.into(),
+            detail: None,
             preformatted: true,
         }
     }
@@ -170,6 +178,7 @@ impl CliError {
             status,
             category,
             message: message.into(),
+            detail: None,
             preformatted: false,
         }
     }
@@ -178,6 +187,18 @@ impl CliError {
         self.message.push_str(" [ref: ");
         self.message.push_str(reference);
         self.message.push(']');
+        self
+    }
+
+    /// Attaches failure detail rendered by `Display` after the existing envelope, never into
+    /// `message` itself — `has_error_message` (`agens-tui-app/src/router/mod.rs`) selects a
+    /// TUI action by exact match on `message`, so appending here would silently break action
+    /// selection. The detail is redacted for credential-shaped values and bounded before
+    /// storage; `None` leaves `Display` unchanged.
+    pub fn with_failure_detail(mut self, detail: Option<String>) -> Self {
+        self.detail = detail.map(|detail| {
+            bounded_detail(&redact_credential_values(&detail), FAILURE_DETAIL_MAX_CHARS)
+        });
         self
     }
 
@@ -193,10 +214,16 @@ impl CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.category.is_empty() {
-            return formatter.write_str(&self.message);
+            formatter.write_str(&self.message)?;
+        } else {
+            write!(formatter, "{}: {}", self.category, self.message)?;
         }
 
-        write!(formatter, "{}: {}", self.category, self.message)
+        if let Some(detail) = &self.detail {
+            write!(formatter, "\n{detail}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -210,4 +237,75 @@ pub fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<()
         return Err(CliError::runtime(HeadlessTurnError::TimedOut));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_failure_detail_none_leaves_display_unchanged() {
+        let error = CliError::runtime(HeadlessTurnError::Provider).with_failure_detail(None);
+
+        assert_eq!(error.to_string(), "provider: provider request failed");
+    }
+
+    #[test]
+    fn with_failure_detail_some_appends_after_the_envelope() {
+        let error = CliError::runtime(HeadlessTurnError::ProviderRejected)
+            .with_failure_detail(Some("HTTP 400 rejected model \"gpt-9-missing\"".to_owned()));
+
+        let rendered = error.to_string();
+        assert!(rendered.starts_with("provider: ChatGPT request was rejected"));
+        assert!(rendered.contains("HTTP 400 rejected model \"gpt-9-missing\""));
+    }
+
+    #[test]
+    fn with_failure_detail_redacts_a_credential_value_but_keeps_surrounding_text() {
+        let error = CliError::runtime(HeadlessTurnError::Provider).with_failure_detail(Some(
+            "Authorization: Bearer abcdefghijklmnopqrstuvwx failed".to_owned(),
+        ));
+
+        let rendered = error.to_string();
+        assert!(!rendered.contains("abcdefghijklmnopqrstuvwx"));
+        assert!(rendered.contains("Authorization: Bearer [redacted:"));
+        assert!(rendered.contains("failed"));
+    }
+
+    #[test]
+    fn with_failure_detail_keeps_absolute_paths_and_benign_detail_verbatim() {
+        let error = CliError::runtime(HeadlessTurnError::Provider).with_failure_detail(Some(
+            "reading /home/user/project/config.toml: request exceeds 128000 tokens".to_owned(),
+        ));
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("/home/user/project/config.toml"));
+        assert!(rendered.contains("request exceeds 128000 tokens"));
+    }
+
+    #[test]
+    fn with_failure_detail_bounds_over_cap_detail_with_a_visible_marker() {
+        let long_detail = "d".repeat(4_096);
+        let error =
+            CliError::runtime(HeadlessTurnError::Provider).with_failure_detail(Some(long_detail));
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("[truncated:"));
+        assert!(
+            rendered
+                .chars()
+                .filter(|&character| character == 'd')
+                .count()
+                < 4_096,
+            "expected the detail to be bounded below its original length"
+        );
+    }
+
+    #[test]
+    fn preformatted_usage_carries_no_detail_by_default() {
+        let error = CliError::preformatted_usage("clap already rendered this");
+
+        assert_eq!(error.to_string(), "usage: clap already rendered this");
+        assert!(error.is_preformatted());
+    }
 }

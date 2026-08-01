@@ -502,22 +502,26 @@ fn user_block(text: &str) -> RenderedBlock {
 }
 
 fn error_lines(error: &crate::ActionableError) -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled(
-            "┌ Error",
-            Style::default()
-                .fg(RolePalette::error())
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
+    let mut lines = vec![Line::from(Span::styled(
+        "┌ Error",
+        Style::default()
+            .fg(RolePalette::error())
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    for segment in error.message.split('\n') {
+        lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(RolePalette::error())),
-            Span::raw(error.message.clone()),
-        ]),
-        Line::from(Span::styled(
-            format!("└ Action: {}", error.action),
-            Style::default().fg(RolePalette::muted()),
-        )),
-    ]
+            Span::raw(segment.to_owned()),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("└ Action: {}", error.action),
+        Style::default().fg(RolePalette::muted()),
+    )));
+
+    lines
 }
 
 /// Inputs for the inline working indicator closing an active turn's transcript.
@@ -2772,6 +2776,31 @@ mod tests {
         ));
         assert!(rendered.contains("Failure"), "{rendered:?}");
         assert!(!rendered.contains("Running"), "{rendered:?}");
+    }
+
+    #[test]
+    fn error_lines_splits_a_multi_line_message_into_its_own_gutter_rows() {
+        let error = crate::ActionableError {
+            message: "provider: ChatGPT request was rejected [ref: abcdef12]\nHTTP 400 rejected model \"x\"".to_owned(),
+            action: "Retry.".to_owned(),
+        };
+
+        let lines = error_lines(&error);
+
+        assert_eq!(lines.len(), 4);
+        let text = |line: &Line<'static>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        assert_eq!(text(&lines[0]), "┌ Error");
+        assert_eq!(
+            text(&lines[1]),
+            "│ provider: ChatGPT request was rejected [ref: abcdef12]"
+        );
+        assert_eq!(text(&lines[2]), "│ HTTP 400 rejected model \"x\"");
+        assert_eq!(text(&lines[3]), "└ Action: Retry.");
     }
 
     fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
