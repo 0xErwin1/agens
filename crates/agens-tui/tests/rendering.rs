@@ -5470,3 +5470,29 @@ fn a_long_turn_reports_its_time_in_units_a_reader_sizes_up() {
     assert!(text.contains("90.4k tok"), "{text:?}");
     assert!(!text.contains("90359"), "{text:?}");
 }
+
+#[test]
+fn typed_input_sits_in_the_same_column_as_the_prose_above_it() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(60, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 60,
+        height: 14,
+    });
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    for character in "INPUT_SENTINEL".chars() {
+        tui.handle(Event::Key(Key::Char(character)));
+    }
+
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(
+        rendered_column(&renderer, "INPUT_SENTINEL"),
+        rendered_column(&renderer, "ANSWER_SENTINEL"),
+        "what the user types lines up with what the agent said"
+    );
+}
