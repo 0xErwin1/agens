@@ -897,6 +897,119 @@ fn ctrl_o_toggles_bounded_detail_without_viewport_motion() {
     assert!(is_collapsed(tui.view().tool_display_modes, "read-1"));
 }
 
+/// Builds a finished turn carrying both reasoning and one settled tool call —
+/// the state in which the two detail axes can be told apart.
+fn turn_with_reasoning_and_a_settled_call() -> Tui<FakeEngine> {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "REASONING_BODY".into(),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "large.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "TOOL_BODY".into(),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+    tui
+}
+
+/// One key drove both reasoning and tool output through an implicit precedence,
+/// which had a trap in it: once reasoning was expanded and any call had settled,
+/// every further press went to the tools and the thought could never be hidden
+/// again. Each axis owning its own key is what makes both reversible.
+#[test]
+fn each_detail_axis_moves_under_its_own_key_and_reverses() {
+    let mut tui = turn_with_reasoning_and_a_settled_call();
+    assert!(tui.view().collapse_thinking);
+
+    tui.handle(Event::Key(Key::CtrlT));
+    assert!(!tui.view().collapse_thinking, "Ctrl+T shows the reasoning");
+    assert!(
+        is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "and leaves the tool output where it was"
+    );
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert!(
+        !is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "Ctrl+O moves the tool output"
+    );
+    assert!(
+        !tui.view().collapse_thinking,
+        "and leaves the reasoning where it was"
+    );
+
+    tui.handle(Event::Key(Key::CtrlT));
+    assert!(
+        tui.view().collapse_thinking,
+        "the thought hides again even with a settled call on screen"
+    );
+}
+
+/// Three levels the reader can aim for are only three levels if overshooting
+/// one costs a single key rather than a full lap.
+#[test]
+fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
+    let mut tui = turn_with_reasoning_and_a_settled_call();
+    assert_eq!(tui.view().tool_detail, DisplayMode::Collapsed);
+
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Truncated);
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Collapsed);
+
+    tui.handle(Event::Key(Key::CtrlShiftO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Expanded);
+    tui.handle(Event::Key(Key::CtrlShiftO));
+    assert_eq!(tui.view().tool_detail, DisplayMode::Truncated);
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Truncated),
+        "the settled call follows the level, not its own history"
+    );
+}
+
+/// The level is what the footer names, so it has to be true before anything has
+/// settled — and a call that settles afterwards has to join its neighbours
+/// rather than arrive hidden among expanded ones.
+#[test]
+fn a_call_settling_after_the_level_moved_arrives_at_that_level() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    assert_eq!(
+        tui.view().tool_detail,
+        DisplayMode::Expanded,
+        "the level moves with nothing settled yet"
+    );
+
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-late".into(),
+        name: "native::read".into(),
+        input: "late.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-late".into(),
+        content: "LATE_BODY".into(),
+        is_error: false,
+    }));
+
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-late"),
+        Some(&DisplayMode::Expanded)
+    );
+}
+
 #[test]
 fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summaries() {
     let mut tui = Tui::new(FakeEngine::default());
@@ -1002,8 +1115,8 @@ fn child_ordered_stream_preserves_visible_child_rows_and_isolates_parent_summari
     assert!(!parent.contains("Subagent tool execution failed."));
 
     tui.select_transcript(TranscriptId::Subagent(7));
-    // Thinking-first detail path, then tool outputs.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Reasoning and tool output are separate axes: one key each.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = renderer

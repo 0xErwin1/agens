@@ -13,6 +13,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::RolePalette;
+use super::expand::DisplayMode;
 use super::overlay::truncate_columns;
 
 /// Context for the single operational footer row.
@@ -26,6 +27,8 @@ pub(crate) struct FooterContext<'a> {
     pub home: Option<&'a str>,
     /// Branch and working-tree size, absent until the first refresh lands.
     pub repository: Option<&'a RepositoryStatus>,
+    /// Level the tool output detail cycle currently rests on.
+    pub tool_detail: DisplayMode,
     pub turn_label: Cow<'a, str>,
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
@@ -81,14 +84,15 @@ impl FooterSegment {
     }
 }
 
-const RANK_CHANGES: u8 = 0;
-const RANK_BRANCH: u8 = 1;
-const RANK_EFFORT: u8 = 2;
-const RANK_DIRECTORY: u8 = 3;
-const RANK_CONTEXT: u8 = 4;
-const RANK_APPROVAL: u8 = 5;
-const RANK_STATUS: u8 = 6;
-const RANK_MODEL: u8 = 7;
+const RANK_DETAIL: u8 = 0;
+const RANK_CHANGES: u8 = 1;
+const RANK_BRANCH: u8 = 2;
+const RANK_EFFORT: u8 = 3;
+const RANK_DIRECTORY: u8 = 4;
+const RANK_CONTEXT: u8 = 5;
+const RANK_APPROVAL: u8 = 6;
+const RANK_STATUS: u8 = 7;
+const RANK_MODEL: u8 = 8;
 
 /// Share of the window above which the context segment stops being neutral.
 const CONTEXT_PRESSURE: f64 = 0.75;
@@ -105,6 +109,7 @@ fn chrome_style() -> Style {
 fn footer_segments(ctx: &FooterContext<'_>) -> Vec<FooterSegment> {
     let mut segments = vec![model_segment(ctx), effort_segment(ctx)];
     segments.push(context_segment(ctx));
+    segments.push(detail_segment(ctx));
     segments.push(directory_segment(ctx));
     if let Some(branch) = branch_segment(ctx) {
         segments.push(branch);
@@ -182,6 +187,21 @@ fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
             (share * 100.0).round() as u64
         ),
         style,
+    )
+}
+
+/// How much of every tool body is on screen, and the key that changes it.
+///
+/// Ctrl+O is a cycle rather than a toggle, so pressing it without being told
+/// where the cycle now rests is guesswork. Naming the level next to its key
+/// makes the three positions learnable from the footer alone; it sheds first
+/// because it is the only footer datum the reader can rediscover by pressing
+/// a key.
+fn detail_segment(ctx: &FooterContext<'_>) -> FooterSegment {
+    FooterSegment::plain(
+        RANK_DETAIL,
+        format!("tools {} ^O", ctx.tool_detail.label()),
+        chrome_style(),
     )
 }
 
@@ -547,10 +567,15 @@ mod tests {
 
         assert_eq!(
             at(200),
-            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
+            " gpt-5.6-sol · high ·  15k/200k   8% · tools hidden ^O · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
         );
         assert_eq!(at(120), at(200), "a wide terminal sheds nothing");
-        // changes, then branch
+        // the detail level, which a key press rediscovers, then changes
+        assert_eq!(
+            at(100),
+            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
+        );
+        // then branch
         assert_eq!(
             at(80),
             " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ask ^⇧P · Ready"
@@ -568,6 +593,23 @@ mod tests {
         assert_eq!(at(12), " gpt-5.6-sol");
         // A lone segment wider than the budget is the only thing ever clipped.
         assert_eq!(at(11), " gpt-5.6-s…");
+    }
+
+    /// Ctrl+O cycles rather than toggles, so the footer has to answer where the
+    /// cycle rests. A level the reader cannot name is a level they cannot aim
+    /// for, and the key belongs next to it for the same reason the approval
+    /// mode carries its own.
+    #[test]
+    fn the_footer_names_the_tool_detail_level_and_the_key_that_moves_it() {
+        let at = |mode: DisplayMode| {
+            let mut ctx = sample();
+            ctx.tool_detail = mode;
+            MetricFooter::text(200, ctx)
+        };
+
+        assert!(at(DisplayMode::Collapsed).contains("tools hidden ^O"));
+        assert!(at(DisplayMode::Truncated).contains("tools preview ^O"));
+        assert!(at(DisplayMode::Expanded).contains("tools full ^O"));
     }
 
     /// A value changing must not move its neighbours, or the eye loses the
@@ -648,6 +690,7 @@ mod tests {
             effort: Some("high"),
             context_window: Some(200_000),
             project: "/home/iperez/dev/personal/agens",
+            tool_detail: DisplayMode::Collapsed,
             turn_label: Cow::Borrowed("Ready"),
             duration: None,
             usage: Some(&Usage {

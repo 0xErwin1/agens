@@ -151,8 +151,12 @@ pub enum Key {
     CtrlC,
     /// Copies the active transcript selection through the terminal clipboard.
     CtrlShiftC,
-    /// Collapses or expands detail (thinking-first, else tool outputs).
+    /// Advances the transcript's tool output detail level.
     CtrlO,
+    /// Walks the tool output detail level back one step.
+    CtrlShiftO,
+    /// Shows or hides the reasoning bodies of the active transcript.
+    CtrlT,
     /// Scrolls the transcript timeline down (composer-safe).
     CtrlJ,
     /// Scrolls the transcript timeline up (composer-safe).
@@ -642,8 +646,15 @@ pub struct TranscriptRecord {
     following_bottom: bool,
     scroll_offset: u16,
     tool_display_modes: BTreeMap<String, widgets::DisplayMode>,
+    /// Detail level every settled tool call of this transcript is shown at.
+    ///
+    /// The per-call map is what the renderer reads, but the level is what the
+    /// reader actually moves, so it is held on its own: a call that settles
+    /// after Ctrl+O moved the level joins its neighbours instead of appearing
+    /// hidden among expanded ones.
+    tool_detail: widgets::DisplayMode,
     collapse_thinking: bool,
-    /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+O).
+    /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+T).
     thinking_user_pinned: bool,
     focus: TranscriptFocus,
     selection: Option<TranscriptSelection>,
@@ -665,6 +676,7 @@ impl TranscriptRecord {
             following_bottom: true,
             scroll_offset: 0,
             tool_display_modes: BTreeMap::new(),
+            tool_detail: widgets::DisplayMode::Collapsed,
             collapse_thinking: false,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
@@ -771,6 +783,8 @@ pub struct ViewState<'a> {
     pub highlight_restored_syntax: bool,
     /// Per-call presentation mode; their source output remains retained regardless of mode.
     pub tool_display_modes: &'a BTreeMap<String, widgets::DisplayMode>,
+    /// Detail level the tool output cycle currently rests on.
+    pub tool_detail: widgets::DisplayMode,
     /// Whether complete reasoning is collapsed according to the UI setting.
     pub collapse_thinking: bool,
     pub focus: TranscriptFocus,
@@ -1748,6 +1762,7 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         project: state.project,
         home: state.home,
         repository: state.repository,
+        tool_detail: state.tool_detail,
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
@@ -4132,7 +4147,9 @@ where
         self.transcript.clear();
         self.completed_conversations.clear();
         self.conversation = None;
-        self.active_record_mut().tool_display_modes.clear();
+        let record = self.active_record_mut();
+        record.tool_display_modes.clear();
+        record.tool_detail = widgets::DisplayMode::Collapsed;
         self.set_running(false);
         self.turn_state = None;
         self.placeholder_failure = false;
@@ -4171,6 +4188,7 @@ where
         {
             let record = self.active_record_mut();
             record.tool_display_modes.clear();
+            record.tool_detail = widgets::DisplayMode::Collapsed;
             record.tool_display_modes.extend(
                 completed_tool_call_ids
                     .into_iter()
@@ -4456,11 +4474,12 @@ where
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply_child_event(event.clone());
         if let agens_core::TuiSubagentUpdate::ToolResult { call_id, .. } = &event.update {
-            self.transcripts
+            let record = self
+                .transcripts
                 .get_mut(&TranscriptId::Subagent(event.id))
-                .expect("admitted child event has a transcript")
-                .tool_display_modes
-                .insert(call_id.clone(), widgets::DisplayMode::Collapsed);
+                .expect("admitted child event has a transcript");
+            let detail = record.tool_detail;
+            record.tool_display_modes.insert(call_id.clone(), detail);
         }
         if matches!(
             &event.update,
@@ -4542,6 +4561,7 @@ where
                 following_bottom: true,
                 scroll_offset: 0,
                 tool_display_modes: BTreeMap::new(),
+                tool_detail: widgets::DisplayMode::Collapsed,
                 collapse_thinking: false,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
@@ -4605,9 +4625,9 @@ where
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply(event)?;
         if let Some(call_id) = completed_tool_call {
-            self.active_record_mut()
-                .tool_display_modes
-                .insert(call_id, widgets::DisplayMode::Collapsed);
+            let record = self.active_record_mut();
+            let detail = record.tool_detail;
+            record.tool_display_modes.insert(call_id, detail);
         }
         Ok(())
     }
@@ -4712,6 +4732,7 @@ where
             },
             highlight_restored_syntax: self.highlight_restored_syntax,
             tool_display_modes: &active.tool_display_modes,
+            tool_detail: active.tool_detail,
             collapse_thinking: active.collapse_thinking,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
@@ -5516,7 +5537,15 @@ where
 
         match key {
             Key::CtrlO => {
-                self.toggle_detail_expansion();
+                self.cycle_tool_detail(true);
+                Action::Render
+            }
+            Key::CtrlShiftO => {
+                self.cycle_tool_detail(false);
+                Action::Render
+            }
+            Key::CtrlT => {
+                self.toggle_thinking_expansion();
                 Action::Render
             }
             Key::CtrlJ => {
@@ -6545,79 +6574,10 @@ where
             .and_then(|entry| entry.dialog_id.clone())
     }
 
-    /// Shared Ctrl+O detail path: expand/collapse finished thinking first, else tool outputs.
-    fn toggle_detail_expansion(&mut self) {
-        if self.has_finished_thinking() {
-            let thinking_collapsed = self
-                .transcripts
-                .get(&self.active_transcript)
-                .expect("active transcript always exists")
-                .collapse_thinking;
-            if thinking_collapsed {
-                self.toggle_thinking_expansion();
-                return;
-            }
-
-            let has_completed_tools = self.completed_tool_call_ids().next().is_some();
-            if !has_completed_tools {
-                self.toggle_thinking_expansion();
-                return;
-            }
-        }
-        self.toggle_tool_output_expansion();
-    }
-
-    fn completed_tool_call_ids(&self) -> impl Iterator<Item = String> + '_ {
-        let active = self
-            .transcripts
-            .get(&self.active_transcript)
-            .expect("active transcript always exists");
-        let (completed, conversation): (&[Conversation], Option<&Conversation>) =
-            if self.active_transcript == TranscriptId::Main {
-                (
-                    self.completed_conversations.as_slice(),
-                    self.conversation.as_ref(),
-                )
-            } else {
-                (
-                    active.completed_conversations.as_slice(),
-                    active.conversation.as_ref(),
-                )
-            };
-        completed
-            .iter()
-            .chain(conversation)
-            .flat_map(|conversation| &conversation.tool_batches)
-            .flat_map(|batch| &batch.calls)
-            .filter(|call| call.result.is_some())
-            .map(|call| call.call_id.clone())
-    }
-
-    fn has_finished_thinking(&self) -> bool {
-        if self.running {
-            return false;
-        }
-        let active = self
-            .transcripts
-            .get(&self.active_transcript)
-            .expect("active transcript always exists");
-        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
-            (
-                self.completed_conversations.as_slice(),
-                self.conversation.as_ref(),
-            )
-        } else {
-            (
-                active.completed_conversations.as_slice(),
-                active.conversation.as_ref(),
-            )
-        };
-        completed
-            .iter()
-            .chain(conversation)
-            .any(|conversation| !conversation.reasoning.is_empty())
-    }
-
+    /// Shows or hides the reasoning bodies of the active transcript.
+    ///
+    /// Pinning survives the auto-collapse a finishing turn performs, so a reader
+    /// who asked to see the thought keeps seeing it.
     fn toggle_thinking_expansion(&mut self) {
         let record = self.active_record_mut();
         let current = widgets::ExpandableBody::new(if record.collapse_thinking {
@@ -6630,7 +6590,14 @@ where
         record.thinking_user_pinned = next.is_visible();
     }
 
-    fn toggle_tool_output_expansion(&mut self) {
+    /// Moves the transcript's tool output detail one step along its cycle.
+    ///
+    /// The level is the whole state this key owns: it advances even when no call
+    /// has settled yet, so what the footer names is always what the next result
+    /// will be shown at. Every settled call is rewritten to the new level, which
+    /// is what makes the cycle legible — three levels, one meaning each, rather
+    /// than a per-call state the reader would have to track block by block.
+    fn cycle_tool_detail(&mut self, forward: bool) {
         let active = self
             .transcripts
             .get(&self.active_transcript)
@@ -6651,24 +6618,16 @@ where
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
             .collect::<Vec<_>>();
-        if completed_call_ids.is_empty() {
-            return;
-        }
 
-        // All completed calls always advance together, so they share one
-        // current mode; sampling the first call's mode (or the shared
-        // fallback for a call cleared by a new submission) keeps the whole
-        // group synchronized on every press. The fallback matches
-        // a finished `ToolCallBlock::default_mode()` so the sampled state
-        // agrees with what is actually on screen.
-        let modes = &mut self.active_record_mut().tool_display_modes;
-        let current = completed_call_ids
-            .first()
-            .and_then(|call_id| modes.get(call_id).copied())
-            .unwrap_or(widgets::DisplayMode::Collapsed);
-        let next = current.next();
+        let record = self.active_record_mut();
+        let next = if forward {
+            record.tool_detail.next()
+        } else {
+            record.tool_detail.previous()
+        };
+        record.tool_detail = next;
         for call_id in completed_call_ids {
-            modes.insert(call_id, next);
+            record.tool_display_modes.insert(call_id, next);
         }
     }
 
@@ -7971,8 +7930,17 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Char('c' | 'C'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlC
         }
+        (KeyCode::Char('o'), modifiers)
+            if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT =>
+        {
+            Key::CtrlShiftO
+        }
+        (KeyCode::Char('O'), modifiers) if modifiers == KeyModifiers::CONTROL => Key::CtrlShiftO,
         (KeyCode::Char('o' | 'O'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlO
+        }
+        (KeyCode::Char('t' | 'T'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::CtrlT
         }
         (KeyCode::Char('j' | 'J'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Key::CtrlJ
@@ -9547,6 +9515,8 @@ mod runtime_tests {
             (KeyCode::Right, ctrl, Key::NextWord),
             (KeyCode::Char('d'), ctrl, Key::Delete),
             (KeyCode::Char('o'), ctrl, Key::CtrlO),
+            (KeyCode::Char('O'), ctrl, Key::CtrlShiftO),
+            (KeyCode::Char('t'), ctrl, Key::CtrlT),
         ] {
             let event = crossterm::event::KeyEvent::new(code, modifiers);
             assert_eq!(map_key(event), Some(Event::Key(expected)));

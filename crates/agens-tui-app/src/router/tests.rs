@@ -2695,8 +2695,8 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         tui.view().focus,
     );
 
-    // Ctrl+O is thinking-first: expand collapsed reasoning before tool bodies.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Ctrl+T owns the reasoning axis; tool bodies stay where they were.
+    tui.handle(Event::Key(Key::CtrlT));
     assert_eq!(
         (
             tui.view().following_bottom,
