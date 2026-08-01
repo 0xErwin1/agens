@@ -1,7 +1,7 @@
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use std::time::Duration;
 
-use agens_core::{Message, MessagePart, Role, TurnEvent, Usage};
+use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
     PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
@@ -402,9 +402,15 @@ fn active_status_glyph_advances_with_tick_and_idle_stays_static() {
     let active_later = rendered_text(&renderer);
 
     assert!(active_early.contains("⠋"), "{active_early:?}");
-    assert!(active_early.contains("Working…"), "{active_early:?}");
+    assert!(
+        active_early.contains("Waiting for the model…"),
+        "{active_early:?}"
+    );
     assert!(active_later.contains("⠙"), "{active_later:?}");
-    assert!(active_later.contains("Working…"), "{active_later:?}");
+    assert!(
+        active_later.contains("Waiting for the model…"),
+        "{active_later:?}"
+    );
     assert_ne!(active_early, active_later);
 }
 
@@ -425,9 +431,99 @@ fn working_indicator_remains_visible_when_live_transcript_reaches_the_composer()
 
     assert!(rendered.contains("output-line-14"), "{rendered:?}");
     assert!(rendered.contains("output-line-19"), "{rendered:?}");
-    assert!(rendered.contains("Working…"), "{rendered:?}");
+    assert!(rendered.contains("Responding…"), "{rendered:?}");
     assert!(!rendered.contains("LIVE"), "{rendered:?}");
     assert!(!rendered.contains("SCROLL"), "{rendered:?}");
+}
+
+#[test]
+fn a_provider_backoff_reads_differently_from_an_ordinary_wait() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+
+    renderer.render(tui.view()).unwrap();
+    let waiting = rendered_text(&renderer);
+
+    tui.apply_progress(TurnEvent::ProviderRetry {
+        attempt: 2,
+        max_attempts: Some(3),
+        delay: Some(Duration::from_millis(1500)),
+        reason: TurnRetryReason::RateLimited,
+    });
+    renderer.render(tui.view()).unwrap();
+    let retrying = rendered_text(&renderer);
+
+    assert!(waiting.contains("Waiting for the model…"), "{waiting:?}");
+    assert!(!waiting.contains("Retrying"), "{waiting:?}");
+    assert!(retrying.contains("Retrying (2/3)"), "{retrying:?}");
+    assert!(retrying.contains("rate limited"), "{retrying:?}");
+    assert!(retrying.contains("retrying in 1.5s"), "{retrying:?}");
+}
+
+#[test]
+fn a_retry_stops_being_reported_once_the_next_attempt_produces_output() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderRetry {
+        attempt: 1,
+        max_attempts: Some(3),
+        delay: Some(Duration::from_millis(250)),
+        reason: TurnRetryReason::ServerError,
+    });
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(!rendered.contains("Retrying"), "{rendered:?}");
+    assert!(rendered.contains("Responding…"), "{rendered:?}");
+}
+
+#[test]
+fn a_settled_turn_keeps_what_it_took_and_what_it_billed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(1_200),
+        output_tokens: Some(300),
+        total_tokens: Some(1_500),
+        context_window: Some(200_000),
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(2_000),
+        output_tokens: Some(700),
+        total_tokens: Some(2_700),
+        context_window: Some(200_000),
+    }));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+    tui.tick(Duration::from_secs(14));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("14s"), "{rendered:?}");
+    assert!(rendered.contains("3.2k tok in"), "{rendered:?}");
+    assert!(rendered.contains("1.0k tok out"), "{rendered:?}");
+}
+
+#[test]
+fn a_reasoning_stretch_reports_how_long_it_has_been_running() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Reasoning(
+        "weighing options".into(),
+    )));
+    tui.tick(Duration::from_secs(9));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("Reasoning… 9s"), "{rendered:?}");
 }
 
 #[test]
@@ -644,10 +740,19 @@ fn user_turns_have_a_distinct_identity_rail_and_compact_separation() {
         buffer[(BULLET_COLUMN as u16, first_agent_row as u16)].fg,
         Color::Rgb(0x95, 0xe6, 0xcb)
     );
+    assert!(
+        second_user_row > second_agent_row,
+        "a new user turn follows the answer it replies to"
+    );
     assert_eq!(
-        second_user_row,
-        second_agent_row + 2,
+        rendered_line(&renderer, second_user_row - 1).trim(),
+        "",
         "a new user turn keeps one blank row above it"
+    );
+    assert_ne!(
+        rendered_line(&renderer, second_user_row - 2).trim(),
+        "",
+        "only one blank row separates a user turn from what precedes it"
     );
 }
 
@@ -861,6 +966,201 @@ fn finished_tool_row_keeps_name_args_and_status_on_one_collapsed_line() {
     );
     assert!(expanded.contains("read"), "{expanded:?}");
     assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
+}
+
+/// Raw JSON input for the shared live/restored collapse fixtures below.
+const COLLAPSE_FIXTURE_INPUT: &str = r#"{"command":"cargo test --workspace","timeout_ms":600000}"#;
+const COLLAPSE_FIXTURE_BODY: &str = "body-sentinel-line\nsecond body line\nthird body line";
+
+/// Transcript rows a settled `native::bash` call leaves behind, live or restored.
+fn collapse_fixture_rows(renderer: &RatatuiRenderer<TestBackend>) -> Vec<String> {
+    transcript_rows(renderer)
+        .into_iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect()
+}
+
+fn assert_settled_call_is_one_hidden_row(rows: &[String], origin: &str) {
+    let text = rows.join("\n");
+
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("cargo test --workspace"))
+            .count(),
+        1,
+        "{origin}: a settled call keeps exactly one row: {rows:?}"
+    );
+    assert!(
+        text.contains("Success"),
+        "{origin}: the row still names its outcome: {rows:?}"
+    );
+    assert!(
+        !text.contains("timeout_ms"),
+        "{origin}: raw input stays out of the settled transcript: {rows:?}"
+    );
+    assert!(
+        !text.contains("body-sentinel-line"),
+        "{origin}: the result body stays out of the settled transcript: {rows:?}"
+    );
+}
+
+#[test]
+fn live_tool_call_collapses_when_it_ends_and_hides_its_raw_input() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("run the tests");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let running = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        running.contains("cargo test --workspace"),
+        "a running call names its work: {running:?}"
+    );
+    assert!(
+        !running.contains("timeout_ms"),
+        "a running call does not dump its raw input: {running:?}"
+    );
+
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: COLLAPSE_FIXTURE_BODY.into(),
+        is_error: false,
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "bash-1".into(),
+        duration: Some(Duration::from_millis(120)),
+        result: ToolResultState::Success,
+    });
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "live");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let audited = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        audited.contains("timeout_ms"),
+        "the raw input stays reachable through the audit mode: {audited:?}"
+    );
+    assert!(
+        audited.contains("body-sentinel-line"),
+        "the body stays reachable through the audit mode: {audited:?}"
+    );
+}
+
+#[test]
+fn settled_tool_call_without_a_recorded_mode_collapses_and_advances_from_collapsed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("run the tests");
+    start_execution(&mut tui, 1, "build");
+    // Settling a parent call while a subagent transcript is selected records the
+    // mode against that subagent, so the main transcript reaches this call with
+    // nothing recorded for it.
+    tui.select_transcript(TranscriptId::Subagent(1));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: COLLAPSE_FIXTURE_BODY.into(),
+        is_error: false,
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "bash-1".into(),
+        duration: Some(Duration::from_millis(120)),
+        result: ToolResultState::Success,
+    });
+    tui.select_transcript(TranscriptId::Main);
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "unrecorded");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let advanced = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        advanced.contains("body-sentinel-line"),
+        "the first press advances out of collapsed instead of re-collapsing: {advanced:?}"
+    );
+    assert!(
+        !advanced.contains("timeout_ms"),
+        "the raw input waits for the audit mode: {advanced:?}"
+    );
+}
+
+#[test]
+fn restored_tool_call_collapses_exactly_like_the_live_path() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    // Mirrors the production resume path, which parses each restored call's
+    // input before projecting it.
+    let history = agens_tui::Conversation::from_messages_with_parser(
+        &[
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("run the tests".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "bash-1".into(),
+                    name: "native::bash".into(),
+                    input: COLLAPSE_FIXTURE_INPUT.into(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "bash-1".into(),
+                    content: COLLAPSE_FIXTURE_BODY.into(),
+                    is_error: false,
+                }],
+            },
+        ],
+        // `ToolInput::parse` lives in `agens-permissions`, which this surface may
+        // not depend on; this stands in for what it yields for the fixture input.
+        |_, _| agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    )
+    .unwrap();
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Resumed session 1.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #1"),
+        history,
+        draft: None,
+        resume_error: None,
+        file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
+    });
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "restored");
 }
 
 #[test]
@@ -2145,7 +2445,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
     assert!(!text.contains("context 128"), "{text:?}");
     assert!(!text.contains("stale live markdown"), "{text:?}");
     assert!(!text.contains("**"), "{text:?}");
-    assert!(!text.contains("```"), "{text:?}");
+    assert!(
+        text.contains("```text"),
+        "a tool result is terminal text, so a fence the tool printed stays literal: {text:?}"
+    );
     assert!(!text.contains("native::read · read-1"), "{text:?}");
     assert!(!text.contains("native::write · write-2"), "{text:?}");
     assert_eq!(text.matches("Tools").count(), 1, "{text:?}");
@@ -3926,13 +4229,15 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
         "child-input-sentinel",
         "child-result-sentinel",
         "Subagent tool execution failed.",
-        "child-final-sentinel",
     ] {
         assert!(
             !main.contains(child_row),
             "duplicated {child_row:?}: {main:?}"
         );
     }
+    // The card is the only place main learns why a delegated run failed, so its
+    // final result belongs there even though the child's own rows do not.
+    assert!(main.contains("child-final-sentinel"), "{main:?}");
 
     tui.select_transcript(TranscriptId::Subagent(7));
     // Ctrl+O is thinking-first, then tools.
@@ -4529,7 +4834,7 @@ fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
 
     assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
     assert!(!rendered.contains("BYPASS"), "{rendered:?}");
-    assert!(!rendered.contains("Waiting"), "{rendered:?}");
+    assert!(!rendered.contains("· Waiting"), "{rendered:?}");
 }
 
 #[test]
@@ -4567,4 +4872,168 @@ fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_ke
             rendered_text(&renderer)
         );
     }
+}
+
+const ERROR_COLOR: Color = Color::Rgb(0xf0, 0x71, 0x78);
+const MUTED_COLOR: Color = Color::Rgb(0x5c, 0x67, 0x73);
+
+#[test]
+fn a_failed_turn_emphasizes_its_footer_status_instead_of_hiding_it_in_the_border_grey() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    tui.finish_submission(Err("provider: request rejected".into()));
+
+    renderer.render(tui.view()).unwrap();
+
+    let status = cell_for_text(&renderer, "Failed");
+    assert_eq!(status.fg, ERROR_COLOR, "{:?}", rendered_text(&renderer));
+    assert!(status.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn a_failure_scrolled_out_of_the_viewport_still_announces_itself_above_the_composer() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 20,
+    });
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "filler-line\n".repeat(60),
+    )));
+    tui.finish_submission(Err("provider: request rejected".into()));
+
+    tui.handle(Event::Key(Key::CtrlG));
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(
+        !rendered.contains("Action:"),
+        "the error card has to be out of view for this assertion: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("provider: request rejected"),
+        "the failure must stay perceptible without scrolling: {rendered:?}"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "provider: request rejected").fg,
+        ERROR_COLOR
+    );
+}
+
+#[test]
+fn a_failure_notice_is_not_painted_in_the_lowest_salience_style() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "mcp: atlas failed to connect (unavailable)".into(),
+        severity: agens_core::NoticeSeverity::Failure,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "session restored".into(),
+        severity: agens_core::NoticeSeverity::Info,
+    });
+
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(cell_for_text(&renderer, "NOTICE").fg, ERROR_COLOR);
+    assert_eq!(cell_for_text(&renderer, "mcp: atlas").fg, ERROR_COLOR);
+    assert_eq!(cell_for_text(&renderer, "INFO").fg, MUTED_COLOR);
+    assert_ne!(cell_for_text(&renderer, "session restored").fg, ERROR_COLOR);
+}
+
+#[test]
+fn a_failed_subagent_card_shows_why_it_failed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.tick(Duration::from_secs(5));
+    start_execution(&mut tui, 10, "reviewer");
+    tui.tick(Duration::from_secs(10));
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Failed { id: 10 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(
+            10,
+            SubagentStatus::Failure,
+            "the reviewer ran out of context window",
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("Failure · recent · 5s"), "{rendered:?}");
+    assert!(
+        rendered.contains("the reviewer ran out of context window"),
+        "{rendered:?}"
+    );
+    assert_eq!(cell_for_text(&renderer, "the reviewer ran").fg, ERROR_COLOR);
+}
+
+#[test]
+fn a_successful_subagent_card_keeps_its_result_out_of_the_transcript() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    start_execution(&mut tui, 11, "explore");
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(11, SubagentStatus::Success, "long successful summary body"),
+    );
+
+    renderer.render(tui.view()).unwrap();
+
+    assert!(
+        !rendered_text(&renderer).contains("long successful summary body"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+}
+
+#[test]
+fn a_failed_tool_body_is_painted_apart_from_a_successful_one() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    for (call_id, output, is_error) in [
+        ("ok-1", "success-body-sentinel", false),
+        ("bad-1", "failure-body-sentinel", true),
+    ] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: call_id.into(),
+            name: "native::bash".into(),
+            input: "run".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::bash".into(),
+                raw: "run".into(),
+            },
+        })
+        .unwrap();
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: call_id.into(),
+            output: output.into(),
+            is_error,
+        })
+        .unwrap();
+    }
+    // Collapsed → Truncated: every settled call advances together.
+    tui.handle(Event::Key(Key::CtrlO));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("success-body-sentinel"), "{rendered:?}");
+    assert!(rendered.contains("failure-body-sentinel"), "{rendered:?}");
+    assert_eq!(
+        cell_for_text(&renderer, "success-body-sentinel").fg,
+        MUTED_COLOR
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "failure-body-sentinel").fg,
+        ERROR_COLOR
+    );
 }

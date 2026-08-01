@@ -1,23 +1,34 @@
 //! Compact operational footer (Claude Code–inspired density, Agens-owned layout).
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use agens_core::Usage;
+use ratatui::{
+    style::{Modifier, Style},
+    text::Span,
+};
 use unicode_width::UnicodeWidthStr;
 
+use super::RolePalette;
 use super::overlay::truncate_columns;
 
 /// Context for the single operational footer row.
+#[derive(Clone)]
 pub(crate) struct FooterContext<'a> {
     pub model: &'a str,
     pub effort: Option<&'a str>,
     pub context_window: Option<u64>,
     pub project: &'a str,
-    pub turn_label: &'a str,
+    pub turn_label: Cow<'a, str>,
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
     pub dangerous: bool,
     pub bypass: bool,
+    /// Whether the turn the status names ended in failure. The footer is the
+    /// only persistent trace of it once the transcript scrolls away, so the
+    /// status segment stops being border grey when this is set.
+    pub failed: bool,
 }
 
 /// Narrowest border line worth splicing metadata into.
@@ -53,6 +64,13 @@ struct FooterSegments {
     usage: String,
     project: String,
     status: String,
+    /// The trailing part of `status` that names *this turn's* outcome, when the
+    /// status segment names one at all.
+    ///
+    /// A permission mode is a standing state of the session and changes on a
+    /// different clock than a turn, so it never belongs to this. Bypass leaves
+    /// it absent because it replaces the turn outcome outright.
+    turn_status: Option<String>,
 }
 
 impl FooterSegments {
@@ -83,7 +101,7 @@ impl FooterSegments {
             project
         };
 
-        let mut status = ctx.turn_label.to_owned();
+        let mut status = ctx.turn_label.to_string();
         if let Some(duration) = ctx.duration {
             status.push_str(&if duration.as_secs() > 0 {
                 format!(" {}s", duration.as_secs())
@@ -91,11 +109,14 @@ impl FooterSegments {
                 format!(" {}ms", duration.as_millis())
             });
         }
+
+        let mut turn_status = (!status.is_empty()).then(|| status.clone());
         if ctx.dangerous {
             status = format!("danger {status}");
         }
         if ctx.bypass {
             status = "bypass".to_owned();
+            turn_status = None;
         }
 
         Self {
@@ -104,6 +125,7 @@ impl FooterSegments {
             usage,
             project,
             status,
+            turn_status,
         }
     }
 
@@ -153,10 +175,45 @@ impl MetricFooter {
         })
     }
 
-    /// Same metadata sized for a border line, or `None` when the border is too
-    /// narrow to host the shortest form whole.
-    pub(crate) fn border_text(width: u16, ctx: FooterContext<'_>) -> Option<String> {
-        (width >= MIN_BORDER_METRICS_WIDTH).then(|| Self::text(width, ctx))
+    /// The fitted footer as spans, with the turn status lifted out of the
+    /// border grey when it reports a failure.
+    ///
+    /// The turn status closes every fitted form that still carries one, so a
+    /// failed turn is emphasized by re-styling that tail rather than by
+    /// rebuilding the degradation ladder in terms of spans. Emphasis stops at
+    /// the turn status: a permission mode sharing the segment keeps the border
+    /// grey, because a security-relevant indicator must not change appearance
+    /// for a reason that has nothing to do with permissions.
+    pub(crate) fn spans(width: u16, ctx: FooterContext<'_>) -> Vec<Span<'static>> {
+        let turn_status = ctx
+            .failed
+            .then(|| FooterSegments::new(ctx.clone()).turn_status)
+            .flatten();
+        let text = Self::text(width, ctx);
+
+        let chrome = Style::default().fg(RolePalette::chrome());
+        let head = turn_status
+            .as_ref()
+            .and_then(|status| text.strip_suffix(status.as_str()));
+
+        let (Some(head), Some(status)) = (head, turn_status) else {
+            return vec![Span::styled(text, chrome)];
+        };
+
+        vec![
+            Span::styled(head.to_owned(), chrome),
+            Span::styled(
+                status,
+                Style::default()
+                    .fg(RolePalette::error())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    }
+
+    /// Border-sized footer spans, or `None` when the border cannot host them.
+    pub(crate) fn border_spans(width: u16, ctx: FooterContext<'_>) -> Option<Vec<Span<'static>>> {
+        (width >= MIN_BORDER_METRICS_WIDTH).then(|| Self::spans(width, ctx))
     }
 
     #[cfg(test)]
@@ -296,7 +353,7 @@ mod tests {
                 effort: Some("high"),
                 context_window: Some(200_000),
                 project: "/home/iperez/dev/personal/agens",
-                turn_label: "Ready",
+                turn_label: Cow::Borrowed("Ready"),
                 duration: Some(Duration::from_secs(2)),
                 usage: Some(&Usage {
                     input_tokens: Some(1),
@@ -306,6 +363,7 @@ mod tests {
                 }),
                 dangerous: false,
                 bypass: false,
+                failed: false,
             },
         );
         assert!(line.contains("gpt-5.6-sol"));
@@ -333,7 +391,7 @@ mod tests {
             effort: Some("high"),
             context_window: Some(200_000),
             project: "/home/iperez/dev/personal/agens",
-            turn_label: "Ready",
+            turn_label: Cow::Borrowed("Ready"),
             duration: None,
             usage: Some(&Usage {
                 input_tokens: Some(1),
@@ -343,6 +401,7 @@ mod tests {
             }),
             dangerous: false,
             bypass: false,
+            failed: false,
         }
     }
 
@@ -388,20 +447,84 @@ mod tests {
         assert!(!line.contains("Ready"), "{line:?}");
     }
 
+    fn border_string(width: u16, ctx: FooterContext<'_>) -> Option<String> {
+        MetricFooter::border_spans(width, ctx)
+            .map(|spans| spans.iter().map(|span| span.content.as_ref()).collect())
+    }
+
     #[test]
-    fn border_text_yields_nothing_below_the_shortest_hostable_form() {
+    fn border_metadata_yields_nothing_below_the_shortest_hostable_form() {
         assert_eq!(
-            MetricFooter::border_text(MIN_BORDER_METRICS_WIDTH, sample()),
+            border_string(MIN_BORDER_METRICS_WIDTH, sample()),
             Some(" gpt-5.6-sol · Ready".to_owned())
         );
+        assert_eq!(border_string(MIN_BORDER_METRICS_WIDTH - 1, sample()), None);
+        assert_eq!(border_string(0, sample()), None);
         assert_eq!(
-            MetricFooter::border_text(MIN_BORDER_METRICS_WIDTH - 1, sample()),
-            None
-        );
-        assert_eq!(MetricFooter::border_text(0, sample()), None);
-        assert_eq!(
-            MetricFooter::border_text(80, sample()),
+            border_string(80, sample()),
             Some(" gpt-5.6-sol · high · 15k/200k (7.5%) · agens · Ready".to_owned())
         );
+    }
+
+    fn failed_spans(mutate: impl FnOnce(&mut FooterContext<'static>)) -> Vec<Span<'static>> {
+        let mut ctx = sample();
+        ctx.turn_label = Cow::Borrowed("Failed");
+        ctx.failed = true;
+        mutate(&mut ctx);
+        MetricFooter::spans(100, ctx)
+    }
+
+    fn spans_text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn assert_emphasized_turn_status(spans: &[Span<'static>]) {
+        let (head, status) = spans.split_at(spans.len() - 1);
+        assert_eq!(status[0].content, "Failed");
+        assert_eq!(status[0].style.fg, Some(RolePalette::error()));
+        assert!(status[0].style.add_modifier.contains(Modifier::BOLD));
+        for span in head {
+            assert_eq!(span.style.fg, Some(RolePalette::chrome()));
+        }
+    }
+
+    #[test]
+    fn a_failed_status_is_the_only_footer_segment_lifted_out_of_the_border_grey() {
+        assert_emphasized_turn_status(&failed_spans(|_| {}));
+
+        let ready = MetricFooter::spans(100, sample());
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].style.fg, Some(RolePalette::chrome()));
+    }
+
+    /// A permission mode is a standing state of the session, not the outcome of
+    /// one turn. Reddening it because an unrelated turn failed would invite the
+    /// inference that the mode caused the failure, on the one indicator whose
+    /// job is to report what the agent is currently allowed to do.
+    #[test]
+    fn a_failed_turn_leaves_the_permission_mode_in_the_border_grey() {
+        let dangerous = failed_spans(|ctx| ctx.dangerous = true);
+
+        assert_emphasized_turn_status(&dangerous);
+        assert_eq!(dangerous.len(), 2);
+        assert!(dangerous[0].content.ends_with("danger "), "{dangerous:?}");
+        assert_eq!(dangerous[0].style.fg, Some(RolePalette::chrome()));
+
+        // Bypass replaces the turn outcome outright: "Failed" never appears, so
+        // emphasizing the segment would redden "bypass" and report nothing.
+        let bypass = failed_spans(|ctx| ctx.bypass = true);
+
+        assert_eq!(bypass.len(), 1);
+        assert_eq!(bypass[0].style.fg, Some(RolePalette::chrome()));
+        assert!(spans_text(&bypass).ends_with("bypass"), "{bypass:?}");
+        assert!(!spans_text(&bypass).contains("Failed"), "{bypass:?}");
+
+        let both = failed_spans(|ctx| {
+            ctx.dangerous = true;
+            ctx.bypass = true;
+        });
+
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].style.fg, Some(RolePalette::chrome()));
     }
 }

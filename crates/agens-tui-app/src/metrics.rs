@@ -2,7 +2,7 @@ use agens_permissions::sanitize_metric;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use agens_core::{MessagePart, TurnEvent, TurnState};
+use agens_core::{MessagePart, NoticeSeverity, TurnEvent, TurnState};
 use agens_tools::{McpErrorCategory, McpLifecycleState, McpStatusHandle};
 use agens_tui::{BridgeCancel, BridgeTx, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -97,9 +97,14 @@ impl TuiMetricsPublisher {
                 descriptor.name(),
                 category.label()
             );
-            let _ = self
-                .bridge
-                .publish(TuiRuntimeEvent::Notice(text), &self.cancellation, None);
+            let _ = self.bridge.publish(
+                TuiRuntimeEvent::Notice {
+                    text,
+                    severity: NoticeSeverity::Failure,
+                },
+                &self.cancellation,
+                None,
+            );
         }
     }
 
@@ -162,6 +167,7 @@ impl TuiMetricsPublisher {
             TurnEvent::ProviderPart(_) | TurnEvent::StateChanged(_) => None,
             TurnEvent::ToolResult(_) => None,
             TurnEvent::ToolResultFacts { .. } => None,
+            TurnEvent::ProviderRetry { .. } => None,
         };
 
         if let Some(event) = metric {
@@ -759,8 +765,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(matches!(
             first_turn_events.as_slice(),
-            [TuiRuntimeEvent::TurnStarted, TuiRuntimeEvent::Notice(text)]
-                if text == "mcp: atlas failed to connect (transport)"
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::Notice {
+                    text,
+                    severity: NoticeSeverity::Failure
+                }
+            ] if text == "mcp: atlas failed to connect (transport)"
         ));
         assert!(receiver_one.try_recv().is_err());
 
@@ -799,8 +810,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(matches!(
             third_turn_events.as_slice(),
-            [TuiRuntimeEvent::TurnStarted, TuiRuntimeEvent::Notice(text)]
-                if text == "mcp: engram failed to connect (transport)"
+            [
+                TuiRuntimeEvent::TurnStarted,
+                TuiRuntimeEvent::Notice {
+                    text,
+                    severity: NoticeSeverity::Failure
+                }
+            ] if text == "mcp: engram failed to connect (transport)"
         ));
         assert!(receiver_three.try_recv().is_err());
 

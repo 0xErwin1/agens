@@ -1,5 +1,6 @@
 //! Terminal lifecycle and input-event boundary for the interactive surface.
 
+mod activity;
 mod app;
 mod bridge;
 mod conversation;
@@ -7,16 +8,17 @@ mod render;
 mod terminal;
 mod widgets;
 
+pub use activity::{RetryActivity, TurnActivity};
 pub use agens_bus::{BridgeCancel, BridgeTx, PublishOutcome, UiEnvelope};
 pub use agens_core::{
-    DiffLine, DiffLineKind, ToolResultState, TuiExecution, TuiExecutionEvent, TuiExecutionState,
-    TuiRuntimeEvent, TuiSubagentEvent,
+    DiffLine, DiffLineKind, NoticeSeverity, ToolResultState, TuiExecution, TuiExecutionEvent,
+    TuiExecutionState, TuiRuntimeEvent, TuiSubagentEvent,
 };
 pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, TurnCost,
 };
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
@@ -78,6 +80,10 @@ const TERMINAL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACTIVE_FRAME_HEARTBEAT: Duration = Duration::from_millis(80);
 const EXIT_WARNING_WINDOW: Duration = Duration::from_secs(2);
 const MAX_SELECTION_COPY_BYTES: usize = 64 * 1024;
+
+/// Stands in for a failure whose cause has not arrived (and may never arrive).
+/// Matched verbatim when the real cause replaces it, so it must stay a literal.
+const UNEXPLAINED_FAILURE_MESSAGE: &str = "The turn failed without reporting a cause.";
 
 const fn transcript_chrome_rows(following_bottom: bool) -> u16 {
     if following_bottom {
@@ -742,6 +748,8 @@ pub struct ViewState<'a> {
     pub execution_activities: Vec<TuiExecutionActivity>,
     /// Tick clock reading when the active turn began, for live elapsed time.
     pub turn_started_at: Option<Duration>,
+    /// What the turn is doing, as the single source of every activity label.
+    pub turn_activity: TurnActivity<'a>,
 }
 
 /// One child row of the subagent tree: a bounded, name-only activity label.
@@ -1504,11 +1512,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
 
     if layout.footer.height > 0 {
         frame.render_widget(
-            Paragraph::new(widgets::MetricFooter::text(
+            Paragraph::new(Line::from(widgets::MetricFooter::spans(
                 layout.footer.width,
                 footer_context(&state),
-            ))
-            .style(Style::default().fg(widgets::RolePalette::chrome())),
+            ))),
             layout.footer,
         );
     }
@@ -1667,11 +1674,12 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         effort: state.reasoning_effort,
         context_window: state.context_window,
         project: state.project,
-        turn_label: turn_state_label(state.turn_state, state.running, state.session_loading),
+        turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
         dangerous: state.dangerous_mode,
         bypass: state.bypass,
+        failed: state.turn_state == Some(TurnState::Failed),
     }
 }
 
@@ -1684,17 +1692,12 @@ fn border_metrics(state: &ViewState<'_>, composer: Rect) -> Option<Line<'static>
     if composer.height < 2 {
         return None;
     }
-    let text = widgets::MetricFooter::border_text(
+    let mut spans = widgets::MetricFooter::border_spans(
         border_metrics_budget(composer.width),
         footer_context(state),
     )?;
-    Some(
-        Line::from(vec![
-            Span::styled(text, Style::default().fg(widgets::RolePalette::chrome())),
-            Span::raw(" "),
-        ])
-        .right_aligned(),
-    )
+    spans.push(Span::raw(" "));
+    Some(Line::from(spans).right_aligned())
 }
 
 /// Content width below which the palette drops the description column entirely.
@@ -2468,6 +2471,8 @@ fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
                 .fg(widgets::RolePalette::warning())
                 .add_modifier(Modifier::BOLD),
         ));
+    } else if let Some(failure) = turn_failure_banner(state) {
+        left.push(failure);
     } else if state.dangerous_mode {
         left.push(Span::styled(
             " danger ",
@@ -2486,6 +2491,38 @@ fn notice_spans(state: &ViewState<'_>) -> Vec<Span<'static>> {
         ));
     }
     left
+}
+
+/// Restates the failure that ended the current turn in the reserved band above
+/// the composer.
+///
+/// The error card can sit anywhere in the transcript, including far outside the
+/// viewport, so it cannot be the only place the cause is readable. The band is
+/// already reserved, always on screen and independent of scroll, which is what
+/// a transient overlay would have had to reinvent with a timer of its own. It
+/// clears by itself when the next turn starts.
+fn turn_failure_banner(state: &ViewState<'_>) -> Option<Span<'static>> {
+    if state.turn_state != Some(TurnState::Failed) {
+        return None;
+    }
+
+    let cause = state
+        .conversation?
+        .errors
+        .last()?
+        .message
+        .lines()
+        .next()?
+        .trim();
+
+    (!cause.is_empty()).then(|| {
+        Span::styled(
+            format!(" {cause} "),
+            Style::default()
+                .fg(widgets::RolePalette::error())
+                .add_modifier(Modifier::BOLD),
+        )
+    })
 }
 
 fn render_notice(frame: &mut ratatui::Frame<'_>, area: Rect, spans: Vec<Span<'static>>) {
@@ -2701,27 +2738,6 @@ fn execution_state_color(state: TuiExecutionState) -> Color {
     }
 }
 
-fn turn_state_label(
-    state: Option<TurnState>,
-    running: bool,
-    session_loading: bool,
-) -> &'static str {
-    if session_loading {
-        return "Loading session…";
-    }
-
-    match state {
-        Some(TurnState::Requesting) => "Waiting",
-        Some(TurnState::Streaming) => "Responding",
-        Some(TurnState::Dispatching) => "Using tool",
-        Some(TurnState::Cancelled) => "Cancelling",
-        Some(TurnState::Failed) => "Failed",
-        Some(TurnState::Completed) => "Completed",
-        _ if running => "Working",
-        _ => "Ready",
-    }
-}
-
 fn transcript_lines(entries: &[TranscriptEntry]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for entry in entries {
@@ -2830,9 +2846,10 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         conversation_is_authoritative,
     )));
     if state.running {
+        let label = state.turn_activity.status_label();
         transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
-                label: "Working…",
+                label: &label,
                 now: state.now,
                 elapsed: state
                     .turn_started_at
@@ -3233,7 +3250,7 @@ impl Renderer for PlainRenderer {
         }
 
         if state.running {
-            writeln!(stdout, "Working…")?;
+            writeln!(stdout, "{}", state.turn_activity.status_label())?;
         }
         write!(stdout, "> {}", state.input)?;
         stdout.flush()
@@ -3262,10 +3279,20 @@ pub struct Tui<E> {
     session: String,
     project: String,
     turn_state: Option<TurnState>,
+    /// Whether the visible failure of the current turn is the projection's own
+    /// placeholder, still waiting to be replaced by the real cause.
+    placeholder_failure: bool,
     active_tool: Option<String>,
+    /// The transient provider failure currently being waited out, if any.
+    pending_retry: Option<RetryActivity>,
+    /// Tick clock reading when the current reasoning stretch began.
+    reasoning_started_at: Option<Duration>,
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
+    /// Tokens billed by the rounds of the active turn, summed as they report.
+    turn_input_tokens: Option<u64>,
+    turn_output_tokens: Option<u64>,
     latest_usage: Option<Usage>,
     status: Option<String>,
     restored_syntax_ready_at: Option<Duration>,
@@ -3319,10 +3346,15 @@ where
             session: "new session".to_owned(),
             project: "agens".to_owned(),
             turn_state: None,
+            placeholder_failure: false,
             active_tool: None,
+            pending_retry: None,
+            reasoning_started_at: None,
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
+            turn_input_tokens: None,
+            turn_output_tokens: None,
             latest_usage: None,
             status: None,
             restored_syntax_ready_at: None,
@@ -3506,10 +3538,15 @@ where
     pub fn set_running(&mut self, running: bool) {
         let finishing = self.running && !running;
         self.running = running;
+        self.pending_retry = None;
+        self.reasoning_started_at = None;
         if running {
             self.turn_started_at = Some(self.now);
+            self.turn_input_tokens = None;
+            self.turn_output_tokens = None;
             self.palette_open = false;
             self.turn_state = Some(TurnState::Requesting);
+            self.placeholder_failure = false;
         } else if !matches!(
             self.turn_state,
             Some(TurnState::Failed | TurnState::Cancelled)
@@ -3527,8 +3564,28 @@ where
     }
 
     fn settle_active_conversation(&mut self) {
+        // Elapsed comes from the tick clock rather than the runtime's own
+        // `TurnEnded`, which may arrive after the turn has already settled.
+        let cost = TurnCost {
+            duration: self
+                .turn_started_at
+                .map(|started| self.now.saturating_sub(started)),
+            input_tokens: self.turn_input_tokens,
+            output_tokens: self.turn_output_tokens,
+        };
         if let Some(conversation) = self.conversation.as_mut() {
+            conversation.cost = cost;
             conversation.mark_settled();
+        }
+    }
+
+    /// Adds one round's report to the active turn's running total.
+    fn accumulate_turn_usage(&mut self, usage: &Usage) {
+        if let Some(input) = usage.input_tokens {
+            self.turn_input_tokens = Some(self.turn_input_tokens.unwrap_or(0) + input);
+        }
+        if let Some(output) = usage.output_tokens {
+            self.turn_output_tokens = Some(self.turn_output_tokens.unwrap_or(0) + output);
         }
     }
 
@@ -3949,6 +4006,7 @@ where
         self.active_record_mut().tool_display_modes.clear();
         self.set_running(false);
         self.turn_state = None;
+        self.placeholder_failure = false;
         self.active_tool = None;
         self.clear_current_session_transcripts();
     }
@@ -4182,8 +4240,14 @@ where
                 if finishing {
                     self.auto_collapse_thinking_on_finish();
                 }
+                if *status == TurnState::Failed {
+                    self.note_turn_failure();
+                }
             }
-            TuiRuntimeEvent::Usage(usage) => self.latest_usage = Some(usage.clone()),
+            TuiRuntimeEvent::Usage(usage) => {
+                self.accumulate_turn_usage(usage);
+                self.latest_usage = Some(usage.clone());
+            }
             TuiRuntimeEvent::Diff { lines, .. } => {
                 self.project_conversation(ConversationEvent::Diff(lines.clone()));
             }
@@ -4219,10 +4283,16 @@ where
                 }
             }
             TuiRuntimeEvent::ToolEnded { .. } => {}
-            TuiRuntimeEvent::Notice(text) => {
-                self.transcript.push(TranscriptEntry::Info(text.clone()));
-                self.project_conversation(ConversationEvent::Info(text.clone()));
-            }
+            TuiRuntimeEvent::Notice { text, severity } => match severity {
+                NoticeSeverity::Info => {
+                    self.transcript.push(TranscriptEntry::Info(text.clone()));
+                    self.project_conversation(ConversationEvent::Info(text.clone()));
+                }
+                NoticeSeverity::Failure => {
+                    self.transcript.push(TranscriptEntry::Error(text.clone()));
+                    self.project_conversation(ConversationEvent::FailureNotice(text.clone()));
+                }
+            },
         }
         self.runtime_events.push(event);
     }
@@ -4541,6 +4611,7 @@ where
             execution_selection: self.execution_selection,
             execution_activities: self.focused_execution_activities(),
             turn_started_at: self.turn_started_at,
+            turn_activity: self.current_activity(),
         }
     }
 
@@ -4834,6 +4905,8 @@ where
             TurnEvent::ProviderPart(MessagePart::Text(delta)) => {
                 self.project_conversation(ConversationEvent::MarkdownDelta(delta.clone()));
                 self.turn_state = Some(TurnState::Streaming);
+                self.clear_provider_retry();
+                self.reasoning_started_at = None;
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Assistant(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Assistant(delta)),
@@ -4841,6 +4914,10 @@ where
             }
             TurnEvent::ProviderPart(MessagePart::Reasoning(delta)) => {
                 self.project_conversation(ConversationEvent::ReasoningDelta(delta.clone()));
+                self.clear_provider_retry();
+                if self.reasoning_started_at.is_none() {
+                    self.reasoning_started_at = Some(self.now);
+                }
                 match self.transcript.last_mut() {
                     Some(TranscriptEntry::Reasoning(text)) => text.push_str(&delta),
                     _ => self.transcript.push(TranscriptEntry::Reasoning(delta)),
@@ -4861,6 +4938,8 @@ where
                     },
                 });
                 self.turn_state = Some(TurnState::Dispatching);
+                self.clear_provider_retry();
+                self.reasoning_started_at = None;
                 self.active_tool = (!hidden_task).then_some(name.clone());
                 if !hidden_task {
                     self.transcript
@@ -4902,14 +4981,53 @@ where
                 self.assistant_streaming = false;
                 self.turn_state = Some(state);
                 self.active_tool = None;
+                self.pending_retry = None;
+                self.reasoning_started_at = None;
                 if finishing {
                     self.settle_active_conversation();
                     self.auto_collapse_thinking_on_finish();
                 }
+                if state == TurnState::Failed {
+                    self.note_turn_failure();
+                }
             }
             TurnEvent::StateChanged(state) => self.turn_state = Some(state),
+            TurnEvent::ProviderRetry {
+                attempt,
+                max_attempts,
+                delay,
+                reason,
+            } => {
+                self.pending_retry = Some(RetryActivity {
+                    attempt,
+                    max_attempts,
+                    delay,
+                    reason,
+                });
+            }
             _ => {}
         }
+    }
+
+    /// Drops the pending retry once the attempt it was waiting for produced
+    /// something. A retry is only ever cleared by evidence of progress or by
+    /// the turn ending — never by a timer, which would leave a long backoff
+    /// silent again.
+    fn clear_provider_retry(&mut self) {
+        self.pending_retry = None;
+    }
+
+    fn current_activity(&self) -> TurnActivity<'_> {
+        activity::TurnActivity::derive(activity::ActivityInputs {
+            turn_state: self.turn_state,
+            running: self.running,
+            session_loading: self.session_loading,
+            active_tool: self.active_tool.as_deref(),
+            retry: self.pending_retry,
+            reasoning_elapsed: self
+                .reasoning_started_at
+                .map(|started| self.now.saturating_sub(started)),
+        })
     }
 
     fn main_task_call_ids(&self) -> impl Iterator<Item = &str> {
@@ -6384,7 +6502,7 @@ where
         let current = completed_call_ids
             .first()
             .and_then(|call_id| modes.get(call_id).copied())
-            .unwrap_or(widgets::DisplayMode::Expanded);
+            .unwrap_or(widgets::DisplayMode::Collapsed);
         let next = current.next();
         for call_id in completed_call_ids {
             modes.insert(call_id, next);
@@ -6460,7 +6578,47 @@ where
         }
     }
 
+    /// Guarantees a failed turn leaves a transcript entry even when nothing
+    /// explains it.
+    ///
+    /// The terminal state signal and the outcome carrying the cause travel on
+    /// separate channels, so either can arrive first and the outcome can be
+    /// lost entirely. This records a placeholder when the turn has explained
+    /// nothing yet; [`Self::add_error`] later replaces it with the real cause
+    /// rather than appending a second entry for the same failure.
+    fn note_turn_failure(&mut self) {
+        let explained = self
+            .conversation
+            .as_ref()
+            .is_some_and(|conversation| !conversation.errors.is_empty());
+        if explained || self.placeholder_failure {
+            return;
+        }
+
+        self.add_error(
+            UNEXPLAINED_FAILURE_MESSAGE.to_owned(),
+            "Open /diagnostics for the runtime event, then retry.".to_owned(),
+        );
+        self.placeholder_failure = true;
+    }
+
+    fn drop_placeholder_failure(&mut self) {
+        if !std::mem::take(&mut self.placeholder_failure) {
+            return;
+        }
+
+        if let Some(index) = self.transcript.iter().rposition(|entry| {
+            matches!(entry, TranscriptEntry::Error(text) if text == UNEXPLAINED_FAILURE_MESSAGE)
+        }) {
+            self.transcript.remove(index);
+        }
+        if let Some(conversation) = self.conversation.as_mut() {
+            conversation.remove_error(UNEXPLAINED_FAILURE_MESSAGE);
+        }
+    }
+
     fn add_error(&mut self, message: String, action: String) {
+        self.drop_placeholder_failure();
         self.project_conversation(ConversationEvent::Error { message, action });
         let message = self
             .conversation

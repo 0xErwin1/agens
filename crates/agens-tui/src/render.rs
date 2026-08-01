@@ -19,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
@@ -167,7 +167,47 @@ pub(super) fn conversation_lines(
         blocks.push(item_block(&context, item));
     }
 
+    if let Some(rows) = turn_cost_rows(conversation) {
+        blocks.push(RenderedBlock::plain(rows));
+    }
+
     paint_blocks(blocks, state.now)
+}
+
+/// The closing row of a settled turn: what it took and what it billed.
+///
+/// A live turn already reports its elapsed time in the status row, which
+/// disappears with the turn, so a settled turn keeps its own record rather
+/// than leaving the reader with only the session-wide footer.
+fn turn_cost_rows(conversation: &Conversation) -> Option<Vec<Line<'static>>> {
+    if !conversation.is_settled() || conversation.cost.is_empty() {
+        return None;
+    }
+
+    let cost = conversation.cost;
+    let mut parts = Vec::new();
+    if let Some(duration) = cost.duration {
+        parts.push(elapsed_label(duration));
+    }
+    if let Some(input) = cost.input_tokens {
+        parts.push(format!("{} in", compact_tokens(input)));
+    }
+    if let Some(output) = cost.output_tokens {
+        parts.push(format!("{} out", compact_tokens(output)));
+    }
+
+    Some(vec![Line::from(Span::styled(
+        format!("│ {}", parts.join(" · ")),
+        Style::default().fg(RolePalette::muted()),
+    ))])
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{:.1}k tok", tokens as f64 / 1_000.0)
+    } else {
+        format!("{tokens} tok")
+    }
 }
 
 /// Shared inputs every conversation item needs to describe its rows.
@@ -312,6 +352,15 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
         ConversationItem::Info(text) => {
             RenderedBlock::plain(label_lines("INFO", RolePalette::muted(), text))
         }
+        ConversationItem::FailureNotice(text) => RenderedBlock::accented(
+            labelled_lines(
+                "NOTICE",
+                RolePalette::error(),
+                Style::default().fg(RolePalette::error()),
+                text,
+            ),
+            Some(RowAccent::Still(RolePalette::error())),
+        ),
         ConversationItem::User(text) => user_block(text),
         ConversationItem::Assistant(text) => assistant_block(
             text,
@@ -400,6 +449,11 @@ fn tool_call_block(
     }
 }
 
+/// Body rows a settled call contributes below its header row.
+///
+/// A body block only exists once the call carries a result, so an absent mode
+/// entry has to resolve the same way `ToolCallBlock::default_mode` resolves it
+/// for a settled call: hidden until the reader asks for it.
 fn tool_result_body_block(
     context: &ItemContext<'_>,
     call_id: &str,
@@ -414,18 +468,19 @@ fn tool_result_body_block(
         .tool_display_modes
         .get(call_id)
         .copied()
-        .unwrap_or(DisplayMode::Expanded);
+        .unwrap_or(DisplayMode::Collapsed);
     if mode == DisplayMode::Collapsed {
         return RenderedBlock::hidden();
     }
 
-    let full_body = tool_result_body(call_id, output, context.content_width);
+    let (result_state, _) = tool_state(context.events, call_id, is_error);
+    let failed = result_state == ToolResultState::Failure;
+    let full_body = tool_result_body(call_id, output, context.content_width, failed);
     let body = match mode {
         DisplayMode::Collapsed => Vec::new(),
         DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
         DisplayMode::Expanded => full_body.to_vec(),
     };
-    let (result_state, _) = tool_state(context.events, call_id, is_error);
     let accent = (!call_is_groupable(context.conversation, call_id))
         .then_some(RowAccent::Still(result_color(result_state)));
 
@@ -788,6 +843,7 @@ struct ToolBodyKey {
     call_id: String,
     content_width: usize,
     output_hash: u64,
+    failed: bool,
 }
 
 thread_local! {
@@ -797,12 +853,20 @@ thread_local! {
 
 /// Described lines for a tool result body, reused while the body is unchanged.
 ///
-/// Keyed by call, content width and output hash, so an idle block is described
-/// once instead of once per animation tick. Caching is safe here because a tool
-/// body is bounded well below [`SYNTAX_DEFER_SOURCE_BYTES`]: its syntax
-/// highlighting resolves on the first frame, so no deferred, unhighlighted
-/// frame can be frozen into the cache.
-fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[Line<'static>]> {
+/// Keyed by call, content width, output hash and outcome, so an idle block is
+/// described once instead of once per animation tick. Caching is safe here
+/// because the description is a pure function of those inputs, so no partially
+/// described frame can be frozen into the cache.
+///
+/// A failed body is painted in the error colour: muting it would make the text
+/// the reader most needs the least readable thing on the row, and would leave
+/// failure and success indistinguishable below the header.
+fn tool_result_body(
+    call_id: &str,
+    output: &str,
+    content_width: usize,
+    failed: bool,
+) -> Arc<[Line<'static>]> {
     let mut hasher = DefaultHasher::new();
     output.hash(&mut hasher);
     let output_hash = hasher.finish();
@@ -813,6 +877,7 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
             .find(|(key, _)| {
                 key.output_hash == output_hash
                     && key.content_width == content_width
+                    && key.failed == failed
                     && key.call_id == call_id
             })
             .map(|(_, body)| Arc::clone(body))
@@ -824,12 +889,14 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
     #[cfg(test)]
     TOOL_BODY_RENDERS.with(|renders| renders.set(renders.get() + 1));
 
-    let mut described = Vec::new();
-    markdown_lines(
-        &mut described,
+    let color = if failed {
+        RolePalette::error()
+    } else {
+        RolePalette::muted()
+    };
+    let described = tool_output_lines(
         &bounded_visible_tool_output(output),
-        Style::default().fg(RolePalette::muted()),
-        "",
+        Style::default().fg(color),
         content_width,
     );
     let body: Arc<[Line<'static>]> = Arc::from(described);
@@ -844,12 +911,234 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
                 call_id: call_id.to_owned(),
                 content_width,
                 output_hash,
+                failed,
             },
             Arc::clone(&body),
         ));
     });
 
     body
+}
+
+/// Columns a tab advances to. Four keeps a narrow transcript readable where the
+/// terminal's traditional eight would spend most of the width on indentation.
+const TERMINAL_TAB_WIDTH: usize = 4;
+
+/// Describes tool output as terminal text rather than as prose.
+///
+/// A command's stdout or a file's contents is what something already printed,
+/// so no Markdown structure is inferred from it: an indented line keeps its
+/// indentation, a `#` line stays a comment, and a `---` line stays three
+/// dashes. ANSI colour and attributes the command emitted become styles; every
+/// other escape sequence and control character is dropped instead of painted.
+/// A row wider than the transcript is wrapped, never clipped, so no output ever
+/// disappears off the right edge.
+fn tool_output_lines(output: &str, base_style: Style, content_width: usize) -> Vec<Line<'static>> {
+    let max_width = content_width.max(1);
+
+    terminal_rows(output, base_style)
+        .into_iter()
+        .flat_map(|row| wrap_terminal_row(row, max_width))
+        .collect()
+}
+
+/// Splits terminal text into unwrapped rows of styled spans.
+///
+/// Styling set by an SGR sequence carries across a newline, the way a terminal
+/// keeps it until the stream itself resets it. A trailing newline ends the last
+/// row instead of opening an empty one, matching [`str::lines`].
+fn terminal_rows(output: &str, base_style: Style) -> Vec<Vec<Span<'static>>> {
+    let mut rows = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = base_style;
+    let mut column = 0_usize;
+    let mut characters = output.chars();
+
+    while let Some(character) = characters.next() {
+        match character {
+            '\n' => {
+                rows.push(std::mem::take(&mut spans));
+                column = 0;
+            }
+            '\u{1b}' => style = escaped_style(&mut characters, style, base_style),
+            '\t' => {
+                let advance = TERMINAL_TAB_WIDTH - column % TERMINAL_TAB_WIDTH;
+                push_styled_text(&mut spans, &" ".repeat(advance), style);
+                column = column.saturating_add(advance);
+            }
+            control if control.is_control() => {}
+            visible => {
+                let mut encoded = [0_u8; 4];
+                push_styled_text(&mut spans, visible.encode_utf8(&mut encoded), style);
+                column = column.saturating_add(visible.width().unwrap_or_default());
+            }
+        }
+    }
+
+    if !spans.is_empty() {
+        rows.push(spans);
+    }
+
+    rows
+}
+
+/// Consumes one escape sequence and reports the style that follows it.
+///
+/// Only SGR is interpreted. A control sequence with any other final byte, and
+/// an operating-system command with its own string terminator, are consumed so
+/// their bytes never reach a span, and leave the current style untouched.
+fn escaped_style(characters: &mut std::str::Chars<'_>, style: Style, base_style: Style) -> Style {
+    match characters.next() {
+        Some('[') => {
+            let mut parameters = String::new();
+            let mut final_byte = None;
+            for character in characters.by_ref() {
+                if matches!(character, '\u{40}'..='\u{7e}') {
+                    final_byte = Some(character);
+                    break;
+                }
+                parameters.push(character);
+            }
+            if final_byte == Some('m') {
+                sgr_style(&parameters, style, base_style)
+            } else {
+                style
+            }
+        }
+        Some(']') => {
+            let mut escaped = false;
+            for character in characters.by_ref() {
+                if character == '\u{7}' || (escaped && character == '\\') {
+                    break;
+                }
+                escaped = character == '\u{1b}';
+            }
+            style
+        }
+        _ => style,
+    }
+}
+
+/// Applies one SGR parameter list to the current style.
+///
+/// An empty list is a reset, as the specification requires, and a parameter the
+/// transcript cannot express is ignored rather than approximated.
+fn sgr_style(parameters: &str, style: Style, base_style: Style) -> Style {
+    if parameters.is_empty() {
+        return base_style;
+    }
+
+    let codes = parameters
+        .split(';')
+        .map(|parameter| parameter.parse::<u16>().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let mut style = style;
+    let mut index = 0_usize;
+
+    while let Some(&code) = codes.get(index) {
+        match code {
+            0 => style = base_style,
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            7 => style = style.add_modifier(Modifier::REVERSED),
+            9 => style = style.add_modifier(Modifier::CROSSED_OUT),
+            22 => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            27 => style = style.remove_modifier(Modifier::REVERSED),
+            29 => style = style.remove_modifier(Modifier::CROSSED_OUT),
+            30..=37 => style = style.fg(ansi_color(code - 30)),
+            38 => {
+                if let Some(color) = extended_ansi_color(&codes, &mut index) {
+                    style = style.fg(color);
+                }
+            }
+            39 => style.fg = base_style.fg,
+            40..=47 => style = style.bg(ansi_color(code - 40)),
+            48 => {
+                if let Some(color) = extended_ansi_color(&codes, &mut index) {
+                    style = style.bg(color);
+                }
+            }
+            49 => style.bg = base_style.bg,
+            90..=97 => style = style.fg(ansi_color(code - 90 + 8)),
+            100..=107 => style = style.bg(ansi_color(code - 100 + 8)),
+            _ => {}
+        }
+        index = index.saturating_add(1);
+    }
+
+    style
+}
+
+/// Reads the colour a `38` or `48` parameter introduces, advancing `index` past
+/// the parameters it consumed.
+fn extended_ansi_color(codes: &[u16], index: &mut usize) -> Option<Color> {
+    let parameter = |offset: usize| codes.get(index.saturating_add(offset)).copied();
+
+    match parameter(1)? {
+        5 => {
+            let color = ansi_color(parameter(2)?);
+            *index = index.saturating_add(2);
+            Some(color)
+        }
+        2 => {
+            let color = Color::Rgb(
+                ansi_byte(parameter(2)?),
+                ansi_byte(parameter(3)?),
+                ansi_byte(parameter(4)?),
+            );
+            *index = index.saturating_add(4);
+            Some(color)
+        }
+        _ => None,
+    }
+}
+
+/// Palette entry `index`, resolved by the terminal's own theme.
+fn ansi_color(index: u16) -> Color {
+    Color::Indexed(ansi_byte(index))
+}
+
+fn ansi_byte(value: u16) -> u8 {
+    u8::try_from(value).unwrap_or_default()
+}
+
+/// Hard-wraps one terminal row at `max_width`, preserving every column.
+///
+/// Alignment carries meaning in tool output, so a row breaks at the column it
+/// runs out of room in rather than at a word boundary, and the remainder
+/// continues on the next row instead of being clipped away.
+fn wrap_terminal_row(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Line<'static>> {
+    let width = spans.iter().map(|span| span.content.width()).sum::<usize>();
+    if width <= max_width {
+        return vec![Line::from(spans)];
+    }
+
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0_usize;
+
+    for span in spans {
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = grapheme.width();
+            if used.saturating_add(grapheme_width) > max_width && !current.is_empty() {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+            }
+
+            push_styled_text(&mut current, grapheme, span.style);
+            used = used.saturating_add(grapheme_width);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+
+    lines
 }
 
 fn subagent_card_block(
@@ -907,6 +1196,7 @@ fn subagent_card_block(
         ),
         Style::default().fg(RolePalette::muted()),
     ))));
+    rows.extend(subagent_failure_row(card, content_width));
 
     for activity in card.activities.iter().take(3) {
         rows.push(BlockLine::new(Line::from(Span::styled(
@@ -936,6 +1226,26 @@ fn subagent_card_block(
         call_id: None,
         closes_call: false,
     }
+}
+
+/// The reason a delegated run failed, as the single row a card can spend on it.
+///
+/// Without it a failed card reads `Failure · recent · 42s` and nothing else:
+/// the outcome is named but the only part the reader can act on is withheld,
+/// even though the projection has carried it since the run ended.
+fn subagent_failure_row(card: &crate::SubagentCard, content_width: usize) -> Option<BlockLine> {
+    if !matches!(card.status, Some(agens_core::SubagentStatus::Failure)) {
+        return None;
+    }
+
+    let reason = bounded_single_line(card.final_result.as_deref()?, content_width);
+
+    (!reason.is_empty()).then(|| {
+        BlockLine::new(Line::from(Span::styled(
+            reason,
+            Style::default().fg(RolePalette::error()),
+        )))
+    })
 }
 
 fn subagent_status_color(status: Option<agens_core::SubagentStatus>) -> Color {
@@ -1168,7 +1478,7 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::TaskExecution { .. }
             | TuiRuntimeEvent::SubagentExecution(_)
             | TuiRuntimeEvent::RestoredCompletedSubagent { .. }
-            | TuiRuntimeEvent::Notice(_) => {}
+            | TuiRuntimeEvent::Notice { .. } => {}
         }
     }
 
@@ -2659,6 +2969,19 @@ fn tool_state(
 }
 
 fn label_lines(label: &str, color: Color, text: impl Into<String>) -> Vec<Line<'static>> {
+    labelled_lines(label, color, Style::default(), text)
+}
+
+/// Labelled rows whose body carries `body` instead of the transcript default.
+///
+/// Used when the label's colour is not enough to place the row: a failure has
+/// to read as a failure across its whole width, not only in its gutter.
+fn labelled_lines(
+    label: &str,
+    color: Color,
+    body: Style,
+    text: impl Into<String>,
+) -> Vec<Line<'static>> {
     text.into()
         .split('\n')
         .map(|text_line| {
@@ -2667,7 +2990,7 @@ fn label_lines(label: &str, color: Color, text: impl Into<String>) -> Vec<Line<'
                     format!("│ {label:<9} "),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(text_line.to_owned()),
+                Span::styled(text_line.to_owned(), body),
             ])
         })
         .collect()
@@ -3230,6 +3553,72 @@ mod tests {
             tool_body_test_renders(),
             1,
             "an idle tool body is described once, not once per tick"
+        );
+    }
+
+    /// Freshly described rows of a tool result body, bypassing the frame cache.
+    fn tool_body(call_id: &str, output: &str, content_width: usize) -> Vec<Line<'static>> {
+        reset_tool_body_test_state();
+        tool_result_body(call_id, output, content_width, false).to_vec()
+    }
+
+    #[test]
+    fn tool_output_keeps_indentation_instead_of_becoming_a_code_panel() {
+        let output = "impl Config {\n    fn new() -> Self {\n        Self\n    }\n\n    fn root(&self) {}\n}";
+
+        let body = tool_body("read-indented", output, 40);
+
+        assert_eq!(
+            body.iter().map(line_text).collect::<Vec<_>>(),
+            output.lines().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn tool_output_keeps_hash_and_rule_lines_as_literal_text() {
+        let output = "# rebuilding\n---";
+
+        let body = tool_body("bash-markers", output, 40);
+
+        assert_eq!(
+            body.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["# rebuilding", "---"]
+        );
+        let style = span_style(&body, "# rebuilding");
+        assert_eq!(style.fg, Some(RolePalette::muted()));
+        assert!(!style.add_modifier.contains(Modifier::BOLD), "{style:?}");
+    }
+
+    #[test]
+    fn tool_output_wraps_a_long_line_at_the_content_width_without_losing_its_tail() {
+        let output = "thread 'main' panicked at src/lib.rs:42:5: assertion failed: left == right";
+
+        let body = tool_body("bash-wide", output, 40);
+
+        let rows = body.iter().map(line_text).collect::<Vec<_>>();
+        assert_eq!(
+            rows.first().map(|row| row.width()),
+            Some(40),
+            "a wrapped row fills the content width instead of breaking on a word"
+        );
+        assert!(rows.iter().all(|row| row.width() <= 40), "{rows:?}");
+        assert_eq!(rows.concat(), output, "wrapping never drops a tail");
+    }
+
+    #[test]
+    fn tool_output_keeps_the_ansi_colour_the_command_emitted() {
+        let output = "\u{1b}[31merror\u{1b}[0m: build failed";
+
+        let body = tool_body("bash-ansi", output, 40);
+
+        assert_eq!(
+            body.iter().map(line_text).collect::<Vec<_>>(),
+            vec!["error: build failed"]
+        );
+        assert_eq!(span_style(&body, "error").fg, Some(Color::Indexed(1)));
+        assert_eq!(
+            span_style(&body, ": build failed").fg,
+            Some(RolePalette::muted())
         );
     }
 

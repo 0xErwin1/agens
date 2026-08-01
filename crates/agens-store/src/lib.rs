@@ -1504,13 +1504,16 @@ fn encode_turn_event(event: &TurnEvent) -> EncodedTurnEvent<'_> {
         TurnEvent::ToolResultFacts { .. } => {
             unreachable!("live-only tool result facts are excluded from completed history")
         }
+        TurnEvent::ProviderRetry { .. } => {
+            unreachable!("live-only provider retries are excluded from completed history")
+        }
     }
 }
 
 fn persistable_turn_event(event: &TurnEvent) -> bool {
     !matches!(
         event,
-        TurnEvent::Usage(_) | TurnEvent::ToolResultFacts { .. }
+        TurnEvent::Usage(_) | TurnEvent::ToolResultFacts { .. } | TurnEvent::ProviderRetry { .. }
     )
 }
 
