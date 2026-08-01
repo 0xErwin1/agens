@@ -267,3 +267,82 @@ fn registry_replacement_invalidates_an_already_authorized_call() {
     assert_eq!(first_calls.load(Ordering::Acquire), 0);
     assert_eq!(replacement_calls.load(Ordering::Acquire), 0);
 }
+
+/// A tool that finishes only after the turn's deadline has already passed —
+/// the shape of a long subagent.
+struct SlowTool;
+
+impl DispatchTool for SlowTool {
+    fn permission_target(&self, arguments: &serde_json::Value) -> Result<String, Error> {
+        arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| Error::Tool("path is required".into()))
+    }
+
+    fn execute(
+        &mut self,
+        _: &ToolExecutionContext,
+        _: serde_json::Value,
+    ) -> Result<ToolOutput, Error> {
+        std::thread::sleep(Duration::from_millis(30));
+        Ok(ToolOutput::success("the work is done"))
+    }
+}
+
+fn slow_dispatch() -> (ToolDispatcher, agens_tools::AuthorizedToolCall) {
+    let mut dispatcher = ToolDispatcher::new();
+    dispatcher
+        .register_native("native::read", ToolAccess::ReadOnly, SlowTool)
+        .unwrap();
+    let policy = PermissionPolicy::new(PermissionMode::Edit, vec![]);
+    let ToolEvaluationOutcome::Authorized(handle) = dispatcher
+        .evaluate(
+            &policy,
+            &[],
+            &PermissionSession::with_temporary_bypass(),
+            request(),
+        )
+        .unwrap()
+    else {
+        panic!("read-only tool should be authorized");
+    };
+    (dispatcher, handle)
+}
+
+/// Reporting a timeout over a call that already produced its answer threw the
+/// work away and told the model to try again — which is how one long subagent
+/// became two.
+#[test]
+fn a_deadline_that_expires_while_a_tool_runs_does_not_discard_its_result() {
+    let (mut dispatcher, handle) = slow_dispatch();
+
+    let output = dispatcher
+        .execute(
+            handle,
+            &ToolExecutionContext::with_timeout(Duration::from_millis(5)),
+        )
+        .unwrap();
+
+    assert_eq!(output.content, "the work is done");
+    assert!(!output.is_error);
+}
+
+/// Cancellation is a decision, not a deadline: its result must not be acted on.
+#[test]
+fn a_cancelled_call_still_reports_the_cancellation_instead_of_its_result() {
+    let (mut dispatcher, handle) = slow_dispatch();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let context = ToolExecutionContext::new(Arc::clone(&cancellation), Duration::from_secs(30));
+    let flag = Arc::clone(&cancellation);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(5));
+        flag.store(true, Ordering::Release);
+    });
+
+    let output = dispatcher.execute(handle, &context).unwrap();
+
+    assert!(output.is_error, "{output:?}");
+    assert_eq!(output.content, "tool execution cancelled");
+}

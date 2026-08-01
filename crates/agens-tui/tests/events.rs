@@ -3767,3 +3767,39 @@ fn a_child_event_that_cannot_be_projected_is_recorded_instead_of_discarded() {
         "the discarded event has to name itself: {errors:?}"
     );
 }
+
+/// Cancelling a duplicate subagent is how the model stops it from answering.
+/// Waking the model because it was cancelled made it answer anyway.
+#[test]
+fn a_cancelled_background_subagent_does_not_schedule_a_turn_of_its_own() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("delegate");
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Completed));
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 2 },
+    });
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::Cancelled { id: 2 },
+    });
+    assert_eq!(
+        tui.take_ready_auto_turn(),
+        None,
+        "a cancellation is a decision already taken, not news to act on"
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "scout".into(),
+        event: TuiExecutionEvent::Completed { id: 1 },
+    });
+    assert!(
+        tui.take_ready_auto_turn().is_some(),
+        "a subagent that finished with a result is still worth continuing on"
+    );
+}
