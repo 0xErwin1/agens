@@ -30,3 +30,10 @@ pub use schema::{
 
 #[cfg(feature = "enabled")]
 pub use recorder::{PerfError, Recorder, RecorderConfig, TracePaths};
+
+/// Re-exported so the [`span!`] and [`field!`] macros can reach `tracing`
+/// through `$crate` from any crate that calls them, without requiring that
+/// crate to declare `tracing` as its own dependency.
+#[cfg(feature = "enabled")]
+#[doc(hidden)]
+pub use tracing;

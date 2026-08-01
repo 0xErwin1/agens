@@ -26,6 +26,7 @@ contracts:
     tests/bootstrap/target-budget.sh
     tests/bootstrap/verify-contracts.sh
     tests/bootstrap/standards-contract.sh
+    tests/bootstrap/perf-offpath.sh
 
 target-size:
     #!/usr/bin/env bash

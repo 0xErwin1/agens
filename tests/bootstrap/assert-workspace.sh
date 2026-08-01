@@ -153,7 +153,8 @@ jq -e '
     ],
     "agens-tui": [
       "agens-bus",
-      "agens-core"
+      "agens-core",
+      "agens-perf"
     ],
     "agens-tui-app": [
       "agens-agents",

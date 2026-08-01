@@ -22,6 +22,19 @@ pub enum ColorLevel {
     TrueColor,
 }
 
+#[cfg(feature = "perf-audit")]
+impl ColorLevel {
+    /// Stable trace-field label for the level's discriminant.
+    pub(crate) const fn trace_label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Ansi16 => "ansi16",
+            Self::Ansi256 => "ansi256",
+            Self::TrueColor => "true_color",
+        }
+    }
+}
+
 /// Whether the terminal can show the chrome glyphs the transcript prefers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UnicodeLevel {

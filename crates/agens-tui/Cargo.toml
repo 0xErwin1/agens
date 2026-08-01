@@ -8,9 +8,13 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+perf-audit = ["agens-perf/enabled"]
+
 [dependencies]
 agens-bus = { path = "../agens-bus" }
 agens-core = { path = "../agens-core" }
+agens-perf = { path = "../agens-perf" }
 arborium = { version = "2.18.1", default-features = false, features = [
   "lang-bash",
   "lang-c",

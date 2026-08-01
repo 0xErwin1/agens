@@ -46,7 +46,7 @@ pub struct Pending;
 #[macro_export]
 macro_rules! span {
     ($name:literal $(, $key:ident = $value:expr)* $(,)?) => {
-        $crate::Guard(::tracing::info_span!($name $(, $key = $value)*).entered())
+        $crate::Guard($crate::tracing::info_span!($name $(, $key = $value)*).entered())
     };
 }
 
@@ -72,7 +72,7 @@ macro_rules! span {
 #[macro_export]
 macro_rules! field {
     ($key:ident = $value:expr) => {
-        ::tracing::Span::current().record(stringify!($key), $value)
+        $crate::tracing::Span::current().record(stringify!($key), $value)
     };
 }
 
