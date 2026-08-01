@@ -167,7 +167,47 @@ pub(super) fn conversation_lines(
         blocks.push(item_block(&context, item));
     }
 
+    if let Some(rows) = turn_cost_rows(conversation) {
+        blocks.push(RenderedBlock::plain(rows));
+    }
+
     paint_blocks(blocks, state.now)
+}
+
+/// The closing row of a settled turn: what it took and what it billed.
+///
+/// A live turn already reports its elapsed time in the status row, which
+/// disappears with the turn, so a settled turn keeps its own record rather
+/// than leaving the reader with only the session-wide footer.
+fn turn_cost_rows(conversation: &Conversation) -> Option<Vec<Line<'static>>> {
+    if !conversation.is_settled() || conversation.cost.is_empty() {
+        return None;
+    }
+
+    let cost = conversation.cost;
+    let mut parts = Vec::new();
+    if let Some(duration) = cost.duration {
+        parts.push(elapsed_label(duration));
+    }
+    if let Some(input) = cost.input_tokens {
+        parts.push(format!("{} in", compact_tokens(input)));
+    }
+    if let Some(output) = cost.output_tokens {
+        parts.push(format!("{} out", compact_tokens(output)));
+    }
+
+    Some(vec![Line::from(Span::styled(
+        format!("│ {}", parts.join(" · ")),
+        Style::default().fg(RolePalette::muted()),
+    ))])
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        format!("{:.1}k tok", tokens as f64 / 1_000.0)
+    } else {
+        format!("{tokens} tok")
+    }
 }
 
 /// Shared inputs every conversation item needs to describe its rows.

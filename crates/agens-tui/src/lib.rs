@@ -18,7 +18,7 @@ pub use app::{AppEvent, AppState, Command, Dialog, Effect, Runtime};
 pub use bridge::{TuiPermissionBridge, TuiPermissionReply, TuiPermissionRequest};
 pub use conversation::{
     ActionableError, Conversation, ConversationError, ConversationEvent, SubagentCard, ToolBatch,
-    ToolCall, ToolResult,
+    ToolCall, ToolResult, TurnCost,
 };
 pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
@@ -3290,6 +3290,9 @@ pub struct Tui<E> {
     runtime_events: Vec<TuiRuntimeEvent>,
     turn_duration: Option<Duration>,
     turn_started_at: Option<Duration>,
+    /// Tokens billed by the rounds of the active turn, summed as they report.
+    turn_input_tokens: Option<u64>,
+    turn_output_tokens: Option<u64>,
     latest_usage: Option<Usage>,
     status: Option<String>,
     restored_syntax_ready_at: Option<Duration>,
@@ -3350,6 +3353,8 @@ where
             runtime_events: Vec::new(),
             turn_duration: None,
             turn_started_at: None,
+            turn_input_tokens: None,
+            turn_output_tokens: None,
             latest_usage: None,
             status: None,
             restored_syntax_ready_at: None,
@@ -3537,6 +3542,8 @@ where
         self.reasoning_started_at = None;
         if running {
             self.turn_started_at = Some(self.now);
+            self.turn_input_tokens = None;
+            self.turn_output_tokens = None;
             self.palette_open = false;
             self.turn_state = Some(TurnState::Requesting);
             self.placeholder_failure = false;
@@ -3557,8 +3564,28 @@ where
     }
 
     fn settle_active_conversation(&mut self) {
+        // Elapsed comes from the tick clock rather than the runtime's own
+        // `TurnEnded`, which may arrive after the turn has already settled.
+        let cost = TurnCost {
+            duration: self
+                .turn_started_at
+                .map(|started| self.now.saturating_sub(started)),
+            input_tokens: self.turn_input_tokens,
+            output_tokens: self.turn_output_tokens,
+        };
         if let Some(conversation) = self.conversation.as_mut() {
+            conversation.cost = cost;
             conversation.mark_settled();
+        }
+    }
+
+    /// Adds one round's report to the active turn's running total.
+    fn accumulate_turn_usage(&mut self, usage: &Usage) {
+        if let Some(input) = usage.input_tokens {
+            self.turn_input_tokens = Some(self.turn_input_tokens.unwrap_or(0) + input);
+        }
+        if let Some(output) = usage.output_tokens {
+            self.turn_output_tokens = Some(self.turn_output_tokens.unwrap_or(0) + output);
         }
     }
 
@@ -4217,7 +4244,10 @@ where
                     self.note_turn_failure();
                 }
             }
-            TuiRuntimeEvent::Usage(usage) => self.latest_usage = Some(usage.clone()),
+            TuiRuntimeEvent::Usage(usage) => {
+                self.accumulate_turn_usage(usage);
+                self.latest_usage = Some(usage.clone());
+            }
             TuiRuntimeEvent::Diff { lines, .. } => {
                 self.project_conversation(ConversationEvent::Diff(lines.clone()));
             }

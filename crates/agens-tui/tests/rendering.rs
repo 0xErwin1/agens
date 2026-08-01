@@ -482,6 +482,35 @@ fn a_retry_stops_being_reported_once_the_next_attempt_produces_output() {
 }
 
 #[test]
+fn a_settled_turn_keeps_what_it_took_and_what_it_billed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(1_200),
+        output_tokens: Some(300),
+        total_tokens: Some(1_500),
+        context_window: Some(200_000),
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+        input_tokens: Some(2_000),
+        output_tokens: Some(700),
+        total_tokens: Some(2_700),
+        context_window: Some(200_000),
+    }));
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text("answer".into())));
+    tui.tick(Duration::from_secs(14));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("14s"), "{rendered:?}");
+    assert!(rendered.contains("3.2k tok in"), "{rendered:?}");
+    assert!(rendered.contains("1.0k tok out"), "{rendered:?}");
+}
+
+#[test]
 fn a_reasoning_stretch_reports_how_long_it_has_been_running() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 20)).unwrap());
     let mut tui = Tui::new(FakeEngine);
@@ -711,10 +740,19 @@ fn user_turns_have_a_distinct_identity_rail_and_compact_separation() {
         buffer[(BULLET_COLUMN as u16, first_agent_row as u16)].fg,
         Color::Rgb(0x95, 0xe6, 0xcb)
     );
+    assert!(
+        second_user_row > second_agent_row,
+        "a new user turn follows the answer it replies to"
+    );
     assert_eq!(
-        second_user_row,
-        second_agent_row + 2,
+        rendered_line(&renderer, second_user_row - 1).trim(),
+        "",
         "a new user turn keeps one blank row above it"
+    );
+    assert_ne!(
+        rendered_line(&renderer, second_user_row - 2).trim(),
+        "",
+        "only one blank row separates a user turn from what precedes it"
     );
 }
 

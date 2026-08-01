@@ -118,6 +118,24 @@ pub(super) enum ConversationItem {
     SubagentCard(u64),
 }
 
+/// What one turn cost: wall time, and the tokens its provider rounds billed.
+///
+/// Tokens are summed across every round of the turn, not taken from the last
+/// one: a turn that ran tools bills one usage report per round, and reporting
+/// only the last would understate a long turn by most of its cost.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnCost {
+    pub duration: Option<Duration>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl TurnCost {
+    pub(crate) const fn is_empty(self) -> bool {
+        self.duration.is_none() && self.input_tokens.is_none() && self.output_tokens.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Conversation {
     pub user: String,
@@ -130,6 +148,8 @@ pub struct Conversation {
     pub errors: Vec<ActionableError>,
     pub subagent_cards: Vec<SubagentCard>,
     pub(super) items: Vec<ConversationItem>,
+    /// What the turn cost, known only once it settles.
+    pub cost: TurnCost,
     last_was_tool_call: bool,
     settled: bool,
 }
@@ -151,6 +171,7 @@ impl Conversation {
             diffs: Vec::new(),
             errors: Vec::new(),
             subagent_cards: Vec::new(),
+            cost: TurnCost::default(),
             last_was_tool_call: false,
             settled: false,
         }
