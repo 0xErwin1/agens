@@ -1445,8 +1445,8 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
     let thought_row = rendered_row(&renderer, "Thought");
     assert_eq!(
         rendered_line(&renderer, thought_row).trim(),
-        "Thought  ^T",
-        "no duration is tracked for reasoning, so the bare form renders beside its key"
+        "Thought",
+        "no duration is tracked for reasoning, so the bare form renders"
     );
     let rows = transcript_rows(&renderer);
     assert_eq!(

@@ -248,20 +248,13 @@ impl ThinkingBlock {
     /// timing exists in the projection today, so the bare form is what ships
     /// rather than a fabricated duration.
     ///
-    /// The row also carries the key that brings the body back. That hint lives
-    /// here rather than in the footer because it is only true where a hidden
-    /// thought exists; a transcript without reasoning never advertises a key
-    /// that would do nothing.
+    /// The row carries no key hint: it is the quietest thing in the transcript
+    /// and stays that way. Ctrl+T is documented where keys are documented.
     pub(crate) fn collapsed_title(elapsed: Option<Duration>) -> Line<'static> {
-        let mut line = Self::row(elapsed.map_or_else(
+        Self::row(elapsed.map_or_else(
             || "Thought".to_owned(),
             |elapsed| format!("Thought for {}", thought_duration(elapsed)),
-        ));
-        line.spans.push(Span::styled(
-            "  ^T",
-            Style::default().fg(RolePalette::muted()),
-        ));
-        line
+        ))
     }
 
     fn row(label: String) -> Line<'static> {
@@ -830,20 +823,17 @@ fn short_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
 
-    /// The collapsed row is the only trace a hidden thought leaves, so it owes
-    /// the reader both what was hidden and how to get it back.
+    /// A hidden thought names itself and nothing else. Anything appended here
+    /// is chrome on the row that exists precisely to be ignorable.
     #[test]
-    fn collapsed_thinking_is_one_row_naming_the_thought_its_duration_and_its_key() {
+    fn collapsed_thinking_is_one_row_naming_the_thought_and_its_duration() {
         assert_eq!(line_text(&ThinkingBlock::title()), "Thinking");
-        assert_eq!(
-            line_text(&ThinkingBlock::collapsed_title(None)),
-            "Thought  ^T"
-        );
+        assert_eq!(line_text(&ThinkingBlock::collapsed_title(None)), "Thought");
         for (elapsed, expected) in [
-            (Duration::from_millis(1_800), "Thought for 1.8s  ^T"),
-            (Duration::from_millis(59_940), "Thought for 59.9s  ^T"),
-            (Duration::from_secs(60), "Thought for 1m0s  ^T"),
-            (Duration::from_secs(125), "Thought for 2m5s  ^T"),
+            (Duration::from_millis(1_800), "Thought for 1.8s"),
+            (Duration::from_millis(59_940), "Thought for 59.9s"),
+            (Duration::from_secs(60), "Thought for 1m0s"),
+            (Duration::from_secs(125), "Thought for 2m5s"),
         ] {
             assert_eq!(
                 line_text(&ThinkingBlock::collapsed_title(Some(elapsed))),
