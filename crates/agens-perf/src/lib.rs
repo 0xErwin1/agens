@@ -7,8 +7,13 @@
 //! later increments; this module only owns the record shapes and the reader
 //! that turns a file back into them.
 
+mod diff;
 mod reader;
 mod schema;
 
+pub use diff::{
+    AdvisoryFinding, CompareError, DiffReport, SpanAggregate, SpanFinding, TraceAssemblyError,
+    TraceSide, compare, render_text,
+};
 pub use reader::{TraceReadError, read_trace};
 pub use schema::{Record, RunMetadata, SCHEMA_VERSION, SpanRecord};
