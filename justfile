@@ -28,6 +28,15 @@ contracts:
     tests/bootstrap/standards-contract.sh
     tests/bootstrap/perf-offpath.sh
 
+perf-audit run_id="":
+    scripts/perf-audit.sh {{run_id}}
+
+perf-diff base new:
+    cargo run -p agens-tui --features perf-audit --bin agens-perf-audit --locked -- diff {{base}} {{new}}
+
+perf-baseline:
+    scripts/perf-regen-baseline.sh
+
 target-size:
     #!/usr/bin/env bash
     set -euo pipefail
