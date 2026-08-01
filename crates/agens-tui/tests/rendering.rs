@@ -22,7 +22,16 @@ impl Engine for FakeEngine {
     fn cancel(&mut self) {}
 }
 
+/// What the terminal shows, with the hyperlink sequences taken back out.
+///
+/// A cell may carry an OSC 8 payload it never displays, so a test asserting on
+/// what the reader sees has to read past it. Tests about the links themselves
+/// use [`rendered_raw`].
 fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
+    strip_osc8(&rendered_raw(renderer))
+}
+
+fn rendered_raw(renderer: &RatatuiRenderer<TestBackend>) -> String {
     renderer
         .terminal()
         .backend()
@@ -31,6 +40,21 @@ fn rendered_text(renderer: &RatatuiRenderer<TestBackend>) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+fn strip_osc8(text: &str) -> String {
+    let mut stripped = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("\u{1b}]8;;") {
+        stripped.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find("\u{1b}\\") {
+            Some(end) => rest = &after[end + 2..],
+            None => return stripped,
+        }
+    }
+    stripped.push_str(rest);
+    stripped
 }
 
 fn apply_subagent(tui: &mut Tui<FakeEngine>, event: TuiSubagentEvent) {
@@ -52,10 +76,11 @@ fn rendered_row(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
 fn rendered_line(renderer: &RatatuiRenderer<TestBackend>, row: usize) -> String {
     let buffer = renderer.terminal().backend().buffer();
     let width = usize::from(buffer.area.width);
-    buffer.content[row * width..(row + 1) * width]
+    let raw: String = buffer.content[row * width..(row + 1) * width]
         .iter()
         .map(|cell| cell.symbol())
-        .collect()
+        .collect();
+    strip_osc8(&raw)
 }
 
 fn rendered_column(renderer: &RatatuiRenderer<TestBackend>, text: &str) -> usize {
@@ -291,6 +316,52 @@ fn a_long_transcript_folds_its_settled_turns_behind_a_reversible_count() {
         rendered_text(&renderer).contains("… 5 earlier turns"),
         "the fold closes again"
     );
+}
+
+/// A path the agent touched is the thing the reader most often wants to open,
+/// and a link is only worth having if it costs the text nothing: the row must
+/// read exactly the same with the sequence spliced in as without it.
+#[test]
+fn a_path_in_a_tool_row_becomes_an_openable_link_without_changing_the_row() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 100,
+        height: 24,
+    });
+    tui.set_hyperlinks(true);
+    tui.set_project("/home/iperez/dev/personal/agens");
+    tui.begin_submission("inspect");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "crates/agens-tui/src/lib.rs".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "body".into(),
+        is_error: false,
+    }));
+    renderer.render(tui.view()).unwrap();
+
+    let raw = rendered_raw(&renderer);
+    assert!(
+        raw.contains(
+            "\u{1b}]8;;file:///home/iperez/dev/personal/agens/crates/agens-tui/src/lib.rs\u{1b}\\"
+        ),
+        "{raw:?}"
+    );
+    assert!(
+        raw.contains("\u{1b}]8;;\u{1b}\\"),
+        "the link closes: {raw:?}"
+    );
+
+    let visible = rendered_text(&renderer);
+    assert!(
+        visible.contains("read crates/agens-tui/src/lib.rs"),
+        "{visible:?}"
+    );
+    assert!(!visible.contains('\u{1b}'), "{visible:?}");
 }
 
 #[test]

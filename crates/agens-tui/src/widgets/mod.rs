@@ -4,6 +4,7 @@ mod blocks;
 mod expand;
 mod footer;
 mod glyph;
+mod hyperlink;
 mod overlay;
 mod overlay_list;
 mod role_palette;
@@ -16,6 +17,7 @@ pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
 pub(crate) use footer::{FooterContext, MIN_BORDER_METRICS_WIDTH, MetricFooter};
 pub(crate) use glyph::StatusGlyph;
+pub(crate) use hyperlink::{apply_hyperlinks, hyperlinks_enabled};
 pub(crate) use overlay::{
     OverlayConfig, OverlayFrame, OverlayKind, OverlayLayout, OverlayShell, OverlayShortcut,
     OverlaySizing,
