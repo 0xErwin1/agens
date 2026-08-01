@@ -138,6 +138,94 @@ fn transcript_drag_selection_paints_exact_cells_and_preserves_original_text() {
     assert!(rendered.contains("omega"), "{rendered:?}");
 }
 
+/// Wrapping is a fact about the terminal, not about the text. A paragraph that
+/// happened to need three rows must come back off the clipboard as the one line
+/// it was, or every quoted answer arrives with the viewport's width baked into
+/// it.
+#[test]
+fn copying_a_wrapped_paragraph_reconstructs_the_logical_line() {
+    let paragraph = "ALPHA the assistant wrote one continuous paragraph that has to \
+survive being folded across several terminal rows before it reaches OMEGA";
+    let terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 48,
+        height: 24,
+    });
+    tui.begin_submission("prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        paragraph.to_owned(),
+    )));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let first_row = rendered_row(&renderer, "ALPHA") as u16;
+    let first_column = rendered_column(&renderer, "ALPHA") as u16;
+    let last_row = rendered_row(&renderer, "OMEGA") as u16;
+    let last_column = rendered_column(&renderer, "OMEGA") as u16 + 4;
+    assert!(last_row > first_row, "the paragraph has to actually wrap");
+
+    tui.handle(Event::MouseDown {
+        column: first_column,
+        row: first_row,
+    });
+    tui.handle(Event::MouseDrag {
+        column: last_column,
+        row: last_row,
+    });
+    tui.handle(Event::MouseUp {
+        column: last_column,
+        row: last_row,
+    });
+
+    assert_eq!(tui.selected_text(), Some(paragraph));
+}
+
+/// The seam inside a word carries no separator, so rejoining must not invent
+/// one. A path broken across rows has to come back as one path, not two.
+#[test]
+fn copying_a_word_broken_mid_token_does_not_invent_a_separator() {
+    let token = format!("ALPHA{}OMEGA", "x".repeat(45));
+    let token = token.as_str();
+    let terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+    let mut renderer = RatatuiRenderer::new(terminal);
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 40,
+        height: 24,
+    });
+    tui.begin_submission("prompt");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(token.to_owned())));
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+    renderer.render(tui.view()).unwrap();
+
+    let first_row = rendered_row(&renderer, "ALPHA") as u16;
+    let first_column = rendered_column(&renderer, "ALPHA") as u16;
+    let last_row = rendered_row(&renderer, "OMEGA") as u16;
+    let last_column = rendered_column(&renderer, "OMEGA") as u16 + 4;
+    assert!(
+        last_row > first_row,
+        "the token has to actually break mid-word: {:?}",
+        rendered_text(&renderer)
+    );
+
+    tui.handle(Event::MouseDown {
+        column: first_column,
+        row: first_row,
+    });
+    tui.handle(Event::MouseDrag {
+        column: last_column,
+        row: last_row,
+    });
+    tui.handle(Event::MouseUp {
+        column: last_column,
+        row: last_row,
+    });
+
+    assert_eq!(tui.selected_text(), Some(token));
+}
+
 #[test]
 fn empty_composer_renders_a_complete_dock() {
     let width = 72_u16;
@@ -2517,7 +2605,10 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
             output: "```text\nread result\n```".into(),
             is_error: false,
         },
-        ConversationEvent::Diff(vec![DiffLine::new(8, DiffLineKind::Added, "new line")]),
+        ConversationEvent::Diff {
+            call_id: "edit-1".into(),
+            lines: vec![DiffLine::new(8, DiffLineKind::Added, "new line")],
+        },
         ConversationEvent::Error {
             message: "Request failed safely".into(),
             action: "Check credentials and retry.".into(),
