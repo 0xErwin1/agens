@@ -839,8 +839,11 @@ fn configured_reasoning_effort_is_sent_on_continuation_request() {
     server.join();
 }
 
+/// A failing tool's own output is what the model needs in order to recover, and the dispatcher
+/// has already redacted credentials and withheld host paths from it. The continuation therefore
+/// carries the sanitized content the turn recorded, not a generic placeholder.
 #[test]
-fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
+fn continues_through_two_tool_rounds_and_forwards_the_sanitized_error_output() {
     let mut server = LocalResponsesServer::start_scripted(vec![
         tool_call_response("resp_first", "fc_first", "call_first"),
         tool_call_response("resp_second", "fc_second", "call_second"),
@@ -850,13 +853,10 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
     let mut provider = scripted_provider(server.base_url());
     let runtime = provider_runtime();
     let cancellation = HeadlessTurnCancellation::new();
-    let first_events = [tool_result(
-        "call_first",
-        "internal failure: secret=hidden",
-        true,
-    )];
+    let sanitized_failure = "bash: internal failure: secret=[redacted: 6 characters]";
+    let first_events = [tool_result("call_first", sanitized_failure, true)];
     let second_events = [
-        tool_result("call_first", "internal failure: secret=hidden", true),
+        tool_result("call_first", sanitized_failure, true),
         tool_result("call_second", "second result", false),
     ];
 
@@ -883,7 +883,7 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
         json!({
             "model": "test-model",
             "previous_response_id": "resp_first",
-            "input": [{"type": "function_call_output", "call_id": "call_first", "output": "Tool execution failed"}],
+            "input": [{"type": "function_call_output", "call_id": "call_first", "output": sanitized_failure}],
             "parallel_tool_calls": true,
             "stream": true,
         })

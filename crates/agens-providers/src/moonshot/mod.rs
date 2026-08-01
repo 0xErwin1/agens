@@ -437,6 +437,13 @@ impl TurnProvider for MoonshotProvider {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        // A prior round in this same turn may have recorded detail for an incident it then
+        // recovered from. This handle is shared across every round of one attempt, so draining
+        // it here keeps that recovered incident from being mistaken for the cause of a later,
+        // unrelated failure in this same turn.
+        if let Some(failure_detail) = &self.failure_detail {
+            failure_detail.take();
+        }
         stop_before_mapping(cancellation)?;
 
         let state = std::mem::replace(&mut self.state, TurnState::Failed);

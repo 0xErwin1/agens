@@ -7,11 +7,11 @@
 //! themselves, always survive. This module is pure text transformation with no I/O, so it
 //! is reachable from every crate in the redaction-consuming graph without adding an edge.
 //!
-//! Detection requires context: a known credential-key prefix, a `Bearer` token, a JWT, or a
-//! credential-keyed pair. There is no standalone high-entropy rule — a raw key with no prefix
-//! and no preceding credential key is not distinguishable from other high-entropy text (a
-//! padded base64 blob, for example) on shape alone, so it is accepted as a residual risk
-//! rather than mangling unrelated content.
+//! Detection requires context: a known credential-key prefix, a value introduced by an
+//! authentication scheme, a JWT, or a credential-keyed pair. There is no standalone
+//! high-entropy rule — a raw key with no prefix and no preceding credential key is not
+//! distinguishable from other high-entropy text (a padded base64 blob, for example) on shape
+//! alone, so it is accepted as a residual risk rather than mangling unrelated content.
 
 const CREDENTIAL_KEYS: [&str; 11] = [
     "api_key",
@@ -27,7 +27,24 @@ const CREDENTIAL_KEYS: [&str; 11] = [
     "client_secret",
 ];
 
+/// Authentication scheme words that introduce a credential rather than being one. A scheme is
+/// always followed by the value it describes, so the scheme word itself must survive and the
+/// token after it is what gets replaced. `aws4-hmac-sha256` is the SigV4 algorithm name, which
+/// occupies the same position in an `Authorization` header.
+const AUTH_SCHEMES: [&str; 7] = [
+    "basic",
+    "bearer",
+    "digest",
+    "negotiate",
+    "token",
+    "apikey",
+    "aws4-hmac-sha256",
+];
+
 const PREFIXED_KEY_PREFIXES: [&str; 3] = ["sk-", "sk_", "rk-"];
+
+/// A credential value is at least this long when nothing else marks it as opaque.
+const MIN_OPAQUE_VALUE_CHARS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Segment<'a> {
@@ -119,26 +136,27 @@ fn next_word_index(segments: &[Segment<'_>], index: usize) -> Option<usize> {
     matches!(segments.get(candidate), Some(Segment::Word(_))).then_some(candidate)
 }
 
-/// Rules whose match spans two tokens: `Bearer <token>`, a bare `key:`/`key=` token
+/// Rules whose match spans two tokens: `<scheme> <credential>`, a bare `key:`/`key=` token
 /// immediately followed, across whitespace, by a separate value token, and a bare credential
 /// key token followed by a separately-tokenized operator and value (the JSON-quoted shape,
 /// where the surrounding quotes are delimiters). All three consume the value token so the
 /// single-token pass below never reprocesses it.
 ///
-/// The Bearer pass runs to completion before the key/value pass starts. Otherwise a preceding
-/// credential key such as `Authorization:` would be visited first in a single combined pass,
-/// consume the literal word `Bearer` as if it were the value, and mark it `consumed` — hiding
-/// the real token from the Bearer rule entirely.
+/// The auth-scheme pass runs to completion before the key/value pass starts. Otherwise a
+/// preceding credential key such as `Authorization:` would be visited first in a single combined
+/// pass, consume the literal scheme word — `Bearer`, `Basic`, `AWS4-HMAC-SHA256` — as if it were
+/// the value, and mark it `consumed`, hiding the real credential from the scheme rule entirely
+/// and leaving it in the output.
 fn apply_cross_token_rules(
     segments: &[Segment<'_>],
     replacements: &mut [Option<String>],
     consumed: &mut [bool],
 ) {
-    redact_bearer_pass(segments, replacements, consumed);
+    redact_auth_scheme_pass(segments, replacements, consumed);
     redact_key_value_pass(segments, replacements, consumed);
 }
 
-fn redact_bearer_pass(
+fn redact_auth_scheme_pass(
     segments: &[Segment<'_>],
     replacements: &mut [Option<String>],
     consumed: &mut [bool],
@@ -151,21 +169,28 @@ fn redact_bearer_pass(
             continue;
         }
 
-        if word.eq_ignore_ascii_case("bearer") || is_bare_key_with_operator_and_bearer(word) {
-            redact_bearer_value(segments, replacements, consumed, index);
+        if is_auth_scheme(word) || is_bare_key_with_operator_and_scheme(word) {
+            redact_scheme_value(segments, replacements, consumed, index);
         }
     }
 }
 
-/// Matches a credential key glued directly to `Bearer` with no separating whitespace, for
-/// example `authorization=Bearer` or `authorization:Bearer`. The whole token — key, operator,
-/// and the word `Bearer` — is left untouched; only the real token in the next word is
-/// replaced, by the same logic as the bare `Bearer <token>` shape.
-fn is_bare_key_with_operator_and_bearer(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    CREDENTIAL_KEYS
+fn is_auth_scheme(word: &str) -> bool {
+    AUTH_SCHEMES
         .iter()
-        .any(|key| lower == format!("{key}=bearer") || lower == format!("{key}:bearer"))
+        .any(|scheme| word.eq_ignore_ascii_case(scheme))
+}
+
+/// Matches a credential key glued directly to its scheme with no separating whitespace, for
+/// example `authorization=Bearer` or `authorization:Basic`. The whole token — key, operator,
+/// and the scheme — is left untouched; only the real credential in the next word is replaced,
+/// by the same logic as the bare `<scheme> <credential>` shape.
+fn is_bare_key_with_operator_and_scheme(word: &str) -> bool {
+    let Some((key, scheme)) = word.split_once(['=', ':']) else {
+        return false;
+    };
+
+    is_credential_key(key) && is_auth_scheme(scheme)
 }
 
 fn redact_key_value_pass(
@@ -186,19 +211,19 @@ fn redact_key_value_pass(
             continue;
         }
 
-        if is_bare_credential_key(word) {
+        if is_credential_key(word) {
             redact_separated_key_value(segments, replacements, consumed, index);
         }
     }
 }
 
-fn redact_bearer_value(
+fn redact_scheme_value(
     segments: &[Segment<'_>],
     replacements: &mut [Option<String>],
     consumed: &mut [bool],
-    bearer_index: usize,
+    scheme_index: usize,
 ) {
-    let Some(value_index) = next_word_index(segments, bearer_index) else {
+    let Some(value_index) = next_word_index(segments, scheme_index) else {
         return;
     };
     if consumed[value_index] {
@@ -207,25 +232,97 @@ fn redact_bearer_value(
     let Segment::Word(value_word) = segments[value_index] else {
         return;
     };
-    if value_word.chars().count() < 16 {
+    if !is_replaceable_credential_value(value_word) {
         return;
     }
 
     replacements[value_index] = Some(redacted_marker(value_word));
     consumed[value_index] = true;
-    consumed[bearer_index] = true;
+    consumed[scheme_index] = true;
+}
+
+/// Whether a token that already carries a credential key or an auth scheme in front of it may
+/// be replaced.
+///
+/// The preceding context alone is not enough: `authorization: denied by policy`, `"secret":
+/// true` and `password: incorrect` all put a benign word in the value position, and replacing
+/// it corrupts failure text while asserting that a secret was there. A real credential is
+/// either long, or mixes letters with digits, or carries a character prose does not use inside
+/// a word. A hyphen counts as one of those: prose in a value position is a single plain word,
+/// while credentials are routinely hyphenated. The withheld marker never qualifies, which is
+/// what keeps a second pass a no-op.
+fn is_replaceable_credential_value(value: &str) -> bool {
+    if value.is_empty()
+        || value.starts_with(REDACTED_MARKER_PREFIX)
+        || is_auth_scheme(value)
+        || CREDENTIAL_KEYS.contains(&value.to_ascii_lowercase().as_str())
+    {
+        return false;
+    }
+
+    is_credential_shaped_value(value)
+}
+
+fn is_credential_shaped_value(value: &str) -> bool {
+    if value
+        .chars()
+        .any(|character| matches!(character, '_' | '-' | '+' | '/' | '='))
+    {
+        return true;
+    }
+    if value.chars().count() >= MIN_OPAQUE_VALUE_CHARS {
+        return true;
+    }
+
+    value.chars().any(|character| character.is_ascii_digit())
+        && value.chars().any(char::is_alphabetic)
+}
+
+/// Whether `name` carries a known credential key as a whole `_`/`-`-delimited segment.
+///
+/// Real credentials are namespaced far more often than they are bare — `GITHUB_TOKEN`,
+/// `AWS_SECRET_ACCESS_KEY`, `DATABASE_PASSWORD` — so requiring the whole name to equal a known
+/// key would recognize only the rarest form. Matching at segment boundaries is what keeps a
+/// benign word that merely contains one (`tokenizer`, `passwordless`, `secretary`) from
+/// matching.
+pub fn is_credential_key(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower.is_empty() || !lower.chars().all(is_credential_key_char) {
+        return false;
+    }
+
+    CREDENTIAL_KEYS
+        .iter()
+        .any(|key| contains_credential_key_segment(&lower, key))
+}
+
+fn is_credential_key_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+fn contains_credential_key_segment(name: &str, key: &str) -> bool {
+    name.match_indices(key).any(|(start, matched)| {
+        is_key_segment_boundary(name, start) && is_key_segment_boundary(name, start + matched.len())
+    })
+}
+
+/// `name` is validated as ASCII by [`is_credential_key`] before this is reached, so byte
+/// indexing cannot split a character here.
+fn is_key_segment_boundary(name: &str, offset: usize) -> bool {
+    if offset == 0 || offset == name.len() {
+        return true;
+    }
+
+    matches!(name.as_bytes().get(offset - 1), Some(b'_' | b'-'))
+        || matches!(name.as_bytes().get(offset), Some(b'_' | b'-'))
 }
 
 fn is_bare_key_with_operator(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    CREDENTIAL_KEYS
-        .iter()
-        .any(|key| lower == format!("{key}=") || lower == format!("{key}:"))
-}
+    let Some(key) = word.strip_suffix('=').or_else(|| word.strip_suffix(':')) else {
+        return false;
+    };
 
-fn is_bare_credential_key(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    CREDENTIAL_KEYS.iter().any(|key| lower == *key)
+    is_credential_key(key)
 }
 
 fn redact_adjacent_key_value(
@@ -243,10 +340,7 @@ fn redact_adjacent_key_value(
     let Segment::Word(value_word) = segments[value_index] else {
         return;
     };
-    if value_word.is_empty()
-        || value_word.starts_with(REDACTED_MARKER_PREFIX)
-        || value_word.eq_ignore_ascii_case("bearer")
-    {
+    if !is_replaceable_credential_value(value_word) {
         return;
     }
 
@@ -287,10 +381,7 @@ fn redact_separated_key_value(
     let Segment::Word(value_word) = segments[value_index] else {
         return;
     };
-    if value_word.is_empty()
-        || value_word.starts_with(REDACTED_MARKER_PREFIX)
-        || value_word.eq_ignore_ascii_case("bearer")
-    {
+    if !is_replaceable_credential_value(value_word) {
         return;
     }
 
@@ -388,12 +479,7 @@ fn find_inline_credential_key_operator(word: &str) -> Option<usize> {
                         .next()
                         .map_or(1, char::len_utf8)
             });
-        let candidate_key = &candidate_prefix[key_start..];
-
-        if CREDENTIAL_KEYS
-            .iter()
-            .any(|key| candidate_key.eq_ignore_ascii_case(key))
-        {
+        if is_credential_key(&candidate_prefix[key_start..]) {
             return Some(operator_offset);
         }
     }
@@ -412,7 +498,7 @@ fn redact_inline_key_value(word: &str) -> Option<String> {
 
     if redaction_value.is_empty()
         || redaction_value.starts_with(REDACTED_MARKER_PREFIX)
-        || redaction_value.eq_ignore_ascii_case("bearer")
+        || is_auth_scheme(redaction_value)
     {
         return None;
     }
@@ -482,6 +568,10 @@ pub fn bounded_detail(value: &str, max_chars: usize) -> String {
 /// regardless of surrounding context. Values are matched longest-first so a secret that is a
 /// substring of another configured secret cannot pre-empt the longer match. Empty values are
 /// never matched.
+///
+/// A withheld marker already present in `value` is copied through untouched rather than being
+/// rescanned. Without that, a secret which happens to be a substring of the marker text would
+/// match its own replacement and this function would not be idempotent.
 pub fn redact_exact_values(value: &str, secrets: &[String]) -> String {
     let mut ordered: Vec<&str> = secrets
         .iter()
@@ -490,13 +580,50 @@ pub fn redact_exact_values(value: &str, secrets: &[String]) -> String {
         .collect();
     ordered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
 
-    let mut redacted = value.to_owned();
-    for secret in ordered {
-        if redacted.contains(secret) {
-            redacted = redacted.replace(secret, &redacted_marker(secret));
+    let mut redacted = String::with_capacity(value.len());
+    let mut offset = 0;
+
+    while offset < value.len() {
+        let remainder = &value[offset..];
+
+        if let Some(marker_length) = redaction_marker_length(remainder) {
+            redacted.push_str(&remainder[..marker_length]);
+            offset += marker_length;
+            continue;
         }
+
+        if let Some(secret) = ordered
+            .iter()
+            .find(|secret| remainder.starts_with(**secret))
+        {
+            redacted.push_str(&redacted_marker(secret));
+            offset += secret.len();
+            continue;
+        }
+
+        let Some(character) = remainder.chars().next() else {
+            break;
+        };
+        redacted.push(character);
+        offset += character.len_utf8();
     }
+
     redacted
+}
+
+/// The byte length of a `[redacted: N characters]` marker starting at the front of `value`.
+fn redaction_marker_length(value: &str) -> Option<usize> {
+    const MARKER_SUFFIX: &str = " characters]";
+
+    let remainder = value
+        .strip_prefix(REDACTED_MARKER_PREFIX)?
+        .strip_prefix(' ')?;
+    let digits = remainder.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || !remainder[digits..].starts_with(MARKER_SUFFIX) {
+        return None;
+    }
+
+    Some(REDACTED_MARKER_PREFIX.len() + 1 + digits + MARKER_SUFFIX.len())
 }
 
 fn truncation_marker(head_chars: usize, tail_chars: usize, total_chars: usize) -> String {
@@ -531,6 +658,16 @@ mod tests {
         let token_equals_value = "SuperSecretToken123";
         let api_key_hyphenated_value = "AKIAHYPHENVALUE12345";
         let x_api_key_value = "xk-remote-body-value123";
+        let basic_credential = "YWxhZGRpbjpvcGVuc2VzYW1l";
+        let token_scheme_credential = "0123456789abcdef0123";
+        let negotiate_credential = "YIIZkwYGKwYBBQUCoIIZ";
+        let digest_credential = "nonce=deadbeefcafe1234";
+        let sigv4_credential = "Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request";
+        let short_bearer_token = "abc123def456ghi";
+        let github_token_value = "ghp_abcdefghijklmnop";
+        let aws_secret_value = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let database_password_value = "hunter2";
+        let namespaced_api_key_value = "abcd1234";
 
         vec![
             (
@@ -593,6 +730,119 @@ mod tests {
                     "secret: Bearer [redacted: {} characters] failed",
                     opaque_bearer_token.chars().count()
                 ),
+            ),
+            (
+                "Basic scheme survives while its credential is withheld",
+                format!("Authorization: Basic {basic_credential}"),
+                format!(
+                    "Authorization: Basic [redacted: {} characters]",
+                    basic_credential.chars().count()
+                ),
+            ),
+            (
+                "JSON-quoted authorization pair carrying a Basic credential",
+                format!(r#"{{"authorization":"Basic {basic_credential}"}}"#),
+                format!(
+                    r#"{{"authorization":"Basic [redacted: {} characters]"}}"#,
+                    basic_credential.chars().count()
+                ),
+            ),
+            (
+                "Token scheme survives while its credential is withheld",
+                format!("Authorization: Token {token_scheme_credential} rejected"),
+                format!(
+                    "Authorization: Token [redacted: {} characters] rejected",
+                    token_scheme_credential.chars().count()
+                ),
+            ),
+            (
+                "Negotiate scheme survives while its credential is withheld",
+                format!("Authorization: Negotiate {negotiate_credential} rejected"),
+                format!(
+                    "Authorization: Negotiate [redacted: {} characters] rejected",
+                    negotiate_credential.chars().count()
+                ),
+            ),
+            (
+                "Digest scheme survives while its credential is withheld",
+                format!("Authorization: Digest {digest_credential} rejected"),
+                format!(
+                    "Authorization: Digest [redacted: {} characters] rejected",
+                    digest_credential.chars().count()
+                ),
+            ),
+            (
+                "AWS SigV4 algorithm survives while its credential is withheld",
+                format!("Authorization: AWS4-HMAC-SHA256 {sigv4_credential} rejected"),
+                format!(
+                    "Authorization: AWS4-HMAC-SHA256 [redacted: {} characters] rejected",
+                    sigv4_credential.chars().count()
+                ),
+            ),
+            (
+                "Bearer token shorter than an opaque-value floor",
+                format!("Authorization: Bearer {short_bearer_token} rejected"),
+                format!(
+                    "Authorization: Bearer [redacted: {} characters] rejected",
+                    short_bearer_token.chars().count()
+                ),
+            ),
+            (
+                "namespaced GITHUB_TOKEN environment assignment",
+                format!("env GITHUB_TOKEN={github_token_value} exported"),
+                format!(
+                    "env GITHUB_TOKEN=[redacted: {} characters] exported",
+                    github_token_value.chars().count()
+                ),
+            ),
+            (
+                "namespaced AWS_SECRET_ACCESS_KEY environment assignment",
+                format!("env AWS_SECRET_ACCESS_KEY={aws_secret_value} exported"),
+                format!(
+                    "env AWS_SECRET_ACCESS_KEY=[redacted: {} characters] exported",
+                    aws_secret_value.chars().count()
+                ),
+            ),
+            (
+                "namespaced DATABASE_PASSWORD environment assignment",
+                format!("env DATABASE_PASSWORD={database_password_value} exported"),
+                format!(
+                    "env DATABASE_PASSWORD=[redacted: {} characters] exported",
+                    database_password_value.chars().count()
+                ),
+            ),
+            (
+                "namespaced MY_API_KEY environment assignment",
+                format!("env MY_API_KEY={namespaced_api_key_value} exported"),
+                format!(
+                    "env MY_API_KEY=[redacted: {} characters] exported",
+                    namespaced_api_key_value.chars().count()
+                ),
+            ),
+            (
+                "negative: NPM_TOKEN with no value survives",
+                "env NPM_TOKEN= exported".to_owned(),
+                "env NPM_TOKEN= exported".to_owned(),
+            ),
+            (
+                "negative: a benign word merely containing a credential key survives",
+                "tokenizer=simple passwordless=true secretary=alice".to_owned(),
+                "tokenizer=simple passwordless=true secretary=alice".to_owned(),
+            ),
+            (
+                "negative: a benign word after a credential key survives",
+                "authorization: denied by policy".to_owned(),
+                "authorization: denied by policy".to_owned(),
+            ),
+            (
+                "negative: a JSON boolean after a credential key survives",
+                r#"{"secret": true}"#.to_owned(),
+                r#"{"secret": true}"#.to_owned(),
+            ),
+            (
+                "negative: a benign word after a password key survives",
+                "password: incorrect".to_owned(),
+                "password: incorrect".to_owned(),
             ),
             (
                 "JWT",
@@ -706,9 +956,26 @@ mod tests {
         for (name, input, _expected) in credential_redaction_cases() {
             let once = redact_credential_values(&input);
             let twice = redact_credential_values(&once);
+            let three_times = redact_credential_values(&twice);
 
             assert_eq!(once, twice, "case: {name}");
+            assert_eq!(twice, three_times, "case: {name}");
         }
+    }
+
+    /// A configured secret that happens to be a substring of the withheld marker would match
+    /// its own replacement on any later pass, so the marker has to be copied through rather
+    /// than rescanned.
+    #[test]
+    fn redact_exact_values_is_idempotent_even_for_a_marker_shaped_secret() {
+        let secrets = vec!["characters".to_owned()];
+        let once = redact_exact_values("the value characters was rejected", &secrets);
+        let twice = redact_exact_values(&once, &secrets);
+        let three_times = redact_exact_values(&twice, &secrets);
+
+        assert_eq!(once, "the value [redacted: 10 characters] was rejected");
+        assert_eq!(once, twice);
+        assert_eq!(twice, three_times);
     }
 
     #[test]

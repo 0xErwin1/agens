@@ -1946,7 +1946,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
 }
 
 #[test]
-fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
+fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
  {
     let directory = temporary_directory("error-output");
     let credentials = write_credentials(&directory);
@@ -1956,25 +1956,19 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     ]);
     let mut provider = subscription_provider(&credentials, &server);
     assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    // The dispatcher is the containment point: it redacts before the content is recorded, so
+    // what reaches the replay is already sanitized and is carried through unchanged.
+    let sanitized_failure = "read: secret=[redacted: 13 characters]";
     assert!(
         run_with_events(
             &mut provider,
-            &[tool_result("call_1", "secret=must-not-leak", true)],
+            &[tool_result("call_1", sanitized_failure, true)],
             HeadlessTurnCancellation::new(),
         )
         .is_ok()
     );
     let requests = server.join();
-    assert_eq!(
-        requests[1].body["input"][3]["output"],
-        "Tool execution failed"
-    );
-    assert!(
-        !requests[1]
-            .body
-            .to_string()
-            .contains("secret=must-not-leak")
-    );
+    assert_eq!(requests[1].body["input"][3]["output"], sanitized_failure);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 
     let oversized_items = (0..=512)

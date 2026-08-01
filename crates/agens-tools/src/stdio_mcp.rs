@@ -24,6 +24,10 @@ use crate::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+/// Below this length an exact configured value is more likely to appear inside unrelated server
+/// output than to identify the credential it came from.
+const MIN_CONFIGURED_SECRET_CHARS: usize = 8;
+
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
@@ -77,7 +81,7 @@ pub struct McpStdioTransport {
 impl McpStdioTransport {
     pub fn spawn(config: McpStdioTransportConfig) -> Result<Self, McpTransportError> {
         config.validate()?;
-        let configured_secret_values: Vec<String> = config.environment.values().cloned().collect();
+        let configured_secret_values = configured_secret_values(&config.environment);
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -446,11 +450,35 @@ pub(crate) fn parse_response(
     ))
 }
 
-/// Withholds this server's own configured transport secrets from a tool call's `isError`
-/// text before the caller can pass it on as `HeadlessToolOutput`. `map_call_result` otherwise
-/// forwards the server's text verbatim, and a server can echo back exactly the values this
-/// process handed it in `[mcp.files.env]` — the only secrets this transport can know about
-/// without guessing at shape. Every other response variant is returned unchanged.
+/// The configured transport environment entries this transport treats as secrets.
+///
+/// A configured environment is mostly operational settings, not credentials: `example/config.toml`
+/// alone sets `LANG = "C"`. Since [`redact_exact_values`] replaces a match wherever it appears,
+/// with no surrounding context, treating every configured value as a secret rewrites unrelated
+/// output — every capital `C` in every result from that server. An entry qualifies only when its
+/// NAME is a credential key and its value is long enough that an exact match identifies the secret
+/// rather than colliding with ordinary text.
+fn configured_secret_values(environment: &BTreeMap<String, String>) -> Vec<String> {
+    environment
+        .iter()
+        .filter(|(name, value)| {
+            agens_core::redaction::is_credential_key(name)
+                && value.chars().count() >= MIN_CONFIGURED_SECRET_CHARS
+        })
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+/// Withholds this server's own configured transport secrets from a tool call's text before the
+/// caller can pass it on as `HeadlessToolOutput`. `map_call_result` otherwise forwards the
+/// server's text verbatim, and a server can echo back exactly the values this process handed it
+/// in `[mcp.files.env]` — the only secrets this transport can know about without guessing at
+/// shape.
+///
+/// Successful and `isError` results are treated alike: both reach the model and the persisted
+/// session, so a credential echoed into either is the same leak. Only [`configured_secret_values`]
+/// decides what counts as a secret, and text carrying none is returned unchanged. Every other
+/// response variant is returned unchanged.
 fn redact_configured_secrets(response: McpResponse, secrets: &[String]) -> McpResponse {
     if secrets.is_empty() {
         return response;
@@ -564,6 +592,120 @@ mod tests {
         let redacted = redact_configured_secrets(response.clone(), &[]);
 
         assert_eq!(redacted, response);
+    }
+
+    /// The values in `example/config.toml`'s own `[mcp.filesystem.env]` block, plus the other
+    /// short operational settings a server is routinely configured with. Treating these as
+    /// secrets turns every capital `C` — or every `1`, or every `UTC` — in a server's output
+    /// into a withheld marker.
+    #[test]
+    fn benign_configured_environment_values_are_never_collected_as_secrets() {
+        let environment = BTreeMap::from([
+            ("LANG".to_owned(), "C".to_owned()),
+            ("DEBUG".to_owned(), "1".to_owned()),
+            ("TZ".to_owned(), "UTC".to_owned()),
+            ("NODE_ENV".to_owned(), "production".to_owned()),
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ]);
+
+        assert_eq!(configured_secret_values(&environment), Vec::<String>::new());
+
+        let response = McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text(
+                "Cannot open Config.toml in production: 1 error".into(),
+            )],
+            is_error: true,
+        });
+
+        assert_eq!(
+            redact_configured_secrets(response.clone(), &configured_secret_values(&environment)),
+            response
+        );
+    }
+
+    /// A short configured credential is still not matched by exact replacement: a two- or
+    /// three-character value collides with unrelated output far more often than it identifies
+    /// the secret, and the marker would then claim a redaction that never happened.
+    #[test]
+    fn only_long_credential_keyed_environment_values_are_collected_as_secrets() {
+        let environment = BTreeMap::from([
+            ("GITHUB_TOKEN".to_owned(), "ghp_abcdefghijklmnop".to_owned()),
+            ("API_KEY".to_owned(), "abc".to_owned()),
+            ("TOKENIZER".to_owned(), "a-long-benign-setting".to_owned()),
+        ]);
+
+        assert_eq!(
+            configured_secret_values(&environment),
+            vec!["ghp_abcdefghijklmnop".to_owned()]
+        );
+    }
+
+    /// The whole point of collecting the transport's own environment: a server that echoes a
+    /// configured credential back in its failure text must not hand it to the model.
+    #[test]
+    fn a_configured_credential_value_never_survives_a_failed_tool_call() {
+        let environment = BTreeMap::from([(
+            "MCP_API_KEY".to_owned(),
+            "SENTINEL_CONFIGURED_TRANSPORT_SECRET".to_owned(),
+        )]);
+        let response = McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text(
+                "upstream rejected SENTINEL_CONFIGURED_TRANSPORT_SECRET".into(),
+            )],
+            is_error: true,
+        });
+
+        let redacted = redact_configured_secrets(response, &configured_secret_values(&environment));
+
+        let McpResponse::ToolCalled(result) = redacted else {
+            panic!("expected a ToolCalled response");
+        };
+        let McpContentBlock::Text(text) = &result.content[0];
+        assert_eq!(text, "upstream rejected [redacted: 36 characters]");
+    }
+
+    /// Content that carries no configured secret is never rewritten, so a server's answer
+    /// survives byte for byte.
+    #[test]
+    fn tool_call_content_without_a_configured_secret_is_returned_unchanged() {
+        let secrets = vec!["CONFIGURED_TRANSPORT_SECRET".to_owned()];
+
+        for is_error in [false, true] {
+            let response = McpResponse::ToolCalled(McpCallResult {
+                content: vec![McpContentBlock::Text("the answer is 42".into())],
+                is_error,
+            });
+
+            assert_eq!(
+                redact_configured_secrets(response.clone(), &secrets),
+                response
+            );
+        }
+    }
+
+    /// A server echoes a configured credential into a SUCCESSFUL result exactly as it does into
+    /// a failure, and both reach the model and the persisted session, so both are withheld.
+    #[test]
+    fn a_configured_credential_value_never_survives_a_successful_tool_call() {
+        let environment = BTreeMap::from([(
+            "MCP_API_KEY".to_owned(),
+            "SENTINEL_CONFIGURED_TRANSPORT_SECRET".to_owned(),
+        )]);
+        let response = McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text(
+                "resolved SENTINEL_CONFIGURED_TRANSPORT_SECRET".into(),
+            )],
+            is_error: false,
+        });
+
+        let redacted = redact_configured_secrets(response, &configured_secret_values(&environment));
+
+        let McpResponse::ToolCalled(result) = redacted else {
+            panic!("expected a ToolCalled response");
+        };
+        assert!(!result.is_error);
+        let McpContentBlock::Text(text) = &result.content[0];
+        assert_eq!(text, "resolved [redacted: 36 characters]");
     }
 
     #[test]

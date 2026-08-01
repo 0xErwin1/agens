@@ -14,8 +14,8 @@ mod moonshot;
 pub use moonshot::MoonshotProvider;
 
 use agens_core::{
-    Error, HeadlessTaskTerminal, HeadlessTurnCancellation, HeadlessTurnPortError, Message,
-    MessagePart, RequestConfig, Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
+    Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -1953,86 +1953,17 @@ impl OpenAiResponsesProvider {
     }
 }
 
-fn model_visible_tool_output(content: &str, is_error: bool) -> String {
-    if !is_error {
-        return bounded_tool_output(content);
-    }
-
-    let safe_terminal = [
-        HeadlessTaskTerminal::Cancelled,
-        HeadlessTaskTerminal::TimedOut,
-        HeadlessTaskTerminal::AgentUnavailable,
-        HeadlessTaskTerminal::ModelUnavailable,
-        HeadlessTaskTerminal::SkillUnavailable,
-        HeadlessTaskTerminal::IterationLimit,
-        HeadlessTaskTerminal::InputLimit,
-        HeadlessTaskTerminal::OutputLimit,
-        HeadlessTaskTerminal::ConcurrencyLimit,
-        HeadlessTaskTerminal::ProviderFailure,
-        HeadlessTaskTerminal::ChildFailure,
-    ]
-    .into_iter()
-    .any(|terminal| {
-        content == terminal.message()
-            || content
-                .strip_prefix(terminal.message())
-                .is_some_and(is_safe_terminal_detail)
-    });
-    if safe_terminal {
-        bounded_tool_output(content)
-    } else {
-        "Tool execution failed".to_owned()
-    }
-}
-
-/// Whether the detail trailing a terminal message is one the model may read.
+/// The tool-result content a request may carry back to the model.
 ///
-/// A terminal message is a closed string, and so is everything allowed to
-/// follow it: a diagnostic reference, a provider failure cause, or a rejected
-/// skill. Anything else is host detail that has not been proven safe, so the
-/// caller replaces the whole output rather than trusting the suffix.
-fn is_safe_terminal_detail(suffix: &str) -> bool {
-    is_safe_diagnostic_reference_suffix(suffix)
-        || is_safe_provider_cause_suffix(suffix)
-        || is_safe_skill_rejection_suffix(suffix)
-}
-
-fn is_safe_provider_cause_suffix(suffix: &str) -> bool {
-    bracketed_detail(suffix, " [cause: ").is_some_and(|cause| {
-        agens_core::TaskProviderFailure::ALL
-            .iter()
-            .any(|failure| failure.label() == cause)
-    })
-}
-
-fn is_safe_skill_rejection_suffix(suffix: &str) -> bool {
-    let Some(detail) = bracketed_detail(suffix, " [skill: ") else {
-        return false;
-    };
-    let Some((skill, reason)) = detail.split_once("; ") else {
-        return false;
-    };
-
-    agens_core::is_catalog_name(skill)
-        && agens_core::TaskSkillRejection::ALL
-            .iter()
-            .any(|rejection| rejection.label() == reason)
-}
-
-fn bracketed_detail<'a>(suffix: &'a str, prefix: &str) -> Option<&'a str> {
-    suffix.strip_prefix(prefix)?.strip_suffix(']')
-}
-
-fn is_safe_diagnostic_reference_suffix(suffix: &str) -> bool {
-    suffix
-        .strip_prefix(" [ref: ")
-        .and_then(|suffix| suffix.strip_suffix(']'))
-        .is_some_and(|reference| {
-            reference.len() == 8
-                && reference
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        })
+/// Containment happens once, in the dispatcher (`agens-dispatch`), which applies credential
+/// redaction and host-path withholding to a failure before it is handed on or persisted. This
+/// layer therefore forwards what it was given, bounded against runaway size. Collapsing a
+/// failure to a generic string here would drop the failing command's own output — the detail
+/// the model needs in order to recover — and would make the same event look different to the
+/// model depending on the dialect and on whether the session had been resumed, since the
+/// resumed-history encoder replays the stored content verbatim.
+fn model_visible_tool_output(content: &str) -> String {
+    bounded_tool_output(content)
 }
 
 fn continuation_payload(
@@ -2050,7 +1981,7 @@ fn continuation_payload(
         let TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id,
             content,
-            is_error,
+            ..
         }) = event
         else {
             continue;
@@ -2064,7 +1995,7 @@ fn continuation_payload(
             return Err(());
         }
 
-        let output = model_visible_tool_output(content, *is_error);
+        let output = model_visible_tool_output(content);
         outputs.insert(tool_call_id, output);
     }
 
@@ -2112,7 +2043,7 @@ fn correlated_tool_outputs(
         let TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id,
             content,
-            is_error,
+            ..
         }) = event
         else {
             continue;
@@ -2126,7 +2057,7 @@ fn correlated_tool_outputs(
             return Err(());
         }
 
-        let output = model_visible_tool_output(content, *is_error);
+        let output = model_visible_tool_output(content);
         outputs.insert(tool_call_id, output);
     }
 
@@ -3690,41 +3621,24 @@ mod tests {
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
+    /// Every failure content that reaches this layer has already passed through the dispatcher,
+    /// which is the designated containment point: it applies credential redaction and host-path
+    /// withholding before the content is ever stored. Collapsing it a second time here would
+    /// discard the failing command's own output — the detail the model needs to recover — and
+    /// would disagree with the resumed-history encoder, which replays the same content verbatim.
     #[test]
-    fn task_terminal_errors_remain_actionable_while_other_tool_failures_stay_redacted() {
-        assert_eq!(
-            model_visible_tool_output("task: requested skill is unavailable", true),
-            "task: requested skill is unavailable"
-        );
-        assert_eq!(
-            model_visible_tool_output("task: requested model is unavailable [ref: 84ca0a64]", true,),
-            "task: requested model is unavailable [ref: 84ca0a64]"
-        );
-        assert_eq!(
-            model_visible_tool_output("bash: SENTINEL_SECRET", true),
-            "Tool execution failed"
-        );
-    }
-
-    #[test]
-    fn terminal_detail_reaches_the_model_only_from_its_closed_sets() {
+    fn model_visible_tool_output_forwards_the_content_the_dispatcher_sanitized() {
         for content in [
+            "bash: cargo test\n[stderr]\ntest tests::works ... FAILED\n[exit status: 101]",
+            "read: [path]: No such file or directory",
+            "api_key=[redacted: 19 characters] was rejected",
+            "task: requested skill is unavailable",
+            "task: requested model is unavailable [ref: 84ca0a64]",
             "task: provider failure [cause: rate limited]",
             "task: requested skill is unavailable [skill: sdd-explore; not declared by the agent]",
+            "permission denied",
         ] {
-            assert_eq!(model_visible_tool_output(content, true), content);
-        }
-
-        for forged in [
-            "task: provider failure [cause: /etc/passwd]",
-            "task: requested skill is unavailable [skill: sdd-explore; /home/user/notes.md]",
-            "task: requested skill is unavailable [skill: /home/user; not in the skill catalog]",
-        ] {
-            assert_eq!(
-                model_visible_tool_output(forged, true),
-                "Tool execution failed",
-                "{forged} must not reach the model"
-            );
+            assert_eq!(model_visible_tool_output(content), content);
         }
     }
 

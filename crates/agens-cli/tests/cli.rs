@@ -2939,7 +2939,7 @@ fn production_binary_static_glob_denies_native_list_and_search_without_execution
             ScriptedOpenAiResponse {
                 required_body_fragments: vec![
                     call_id,
-                    "\"output\":\"Tool execution failed\"".to_owned(),
+                    "\"output\":\"permission denied\"".to_owned(),
                 ],
                 response: text_response("static permission denied"),
             },
@@ -3015,7 +3015,7 @@ fn production_binary_denies_unrelated_static_list_and_search_targets_and_continu
             ScriptedOpenAiResponse {
                 required_body_fragments: vec![
                     "\"call_id\":\"call_ask\"".to_owned(),
-                    "\"output\":\"Tool execution failed\"".to_owned(),
+                    "\"output\":\"permission denied\"".to_owned(),
                 ],
                 response: text_response("static ask denial handled"),
             },
@@ -3090,7 +3090,7 @@ fn production_binary_denies_native_read_without_side_effect_and_continues_safely
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_denied\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "\"output\":\"permission denied\"".to_owned(),
             ],
             response: text_response("denial handled"),
         },
@@ -3157,7 +3157,7 @@ fn production_binary_denies_unresolved_native_call_without_dispatching_and_conti
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_ask\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "\"output\":\"permission denied\"".to_owned(),
                 "!SENTINEL_UNRESOLVED_ASK".to_owned(),
             ],
             response: text_response("native ask denial handled"),
@@ -3239,7 +3239,7 @@ fn production_binary_denies_native_write_in_chat_mode_even_with_temporary_bypass
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_chat_write\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "\"output\":\"permission denied\"".to_owned(),
             ],
             response: text_response("chat mode denial handled"),
         },
@@ -3854,7 +3854,7 @@ fn production_binary_persists_model_visible_mcp_arguments_without_transport_secr
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_mcp_error\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "\"output\":\"[redacted: 24 characters]\"".to_owned(),
                 "!SENTINEL_MCP_ARGUMENT".to_owned(),
                 "!SENTINEL_MCP_REMOTE_BODY".to_owned(),
             ],
@@ -3940,18 +3940,13 @@ fn production_binary_persists_model_visible_native_arguments_and_tool_failure_ou
             ),
         },
         ScriptedOpenAiResponse {
-            // The immediate continuation still sends the provider the generic string:
-            // `model_visible_tool_output` (`agens-providers/src/lib.rs`) is a separate,
-            // unmodified containment layer that collapses any non-task-terminal tool
-            // failure before it goes back over the wire this same turn (see
-            // `task_terminal_errors_remain_actionable_while_other_tool_failures_stay_redacted`).
-            // AGN-102 only changes what the dispatcher hands to `HeadlessToolOutput` and
-            // what gets persisted, asserted below via the resumable session.
+            // The failing command's own output is what the model needs in order to recover, so
+            // the immediate continuation carries the text the dispatcher sanitized. The tool
+            // ARGUMENTS are not resent: this dialect refers back to them by response id.
             required_body_fragments: vec![
                 "\"call_id\":\"call_native_secret\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "SENTINEL_NATIVE_OUTPUT".to_owned(),
                 "!SENTINEL_NATIVE_ARGUMENT".to_owned(),
-                "!SENTINEL_NATIVE_OUTPUT".to_owned(),
             ],
             response: text_response("native failure handled"),
         },
@@ -4256,7 +4251,7 @@ fn production_binary_static_deny_blocks_mcp_write_without_a_child_call() {
         ScriptedOpenAiResponse {
             required_body_fragments: vec![
                 "\"call_id\":\"call_mcp_deny\"".to_owned(),
-                "\"output\":\"Tool execution failed\"".to_owned(),
+                "\"output\":\"permission denied\"".to_owned(),
             ],
             response: text_response("MCP denial handled"),
         },
@@ -4388,7 +4383,7 @@ fn production_binary_enforces_mcp_permission_matrix_and_executes_allowed_calls_o
                         if executes {
                             "tool succeeded".to_owned()
                         } else {
-                            "\"output\":\"Tool execution failed\"".to_owned()
+                            "\"output\":\"permission denied\"".to_owned()
                         },
                     ],
                     response: text_response("MCP permission handled"),
