@@ -977,6 +977,43 @@ fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
     );
 }
 
+/// Parent turn events keep arriving while the reader watches a subagent, so
+/// "which transcript does this call belong to" and "which transcript am I
+/// looking at" are different questions. Answering the first with the second
+/// filed the parent's presentation state under the child, and left the parent
+/// call with nothing recorded at all — leaning the render on a fallback that is
+/// meant to be a safety net.
+#[test]
+fn a_parent_call_settling_under_a_child_transcript_records_against_the_parent() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+    start_child(&mut tui, 7);
+    tui.select_transcript(TranscriptId::Subagent(7));
+
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "parent-read".into(),
+        name: "native::read".into(),
+        input: "parent.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "parent-read".into(),
+        content: "PARENT_BODY".into(),
+        is_error: false,
+    }));
+
+    assert!(
+        !tui.view().tool_display_modes.contains_key("parent-read"),
+        "the child's record has no business holding a parent call: {:?}",
+        tui.view().tool_display_modes
+    );
+
+    tui.select_transcript(TranscriptId::Main);
+    assert_eq!(
+        tui.view().tool_display_modes.get("parent-read"),
+        Some(&DisplayMode::Collapsed)
+    );
+}
+
 /// The level is what the footer names, so it has to be true before anything has
 /// settled — and a call that settles afterwards has to join its neighbours
 /// rather than arrive hidden among expanded ones.

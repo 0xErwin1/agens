@@ -4224,6 +4224,18 @@ where
             .expect("active transcript always exists")
     }
 
+    /// The record owning `self.conversation`, whichever transcript is on screen.
+    ///
+    /// Parent turn events arrive while the reader may be watching a subagent, so
+    /// the transcript they belong to and the transcript being looked at are
+    /// different questions. Presentation state for a parent call belongs to the
+    /// former.
+    fn main_record_mut(&mut self) -> &mut TranscriptRecord {
+        self.transcripts
+            .get_mut(&TranscriptId::Main)
+            .expect("the main transcript always exists")
+    }
+
     fn show_transcript_dialog(&mut self) {
         if self.child_transcript_order.is_empty() {
             return;
@@ -4625,7 +4637,7 @@ where
             .get_or_insert_with(|| Conversation::new(String::new()))
             .apply(event)?;
         if let Some(call_id) = completed_tool_call {
-            let record = self.active_record_mut();
+            let record = self.main_record_mut();
             let detail = record.tool_detail;
             record.tool_display_modes.insert(call_id, detail);
         }
