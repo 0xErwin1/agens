@@ -977,6 +977,102 @@ fn the_tool_detail_cycle_walks_both_ways_through_its_three_levels() {
     );
 }
 
+/// AGN-109 collapses every settled call, so the detail it hides has to be
+/// reachable one block at a time — a transcript-wide cycle answers "how much of
+/// everything", not "what is in this one".
+#[test]
+fn block_focus_walks_settled_calls_and_opens_only_the_one_it_stands_on() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 24,
+    });
+    tui.begin_submission("request");
+    for id in ["read-1", "read-2", "read-3"] {
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: id.into(),
+            name: "native::read".into(),
+            input: format!("{id}.log"),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: id.into(),
+            content: format!("body of {id}"),
+            is_error: false,
+        }));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    tui.handle(Event::Key(Key::Escape));
+    assert_eq!(tui.view().focus, TranscriptFocus::Viewport);
+
+    // Focus enters at the newest block, which is the one a reader just watched
+    // happen.
+    tui.handle(Event::Key(Key::Char('k')));
+    assert_eq!(tui.view().focused_call, Some("read-3"));
+    tui.handle(Event::Key(Key::Char('k')));
+    assert_eq!(tui.view().focused_call, Some("read-2"));
+    tui.handle(Event::Key(Key::Char('j')));
+    assert_eq!(tui.view().focused_call, Some("read-3"));
+
+    tui.handle(Event::Key(Key::Char('k')));
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-2"),
+        Some(&DisplayMode::Truncated),
+        "the focused block opens"
+    );
+    assert!(
+        is_collapsed(tui.view().tool_display_modes, "read-1"),
+        "and its neighbours stay as they were"
+    );
+    assert!(is_collapsed(tui.view().tool_display_modes, "read-3"));
+    assert_eq!(
+        tui.view().tool_detail,
+        DisplayMode::Collapsed,
+        "opening one block is not a statement about all of them"
+    );
+}
+
+/// Detail that arrives by pushing the transcript around costs the reader the
+/// place they were reading. Opening a block must leave every row above it where
+/// it was.
+#[test]
+fn opening_a_focused_block_does_not_move_the_rows_above_it() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 16,
+    });
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "anchor-line\n".repeat(40),
+    )));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "read-1".into(),
+        name: "native::read".into(),
+        input: "big.log".into(),
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "read-1".into(),
+        content: "body\n".repeat(200),
+        is_error: false,
+    }));
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('k')));
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+    let anchored = tui.view().scroll_offset;
+    assert!(!tui.view().following_bottom, "navigation detaches the view");
+
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().scroll_offset,
+        anchored,
+        "the rows above the block do not move when it opens"
+    );
+}
+
 /// Parent turn events keep arriving while the reader watches a subagent, so
 /// "which transcript does this call belong to" and "which transcript am I
 /// looking at" are different questions. Answering the first with the second
@@ -3065,9 +3161,11 @@ fn viewport_owner_keys_remain_g_m_h_l_with_ctrl_timeline_nav() {
     tui.handle(Event::Key(Key::Char('m')));
     assert_eq!(tui.view().active_transcript, TranscriptId::Main);
 
-    // Ctrl timeline keys must not steal plain owner navigation characters.
-    tui.handle(Event::Key(Key::Char('j')));
-    assert_eq!(tui.input(), "j");
+    // Ctrl timeline keys must not steal plain characters the viewport does not
+    // claim. `j`, `k` and `o` are claimed — they walk and open blocks — so the
+    // check uses a letter the viewport leaves alone.
+    tui.handle(Event::Key(Key::Char('z')));
+    assert_eq!(tui.input(), "z");
 }
 
 fn permission_confirm_entries(request_id: u64) -> Vec<DialogEntry> {
