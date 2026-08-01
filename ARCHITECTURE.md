@@ -10,6 +10,7 @@ crates/agens-cli        argument parsing and composition; calls into the crates 
   -> agens-bus          a bounded, ordered, cancellable publish channel
   -> agens-error        the shared error and exit-status contract
   -> agens-callcount    how often a cold path ran, for tests to assert on
+  -> agens-perf         hierarchical timing traces, and the diff between two runs
   -> agens-config       TOML configuration and credential-path compatibility
   -> agens-models       the bundled model catalog and selection
   -> agens-bootstrap    resolving a run's configuration from a host environment
@@ -39,6 +40,7 @@ by which of these sentences it fits, not by which directory is convenient.
 | `agens-core` | The domain vocabulary every other crate speaks: messages, turns and their state machine, cancellation, session metadata, tool-result facts, the subagent outcome taxonomy. | Anything that performs I/O, and any dependency on another workspace crate. |
 | `agens-bus` | A bounded, ordered, cancellable publish channel, generic over what travels on it. Communication belongs to no layer: the runtime publishes, and a terminal, a daemon or a test consumes. | Knowing what an event means, or who is at either end. |
 | `agens-callcount` | Thread-local counters for cold paths a test needs to count: runtime construction, session resume. Not behind `cfg(test)`, because that flag never reaches a dependency and the instrumentation would silently become a no-op across a crate boundary. | Anything on a hot path. |
+| `agens-perf` | The hot-path counterpart: hierarchical spans with timings, written to a trace, and the diff that says what changed between two of them. Compiles to nothing unless its feature is on, for the same reason `agens-callcount` is not behind `cfg(test)`. Knows nothing about any crate that instruments it. | Deciding what is too slow. It reports; a person judges. |
 | `agens-error` | The error and exit-status contract shared by every layer that can fail. | Deciding how an error is displayed. |
 | `agens-config` | Reading hand-authored TOML and resolving credential paths. | Deciding what the resolved values mean for a run. |
 | `agens-models` | The bundled model catalog, its checksum, and a validated model selection. | Talking to a provider. |
@@ -65,9 +67,9 @@ by which of these sentences it fits, not by which directory is convenient.
 - `agens-core` owns domain contracts and does not depend on adapter crates.
 - `agens-config` is a leaf crate for configuration and credential compatibility.
 - Provider, tool, and store crates may depend on `agens-core` and `agens-config` where required.
-- `agens-tui` depends on `agens-core` only and remains a surface adapter.
+- `agens-tui` depends on `agens-bus`, `agens-core` and `agens-perf`, and remains a surface adapter.
 - `agens-server` depends on `agens-core` only. It owns the daemon: the single-instance runtime today, and the coordinator, its state machines, the scheduler and the timers as they land. None of that belongs to a command surface, so `serve` stays a thin adapter over this crate.
-- `agens-cli` is the composition root and the sole binary crate.
+- `agens-cli` is the composition root and the sole shipped binary crate. `agens-tui` also carries `agens-perf-audit`, a development binary that only exists behind a non-default feature.
 
 ## Surfaces and logic
 
