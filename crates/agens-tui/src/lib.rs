@@ -1525,12 +1525,15 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     let composer_color = widgets::RolePalette::muted();
     if layout.composer.height > 0 && state.active_transcript == TranscriptId::Main {
         let (cursor_line, cursor_column) = cursor_position(state.input, state.input_cursor);
-        let inner_width = usize::from(layout.composer.width.saturating_sub(2).max(1));
+        // Two borders plus the column of padding that puts typed text in the
+        // same column as the prose above it.
+        let inner_width = usize::from(layout.composer.width.saturating_sub(3).max(1));
         let inner_height = usize::from(layout.composer.height.saturating_sub(2).max(1));
         let vertical_scroll = cursor_line.saturating_sub(inner_height.saturating_sub(1));
         let horizontal_scroll = cursor_column.saturating_sub(inner_width.saturating_sub(1));
         let mut composer = Block::default()
             .borders(Borders::ALL)
+            .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
         if let Some(metrics) = border_metrics(&state, layout.composer) {
             composer = composer.title_bottom(metrics);
@@ -1558,7 +1561,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             let cursor_x = layout.composer.x.saturating_add(saturating_u16(
                 cursor_column
                     .saturating_sub(horizontal_scroll)
-                    .saturating_add(1),
+                    .saturating_add(2),
             ));
             frame.set_cursor_position((cursor_x, cursor_y));
         }
