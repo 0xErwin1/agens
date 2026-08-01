@@ -438,6 +438,41 @@ pub struct OpenAiFunctionTool {
     parameters: Value,
 }
 
+/// A tool name the Responses API will accept, derived from `name`.
+///
+/// The API constrains function names to `^[a-zA-Z0-9_-]+$` and rejects the
+/// WHOLE request when a replayed history item breaks it — one bad name kills
+/// the turn, not just the call. History outlives the code that wrote it, so
+/// this is enforced at the wire boundary rather than trusted upstream: a
+/// session recorded before a naming fix must still be replayable.
+pub fn wire_tool_name(name: &str) -> String {
+    // `native::` is the dispatcher's own namespace, never a wire name. A
+    // history item carrying it is reporting the same call the model made as
+    // `read` or `task`, so the prefix is dropped rather than mangled.
+    let name = name.strip_prefix("native::").unwrap_or(name);
+    if name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return name.to_owned();
+    }
+
+    let mut wire = String::with_capacity(name.len());
+    let mut pending_separator = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            if pending_separator && !wire.is_empty() {
+                wire.push('_');
+            }
+            pending_separator = false;
+            wire.push(character);
+        } else {
+            pending_separator = true;
+        }
+    }
+    wire
+}
+
 impl OpenAiFunctionTool {
     pub fn new(
         name: impl Into<String>,
@@ -2601,7 +2636,7 @@ pub fn encode_openai_response_request_with_messages(
                             input.push(serde_json::json!({
                                 "type": "function_call",
                                 "call_id": id,
-                                "name": name,
+                                "name": wire_tool_name(name),
                                 "arguments": arguments,
                             }));
                         }
@@ -3439,6 +3474,19 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// The Responses API rejects the whole request over one bad name, so a
+    /// history item recorded by older code must not be able to poison a resumed
+    /// session.
+    #[test]
+    fn a_history_tool_name_is_made_acceptable_before_it_reaches_the_wire() {
+        assert_eq!(wire_tool_name("task"), "task");
+        assert_eq!(wire_tool_name("mcp_server_tool-1"), "mcp_server_tool-1");
+        assert_eq!(wire_tool_name("native::task"), "task");
+        assert_eq!(wire_tool_name("native::git_read"), "git_read");
+        assert_eq!(wire_tool_name("atlas.search"), "atlas_search");
+        assert_eq!(wire_tool_name("weird name/here"), "weird_name_here");
+    }
+
     #[test]
     fn provider_failure_detail_records_and_takes_once() {
         let detail = ProviderFailureDetail::new();
@@ -3680,7 +3728,9 @@ mod tests {
                 serde_json::json!({
                     "type": "function_call",
                     "call_id": "call-1",
-                    "name": "native::read",
+                    // Recorded as `native::read`; the wire only ever sees a name
+                    // the provider's own pattern accepts.
+                    "name": "read",
                     "arguments": r#"{"path":"notes.md"}"#,
                 }),
                 serde_json::json!({

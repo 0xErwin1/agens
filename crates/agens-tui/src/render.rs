@@ -1257,11 +1257,18 @@ fn subagent_card_block(
     let elapsed = card
         .started_at
         .map(|started| card.terminal_at.unwrap_or(now).saturating_sub(started));
+    let mut meta = format!("{status} · {presentation}{}", duration_label(elapsed));
+    // What the delegation actually runs on. A subagent routinely differs from
+    // its parent in model and effort, and that difference explains both its
+    // speed and its answers.
+    if let Some(model) = card.model.as_deref() {
+        meta.push_str(&format!(" · {model}"));
+    }
+    if let Some(effort) = card.effort.as_deref() {
+        meta.push_str(&format!(" · {effort}"));
+    }
     rows.push(BlockLine::new(Line::from(Span::styled(
-        bounded_single_line(
-            &format!("{status} · {presentation}{}", duration_label(elapsed)),
-            content_width,
-        ),
+        bounded_single_line(&meta, content_width),
         Style::default().fg(RolePalette::muted()),
     ))));
     rows.extend(subagent_failure_row(card, content_width));

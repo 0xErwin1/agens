@@ -309,11 +309,13 @@ fn p1c1_p1b_authorized_runner_persists_one_completed_subagent_turn() {
                 agent: "reviewer".into(),
                 event: TuiExecutionEvent::ForegroundStarted { id: 1 },
             },
-            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
                 1,
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
+                Some("gpt-4.1"),
+                None,
             )),
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::reasoning(1, "inspect")),
             TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::text(1, "partial")),
@@ -583,11 +585,13 @@ fn production_runner_error_publication_orders_sanitized_typed_failure_before_ter
                 agent: "reviewer".into(),
                 event: TuiExecutionEvent::ForegroundStarted { id: 1 },
             },
-            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+            TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
                 1,
                 "reviewer",
                 "review task",
                 agens_core::TuiExecutionState::ForegroundRunning,
+                Some("gpt-4.1"),
+                None,
             )),
         ];
         if let Some(kind) = expected_kind {

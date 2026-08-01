@@ -353,11 +353,13 @@ fn u15_c1c_backgrounded_success_skips_the_parent_provider_and_history_path() {
     );
     assert_eq!(
         next_event(std::time::Duration::from_secs(1)),
-        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started(
+        TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent::started_on(
             1,
             "reviewer",
             "review task",
             agens_tui::TuiExecutionState::ForegroundRunning,
+            Some("gpt-4.1"),
+            None,
         ))
     );
     assert!(controls.transition_to_background(1));

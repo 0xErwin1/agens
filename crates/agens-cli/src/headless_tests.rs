@@ -772,7 +772,9 @@ fn production_resumed_headless_turn_replays_typed_history_and_appends_to_the_sam
         serde_json::json!([
             {"role": "user", "content": [{"type": "input_text", "text": "first input"}]},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first reasoning"}]},
-            {"type": "function_call", "call_id": "call-history", "name": "native::read", "arguments": "{\"path\":\"notes.md\"}"},
+            // Recorded history keeps the dispatcher's name; the wire never sees
+            // it, because the provider rejects the whole request over it.
+            {"type": "function_call", "call_id": "call-history", "name": "read", "arguments": "{\"path\":\"notes.md\"}"},
             {"role": "assistant", "content": [{"type": "output_text", "text": "calling the tool"}]},
             {"type": "function_call_output", "call_id": "call-history", "output": "file contents"},
             {"role": "system", "content": [{"type": "input_text", "text": "Agent capabilities expanded: primary -> reviewer."}]},

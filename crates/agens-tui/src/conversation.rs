@@ -76,6 +76,9 @@ pub struct SubagentCard {
     pub agent: String,
     pub task_summary: String,
     pub presentation: TuiExecutionState,
+    /// What the subagent runs on, when the runtime reported it.
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_uses: usize,
     pub activities: Vec<String>,
@@ -399,12 +402,16 @@ impl Conversation {
                 agent,
                 task_summary,
                 presentation,
+                model,
+                effort,
             } if self.subagent_cards.iter().all(|card| card.id != event.id) => {
                 self.subagent_cards.push(SubagentCard {
                     id: event.id,
                     agent,
                     task_summary,
                     presentation,
+                    model,
+                    effort,
                     tool_calls: Vec::new(),
                     tool_uses: 0,
                     activities: Vec::new(),
@@ -554,6 +561,10 @@ impl Conversation {
             agent,
             task_summary,
             presentation: TuiExecutionState::CompletedRecent,
+            // A restored card carries only what history recorded, and the
+            // model a finished subagent ran on was never persisted.
+            model: None,
+            effort: None,
             tool_calls: Vec::new(),
             tool_uses,
             activities: Vec::new(),

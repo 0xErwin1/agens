@@ -2877,6 +2877,11 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         conversation_is_authoritative,
     )));
     if state.running {
+        // The status row reports the turn, it is not part of it: without a
+        // blank row it reads as another line of whatever the agent just said.
+        if transcript.last().is_some_and(|line| line.width() > 0) {
+            transcript.push(render::unaccented_row(Line::default()));
+        }
         let label = state.turn_activity.status_label();
         transcript.push(render::unaccented_row(render::turn_status_line(
             render::TurnStatus {
@@ -3543,6 +3548,23 @@ where
                 .then_with(|| right.id.cmp(&left.id))
         });
         executions
+    }
+
+    /// Whether anything is still moving and therefore owed a repaint.
+    ///
+    /// The parent turn is not the only live thing on screen: a background
+    /// subagent keeps running after its turn ends, and its card reports an
+    /// elapsed time. Tying the frame heartbeat to the parent alone froze that
+    /// clock until the next keystroke, so the surface looked hung and then
+    /// jumped when the runtime continued on its own.
+    pub fn has_live_work(&self) -> bool {
+        self.running
+            || self.executions.iter().any(|execution| {
+                matches!(
+                    execution.state,
+                    TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning
+                )
+            })
     }
 
     pub fn tick(&mut self, now: Duration) {
@@ -5828,6 +5850,13 @@ where
             .get(&self.active_transcript)
             .expect("active transcript always exists");
         if let Some(text) = record.selection_text.clone() {
+            // Copying ends the selection. It is also what keeps the exit
+            // reachable: with the selection gone, the next Ctrl+C arms the
+            // quit it always did.
+            let record = self.active_record_mut();
+            record.selection = None;
+            record.selection_text = None;
+            record.selection_too_large = false;
             return Action::CopySelection(text);
         }
         if record.selection_too_large {
@@ -5837,6 +5866,20 @@ where
     }
 
     fn handle_control_c(&mut self) -> Action {
+        // Mouse capture takes the terminal's own selection away, so the only
+        // copy the user has is ours. Many terminals also swallow Ctrl+Shift+C
+        // for themselves, which left a made selection with no way to reach the
+        // clipboard: with something selected, Ctrl+C copies rather than arms
+        // the exit it would otherwise arm.
+        if self
+            .transcripts
+            .get(&self.active_transcript)
+            .and_then(|record| record.selection_text.as_ref())
+            .is_some()
+        {
+            return self.handle_copy_selection();
+        }
+
         if self.quit_is_armed() {
             self.quit_armed_until = None;
             if self.running || self.has_active_execution() {
@@ -6724,6 +6767,20 @@ fn auto_turn_subject(finished: usize) -> String {
 /// It is not a user message and must never read like one: the completion notices themselves
 /// arrive as bounded coordination messages, so this only states who scheduled the turn and where
 /// the recorded outcome lives.
+/// Opening marker of a prompt the runtime wrote for itself.
+pub const RUNTIME_SCHEDULED_PROMPT_MARKER: &str = "[coordination source=runtime";
+
+/// Whether `prompt` was scheduled by the runtime rather than typed by the user.
+///
+/// A failed turn's prompt is offered back for retry, which is only ever right
+/// for something the user wrote. Handing back a coordination prompt puts text
+/// nobody typed in the composer and invites retrying a turn the runtime owns.
+pub fn is_runtime_scheduled_prompt(prompt: &str) -> bool {
+    prompt
+        .trim_start()
+        .starts_with(RUNTIME_SCHEDULED_PROMPT_MARKER)
+}
+
 fn auto_turn_prompt(finished: usize) -> String {
     format!(
         "[coordination source=runtime untrusted=false]\n{} finished. The completion notices \
@@ -7163,22 +7220,21 @@ struct FrameSchedule {
 }
 
 impl FrameSchedule {
-    fn heartbeat_due(self, now: Duration, running: bool) -> bool {
-        running
-            && self
-                .last_render
-                .is_none_or(|last| now.saturating_sub(last) >= ACTIVE_FRAME_HEARTBEAT)
+    fn heartbeat_due(self, now: Duration, live: bool) -> bool {
+        live && self
+            .last_render
+            .is_none_or(|last| now.saturating_sub(last) >= ACTIVE_FRAME_HEARTBEAT)
     }
 
     fn mark_rendered(&mut self, now: Duration) {
         self.last_render = Some(now);
     }
 
-    fn poll_timeout(self, now: Duration, running: bool, backlog: bool) -> Duration {
+    fn poll_timeout(self, now: Duration, live: bool, backlog: bool) -> Duration {
         if backlog {
             return Duration::ZERO;
         }
-        if !running {
+        if !live {
             return TERMINAL_POLL_INTERVAL;
         }
 
@@ -7214,7 +7270,7 @@ where
         && !expired_quit_warning
         && !restored_syntax_became_ready
         && !status_changed
-        && !schedule.heartbeat_due(now, tui.running)
+        && !schedule.heartbeat_due(now, tui.has_live_work())
     {
         return Ok(false);
     }
@@ -7516,7 +7572,7 @@ where
             dirty = true;
         }
         render_progress_frame(tui, &mut renderer, &mut frame_schedule, now, dirty)?;
-        let timeout = frame_schedule.poll_timeout(now, tui.running, backlog);
+        let timeout = frame_schedule.poll_timeout(now, tui.has_live_work(), backlog);
         let event = if let Some(event) = pending_event.take() {
             event
         } else {
