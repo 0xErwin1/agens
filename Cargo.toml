@@ -19,6 +19,7 @@ members = [
   "crates/agens-headless",
   "crates/agens-tool-runtime",
   "crates/agens-store",
+  "crates/agens-perf",
   "crates/agens-tui",
   "crates/agens-tui-app",
   "crates/agens-server",

@@ -102,6 +102,7 @@ jq -e '
     "agens-models": [
       "agens-core"
     ],
+    "agens-perf": [],
     "agens-permissions": [
       "agens-config",
       "agens-core",
