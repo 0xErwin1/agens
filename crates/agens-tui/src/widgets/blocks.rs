@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use agens_core::ToolInput;
+use agens_core::redaction::redact_credential_values;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -480,22 +481,64 @@ fn header_parts(parsed: &ToolInput) -> HeaderParts {
     }
 }
 
-/// Summarize an unknown tool's arguments without dumping arbitrary values.
+/// Summarize an unknown tool's arguments by what was actually asked for.
 ///
-/// Stable resource identifiers (`readable_id` or `slug`) are safe and useful on
-/// the scan path; a move also includes its destination column. Other JSON objects
-/// retain only their top-level key shape. Complete raw arguments stay reachable
+/// The key shape alone (`{board, limit, status}`) is the same for every call to
+/// the same tool, so a batch of them reads as one row repeated: it says which
+/// tool ran and nothing about what it was told to do. The values are what tell
+/// two calls apart, so scalars are shown — each redacted, collapsed and
+/// bounded — while nested objects and arrays stay shape-only, since those are
+/// the payloads worth dumping nowhere. Complete raw arguments remain reachable
 /// through [`DisplayMode::Expanded`].
 fn summarize_args(tool_name: &str, raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.starts_with('{') {
-        tool_name
-            .strip_prefix("mcp::atlas_")
-            .and_then(|_| safe_resource_summary(trimmed))
-            .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
-    } else {
-        collapse_whitespace(trimmed)
+    if !trimmed.starts_with('{') {
+        return redact_credential_values(&collapse_whitespace(trimmed));
     }
+
+    tool_name
+        .strip_prefix("mcp::atlas_")
+        .and_then(|_| safe_resource_summary(trimmed))
+        .or_else(|| summarize_arguments_by_value(trimmed))
+        .unwrap_or_else(|| format_key_shape(&object_keys(trimmed)))
+}
+
+/// Bounded `key=value` pairs for a JSON object's own members.
+///
+/// Returns `None` for anything that is not a parsable object, so the caller can
+/// fall back to the shape scanner that tolerates malformed input.
+fn summarize_arguments_by_value(raw: &str) -> Option<String> {
+    let Value::Object(arguments) = serde_json::from_str(raw).ok()? else {
+        return None;
+    };
+    if arguments.is_empty() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut width = 0usize;
+    for (key, value) in arguments.iter().take(MAX_SUMMARIZED_KEYS) {
+        let key = truncate_operand(key, MAX_SUMMARIZED_KEY_WIDTH);
+        let rendered = match value {
+            Value::Object(_) => "{…}".to_owned(),
+            Value::Array(items) => format!("[{}]", items.len()),
+            Value::Null => "null".to_owned(),
+            Value::String(text) => {
+                let text = redact_credential_values(&collapse_whitespace(text));
+                truncate_operand(&text, MAX_SUMMARIZED_VALUE_WIDTH)
+            }
+            other => other.to_string(),
+        };
+        let part = format!("{key}={rendered}");
+        width += part.width() + 2;
+        if width > MAX_SUMMARIZED_ARGUMENTS_WIDTH && !parts.is_empty() {
+            parts.push("…".to_owned());
+            break;
+        }
+        parts.push(part);
+    }
+
+    (!parts.is_empty()).then(|| format!("{{{}}}", parts.join(", ")))
 }
 
 const MAX_RESOURCE_SUMMARY_WIDTH: usize = 48;
@@ -527,6 +570,9 @@ fn collapse_whitespace(raw: &str) -> String {
 
 const MAX_SUMMARIZED_KEYS: usize = 6;
 const MAX_SUMMARIZED_KEY_WIDTH: usize = 24;
+const MAX_SUMMARIZED_VALUE_WIDTH: usize = 28;
+/// Budget the whole argument summary shares before it elides the rest.
+const MAX_SUMMARIZED_ARGUMENTS_WIDTH: usize = 72;
 
 /// Top-level member names of a JSON-shaped object payload, in source order.
 ///
@@ -914,7 +960,7 @@ mod tests {
                 name: "mcp::foo__bar".into(),
                 raw: "{\"a\":1}".into(),
             }),
-            "foo__bar {a}"
+            "foo__bar {a=1}"
         );
         // Multi-line raw args collapse to a single summarized line (no JSON dump).
         let collapsed = header_of(&ToolInput::Other {
@@ -1037,16 +1083,33 @@ mod tests {
         );
     }
 
+    /// A batch of calls to the same tool differs only in its values, so the
+    /// summary carries them; nested payloads stay shape-only, which is what
+    /// keeps a blob out of a one-line row.
     #[test]
-    fn mcp_headers_summarize_argument_shape_instead_of_raw_json() {
+    fn mcp_headers_summarize_what_was_asked_for_not_only_its_shape() {
         let header = header_of(&ToolInput::Other {
             name: "mcp::foo__bar".into(),
             raw: "{\"path\":\"/etc/hosts\",\"limit\":10,\"nested\":{\"deep\":true}}".into(),
         });
-        assert_eq!(header, "foo__bar {path, limit, nested}");
+        assert_eq!(header, "foo__bar {limit=10, nested={…}, path=/etc/hosts}");
         assert!(!header.contains('"'), "no raw JSON punctuation: {header:?}");
-        assert!(!header.contains("/etc/hosts"), "no argument values");
         assert!(!header.contains("deep"), "no nested keys");
+
+        let credential = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: "{\"token\":\"sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}".into(),
+        });
+        assert!(
+            !credential.contains("sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            "an argument that looks like a credential never reaches the row: {credential:?}"
+        );
+
+        let long = header_of(&ToolInput::Other {
+            name: "mcp::foo__bar".into(),
+            raw: format!("{{\"query\":\"{}\"}}", "x".repeat(200)),
+        });
+        assert!(long.width() < 80, "the summary stays bounded: {long:?}");
 
         assert_eq!(
             header_of(&ToolInput::Other {
@@ -1071,12 +1134,17 @@ mod tests {
             }),
             "atlas_move_task AGN-92 → Done"
         );
+        // Outside the Atlas shape the summary is generic rather than absent:
+        // the values are what tell one call from the next, and they are the
+        // same values the model was already given.
         let non_atlas = header_of(&ToolInput::Other {
             name: "mcp::other_lookup".into(),
-            raw: r#"{"readable_id":"PRIVATE-ID","slug":"PRIVATE-SLUG"}"#.into(),
+            raw: r#"{"readable_id":"LOOKUP-ID","slug":"lookup-slug"}"#.into(),
         });
-        assert_eq!(non_atlas, "other_lookup {readable_id, slug}");
-        assert!(!non_atlas.contains("PRIVATE"));
+        assert_eq!(
+            non_atlas,
+            "other_lookup {readable_id=LOOKUP-ID, slug=lookup-slug}"
+        );
         // Non-object payloads keep the collapsed single-line summary.
         assert_eq!(
             header_of(&ToolInput::Other {

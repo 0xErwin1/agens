@@ -38,7 +38,13 @@ const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CHATGPT_ERROR_BODY_BYTES: usize = 8 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_OPENAI_TOOL_CONTINUATION_ROUNDS: usize = 128;
-const MAX_CHATGPT_REPLAY_ITEMS: usize = 512;
+/// Items one request may replay.
+///
+/// The byte budgets below are what actually protect the request; this bounds
+/// the pathological case of many tiny items. At 512 it was the binding limit
+/// instead: a session of roughly 250 tool calls died here while using a tenth
+/// of the model's context window, and said so in the model's name.
+const MAX_CHATGPT_REPLAY_ITEMS: usize = 4096;
 const MAX_CHATGPT_REPLAY_ITEM_BYTES: usize = 64 * 1024;
 const MAX_CHATGPT_REPLAY_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 const PROACTIVE_REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
@@ -1524,6 +1530,8 @@ fn diagnostic_class_for_port_error(error: HeadlessTurnPortError) -> ProviderDiag
         HeadlessTurnPortError::Cancelled => ProviderDiagnosticClass::Cancelled,
         HeadlessTurnPortError::TimedOut => ProviderDiagnosticClass::Deadline,
         HeadlessTurnPortError::ProviderContext => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderHistoryBudget => ProviderDiagnosticClass::Context,
+        HeadlessTurnPortError::ProviderToolRounds => ProviderDiagnosticClass::Runtime,
         HeadlessTurnPortError::ProviderNetwork => ProviderDiagnosticClass::Network,
         HeadlessTurnPortError::ProviderRateLimited => ProviderDiagnosticClass::RateLimited,
         HeadlessTurnPortError::ProviderRejected => ProviderDiagnosticClass::Rejected,
@@ -1703,7 +1711,7 @@ impl TurnProvider for ChatGptResponsesProvider {
                     return Err(local_chatgpt_failure(
                         self.diagnostics.as_ref(),
                         ProviderDiagnosticKind::ContinuationLimitExceeded,
-                        HeadlessTurnPortError::ProviderContext,
+                        HeadlessTurnPortError::ProviderToolRounds,
                     ));
                 }
                 let Some(new_events) = events.get(event_cursor..) else {
@@ -1726,7 +1734,7 @@ impl TurnProvider for ChatGptResponsesProvider {
                     local_chatgpt_failure(
                         self.diagnostics.as_ref(),
                         ProviderDiagnosticKind::ReplayLimitExceeded,
-                        HeadlessTurnPortError::ProviderContext,
+                        HeadlessTurnPortError::ProviderHistoryBudget,
                     )
                 })?;
                 (self.request_payload(replay_history.clone()), replay_history)
@@ -1801,7 +1809,7 @@ impl TurnProvider for ChatGptResponsesProvider {
             return Err(local_chatgpt_failure(
                 self.diagnostics.as_ref(),
                 ProviderDiagnosticKind::ReplayLimitExceeded,
-                HeadlessTurnPortError::ProviderContext,
+                HeadlessTurnPortError::ProviderHistoryBudget,
             ));
         }
 
@@ -1812,7 +1820,7 @@ impl TurnProvider for ChatGptResponsesProvider {
             return Err(local_chatgpt_failure(
                 self.diagnostics.as_ref(),
                 ProviderDiagnosticKind::ReplayLimitExceeded,
-                HeadlessTurnPortError::ProviderContext,
+                HeadlessTurnPortError::ProviderHistoryBudget,
             ));
         }
         if response.pending_calls.is_empty() {

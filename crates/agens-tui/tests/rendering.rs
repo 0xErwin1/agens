@@ -1318,7 +1318,7 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
         "Read src/main.rs",
         "$ cargo test",
         "Grep needle in src",
-        "foo__bar {path, limit}",
+        "foo__bar {limit=10, path=/etc/hosts-sentinel}",
     ] {
         assert!(text.contains(header), "missing {header:?}: {text:?}");
     }
@@ -1326,7 +1326,6 @@ fn typed_tool_headers_render_per_kind_and_keep_raw_arguments_behind_expand() {
         !text.contains("\"path\":"),
         "no raw JSON on the scan path: {text:?}"
     );
-    assert!(!text.contains("/etc/hosts-sentinel"), "{text:?}");
 
     tui.handle(Event::Key(Key::CtrlO));
     tui.handle(Event::Key(Key::CtrlO));
@@ -5261,11 +5260,11 @@ fn the_transcript_greys_run_from_prose_to_tool_header_to_tool_output() {
     };
 
     assert!(
-        luminance("PROSE_SENTINEL") > luminance("{path}"),
+        luminance("PROSE_SENTINEL") > luminance("path="),
         "the answer reads louder than what the agent ran"
     );
     assert!(
-        luminance("{path}") > luminance("OUTPUT_SENTINEL"),
+        luminance("path=") > luminance("OUTPUT_SENTINEL"),
         "what the agent ran reads louder than what it printed"
     );
 }

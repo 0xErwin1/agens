@@ -119,6 +119,16 @@ impl CliError {
                 "provider",
                 "request exceeds the model context window",
             ),
+            HeadlessTurnError::ProviderHistoryBudget => (
+                ExitStatus::Failure,
+                "provider",
+                "this session's history outgrew what one request can replay",
+            ),
+            HeadlessTurnError::ProviderToolRounds => (
+                ExitStatus::Failure,
+                "provider",
+                "the turn ran its tool-continuation rounds out without finishing",
+            ),
             HeadlessTurnError::ProviderRateLimited => (
                 ExitStatus::Failure,
                 "provider",
@@ -242,6 +252,26 @@ pub fn cancellation_result(cancellation: &HeadlessTurnCancellation) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A runtime budget is not the model's context window. Saying it is sends
+    /// the reader to shorten a prompt that was never too long — the session in
+    /// the report was using a tenth of its window.
+    #[test]
+    fn a_runtime_budget_never_reports_itself_as_the_model_context_window() {
+        let history = CliError::runtime(HeadlessTurnError::ProviderHistoryBudget).to_string();
+        assert!(history.contains("history"), "{history:?}");
+        assert!(!history.contains("context window"), "{history:?}");
+
+        let rounds = CliError::runtime(HeadlessTurnError::ProviderToolRounds).to_string();
+        assert!(rounds.contains("tool-continuation rounds"), "{rounds:?}");
+        assert!(!rounds.contains("context window"), "{rounds:?}");
+
+        let context = CliError::runtime(HeadlessTurnError::ProviderContext).to_string();
+        assert!(
+            context.contains("exceeds the model context window"),
+            "the remote signal keeps its own words: {context:?}"
+        );
+    }
 
     #[test]
     fn with_failure_detail_none_leaves_display_unchanged() {
