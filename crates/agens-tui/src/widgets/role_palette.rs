@@ -69,6 +69,12 @@ impl RolePalette {
         rgb(0x36, 0x18, 0x1c)
     }
 
+    /// Code panel background — one step above the terminal's own, so a fenced
+    /// block reads as a panel without becoming a second surface.
+    pub(crate) const fn code_panel_bg() -> Color {
+        rgb(0x1a, 0x1f, 0x29)
+    }
+
     /// Selected overlay row background — brand hue collapsed to a dark wash.
     pub(crate) const fn selection_bg() -> Color {
         rgb(0x1b, 0x33, 0x30)

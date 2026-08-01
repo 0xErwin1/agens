@@ -12,9 +12,9 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::RolePalette;
 use super::expand::DisplayMode;
 use super::overlay::truncate_columns;
+use super::{Glyph, RolePalette, UnicodeLevel};
 
 /// Context for the single operational footer row.
 #[derive(Clone)]
@@ -31,6 +31,8 @@ pub(crate) struct FooterContext<'a> {
     pub tool_detail: DisplayMode,
     /// Level of the block keyboard focus stands on, when navigation is active.
     pub focused_detail: Option<DisplayMode>,
+    /// Glyph set this terminal can draw the footer's chrome with.
+    pub unicode: UnicodeLevel,
     pub turn_label: Cow<'a, str>,
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
@@ -224,7 +226,7 @@ fn branch_segment(ctx: &FooterContext<'_>) -> Option<FooterSegment> {
     let branch = ctx.repository?.branch.as_deref()?;
     Some(FooterSegment::plain(
         RANK_BRANCH,
-        format!("⎇ {branch}"),
+        format!("{} {branch}", Glyph::Branch.text(ctx.unicode)),
         chrome_style(),
     ))
 }
@@ -709,6 +711,7 @@ mod tests {
             project: "/home/iperez/dev/personal/agens",
             tool_detail: DisplayMode::Collapsed,
             focused_detail: None,
+            unicode: UnicodeLevel::Extended,
             turn_label: Cow::Borrowed("Ready"),
             duration: None,
             usage: Some(&Usage {

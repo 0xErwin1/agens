@@ -23,8 +23,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::conversation::ConversationItem;
 use crate::widgets::{
-    ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, RolePalette, RowAccent,
-    RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup,
+    ACCENT_WIDTH, BlockContent, BlockLine, DisplayMode, GUTTER_WIDTH, Glyph, RolePalette,
+    RowAccent, RowBullet, RowState, StatusGlyph, ThinkingBlock, ToolCallBlock, ToolResultBlock,
+    UnicodeLevel, VerbGroup,
 };
 use crate::{Conversation, DiffLine, DiffLineKind, ToolResultState, TuiRuntimeEvent};
 
@@ -48,6 +49,8 @@ pub(super) struct ConversationRenderState<'a> {
     pub now: Duration,
     /// Call id keyboard focus is standing on, when any.
     pub focused_call: Option<&'a str>,
+    /// Glyph set this terminal can draw the transcript's chrome with.
+    pub unicode: UnicodeLevel,
 }
 
 /// Identifies one settled conversation across frames.
@@ -180,7 +183,7 @@ pub(super) fn conversation_lines(
         blocks.push(RenderedBlock::plain(rows));
     }
 
-    paint_blocks(blocks, state.now)
+    paint_blocks(blocks, state.now, state.unicode)
 }
 
 /// The closing row of a settled turn: what it took and what it billed.
@@ -286,7 +289,11 @@ struct Neighbour {
 /// separated by exactly one. A tool result never detaches from the call it
 /// closes, even when the user expanded its body. Blocks that render nothing are
 /// transparent, so a hidden item can neither force nor absorb a gap.
-fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration) -> Vec<Line<'static>> {
+fn paint_blocks(
+    blocks: Vec<RenderedBlock>,
+    now: Duration,
+    unicode: UnicodeLevel,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut previous: Option<Neighbour> = None;
 
@@ -306,7 +313,7 @@ fn paint_blocks(blocks: Vec<RenderedBlock>, now: Duration) -> Vec<Line<'static>>
                 .rows
                 .into_iter()
                 .enumerate()
-                .map(|(row, line)| painted_row(line, row, now)),
+                .map(|(row, line)| painted_row(line, row, now, unicode)),
         );
     }
 
@@ -324,7 +331,12 @@ fn separates(previous: &Neighbour, block: &RenderedBlock) -> bool {
 ///
 /// `row` is the row's index inside its own block, which is what makes the accent
 /// wave travel down a block instead of blinking in unison.
-fn painted_row(row: BlockLine, index: usize, now: Duration) -> Line<'static> {
+fn painted_row(
+    row: BlockLine,
+    index: usize,
+    now: Duration,
+    unicode: UnicodeLevel,
+) -> Line<'static> {
     if row.bullet.is_none()
         && row.accent.is_none()
         && row.line.spans.iter().all(|span| span.content.is_empty())
@@ -335,10 +347,12 @@ fn painted_row(row: BlockLine, index: usize, now: Duration) -> Line<'static> {
     let mut spans = vec![
         row.accent.map_or_else(
             || Span::raw(" ".repeat(ACCENT_WIDTH)),
-            |accent| accent.span(index, now),
+            |accent| accent.span(index, now, unicode),
         ),
-        row.bullet
-            .map_or_else(|| Span::raw(" ".repeat(GUTTER_WIDTH)), RowBullet::span),
+        row.bullet.map_or_else(
+            || Span::raw(" ".repeat(GUTTER_WIDTH)),
+            |bullet| bullet.span(unicode),
+        ),
     ];
     spans.extend(row.line.spans);
     Line::from(spans)
@@ -378,11 +392,18 @@ fn mark_focused_row(rows: &mut [BlockLine]) {
 /// It carries its own key because it is the only row for which that key does
 /// anything, and it exists only while something is actually hidden — so the
 /// hint is never advertising a press that would do nothing.
-pub(super) fn history_elision_row(elided: usize, row_width: u16) -> Line<'static> {
+pub(super) fn history_elision_row(
+    elided: usize,
+    row_width: u16,
+    unicode: UnicodeLevel,
+) -> Line<'static> {
     let noun = if elided == 1 { "turn" } else { "turns" };
     unaccented_row(Line::from(Span::styled(
         bounded_single_line(
-            &format!("… {elided} earlier {noun} · ^Y to show"),
+            &format!(
+                "{} {elided} earlier {noun} · ^Y to show",
+                Glyph::Ellipsis.text(unicode)
+            ),
             usize::from(row_width),
         ),
         Style::default().fg(RolePalette::muted()),
@@ -578,7 +599,7 @@ fn assistant_block(text: &str, content_width: usize, highlight_syntax: bool) -> 
             if index == 0 {
                 BlockLine::with_bullet(
                     line,
-                    RowBullet::Identity("●", RolePalette::assistant_identity()),
+                    RowBullet::Identity(Glyph::AssistantBullet, RolePalette::assistant_identity()),
                 )
             } else {
                 BlockLine::new(line)
@@ -655,7 +676,7 @@ fn user_block(text: &str, content_width: usize) -> RenderedBlock {
                 if rows.is_empty() {
                     BlockLine::with_bullet(
                         line,
-                        RowBullet::Identity("❯", RolePalette::user_identity()),
+                        RowBullet::Identity(Glyph::UserBullet, RolePalette::user_identity()),
                     )
                 } else {
                     BlockLine::new(line)
@@ -1305,7 +1326,7 @@ fn subagent_card_block(
     }
     rows.push(BlockLine::with_bullet(
         Line::from(title),
-        RowBullet::Identity("●", subagent_status_color(card.status)),
+        RowBullet::Identity(Glyph::AssistantBullet, subagent_status_color(card.status)),
     ));
 
     let status = match card.status {
@@ -3024,7 +3045,7 @@ fn take_visible_width(text: &str, max_width: usize) -> String {
 
 /// Panel background for fenced/inline code — slightly elevated over the default terminal bg.
 const fn code_block_background() -> Color {
-    Color::Rgb(0x1a, 0x1f, 0x29)
+    RolePalette::code_panel_bg()
 }
 
 const MAX_DIFF_ROWS: usize = 200;
@@ -3335,9 +3356,9 @@ fn diff_note_line(text: &str, gutter_width: usize) -> Line<'static> {
 
 fn diff_line(lines: &mut Vec<Line<'static>>, number: u32, kind: DiffLineKind, text: &str) {
     let (marker, color) = match kind {
-        DiffLineKind::Added => ('+', Color::Green),
-        DiffLineKind::Removed => ('-', Color::Red),
-        DiffLineKind::Context => (' ', Color::Gray),
+        DiffLineKind::Added => ('+', RolePalette::success()),
+        DiffLineKind::Removed => ('-', RolePalette::error()),
+        DiffLineKind::Context => (' ', RolePalette::muted()),
     };
     lines.push(Line::from(vec![
         Span::styled(
@@ -3533,6 +3554,7 @@ mod tests {
             assistant_streaming,
             now: Duration::ZERO,
             focused_call: None,
+            unicode: UnicodeLevel::Extended,
         }
     }
 
@@ -3588,6 +3610,7 @@ mod tests {
                 assistant_streaming: false,
                 now,
                 focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         ))
     }
@@ -3607,6 +3630,7 @@ mod tests {
                 assistant_streaming: false,
                 now: Duration::ZERO,
                 focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
     }
@@ -4147,6 +4171,7 @@ mod tests {
                 assistant_streaming: false,
                 now: Duration::ZERO,
                 focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
     }
@@ -4166,6 +4191,7 @@ mod tests {
                 assistant_streaming: false,
                 now: Duration::ZERO,
                 focused_call: None,
+                unicode: UnicodeLevel::Extended,
             },
         )
     }
