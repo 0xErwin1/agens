@@ -267,6 +267,12 @@ impl Key {
 pub enum Action {
     /// Render the current view state.
     Render,
+    /// The event changed nothing a reader could see.
+    ///
+    /// Pointer movement is the reason this exists: it arrives dozens of times
+    /// per second and almost all of it lands inside the block already under
+    /// the cursor, where repainting shows exactly what was already on screen.
+    Unchanged,
     /// Send this prompt to the composition layer.
     Submit(String),
     /// Submit a redacted credential through the dedicated route only.
@@ -504,6 +510,7 @@ impl std::fmt::Debug for Action {
                 .field("secret", &"<redacted>")
                 .finish(),
             Self::Render => formatter.write_str("Render"),
+            Self::Unchanged => formatter.write_str("Unchanged"),
             Self::Submit(value) => formatter.debug_tuple("Submit").field(value).finish(),
             Self::SubmitBackground(value) => formatter
                 .debug_tuple("SubmitBackground")
@@ -7235,7 +7242,7 @@ where
             || column < layout.transcript.x
             || column >= layout.transcript.right()
         {
-            return Action::Render;
+            return Action::Unchanged;
         }
 
         let row_width = layout
@@ -7255,7 +7262,7 @@ where
             .checked_sub(layout.transcript.y)
             .and_then(|offset| offset.checked_sub(1))
         else {
-            return Action::Render;
+            return Action::Unchanged;
         };
         let target = scroll.saturating_add(usize::from(inside));
 
@@ -7265,9 +7272,11 @@ where
             .flatten();
 
         let record = self.active_record_mut();
-        if record.focused_call != hovered {
-            record.focused_call = hovered;
+        if record.focused_call == hovered {
+            return Action::Unchanged;
         }
+
+        record.focused_call = hovered;
         Action::Render
     }
 
@@ -7749,7 +7758,8 @@ where
                 terminal.copy_selection(&text)?;
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::Submit(_)
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
@@ -7827,7 +7837,8 @@ where
                 });
                 renderer.render(tui.view())?;
             }
-            Action::Render
+            Action::Unchanged
+            | Action::Render
             | Action::SubmitSecret { .. }
             | Action::SubmitBackground(_)
             | Action::TransitionToBackground(_)
@@ -8267,6 +8278,7 @@ where
         } else {
             tui.handle(event)
         };
+        let changed_something = !matches!(action, Action::Unchanged);
         match action {
             Action::Quit => {
                 if let Some((_, cancellation, session_load)) = active_route.take()
@@ -8469,6 +8481,7 @@ where
             Action::CopySelection(text) => {
                 runtime_terminal.copy_selection(&text)?;
             }
+            Action::Unchanged => {}
             Action::Render | Action::Cancel => {
                 if cancel_permission
                     && let (Some(id), Some(permission_bridge)) =
@@ -8478,7 +8491,9 @@ where
                 }
             }
         }
-        render_requested = true;
+        if changed_something {
+            render_requested = true;
+        }
     }
 }
 
