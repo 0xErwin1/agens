@@ -11,6 +11,9 @@ use agens_core::{TuiExecutionState, TuiSubagentEvent, TuiSubagentUpdate};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEvent {
     Info(String),
+    /// Runtime context the reader must not be able to mistake for prose the
+    /// turn produced, because it reports something the runtime could not do.
+    FailureNotice(String),
     MarkdownDelta(String),
     MarkdownFinal(String),
     ReasoningDelta(String),
@@ -94,6 +97,7 @@ pub enum ConversationError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ConversationItem {
     Info(String),
+    FailureNotice(String),
     User(String),
     Assistant(String),
     Reasoning(String),
@@ -281,6 +285,10 @@ impl Conversation {
             ConversationEvent::Info(message) => {
                 self.info.push(message.clone());
                 self.items.push(ConversationItem::Info(message));
+            }
+            ConversationEvent::FailureNotice(message) => {
+                self.info.push(message.clone());
+                self.items.push(ConversationItem::FailureNotice(message));
             }
             ConversationEvent::MarkdownDelta(delta) => {
                 self.live_markdown.push_str(&delta);
@@ -472,7 +480,40 @@ impl Conversation {
                 Ok(())
             }
         };
-        let _ = result;
+
+        if let Err(error) = result {
+            self.record_projection_error(&error);
+        }
+    }
+
+    /// Surfaces a child event the projection refused instead of dropping it.
+    ///
+    /// A refusal means the child's stream is inconsistent and the row that
+    /// event would have produced is gone for good. Showing a silently shorter
+    /// transcript would let the reader trust a record that is missing a step,
+    /// so the gap is stated where the step would have been.
+    fn record_projection_error(&mut self, error: &ConversationError) {
+        let message = match error {
+            ConversationError::OrphanToolResult(call_id) => {
+                format!("Subagent tool result {call_id} arrived without its call and was dropped.")
+            }
+            ConversationError::DuplicateToolCall(call_id) => {
+                format!("Subagent tool call {call_id} arrived twice; the repeat was dropped.")
+            }
+            ConversationError::DuplicateToolResult(call_id) => {
+                format!("Subagent tool result {call_id} arrived twice; the repeat was dropped.")
+            }
+            ConversationError::InvalidMessageOrder => {
+                "A subagent event arrived out of order and was dropped.".to_owned()
+            }
+        };
+
+        let actionable = ActionableError::sanitized(
+            message,
+            "Re-run the delegation if the dropped step matters.".into(),
+        );
+        self.errors.push(actionable.clone());
+        self.items.push(ConversationItem::Error(actionable));
     }
 
     pub(crate) fn restore_completed_subagent(
@@ -525,6 +566,26 @@ impl Conversation {
                 *slot = parsed;
                 break;
             }
+        }
+    }
+
+    /// Drops a projected error by exact message.
+    ///
+    /// A placeholder recorded for an unexplained failure has to give way to the
+    /// cause that later explains it, instead of standing beside it as a second
+    /// error for the same failure.
+    pub(crate) fn remove_error(&mut self, message: &str) {
+        if let Some(index) = self
+            .errors
+            .iter()
+            .rposition(|error| error.message == message)
+        {
+            self.errors.remove(index);
+        }
+        if let Some(index) = self.items.iter().rposition(
+            |item| matches!(item, ConversationItem::Error(error) if error.message == message),
+        ) {
+            self.items.remove(index);
         }
     }
 

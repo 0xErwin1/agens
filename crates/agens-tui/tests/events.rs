@@ -1,7 +1,7 @@
 use agens_core::{
     HeadlessTurnCancellation, Message, MessagePart, Role, ToolInput, TurnEvent, TurnState,
 };
-use agens_core::{SubagentErrorKind, SubagentStatus};
+use agens_core::{NoticeSeverity, SubagentErrorKind, SubagentStatus};
 use agens_tui::{
     Action, AppEvent, AppState, BridgeCancel, BridgeTx, Command, Conversation, ConversationError,
     ConversationEvent, Dialog, DialogEntry, DialogView, DiffLine, DiffLineKind, DisplayMode,
@@ -3621,18 +3621,20 @@ fn device_auth_overlay_escape_cancels_active_auth_route() {
 fn notice_runtime_events_persist_as_distinct_transcript_entries_and_survive_a_key_press() {
     let mut tui = Tui::new(FakeEngine::default());
 
-    tui.apply_runtime_event(TuiRuntimeEvent::Notice(
-        "mcp: files failed to connect".into(),
-    ));
-    tui.apply_runtime_event(TuiRuntimeEvent::Notice(
-        "mcp: atlas failed to connect".into(),
-    ));
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "mcp: files failed to connect".into(),
+        severity: NoticeSeverity::Failure,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "session restored".into(),
+        severity: NoticeSeverity::Info,
+    });
 
     assert_eq!(
         tui.transcript(),
         &[
-            TranscriptEntry::Info("mcp: files failed to connect".into()),
-            TranscriptEntry::Info("mcp: atlas failed to connect".into()),
+            TranscriptEntry::Error("mcp: files failed to connect".into()),
+            TranscriptEntry::Info("session restored".into()),
         ]
     );
 
@@ -3641,8 +3643,127 @@ fn notice_runtime_events_persist_as_distinct_transcript_entries_and_survive_a_ke
     assert_eq!(
         tui.transcript(),
         &[
-            TranscriptEntry::Info("mcp: files failed to connect".into()),
-            TranscriptEntry::Info("mcp: atlas failed to connect".into()),
+            TranscriptEntry::Error("mcp: files failed to connect".into()),
+            TranscriptEntry::Info("session restored".into()),
         ]
+    );
+}
+
+#[test]
+fn a_failed_state_change_records_a_transcript_error_without_a_provider_outcome() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+
+    tui.apply_progress(TurnEvent::StateChanged(TurnState::Failed));
+
+    let view = tui.view();
+    assert_eq!(view.turn_state, Some(TurnState::Failed));
+    assert_eq!(view.conversation.unwrap().errors.len(), 1);
+    assert_eq!(
+        tui.transcript()
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Error(_)))
+            .count(),
+        1,
+        "{:?}",
+        tui.transcript()
+    );
+}
+
+#[test]
+fn a_failed_turn_end_records_a_transcript_error_without_a_provider_outcome() {
+    let mut tui = Tui::new(FakeEngine::default());
+    tui.begin_submission("request");
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Failed,
+        duration: Some(Duration::from_secs(2)),
+    });
+
+    let view = tui.view();
+    assert_eq!(view.turn_state, Some(TurnState::Failed));
+    assert_eq!(view.conversation.unwrap().errors.len(), 1);
+    assert_eq!(
+        tui.transcript()
+            .iter()
+            .filter(|entry| matches!(entry, TranscriptEntry::Error(_)))
+            .count(),
+        1,
+        "{:?}",
+        tui.transcript()
+    );
+}
+
+#[test]
+fn a_provider_failure_replaces_the_placeholder_whichever_signal_arrives_first() {
+    let mut late_outcome = Tui::new(FakeEngine::default());
+    late_outcome.begin_submission("request");
+    late_outcome.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Failed,
+        duration: None,
+    });
+    late_outcome.finish_provider_turn(TuiProviderOutcome::Failed {
+        message: "network request failed".into(),
+        action: "Check the network connection, then retry.".into(),
+    });
+
+    assert_eq!(
+        late_outcome.transcript(),
+        [
+            TranscriptEntry::User("request".into()),
+            TranscriptEntry::Error("network request failed".into()),
+        ]
+    );
+    let view = late_outcome.view();
+    let errors = &view.conversation.unwrap().errors;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].message, "network request failed");
+
+    let mut early_outcome = Tui::new(FakeEngine::default());
+    early_outcome.begin_submission("request");
+    early_outcome.finish_provider_turn(TuiProviderOutcome::Failed {
+        message: "network request failed".into(),
+        action: "Check the network connection, then retry.".into(),
+    });
+    early_outcome.apply_runtime_event(TuiRuntimeEvent::TurnEnded {
+        status: TurnState::Failed,
+        duration: None,
+    });
+    early_outcome.apply_progress(TurnEvent::StateChanged(TurnState::Failed));
+
+    assert_eq!(
+        early_outcome.transcript(),
+        [
+            TranscriptEntry::User("request".into()),
+            TranscriptEntry::Error("network request failed".into()),
+        ]
+    );
+    assert_eq!(
+        early_outcome.view().conversation.unwrap().errors.len(),
+        1,
+        "a terminal signal after the real error must not add a second entry"
+    );
+}
+
+#[test]
+fn a_child_event_that_cannot_be_projected_is_recorded_instead_of_discarded() {
+    let mut tui = Tui::new(FakeEngine::default());
+    start_child(&mut tui, 7);
+    tui.apply_runtime_event(TuiRuntimeEvent::SubagentExecution(TuiSubagentEvent {
+        id: 7,
+        update: agens_core::TuiSubagentUpdate::ToolResult {
+            call_id: "never-requested".into(),
+            output: "orphan output".into(),
+            is_error: false,
+        },
+    }));
+
+    tui.select_transcript(TranscriptId::Subagent(7));
+    let view = tui.view();
+    let errors = &view.conversation.expect("child conversation").errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].message.contains("never-requested"),
+        "the discarded event has to name itself: {errors:?}"
     );
 }

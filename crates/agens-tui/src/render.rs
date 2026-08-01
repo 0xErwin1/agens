@@ -312,6 +312,15 @@ fn item_block(context: &ItemContext<'_>, item: &ConversationItem) -> RenderedBlo
         ConversationItem::Info(text) => {
             RenderedBlock::plain(label_lines("INFO", RolePalette::muted(), text))
         }
+        ConversationItem::FailureNotice(text) => RenderedBlock::accented(
+            labelled_lines(
+                "NOTICE",
+                RolePalette::error(),
+                Style::default().fg(RolePalette::error()),
+                text,
+            ),
+            Some(RowAccent::Still(RolePalette::error())),
+        ),
         ConversationItem::User(text) => user_block(text),
         ConversationItem::Assistant(text) => assistant_block(
             text,
@@ -424,13 +433,14 @@ fn tool_result_body_block(
         return RenderedBlock::hidden();
     }
 
-    let full_body = tool_result_body(call_id, output, context.content_width);
+    let (result_state, _) = tool_state(context.events, call_id, is_error);
+    let failed = result_state == ToolResultState::Failure;
+    let full_body = tool_result_body(call_id, output, context.content_width, failed);
     let body = match mode {
         DisplayMode::Collapsed => Vec::new(),
         DisplayMode::Truncated => crate::widgets::bounded_tool_preview(&full_body),
         DisplayMode::Expanded => full_body.to_vec(),
     };
-    let (result_state, _) = tool_state(context.events, call_id, is_error);
     let accent = (!call_is_groupable(context.conversation, call_id))
         .then_some(RowAccent::Still(result_color(result_state)));
 
@@ -793,6 +803,7 @@ struct ToolBodyKey {
     call_id: String,
     content_width: usize,
     output_hash: u64,
+    failed: bool,
 }
 
 thread_local! {
@@ -802,11 +813,20 @@ thread_local! {
 
 /// Described lines for a tool result body, reused while the body is unchanged.
 ///
-/// Keyed by call, content width and output hash, so an idle block is described
-/// once instead of once per animation tick. Caching is safe here because the
-/// description is a pure function of those three inputs, so no partially
+/// Keyed by call, content width, output hash and outcome, so an idle block is
+/// described once instead of once per animation tick. Caching is safe here
+/// because the description is a pure function of those inputs, so no partially
 /// described frame can be frozen into the cache.
-fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[Line<'static>]> {
+///
+/// A failed body is painted in the error colour: muting it would make the text
+/// the reader most needs the least readable thing on the row, and would leave
+/// failure and success indistinguishable below the header.
+fn tool_result_body(
+    call_id: &str,
+    output: &str,
+    content_width: usize,
+    failed: bool,
+) -> Arc<[Line<'static>]> {
     let mut hasher = DefaultHasher::new();
     output.hash(&mut hasher);
     let output_hash = hasher.finish();
@@ -817,6 +837,7 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
             .find(|(key, _)| {
                 key.output_hash == output_hash
                     && key.content_width == content_width
+                    && key.failed == failed
                     && key.call_id == call_id
             })
             .map(|(_, body)| Arc::clone(body))
@@ -828,9 +849,14 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
     #[cfg(test)]
     TOOL_BODY_RENDERS.with(|renders| renders.set(renders.get() + 1));
 
+    let color = if failed {
+        RolePalette::error()
+    } else {
+        RolePalette::muted()
+    };
     let described = tool_output_lines(
         &bounded_visible_tool_output(output),
-        Style::default().fg(RolePalette::muted()),
+        Style::default().fg(color),
         content_width,
     );
     let body: Arc<[Line<'static>]> = Arc::from(described);
@@ -845,6 +871,7 @@ fn tool_result_body(call_id: &str, output: &str, content_width: usize) -> Arc<[L
                 call_id: call_id.to_owned(),
                 content_width,
                 output_hash,
+                failed,
             },
             Arc::clone(&body),
         ));
@@ -1129,6 +1156,7 @@ fn subagent_card_block(
         ),
         Style::default().fg(RolePalette::muted()),
     ))));
+    rows.extend(subagent_failure_row(card, content_width));
 
     for activity in card.activities.iter().take(3) {
         rows.push(BlockLine::new(Line::from(Span::styled(
@@ -1158,6 +1186,26 @@ fn subagent_card_block(
         call_id: None,
         closes_call: false,
     }
+}
+
+/// The reason a delegated run failed, as the single row a card can spend on it.
+///
+/// Without it a failed card reads `Failure · recent · 42s` and nothing else:
+/// the outcome is named but the only part the reader can act on is withheld,
+/// even though the projection has carried it since the run ended.
+fn subagent_failure_row(card: &crate::SubagentCard, content_width: usize) -> Option<BlockLine> {
+    if !matches!(card.status, Some(agens_core::SubagentStatus::Failure)) {
+        return None;
+    }
+
+    let reason = bounded_single_line(card.final_result.as_deref()?, content_width);
+
+    (!reason.is_empty()).then(|| {
+        BlockLine::new(Line::from(Span::styled(
+            reason,
+            Style::default().fg(RolePalette::error()),
+        )))
+    })
 }
 
 fn subagent_status_color(status: Option<agens_core::SubagentStatus>) -> Color {
@@ -1390,7 +1438,7 @@ pub(super) fn detail_lines(
             | TuiRuntimeEvent::TaskExecution { .. }
             | TuiRuntimeEvent::SubagentExecution(_)
             | TuiRuntimeEvent::RestoredCompletedSubagent { .. }
-            | TuiRuntimeEvent::Notice(_) => {}
+            | TuiRuntimeEvent::Notice { .. } => {}
         }
     }
 
@@ -2881,6 +2929,19 @@ fn tool_state(
 }
 
 fn label_lines(label: &str, color: Color, text: impl Into<String>) -> Vec<Line<'static>> {
+    labelled_lines(label, color, Style::default(), text)
+}
+
+/// Labelled rows whose body carries `body` instead of the transcript default.
+///
+/// Used when the label's colour is not enough to place the row: a failure has
+/// to read as a failure across its whole width, not only in its gutter.
+fn labelled_lines(
+    label: &str,
+    color: Color,
+    body: Style,
+    text: impl Into<String>,
+) -> Vec<Line<'static>> {
     text.into()
         .split('\n')
         .map(|text_line| {
@@ -2889,7 +2950,7 @@ fn label_lines(label: &str, color: Color, text: impl Into<String>) -> Vec<Line<'
                     format!("│ {label:<9} "),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(text_line.to_owned()),
+                Span::styled(text_line.to_owned(), body),
             ])
         })
         .collect()
@@ -3458,7 +3519,7 @@ mod tests {
     /// Freshly described rows of a tool result body, bypassing the frame cache.
     fn tool_body(call_id: &str, output: &str, content_width: usize) -> Vec<Line<'static>> {
         reset_tool_body_test_state();
-        tool_result_body(call_id, output, content_width).to_vec()
+        tool_result_body(call_id, output, content_width, false).to_vec()
     }
 
     #[test]

@@ -2966,10 +2966,23 @@ pub enum TuiRuntimeEvent {
         final_result: String,
         tool_uses: usize,
     },
-    /// A one-line, already-sanitized informational message to surface as a
-    /// status line outside the transcript — for example an MCP server
-    /// failure discovered while building this turn's tools.
-    Notice(String),
+    /// A one-line, already-sanitized message to surface outside the transcript
+    /// — for example an MCP server failure discovered while building this
+    /// turn's tools. `severity` decides how loudly a surface may render it.
+    Notice {
+        text: String,
+        severity: NoticeSeverity,
+    },
+}
+
+/// How much salience a [`TuiRuntimeEvent::Notice`] is owed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoticeSeverity {
+    /// Context the reader may ignore without losing anything.
+    Info,
+    /// Something the runtime could not do. It must never be rendered in a
+    /// surface's lowest-salience style.
+    Failure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

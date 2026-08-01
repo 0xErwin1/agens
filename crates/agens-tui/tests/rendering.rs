@@ -4124,13 +4124,15 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
         "child-input-sentinel",
         "child-result-sentinel",
         "Subagent tool execution failed.",
-        "child-final-sentinel",
     ] {
         assert!(
             !main.contains(child_row),
             "duplicated {child_row:?}: {main:?}"
         );
     }
+    // The card is the only place main learns why a delegated run failed, so its
+    // final result belongs there even though the child's own rows do not.
+    assert!(main.contains("child-final-sentinel"), "{main:?}");
 
     tui.select_transcript(TranscriptId::Subagent(7));
     // Ctrl+O is thinking-first, then tools.
@@ -4765,4 +4767,168 @@ fn a_context_changed_outcome_shows_the_toggled_safety_state_without_a_further_ke
             rendered_text(&renderer)
         );
     }
+}
+
+const ERROR_COLOR: Color = Color::Rgb(0xf0, 0x71, 0x78);
+const MUTED_COLOR: Color = Color::Rgb(0x5c, 0x67, 0x73);
+
+#[test]
+fn a_failed_turn_emphasizes_its_footer_status_instead_of_hiding_it_in_the_border_grey() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    tui.finish_submission(Err("provider: request rejected".into()));
+
+    renderer.render(tui.view()).unwrap();
+
+    let status = cell_for_text(&renderer, "Failed");
+    assert_eq!(status.fg, ERROR_COLOR, "{:?}", rendered_text(&renderer));
+    assert!(status.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn a_failure_scrolled_out_of_the_viewport_still_announces_itself_above_the_composer() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 20,
+    });
+    tui.begin_submission("request");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "filler-line\n".repeat(60),
+    )));
+    tui.finish_submission(Err("provider: request rejected".into()));
+
+    tui.handle(Event::Key(Key::CtrlG));
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(
+        !rendered.contains("Action:"),
+        "the error card has to be out of view for this assertion: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("provider: request rejected"),
+        "the failure must stay perceptible without scrolling: {rendered:?}"
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "provider: request rejected").fg,
+        ERROR_COLOR
+    );
+}
+
+#[test]
+fn a_failure_notice_is_not_painted_in_the_lowest_salience_style() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 20)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "mcp: atlas failed to connect (unavailable)".into(),
+        severity: agens_core::NoticeSeverity::Failure,
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::Notice {
+        text: "session restored".into(),
+        severity: agens_core::NoticeSeverity::Info,
+    });
+
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(cell_for_text(&renderer, "NOTICE").fg, ERROR_COLOR);
+    assert_eq!(cell_for_text(&renderer, "mcp: atlas").fg, ERROR_COLOR);
+    assert_eq!(cell_for_text(&renderer, "INFO").fg, MUTED_COLOR);
+    assert_ne!(cell_for_text(&renderer, "session restored").fg, ERROR_COLOR);
+}
+
+#[test]
+fn a_failed_subagent_card_shows_why_it_failed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.tick(Duration::from_secs(5));
+    start_execution(&mut tui, 10, "reviewer");
+    tui.tick(Duration::from_secs(10));
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "reviewer".into(),
+        event: TuiExecutionEvent::Failed { id: 10 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(
+            10,
+            SubagentStatus::Failure,
+            "the reviewer ran out of context window",
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("Failure · recent · 5s"), "{rendered:?}");
+    assert!(
+        rendered.contains("the reviewer ran out of context window"),
+        "{rendered:?}"
+    );
+    assert_eq!(cell_for_text(&renderer, "the reviewer ran").fg, ERROR_COLOR);
+}
+
+#[test]
+fn a_successful_subagent_card_keeps_its_result_out_of_the_transcript() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    start_execution(&mut tui, 11, "explore");
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::terminal(11, SubagentStatus::Success, "long successful summary body"),
+    );
+
+    renderer.render(tui.view()).unwrap();
+
+    assert!(
+        !rendered_text(&renderer).contains("long successful summary body"),
+        "{:?}",
+        rendered_text(&renderer)
+    );
+}
+
+#[test]
+fn a_failed_tool_body_is_painted_apart_from_a_successful_one() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("request");
+    for (call_id, output, is_error) in [
+        ("ok-1", "success-body-sentinel", false),
+        ("bad-1", "failure-body-sentinel", true),
+    ] {
+        tui.apply_conversation_event(ConversationEvent::ToolCall {
+            call_id: call_id.into(),
+            name: "native::bash".into(),
+            input: "run".into(),
+            parsed: agens_core::ToolInput::Other {
+                name: "native::bash".into(),
+                raw: "run".into(),
+            },
+        })
+        .unwrap();
+        tui.apply_conversation_event(ConversationEvent::ToolResult {
+            call_id: call_id.into(),
+            output: output.into(),
+            is_error,
+        })
+        .unwrap();
+    }
+    // Collapsed → Truncated: every settled call advances together.
+    tui.handle(Event::Key(Key::CtrlO));
+
+    renderer.render(tui.view()).unwrap();
+    let rendered = rendered_text(&renderer);
+
+    assert!(rendered.contains("success-body-sentinel"), "{rendered:?}");
+    assert!(rendered.contains("failure-body-sentinel"), "{rendered:?}");
+    assert_eq!(
+        cell_for_text(&renderer, "success-body-sentinel").fg,
+        MUTED_COLOR
+    );
+    assert_eq!(
+        cell_for_text(&renderer, "failure-body-sentinel").fg,
+        ERROR_COLOR
+    );
 }
