@@ -3,11 +3,11 @@ use std::time::Duration;
 
 use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
-    Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
-    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, RepositoryStatus,
+    Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine,
+    Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, RepositoryStatus,
     SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId, Tui,
     TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
-    TuiSubmissionOutcome,
+    TuiSubmissionOutcome, UnicodeLevel,
 };
 use ratatui::{
     Terminal,
@@ -362,6 +362,92 @@ fn a_path_in_a_tool_row_becomes_an_openable_link_without_changing_the_row() {
         "{visible:?}"
     );
     assert!(!visible.contains('\u{1b}'), "{visible:?}");
+}
+
+/// A palette that resolves to one undifferentiated colour, or chrome that
+/// resolves to replacement characters, is not a degraded transcript — it is an
+/// unreadable one. Both fallbacks are judged by what survives them: the
+/// distinctions, and the column each glyph occupies.
+#[test]
+fn the_transcript_stays_legible_on_sixteen_colours_and_without_extended_glyphs() {
+    let render = |color: ColorLevel, unicode: UnicodeLevel| {
+        let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.handle(Event::Resize {
+            width: 80,
+            height: 24,
+        });
+        tui.set_capabilities(color, unicode);
+        tui.begin_submission("request");
+        tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+            "assistant body".into(),
+        )));
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: "read-1".into(),
+            name: "native::read".into(),
+            input: "src/lib.rs".into(),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: "read-1".into(),
+            content: "body".into(),
+            is_error: false,
+        }));
+        tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+        renderer.render(tui.view()).unwrap();
+        renderer
+    };
+
+    let truecolor = render(ColorLevel::TrueColor, UnicodeLevel::Extended);
+    let colours_of = |renderer: &RatatuiRenderer<TestBackend>| {
+        let mut seen = Vec::new();
+        for cell in &renderer.terminal().backend().buffer().content {
+            if !seen.contains(&cell.fg) {
+                seen.push(cell.fg);
+            }
+        }
+        seen
+    };
+    let rich = colours_of(&truecolor).len();
+
+    for level in [ColorLevel::Ansi256, ColorLevel::Ansi16] {
+        let renderer = render(level, UnicodeLevel::Extended);
+        let seen = colours_of(&renderer);
+        assert!(
+            seen.iter().all(|colour| !matches!(colour, Color::Rgb(..))),
+            "{level:?} still sends 24-bit colour: {seen:?}"
+        );
+        assert!(
+            seen.len() * 2 >= rich,
+            "{level:?} collapsed {rich} distinctions into {}",
+            seen.len()
+        );
+    }
+
+    let plain = render(ColorLevel::None, UnicodeLevel::Extended);
+    assert!(
+        colours_of(&plain)
+            .iter()
+            .all(|colour| *colour == Color::Reset),
+        "the terminal's own colours are the whole palette here"
+    );
+
+    // The ASCII transcript says the same things in the same columns.
+    let extended = render(ColorLevel::TrueColor, UnicodeLevel::Extended);
+    let ascii = render(ColorLevel::TrueColor, UnicodeLevel::Ascii);
+    let text = rendered_text(&ascii);
+    assert!(text.contains("assistant body"), "{text:?}");
+    assert!(text.contains("read src/lib.rs"), "{text:?}");
+    for glyph in ['┃', '◆', '❯', '●'] {
+        assert!(
+            !text.contains(glyph),
+            "{glyph} survived the fallback: {text:?}"
+        );
+    }
+    assert_eq!(
+        rendered_column(&ascii, "assistant body"),
+        rendered_column(&extended, "assistant body"),
+        "the content column does not move with the locale"
+    );
 }
 
 #[test]

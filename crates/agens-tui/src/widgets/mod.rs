@@ -1,6 +1,7 @@
 //! Reusable presentation widgets for the terminal surface.
 
 mod blocks;
+mod capability;
 mod expand;
 mod footer;
 mod glyph;
@@ -13,6 +14,8 @@ pub(crate) use blocks::{
     ACCENT_WIDTH, BlockContent, BlockLine, GUTTER_WIDTH, RowAccent, RowBullet, RowState,
     ThinkingBlock, ToolCallBlock, ToolResultBlock, VerbGroup, bounded_tool_preview,
 };
+pub use capability::{ColorLevel, UnicodeLevel};
+pub(crate) use capability::{Glyph, detect_color_level, detect_unicode_level, quantize_buffer};
 pub use expand::DisplayMode;
 pub(crate) use expand::{ExpandMode, ExpandableBody};
 pub(crate) use footer::{FooterContext, MIN_BORDER_METRICS_WIDTH, MetricFooter};

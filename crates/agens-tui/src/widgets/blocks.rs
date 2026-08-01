@@ -11,7 +11,7 @@ use ratatui::{
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::{DisplayMode, ExpandMode, RolePalette, StatusGlyph};
+use super::{DisplayMode, ExpandMode, Glyph, RolePalette, StatusGlyph, UnicodeLevel};
 
 /// Columns reserved by the shared transcript gutter: one bullet cell plus one
 /// separator cell.
@@ -41,8 +41,6 @@ pub(crate) enum RowAccent {
 }
 
 impl RowAccent {
-    const BAR: &'static str = "┃";
-    const THIN_BAR: &'static str = "❙";
     /// Brightness percentages the wave cycles through, in travel order.
     const WAVE_LEVELS: [u16; 4] = [100, 84, 68, 84];
     const COLLAPSED_LEVEL: u16 = 50;
@@ -54,13 +52,13 @@ impl RowAccent {
     const WAVE_PERIODS: u128 = 3;
 
     /// Bar painted for the `row`-th line of its block under the tick clock.
-    pub(crate) fn span(self, row: usize, now: Duration) -> Span<'static> {
+    pub(crate) fn span(self, row: usize, now: Duration, unicode: UnicodeLevel) -> Span<'static> {
         let (glyph, color) = match self {
-            Self::Wave(color) => (Self::BAR, scaled(color, Self::wave_level(row, now))),
-            Self::Still(color) => (Self::BAR, color),
-            Self::Collapsed(color) => (Self::THIN_BAR, scaled(color, Self::COLLAPSED_LEVEL)),
+            Self::Wave(color) => (Glyph::AccentBar, scaled(color, Self::wave_level(row, now))),
+            Self::Still(color) => (Glyph::AccentBar, color),
+            Self::Collapsed(color) => (Glyph::ThinAccentBar, scaled(color, Self::COLLAPSED_LEVEL)),
         };
-        Span::styled(glyph, Style::default().fg(color))
+        Span::styled(glyph.text(unicode), Style::default().fg(color))
     }
 
     fn wave_level(row: usize, now: Duration) -> u16 {
@@ -113,18 +111,15 @@ pub(crate) enum RowBullet {
     /// A header standing in for several rows (verb run, elided remainder).
     Group(RowState),
     /// Fixed identity glyph (user prompt, subagent card).
-    Identity(&'static str, Color),
+    Identity(Glyph, Color),
 }
 
 impl RowBullet {
-    const ACTIVITY: &'static str = "◆";
-    const GROUP: &'static str = "◈";
-
-    pub(crate) fn span(self) -> Span<'static> {
+    pub(crate) fn span(self, unicode: UnicodeLevel) -> Span<'static> {
         let (glyph, color) = match self {
-            Self::Activity(state) => (Self::ACTIVITY, state.color()),
-            Self::Group(state) => (Self::GROUP, state.color()),
-            Self::Identity(glyph, color) => (glyph, color),
+            Self::Activity(state) => (Glyph::ActivityBullet.text(unicode), state.color()),
+            Self::Group(state) => (Glyph::GroupBullet.text(unicode), state.color()),
+            Self::Identity(glyph, color) => (glyph.text(unicode), color),
         };
         Span::styled(
             format!("{glyph} "),
@@ -1412,9 +1407,9 @@ mod tests {
     #[test]
     fn the_accent_bar_moves_in_colour_only_and_dims_when_collapsed() {
         let wave = RowAccent::Wave(RolePalette::running());
-        let first = wave.span(0, Duration::ZERO);
-        let later = wave.span(0, Duration::from_millis(240));
-        let travelled = wave.span(1, Duration::ZERO);
+        let first = wave.span(0, Duration::ZERO, UnicodeLevel::Extended);
+        let later = wave.span(0, Duration::from_millis(240), UnicodeLevel::Extended);
+        let travelled = wave.span(1, Duration::ZERO, UnicodeLevel::Extended);
 
         assert_eq!(first.content, later.content, "the glyph never changes");
         assert_eq!(
@@ -1431,17 +1426,26 @@ mod tests {
             "the wave travels down the block by one row per frame"
         );
         assert_eq!(
-            wave.span(0, Duration::from_millis(239)).style.fg,
+            wave.span(0, Duration::from_millis(239), UnicodeLevel::Extended)
+                .style
+                .fg,
             first.style.fg,
             "a frame holds for three spinner periods"
         );
 
-        let still = RowAccent::Still(RolePalette::success()).span(0, Duration::from_millis(240));
+        let still = RowAccent::Still(RolePalette::success()).span(
+            0,
+            Duration::from_millis(240),
+            UnicodeLevel::Extended,
+        );
         assert_eq!(still.content, first.content);
         assert_eq!(still.style.fg, Some(RolePalette::success()));
 
-        let collapsed =
-            RowAccent::Collapsed(RolePalette::success()).span(0, Duration::from_millis(240));
+        let collapsed = RowAccent::Collapsed(RolePalette::success()).span(
+            0,
+            Duration::from_millis(240),
+            UnicodeLevel::Extended,
+        );
         assert_ne!(
             collapsed.content, first.content,
             "a collapsed run gets the thin variant"

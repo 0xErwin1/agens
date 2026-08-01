@@ -24,7 +24,7 @@ pub use terminal::{
     PendingPermissions, PermissionReply, TerminalControl, TerminalModeGuard, TerminalOperation,
     teardown,
 };
-pub use widgets::DisplayMode;
+pub use widgets::{ColorLevel, DisplayMode, UnicodeLevel};
 
 use std::{
     borrow::Cow,
@@ -801,6 +801,10 @@ pub struct ViewState<'a> {
     pub focused_call: Option<&'a str>,
     /// Whether this terminal renders OSC 8 hyperlinks.
     pub hyperlinks: bool,
+    /// How much colour this terminal can be sent.
+    pub color_level: widgets::ColorLevel,
+    /// Which glyph set this terminal can show.
+    pub unicode_level: widgets::UnicodeLevel,
     pub focus: TranscriptFocus,
     /// A bounded informational dialog rendered above the conversation.
     pub dialog: Option<&'a DialogView>,
@@ -1493,8 +1497,15 @@ impl<B: Backend> Renderer for RatatuiRenderer<B> {
 }
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
+    render_frame_content(frame, &state);
+    // Last, over the finished frame: the buffer is the one place every colour
+    // has arrived, including the ones this crate never chose.
+    widgets::quantize_buffer(frame.buffer_mut(), state.color_level);
+}
+
+fn render_frame_content(frame: &mut ratatui::Frame<'_>, state: &ViewState<'_>) {
     let area = frame.area();
-    let notice = notice_spans(&state);
+    let notice = notice_spans(state);
     let layout = screen_layout(area, state.input, !notice.is_empty());
 
     let row_width = layout
@@ -1502,7 +1513,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         .width
         .saturating_sub(TRANSCRIPT_ROW_INDENT);
     let transcript =
-        SelectableTranscript::from_lines(&rendered_transcript(&state, row_width), row_width);
+        SelectableTranscript::from_lines(&rendered_transcript(state, row_width), row_width);
     let visible_rows = layout
         .transcript
         .height
@@ -1518,12 +1529,12 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         let mut transcript_block = Block::default()
             .borders(Borders::TOP)
             .padding(Padding::left(TRANSCRIPT_ROW_INDENT))
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(widgets::RolePalette::chrome()));
         if !state.following_bottom {
             transcript_block = transcript_block
                 .title_bottom(Span::styled(
                     format!(" SCROLL {scroll}/{bottom_scroll}"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(widgets::RolePalette::chrome()),
                 ))
                 .title_alignment(Alignment::Right);
         }
@@ -1546,13 +1557,13 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if layout.composer.height > 0 && state.active_transcript != TranscriptId::Main {
         let mut dock = Block::default()
             .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
-        if let Some(metrics) = border_metrics(&state, layout.composer) {
+            .border_style(Style::default().fg(widgets::RolePalette::chrome()));
+        if let Some(metrics) = border_metrics(state, layout.composer) {
             dock = dock.title_top(metrics);
         }
         frame.render_widget(
             Paragraph::new(" Subagent transcript · i to message · x to cancel")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(widgets::RolePalette::chrome()))
                 .block(dock),
             layout.composer,
         );
@@ -1571,7 +1582,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
             .borders(Borders::ALL)
             .padding(Padding::left(1))
             .border_style(Style::default().fg(composer_color));
-        if let Some(metrics) = border_metrics(&state, layout.composer) {
+        if let Some(metrics) = border_metrics(state, layout.composer) {
             composer = composer.title_bottom(metrics);
         }
         frame.render_widget(
@@ -1610,7 +1621,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
     if layout.tree.height > 0 {
         frame.render_widget(
             Paragraph::new(Text::from(fitted_subagent_tree_lines(
-                &state,
+                state,
                 layout.tree.height,
                 layout.tree.width,
             ))),
@@ -1622,7 +1633,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, state: ViewState<'_>) {
         frame.render_widget(
             Paragraph::new(Line::from(widgets::MetricFooter::spans(
                 layout.footer.width,
-                footer_context(&state),
+                footer_context(state),
             ))),
             layout.footer,
         );
@@ -1792,6 +1803,7 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
                 .copied()
                 .unwrap_or(state.tool_detail)
         }),
+        unicode: state.unicode_level,
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
@@ -2757,7 +2769,10 @@ fn tree_branch_lines(
     for (index, execution) in branches.iter().enumerate() {
         let last = index + 1 == branches.len();
         let rail = if last { "└─ " } else { "├─ " };
-        let glyph = format!("{} ", execution_state_glyph(execution.state));
+        let glyph = format!(
+            "{} ",
+            execution_state_glyph(execution.state).text(state.unicode_level)
+        );
         lines.push(Line::from(vec![
             Span::styled(
                 rail.to_owned(),
@@ -2796,7 +2811,14 @@ fn tree_branch_lines(
                     "├─ "
                 }
             );
-            let glyph = format!("{} ", if activity.running { "●" } else { "✓" });
+            let glyph = format!(
+                "{} ",
+                if activity.running {
+                    widgets::Glyph::Running.text(state.unicode_level)
+                } else {
+                    widgets::Glyph::Succeeded.text(state.unicode_level)
+                }
+            );
             let label_width = width
                 .saturating_sub(rail.width())
                 .saturating_sub(glyph.width());
@@ -3000,7 +3022,11 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
     };
     let elided = elided_turn_count(state);
     if elided > 0 {
-        append_turn(vec![render::history_elision_row(elided, row_width)]);
+        append_turn(vec![render::history_elision_row(
+            elided,
+            row_width,
+            state.unicode_level,
+        )]);
     }
     for (index, conversation) in state
         .completed_conversations
@@ -3024,6 +3050,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
                     assistant_streaming: !state.highlight_restored_syntax,
                     now: state.now,
                     focused_call: state.focused_call,
+                    unicode: state.unicode_level,
                 },
             )
             .to_vec(),
@@ -3041,6 +3068,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
                 assistant_streaming: state.assistant_streaming,
                 now: state.now,
                 focused_call: state.focused_call,
+                unicode: state.unicode_level,
             },
         ));
     }
@@ -3239,7 +3267,7 @@ impl SelectableTranscript {
                     let style = if selected {
                         cell.style.patch(
                             Style::default()
-                                .fg(Color::Black)
+                                .fg(widgets::RolePalette::selection_fg())
                                 .bg(widgets::RolePalette::brand()),
                         )
                     } else {
@@ -3403,12 +3431,12 @@ fn transcript_provenance(state: &ViewState<'_>) -> Vec<Line<'static>> {
             Line::styled(
                 format!("Subagent {id} · {}", state.owner_label),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(widgets::RolePalette::warning())
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
                 "g select · m Main · h/l sibling",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(widgets::RolePalette::chrome()),
             ),
             Line::default(),
         ],
@@ -3458,12 +3486,14 @@ fn execution_priority(state: TuiExecutionState) -> u8 {
     }
 }
 
-const fn execution_state_glyph(state: TuiExecutionState) -> &'static str {
+const fn execution_state_glyph(state: TuiExecutionState) -> widgets::Glyph {
     match state {
-        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => "●",
-        TuiExecutionState::CompletedRecent => "✓",
-        TuiExecutionState::Failed => "✗",
-        TuiExecutionState::Cancelled => "○",
+        TuiExecutionState::ForegroundRunning | TuiExecutionState::BackgroundRunning => {
+            widgets::Glyph::Running
+        }
+        TuiExecutionState::CompletedRecent => widgets::Glyph::Succeeded,
+        TuiExecutionState::Failed => widgets::Glyph::Failed,
+        TuiExecutionState::Cancelled => widgets::Glyph::Cancelled,
     }
 }
 
@@ -3567,6 +3597,8 @@ pub struct Tui<E> {
     /// Decided once from the environment rather than per frame, so the render
     /// path stays a pure function of state and a test can state the answer.
     hyperlinks: bool,
+    color_level: widgets::ColorLevel,
+    unicode_level: widgets::UnicodeLevel,
     completed_conversations: Vec<Conversation>,
     conversation: Option<Conversation>,
     dialog: Option<DialogView>,
@@ -3598,6 +3630,20 @@ where
         Self {
             engine,
             hyperlinks: widgets::hyperlinks_enabled(),
+            color_level: widgets::detect_color_level(
+                std::env::var("NO_COLOR").ok().as_deref(),
+                std::env::var("AGENS_COLOR").ok().as_deref(),
+                std::env::var("COLORTERM").ok().as_deref(),
+                std::env::var("TERM").ok().as_deref(),
+            ),
+            unicode_level: widgets::detect_unicode_level(
+                std::env::var("AGENS_GLYPHS").ok().as_deref(),
+                std::env::var("LC_ALL")
+                    .or_else(|_| std::env::var("LC_CTYPE"))
+                    .or_else(|_| std::env::var("LANG"))
+                    .ok()
+                    .as_deref(),
+            ),
             input: String::new(),
             input_cursor: 0,
             recovered_failed_prompt: false,
@@ -3737,6 +3783,13 @@ where
     /// whatever `TERM` the runner happened to export.
     pub fn set_hyperlinks(&mut self, enabled: bool) {
         self.hyperlinks = enabled;
+    }
+
+    /// Overrides the terminal colour and glyph capabilities detected at
+    /// construction, for the same reason [`Tui::set_hyperlinks`] exists.
+    pub fn set_capabilities(&mut self, color: widgets::ColorLevel, unicode: widgets::UnicodeLevel) {
+        self.color_level = color;
+        self.unicode_level = unicode;
     }
 
     pub fn set_collapse_thinking(&mut self, collapse: bool) {
@@ -4943,6 +4996,8 @@ where
             history_expanded: active.history_expanded,
             focused_call: active.focused_call.as_deref(),
             hyperlinks: self.hyperlinks,
+            color_level: self.color_level,
+            unicode_level: self.unicode_level,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
             secret_entry: self.secret_entry.as_ref().map(|entry| SecretEntryRender {
