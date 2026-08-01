@@ -243,4 +243,51 @@ mod tests {
         };
         assert!(sr < br && sg < bg && sb < bb);
     }
+
+    /// Relative luminance per WCAG 2.1, used only to keep the selection pair
+    /// legible. Two slots can both be valid palette colours and still be
+    /// unreadable stacked on each other, which no equality assertion catches.
+    fn relative_luminance(color: Color) -> f64 {
+        let Color::Rgb(r, g, b) = color else {
+            panic!("palette slots are RGB");
+        };
+
+        let channel = |value: u8| {
+            let value = f64::from(value) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
+    fn contrast_ratio(a: Color, b: Color) -> f64 {
+        let (high, low) = {
+            let (x, y) = (relative_luminance(a), relative_luminance(b));
+            if x >= y { (x, y) } else { (y, x) }
+        };
+
+        (high + 0.05) / (low + 0.05)
+    }
+
+    #[test]
+    fn selected_text_stays_readable_against_its_own_background() {
+        let ratio = contrast_ratio(RolePalette::selection_fg(), RolePalette::selection_bg());
+        assert!(
+            ratio >= 7.0,
+            "selection foreground and background contrast at {ratio:.2}:1"
+        );
+
+        // The brand mint is the trap: it is close enough to the selection
+        // foreground that pairing them washes the selection out entirely,
+        // and it reads as a plausible highlight colour at the call site.
+        let against_brand = contrast_ratio(RolePalette::selection_fg(), RolePalette::brand());
+        assert!(
+            against_brand < 3.0,
+            "brand was expected to be an unusable selection background, but contrasts at {against_brand:.2}:1"
+        );
+    }
 }

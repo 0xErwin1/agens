@@ -3374,7 +3374,7 @@ impl SelectableTranscript {
                         cell.style.patch(
                             Style::default()
                                 .fg(widgets::RolePalette::selection_fg())
-                                .bg(widgets::RolePalette::brand()),
+                                .bg(widgets::RolePalette::selection_bg()),
                         )
                     } else {
                         cell.style

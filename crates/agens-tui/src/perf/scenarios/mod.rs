@@ -9,6 +9,7 @@
 //! fixture content; reordering this array changes what each scenario
 //! measures.
 
+mod dense_tool_turn;
 mod expand_collapse;
 mod long_transcript;
 mod short_transcript;
@@ -25,4 +26,5 @@ pub const SCENARIOS: &[Scenario] = &[
     streaming_with_spinner::SCENARIO,
     sustained_resize::SCENARIO,
     expand_collapse::SCENARIO,
+    dense_tool_turn::SCENARIO,
 ];
