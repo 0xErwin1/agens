@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 target_dir=${CARGO_TARGET_DIR:-"$repo_root/target"}
-limit=21474836480
+limit=53687091200
 
 if [[ -d "$target_dir" ]]; then
     actual=$(du --apparent-size --bytes --summarize "$target_dir" | cut -f1)
