@@ -2671,10 +2671,10 @@ fn tui_resume_overlay_restores_appends_reopens_and_resets_complete_history() {
         1,
         "{restored_render:?}"
     );
-    assert!(
-        restored_render.contains("output collapsed"),
-        "{restored_render:?}"
-    );
+    // A restored call is hidden by being one row, not by announcing that it is
+    // hidden: the "output collapsed" marker was removed with AGN-108. What the
+    // assertion owes the reader is that the body is absent, which the
+    // "previous result" check below already states.
     assert!(
         !restored_render.contains("previous reasoning"),
         "{restored_render:?}"

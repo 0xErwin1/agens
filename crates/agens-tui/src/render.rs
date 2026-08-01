@@ -788,11 +788,7 @@ fn collect_group(
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     start: usize,
 ) -> Option<(FoldedGroup, usize)> {
-    let verb = foldable_call(
-        conversation,
-        tool_display_modes,
-        conversation.items.get(start)?,
-    )?;
+    let verb = foldable_call(tool_display_modes, conversation.items.get(start)?)?;
     let mut members = BTreeSet::new();
     let mut count = 0usize;
     let mut failed = 0usize;
@@ -803,7 +799,7 @@ fn collect_group(
         match item {
             ConversationItem::ToolCall { name, .. } if is_task_tool_name(name) => {}
             ConversationItem::ToolCall { call_id, .. } => {
-                if foldable_call(conversation, tool_display_modes, item) != Some(verb) {
+                if foldable_call(tool_display_modes, item) != Some(verb) {
                     break;
                 }
                 members.insert(call_id.as_str());
@@ -830,7 +826,6 @@ fn collect_group(
 }
 
 fn foldable_call(
-    conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     item: &ConversationItem,
 ) -> Option<VerbGroup> {
@@ -841,11 +836,17 @@ fn foldable_call(
         return None;
     };
     let verb = VerbGroup::of(parsed)?;
-    let settled = match tool_display_modes.get(call_id) {
+
+    // An absent mode is not a state of its own: nothing recorded means nobody
+    // expanded this call, so it folds. The arm cannot compare against
+    // `default_mode()` instead — a running call defaults to `Truncated`
+    // precisely so live work keeps a preview when it stands alone, and that
+    // must not stop it from folding into a group.
+    let folds = match tool_display_modes.get(call_id) {
         Some(mode) => *mode == DisplayMode::Collapsed,
-        None => !call_has_result(conversation, call_id),
+        None => true,
     };
-    settled.then_some(verb)
+    folds.then_some(verb)
 }
 
 fn call_result<'a>(conversation: &'a Conversation, call_id: &str) -> Option<&'a crate::ToolResult> {
@@ -855,10 +856,6 @@ fn call_result<'a>(conversation: &'a Conversation, call_id: &str) -> Option<&'a 
         .flat_map(|batch| &batch.calls)
         .find(|call| call.call_id == call_id)
         .and_then(|call| call.result.as_ref())
-}
-
-fn call_has_result(conversation: &Conversation, call_id: &str) -> bool {
-    call_result(conversation, call_id).is_some()
 }
 
 fn call_is_groupable(conversation: &Conversation, call_id: &str) -> bool {
@@ -3589,6 +3586,42 @@ mod tests {
         let thinking = accent_span(&plain, "Thinking");
         assert_eq!(thinking.content, "┃");
         assert_eq!(thinking.style.fg, Some(RolePalette::muted()));
+    }
+
+    /// The recorded mode is a reader override, so its absence has to mean "the
+    /// reader asked for nothing", not a fourth state. A settled run used to
+    /// render collapsed and refuse to fold at the same time, which is the one
+    /// combination the group summary exists to prevent.
+    #[test]
+    fn a_settled_run_folds_whether_or_not_a_mode_was_ever_recorded_for_it() {
+        let mut settled = read_conversation(&["a.rs", "b.rs"]);
+        for path in ["a.rs", "b.rs"] {
+            settled
+                .apply(crate::ConversationEvent::ToolResult {
+                    call_id: path.to_owned(),
+                    output: "ok".into(),
+                    is_error: false,
+                })
+                .expect("result should project");
+        }
+
+        let unrecorded = lines_at(&settled, &BTreeMap::new());
+        assert!(
+            unrecorded
+                .iter()
+                .any(|line| line_text(line).contains("Read 2 files")),
+            "{unrecorded:?}"
+        );
+
+        let mut expanded = BTreeMap::new();
+        expanded.insert("a.rs".to_owned(), DisplayMode::Expanded);
+        let opened = lines_at(&settled, &expanded);
+        assert!(
+            !opened
+                .iter()
+                .any(|line| line_text(line).contains("Read 2 files")),
+            "a call the reader opened stays out of the group: {opened:?}"
+        );
     }
 
     #[test]
