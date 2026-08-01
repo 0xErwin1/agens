@@ -226,6 +226,73 @@ fn copying_a_word_broken_mid_token_does_not_invent_a_separator() {
     assert_eq!(tui.selected_text(), Some(token));
 }
 
+/// Folding old work is only worth a row when it hides more than it costs, and
+/// the fold has to be reversible from the row itself — a reader who scrolls to
+/// the top has to find the way back, not a dead end.
+#[test]
+fn a_long_transcript_folds_its_settled_turns_behind_a_reversible_count() {
+    let turns = |count: usize| {
+        (0..count)
+            .flat_map(|turn| {
+                [
+                    Message {
+                        role: Role::User,
+                        parts: vec![MessagePart::Text(format!("user-{turn:02}"))],
+                    },
+                    Message {
+                        role: Role::Assistant,
+                        parts: vec![MessagePart::Text(format!("answer-{turn:02}"))],
+                    },
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(60, 60)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 60,
+        height: 60,
+    });
+
+    // Seven settled turns is one over the visible window: folding a single turn
+    // would trade one row for one row, so nothing is folded.
+    tui.replace_history(&turns(7)).unwrap();
+    renderer.render(tui.view()).unwrap();
+    let short = rendered_text(&renderer);
+    assert!(short.contains("user-00"), "{short:?}");
+    assert!(!short.contains("earlier turn"), "{short:?}");
+
+    tui.replace_history(&turns(11)).unwrap();
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    let folded = rendered_text(&renderer);
+    assert!(
+        folded.contains("… 5 earlier turns · ^Y to show"),
+        "{folded:?}"
+    );
+    assert!(!folded.contains("user-00"), "{folded:?}");
+    assert!(
+        folded.contains("user-10"),
+        "the recent turns stay: {folded:?}"
+    );
+
+    tui.handle(Event::Key(Key::CtrlY));
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    let unfolded = rendered_text(&renderer);
+    assert!(unfolded.contains("user-00"), "{unfolded:?}");
+    assert!(!unfolded.contains("earlier turns"), "{unfolded:?}");
+
+    tui.handle(Event::Key(Key::CtrlY));
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    assert!(
+        rendered_text(&renderer).contains("… 5 earlier turns"),
+        "the fold closes again"
+    );
+}
+
 #[test]
 fn empty_composer_renders_a_complete_dock() {
     let width = 72_u16;
@@ -2890,6 +2957,16 @@ fn restored_history_scroll_stays_fixed_while_streaming_and_end_resumes_follow() 
     assert!(streamed.contains("restored-user-10"), "{streamed:?}");
     assert!(!tui.following_bottom());
 
+    // The top of a long transcript is the elision row, not its oldest turn:
+    // scrolling there is exactly where the key that unfolds it has to be found.
+    tui.handle(Event::Key(Key::Home));
+    renderer.render(tui.view()).unwrap();
+    let top = rendered_text(&renderer);
+    assert!(!top.contains("restored-user-00"), "{top:?}");
+    assert!(top.contains("earlier turns · ^Y to show"), "{top:?}");
+    assert!(!tui.following_bottom());
+
+    tui.handle(Event::Key(Key::CtrlY));
     tui.handle(Event::Key(Key::Home));
     renderer.render(tui.view()).unwrap();
     assert!(rendered_text(&renderer).contains("restored-user-00"));
