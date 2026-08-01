@@ -140,6 +140,7 @@ pub enum Key {
     Backspace,
     Delete,
     DeletePreviousWord,
+    DeleteNextWord,
     DeleteToLineStart,
     DeleteToLineEnd,
     /// Submits the current input.
@@ -190,6 +191,45 @@ pub enum Key {
     Up,
     Down,
     Tab,
+}
+
+impl Key {
+    /// Whether holding this key down should keep applying it.
+    ///
+    /// Typing, deleting and moving are the keys a reader holds on purpose:
+    /// dropping their auto-repeat means a held backspace deletes one character
+    /// and a held `Ctrl+W` one word, which is not what holding a key means
+    /// anywhere else.
+    ///
+    /// Everything else is a command or a mode, and a command must fire once
+    /// per press. A held `Ctrl+Shift+P` that toggled permission bypass forty
+    /// times would land on whichever state the key release happened to leave —
+    /// that is why auto-repeat was dropped wholesale, and why it stays dropped
+    /// here.
+    pub const fn repeats_while_held(self) -> bool {
+        matches!(
+            self,
+            Self::Char(_)
+                | Self::Backspace
+                | Self::Delete
+                | Self::DeletePreviousWord
+                | Self::DeleteNextWord
+                | Self::DeleteToLineStart
+                | Self::DeleteToLineEnd
+                | Self::Left
+                | Self::Right
+                | Self::Up
+                | Self::Down
+                | Self::PreviousWord
+                | Self::NextWord
+                | Self::PageUp
+                | Self::PageDown
+                | Self::ScrollUp
+                | Self::ScrollDown
+                | Self::CtrlJ
+                | Self::CtrlK
+        )
+    }
 }
 
 /// The result of handling a single terminal event.
@@ -5404,6 +5444,7 @@ where
                     | Key::Backspace
                     | Key::Delete
                     | Key::DeletePreviousWord
+                    | Key::DeleteNextWord
                     | Key::DeleteToLineStart
                     | Key::DeleteToLineEnd
                     | Key::Left
@@ -5453,6 +5494,7 @@ where
                 | Key::Backspace
                 | Key::Delete
                 | Key::DeletePreviousWord
+                | Key::DeleteNextWord
                 | Key::DeleteToLineStart
                 | Key::DeleteToLineEnd
                 | Key::Left
@@ -5611,6 +5653,9 @@ where
             Key::Delete => self.replace_chars(cursor, cursor.saturating_add(1), ""),
             Key::DeletePreviousWord => {
                 self.replace_chars(previous_word_boundary(&self.input, cursor), cursor, "");
+            }
+            Key::DeleteNextWord => {
+                self.replace_chars(cursor, next_word_boundary(&self.input, cursor), "");
             }
             Key::DeleteToLineStart => {
                 self.replace_chars(line_start(&self.input, cursor), cursor, "");
@@ -7866,7 +7911,11 @@ fn sync_terminal_size<E: Engine>(tui: &mut Tui<E>) -> io::Result<()> {
 fn map_event(event: CrosstermEvent) -> Option<Event> {
     match event {
         CrosstermEvent::Resize(width, height) => Some(Event::Resize { width, height }),
-        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => map_key(key),
+        CrosstermEvent::Key(key)
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+        {
+            map_key(key)
+        }
         CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::ScrollUp => {
             Some(Event::MouseWheel(MouseWheelDirection::Up))
         }
@@ -7903,7 +7952,9 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
 }
 
 fn map_key(event: KeyEvent) -> Option<Event> {
-    if event.kind != KeyEventKind::Press {
+    // A release never acts. A repeat acts only for the keys holding down is
+    // meant to repeat; see [`Key::repeats_while_held`].
+    if !matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
@@ -8000,6 +8051,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         {
             Key::Char(character)
         }
+        (KeyCode::Backspace, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeletePreviousWord
+        }
         (KeyCode::Backspace, _) => Key::Backspace,
         (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::SHIFT) => Key::ShiftEnter,
         (KeyCode::Enter, _) => Key::Enter,
@@ -8009,6 +8063,9 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Right, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => Key::NextWord,
         (KeyCode::Left, _) => Key::Left,
         (KeyCode::Right, _) => Key::Right,
+        (KeyCode::Delete, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Key::DeleteNextWord
+        }
         (KeyCode::Delete, _) => Key::Delete,
         (KeyCode::Home, _) => Key::Home,
         (KeyCode::End, _) => Key::End,
@@ -8020,6 +8077,10 @@ fn map_key(event: KeyEvent) -> Option<Event> {
         (KeyCode::Esc, _) => Key::Escape,
         _ => return None,
     };
+
+    if event.kind == KeyEventKind::Repeat && !key.repeats_while_held() {
+        return None;
+    }
 
     Some(Event::Key(key))
 }
@@ -9392,6 +9453,64 @@ mod runtime_tests {
         tui.handle(event)
     }
 
+    /// Holding a key down is how a reader deletes a line or walks a word at a
+    /// time. Dropping auto-repeat wholesale made every one of those a
+    /// one-shot, which is why a held Ctrl+W removed a single word.
+    #[test]
+    fn held_editing_keys_repeat_while_commands_and_modes_fire_once() {
+        let ctrl = KeyModifiers::CONTROL;
+        let repeated = |code, modifiers| {
+            map_key(crossterm::event::KeyEvent::new_with_kind(
+                code,
+                modifiers,
+                KeyEventKind::Repeat,
+            ))
+        };
+
+        for (code, modifiers) in [
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Backspace, ctrl),
+            (KeyCode::Delete, ctrl),
+            (KeyCode::Char('w'), ctrl),
+            (KeyCode::Char('a'), KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::PageDown, KeyModifiers::NONE),
+        ] {
+            assert!(
+                repeated(code, modifiers).is_some(),
+                "{code:?} with {modifiers:?} should repeat while held"
+            );
+        }
+
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Char('c'), ctrl),
+            (KeyCode::Char('o'), ctrl),
+            (KeyCode::Char('D'), ctrl),
+            (KeyCode::Char('P'), ctrl),
+        ] {
+            assert!(
+                repeated(code, modifiers).is_none(),
+                "{code:?} with {modifiers:?} is a command and must fire once per press"
+            );
+        }
+    }
+
+    #[test]
+    fn control_delete_removes_the_word_ahead_of_the_cursor() {
+        let mut tui = Tui::new(NoopEngine);
+        for character in "borra esta palabra".chars() {
+            press(&mut tui, KeyCode::Char(character), KeyModifiers::NONE);
+        }
+        press(&mut tui, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut tui, KeyCode::Delete, KeyModifiers::CONTROL);
+
+        assert_eq!(tui.input(), " esta palabra");
+    }
+
     #[test]
     fn maps_readline_crossterm_keys_to_composer_actions() {
         let ctrl = KeyModifiers::CONTROL;
@@ -9406,6 +9525,8 @@ mod runtime_tests {
             (KeyCode::Enter, KeyModifiers::NONE, Key::Enter),
             (KeyCode::Enter, KeyModifiers::SHIFT, Key::ShiftEnter),
             (KeyCode::Char('w'), ctrl, Key::DeletePreviousWord),
+            (KeyCode::Backspace, ctrl, Key::DeletePreviousWord),
+            (KeyCode::Delete, ctrl, Key::DeleteNextWord),
             (KeyCode::Char('u'), ctrl, Key::DeleteToLineStart),
             (KeyCode::Char('j'), ctrl, Key::CtrlJ),
             (KeyCode::Char('k'), ctrl, Key::CtrlK),
