@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
-    Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine,
-    Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, RepositoryStatus,
-    SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId, Tui,
-    TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
+    Action, ColorLevel, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind,
+    DisplayMode, Engine, Event, Key, PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer,
+    RepositoryStatus, SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId,
+    Tui, TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
     TuiSubmissionOutcome, UnicodeLevel,
 };
 use ratatui::{
@@ -447,6 +447,67 @@ fn the_transcript_stays_legible_on_sixteen_colours_and_without_extended_glyphs()
         rendered_column(&ascii, "assistant body"),
         rendered_column(&extended, "assistant body"),
         "the content column does not move with the locale"
+    );
+}
+
+/// Hover is an accelerator over the keyboard path, never a second one. It sets
+/// the focus `j`/`k` set and opens nothing by itself, so a session with mouse
+/// capture off loses speed and no capability.
+#[test]
+fn hovering_a_block_focuses_it_and_adds_nothing_the_keyboard_cannot_do() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(80, 24)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.handle(Event::Resize {
+        width: 80,
+        height: 24,
+    });
+    tui.begin_submission("request");
+    for id in ["read-1", "read-2"] {
+        tui.apply_progress(TurnEvent::ToolCallRequested {
+            id: id.into(),
+            name: "native::read".into(),
+            input: format!("{id}.log"),
+        });
+        tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+            tool_call_id: id.into(),
+            content: format!("body of {id}"),
+            is_error: false,
+        }));
+    }
+    tui.finish_provider_turn(agens_tui::TuiProviderOutcome::Completed("answer".into()));
+    renderer.render(tui.view()).unwrap();
+
+    assert_eq!(tui.view().focused_call, None);
+
+    let second = rendered_row(&renderer, "read-2.log") as u16;
+    tui.handle(Event::MouseMove {
+        column: 10,
+        row: second,
+    });
+    assert_eq!(tui.view().focused_call, Some("read-2"));
+    assert!(
+        !tui.view().tool_display_modes.contains_key("read-2")
+            || tui.view().tool_display_modes.get("read-2") == Some(&DisplayMode::Collapsed),
+        "hover moves focus; opening still costs a deliberate press"
+    );
+
+    let first = rendered_row(&renderer, "read-1.log") as u16;
+    tui.handle(Event::MouseMove {
+        column: 10,
+        row: first,
+    });
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+
+    // Off the transcript there is nothing to focus, and nothing is claimed.
+    tui.handle(Event::MouseMove { column: 10, row: 0 });
+    assert_eq!(tui.view().focused_call, Some("read-1"));
+
+    // Every capability hover reaches is one the keyboard already had.
+    tui.handle(Event::Key(Key::Escape));
+    tui.handle(Event::Key(Key::Char('o')));
+    assert_eq!(
+        tui.view().tool_display_modes.get("read-1"),
+        Some(&DisplayMode::Truncated)
     );
 }
 

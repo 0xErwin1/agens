@@ -117,6 +117,11 @@ pub enum Event {
         column: u16,
         row: u16,
     },
+    /// The pointer moved with no button held.
+    MouseMove {
+        column: u16,
+        row: u16,
+    },
     Paste(String),
     /// A terminal resize in columns and rows.
     Resize {
@@ -3008,25 +3013,50 @@ fn elided_turn_count(state: &ViewState<'_>) -> usize {
 }
 
 fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'static>> {
+    assemble_transcript(state, row_width, false).0
+}
+
+/// Which tool call owns each transcript row, for the rows any call owns.
+///
+/// Computed only when something asks — hit-testing a pointer, and nothing else —
+/// because the owners bypass the settled-conversation cache that the lines
+/// themselves enjoy.
+fn transcript_call_owners(state: &ViewState<'_>, row_width: u16) -> Vec<Option<String>> {
+    assemble_transcript(state, row_width, true).1
+}
+
+fn assemble_transcript(
+    state: &ViewState<'_>,
+    row_width: u16,
+    want_owners: bool,
+) -> (Vec<Line<'static>>, Vec<Option<String>>) {
     let mut transcript = chrome_rows(transcript_provenance(state));
+    let mut owners = vec![None; transcript.len()];
     let thinking_streaming = state.running;
     let mut turn_lines = Vec::new();
-    let mut append_turn = |lines: Vec<Line<'static>>| {
+    let mut turn_owners: Vec<Option<String>> = Vec::new();
+    let mut append_turn = |lines: Vec<Line<'static>>, mut lines_owners: Vec<Option<String>>| {
         if lines.is_empty() {
             return;
         }
         if !turn_lines.is_empty() {
             turn_lines.push(Line::default());
+            turn_owners.push(None);
         }
+        lines_owners.resize(lines.len(), None);
         turn_lines.extend(lines);
+        turn_owners.extend(lines_owners);
     };
     let elided = elided_turn_count(state);
     if elided > 0 {
-        append_turn(vec![render::history_elision_row(
-            elided,
-            row_width,
-            state.unicode_level,
-        )]);
+        append_turn(
+            vec![render::history_elision_row(
+                elided,
+                row_width,
+                state.unicode_level,
+            )],
+            Vec::new(),
+        );
     }
     for (index, conversation) in state
         .completed_conversations
@@ -3034,6 +3064,25 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
         .enumerate()
         .skip(elided)
     {
+        let settled_state = render::ConversationRenderState {
+            collapse_thinking: state.collapse_thinking,
+            thinking_streaming: false,
+            assistant_streaming: !state.highlight_restored_syntax,
+            now: state.now,
+            focused_call: state.focused_call,
+            unicode: state.unicode_level,
+        };
+        let owners = if want_owners {
+            render::conversation_call_rows(
+                conversation,
+                &[],
+                state.tool_display_modes,
+                row_width,
+                settled_state,
+            )
+        } else {
+            Vec::new()
+        };
         append_turn(
             render::settled_conversation_lines(
                 render::SettledConversation {
@@ -3044,35 +3093,47 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
                 conversation,
                 state.tool_display_modes,
                 row_width,
-                render::ConversationRenderState {
-                    collapse_thinking: state.collapse_thinking,
-                    thinking_streaming: false,
-                    assistant_streaming: !state.highlight_restored_syntax,
-                    now: state.now,
-                    focused_call: state.focused_call,
-                    unicode: state.unicode_level,
-                },
+                settled_state,
             )
             .to_vec(),
+            owners,
         );
     }
     if let Some(conversation) = state.conversation {
-        append_turn(render::conversation_lines(
-            conversation,
-            state.runtime_events,
-            state.tool_display_modes,
-            row_width,
-            render::ConversationRenderState {
-                collapse_thinking: state.collapse_thinking,
-                thinking_streaming,
-                assistant_streaming: state.assistant_streaming,
-                now: state.now,
-                focused_call: state.focused_call,
-                unicode: state.unicode_level,
-            },
-        ));
+        let live_state = render::ConversationRenderState {
+            collapse_thinking: state.collapse_thinking,
+            thinking_streaming,
+            assistant_streaming: state.assistant_streaming,
+            now: state.now,
+            focused_call: state.focused_call,
+            unicode: state.unicode_level,
+        };
+        let owners = if want_owners {
+            render::conversation_call_rows(
+                conversation,
+                state.runtime_events,
+                state.tool_display_modes,
+                row_width,
+                live_state,
+            )
+        } else {
+            Vec::new()
+        };
+        append_turn(
+            render::conversation_lines(
+                conversation,
+                state.runtime_events,
+                state.tool_display_modes,
+                row_width,
+                live_state,
+            ),
+            owners,
+        );
     }
+    let turn_start = transcript.len();
     transcript.extend(turn_lines);
+    owners.resize(turn_start, None);
+    owners.extend(turn_owners);
     let conversation_is_authoritative =
         !state.completed_conversations.is_empty() || state.conversation.is_some();
     if !conversation_is_authoritative {
@@ -3103,7 +3164,8 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
             usize::from(row_width.max(1)).saturating_sub(widgets::ACCENT_WIDTH),
         )));
     }
-    transcript
+    owners.resize(transcript.len(), None);
+    (transcript, owners)
 }
 
 /// Reserves the accent column on transcript rows that no conversation block owns.
@@ -3721,6 +3783,7 @@ where
                 .unwrap_or_else(|| self.begin_mouse_selection(column, row)),
             Event::MouseDrag { column, row } => self.update_mouse_selection(column, row, true),
             Event::MouseUp { column, row } => self.update_mouse_selection(column, row, false),
+            Event::MouseMove { column, row } => self.hover_block(column, row),
             Event::Paste(text) if self.secret_entry.is_some() => {
                 self.quit_armed_until = None;
                 self.append_secret_text(&text);
@@ -7025,6 +7088,56 @@ where
         }
     }
 
+    /// Moves block focus to whatever the pointer is resting on.
+    ///
+    /// Hover is an accelerator over the keyboard path, never a second one: it
+    /// sets the same focus `j`/`k` set and opens nothing by itself, so the
+    /// detail still costs a deliberate press and a session with mouse capture
+    /// off loses no capability at all.
+    fn hover_block(&mut self, column: u16, row: u16) -> Action {
+        let layout = self.screen_layout();
+        if layout.transcript.height == 0
+            || row < layout.transcript.y
+            || row >= layout.transcript.bottom()
+            || column < layout.transcript.x
+            || column >= layout.transcript.right()
+        {
+            return Action::Render;
+        }
+
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let view = self.view();
+        let scroll = usize::from(if view.following_bottom {
+            self.detached_scroll_bottom()
+        } else {
+            view.scroll_offset
+        });
+        // The transcript block draws a top border, so its first content row sits
+        // one below the rect. A pointer on the border itself owns nothing.
+        let Some(inside) = row
+            .checked_sub(layout.transcript.y)
+            .and_then(|offset| offset.checked_sub(1))
+        else {
+            return Action::Render;
+        };
+        let target = scroll.saturating_add(usize::from(inside));
+
+        let hovered = transcript_call_owners(&view, row_width)
+            .into_iter()
+            .nth(target)
+            .flatten();
+
+        let record = self.active_record_mut();
+        if record.focused_call != hovered {
+            record.focused_call = hovered;
+        }
+        Action::Render
+    }
+
     /// Brings the focused block into view and stops the viewport chasing the
     /// bottom.
     ///
@@ -8287,6 +8400,12 @@ fn map_event(event: CrosstermEvent) -> Option<Event> {
             if mouse.kind == MouseEventKind::Drag(crossterm::event::MouseButton::Left) =>
         {
             Some(Event::MouseDrag {
+                column: mouse.column,
+                row: mouse.row,
+            })
+        }
+        CrosstermEvent::Mouse(mouse) if mouse.kind == MouseEventKind::Moved => {
+            Some(Event::MouseMove {
                 column: mouse.column,
                 row: mouse.row,
             })
