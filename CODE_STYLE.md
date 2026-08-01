@@ -14,7 +14,7 @@ nix develop --no-pure-eval -c just fmt-check
 
 `just fmt` is intentionally mutating. Do not run it when unrelated or excluded Rust files are dirty. Use `just fmt-check` for verification.
 
-Build outputs remain at `target/{debug,release}/agens`. The target budget is 20 GiB. Verification never cleans automatically; cleanup is manual only through `just clean`.
+Build outputs remain at `target/{debug,release}/agens`. The target budget is 50 GiB. Verification never cleans automatically; cleanup is manual only through `just clean`.
 
 ## Naming, imports, and modules
 

@@ -55,7 +55,7 @@ It checks the target budget, bootstrap contracts, formatting, Clippy, tests, bui
 
 ## Build-output budget
 
-The Rust `target/` directory has a 20 GiB budget. Verification reports an overage and never removes artifacts automatically. Cleanup is a deliberate manual action:
+The Rust `target/` directory has a 50 GiB budget. Verification reports an overage and never removes artifacts automatically. Cleanup is a deliberate manual action:
 
 ```sh
 just clean

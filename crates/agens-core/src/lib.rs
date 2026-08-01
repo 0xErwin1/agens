@@ -11,6 +11,7 @@ use std::{
 
 use globset::{GlobBuilder, GlobMatcher};
 
+pub mod redaction;
 mod request_config;
 
 pub use request_config::{ReasoningEffort, RequestConfig, RequestConfigError};

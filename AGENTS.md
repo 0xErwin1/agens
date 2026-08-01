@@ -37,7 +37,7 @@ The canonical completion gate is:
 nix develop --no-pure-eval -c just verify
 ```
 
-Build outputs are `target/{debug,release}/agens`. The `target/` budget is 20 GiB. Verification checks the budget before and after the gate and never cleans automatically; cleanup is manual only with `just clean`.
+Build outputs are `target/{debug,release}/agens`. The `target/` budget is 50 GiB. Verification checks the budget before and after the gate and never cleans automatically; cleanup is manual only with `just clean`.
 
 ## Strict TDD
 

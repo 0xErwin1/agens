@@ -5,17 +5,17 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 mod moonshot;
 pub use moonshot::MoonshotProvider;
 
 use agens_core::{
-    Error, HeadlessTaskTerminal, HeadlessTurnCancellation, HeadlessTurnPortError, Message,
-    MessagePart, RequestConfig, Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
+    Error, HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, RequestConfig,
+    Role, TurnEvent, TurnProgressSink, TurnProvider, Usage,
 };
 use fs4::fs_std::FileExt;
 use serde_json::Value;
@@ -87,6 +87,7 @@ pub struct OpenAiResponsesProvider {
     continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
+    failure_detail: Option<ProviderFailureDetail>,
 }
 
 /// ChatGPT subscription Responses transport using existing auth.json credentials.
@@ -111,6 +112,66 @@ pub struct ChatGptResponsesProvider {
     continuation_rounds: usize,
     progress: Option<TurnProgressSink>,
     diagnostics: Option<ProviderDiagnostics>,
+    failure_detail: Option<ProviderFailureDetail>,
+}
+
+/// Carries the raw detail a provider failure produced, from the point a body
+/// or a mid-stream event is in scope to the outermost boundary that renders
+/// it to a user. It mirrors [`ProviderDiagnostics`]: a cheap-clone handle
+/// passed through a builder so a `&self` capture site can still write into
+/// it. `take()` clears the slot so a later, unrelated failure can never
+/// inherit a stale record.
+///
+/// The content recorded here is never redacted or bounded to the caller's
+/// final display cap; sinks that render it to a person are responsible for
+/// that. It is bounded only against runaway input, with a visible truncation
+/// marker when that bound is hit.
+#[derive(Clone, Default)]
+pub struct ProviderFailureDetail(Arc<Mutex<Option<String>>>);
+
+const MAX_PROVIDER_FAILURE_DETAIL_CHARS: usize = 8 * 1024;
+const PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER: &str =
+    "\n[truncated: only the first 8192 characters of this provider failure detail were captured]";
+
+impl ProviderFailureDetail {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Appends `detail` to whatever this handle already holds. A single
+    /// terminal failure may contribute more than one piece of detail (an
+    /// HTTP status and model alongside a response body), so later calls
+    /// extend rather than replace. Recording an empty string is a no-op.
+    pub fn record(&self, detail: &str) {
+        if detail.is_empty() {
+            return;
+        }
+        let Ok(mut slot) = self.0.lock() else {
+            return;
+        };
+        let combined = match slot.take() {
+            Some(existing) => format!("{existing}\n{detail}"),
+            None => detail.to_owned(),
+        };
+        *slot = Some(bound_provider_failure_detail(&combined));
+    }
+
+    /// Returns the recorded detail and clears the slot.
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+fn bound_provider_failure_detail(value: &str) -> String {
+    if value.chars().count() <= MAX_PROVIDER_FAILURE_DETAIL_CHARS {
+        return value.to_owned();
+    }
+    let mut bounded: String = value
+        .chars()
+        .take(MAX_PROVIDER_FAILURE_DETAIL_CHARS)
+        .collect();
+    bounded.push_str(PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER);
+    bounded
 }
 
 pub type ProviderDiagnosticSink = Arc<dyn Fn(ProviderDiagnosticEvent) + Send + Sync>;
@@ -507,6 +568,7 @@ impl OpenAiResponsesProvider {
             continuation_rounds: 0,
             progress: None,
             diagnostics: None,
+            failure_detail: None,
         })
     }
 
@@ -543,6 +605,11 @@ impl OpenAiResponsesProvider {
 
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    pub fn with_failure_detail(mut self, failure_detail: ProviderFailureDetail) -> Self {
+        self.failure_detail = Some(failure_detail);
         self
     }
 
@@ -644,7 +711,15 @@ impl OpenAiResponsesProvider {
         stop_before_mapping(cancellation)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let context_exceeded = read_safe_openai_context_error(response, cancellation).await?;
+            if let Some(failure_detail) = &self.failure_detail {
+                failure_detail.record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+            }
+            let context_exceeded = read_safe_openai_context_error(
+                response,
+                cancellation,
+                self.failure_detail.as_ref(),
+            )
+            .await?;
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.emit(
                     ProviderDiagnosticComponent::Responses,
@@ -665,6 +740,7 @@ impl OpenAiResponsesProvider {
             self.progress.as_ref(),
             HeadlessTurnPortError::ProviderProtocol,
             false,
+            self.failure_detail.as_ref(),
         )
         .await;
         if let Some(diagnostics) = &self.diagnostics {
@@ -701,20 +777,24 @@ fn classify_openai_response_status(status: u16, context_exceeded: bool) -> Headl
 async fn read_safe_openai_context_error(
     response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
+    failure_detail: Option<&ProviderFailureDetail>,
 ) -> Result<bool, HeadlessTurnPortError> {
-    read_safe_context_error(response, cancellation, &[]).await
+    read_safe_context_error(response, cancellation, &[], failure_detail).await
 }
 
 /// The same question for a provider that signals context overflow in the error
 /// message instead of a code. `message_markers` are matched against the raw
 /// body; passing none leaves only the OpenAI code check.
 ///
-/// The body is read under a size cap and discarded: it can echo the request, so
-/// nothing beyond the verdict survives this function.
+/// The body is read under a size cap. Beyond the context-overflow verdict it
+/// is otherwise discarded, unless the caller supplies a [`ProviderFailureDetail`]
+/// handle: the raw body then survives there for a user-visible sink. It can
+/// echo the request, so a caller on a model-visible path must pass `None`.
 async fn read_safe_context_error(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
     message_markers: &[&str],
+    failure_detail: Option<&ProviderFailureDetail>,
 ) -> Result<bool, HeadlessTurnPortError> {
     let mut body = Vec::new();
     while body.len() < MAX_CHATGPT_ERROR_BODY_BYTES {
@@ -733,6 +813,10 @@ async fn read_safe_context_error(
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     stop_before_mapping(cancellation)?;
+
+    if let Some(failure_detail) = failure_detail {
+        failure_detail.record(String::from_utf8_lossy(&body).as_ref());
+    }
 
     if !message_markers.is_empty()
         && let Ok(text) = std::str::from_utf8(&body)
@@ -864,6 +948,7 @@ impl ChatGptResponsesProvider {
             continuation_rounds: 0,
             progress: None,
             diagnostics: None,
+            failure_detail: None,
         })
     }
 
@@ -905,6 +990,11 @@ impl ChatGptResponsesProvider {
 
     pub fn with_diagnostics(mut self, diagnostics: ProviderDiagnostics) -> Self {
         self.diagnostics = Some(diagnostics);
+        self
+    }
+
+    pub fn with_failure_detail(mut self, failure_detail: ProviderFailureDetail) -> Self {
+        self.failure_detail = Some(failure_detail);
         self
     }
 
@@ -1022,9 +1112,13 @@ impl ChatGptResponsesProvider {
         stop_before_mapping(cancellation).map_err(ChatGptResponseError::Other)?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            let safe_error = read_safe_chatgpt_error(response, cancellation)
-                .await
-                .map_err(ChatGptResponseError::Other)?;
+            if let Some(failure_detail) = &self.failure_detail {
+                failure_detail.record(&format!("HTTP {status} rejected model \"{}\"", self.model));
+            }
+            let safe_error =
+                read_safe_chatgpt_error(response, cancellation, self.failure_detail.as_ref())
+                    .await
+                    .map_err(ChatGptResponseError::Other)?;
             if let Some(diagnostics) = &self.diagnostics {
                 diagnostics.emit(
                     ProviderDiagnosticComponent::Responses,
@@ -1057,6 +1151,7 @@ impl ChatGptResponsesProvider {
             self.progress.as_ref(),
             HeadlessTurnPortError::ProviderProtocol,
             true,
+            self.failure_detail.as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -1544,6 +1639,14 @@ impl TurnProvider for ChatGptResponsesProvider {
         events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        // A prior round in this same turn may have recorded detail for an incident it then
+        // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
+        // succeeded). This handle is shared across every round of one attempt, so draining it
+        // here keeps that recovered incident from being mistaken for the cause of a later,
+        // unrelated failure in this same turn.
+        if let Some(failure_detail) = &self.failure_detail {
+            failure_detail.take();
+        }
         if cancellation.is_cancelled() {
             return Err(HeadlessTurnPortError::Cancelled);
         }
@@ -1734,6 +1837,14 @@ impl TurnProvider for OpenAiResponsesProvider {
         _events: &[TurnEvent],
         cancellation: &HeadlessTurnCancellation,
     ) -> Result<Vec<MessagePart>, HeadlessTurnPortError> {
+        // A prior round in this same turn may have recorded detail for an incident it then
+        // recovered from (a mid-stream `error` event whose enclosing `next_parts` call still
+        // succeeded). This handle is shared across every round of one attempt, so draining it
+        // here keeps that recovered incident from being mistaken for the cause of a later,
+        // unrelated failure in this same turn.
+        if let Some(failure_detail) = &self.failure_detail {
+            failure_detail.take();
+        }
         if cancellation.is_cancelled() {
             return Err(HeadlessTurnPortError::Cancelled);
         }
@@ -1842,86 +1953,17 @@ impl OpenAiResponsesProvider {
     }
 }
 
-fn model_visible_tool_output(content: &str, is_error: bool) -> String {
-    if !is_error {
-        return bounded_tool_output(content);
-    }
-
-    let safe_terminal = [
-        HeadlessTaskTerminal::Cancelled,
-        HeadlessTaskTerminal::TimedOut,
-        HeadlessTaskTerminal::AgentUnavailable,
-        HeadlessTaskTerminal::ModelUnavailable,
-        HeadlessTaskTerminal::SkillUnavailable,
-        HeadlessTaskTerminal::IterationLimit,
-        HeadlessTaskTerminal::InputLimit,
-        HeadlessTaskTerminal::OutputLimit,
-        HeadlessTaskTerminal::ConcurrencyLimit,
-        HeadlessTaskTerminal::ProviderFailure,
-        HeadlessTaskTerminal::ChildFailure,
-    ]
-    .into_iter()
-    .any(|terminal| {
-        content == terminal.message()
-            || content
-                .strip_prefix(terminal.message())
-                .is_some_and(is_safe_terminal_detail)
-    });
-    if safe_terminal {
-        bounded_tool_output(content)
-    } else {
-        "Tool execution failed".to_owned()
-    }
-}
-
-/// Whether the detail trailing a terminal message is one the model may read.
+/// The tool-result content a request may carry back to the model.
 ///
-/// A terminal message is a closed string, and so is everything allowed to
-/// follow it: a diagnostic reference, a provider failure cause, or a rejected
-/// skill. Anything else is host detail that has not been proven safe, so the
-/// caller replaces the whole output rather than trusting the suffix.
-fn is_safe_terminal_detail(suffix: &str) -> bool {
-    is_safe_diagnostic_reference_suffix(suffix)
-        || is_safe_provider_cause_suffix(suffix)
-        || is_safe_skill_rejection_suffix(suffix)
-}
-
-fn is_safe_provider_cause_suffix(suffix: &str) -> bool {
-    bracketed_detail(suffix, " [cause: ").is_some_and(|cause| {
-        agens_core::TaskProviderFailure::ALL
-            .iter()
-            .any(|failure| failure.label() == cause)
-    })
-}
-
-fn is_safe_skill_rejection_suffix(suffix: &str) -> bool {
-    let Some(detail) = bracketed_detail(suffix, " [skill: ") else {
-        return false;
-    };
-    let Some((skill, reason)) = detail.split_once("; ") else {
-        return false;
-    };
-
-    agens_core::is_catalog_name(skill)
-        && agens_core::TaskSkillRejection::ALL
-            .iter()
-            .any(|rejection| rejection.label() == reason)
-}
-
-fn bracketed_detail<'a>(suffix: &'a str, prefix: &str) -> Option<&'a str> {
-    suffix.strip_prefix(prefix)?.strip_suffix(']')
-}
-
-fn is_safe_diagnostic_reference_suffix(suffix: &str) -> bool {
-    suffix
-        .strip_prefix(" [ref: ")
-        .and_then(|suffix| suffix.strip_suffix(']'))
-        .is_some_and(|reference| {
-            reference.len() == 8
-                && reference
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        })
+/// Containment happens once, in the dispatcher (`agens-dispatch`), which applies credential
+/// redaction and host-path withholding to a failure before it is handed on or persisted. This
+/// layer therefore forwards what it was given, bounded against runaway size. Collapsing a
+/// failure to a generic string here would drop the failing command's own output — the detail
+/// the model needs in order to recover — and would make the same event look different to the
+/// model depending on the dialect and on whether the session had been resumed, since the
+/// resumed-history encoder replays the stored content verbatim.
+fn model_visible_tool_output(content: &str) -> String {
+    bounded_tool_output(content)
 }
 
 fn continuation_payload(
@@ -1939,7 +1981,7 @@ fn continuation_payload(
         let TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id,
             content,
-            is_error,
+            ..
         }) = event
         else {
             continue;
@@ -1953,7 +1995,7 @@ fn continuation_payload(
             return Err(());
         }
 
-        let output = model_visible_tool_output(content, *is_error);
+        let output = model_visible_tool_output(content);
         outputs.insert(tool_call_id, output);
     }
 
@@ -2001,7 +2043,7 @@ fn correlated_tool_outputs(
         let TurnEvent::ToolResult(MessagePart::ToolResult {
             tool_call_id,
             content,
-            is_error,
+            ..
         }) = event
         else {
             continue;
@@ -2015,7 +2057,7 @@ fn correlated_tool_outputs(
             return Err(());
         }
 
-        let output = model_visible_tool_output(content, *is_error);
+        let output = model_visible_tool_output(content);
         outputs.insert(tool_call_id, output);
     }
 
@@ -2114,8 +2156,10 @@ async fn decode_http_response_stream(
     progress: Option<&TurnProgressSink>,
     protocol_failure: HeadlessTurnPortError,
     finish_on_terminal: bool,
+    failure_detail: Option<&ProviderFailureDetail>,
 ) -> Result<DecodedResponse, HeadlessTurnPortError> {
-    let mut decoder = OpenAiResponseDecoder::new(require_encrypted_reasoning);
+    let mut decoder =
+        OpenAiResponseDecoder::new(require_encrypted_reasoning, failure_detail.cloned());
     let mut frame = Vec::new();
 
     loop {
@@ -2153,6 +2197,14 @@ async fn decode_http_response_stream(
     }
 }
 
+/// Decodes one buffered SSE frame and reports whether the response is now
+/// complete.
+///
+/// `frame` is always cleared before returning, on every path including a
+/// decode failure: a caller that discards this function's `Err` (an SSE
+/// reader that only finishes on the closed connection, not on a terminal
+/// event) would otherwise revisit the same undrained bytes on the next `\n`
+/// and process the identical event a second time.
 fn process_sse_frame(
     decoder: &mut OpenAiResponseDecoder,
     frame: &mut Vec<u8>,
@@ -2164,32 +2216,40 @@ fn process_sse_frame(
 
     let data = frame
         .strip_prefix(b"data:")
-        .map(|value| value.strip_prefix(b" ").unwrap_or(value));
-    if let Some(data) = data.filter(|data| !data.is_empty()) {
-        if data == b"[DONE]" {
-            frame.clear();
-            return Ok(false);
+        .map(|value| value.strip_prefix(b" ").unwrap_or(value))
+        .filter(|data| !data.is_empty());
+    let outcome = match data {
+        Some(data) if data == b"[DONE]" => Ok(false),
+        Some(data) => decode_sse_event(decoder, data, progress).map(|()| decoder.completed),
+        None => Ok(decoder.completed),
+    };
+    frame.clear();
+    outcome
+}
+
+fn decode_sse_event(
+    decoder: &mut OpenAiResponseDecoder,
+    data: &[u8],
+    progress: Option<&TurnProgressSink>,
+) -> Result<(), ()> {
+    let event = std::str::from_utf8(data).map_err(|_| ())?;
+    let start = decoder.parts.len();
+    decoder.process(event).map_err(|_| ())?;
+    if let Some(progress) = progress {
+        for part in &decoder.parts[start..] {
+            progress(agens_core::TurnEvent::ProviderPart(part.clone()));
         }
-        let event = std::str::from_utf8(data).map_err(|_| ())?;
-        let start = decoder.parts.len();
-        decoder.process(event).map_err(|_| ())?;
-        if let Some(progress) = progress {
-            for part in &decoder.parts[start..] {
-                progress(agens_core::TurnEvent::ProviderPart(part.clone()));
-            }
-            if let Some(usage) = decoder.completed_usage() {
-                progress(TurnEvent::Usage(usage));
-            }
+        if let Some(usage) = decoder.completed_usage() {
+            progress(TurnEvent::Usage(usage));
         }
     }
-    let completed = decoder.completed;
-    frame.clear();
-    Ok(completed)
+    Ok(())
 }
 
 async fn read_safe_chatgpt_error(
     mut response: reqwest::Response,
     cancellation: &HeadlessTurnCancellation,
+    failure_detail: Option<&ProviderFailureDetail>,
 ) -> Result<Option<SafeRemoteError>, HeadlessTurnPortError> {
     let mut body = Vec::new();
     while body.len() < MAX_CHATGPT_ERROR_BODY_BYTES {
@@ -2208,6 +2268,10 @@ async fn read_safe_chatgpt_error(
         body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
     stop_before_mapping(cancellation)?;
+
+    if let Some(failure_detail) = failure_detail {
+        failure_detail.record(String::from_utf8_lossy(&body).as_ref());
+    }
 
     let Ok(body) = serde_json::from_slice::<Value>(&body) else {
         return Ok(None);
@@ -2690,6 +2754,7 @@ struct OpenAiResponseDecoder {
     require_encrypted_reasoning: bool,
     usage: Option<Usage>,
     completed: bool,
+    failure_detail: Option<ProviderFailureDetail>,
 }
 
 struct DecodedResponse {
@@ -2707,9 +2772,13 @@ struct FunctionCall {
 }
 
 impl OpenAiResponseDecoder {
-    fn new(require_encrypted_reasoning: bool) -> Self {
+    fn new(
+        require_encrypted_reasoning: bool,
+        failure_detail: Option<ProviderFailureDetail>,
+    ) -> Self {
         Self {
             require_encrypted_reasoning,
+            failure_detail,
             ..Self::default()
         }
     }
@@ -2730,8 +2799,10 @@ impl OpenAiResponseDecoder {
             "response.output_item.added" => self.add_function_call(&event)?,
             "response.function_call_arguments.delta" => self.append_function_arguments(&event)?,
             "response.function_call_arguments.done" => self.finish_function_call(&event)?,
-            "error" => return Err(upstream_error(&event)),
-            "response.failed" => return Err(response_failed_error(&event)),
+            "error" => return Err(upstream_error(&event, self.failure_detail.as_ref())),
+            "response.failed" => {
+                return Err(response_failed_error(&event, self.failure_detail.as_ref()));
+            }
             "response.completed" | "response.done" => {
                 self.capture_response_id(&event)?;
                 self.usage = Some(usage_from_event(&event));
@@ -3062,13 +3133,42 @@ fn usage_from_event(event: &Value) -> Usage {
     }
 }
 
-fn upstream_error(event: &Value) -> Error {
-    let _ = event;
+/// The message text an `error` or `response.failed` event carries, checking
+/// the shapes the OpenAI Responses API is known to use: a top-level `error`
+/// object, an `error` nested under `response` (how `response.failed` reports
+/// it), or a bare top-level `message`. Returns `None` when no such field is
+/// present.
+///
+/// This text is upstream-authored and unredacted, so it must reach only a
+/// [`ProviderFailureDetail`] handle, never `Error::Provider`'s own message:
+/// that type's `Display`/`Debug` output is a much wider surface (it is
+/// observed directly by callers with no redaction boundary of their own),
+/// while a `ProviderFailureDetail` handle is redacted before it reaches a
+/// user-visible sink.
+fn event_error_detail(event: &Value) -> Option<&str> {
+    let nested_error = event.get("error").or_else(|| {
+        event
+            .get("response")
+            .and_then(|response| response.get("error"))
+    });
+    nested_error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| event.get("message").and_then(Value::as_str))
+        .filter(|message| !message.is_empty())
+}
+
+fn upstream_error(event: &Value, failure_detail: Option<&ProviderFailureDetail>) -> Error {
+    if let Some((detail, failure_detail)) = event_error_detail(event).zip(failure_detail) {
+        failure_detail.record(detail);
+    }
     Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
 }
 
-fn response_failed_error(event: &Value) -> Error {
-    let _ = event;
+fn response_failed_error(event: &Value, failure_detail: Option<&ProviderFailureDetail>) -> Error {
+    if let Some((detail, failure_detail)) = event_error_detail(event).zip(failure_detail) {
+        failure_detail.record(detail);
+    }
     Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
 }
 
@@ -3340,6 +3440,81 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn provider_failure_detail_records_and_takes_once() {
+        let detail = ProviderFailureDetail::new();
+        assert_eq!(detail.take(), None);
+
+        detail.record("first failure");
+
+        assert_eq!(detail.take(), Some("first failure".to_owned()));
+        assert_eq!(detail.take(), None);
+    }
+
+    #[test]
+    fn provider_failure_detail_ignores_empty_records() {
+        let detail = ProviderFailureDetail::new();
+
+        detail.record("");
+
+        assert_eq!(detail.take(), None);
+    }
+
+    #[test]
+    fn provider_failure_detail_bounds_long_text_with_a_visible_marker() {
+        let detail = ProviderFailureDetail::new();
+        let long = "a".repeat(MAX_PROVIDER_FAILURE_DETAIL_CHARS + 500);
+
+        detail.record(&long);
+
+        let captured = detail.take().expect("bounded text should be recorded");
+        assert!(captured.starts_with(&"a".repeat(64)));
+        assert!(captured.ends_with(PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER));
+        assert_eq!(
+            captured.chars().count(),
+            MAX_PROVIDER_FAILURE_DETAIL_CHARS
+                + PROVIDER_FAILURE_DETAIL_TRUNCATION_MARKER.chars().count()
+        );
+    }
+
+    #[test]
+    fn provider_failure_detail_under_cap_is_untouched() {
+        let detail = ProviderFailureDetail::new();
+
+        detail.record("short failure detail");
+
+        assert_eq!(detail.take(), Some("short failure detail".to_owned()));
+    }
+
+    #[test]
+    fn upstream_and_response_failed_events_record_their_message_but_keep_generic_error_text() {
+        let failure_detail = ProviderFailureDetail::new();
+        let mut decoder = OpenAiResponseDecoder::new(false, Some(failure_detail.clone()));
+
+        let error = decoder
+            .process(r#"{"type":"error","message":"the model is temporarily overloaded"}"#)
+            .expect_err("an error event should fail decoding");
+        assert_eq!(
+            error,
+            Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
+        );
+        assert_eq!(
+            failure_detail.take(),
+            Some("the model is temporarily overloaded".to_owned())
+        );
+
+        let error = decoder
+            .process(
+                r#"{"type":"response.failed","response":{"error":{"message":"rate limited"}}}"#,
+            )
+            .expect_err("a response.failed event should fail decoding");
+        assert_eq!(
+            error,
+            Error::Provider("OpenAI stream failed: upstream provider reported an error".to_owned())
+        );
+        assert_eq!(failure_detail.take(), Some("rate limited".to_owned()));
+    }
+
+    #[test]
     fn queued_coordination_encodes_only_nonempty_user_text_as_user_input() {
         assert_eq!(
             queued_user_input(vec![Message {
@@ -3446,41 +3621,24 @@ mod tests {
         fs::remove_dir_all(directory).expect("temporary directory should be removed");
     }
 
+    /// Every failure content that reaches this layer has already passed through the dispatcher,
+    /// which is the designated containment point: it applies credential redaction and host-path
+    /// withholding before the content is ever stored. Collapsing it a second time here would
+    /// discard the failing command's own output — the detail the model needs to recover — and
+    /// would disagree with the resumed-history encoder, which replays the same content verbatim.
     #[test]
-    fn task_terminal_errors_remain_actionable_while_other_tool_failures_stay_redacted() {
-        assert_eq!(
-            model_visible_tool_output("task: requested skill is unavailable", true),
-            "task: requested skill is unavailable"
-        );
-        assert_eq!(
-            model_visible_tool_output("task: requested model is unavailable [ref: 84ca0a64]", true,),
-            "task: requested model is unavailable [ref: 84ca0a64]"
-        );
-        assert_eq!(
-            model_visible_tool_output("bash: SENTINEL_SECRET", true),
-            "Tool execution failed"
-        );
-    }
-
-    #[test]
-    fn terminal_detail_reaches_the_model_only_from_its_closed_sets() {
+    fn model_visible_tool_output_forwards_the_content_the_dispatcher_sanitized() {
         for content in [
+            "bash: cargo test\n[stderr]\ntest tests::works ... FAILED\n[exit status: 101]",
+            "read: [path]: No such file or directory",
+            "api_key=[redacted: 19 characters] was rejected",
+            "task: requested skill is unavailable",
+            "task: requested model is unavailable [ref: 84ca0a64]",
             "task: provider failure [cause: rate limited]",
             "task: requested skill is unavailable [skill: sdd-explore; not declared by the agent]",
+            "permission denied",
         ] {
-            assert_eq!(model_visible_tool_output(content, true), content);
-        }
-
-        for forged in [
-            "task: provider failure [cause: /etc/passwd]",
-            "task: requested skill is unavailable [skill: sdd-explore; /home/user/notes.md]",
-            "task: requested skill is unavailable [skill: /home/user; not in the skill catalog]",
-        ] {
-            assert_eq!(
-                model_visible_tool_output(forged, true),
-                "Tool execution failed",
-                "{forged} must not reach the model"
-            );
+            assert_eq!(model_visible_tool_output(content), content);
         }
     }
 

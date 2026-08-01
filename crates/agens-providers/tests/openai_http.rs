@@ -7,11 +7,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agens_core::{
-    HeadlessTurnCancellation, HeadlessTurnPortError, RequestConfig, TurnEvent, TurnProvider,
+    HeadlessTurnCancellation, HeadlessTurnPortError, MessagePart, RequestConfig, TurnEvent,
+    TurnProvider,
 };
 use agens_providers::{
     OpenAiFunctionTool, OpenAiResponsesProvider, ProviderDiagnosticClass, ProviderDiagnosticKind,
-    ProviderDiagnosticScope, ProviderDiagnostics,
+    ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
 };
 use serde_json::json;
 
@@ -228,6 +229,179 @@ fn openai_transport_uses_frozen_failure_precedence() {
         );
         server.join();
     }
+}
+
+#[test]
+fn rejected_status_records_body_status_and_model_for_a_user_visible_sink() {
+    let server = LocalResponsesServer::start_error_response(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#,
+    );
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "gpt-9-missing".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        provider_runtime()
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .map(|_| ()),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    let detail = failure_detail
+        .take()
+        .expect("a rejected request should record failure detail");
+    assert!(detail.contains("400"), "{detail}");
+    assert!(detail.contains("gpt-9-missing"), "{detail}");
+    assert!(
+        detail.contains("The model `gpt-9-missing` does not exist"),
+        "{detail}"
+    );
+
+    server.join();
+}
+
+#[test]
+fn no_failure_detail_handle_means_nothing_is_recorded() {
+    let server = LocalResponsesServer::start_error_response(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#,
+    );
+
+    assert_eq!(
+        run_provider(
+            server.base_url(),
+            HeadlessTurnCancellation::new(),
+            Duration::from_secs(1),
+        ),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    server.join();
+}
+
+#[test]
+fn mid_stream_response_failed_event_records_its_payload_for_a_user_visible_sink() {
+    let server = LocalResponsesServer::start_scripted(vec![concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"the model is temporarily overloaded\"}}}\n\n"
+    )
+    .to_owned()]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        provider_runtime()
+            .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+            .map(|_| ()),
+        Err(HeadlessTurnPortError::ProviderProtocol)
+    );
+
+    assert_eq!(
+        failure_detail.take(),
+        Some("the model is temporarily overloaded".to_owned())
+    );
+
+    server.join();
+}
+
+/// Regression pin for the SSE frame-drain fix (WU-3): with `finish_on_terminal=false`, a
+/// discarded mid-stream decode error must not carry the response's whole output loss with it.
+/// Before that fix, `process_sse_frame` left its buffer undrained on the error path, so the
+/// very next `\n` reprocessed the SAME undrained bytes and this stream reported
+/// `Err(ProviderProtocol)` even though a real, later `output_text.delta` had already arrived —
+/// the whole response was silently lost. Nothing else in this suite pins the recovered
+/// behavior, so a future refactor could reintroduce the loss with every other test green.
+#[test]
+fn a_recovered_mid_stream_error_event_does_not_lose_the_completed_response() {
+    let server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"transient hiccup\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"the answer\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured");
+
+    let parts = provider_runtime()
+        .block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()))
+        .expect("a recovered mid-stream error must not lose the completed response");
+
+    assert_eq!(parts, vec![MessagePart::Text("the answer".to_owned())]);
+
+    server.join();
+}
+
+/// A recovered mid-stream `error` event still records its text into the failure-detail handle
+/// (`upstream_error`) even though the round it happened in ultimately succeeds. `agens-headless`
+/// only drains the handle once per whole attempt, so without a drain at the top of every
+/// `next_parts` call, that recovered incident's text would still be sitting in the handle when a
+/// later, unrelated round in the SAME turn fails — making the stale incident look like the cause
+/// of a failure it had nothing to do with.
+#[test]
+fn a_recovered_mid_stream_error_does_not_leak_into_a_later_same_turn_failure() {
+    let server = LocalResponsesServer::start_scripted(vec![
+        concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data: {\"type\":\"error\",\"message\":\"transient hiccup\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"the answer\"}\n\n",
+            "data: {\"type\":\"response.completed\"}\n\n"
+        )
+        .to_owned(),
+    ]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = OpenAiResponsesProvider::from_api_key_with_timeout(
+        "test-api-key".into(),
+        Some(&server.base_url()),
+        "test-model".into(),
+        "test prompt".into(),
+        Duration::from_secs(1),
+    )
+    .expect("provider should be configured")
+    .with_failure_detail(failure_detail.clone());
+    let runtime = provider_runtime();
+
+    let first_round = runtime.block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()));
+    assert_eq!(
+        first_round,
+        Ok(vec![MessagePart::Text("the answer".to_owned())])
+    );
+
+    // The provider is now `Completed`, so this round fails without recording any new detail —
+    // exactly the shape a later, unrelated same-turn failure would take.
+    let second_round = runtime.block_on(provider.next_parts(&[], &HeadlessTurnCancellation::new()));
+    assert_eq!(
+        second_round.map(|_| ()),
+        Err(HeadlessTurnPortError::Provider)
+    );
+
+    assert_eq!(failure_detail.take(), None);
+
+    server.join();
 }
 
 #[test]
@@ -665,8 +839,11 @@ fn configured_reasoning_effort_is_sent_on_continuation_request() {
     server.join();
 }
 
+/// A failing tool's own output is what the model needs in order to recover, and the dispatcher
+/// has already redacted credentials and withheld host paths from it. The continuation therefore
+/// carries the sanitized content the turn recorded, not a generic placeholder.
 #[test]
-fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
+fn continues_through_two_tool_rounds_and_forwards_the_sanitized_error_output() {
     let mut server = LocalResponsesServer::start_scripted(vec![
         tool_call_response("resp_first", "fc_first", "call_first"),
         tool_call_response("resp_second", "fc_second", "call_second"),
@@ -676,13 +853,10 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
     let mut provider = scripted_provider(server.base_url());
     let runtime = provider_runtime();
     let cancellation = HeadlessTurnCancellation::new();
-    let first_events = [tool_result(
-        "call_first",
-        "internal failure: secret=hidden",
-        true,
-    )];
+    let sanitized_failure = "bash: internal failure: secret=[redacted: 6 characters]";
+    let first_events = [tool_result("call_first", sanitized_failure, true)];
     let second_events = [
-        tool_result("call_first", "internal failure: secret=hidden", true),
+        tool_result("call_first", sanitized_failure, true),
         tool_result("call_second", "second result", false),
     ];
 
@@ -709,7 +883,7 @@ fn continues_through_two_tool_rounds_and_sanitizes_error_outputs() {
         json!({
             "model": "test-model",
             "previous_response_id": "resp_first",
-            "input": [{"type": "function_call_output", "call_id": "call_first", "output": "Tool execution failed"}],
+            "input": [{"type": "function_call_output", "call_id": "call_first", "output": sanitized_failure}],
             "parallel_tool_calls": true,
             "stream": true,
         })

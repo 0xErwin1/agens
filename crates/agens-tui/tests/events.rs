@@ -2438,13 +2438,21 @@ fn typed_provider_completion_keeps_success_clean_and_failure_actionable() {
         failure.transcript(),
         [
             TranscriptEntry::User("request".into()),
-            TranscriptEntry::Error("[redacted]".into()),
+            TranscriptEntry::Error("provider: token=[redacted: 8 characters]".into()),
         ]
     );
     let view = failure.view();
     assert_eq!(view.turn_state, Some(TurnState::Failed));
     assert_eq!(view.conversation.unwrap().errors.len(), 1);
-    assert_eq!(view.conversation.unwrap().errors[0].message, "[redacted]");
+    assert_eq!(
+        view.conversation.unwrap().errors[0].message,
+        "provider: token=[redacted: 8 characters]"
+    );
+    assert!(
+        !view.conversation.unwrap().errors[0]
+            .message
+            .contains("SENTINEL")
+    );
     assert!(view.conversation.unwrap().final_markdown.is_none());
 }
 

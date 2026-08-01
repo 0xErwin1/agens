@@ -14,7 +14,7 @@ use agens_core::{
 };
 use agens_providers::{
     ChatGptResponsesProvider, OpenAiFunctionTool, ProgressAwareProvider, ProviderDiagnosticClass,
-    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics,
+    ProviderDiagnosticKind, ProviderDiagnosticScope, ProviderDiagnostics, ProviderFailureDetail,
 };
 use serde_json::{Value, json};
 
@@ -353,6 +353,49 @@ fn subscription_transport_bounds_error_bodies_before_an_open_connection() {
     );
 
     server.join();
+    fs::remove_dir_all(directory).expect("temporary directory should be removed");
+}
+
+#[test]
+fn rejected_status_records_body_status_and_model_for_a_user_visible_sink() {
+    let directory = temporary_directory("failure-detail");
+    let credentials = write_credentials(&directory);
+    let server = ScriptedServer::start(vec![ScriptedResponse::Json(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `gpt-9-missing` does not exist"}}"#
+            .to_owned(),
+    )]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider =
+        ChatGptResponsesProvider::from_credentials_with_tools_and_timeout_and_auth_url(
+            &credentials,
+            Some(&server.responses_base_url()),
+            Some(&server.oauth_url()),
+            "gpt-9-missing".to_owned(),
+            "test instructions".to_owned(),
+            "test input".to_owned(),
+            Vec::new(),
+            Duration::from_secs(1),
+        )
+        .expect("provider should be configured")
+        .with_failure_detail(failure_detail.clone());
+
+    assert_eq!(
+        run(&mut provider, HeadlessTurnCancellation::new()),
+        Err(HeadlessTurnPortError::ProviderRejected)
+    );
+
+    let detail = failure_detail
+        .take()
+        .expect("a rejected request should record failure detail");
+    assert!(detail.contains("400"), "{detail}");
+    assert!(detail.contains("gpt-9-missing"), "{detail}");
+    assert!(
+        detail.contains("The model `gpt-9-missing` does not exist"),
+        "{detail}"
+    );
+
+    assert_eq!(server.join().len(), 1);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 }
 
@@ -1903,7 +1946,7 @@ fn subscription_tool_replay_rejects_replayed_or_malformed_wire_items_without_ret
 }
 
 #[test]
-fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
+fn subscription_tool_replay_forwards_error_outputs_and_rejects_item_history_and_round_bounds_before_http()
  {
     let directory = temporary_directory("error-output");
     let credentials = write_credentials(&directory);
@@ -1913,25 +1956,19 @@ fn subscription_tool_replay_sanitizes_error_outputs_and_rejects_item_history_and
     ]);
     let mut provider = subscription_provider(&credentials, &server);
     assert!(run_with_events(&mut provider, &[], HeadlessTurnCancellation::new()).is_ok());
+    // The dispatcher is the containment point: it redacts before the content is recorded, so
+    // what reaches the replay is already sanitized and is carried through unchanged.
+    let sanitized_failure = "read: secret=[redacted: 13 characters]";
     assert!(
         run_with_events(
             &mut provider,
-            &[tool_result("call_1", "secret=must-not-leak", true)],
+            &[tool_result("call_1", sanitized_failure, true)],
             HeadlessTurnCancellation::new(),
         )
         .is_ok()
     );
     let requests = server.join();
-    assert_eq!(
-        requests[1].body["input"][3]["output"],
-        "Tool execution failed"
-    );
-    assert!(
-        !requests[1]
-            .body
-            .to_string()
-            .contains("secret=must-not-leak")
-    );
+    assert_eq!(requests[1].body["input"][3]["output"], sanitized_failure);
     fs::remove_dir_all(directory).expect("temporary directory should be removed");
 
     let oversized_items = (0..=512)

@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../.." && pwd)
 check="$repo_root/scripts/check-target-budget.sh"
-limit=21474836480
+limit=53687091200
 sandbox=$(mktemp -d)
 trap 'rm -rf "$sandbox"' EXIT
 

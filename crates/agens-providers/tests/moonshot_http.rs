@@ -15,7 +15,7 @@ use agens_core::{
     HeadlessTurnCancellation, HeadlessTurnPortError, Message, MessagePart, ReasoningEffort,
     RequestConfig, Role, TurnEvent, TurnProvider,
 };
-use agens_providers::{MoonshotProvider, OpenAiFunctionTool};
+use agens_providers::{MoonshotProvider, OpenAiFunctionTool, ProviderFailureDetail};
 use serde_json::{Value, json};
 
 const SECRET_BODY_SENTINEL: &str = "SENTINEL_REMOTE_ERROR_BODY";
@@ -236,6 +236,83 @@ fn a_rejected_request_never_leaks_its_body_into_the_error() {
         !rendered.contains(SECRET_BODY_SENTINEL),
         "the remote body must not reach the error: {rendered}"
     );
+}
+
+#[test]
+fn a_rejected_request_records_body_status_and_model_for_a_user_visible_sink() {
+    let server = ErrorServer::start(
+        400,
+        r#"{"error":{"code":"model_not_found","message":"The model `kimi-missing` does not exist"}}"#,
+    );
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = MoonshotProvider::from_api_key_with_tools_and_timeout(
+        "test-key".to_owned(),
+        Some(&format!("http://{}/v1", server.address)),
+        "kimi-missing".to_owned(),
+        "hello".to_owned(),
+        Vec::new(),
+        Duration::from_secs(5),
+    )
+    .expect("provider should build")
+    .with_failure_detail(failure_detail.clone());
+    let cancellation = HeadlessTurnCancellation::new();
+
+    let error = runtime()
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect_err("a rejected request must fail");
+
+    assert_eq!(error, HeadlessTurnPortError::ProviderRejected);
+    let detail = failure_detail
+        .take()
+        .expect("a rejected request should record failure detail");
+    assert!(detail.contains("400"), "{detail}");
+    assert!(detail.contains("kimi-missing"), "{detail}");
+    assert!(
+        detail.contains("The model `kimi-missing` does not exist"),
+        "{detail}"
+    );
+}
+
+/// One `ProviderFailureDetail` handle is shared by every continuation round of one attempt, and
+/// `agens-headless` drains it once per whole attempt. A round that records detail for an incident
+/// it then recovers from would leave that text in the handle, so a later, unrelated round's
+/// failure would be reported with a cause it never had. Every round therefore starts clean.
+#[test]
+fn each_continuation_round_starts_from_a_clean_failure_detail_handle() {
+    let server = SseServer::start(vec![sse(&[
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_0",
+            "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}]},
+            "finish_reason": null}]}),
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+    ])]);
+    let failure_detail = ProviderFailureDetail::new();
+    let mut provider = MoonshotProvider::from_api_key_with_tools_and_timeout(
+        "test-key".to_owned(),
+        Some(&format!("http://{}/v1", server.address)),
+        "kimi-k3".to_owned(),
+        "hello".to_owned(),
+        vec![weather_tool()],
+        Duration::from_secs(5),
+    )
+    .expect("provider should build")
+    .with_failure_detail(failure_detail.clone());
+    let cancellation = HeadlessTurnCancellation::new();
+    let runtime = runtime();
+
+    runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect("the first round should complete");
+
+    // Stands in for a recording site inside the round above whose enclosing round still
+    // succeeded, which is the only way stale detail can outlive the round that produced it.
+    failure_detail.record("recovered mid-round incident");
+
+    let error = runtime
+        .block_on(provider.next_parts(&[], &cancellation))
+        .expect_err("a continuation without tool results must fail");
+
+    assert_eq!(error, HeadlessTurnPortError::Provider);
+    assert_eq!(failure_detail.take(), None);
 }
 
 #[test]

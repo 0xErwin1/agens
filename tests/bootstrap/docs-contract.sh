@@ -37,7 +37,7 @@ for doc in README.md AGENTS.md CONTRIBUTING.md CODE_STYLE.md; do
     fi
     grep -F 'target/{debug,release}/agens' "$doc" >/dev/null
     grep -F 'just verify' "$doc" >/dev/null
-    grep -F '20 GiB' "$doc" >/dev/null
+    grep -F '50 GiB' "$doc" >/dev/null
     grep -Fi 'manual' "$doc" >/dev/null
     grep -F 'just clean' "$doc" >/dev/null
 

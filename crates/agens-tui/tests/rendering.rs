@@ -2461,15 +2461,32 @@ fn renderer_sanitizes_runtime_errors_and_preserves_the_action() {
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
 
-    for secret in [
-        "key-sentinel",
-        "header-sentinel",
-        "path-sentinel",
-        "prompt-sentinel",
-    ] {
+    // Credential-shaped values are withheld, but only the value — never the whole message.
+    for secret in ["key-sentinel", "header-sentinel"] {
         assert!(!text.contains(secret), "leaked {secret:?} in {text:?}");
     }
-    assert!(text.contains("[redacted]"), "{text:?}");
+    assert!(
+        !text.contains("[redacted]"),
+        "whole message wiped: {text:?}"
+    );
+    assert!(
+        text.contains("api_key=[redacted:"),
+        "surrounding text around the key must survive: {text:?}"
+    );
+    assert!(
+        text.contains("Authorization: [redacted:"),
+        "surrounding text around the header must survive: {text:?}"
+    );
+
+    // `path:` and `prompt:` are not credential keys, and this sink is user-visible-only, so host
+    // paths and prompt text are allowed to survive verbatim.
+    for benign in ["path-sentinel", "prompt-sentinel"] {
+        assert!(
+            text.contains(benign),
+            "benign text must survive on a user-visible-only sink: {benign:?} missing in {text:?}"
+        );
+    }
+
     assert!(
         text.contains("Action: Retry after updating credentials."),
         "{text:?}"

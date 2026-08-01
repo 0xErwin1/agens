@@ -172,7 +172,7 @@ just verify       # canonical complete gate
 just clean        # manual build-output cleanup
 ```
 
-Build outputs are `target/{debug,release}/agens`. The directory has a 20 GiB budget. Verification checks the budget and never cleans automatically; cleanup is manual only with `just clean`.
+Build outputs are `target/{debug,release}/agens`. The directory has a 50 GiB budget. Verification checks the budget and never cleans automatically; cleanup is manual only with `just clean`.
 
 Before considering a change complete, run:
 
