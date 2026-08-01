@@ -8,12 +8,25 @@
 //! that turns a file back into them.
 
 mod diff;
+mod guard;
 mod reader;
 mod schema;
+
+#[cfg(feature = "enabled")]
+mod recorder;
+#[cfg(feature = "enabled")]
+mod tracing_layer;
 
 pub use diff::{
     AdvisoryFinding, CompareError, DiffReport, SpanAggregate, SpanFinding, TraceAssemblyError,
     TraceSide, compare, render_text,
 };
+pub use guard::{Guard, Pending};
 pub use reader::{TraceReadError, read_trace};
-pub use schema::{Record, RunMetadata, SCHEMA_VERSION, SpanRecord};
+pub use schema::{
+    FIELD_SCENARIO, FIELD_TERMINAL_SIZE, FIELD_TRANSCRIPT_LINES, Record, RunMetadata,
+    SCHEMA_VERSION, SpanRecord,
+};
+
+#[cfg(feature = "enabled")]
+pub use recorder::{PerfError, Recorder, RecorderConfig, TracePaths};

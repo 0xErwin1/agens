@@ -11,6 +11,25 @@ use serde::{Deserialize, Serialize};
 /// Bumped only when a change to this file breaks an existing reader.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Conventional key, inside [`RunMetadata::fields`], for the scenario name.
+///
+/// The comparator refuses to compare two traces whose value under this key
+/// differs. A writer and a reader that spell this key differently would turn
+/// that refusal into a silent no-op, so every writer and reader in this
+/// crate reads and writes the scenario name through this constant rather
+/// than a string literal.
+pub const FIELD_SCENARIO: &str = "scenario";
+
+/// Conventional key, inside [`RunMetadata::fields`], for the terminal size
+/// the scenario ran at. See [`FIELD_SCENARIO`] for why this is a constant
+/// rather than a string literal.
+pub const FIELD_TERMINAL_SIZE: &str = "terminal_size";
+
+/// Conventional key, inside [`RunMetadata::fields`], for the line count of
+/// the transcript fixture the scenario ran against. See [`FIELD_SCENARIO`]
+/// for why this is a constant rather than a string literal.
+pub const FIELD_TRANSCRIPT_LINES: &str = "transcript_lines";
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "record", rename_all = "snake_case")]
 pub enum Record {

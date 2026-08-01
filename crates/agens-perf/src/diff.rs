@@ -10,9 +10,10 @@
 //!
 //! `RunMetadata` carries no typed `scenario` or `terminal_size` field; the
 //! design's public API reserves those for the open `fields` map. This module
-//! reads them from `fields` under the conventional keys `"scenario"` and
-//! `"terminal_size"` rather than extending the schema landed by an earlier
-//! batch.
+//! reads them from `fields` under [`crate::schema::FIELD_SCENARIO`] and
+//! [`crate::schema::FIELD_TERMINAL_SIZE`] rather than extending the schema
+//! landed by an earlier batch. `Recorder` writes under the same constants,
+//! so a writer and this reader cannot drift apart on the key spelling.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -281,8 +282,8 @@ fn metadata_warnings(base: &RunMetadata, new: &RunMetadata) -> Vec<String> {
         ));
     }
 
-    let base_terminal_size = base.fields.get("terminal_size");
-    let new_terminal_size = new.fields.get("terminal_size");
+    let base_terminal_size = base.fields.get(crate::schema::FIELD_TERMINAL_SIZE);
+    let new_terminal_size = new.fields.get(crate::schema::FIELD_TERMINAL_SIZE);
 
     if base_terminal_size != new_terminal_size {
         warnings.push(format!(
@@ -368,8 +369,16 @@ pub fn compare(base: Vec<Record>, new: Vec<Record>) -> Result<DiffReport, Compar
         });
     }
 
-    let base_scenario = base.metadata.fields.get("scenario").cloned();
-    let new_scenario = new.metadata.fields.get("scenario").cloned();
+    let base_scenario = base
+        .metadata
+        .fields
+        .get(crate::schema::FIELD_SCENARIO)
+        .cloned();
+    let new_scenario = new
+        .metadata
+        .fields
+        .get(crate::schema::FIELD_SCENARIO)
+        .cloned();
 
     if base_scenario != new_scenario {
         return Err(CompareError::ScenarioMismatch {
@@ -536,7 +545,10 @@ mod tests {
     }
 
     fn scenario_fields(name: &str) -> Vec<(&'static str, serde_json::Value)> {
-        vec![("scenario", serde_json::Value::String(name.to_string()))]
+        vec![(
+            crate::schema::FIELD_SCENARIO,
+            serde_json::Value::String(name.to_string()),
+        )]
     }
 
     #[test]
@@ -748,12 +760,12 @@ mod tests {
     fn comparing_traces_with_different_terminal_sizes_produces_a_warning_naming_both_sizes() {
         let mut base_extra = scenario_fields("resize");
         base_extra.push((
-            "terminal_size",
+            crate::schema::FIELD_TERMINAL_SIZE,
             serde_json::json!({"columns": 80, "rows": 24}),
         ));
         let mut new_extra = scenario_fields("resize");
         new_extra.push((
-            "terminal_size",
+            crate::schema::FIELD_TERMINAL_SIZE,
             serde_json::json!({"columns": 120, "rows": 40}),
         ));
 
