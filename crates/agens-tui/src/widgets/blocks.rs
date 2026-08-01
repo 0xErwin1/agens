@@ -182,23 +182,11 @@ pub(crate) trait BlockContent {
     fn lines(&self, mode: DisplayMode) -> Vec<BlockLine>;
 
     /// Mode used when no explicit mode is recorded for this block.
+    ///
+    /// The recorded mode is a reader override, so this answers what the block
+    /// shows before anyone asked for anything else.
     fn default_mode(&self) -> DisplayMode {
         DisplayMode::Collapsed
-    }
-
-    /// Mode applied automatically once the block finishes.
-    ///
-    /// Currently implicit: an absent mode entry already resolves to
-    /// [`BlockContent::default_mode`].
-    #[allow(dead_code)]
-    fn mode_on_finish(&self) -> DisplayMode {
-        DisplayMode::Collapsed
-    }
-
-    /// Next mode in the Ctrl+O cycle from `current`.
-    #[allow(dead_code)]
-    fn next_mode(&self, current: DisplayMode) -> DisplayMode {
-        current.next()
     }
 
     /// Accent color for the block's gutter/bullet.
@@ -726,9 +714,12 @@ impl BlockContent for ToolCallBlock<'_> {
         lines
     }
 
+    /// A settled call costs one row and keeps its raw input behind the audit
+    /// mode; a pending one keeps a bounded preview so live work stays visible
+    /// while it happens.
     fn default_mode(&self) -> DisplayMode {
         if self.result.is_some() {
-            DisplayMode::Expanded
+            DisplayMode::Collapsed
         } else {
             DisplayMode::Truncated
         }
@@ -1213,7 +1204,11 @@ mod tests {
             state: RowState::Success,
             result: Some(&result),
         };
-        assert_eq!(block.default_mode(), DisplayMode::Expanded);
+        assert_eq!(
+            block.default_mode(),
+            DisplayMode::Collapsed,
+            "a settled call defaults to its single collapsed row, not to the audit view"
+        );
 
         let collapsed = block.lines(DisplayMode::Collapsed);
         assert_eq!(collapsed.len(), 1);

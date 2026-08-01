@@ -863,6 +863,201 @@ fn finished_tool_row_keeps_name_args_and_status_on_one_collapsed_line() {
     assert!(expanded.contains("src/lib.rs"), "{expanded:?}");
 }
 
+/// Raw JSON input for the shared live/restored collapse fixtures below.
+const COLLAPSE_FIXTURE_INPUT: &str = r#"{"command":"cargo test --workspace","timeout_ms":600000}"#;
+const COLLAPSE_FIXTURE_BODY: &str = "body-sentinel-line\nsecond body line\nthird body line";
+
+/// Transcript rows a settled `native::bash` call leaves behind, live or restored.
+fn collapse_fixture_rows(renderer: &RatatuiRenderer<TestBackend>) -> Vec<String> {
+    transcript_rows(renderer)
+        .into_iter()
+        .filter(|row| !row.trim().is_empty())
+        .collect()
+}
+
+fn assert_settled_call_is_one_hidden_row(rows: &[String], origin: &str) {
+    let text = rows.join("\n");
+
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("cargo test --workspace"))
+            .count(),
+        1,
+        "{origin}: a settled call keeps exactly one row: {rows:?}"
+    );
+    assert!(
+        text.contains("Success"),
+        "{origin}: the row still names its outcome: {rows:?}"
+    );
+    assert!(
+        !text.contains("timeout_ms"),
+        "{origin}: raw input stays out of the settled transcript: {rows:?}"
+    );
+    assert!(
+        !text.contains("body-sentinel-line"),
+        "{origin}: the result body stays out of the settled transcript: {rows:?}"
+    );
+}
+
+#[test]
+fn live_tool_call_collapses_when_it_ends_and_hides_its_raw_input() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("run the tests");
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    });
+
+    renderer.render(tui.view()).unwrap();
+    let running = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        running.contains("cargo test --workspace"),
+        "a running call names its work: {running:?}"
+    );
+    assert!(
+        !running.contains("timeout_ms"),
+        "a running call does not dump its raw input: {running:?}"
+    );
+
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: COLLAPSE_FIXTURE_BODY.into(),
+        is_error: false,
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "bash-1".into(),
+        duration: Some(Duration::from_millis(120)),
+        result: ToolResultState::Success,
+    });
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "live");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let audited = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        audited.contains("timeout_ms"),
+        "the raw input stays reachable through the audit mode: {audited:?}"
+    );
+    assert!(
+        audited.contains("body-sentinel-line"),
+        "the body stays reachable through the audit mode: {audited:?}"
+    );
+}
+
+#[test]
+fn settled_tool_call_without_a_recorded_mode_collapses_and_advances_from_collapsed() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("run the tests");
+    start_execution(&mut tui, 1, "build");
+    // Settling a parent call while a subagent transcript is selected records the
+    // mode against that subagent, so the main transcript reaches this call with
+    // nothing recorded for it.
+    tui.select_transcript(TranscriptId::Subagent(1));
+    tui.apply_progress(TurnEvent::ToolCallRequested {
+        id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+    });
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolStarted {
+        call_id: "bash-1".into(),
+        name: "native::bash".into(),
+        input: COLLAPSE_FIXTURE_INPUT.into(),
+        parsed: agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    });
+    tui.apply_progress(TurnEvent::ToolResult(MessagePart::ToolResult {
+        tool_call_id: "bash-1".into(),
+        content: COLLAPSE_FIXTURE_BODY.into(),
+        is_error: false,
+    }));
+    tui.apply_runtime_event(TuiRuntimeEvent::ToolEnded {
+        call_id: "bash-1".into(),
+        duration: Some(Duration::from_millis(120)),
+        result: ToolResultState::Success,
+    });
+    tui.select_transcript(TranscriptId::Main);
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "unrecorded");
+
+    tui.handle(Event::Key(Key::CtrlO));
+    renderer.render(tui.view()).unwrap();
+    let advanced = collapse_fixture_rows(&renderer).join("\n");
+    assert!(
+        advanced.contains("body-sentinel-line"),
+        "the first press advances out of collapsed instead of re-collapsing: {advanced:?}"
+    );
+    assert!(
+        !advanced.contains("timeout_ms"),
+        "the raw input waits for the audit mode: {advanced:?}"
+    );
+}
+
+#[test]
+fn restored_tool_call_collapses_exactly_like_the_live_path() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 40)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    // Mirrors the production resume path, which parses each restored call's
+    // input before projecting it.
+    let history = agens_tui::Conversation::from_messages_with_parser(
+        &[
+            Message {
+                role: Role::User,
+                parts: vec![MessagePart::Text("run the tests".into())],
+            },
+            Message {
+                role: Role::Assistant,
+                parts: vec![MessagePart::ToolCall {
+                    id: "bash-1".into(),
+                    name: "native::bash".into(),
+                    input: COLLAPSE_FIXTURE_INPUT.into(),
+                }],
+            },
+            Message {
+                role: Role::Tool,
+                parts: vec![MessagePart::ToolResult {
+                    tool_call_id: "bash-1".into(),
+                    content: COLLAPSE_FIXTURE_BODY.into(),
+                    is_error: false,
+                }],
+            },
+        ],
+        // `ToolInput::parse` lives in `agens-permissions`, which this surface may
+        // not depend on; this stands in for what it yields for the fixture input.
+        |_, _| agens_core::ToolInput::Bash {
+            command: "cargo test --workspace".into(),
+        },
+    )
+    .unwrap();
+    tui.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+        message: "Resumed session 1.".into(),
+        presentation: TuiPresentation::new("provider", "model", "session #1"),
+        history,
+        draft: None,
+        resume_error: None,
+        file_candidates: Vec::new(),
+        palette_entries: Vec::new(),
+    });
+
+    renderer.render(tui.view()).unwrap();
+    assert_settled_call_is_one_hidden_row(&collapse_fixture_rows(&renderer), "restored");
+}
+
 #[test]
 fn tool_call_updates_one_row_in_place_when_it_finishes() {
     let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(120, 30)).unwrap());

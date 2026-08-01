@@ -6384,7 +6384,7 @@ where
         let current = completed_call_ids
             .first()
             .and_then(|call_id| modes.get(call_id).copied())
-            .unwrap_or(widgets::DisplayMode::Expanded);
+            .unwrap_or(widgets::DisplayMode::Collapsed);
         let next = current.next();
         for call_id in completed_call_ids {
             modes.insert(call_id, next);

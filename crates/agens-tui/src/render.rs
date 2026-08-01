@@ -400,6 +400,11 @@ fn tool_call_block(
     }
 }
 
+/// Body rows a settled call contributes below its header row.
+///
+/// A body block only exists once the call carries a result, so an absent mode
+/// entry has to resolve the same way `ToolCallBlock::default_mode` resolves it
+/// for a settled call: hidden until the reader asks for it.
 fn tool_result_body_block(
     context: &ItemContext<'_>,
     call_id: &str,
@@ -414,7 +419,7 @@ fn tool_result_body_block(
         .tool_display_modes
         .get(call_id)
         .copied()
-        .unwrap_or(DisplayMode::Expanded);
+        .unwrap_or(DisplayMode::Collapsed);
     if mode == DisplayMode::Collapsed {
         return RenderedBlock::hidden();
     }
