@@ -474,6 +474,31 @@ pub fn bounded_detail(value: &str, max_chars: usize) -> String {
     )
 }
 
+/// Replaces every exact occurrence of a caller-supplied value with a withheld marker.
+///
+/// Unlike [`redact_credential_values`], this does not rely on a recognizable shape: the
+/// caller already knows the literal secret (for example, an MCP server's own configured
+/// transport environment), so it is matched and replaced wherever it appears in `value`,
+/// regardless of surrounding context. Values are matched longest-first so a secret that is a
+/// substring of another configured secret cannot pre-empt the longer match. Empty values are
+/// never matched.
+pub fn redact_exact_values(value: &str, secrets: &[String]) -> String {
+    let mut ordered: Vec<&str> = secrets
+        .iter()
+        .map(String::as_str)
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    ordered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+
+    let mut redacted = value.to_owned();
+    for secret in ordered {
+        if redacted.contains(secret) {
+            redacted = redacted.replace(secret, &redacted_marker(secret));
+        }
+    }
+    redacted
+}
+
 fn truncation_marker(head_chars: usize, tail_chars: usize, total_chars: usize) -> String {
     format!(
         "\n[truncated: kept the first {head_chars} and last {tail_chars} of {total_chars} characters]\n"
@@ -790,5 +815,50 @@ mod tests {
 
         let relative = "see src/main.rs:12 for detail";
         assert_eq!(redact_absolute_paths(relative), relative);
+    }
+
+    #[test]
+    fn redact_exact_values_withholds_only_the_given_values() {
+        let secrets = vec!["SENTINEL_MCP_REMOTE_BODY".to_owned()];
+        let redacted = redact_exact_values(
+            "server rejected the call: SENTINEL_MCP_REMOTE_BODY was invalid",
+            &secrets,
+        );
+
+        assert!(!redacted.contains("SENTINEL_MCP_REMOTE_BODY"));
+        assert!(redacted.starts_with("server rejected the call: [redacted:"));
+        assert!(redacted.ends_with("was invalid"));
+    }
+
+    #[test]
+    fn redact_exact_values_matches_every_occurrence_and_every_configured_secret() {
+        let secrets = vec!["FIRST_SECRET".to_owned(), "SECOND_SECRET".to_owned()];
+        let redacted = redact_exact_values(
+            "FIRST_SECRET arrived twice: FIRST_SECRET, alongside SECOND_SECRET",
+            &secrets,
+        );
+
+        assert!(!redacted.contains("FIRST_SECRET"));
+        assert!(!redacted.contains("SECOND_SECRET"));
+        assert_eq!(redacted.matches("[redacted:").count(), 3);
+    }
+
+    #[test]
+    fn redact_exact_values_leaves_unrelated_text_untouched() {
+        let secrets = vec!["CONFIGURED_SECRET".to_owned()];
+        let benign = "request exceeds 128000 tokens";
+
+        assert_eq!(redact_exact_values(benign, &secrets), benign);
+        assert_eq!(redact_exact_values(benign, &[]), benign);
+    }
+
+    #[test]
+    fn redact_exact_values_ignores_empty_configured_values() {
+        let secrets = vec![String::new(), "REAL_SECRET".to_owned()];
+        let redacted = redact_exact_values("value REAL_SECRET here", &secrets);
+
+        assert!(!redacted.contains("REAL_SECRET"));
+        assert!(redacted.starts_with("value "));
+        assert!(redacted.ends_with(" here"));
     }
 }

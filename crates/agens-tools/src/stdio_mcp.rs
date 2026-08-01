@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use agens_core::redaction::redact_exact_values;
 use serde_json::{Value, json};
 
 use crate::{
@@ -70,11 +71,13 @@ pub struct McpStdioTransport {
     writer: mpsc::SyncSender<WriteRequest>,
     process_id: AtomicU32,
     next_id: AtomicU64,
+    configured_secret_values: Vec<String>,
 }
 
 impl McpStdioTransport {
     pub fn spawn(config: McpStdioTransportConfig) -> Result<Self, McpTransportError> {
         config.validate()?;
+        let configured_secret_values: Vec<String> = config.environment.values().cloned().collect();
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -116,6 +119,7 @@ impl McpStdioTransport {
             writer,
             next_id: AtomicU64::new(1),
             process_id: AtomicU32::new(process_id),
+            configured_secret_values,
         })
     }
 
@@ -227,6 +231,7 @@ impl McpTransport for McpStdioTransport {
         context: &McpOperationContext,
     ) -> Result<McpResponse, McpTransportError> {
         self.request(request, context)
+            .map(|response| redact_configured_secrets(response, &self.configured_secret_values))
     }
 
     fn notify(
@@ -441,6 +446,33 @@ pub(crate) fn parse_response(
     ))
 }
 
+/// Withholds this server's own configured transport secrets from a tool call's `isError`
+/// text before the caller can pass it on as `HeadlessToolOutput`. `map_call_result` otherwise
+/// forwards the server's text verbatim, and a server can echo back exactly the values this
+/// process handed it in `[mcp.files.env]` — the only secrets this transport can know about
+/// without guessing at shape. Every other response variant is returned unchanged.
+fn redact_configured_secrets(response: McpResponse, secrets: &[String]) -> McpResponse {
+    if secrets.is_empty() {
+        return response;
+    }
+    let McpResponse::ToolCalled(result) = response else {
+        return response;
+    };
+    let content = result
+        .content
+        .into_iter()
+        .map(|block| match block {
+            McpContentBlock::Text(text) => {
+                McpContentBlock::Text(redact_exact_values(&text, secrets))
+            }
+        })
+        .collect();
+    McpResponse::ToolCalled(McpCallResult {
+        content,
+        is_error: result.is_error,
+    })
+}
+
 fn parse_tool(value: &Value) -> Result<McpToolDefinition, McpTransportError> {
     Ok(McpToolDefinition {
         name: value
@@ -495,5 +527,55 @@ mod tests {
             Some(2),
         );
         assert_eq!(present["params"], json!({"cursor": "next"}));
+    }
+
+    /// The server's own configured environment values are the only secrets this transport can
+    /// know about, so a tool call whose `isError` text echoes one back is redacted by that exact
+    /// value before the caller ever sees it — no shape detection involved.
+    #[test]
+    fn tool_called_responses_redact_the_servers_own_configured_secret_values() {
+        let secrets = vec!["CONFIGURED_TRANSPORT_SECRET".to_owned()];
+        let response = McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text(
+                "server rejected the call: CONFIGURED_TRANSPORT_SECRET was invalid".into(),
+            )],
+            is_error: true,
+        });
+
+        let redacted = redact_configured_secrets(response, &secrets);
+
+        let McpResponse::ToolCalled(result) = redacted else {
+            panic!("expected a ToolCalled response");
+        };
+        assert!(result.is_error);
+        let McpContentBlock::Text(text) = &result.content[0];
+        assert!(!text.contains("CONFIGURED_TRANSPORT_SECRET"));
+        assert!(text.starts_with("server rejected the call: [redacted:"));
+        assert!(text.ends_with("was invalid"));
+    }
+
+    #[test]
+    fn tool_called_responses_are_unchanged_when_no_secrets_are_configured() {
+        let response = McpResponse::ToolCalled(McpCallResult {
+            content: vec![McpContentBlock::Text("no secrets here".into())],
+            is_error: false,
+        });
+
+        let redacted = redact_configured_secrets(response.clone(), &[]);
+
+        assert_eq!(redacted, response);
+    }
+
+    #[test]
+    fn non_tool_called_responses_are_unaffected() {
+        let response = McpResponse::ProtocolError(McpProtocolError::new(
+            -32000,
+            "CONFIGURED_TRANSPORT_SECRET failed",
+        ));
+        let secrets = vec!["CONFIGURED_TRANSPORT_SECRET".to_owned()];
+
+        let redacted = redact_configured_secrets(response.clone(), &secrets);
+
+        assert_eq!(redacted, response);
     }
 }
