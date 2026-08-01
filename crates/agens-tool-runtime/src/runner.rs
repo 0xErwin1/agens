@@ -12,10 +12,11 @@ use agens_core::HeadlessTurnError;
 use agens_core::{HeadlessTurnCancellation, MessagePart, TurnEvent, TurnProgressSink};
 use agens_core::{SubagentErrorKind, SubagentStatus};
 use agens_core::{TuiExecutionEvent, TuiRuntimeEvent, TuiSubagentEvent};
+#[cfg(any(test, feature = "probe"))]
+use agens_tools::TaskProviderFailure;
 use agens_tools::{
     TaskExecutionEvent, TaskExecutionLifecycle, TaskExecutionRegistry, TaskLaunchMode,
-    TaskProviderFailure, TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest,
-    TaskTurnResult,
+    TaskRunContext, TaskRunner, TaskRunnerError, TaskTurnRequest, TaskTurnResult,
 };
 
 use crate::child::{ChildRunError, ProductionTaskExecutionContext, run_production_task};
