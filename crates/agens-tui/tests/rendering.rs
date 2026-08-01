@@ -335,7 +335,9 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
     assert!(
-        before_usage.contains("gpt-4.1 · high ·    0/200k   0% · ~/d/p/agens · ask ^⇧P · Ready"),
+        before_usage.contains(
+            "gpt-4.1 · high ·    0/200k   0% · tools hidden ^O · ~/d/p/agens · ask ^⇧P · Ready"
+        ),
         "{before_usage:?}"
     );
     assert!(!before_usage.contains("model · default · ctx —"));
@@ -355,7 +357,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let next_turn = rendered_text(&renderer);
     assert!(
-        next_turn.contains("gpt-4.1 · high ·  71k/200k  36% · ~/d/p/agens"),
+        next_turn.contains("gpt-4.1 · high ·  71k/200k  36% · tools hidden ^O · ~/d/p/agens"),
         "{next_turn:?}"
     );
 }
@@ -809,8 +811,8 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
             },
         ])
         .unwrap();
-        // Finished restored history: thinking-first, then tools.
-        tui.handle(Event::Key(Key::CtrlO));
+        // Finished restored history: reasoning and tool output, one key each.
+        tui.handle(Event::Key(Key::CtrlT));
         tui.handle(Event::Key(Key::CtrlO));
     } else {
         tui.begin_submission("USER_BODY");
@@ -868,7 +870,7 @@ fn assert_conversation_content_column(width: u16, restored: bool) {
 }
 
 #[test]
-fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
+fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_t_re_expands() {
     let terminal = Terminal::new(TestBackend::new(64, 24)).unwrap();
     let mut renderer = RatatuiRenderer::new(terminal);
     let mut tui = Tui::new(FakeEngine);
@@ -898,7 +900,7 @@ fn thinking_streams_expanded_auto_collapses_on_finish_and_ctrl_o_re_expands() {
     assert!(!collapsed.contains("THOUGHTTOKEN"), "{collapsed:?}");
     assert!(tui.view().collapse_thinking);
 
-    tui.handle(Event::Key(Key::CtrlO));
+    tui.handle(Event::Key(Key::CtrlT));
     renderer.render(tui.view()).unwrap();
     let reexpanded = rendered_text(&renderer);
     assert!(reexpanded.contains("THOUGHTTOKEN"), "{reexpanded:?}");
@@ -1443,8 +1445,8 @@ fn collapsed_thinking_occupies_exactly_one_row_and_names_the_finished_thought() 
     let thought_row = rendered_row(&renderer, "Thought");
     assert_eq!(
         rendered_line(&renderer, thought_row).trim(),
-        "Thought",
-        "no duration is tracked for reasoning, so the bare form renders"
+        "Thought  ^T",
+        "no duration is tracked for reasoning, so the bare form renders beside its key"
     );
     let rows = transcript_rows(&renderer);
     assert_eq!(
@@ -2733,8 +2735,8 @@ fn restored_messages_render_every_turn_and_typed_part_in_persisted_order() {
         message(Role::Assistant, text("second answer")),
     ];
     tui.replace_history(&messages).unwrap();
-    // Thinking-first then tools for restored finished history.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Reasoning and tool output for restored finished history, one key each.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let text = rendered_text(&renderer);
@@ -4246,8 +4248,8 @@ fn active_transcript_render_keeps_child_rows_out_of_main_and_renders_owner_navig
     assert!(main.contains("child-final-sentinel"), "{main:?}");
 
     tui.select_transcript(TranscriptId::Subagent(7));
-    // Ctrl+O is thinking-first, then tools.
-    tui.handle(Event::Key(Key::CtrlO));
+    // Ctrl+T shows the reasoning, Ctrl+O the tool output.
+    tui.handle(Event::Key(Key::CtrlT));
     tui.handle(Event::Key(Key::CtrlO));
     renderer.render(tui.view()).unwrap();
     let child = rendered_text(&renderer);
@@ -4490,8 +4492,8 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
     assert_eq!(
         rendered_line(&renderer, usize::from(bottom)),
         format!(
-            "    └{} model — · effort — · ctx — · agens · ask ^⇧P · Ready ┘    ",
-            "─".repeat(36)
+            "    └{} model — · effort — · ctx — · tools hidden ^O · agens · ask ^⇧P · Ready ┘    ",
+            "─".repeat(18)
         ),
         "the metadata is spliced into the composer border, one gap off the corner"
     );
@@ -4531,13 +4533,19 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
 
 #[test]
 fn border_metadata_drops_segments_as_the_composer_narrows() {
-    // The declared shed order: effort, then the directory, then the context,
-    // then the approval mode, leaving the model and the turn outcome last.
+    // The declared shed order: the detail level, then effort, then the
+    // directory, then the context, then the approval mode, leaving the model
+    // and the turn outcome last.
     for (width, present, absent) in [
         (
             100_u16,
-            "model — · effort — · ctx — · agens · ask ^⇧P · Ready",
+            "model — · effort — · ctx — · tools hidden ^O · agens · ask ^⇧P · Ready",
             "",
+        ),
+        (
+            72,
+            "model — · effort — · ctx — · agens · ask ^⇧P · Ready",
+            "tools hidden",
         ),
         (56, "model — · ctx — · agens · ask ^⇧P · Ready", "effort —"),
         (52, "model — · ctx — · ask ^⇧P · Ready", "agens"),
