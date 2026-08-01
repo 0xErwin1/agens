@@ -90,12 +90,7 @@ const RANK_APPROVAL: u8 = 5;
 const RANK_STATUS: u8 = 6;
 const RANK_MODEL: u8 = 7;
 
-/// Cells the context gauge spends on magnitude.
-const CONTEXT_GAUGE_CELLS: usize = 5;
-const CONTEXT_GAUGE_FULL: &str = "▰";
-const CONTEXT_GAUGE_EMPTY: &str = "▱";
-
-/// Share of the window above which the gauge stops being neutral chrome.
+/// Share of the window above which the context segment stops being neutral.
 const CONTEXT_PRESSURE: f64 = 0.75;
 const CONTEXT_EXHAUSTION: f64 = 0.90;
 
@@ -148,11 +143,11 @@ fn effort_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     FooterSegment::plain(RANK_EFFORT, effort.to_owned(), chrome_style())
 }
 
-/// Context as a gauge plus the exact fraction behind it.
+/// Context as the exact count and the share it represents.
 ///
-/// The gauge answers "am I running out?" without arithmetic; the fraction is
-/// there for when the answer matters exactly. The used side is padded so the
-/// footer does not reflow every time the count crosses a digit.
+/// Both are needed and neither replaces the other: the count says how much room
+/// is left in tokens, the percentage answers "am I running out" without
+/// arithmetic. The used side is padded so the footer never reflows as it grows.
 fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
     let used = ctx
         .usage
@@ -170,30 +165,23 @@ fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
 
     let used = used.unwrap_or(0);
     let share = (used as f64 / window as f64).clamp(0.0, 1.0);
-    let filled = (share * CONTEXT_GAUGE_CELLS as f64).round() as usize;
-    let filled = if used > 0 { filled.max(1) } else { 0 };
-
-    let gauge_style = if share >= CONTEXT_EXHAUSTION {
+    let style = if share >= CONTEXT_EXHAUSTION {
         Style::default().fg(RolePalette::error())
     } else if share >= CONTEXT_PRESSURE {
         Style::default().fg(RolePalette::warning())
     } else {
-        Style::default().fg(RolePalette::machine())
+        chrome_style()
     };
 
-    FooterSegment::new(
+    FooterSegment::plain(
         RANK_CONTEXT,
-        vec![
-            Span::styled(CONTEXT_GAUGE_FULL.repeat(filled), gauge_style),
-            Span::styled(
-                CONTEXT_GAUGE_EMPTY.repeat(CONTEXT_GAUGE_CELLS.saturating_sub(filled)),
-                chrome_style(),
-            ),
-            Span::styled(
-                format!(" {:>4}/{}", compact_count(used), compact_count(window)),
-                chrome_style(),
-            ),
-        ],
+        format!(
+            "{:>4}/{} {:>3}%",
+            compact_count(used),
+            compact_count(window),
+            (share * 100.0).round() as u64
+        ),
+        style,
     )
 }
 
@@ -533,8 +521,8 @@ mod tests {
 
         assert!(line.contains("gpt-5.6-sol"), "model: {line:?}");
         assert!(line.contains("high"), "effort: {line:?}");
-        assert!(line.contains("15k/200k"), "context value: {line:?}");
-        assert!(line.contains('▰') && line.contains('▱'), "gauge: {line:?}");
+        assert!(line.contains("15k/200k"), "context count: {line:?}");
+        assert!(line.contains("8%"), "context share: {line:?}");
         assert!(line.contains("~/d/p/agens"), "directory: {line:?}");
         assert!(line.contains("feat/agn-114"), "branch: {line:?}");
         assert!(
@@ -559,18 +547,22 @@ mod tests {
 
         assert_eq!(
             at(200),
-            " gpt-5.6-sol · high · ▰▱▱▱▱  15k/200k · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
+            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ⎇ feat/agn-114 · 3± +120 -8 · ask ^⇧P · Ready"
         );
         assert_eq!(at(120), at(200), "a wide terminal sheds nothing");
         // changes, then branch
         assert_eq!(
             at(80),
-            " gpt-5.6-sol · high · ▰▱▱▱▱  15k/200k · ~/d/p/agens · ask ^⇧P · Ready"
+            " gpt-5.6-sol · high ·  15k/200k   8% · ~/d/p/agens · ask ^⇧P · Ready"
         );
         // then effort, then the directory
-        assert_eq!(at(60), " gpt-5.6-sol · ▰▱▱▱▱  15k/200k · ask ^⇧P · Ready");
-        // then the context gauge
-        assert_eq!(at(44), " gpt-5.6-sol · ask ^⇧P · Ready");
+        assert_eq!(
+            at(64),
+            " gpt-5.6-sol ·  15k/200k   8% · ~/d/p/agens · ask ^⇧P · Ready"
+        );
+        assert_eq!(at(50), " gpt-5.6-sol ·  15k/200k   8% · ask ^⇧P · Ready");
+        // then the context reading
+        assert_eq!(at(30), " gpt-5.6-sol · ask ^⇧P · Ready");
         // then the approval mode, and last of all the turn status
         assert_eq!(at(24), " gpt-5.6-sol · Ready");
         assert_eq!(at(12), " gpt-5.6-sol");
@@ -599,8 +591,8 @@ mod tests {
     }
 
     #[test]
-    fn the_gauge_changes_colour_only_as_the_window_fills() {
-        let gauge_colour = |used: u64| {
+    fn the_context_segment_changes_colour_only_as_the_window_fills() {
+        let context_colour = |used: u64| {
             let usage = Usage {
                 input_tokens: None,
                 output_tokens: None,
@@ -611,15 +603,15 @@ mod tests {
             ctx.usage = Some(&usage);
             MetricFooter::spans(200, ctx)
                 .into_iter()
-                .find(|span| span.content.contains('▰'))
-                .expect("a filled gauge")
+                .find(|span| span.content.contains("200k"))
+                .expect("the context segment names the window")
                 .style
                 .fg
         };
 
-        assert_eq!(gauge_colour(20_000), Some(RolePalette::machine()));
-        assert_eq!(gauge_colour(160_000), Some(RolePalette::warning()));
-        assert_eq!(gauge_colour(190_000), Some(RolePalette::error()));
+        assert_eq!(context_colour(20_000), Some(RolePalette::chrome()));
+        assert_eq!(context_colour(160_000), Some(RolePalette::warning()));
+        assert_eq!(context_colour(190_000), Some(RolePalette::error()));
     }
 
     #[test]

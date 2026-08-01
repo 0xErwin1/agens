@@ -292,7 +292,7 @@ fn conversational_surface_uses_full_width_and_moves_context_to_footer() {
             assert!(text.contains("high"), "footer effort: {text:?}");
             assert!(text.contains("agens"), "footer project basename: {text:?}");
             assert!(text.contains("8/128"), "footer usage: {text:?}");
-            assert!(text.contains('▱'), "footer context gauge: {text:?}");
+            assert!(text.contains("6%"), "footer context share: {text:?}");
             assert!(text.contains("Ready"), "{text:?}");
             assert!(!text.contains("Enter send"), "{text:?}");
         }
@@ -315,7 +315,7 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
     let text = rendered_text(&renderer);
 
     assert!(text.contains("15/8.2k"), "{text:?}");
-    assert!(text.contains('▰'), "{text:?}");
+    assert!(text.contains("0%"), "{text:?}");
     assert!(!text.contains("ctx 15/8192"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
@@ -335,7 +335,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
     assert!(
-        before_usage.contains("gpt-4.1 · high · ▱▱▱▱▱    0/200k · ~/d/p/agens · ask ^⇧P · Ready"),
+        before_usage.contains("gpt-4.1 · high ·    0/200k   0% · ~/d/p/agens · ask ^⇧P · Ready"),
         "{before_usage:?}"
     );
     assert!(!before_usage.contains("model · default · ctx —"));
@@ -355,7 +355,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let next_turn = rendered_text(&renderer);
     assert!(
-        next_turn.contains("gpt-4.1 · high · ▰▰▱▱▱  71k/200k · ~/d/p/agens"),
+        next_turn.contains("gpt-4.1 · high ·  71k/200k  36% · ~/d/p/agens"),
         "{next_turn:?}"
     );
 }
@@ -2442,7 +2442,7 @@ fn renderer_projects_conversation_losslessly_by_call_id() {
         "write result",
         "12ms",
         "new line",
-        "8/128",
+        "6%",
         "Request failed safely",
         "Action: Check credentials and retry.",
     ] {
@@ -2489,7 +2489,7 @@ fn lifecycle_metrics_render_in_footer_without_transcript_rows() {
     assert!(!text.contains("USAGE"));
     assert!(text.contains("Completed"));
     assert!(text.contains("25ms"));
-    assert!(text.contains("15/8.2k"), "{text:?}");
+    assert!(text.contains("0%"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
 }
@@ -3403,7 +3403,7 @@ fn renderer_shows_complete_rich_turn_details_without_truncation() {
         "12ms",
         "old line",
         "new line",
-        "8/128",
+        "6%",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
@@ -5301,7 +5301,7 @@ fn the_footer_answers_its_questions_at_every_real_terminal_width() {
         let text = rendered_text(&renderer);
 
         // What survives at 80 columns is the floor every wider terminal keeps.
-        for datum in ["gpt-5.6-sol", "71k/200k", "▰", "ask ^⇧P"] {
+        for datum in ["gpt-5.6-sol", "71k/200k", "36%", "ask ^⇧P"] {
             assert!(
                 text.contains(datum),
                 "width {width} lost {datum:?}: {text:?}"
@@ -5317,4 +5317,86 @@ fn the_footer_answers_its_questions_at_every_real_terminal_width() {
             assert!(text.contains("+120"), "width {width}: {text:?}");
         }
     }
+}
+
+#[test]
+fn a_subagent_card_names_the_model_and_effort_it_runs_on() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(100, 16)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("delegate");
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started_on(
+            1,
+            "explore",
+            "sweep the repository",
+            TuiExecutionState::BackgroundRunning,
+            Some("gpt-5.6-sol"),
+            Some("high"),
+        ),
+    );
+
+    renderer.render(tui.view()).unwrap();
+    let text = rendered_text(&renderer);
+
+    assert!(text.contains("gpt-5.6-sol"), "{text:?}");
+    assert!(text.contains("high"), "{text:?}");
+}
+
+#[test]
+fn a_background_subagent_keeps_the_surface_repainting_after_its_turn_ends() {
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("delegate");
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::BackgroundStarted { id: 1 },
+    });
+    apply_subagent(
+        &mut tui,
+        TuiSubagentEvent::started(1, "explore", "sweep", TuiExecutionState::BackgroundRunning),
+    );
+    tui.apply_progress(TurnEvent::StateChanged(agens_core::TurnState::Completed));
+
+    assert!(
+        !tui.view().running,
+        "the parent turn is what finished, not the delegation"
+    );
+    assert!(
+        tui.has_live_work(),
+        "a running background subagent still owes the reader a moving clock"
+    );
+
+    tui.apply_runtime_event(TuiRuntimeEvent::TaskExecution {
+        agent: "explore".into(),
+        event: TuiExecutionEvent::Completed { id: 1 },
+    });
+
+    assert!(
+        !tui.has_live_work(),
+        "nothing running means nothing to repaint for"
+    );
+}
+
+#[test]
+fn the_turn_status_row_is_separated_from_what_the_agent_just_said() {
+    let mut renderer = RatatuiRenderer::new(Terminal::new(TestBackend::new(70, 14)).unwrap());
+    let mut tui = Tui::new(FakeEngine);
+    tui.begin_submission("ask");
+    tui.apply_progress(TurnEvent::ProviderPart(MessagePart::Text(
+        "ANSWER_SENTINEL".into(),
+    )));
+
+    renderer.render(tui.view()).unwrap();
+    let answer = rendered_row(&renderer, "ANSWER_SENTINEL");
+    let status = rendered_row(&renderer, "Responding…");
+
+    assert_eq!(
+        status,
+        answer + 2,
+        "a blank row separates the answer from the row reporting on it"
+    );
 }

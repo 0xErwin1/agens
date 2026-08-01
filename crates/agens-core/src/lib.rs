@@ -3022,6 +3022,11 @@ pub enum TuiSubagentUpdate {
         agent: String,
         task_summary: String,
         presentation: TuiExecutionState,
+        /// What the subagent is actually running on. A delegation whose model
+        /// or effort differs from the parent's is the common case, and the
+        /// surface that hides it makes the difference impossible to notice.
+        model: Option<String>,
+        effort: Option<String>,
     },
     Reasoning(String),
     Text(String),
@@ -3053,12 +3058,26 @@ impl TuiSubagentEvent {
         task_summary: impl AsRef<str>,
         presentation: TuiExecutionState,
     ) -> Self {
+        Self::started_on(id, agent, task_summary, presentation, None, None)
+    }
+
+    /// A start that also records the model and effort the subagent runs on.
+    pub fn started_on(
+        id: u64,
+        agent: impl AsRef<str>,
+        task_summary: impl AsRef<str>,
+        presentation: TuiExecutionState,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Self {
         Self {
             id,
             update: TuiSubagentUpdate::Started {
                 agent: sanitize_projection(agent.as_ref()),
                 task_summary: sanitize_projection(task_summary.as_ref()),
                 presentation,
+                model: model.map(sanitize_projection),
+                effort: effort.map(sanitize_projection),
             },
         }
     }
