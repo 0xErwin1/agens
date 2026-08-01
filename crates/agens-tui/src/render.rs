@@ -41,11 +41,13 @@ const SYNTAX_DEFER_SOURCE_BYTES: usize = 4 * 1024;
 const SYNTAX_MAX_SOURCE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy)]
-pub(super) struct ConversationRenderState {
+pub(super) struct ConversationRenderState<'a> {
     pub collapse_thinking: bool,
     pub thinking_streaming: bool,
     pub assistant_streaming: bool,
     pub now: Duration,
+    /// Call id keyboard focus is standing on, when any.
+    pub focused_call: Option<&'a str>,
 }
 
 /// Identifies one settled conversation across frames.
@@ -83,7 +85,7 @@ pub(super) fn settled_conversation_lines(
     conversation: &Conversation,
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
-    state: ConversationRenderState,
+    state: ConversationRenderState<'_>,
 ) -> Arc<[Line<'static>]> {
     if !is_settled(conversation) {
         return conversation_lines(conversation, &[], tool_display_modes, content_width, state)
@@ -95,6 +97,9 @@ pub(super) fn settled_conversation_lines(
         call_id.hash(&mut hasher);
         std::mem::discriminant(mode).hash(&mut hasher);
     }
+    // Focus paints a row, so a settled turn cached without it would keep
+    // showing the mark after focus moved on.
+    state.focused_call.hash(&mut hasher);
     let key = SettledConversationKey {
         conversation: identity,
         content_width,
@@ -146,7 +151,7 @@ pub(super) fn conversation_lines(
     events: &[TuiRuntimeEvent],
     tool_display_modes: &BTreeMap<String, DisplayMode>,
     content_width: u16,
-    state: ConversationRenderState,
+    state: ConversationRenderState<'_>,
 ) -> Vec<Line<'static>> {
     let context = ItemContext {
         conversation,
@@ -224,7 +229,7 @@ struct ItemContext<'a> {
     events: &'a [TuiRuntimeEvent],
     tool_display_modes: &'a BTreeMap<String, DisplayMode>,
     content_width: usize,
-    state: ConversationRenderState,
+    state: ConversationRenderState<'a>,
 }
 
 /// One conversation item's rows plus what the vertical-gap policy needs.
@@ -351,6 +356,23 @@ pub(super) fn unaccented_row(line: Line<'static>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Marks the header row of the block keyboard focus is standing on.
+///
+/// The mark is a repaint and never a character: the block has to look focused
+/// without occupying a column it did not occupy before, or moving focus would
+/// reflow the transcript under the reader's eyes.
+fn mark_focused_row(rows: &mut [BlockLine]) {
+    let Some(row) = rows.first_mut() else {
+        return;
+    };
+    for span in &mut row.line.spans {
+        span.style = span
+            .style
+            .fg(RolePalette::navigation())
+            .add_modifier(Modifier::BOLD);
+    }
+}
+
 /// The one row standing in for the settled turns the transcript folded away.
 ///
 /// It carries its own key because it is the only row for which that key does
@@ -471,8 +493,13 @@ fn tool_call_block(
         .copied()
         .unwrap_or_else(|| block.default_mode());
 
+    let mut rows = block.lines(mode);
+    if context.state.focused_call == Some(call_id) {
+        mark_focused_row(&mut rows);
+    }
+
     RenderedBlock {
-        rows: block.lines(mode),
+        rows,
         // Any call showing a single summary row packs against its neighbours.
         // Packing used to require the call be verb-foldable, which is a
         // different question: an MCP call cannot fold into "Read files ×3" but
@@ -703,6 +730,12 @@ pub(super) fn turn_status_line(status: TurnStatus<'_>, content_width: usize) -> 
         }
         right.push_str(&compact_tokens(tokens));
     }
+    // Stopping is the one thing a reader may want from a turn while it runs, so
+    // the row that reports the turn is where its key belongs.
+    if !right.is_empty() {
+        right.push_str(" · ");
+    }
+    right.push_str("esc stop");
 
     // The metadata never takes the whole row: the label keeps at least the
     // spinner cell and the gap that separates the two halves.
@@ -3493,12 +3526,13 @@ mod tests {
         assert_eq!(text(&lines[3]), "└ Action: Retry.");
     }
 
-    fn conversation_state(assistant_streaming: bool) -> ConversationRenderState {
+    fn conversation_state(assistant_streaming: bool) -> ConversationRenderState<'static> {
         ConversationRenderState {
             collapse_thinking: false,
             thinking_streaming: false,
             assistant_streaming,
             now: Duration::ZERO,
+            focused_call: None,
         }
     }
 
@@ -3553,6 +3587,7 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now,
+                focused_call: None,
             },
         ))
     }
@@ -3571,6 +3606,7 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
             },
         )
     }
@@ -4110,6 +4146,7 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
             },
         )
     }
@@ -4128,6 +4165,7 @@ mod tests {
                 thinking_streaming: false,
                 assistant_streaming: false,
                 now: Duration::ZERO,
+                focused_call: None,
             },
         )
     }

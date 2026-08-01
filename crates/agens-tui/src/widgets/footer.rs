@@ -29,6 +29,8 @@ pub(crate) struct FooterContext<'a> {
     pub repository: Option<&'a RepositoryStatus>,
     /// Level the tool output detail cycle currently rests on.
     pub tool_detail: DisplayMode,
+    /// Level of the block keyboard focus stands on, when navigation is active.
+    pub focused_detail: Option<DisplayMode>,
     pub turn_label: Cow<'a, str>,
     pub duration: Option<Duration>,
     pub usage: Option<&'a Usage>,
@@ -198,11 +200,14 @@ fn context_segment(ctx: &FooterContext<'_>) -> FooterSegment {
 /// because it is the only footer datum the reader can rediscover by pressing
 /// a key.
 fn detail_segment(ctx: &FooterContext<'_>) -> FooterSegment {
-    FooterSegment::plain(
-        RANK_DETAIL,
-        format!("tools {} ^O", ctx.tool_detail.label()),
-        chrome_style(),
-    )
+    // While a block is focused the reader is acting on that block, so the slot
+    // answers the question they actually have. One slot rather than two: a
+    // footer that grows a segment per mode stops being scannable.
+    let text = match ctx.focused_detail {
+        Some(mode) => format!("block {} o · j/k walk", mode.label()),
+        None => format!("tools {} ^O", ctx.tool_detail.label()),
+    };
+    FooterSegment::plain(RANK_DETAIL, text, chrome_style())
 }
 
 fn directory_segment(ctx: &FooterContext<'_>) -> FooterSegment {
@@ -612,6 +617,18 @@ mod tests {
         assert!(at(DisplayMode::Expanded).contains("tools full ^O"));
     }
 
+    /// The slot is contextual, not additive: a reader standing on a block is
+    /// asking what that block will do, not what the transcript would do.
+    #[test]
+    fn the_detail_slot_speaks_about_the_focused_block_while_one_is_focused() {
+        let mut ctx = sample();
+        ctx.focused_detail = Some(DisplayMode::Truncated);
+        let line = MetricFooter::text(200, ctx);
+
+        assert!(line.contains("block preview o · j/k walk"), "{line:?}");
+        assert!(!line.contains("tools hidden"), "{line:?}");
+    }
+
     /// A value changing must not move its neighbours, or the eye loses the
     /// place it learned to look at.
     #[test]
@@ -691,6 +708,7 @@ mod tests {
             context_window: Some(200_000),
             project: "/home/iperez/dev/personal/agens",
             tool_detail: DisplayMode::Collapsed,
+            focused_detail: None,
             turn_label: Cow::Borrowed("Ready"),
             duration: None,
             usage: Some(&Usage {

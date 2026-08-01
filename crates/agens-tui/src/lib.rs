@@ -658,6 +658,8 @@ pub struct TranscriptRecord {
     collapse_thinking: bool,
     /// When true, the settled turns the transcript would elide stay in view.
     history_expanded: bool,
+    /// The block keyboard navigation is standing on, by call id.
+    focused_call: Option<String>,
     /// When true, auto-collapse on turn finish is skipped (user re-expanded via Ctrl+T).
     thinking_user_pinned: bool,
     focus: TranscriptFocus,
@@ -683,6 +685,7 @@ impl TranscriptRecord {
             tool_detail: widgets::DisplayMode::Collapsed,
             collapse_thinking: false,
             history_expanded: false,
+            focused_call: None,
             thinking_user_pinned: false,
             focus: TranscriptFocus::Composer,
             selection: None,
@@ -794,6 +797,8 @@ pub struct ViewState<'a> {
     pub collapse_thinking: bool,
     /// Whether the reader asked to see the settled turns the transcript elides.
     pub history_expanded: bool,
+    /// The block keyboard navigation is standing on, when there is one.
+    pub focused_call: Option<&'a str>,
     /// Whether this terminal renders OSC 8 hyperlinks.
     pub hyperlinks: bool,
     pub focus: TranscriptFocus,
@@ -1780,6 +1785,13 @@ fn footer_context<'a>(state: &ViewState<'a>) -> widgets::FooterContext<'a> {
         home: state.home,
         repository: state.repository,
         tool_detail: state.tool_detail,
+        focused_detail: state.focused_call.map(|call_id| {
+            state
+                .tool_display_modes
+                .get(call_id)
+                .copied()
+                .unwrap_or(state.tool_detail)
+        }),
         turn_label: state.turn_activity.footer_label(),
         duration: state.turn_duration,
         usage: state.latest_usage,
@@ -3011,6 +3023,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
                     thinking_streaming: false,
                     assistant_streaming: !state.highlight_restored_syntax,
                     now: state.now,
+                    focused_call: state.focused_call,
                 },
             )
             .to_vec(),
@@ -3027,6 +3040,7 @@ fn rendered_transcript(state: &ViewState<'_>, row_width: u16) -> Vec<Line<'stati
                 thinking_streaming,
                 assistant_streaming: state.assistant_streaming,
                 now: state.now,
+                focused_call: state.focused_call,
             },
         ));
     }
@@ -4754,6 +4768,7 @@ where
                 tool_detail: widgets::DisplayMode::Collapsed,
                 collapse_thinking: false,
                 history_expanded: false,
+                focused_call: None,
                 thinking_user_pinned: false,
                 focus: TranscriptFocus::Viewport,
                 selection: None,
@@ -4926,6 +4941,7 @@ where
             tool_detail: active.tool_detail,
             collapse_thinking: active.collapse_thinking,
             history_expanded: active.history_expanded,
+            focused_call: active.focused_call.as_deref(),
             hyperlinks: self.hyperlinks,
             focus: active.focus,
             dialog: self.dialog.as_ref(),
@@ -5610,6 +5626,21 @@ where
             }
             Key::Char('m') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
                 self.select_transcript(TranscriptId::Main);
+                return Action::Render;
+            }
+            Key::Char('j') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
+                self.move_block_focus(true);
+                self.scroll_to_focused_block();
+                return Action::Render;
+            }
+            Key::Char('k') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
+                self.move_block_focus(false);
+                self.scroll_to_focused_block();
+                return Action::Render;
+            }
+            Key::Char('o') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
+                self.cycle_focused_block_detail();
+                self.scroll_to_focused_block();
                 return Action::Render;
             }
             Key::Char('h') if self.active_record_mut().focus == TranscriptFocus::Viewport => {
@@ -6796,27 +6827,80 @@ where
     /// will be shown at. Every settled call is rewritten to the new level, which
     /// is what makes the cycle legible — three levels, one meaning each, rather
     /// than a per-call state the reader would have to track block by block.
-    fn cycle_tool_detail(&mut self, forward: bool) {
+    /// Every settled tool call of the active transcript, in transcript order.
+    ///
+    /// This is the set AGN-109 collapses, which makes it the set block
+    /// navigation has to be able to reach.
+    fn settled_call_ids(&self) -> Vec<String> {
         let active = self
             .transcripts
             .get(&self.active_transcript)
             .expect("active transcript always exists");
-        let (completed, conversation) = if self.active_transcript == TranscriptId::Main {
-            (&self.completed_conversations, self.conversation.as_ref())
-        } else {
-            (
-                &active.completed_conversations,
-                active.conversation.as_ref(),
-            )
-        };
-        let completed_call_ids = completed
+        let (completed, conversation): (&[Conversation], Option<&Conversation>) =
+            if self.active_transcript == TranscriptId::Main {
+                (
+                    self.completed_conversations.as_slice(),
+                    self.conversation.as_ref(),
+                )
+            } else {
+                (
+                    active.completed_conversations.as_slice(),
+                    active.conversation.as_ref(),
+                )
+            };
+        completed
             .iter()
             .chain(conversation)
             .flat_map(|conversation| &conversation.tool_batches)
             .flat_map(|batch| &batch.calls)
             .filter(|call| call.result.is_some())
             .map(|call| call.call_id.clone())
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Moves the focused block, or starts focus at the newest block.
+    ///
+    /// Focus enters at the end rather than the start because the block a reader
+    /// wants is almost always the one that just happened.
+    fn move_block_focus(&mut self, forward: bool) {
+        let calls = self.settled_call_ids();
+        if calls.is_empty() {
+            return;
+        }
+
+        let record = self.active_record_mut();
+        let next = match record
+            .focused_call
+            .as_ref()
+            .and_then(|focused| calls.iter().position(|call| call == focused))
+        {
+            None => calls.len() - 1,
+            Some(index) if forward => (index + 1).min(calls.len() - 1),
+            Some(index) => index.saturating_sub(1),
+        };
+        record.focused_call = Some(calls[next].clone());
+    }
+
+    /// Cycles the detail of the focused block alone.
+    ///
+    /// The transcript-wide cycle answers "how much of everything"; this answers
+    /// "what is in this one", which is the question a reader has while looking
+    /// at a specific row.
+    fn cycle_focused_block_detail(&mut self) {
+        let record = self.active_record_mut();
+        let Some(call_id) = record.focused_call.clone() else {
+            return;
+        };
+        let current = record
+            .tool_display_modes
+            .get(&call_id)
+            .copied()
+            .unwrap_or(record.tool_detail);
+        record.tool_display_modes.insert(call_id, current.next());
+    }
+
+    fn cycle_tool_detail(&mut self, forward: bool) {
+        let completed_call_ids = self.settled_call_ids();
 
         let record = self.active_record_mut();
         let next = if forward {
@@ -6883,6 +6967,59 @@ where
             record.following_bottom = false;
             record.scroll_offset = offset.min(bottom);
             record.focus = TranscriptFocus::Viewport;
+        }
+    }
+
+    /// Brings the focused block into view and stops the viewport chasing the
+    /// bottom.
+    ///
+    /// Detaching is what keeps the detail from displacing the transcript: rows
+    /// opening below a header never move the header, but a viewport still stuck
+    /// to the bottom would slide everything up under the reader instead.
+    fn scroll_to_focused_block(&mut self) {
+        let layout = self.screen_layout();
+        let row_width = layout
+            .transcript
+            .width
+            .saturating_sub(TRANSCRIPT_ROW_INDENT)
+            .max(1);
+        let lines = rendered_transcript(&self.view(), row_width);
+
+        let mut row = 0usize;
+        let mut target = None;
+        for line in &lines {
+            if target.is_none()
+                && line
+                    .spans
+                    .iter()
+                    .any(|span| span.style.fg == Some(widgets::RolePalette::navigation()))
+            {
+                target = Some(saturating_u16(row));
+            }
+            row += line.width().div_ceil(usize::from(row_width)).max(1);
+        }
+
+        let Some(target) = target else {
+            return;
+        };
+        let bottom = self.detached_scroll_bottom();
+        let visible = usize::from(
+            layout
+                .transcript
+                .height
+                .saturating_sub(transcript_chrome_rows(false)),
+        );
+        let record = self.active_record_mut();
+        record.following_bottom = false;
+        record.focus = TranscriptFocus::Viewport;
+        if target < record.scroll_offset {
+            record.scroll_offset = target.min(bottom);
+        } else if usize::from(target) >= usize::from(record.scroll_offset) + visible {
+            record.scroll_offset = saturating_u16(
+                usize::from(target)
+                    .saturating_sub(visible.saturating_sub(1))
+                    .min(usize::from(bottom)),
+            );
         }
     }
 
