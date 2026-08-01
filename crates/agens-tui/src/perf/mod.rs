@@ -11,13 +11,25 @@ pub mod fixtures;
 mod scenarios;
 
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::time::Duration;
 
+use agens_core::TurnEvent;
 use ratatui::backend::TestBackend;
 
-use crate::{Engine, FrameSchedule, RatatuiRenderer, Tui, TuiSubmissionOutcome};
+use crate::{
+    Action, Conversation, Engine, Event, FrameSchedule, RatatuiRenderer, Tui, TuiPresentation,
+    TuiSubmissionOutcome, ViewState,
+};
 
 pub use scenarios::SCENARIOS;
+
+/// The terminal the audit reports its numbers against. Scenarios that resize
+/// start here and return here, so a resize is a departure from a known shape
+/// rather than an arbitrary one.
+pub const BASE_WIDTH: u16 = 120;
+pub const BASE_HEIGHT: u16 = 40;
 
 /// A named unit of the audit. Registering one requires only a new module and
 /// one entry in [`SCENARIOS`] — no change to the harness, the writer, the
@@ -79,7 +91,19 @@ impl ScenarioContext {
     /// of the real render-skip gate, exactly as `run_with_default_progress_submit_with_permissions_and_task_controls`
     /// does per loop iteration.
     pub fn render_frame(&mut self, dirty: bool) -> io::Result<bool> {
-        self.now = self.now.saturating_add(Duration::from_millis(1));
+        self.render_frame_after(Duration::from_millis(1), dirty)
+    }
+
+    /// Drives one pass of the gate after advancing the synthetic clock by
+    /// `step`.
+    ///
+    /// The step is a scenario's only lever over time-driven work: the spinner
+    /// and the elapsed-time counters redraw on clock movement alone, so a
+    /// scenario that wants to measure them has to advance far enough for the
+    /// animation to reach its next frame.
+    pub fn render_frame_after(&mut self, step: Duration, dirty: bool) -> io::Result<bool> {
+        self.now = self.now.saturating_add(step);
+
         crate::render_progress_frame(
             &mut self.tui,
             &mut self.renderer,
@@ -88,6 +112,124 @@ impl ScenarioContext {
             dirty,
         )
     }
+
+    pub fn handle(&mut self, event: Event) -> Action {
+        self.tui.handle(event)
+    }
+
+    pub fn apply_progress(&mut self, event: TurnEvent) {
+        self.tui.apply_progress(event);
+    }
+
+    /// Marks the turn as in flight, which is what keeps the spinner and the
+    /// elapsed counters alive across frames.
+    pub fn set_running(&mut self, running: bool) {
+        self.tui.set_running(running);
+    }
+
+    pub fn view(&self) -> ViewState<'_> {
+        self.tui.view()
+    }
+
+    /// Resizes both the TUI state and the backing test terminal.
+    ///
+    /// Resizing only the TUI would leave the renderer drawing into a buffer
+    /// of the old size, so the settled-conversation cache would be keyed on a
+    /// width the frame never actually used.
+    pub fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.width = width;
+        self.height = height;
+
+        self.renderer.terminal.backend_mut().resize(width, height);
+
+        self.tui.handle(Event::Resize { width, height });
+
+        Ok(())
+    }
+
+    /// Seats a fixture transcript as resumed session history.
+    pub fn load_transcript(&mut self, messages: &[agens_core::Message]) -> io::Result<()> {
+        let history = Conversation::from_messages(messages).map_err(|error| {
+            io::Error::other(format!("fixture built an invalid conversation: {error:?}"))
+        })?;
+
+        self.apply_submission_outcome(TuiSubmissionOutcome::SessionResumed {
+            message: "Resumed session.".to_owned(),
+            presentation: TuiPresentation::new("provider", "model", "session"),
+            history,
+            draft: None,
+            resume_error: None,
+            file_candidates: Vec::new(),
+            palette_entries: Vec::new(),
+        });
+
+        Ok(())
+    }
+}
+
+/// What one audit run produced.
+///
+/// `failed` is not an error: a scenario that panics is named and skipped so
+/// the remaining scenarios still contribute their spans, and the caller
+/// decides the exit status. A run that hid a panic to keep a clean exit code
+/// would present a partial trace as a complete one.
+pub struct AuditOutcome {
+    pub paths: agens_perf::TracePaths,
+    pub failed: Vec<&'static str>,
+}
+
+/// Runs every registered scenario against a single recorder.
+///
+/// The recorder is installed once for the whole run, never once per scenario:
+/// installation is process-global and one-shot, and the event loop this
+/// harness drives spawns worker threads that a thread-local subscriber would
+/// silently drop. Scenario identity therefore travels as a field on each
+/// scenario's root span.
+pub fn run_all(trace_dir: &Path, run_id: &str) -> io::Result<AuditOutcome> {
+    let config = agens_perf::RecorderConfig::new(trace_dir, run_id)
+        .with_scenario("audit")
+        .with_terminal_size(BASE_WIDTH, BASE_HEIGHT);
+
+    let recorder = agens_perf::Recorder::install(config)
+        .map_err(|error| io::Error::other(format!("could not install the recorder: {error}")))?;
+
+    let failed = run_scenarios(SCENARIOS);
+
+    let paths = recorder
+        .finish()
+        .map_err(|error| io::Error::other(format!("could not finish the trace: {error}")))?;
+
+    Ok(AuditOutcome { paths, failed })
+}
+
+/// Runs each scenario in isolation and returns the names that did not finish.
+///
+/// A scenario that panics must not take the run down with it: the ones after
+/// it still have spans worth recording, and a run that stopped at the first
+/// panic would look identical to a run that measured less.
+fn run_scenarios(scenarios: &[Scenario]) -> Vec<&'static str> {
+    let mut failed = Vec::new();
+
+    for scenario in scenarios {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut context = ScenarioContext::new(BASE_WIDTH, BASE_HEIGHT)?;
+            (scenario.run)(&mut context)
+        }));
+
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("scenario {} failed: {error}", scenario.name);
+                failed.push(scenario.name);
+            }
+            Err(_) => {
+                eprintln!("scenario {} panicked", scenario.name);
+                failed.push(scenario.name);
+            }
+        }
+    }
+
+    failed
 }
 
 #[cfg(test)]
@@ -99,6 +241,79 @@ mod tests {
     use agens_perf::{Record, Recorder, RecorderConfig};
 
     use super::SCENARIOS;
+
+    #[test]
+    fn a_panicking_scenario_is_named_without_stopping_the_ones_after_it() {
+        fn healthy(_: &mut super::ScenarioContext) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn explodes(_: &mut super::ScenarioContext) -> std::io::Result<()> {
+            panic!("this scenario is supposed to blow up");
+        }
+
+        let scenarios = [
+            super::Scenario {
+                name: "first_healthy",
+                run: healthy,
+            },
+            super::Scenario {
+                name: "explodes",
+                run: explodes,
+            },
+            super::Scenario {
+                name: "last_healthy",
+                run: healthy,
+            },
+        ];
+
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let failed = super::run_scenarios(&scenarios);
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(
+            failed,
+            vec!["explodes"],
+            "only the panicking scenario should be reported as failed"
+        );
+    }
+
+    #[test]
+    fn expand_collapse_does_not_move_the_scroll_offset() {
+        use crate::perf::fixtures;
+        use crate::{Event, Key, MouseWheelDirection};
+
+        let mut ctx = super::ScenarioContext::new(super::BASE_WIDTH, super::BASE_HEIGHT)
+            .expect("test backend always builds");
+
+        let fixture = fixtures::transcript(40, 12);
+        ctx.load_transcript(&fixture.messages)
+            .expect("fixture is a valid conversation");
+        ctx.render_frame(true).expect("first frame renders");
+
+        for _ in 0..4 {
+            ctx.handle(Event::MouseWheel(MouseWheelDirection::Up));
+        }
+        ctx.render_frame(true).expect("scrolled frame renders");
+
+        let anchored = ctx.view().scroll_offset;
+        assert!(
+            !ctx.view().following_bottom,
+            "the scroll test is meaningless while the view is pinned to the bottom"
+        );
+
+        for _ in 0..3 {
+            ctx.handle(Event::Key(Key::CtrlT));
+            ctx.render_frame(true).expect("toggled frame renders");
+
+            assert_eq!(
+                ctx.view().scroll_offset,
+                anchored,
+                "changing tool detail moved the ground under the reader"
+            );
+        }
+    }
 
     #[test]
     fn every_registered_scenario_has_a_unique_name() {

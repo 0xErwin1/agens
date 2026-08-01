@@ -9,9 +9,20 @@
 //! fixture content; reordering this array changes what each scenario
 //! measures.
 
+mod expand_collapse;
 mod long_transcript;
 mod short_transcript;
+mod streaming_response;
+mod streaming_with_spinner;
+mod sustained_resize;
 
 use super::Scenario;
 
-pub const SCENARIOS: &[Scenario] = &[short_transcript::SCENARIO, long_transcript::SCENARIO];
+pub const SCENARIOS: &[Scenario] = &[
+    short_transcript::SCENARIO,
+    long_transcript::SCENARIO,
+    streaming_response::SCENARIO,
+    streaming_with_spinner::SCENARIO,
+    sustained_resize::SCENARIO,
+    expand_collapse::SCENARIO,
+];
