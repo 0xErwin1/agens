@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod models;
 pub mod permission_prompt;
 pub mod profiles;
+pub mod repository;
 pub mod resume;
 pub mod router;
 pub mod session;

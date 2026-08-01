@@ -4,9 +4,10 @@ use std::time::Duration;
 use agens_core::{Message, MessagePart, Role, TurnEvent, TurnRetryReason, Usage};
 use agens_tui::{
     Action, ConversationEvent, DialogEntry, DialogView, DiffLine, DiffLineKind, Engine, Event, Key,
-    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, SessionDialogCursor,
-    SessionDialogRequest, ToolResultState, TranscriptId, Tui, TuiExecutionEvent, TuiExecutionState,
-    TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent, TuiSubmissionOutcome,
+    PaletteEntry, PaletteEntryKind, RatatuiRenderer, Renderer, RepositoryStatus,
+    SessionDialogCursor, SessionDialogRequest, ToolResultState, TranscriptId, Tui,
+    TuiExecutionEvent, TuiExecutionState, TuiPresentation, TuiRuntimeEvent, TuiSubagentEvent,
+    TuiSubmissionOutcome,
 };
 use ratatui::{
     Terminal,
@@ -291,7 +292,7 @@ fn conversational_surface_uses_full_width_and_moves_context_to_footer() {
             assert!(text.contains("high"), "footer effort: {text:?}");
             assert!(text.contains("agens"), "footer project basename: {text:?}");
             assert!(text.contains("8/128"), "footer usage: {text:?}");
-            assert!(text.contains('%'), "footer percent: {text:?}");
+            assert!(text.contains('▱'), "footer context gauge: {text:?}");
             assert!(text.contains("Ready"), "{text:?}");
             assert!(!text.contains("Enter send"), "{text:?}");
         }
@@ -314,7 +315,7 @@ fn footer_shows_compact_tokens_used_over_window_without_header_ctx() {
     let text = rendered_text(&renderer);
 
     assert!(text.contains("15/8.2k"), "{text:?}");
-    assert!(text.contains('%'), "{text:?}");
+    assert!(text.contains('▰'), "{text:?}");
     assert!(!text.contains("ctx 15/8192"), "{text:?}");
     assert!(!text.contains("context 8192"), "{text:?}");
     assert!(!text.contains("unavailable"), "{text:?}");
@@ -334,7 +335,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let before_usage = rendered_text(&renderer);
     assert!(
-        before_usage.contains("gpt-4.1 · high · 0/200k (0%) · agens · Ready"),
+        before_usage.contains("gpt-4.1 · high · ▱▱▱▱▱    0/200k · ~/d/p/agens · ask ^⇧P · Ready"),
         "{before_usage:?}"
     );
     assert!(!before_usage.contains("model · default · ctx —"));
@@ -354,7 +355,7 @@ fn footer_keeps_five_fields_and_usage_across_submission_start() {
     renderer.render(tui.view()).unwrap();
     let next_turn = rendered_text(&renderer);
     assert!(
-        next_turn.contains("gpt-4.1 · high · 71k/200k (36%) · agens"),
+        next_turn.contains("gpt-4.1 · high · ▰▰▱▱▱  71k/200k · ~/d/p/agens"),
         "{next_turn:?}"
     );
 }
@@ -4490,8 +4491,8 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
     assert_eq!(
         rendered_line(&renderer, usize::from(bottom)),
         format!(
-            "    └{} model — · effort — · ctx — · agens · Ready ┘    ",
-            "─".repeat(46)
+            "    └{} model — · effort — · ctx — · agens · ask ^⇧P · Ready ┘    ",
+            "─".repeat(36)
         ),
         "the metadata is spliced into the composer border, one gap off the corner"
     );
@@ -4531,11 +4532,17 @@ fn composer_bottom_border_hosts_the_metadata_right_aligned() {
 
 #[test]
 fn border_metadata_drops_segments_as_the_composer_narrows() {
+    // The declared shed order: effort, then the directory, then the context,
+    // then the approval mode, leaving the model and the turn outcome last.
     for (width, present, absent) in [
-        (100_u16, "model — · effort — · ctx — · agens · Ready", ""),
-        (52, "model — · effort — · ctx — · Ready", "agens"),
-        (42, "model — · effort — · Ready", "ctx —"),
-        (36, "model — · Ready", "effort —"),
+        (
+            100_u16,
+            "model — · effort — · ctx — · agens · ask ^⇧P · Ready",
+            "",
+        ),
+        (56, "model — · ctx — · agens · ask ^⇧P · Ready", "effort —"),
+        (52, "model — · ctx — · ask ^⇧P · Ready", "agens"),
+        (40, "model — · ask ^⇧P · Ready", "ctx —"),
     ] {
         let (mut renderer, tui) = docked_renderer(width, 20);
         renderer.render(tui.view()).unwrap();
@@ -4840,7 +4847,8 @@ fn bypass_is_compact_footer_metadata_instead_of_a_dedicated_notice() {
 
     assert_eq!(rendered.matches("bypass").count(), 1, "{rendered:?}");
     assert!(!rendered.contains("BYPASS"), "{rendered:?}");
-    assert!(!rendered.contains("· Waiting"), "{rendered:?}");
+    // The mode is its own segment, so it no longer costs the turn its status.
+    assert!(rendered.contains("bypass ^⇧P · Waiting"), "{rendered:?}");
 }
 
 #[test]
@@ -5260,4 +5268,53 @@ fn the_transcript_greys_run_from_prose_to_tool_header_to_tool_output() {
         luminance("{path}") > luminance("OUTPUT_SENTINEL"),
         "what the agent ran reads louder than what it printed"
     );
+}
+
+#[test]
+fn the_footer_answers_its_questions_at_every_real_terminal_width() {
+    for width in [80_u16, 120, 200] {
+        let mut renderer =
+            RatatuiRenderer::new(Terminal::new(TestBackend::new(width, 14)).unwrap());
+        let mut tui = Tui::new(FakeEngine);
+        tui.apply_presentation(
+            TuiPresentation::new("openai-api", "gpt-5.6-sol", "session #1")
+                .with_effort("high")
+                .with_context_window(Some(200_000)),
+        );
+        tui.set_project("/home/iperez/dev/personal/deep/nested/workspace/agens");
+        tui.set_repository_probe(std::sync::Arc::new(|| {
+            Some(RepositoryStatus {
+                branch: Some("feat/agn-114".to_owned()),
+                changed_files: 3,
+                insertions: 120,
+                deletions: 8,
+            })
+        }));
+        tui.apply_runtime_event(TuiRuntimeEvent::Usage(Usage {
+            input_tokens: Some(70_000),
+            output_tokens: Some(1_000),
+            total_tokens: Some(71_000),
+            context_window: Some(200_000),
+        }));
+
+        renderer.render(tui.view()).unwrap();
+        let text = rendered_text(&renderer);
+
+        // What survives at 80 columns is the floor every wider terminal keeps.
+        for datum in ["gpt-5.6-sol", "71k/200k", "▰", "ask ^⇧P"] {
+            assert!(
+                text.contains(datum),
+                "width {width} lost {datum:?}: {text:?}"
+            );
+        }
+        // A deep path never spends the footer's budget on its ancestors.
+        assert!(
+            text.contains("/agens") && !text.contains("/personal/deep"),
+            "width {width}: {text:?}"
+        );
+        if width >= 120 {
+            assert!(text.contains("feat/agn-114"), "width {width}: {text:?}");
+            assert!(text.contains("+120"), "width {width}: {text:?}");
+        }
+    }
 }

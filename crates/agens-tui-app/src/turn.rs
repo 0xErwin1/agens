@@ -314,7 +314,7 @@ mod tests {
         let known = render_tui_test_backend(&known_tui, 140, 14);
 
         assert!(
-            known.contains("gpt-5.6-sol · medium · 0/1.1m (0%)"),
+            known.contains("gpt-5.6-sol · medium · ▱▱▱▱▱    0/1.1m"),
             "{known:?}"
         );
         assert!(!known.contains("model · default · ctx —"), "{known:?}");
